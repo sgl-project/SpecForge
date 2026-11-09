@@ -220,8 +220,25 @@ class ComponentCodecTest(unittest.TestCase):
 
         with patch.dict(registry._SCHEMAS):
             register_component_schema("mlp", MutableValue)
-            with self.assertRaisesRegex(ValueError, "widths"):
+            with self.assertRaisesRegex(
+                ValueError, "widths: unsupported field annotation"
+            ):
                 decode_component("mlp", {"type": "test_mutable_value", "widths": [32]})
+
+    def test_number_errors_name_the_value_received(self):
+        # PyYAML (YAML 1.1) loads `eps: 1e-6` as a string
+        with self.assertRaisesRegex(
+            ValueError, r"norm/rms\.eps: expected a number, got str '1e-6'"
+        ):
+            decode_component(
+                "norm", {"type": "rms", "eps": "1e-6", "weight_offset": 0}
+            )
+        with self.assertRaisesRegex(
+            ValueError, r"attention/gqa\.head_dim: expected int, got str '128'"
+        ):
+            decode_component(
+                "attention", {**COMPONENTS["attention"], "head_dim": "128"}
+            )
 
     def test_derived_fields_are_not_serialized(self):
         @dataclass(frozen=True, kw_only=True)

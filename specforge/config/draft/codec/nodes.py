@@ -40,11 +40,23 @@ def _decode_value(annotation, value, path):
             for index, item in enumerate(value)
         )
     if annotation is float:
+        if type(value) not in (int, float):
+            raise ValueError(f"{path}: expected a number, got {_describe(value)}")
         finite_number(path, value)
         return value
-    if annotation in (int, bool, str) and type(value) is annotation:
-        return value
-    raise ValueError(f"{path}: expected {annotation}, got {type(value).__name__}")
+    if annotation in (int, bool, str):
+        if type(value) is annotation:
+            return value
+        raise ValueError(
+            f"{path}: expected {annotation.__name__}, got {_describe(value)}"
+        )
+    raise ValueError(f"{path}: unsupported field annotation {annotation!r}")
+
+
+def _describe(value) -> str:
+    if type(value) in (str, int, float, bool):
+        return f"{type(value).__name__} {value!r}"
+    return type(value).__name__
 
 
 def decode_node(schema: type, payload: Mapping, path: str):
