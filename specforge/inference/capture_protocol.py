@@ -13,6 +13,10 @@ class CaptureControlRejected(RuntimeError):
     """The server explicitly rejected the operation without granting a permit."""
 
 
+class CaptureCapacityDeclined(CaptureControlRejected):
+    """An atomic begin was refused before granting any reservation."""
+
+
 def request_digest(tokens, spec):
     value = {"tokens": list(tokens), "features": spec.get("features", {}),
              "passthrough": spec.get("passthrough", [])}
@@ -47,6 +51,10 @@ class CaptureProtocol:
                 except Exception:
                     pass  # Keep the original rejection recognizable to its owner.
             raise
+        if (isinstance(result, dict) and body.get('action') in ('begin', 'begin_batch')
+                and result.get('error_code') == 'capture_capacity_declined'
+                and result.get('reservation_granted') is False):
+            raise CaptureCapacityDeclined(str(result.get('error', 'capture capacity exhausted')))
         if not isinstance(result, dict) or result.get('error'):
             raise RuntimeError('capture control failed: ' + repr(result))
         return result
