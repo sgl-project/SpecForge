@@ -180,6 +180,18 @@ class AttentionRoPETest(unittest.TestCase):
                     }
                 )
 
+    def test_yaml_explicit_overrides_survive_parsing(self):
+        payload = encode_config(draft_config())
+        payload["attention_configs"]["full"]["rope_parameters"] = {"rope_type": "none"}
+        node = parse_draft(payload, target_config=None)
+        self.assertEqual(node.attention_configs["full"].rope_parameters, NoRoPESpec())
+        payload["attention"] = payload.pop("attention_configs")["full"]
+        payload["mlp"] = payload.pop("mlp_configs")["dense"]
+        for name in ("conv_configs", "layer_configs", "layer_types"):
+            payload.pop(name)
+        node = parse_draft(payload, target_config=None)
+        self.assertEqual(node.attention_configs["default"].rope_parameters, NoRoPESpec())
+
 
 if __name__ == "__main__":
     unittest.main()
