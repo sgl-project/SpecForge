@@ -58,6 +58,10 @@ class NestedFFN(FFNSpec):
 
 
 class ComponentCodecTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(registry._SCHEMAS))
+        self.enterContext(patch.dict(registry._VALIDATORS))
+
     def test_nested_nodes_and_components_use_the_same_codec(self):
         register_component_schema("mlp", NestedFFN)
         payload = {
