@@ -142,7 +142,7 @@ _SGLANG_FLAG_NAMES: Mapping[str, str] = {
 #: ``sglang_*`` fields that carry raw argv tokens instead of one flag.
 SGLANG_PASSTHROUGH_FIELDS = frozenset({"sglang_extra_args"})
 #: Capture-server environment the managed-local launcher sets itself.
-_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_")
+_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_", "SPECFORGE_HS_")
 _OWNED_SERVER_ENV = {
     "CUDA_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ASCEND_RT_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
@@ -417,6 +417,7 @@ class DataConfig(StrictConfigModel):
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
     eval_hidden_states_path: str = ""
     max_length: int = Field(default=2048, gt=0)
+    overlength_policy: Literal["truncate", "drop"] = "truncate"
     chat_template: str = "llama3"
     is_preformatted: bool = False
     train_only_last_turn: bool = False
@@ -430,6 +431,8 @@ class DataConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
+        if self.overlength_policy == "drop" and not self.prompts_path:
+            raise ValueError("data.overlength_policy=drop requires native data.prompts_path")
         sources = [
             bool(self.train_data_path),
             bool(self.prompts_path),
@@ -493,6 +496,9 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    producer_backpressure_poll_s: float = Field(default=0.2, gt=0, allow_inf_nan=False)
+    consumer_ref_poll_s: float = Field(default=0.1, gt=0, allow_inf_nan=False)
+    ref_distributor_poll_s: float = Field(default=0.05, gt=0, allow_inf_nan=False)
     consumer_dispatch: Literal[
         "round_robin",
         "cost_balanced",
@@ -506,6 +512,14 @@ class RuntimeConfig(StrictConfigModel):
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
     feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
+
+    @field_validator("producer_backpressure_poll_s", "consumer_ref_poll_s",
+                     "ref_distributor_poll_s", mode="before")
+    @classmethod
+    def _poll_seconds_numeric(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("polling intervals must be positive finite numbers")
+        return value
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
@@ -839,6 +853,17 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: backend: managed_local probes each capture server's interpreter while
     #: planning; the producer reads an external server's ``/server_info``.
     server_capture: Literal["auto", "plugin"] = "auto"
+    #: Native HS protocol and content-cache reuse are separate opt-ins so
+    #: cache-off/on comparisons share the same publication/ownership path.
+    hs_capture: bool = False
+    hs_prefix_cache: bool = False
+    hs_chunk_tokens: int = Field(default=256, gt=0)
+    hs_cache_bytes: int = Field(default=1 << 30, gt=0)
+    hs_pinned_bytes: int = Field(default=256 << 20, gt=0)
+    hs_output_bytes: int = Field(default=512 << 20, gt=0)
+    hs_device_bytes: int = Field(default=256 << 20, gt=0)
+    hs_max_workers: int = Field(default=4, gt=0)
+    hs_attempt_capacity: int = Field(default=4096, gt=0)
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -878,6 +903,10 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_store(self):
+        if self.hs_prefix_cache and not self.hs_capture:
+            raise ValueError("hs_prefix_cache requires hs_capture")
+        if self.hs_capture and self.backend != "mooncake":
+            raise ValueError("HS capture requires backend=mooncake")
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
         if self.managed_local is not None:
@@ -1044,7 +1073,9 @@ class TrainingConfig(StrictConfigModel):
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    lr_scheduler: Literal["cosine", "constant", "torchspec_cosine"] = "cosine"
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    min_lr: float = Field(default=0.0, ge=0.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
@@ -1091,6 +1122,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.min_lr > self.learning_rate:
+            raise ValueError("training.min_lr must not exceed training.learning_rate")
+        if self.min_lr and self.lr_scheduler == "constant":
+            raise ValueError("training.min_lr requires a cosine scheduler")
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:

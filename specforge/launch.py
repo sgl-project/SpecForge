@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import logging
 import os
 from typing import Any, Callable, List, Mapping, Optional, Tuple
@@ -386,8 +388,8 @@ def _publish_refs_with_cleanup(
         cleanup_errors = []
         for ref in transaction.unpublished_refs:
             try:
-                feature_store.abort(
-                    ref.sample_id,
+                abort_feature_ref(
+                    feature_store, ref,
                     reason="producer-ref-publication-failed",
                 )
             except Exception as cleanup_exc:
@@ -402,6 +404,11 @@ def _publish_refs_with_cleanup(
                 f"{cleanup_errors}"
             ) from publish_exc
         raise
+    finally:
+        relinquish = getattr(feature_store, "relinquish_published", None)
+        if callable(relinquish):
+            for ref in transaction.published_refs:
+                relinquish(ref)
 
 
 def _epoch_online_prompts(
@@ -838,8 +845,12 @@ def build_disagg_online_producer(
     server-capture transport; a *sequence* of sources fans out to one logical
     worker per source (the multi-server topology). Each logical worker keeps
     ``producer_concurrency`` capture calls in flight and replenishes a slot as
-    soon as that call completes. There is intentionally no in-process
-    target-model path.
+    soon as that call completes. Negotiated capture adapters register the
+    currently ready leases together per endpoint, then generate and publish
+    each lease independently. Prepared leases occupy bounded capture slots;
+    negotiated output byte reservations include all unfinished server writes
+    in the global feature-store hard cap until publication or exact cleanup.
+    There is intentionally no in-process target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -1081,10 +1092,12 @@ def build_disagg_online_producer(
             "accounted_consumed": channel.consumed_remote(),
             "resident_bytes": 0,
             "published_bytes": 0,
+            "reserved_bytes": 0,
         }
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
+        inactive: dict = {}  # explicitly stopped/draining workers
         # Set once the feeder will ingest nothing more (plan exhausted, stop,
         # or failure); only then may an empty pool end a worker.
         ingest_closed = threading.Event()
@@ -1144,10 +1157,11 @@ def build_disagg_online_producer(
             with publish_lock:
                 return reconcile_consumed_locked()
 
-        def publish_refs(w, refs, run_once_start: float) -> None:
-            if not refs:
-                return
+        def publish_refs(w, refs, run_once_start: float, reservation: int = 0) -> None:
             with publish_lock:
+                if not refs:
+                    state["reserved_bytes"] -= reservation
+                    return
                 current_bytes = reconcile_consumed_locked()
                 ref_sizes = [max(0, int(ref.estimated_bytes or 0)) for ref in refs]
                 projected_bytes = current_bytes + sum(ref_sizes)
@@ -1158,8 +1172,8 @@ def build_disagg_online_producer(
                     cleanup_errors = []
                     for ref in refs:
                         try:
-                            feature_store.abort(
-                                ref.sample_id,
+                            abort_feature_ref(
+                                feature_store, ref,
                                 reason="producer-resident-byte-hard-cap",
                             )
                         except Exception as exc:
@@ -1174,11 +1188,18 @@ def build_disagg_online_producer(
                     if cleanup_errors:
                         message += f"; cleanup errors={cleanup_errors}"
                     raise MemoryError(message)
-                _publish_refs_with_cleanup(
-                    channel=channel,
-                    feature_store=feature_store,
-                    refs=refs,
-                )
+                try:
+                    _publish_refs_with_cleanup(
+                        channel=channel,
+                        feature_store=feature_store,
+                        refs=refs,
+                    )
+                except BaseException:
+                    # A possibly visible prefix still owns its original credit.
+                    # Stop peer admissions before releasing the shared lock.
+                    abort.set()
+                    raise
+                state["reserved_bytes"] -= reservation
                 if channel.consumed_state_remote()[1] is None:
                     published_sizes.extend(ref_sizes)
                 state["published_bytes"] += sum(ref_sizes)
@@ -1214,8 +1235,8 @@ def build_disagg_online_producer(
                     continue
                 for ref in refs:
                     try:
-                        feature_store.abort(
-                            ref.sample_id,
+                        abort_feature_ref(
+                            feature_store, ref,
                             reason="producer-driver-failed-before-publication",
                         )
                     except Exception:
@@ -1223,7 +1244,7 @@ def build_disagg_online_producer(
                             "failed to abort unpublished ref %s", ref.sample_id
                         )
 
-        def run_worker(w) -> None:
+        def run_worker_legacy(w) -> None:
             failures = 0
             submitted = 0
             accepting = True
@@ -1361,6 +1382,291 @@ def build_disagg_online_producer(
                     abort_unpublished(futures)
                     raise
 
+        def run_worker(w) -> None:
+            source = w.feature_source
+            if getattr(source, "_capture_protocol", None) is None:
+                return run_worker_legacy(w)
+
+            # One endpoint's network registration has its own executor. The
+            # coordinator only leases, reserves credits and harvests futures;
+            # an in-flight begin never blocks independent ref publication.
+            records = []
+            futures = {}
+            preparing = registering = cleaning = None
+            failures = submitted = 0
+            accepting = True
+            backpressure_started = None
+            capacity_blocked = False
+            next_registration_at = 0.0
+            from specforge.inference.capture_protocol import CaptureCapacityDeclined
+
+            def release_credit(record):
+                with publish_lock:
+                    state["reserved_bytes"] -= record["credit"]
+                    record["credit"] = 0
+
+            def reserve(record):
+                if record["credit"]:
+                    return True  # Same leased attempt retains its original credit.
+                size = record["prepared"]["estimated_bytes"]
+                if size is None or feature_store_max_resident_bytes is None:
+                    return True
+                with publish_lock:
+                    if abort.is_set():
+                        return False
+                    current = reconcile_consumed_locked()
+                    if size > feature_store_max_resident_bytes:
+                        raise MemoryError(
+                            "producer feature-store hard cap exceeded: "
+                            f"sample reservation={size} > limit={feature_store_max_resident_bytes} bytes"
+                        )
+                    if current + state["reserved_bytes"] + size > feature_store_max_resident_bytes:
+                        return False
+                    state["reserved_bytes"] += size
+                    record["credit"] = size
+                    return True
+
+            def failed(exc):
+                nonlocal failures, accepting
+                failures += 1
+                if failures >= max_worker_failures:
+                    accepting = False
+                    dead[w.worker_id] = str(exc)
+
+            def clean_batch(group):
+                source.discard_prepared_batches([r["prepared"] for r in group])
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=producer_concurrency,
+                thread_name_prefix=f"capture-{w.worker_id}",
+            ) as executor, concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"prepare-{w.worker_id}",
+            ) as preparation, concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"register-{w.worker_id}",
+            ) as registration:
+                try:
+                    while True:
+                        health_state = w.health()["state"]
+                        if health_state in ("stopped", "draining"):
+                            accepting = False
+                            inactive[w.worker_id] = health_state
+                        if abort.is_set() or (should_stop is not None and should_stop()):
+                            accepting = False
+                        # Harvest generates first, including while a different
+                        # registration or uncertain-attempt cleanup is blocked.
+                        for future in list(futures):
+                            if not future.done():
+                                continue
+                            record = futures.pop(future)
+                            # A cancelled queued future never entered run_leased.
+                            record["settled"] = not future.cancelled()
+                            try:
+                                refs = future.result()
+                            except Exception as exc:
+                                record.update(stage="cleanup", error=exc)
+                                failed(exc)
+                            else:
+                                failures = 0
+                                credit = record["credit"]
+                                missing = source.unreturned_prepared(record["prepared"], refs)
+                                if missing is not None:
+                                    # Per-task errors settle controller leases but
+                                    # can still own server reservations or writes.
+                                    # Publish successes now; retain only failed
+                                    # identities and their credits until drained.
+                                    failed_credit = missing["estimated_bytes"] if credit else 0
+                                    record.update(prepared=missing, tasks=missing["tasks"],
+                                                  credit=failed_credit, stage="cleanup")
+                                    credit -= failed_credit
+                                else:
+                                    record["credit"] = 0
+                                    records.remove(record)
+                                publish_refs(w, refs, record["start"], credit)
+
+                        if cleaning is not None and cleaning[0].done():
+                            future, group = cleaning
+                            future.result()  # Failure retains original ownership and aborts the driver.
+                            for record in group:
+                                release_credit(record)
+                                if not record["settled"]:
+                                    w.fail_leased(record["tasks"], str(record["error"]),
+                                                  unhealthy=not record.get("cancelled", False))
+                                records.remove(record)
+                            cleaning = None
+
+                        if registering is not None and registering[0].done():
+                            future, group = registering
+                            registering = None
+                            try:
+                                future.result()
+                            except CaptureCapacityDeclined:
+                                capacity_blocked = True
+                                next_registration_at = time.monotonic() + backpressure_poll_s
+                                for record in group:
+                                    record["stage"] = "pending"
+                            except Exception as exc:
+                                failed(exc)
+                                for record in group:
+                                    record.update(stage="cleanup", error=exc)
+                            else:
+                                capacity_blocked = False
+                                for record in group:
+                                    if (not accepting or abort.is_set()
+                                        or w.health()["state"] in ("stopped", "draining")
+                                        or (should_stop is not None and should_stop())):
+                                        accepting = False
+                                        record.update(stage="cleanup", error="producer-stopped", cancelled=True)
+                                        continue
+                                    record["stage"] = "generate"
+                                    future = executor.submit(
+                                        w.run_leased, record["tasks"],
+                                        max_tasks=worker_lease, prepared=record["prepared"],
+                                    )
+                                    futures[future] = record
+
+                        if preparing is not None and preparing[0].done():
+                            future, group = preparing
+                            preparing = None
+                            try:
+                                prepared = future.result()
+                                if len(prepared) != len(group):
+                                    raise RuntimeError(
+                                        "capture preparation returned "
+                                        f"{len(prepared)} groups for {len(group)} leases"
+                                    )
+                            except Exception as exc:
+                                failed(exc)
+                                for record in group:
+                                    w.fail_leased(record["tasks"], f"prepare_refs:{exc}")
+                                    records.remove(record)
+                            else:
+                                for record, item in zip(group, prepared):
+                                    record.update(stage="pending", prepared=item)
+
+                        if not accepting:
+                            # An unregistered prepared lease may be waiting for
+                            # consumer credit. Cooperative stop must not depend
+                            # on another ACK arriving before it can retire.
+                            for record in records:
+                                if record["stage"] == "pending":
+                                    record.update(stage="cleanup", error="producer-stopped", cancelled=True)
+
+                        # Credits for unfinished or uncertain server writes stay
+                        # reserved until the exact attempt is physically drained.
+                        if cleaning is None and registering is None:
+                            group = [r for r in records if r["stage"] == "cleanup"]
+                            if group:
+                                cleaning = (registration.submit(clean_batch, group), group)
+
+                        in_flight = channel.in_flight_remote()
+                        current_bytes = resident_bytes()
+                        paused = in_flight >= consumer_quantum and flow_control.should_pause(
+                            in_flight_refs=in_flight, resident_bytes=current_bytes,
+                        )
+                        if accepting and not paused and submitted < round_budget and preparing is None:
+                            group = []
+                            while len(records) < producer_concurrency and submitted < round_budget:
+                                tasks = w.lease_tasks(worker_lease)
+                                if not tasks:
+                                    break
+                                record = dict(tasks=tasks, start=time.perf_counter(),
+                                              stage="prepare", credit=0, settled=False)
+                                records.append(record)
+                                group.append(record)
+                                submitted += 1
+                            if group:
+                                preparing = (preparation.submit(
+                                    source.prepare_refs_batches,
+                                    [r["tasks"] for r in group], capture=w.capture,
+                                ), group)
+
+                        # Take the entire ready snapshot. Initial idle slots
+                        # deterministically share one begin; late arrivals queue
+                        # behind an active registration and coalesce next turn.
+                        budget_wait = False
+                        if (registering is None and cleaning is None
+                            and time.monotonic() >= next_registration_at):
+                            group = []
+                            for record in records:
+                                if record["stage"] != "pending":
+                                    continue
+                                if reserve(record):
+                                    record["stage"] = "register"
+                                    group.append(record)
+                                else:
+                                    budget_wait = True
+                            if group:
+                                registering = (registration.submit(
+                                    source.register_prepared_batches,
+                                    [r["prepared"] for r in group],
+                                ), group)
+
+                        if paused or budget_wait or capacity_blocked:
+                            if backpressure_started is None:
+                                backpressure_started = time.monotonic()
+                            if (peer_wait_timeout_s is not None and
+                                time.monotonic() - backpressure_started > peer_wait_timeout_s):
+                                raise TimeoutError("producer backpressure timed out waiting for consumer progress")
+                        else:
+                            backpressure_started = None
+
+                        if not records:
+                            if ingest_closed.is_set() and pool_drained():
+                                return
+                            if not accepting or submitted >= round_budget:
+                                return
+                        waits = list(futures)
+                        waits.extend(item[0] for item in (preparing, registering, cleaning) if item is not None)
+                        if waits:
+                            concurrent.futures.wait(waits, timeout=backpressure_poll_s,
+                                                    return_when=concurrent.futures.FIRST_COMPLETED)
+                        else:
+                            sleep(backpressure_poll_s)
+                except BaseException:
+                    abort.set()
+                    # Executor submit can fail before a future is installed.
+                    # Every prelease remains in records, so none can disappear
+                    # between preparation, registration and independent generate.
+                    for item in (preparing, registering, cleaning):
+                        if item is not None:
+                            try:
+                                result = item[0].result()
+                                if item is preparing:
+                                    for record, prepared in zip(item[1], result):
+                                        record["prepared"] = prepared
+                            except BaseException:
+                                pass
+                    cleanup_errors = []
+                    for future, record in futures.items():
+                        try:
+                            refs = future.result()
+                        except BaseException:
+                            pass
+                        else:
+                            for ref in refs:
+                                try:
+                                    abort_feature_ref(feature_store, ref,
+                                                      reason="producer-driver-failed-before-publication")
+                                except BaseException as exc:
+                                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                        record["settled"] = not future.cancelled()
+                    for record in records:
+                        cleaned = False
+                        try:
+                            if "prepared" in record:
+                                clean_batch([record])
+                            cleaned = True
+                        except BaseException as exc:
+                            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                        finally:
+                            if not record["settled"]:
+                                w.fail_leased(record["tasks"], "producer-driver-failed")
+                            if cleaned:
+                                release_credit(record)
+                    if cleanup_errors:
+                        logger.error("producer exact-attempt cleanup remains pending: %s", cleanup_errors)
+                    raise
+
         last_ingest_log = {"t": None}
 
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
@@ -1488,6 +1794,11 @@ def build_disagg_online_producer(
                     f"all rollout workers exited with {len(dead)} dropped "
                     f"as dead and prompts remaining — dead workers: {dead}"
                 )
+            if inactive and not stopped and remaining:
+                raise RuntimeError(
+                    "rollout workers stopped or draining with prompts remaining: "
+                    f"{inactive}"
+                )
             if st["prompts_failed"] and not stopped:
                 raise RuntimeError(
                     "producer finished with "
@@ -1567,6 +1878,8 @@ def build_disagg_online_consumer(
     async_ack: Optional[bool] = None,
     consumer_dispatch: str = "cost_balanced",
     dispatch_num_anchors: int = 512,
+    ref_poll_s: float = 0.1,
+    distributor_poll_s: float = 0.05,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1744,6 +2057,7 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
+                poll_s=distributor_poll_s,
             )
             inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
             if inbox_server_url:
@@ -1801,7 +2115,7 @@ def build_disagg_online_consumer(
         inbox = RemoteInboxChannel(inbox_server_url, dp_rank)
     else:
         inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
-    queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
+    queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s, poll_s=ref_poll_s)
 
     drain_state = {"attempted": False}
     fit_failure = {"error": None}

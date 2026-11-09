@@ -772,6 +772,22 @@ def _managed_local_services(
         argv.extend(cfg.model.sglang_extra_args)
         argv.extend(server.extra_args)
         gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
+        hs_env = {}
+        if deployment.hs_capture:
+            if gpu_put:
+                raise ValueError("HS capture supports host publication only; disable gpu_put")
+            if mooncake.arena_bytes is not None:
+                raise ValueError("HS capture does not support NVLink arena publication")
+            gpu_put = False
+            hs_env = {
+                "SPECFORGE_HS_CAPTURE": "1",
+                "SPECFORGE_HS_CACHE": "1" if deployment.hs_prefix_cache else "0",
+                **{
+                    "SPECFORGE_HS_" + name.upper(): str(getattr(deployment, "hs_" + name))
+                    for name in ("chunk_tokens", "cache_bytes", "pinned_bytes",
+                                 "output_bytes", "device_bytes", "max_workers", "attempt_capacity")
+                },
+            }
         python_env: dict[str, Optional[str]] = {}
         if server.python_executable:
             python_env = {"PYTHONPATH": None, "VIRTUAL_ENV": None}
@@ -789,7 +805,9 @@ def _managed_local_services(
                 else {}
             ),
             **({"SPECFORGE_SPEC_CAPTURE": "1"} if server_capture is not None else {}),
-            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+            **hs_env,
+            # Installation/runtime compatibility is checked by the real guard.
+            "FLASHINFER_DISABLE_VERSION_CHECK": None,
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": str(mooncake.global_segment_size_bytes),
             "MOONCAKE_LOCAL_BUFFER_SIZE": str(mooncake.local_buffer_size_bytes),
             **(

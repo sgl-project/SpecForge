@@ -17,6 +17,8 @@ immediately, so prefetch can never race a release.
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import os
 import queue as queue_module
 import threading
@@ -350,7 +352,7 @@ class FeatureDataLoader:
                 adopt = getattr(self.store, "adopt", None)
                 if callable(adopt):
                     adopt(ref)
-                self.store.abort(ref.sample_id, reason=reason)
+                abort_feature_ref(self.store, ref, reason=reason)
             except Exception as exc:  # settle the full tail, then fail loudly
                 cleanup_errors.append(f"{ref.sample_id}: {exc}")
         if cleanup_errors:
