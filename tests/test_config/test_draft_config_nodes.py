@@ -26,17 +26,18 @@ class DraftConfigNodesTest(unittest.TestCase):
         class CustomLogits(NoLogitTransformSpec):
             type: ClassVar[str] = "test_config_logits"
 
-        register_component_schema("logits", CustomLogits)
-        node = draft_config(target_logit_transform=CustomLogits())
-        self.assertEqual(decode_config(encode_config(node)), node)
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            decode_config(
-                encode_config(node),
-                target_config={
-                    "hidden_size": node.hidden_size,
-                    "vocab_size": node.vocab_size,
-                },
-            )
+        with patch.dict(registry._SCHEMAS):
+            register_component_schema("logits", CustomLogits)
+            node = draft_config(target_logit_transform=CustomLogits())
+            self.assertEqual(decode_config(encode_config(node)), node)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                decode_config(
+                    encode_config(node),
+                    target_config={
+                        "hidden_size": node.hidden_size,
+                        "vocab_size": node.vocab_size,
+                    },
+                )
 
     def test_graph_is_an_immutable_snapshot(self):
         source = {"full_dense": LayerSpec(attention="full", mlp="dense")}
@@ -211,7 +212,6 @@ class DraftConfigNodesTest(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
-                "-S",
                 "-c",
                 """
 import sys
