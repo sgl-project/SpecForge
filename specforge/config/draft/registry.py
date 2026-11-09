@@ -1,4 +1,4 @@
-"""Configuration schemas only; computational builders register in modeling."""
+"""Configuration schemas and pure validation; computational builders live in modeling."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .architecture.constraints import (
 from .architecture.dspine import validate_dspine
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
+from .conv.constraints import validate_grouped_causal
 from .logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
@@ -40,6 +41,7 @@ _BASES = {
     "logits": TargetLogitSpec,
 }
 _SCHEMAS: dict[tuple[str, str], type] = {}
+_VALIDATORS: dict[tuple[str, str], Callable[..., None]] = {}
 
 
 def _validate_schema(schema: type, label: str) -> None:
@@ -72,17 +74,23 @@ def component_type(kind: str, node):
     return getattr(node, "rope_type" if kind == "rope" else "type", None)
 
 
-def register_component_schema(kind: str, schema: type) -> None:
+def register_component_schema(
+    kind: str, schema: type, *, validate: Callable[..., None] | None = None
+) -> None:
     """Register a frozen node under its kind and class-level type name.
 
     Repeating the same registration is harmless; replacing a schema is an
     error. LayerSpec is a fixed reference schema and is not registered here.
+    An optional pure validator accepts the node and caller-supplied context.
+    Omitting it on a repeated registration preserves the existing validator.
     """
     if not isinstance(kind, str) or kind not in _BASES:
         raise ValueError(f"unknown component kind {kind!r}; expected {sorted(_BASES)}")
     if not isinstance(schema, type) or not issubclass(schema, _BASES[kind]):
         raise TypeError(f"{kind} schema must inherit {_BASES[kind].__name__}")
     _validate_schema(schema, kind)
+    if validate is not None and not callable(validate):
+        raise TypeError("component validation must be callable")
     name = component_type(kind, schema)
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{kind} schema must declare a nonempty type name")
@@ -92,7 +100,12 @@ def register_component_schema(kind: str, schema: type) -> None:
         raise ValueError(
             f"component {kind}/{name} already registered to {existing.__name__}"
         )
+    previous = _VALIDATORS.get(key)
+    if validate is not None and previous is not None and previous is not validate:
+        raise ValueError(f"component validation {kind}/{name} already registered")
     _SCHEMAS[key] = schema
+    if validate is not None:
+        _VALIDATORS[key] = validate
 
 
 def component_schema(kind: str, name: str) -> type:
@@ -103,6 +116,16 @@ def component_schema(kind: str, name: str) -> type:
         available = sorted(key[1] for key in _SCHEMAS if key[0] == kind)
         raise ValueError(f"unknown {kind} type {name!r}; available: {available}")
     return _SCHEMAS[kind, name]
+
+
+def validate_component(kind: str, node, **context) -> None:
+    """Run the registered context validator; node-local checks run at construction."""
+    name = component_type(kind, node)
+    if type(node) is not component_schema(kind, name):
+        raise ValueError(f"{kind}/{name}: expected its registered configuration node")
+    validator = _VALIDATORS.get((kind, name))
+    if validator is not None:
+        validator(node, **context)
 
 
 @dataclass(frozen=True)
@@ -143,7 +166,6 @@ for _kind, _schema in (
     ("attention", MHASpec),
     ("attention", MLASpec),
     ("mlp", DenseFFNSpec),
-    ("conv", GroupedCausalConvSpec),
     ("norm", RMSNormSpec),
     ("residual", StandardResidualSpec),
     ("rope", DefaultRoPESpec),
@@ -153,6 +175,10 @@ for _kind, _schema in (
     ("logits", MuPLogitTransformSpec),
 ):
     register_component_schema(_kind, _schema)
+
+register_component_schema(
+    "conv", GroupedCausalConvSpec, validate=validate_grouped_causal
+)
 
 register_spec("DFlashDraftModel", DFlashSpec, validate_dflash)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
