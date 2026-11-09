@@ -124,7 +124,7 @@ class HSPluginTests(unittest.TestCase):
         hs.commit(hs.s, req, proposal, L)
         return proposal, L
 
-    def forward(self, hs, reqs, lengths):
+    def forward(self, hs, reqs, lengths, *, wait_materialize=False):
         aux, last, prefixes = [], [], []
         for req, length in zip(reqs, lengths):
             L = req._specforge_hs_plan.L
@@ -140,6 +140,8 @@ class HSPluginTests(unittest.TestCase):
         output = hs.capture.observer.after_forward(batch, forward, logits, can_run_graph=True)
         with mock.patch.object(torch.Tensor, "to", side_effect=AssertionError("native D2H is duplicated")):
             host = output.copy_to_host(lambda tensor: self.fail("HS must not call native copy_tensor"))
+        if wait_materialize:
+            self.spin(hs, lambda: all(job.materialize.done() for job in output.hs_jobs))
         host.consume(batch, [None] * len(reqs))
         return output
 
@@ -186,10 +188,17 @@ class HSPluginTests(unittest.TestCase):
         reqs = [self.request(hs, name) for name in ("cancel", "sibling")]
         for req in reqs:
             self.admit(hs, req)
-        self.forward(hs, reqs, [8, 8])
+        output = self.forward(hs, reqs, [8, 8], wait_materialize=True)
+        first, sibling = output.hs_jobs
+        self.assertIs(first.sink, sibling.sink)
+        self.assertIsNotNone(first.sink)
+        self.assertEqual((first.sink_count, sibling.sink_count), (2, 2))
         self.spin(hs, store.entered.is_set)
+        held = first.sample
         hs.deferred[0][1].cancel()
         self.assertTrue(hs.deferred[0][1].done())
+        self.assertIs(first.sample, held)
+        self.assertFalse(first.sink.done())
         self.assertGreater(hs.controller.stats()["output_bytes"], 0)
         gate.set()
         self.spin(hs, lambda: not hs.jobs)

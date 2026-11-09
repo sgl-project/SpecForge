@@ -241,3 +241,21 @@ proof exists. Timeouts do not authorize reuse.
 store; `test_hs_controller_parallel_cuda` requires actual CUDA/pinned copies.
 CPU fixtures do not certify numerical model, real Mooncake, scheduler TP or
 training equivalence.
+
+Internal TP control/admission collectives use named local phases: owner/poll,
+writer payload construction, received-state application, target lookup and
+permit validation all vote local errors before entering a later collective.
+Ranks agree request membership and control branches before dispatch. Startup
+epoch/model/schema/core failures use the same protocol. `poll` and `lifecycle`
+themselves remain local because native completion paths may call them only on
+the writer. Begin operations preflight a separate registry on every rank;
+only unanimous capacity refusal of uncommitted trials can emit the typed
+`reservation_granted=false` proof. A rank disagreement or partial commit fails
+closed without that proof.
+
+`tests.test_runtime.test_hs_tp_protocol` drives the real runtime and companion
+SG `PrefixAdmissionCoordinator.phase` with two CPU scheduler threads and a
+blocking operation-order rendezvous. Set `SPECFORGE_HS_TEST_SG_SOURCE` to the SG
+checkout when the installed editable still points at an upstream baseline.
+This detects mismatched collective sequences in the tested faults; actual
+distributed TP, CUDA and transport failure validation remains separate.

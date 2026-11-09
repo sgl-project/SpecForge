@@ -116,28 +116,41 @@ class HSCaptureRuntime:
         if self.tp_size is None:
             from sglang.srt.runtime_context import get_parallel
             self.tp_size = get_parallel().tp_size
-        self.epoch = self.broadcast(uuid.uuid4().hex if self.writer else None)
+        self.epoch = self._writer_broadcast("startup.epoch", lambda: uuid.uuid4().hex)
         if manifest is None or schema is None:
-            manifest, schema = self._model_identity()
-        self.schema = schema
-        self.schema_wire = [dataclasses.asdict(feature) for feature in schema.features]
-        for feature in self.schema_wire:
-            feature["layer_ids"] = list(feature["layer_ids"])
-        manifest = {**manifest, "load_epoch": self.epoch, "schema": self.schema_wire,
-                    "chunk_tokens": config.chunk_tokens}
-        self.signature = hashlib.sha256(json.dumps(
-            manifest, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
-        self.namespace = "spec-feature-v1:" + self.signature
-        if len(set(self.gather(self.signature))) != 1:
-            raise CaptureContractError("TP capture model/schema signatures differ")
-        self.registry = AttemptRegistry(self.epoch, config.attempt_capacity)
+            manifest, schema = self._local_phase("startup.model", self._model_identity)
+
+        def identify():
+            self.schema = schema
+            self.schema_wire = [dataclasses.asdict(feature) for feature in schema.features]
+            for feature in self.schema_wire:
+                feature["layer_ids"] = list(feature["layer_ids"])
+            identity = {**manifest, "load_epoch": self.epoch, "schema": self.schema_wire,
+                        "chunk_tokens": config.chunk_tokens}
+            self.signature = hashlib.sha256(json.dumps(
+                identity, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+            self.namespace = "spec-feature-v1:" + self.signature
+            self.registry = AttemptRegistry(self.epoch, config.attempt_capacity)
+            return self.signature
+
+        signature = self._local_phase("startup.identity", identify)
+        self._agree("startup.signature", signature)
         self.cache = self.controller = None
-        if self.writer:
-            self.cache = PrefixFeatureCache(schema, config.chunk_tokens,
-                                            config.cache_bytes if self.enabled else 0)
-            self.controller = CaptureController(
-                self.cache, schema, config.pinned_bytes, config.output_bytes,
-                config.device_bytes, max_workers=config.max_workers)
+
+        def create_core():
+            if self.writer:
+                self.cache = PrefixFeatureCache(schema, config.chunk_tokens,
+                                                config.cache_bytes if self.enabled else 0)
+                self.controller = CaptureController(
+                    self.cache, schema, config.pinned_bytes, config.output_bytes,
+                    config.device_bytes, max_workers=config.max_workers)
+
+        try:
+            self._local_phase("startup.core", create_core)
+        except Exception:
+            if self.controller is not None:
+                self.controller.shutdown(wait=True)
+            raise
         self.candidates: dict[str, _Candidate] = {}
         self.jobs: dict[ExecutionIdentity, _Publication] = {}
         self.history = deque(maxlen=256)
@@ -150,6 +163,51 @@ class HSCaptureRuntime:
     def _assert_owner(self):
         if threading.get_ident() != self.owner_thread:
             raise RuntimeError("HS state may only be changed on the scheduler thread")
+
+    def _local_phase(self, phase, call):
+        """Vote local work BEFORE any subsequent internal collective.
+
+        SG's outer callback phase runs too late to repair divergent nested
+        collectives. Labels also fail closed if ranks choose different plugin
+        branches that happen to arrive at a gather together. ``call`` must not
+        itself contain a collective; poll/lifecycle therefore remain local.
+        """
+        value, error = None, None
+        try:
+            value = call()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        votes = self.gather((phase, error))
+        if any(not isinstance(vote, tuple) or len(vote) != 2
+               or vote[0] != phase for vote in votes):
+            raise CaptureControlRejected(f"TP HS phase order differs at {phase}: {votes!r}")
+        if any(vote[1] is not None for vote in votes):
+            raise CaptureControlRejected(f"TP HS {phase} failed: {votes!r}")
+        return value
+
+    def _agree(self, phase, value):
+        votes = self.gather((phase, value))
+        if any(not isinstance(vote, tuple) or len(vote) != 2
+               or vote[0] != phase or vote[1] != value for vote in votes):
+            raise CaptureControlRejected(f"TP HS {phase} differs: {votes!r}")
+
+    def _writer_broadcast(self, phase, build):
+        payload = self._local_phase(phase + ".build", lambda: build() if self.writer else None)
+        return self.broadcast(payload)
+
+    def _broadcast_wire(self, phase, entry):
+        wire = self._writer_broadcast(phase, lambda: self._wire(entry))
+
+        def apply():
+            if any(wire.get(name) != expected for name, expected in (
+                ("server_epoch", self.epoch), ("store_id", entry.identity[0]),
+                ("sample_id", entry.identity[1]), ("gen", entry.identity[2]),
+                ("attempt_id", entry.attempt_id), ("reservation_token", entry.token))):
+                raise CaptureContractError("TP HS wire identity changed")
+            entry.state = wire["state"]
+
+        self._local_phase(phase + ".apply", apply)
+        return wire
 
     def broadcast(self, value):
         if self.tp_size == 1:
@@ -311,11 +369,20 @@ class HSCaptureRuntime:
         return entry
 
     def prepare(self, scheduler, req):
-        self._assert_owner()
-        from specforge_sglang_capture.capture import request_spec
-        if not (spec := request_spec(req)) or "protocol_version" not in spec:
+        def membership():
+            self._assert_owner()
+            from specforge_sglang_capture.capture import request_spec
+            spec = request_spec(req)
+            return req.rid, bool(spec and "protocol_version" in spec)
+
+        member = self._local_phase("prepare.input", membership)
+        self._agree("prepare.membership", member)
+        if not member[1]:
             return None
-        self._sync_transfers()
+        self._sync_transfers("prepare.transfers")
+        return self._local_phase("prepare.lease", lambda: self._prepare_local(req))
+
+    def _prepare_local(self, req):
         if self._closed or self.fatal_capture_error:
             raise CaptureContractError(self.fatal_capture_error or "HS runtime is closed")
         entry = self._claim(req)
@@ -733,133 +800,234 @@ class HSCaptureRuntime:
                 **entry.transfer_certificate}
 
     def control(self, scheduler, body):
-        self._assert_owner()
         try:
             return self._control(body)
-        except AttemptCapacityDeclined as exc:
-            return {"error": str(exc), "error_code": "capture_capacity_declined",
-                    "reservation_granted": False}
         except ValueError as exc:
             raise CaptureControlRejected(str(exc)) from None
 
-    def _sync_transfers(self, transferred=None, fatal=None):
-        if transferred is None:
-            pending = getattr(self, "_transferred_tokens", [])
-            packet = (pending, getattr(self, "fatal_capture_error", None)) if self.writer else None
-            transferred, fatal = self.broadcast(packet)
-        if fatal:
-            self.fatal_capture_error = fatal
-        if not self.writer:
-            for token in transferred:
-                entry = self.registry.tokens.get(token)
-                if entry is not None:
-                    if entry.request is not None:
-                        self.candidates.pop(entry.request.rid, None)
-                    entry.state = "PUBLISHED"
-                    self.registry.retire(entry)
+    def _sync_transfers(self, phase):
+        def packet():
+            return list(self._transferred_tokens), self.fatal_capture_error
+
+        update = self._writer_broadcast(phase + ".payload", packet)
+
+        def apply():
+            transferred, fatal = update
+            if fatal:
+                self.fatal_capture_error = fatal
+            if not self.writer:
+                for token in transferred:
+                    entry = self.registry.tokens.get(token)
+                    if entry is not None:
+                        if entry.request is not None:
+                            self.candidates.pop(entry.request.rid, None)
+                        entry.state = "PUBLISHED"
+                        self.registry.retire(entry)
+
+        # A peer retirement can fail after local bookkeeping or resource checks.
+        # Do not let its caller proceed to a later broadcast without this vote.
+        self._local_phase(phase + ".apply", apply)
         self._transferred_tokens = []
 
-    def _control(self, body):
-        self.poll()
-        self._sync_transfers()
-        if int(body.get("protocol_version", -1)) != 1:
+    def _control_input(self, body):
+        self._assert_owner()
+        if not isinstance(body, dict) or int(body.get("protocol_version", -1)) != 1:
             raise ValueError("unsupported capture protocol")
         action = body.get("action")
-        if action == "capability":
-            return self.capability()
-        if body.get("server_epoch") != self.epoch:
+        if action not in ("capability", "stats", "begin", "begin_batch", "resolve",
+                          "read_acquire", "read_release", "cleanup_acquire", "cleanup_done"):
+            raise ValueError("unknown capture control action")
+        if action != "capability" and body.get("server_epoch") != self.epoch:
             raise ValueError("capture server epoch changed")
+        # HTTP and typed IPC carry JSON. Agree the complete request, including
+        # action and fencing tokens, before choosing any nested control branch.
+        return action, json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+    def _control(self, body):
+        request = self._local_phase("control.input", lambda: self._control_input(body))
+        self._agree("control.request", request)
+        self._local_phase("control.poll", self.poll)
+        self._sync_transfers("control.transfers")
+        action = request[0]
+        if action == "capability":
+            return self._local_phase("control.capability", self.capability)
         if action == "stats":
-            return {**self.capability(), "active_attempts": len(self.registry.active),
-                    "pending_deliveries": len(self.jobs), "active_readers": sum(len(x.readers) for x in self.registry.active.values()), "plans": list(self.history),
-                    "cache": self.cache.stats() if self.cache else {},
-                    "controller": self.controller.stats() if self.controller else {}}
-        if action in ("begin", "begin_batch") and getattr(self, "fatal_capture_error", None):
-            raise ValueError(self.fatal_capture_error)
-        if action == "begin_batch":
-            bodies = body.get("tasks")
+            def stats():
+                return {**self.capability(), "active_attempts": len(self.registry.active),
+                        "pending_deliveries": len(self.jobs),
+                        "active_readers": sum(len(x.readers) for x in self.registry.active.values()),
+                        "plans": list(self.history),
+                        "cache": self.cache.stats() if self.cache else {},
+                        "controller": self.controller.stats() if self.controller else {}}
+            return self._local_phase("control.stats", stats)
+        if action in ("begin", "begin_batch"):
+            return self._begin_control(body, action)
+
+        kind, entry = self._local_phase("control.lookup", lambda: self._lookup_control(body))
+        key = self._local_phase("control.target-key", lambda: (
+            kind, entry.identity, entry.attempt_id, entry.request_digest, entry.token, entry.sequence))
+        self._agree("control.target", key)
+        if kind == "retired":
+            return self._local_phase("control.retired", lambda: self._retired_control(body, entry))
+
+        if action == "resolve":
+            def resolve():
+                if body.get("cancel"):
+                    self.invalidate(entry, "external-cancel")
+                    if entry.request is not None:
+                        from sglang.srt.managers.io_struct import AbortReq
+                        self.s.abort_request(AbortReq(rid=entry.request.rid))
+                self._mark_drained(entry)
+            self._local_phase("control.resolve.local", resolve)
+            return self._broadcast_wire("control.resolve.wire", entry)
+        if action == "read_acquire":
+            wire = self._broadcast_wire("control.read-acquire.wire", entry)
+
+            def validate_read():
+                owner = str(body.get("reader_owner") or "")
+                if not owner:
+                    raise ValueError("read owner is required")
+                existing = entry.readers.get(owner)
+                # Lost replies can recover an existing permit after revoke;
+                # they cannot create a new reader after its first release.
+                if existing is None:
+                    if any(old == owner for old, _ in entry.released_readers):
+                        raise ValueError("released read owner cannot acquire again")
+                    if len(entry.readers) + len(entry.released_readers) >= self.registry.capacity:
+                        raise ValueError("attempt read owner history capacity exhausted")
+                    if entry.revoked or wire["state"] != "PUBLISHED" or entry.cleanup_token is not None:
+                        raise ValueError("attempt is not readable")
+                    if sum(len(x.readers) for x in self.registry.active.values()) >= self.registry.capacity:
+                        raise ValueError("read permit capacity exhausted")
+                return owner, existing
+
+            owner, existing = self._local_phase("control.read-acquire.validate", validate_read)
+            self._agree("control.read-acquire.branch", (owner, existing))
+            token = existing
+            if token is None:
+                token = self._writer_broadcast("control.read-acquire.token", lambda: uuid.uuid4().hex)
+
+            def acquire_read():
+                entry.readers[owner] = token
+                return dict(self._wire(entry), reader_owner=owner, reader_token=token)
+            return self._local_phase("control.read-acquire.commit", acquire_read)
+        if action == "read_release":
+            def release_read():
+                owner, token = body.get("reader_owner"), body.get("reader_token")
+                if entry.readers.get(owner) == token and token is not None:
+                    entry.readers.pop(owner)
+                    entry.released_readers.append((owner, token))
+                elif (owner, token) not in entry.released_readers:
+                    raise ValueError("unknown read permit")
+                return dict(self._wire(entry), reader_owner=owner, reader_token=token, reader_released=True)
+            return self._local_phase("control.read-release", release_read)
+        if action == "cleanup_acquire":
+            self._local_phase("control.cleanup-acquire.drain", lambda: self._mark_drained(entry))
+            wire = self._broadcast_wire("control.cleanup-acquire.wire", entry)
+
+            def validate_cleanup():
+                owner = str(body.get("cleanup_owner") or "")
+                if not owner or not wire["writer_drained"] or entry.readers:
+                    raise ValueError("writer/readers not drained or cleanup owner absent")
+                if entry.cleanup_owner is not None and entry.cleanup_owner != owner:
+                    raise ValueError("another store owns sample cleanup")
+                return owner, entry.cleanup_token
+
+            owner, existing = self._local_phase("control.cleanup-acquire.validate", validate_cleanup)
+            self._agree("control.cleanup-acquire.branch", (owner, existing))
+            token = existing
+            if token is None:
+                token = self._writer_broadcast("control.cleanup-acquire.token", lambda: uuid.uuid4().hex)
+
+            def acquire_cleanup():
+                entry.cleanup_owner, entry.cleanup_token = owner, token
+                return self._wire(entry)
+            return self._local_phase("control.cleanup-acquire.commit", acquire_cleanup)
+        if action == "cleanup_done":
+            def validate_done():
+                if entry.cleanup_token is None or body.get("cleanup_token") != entry.cleanup_token:
+                    raise ValueError("cleanup permit mismatch")
+                self._mark_drained(entry)
+            self._local_phase("control.cleanup-done.validate", validate_done)
+            self._broadcast_wire("control.cleanup-done.wire", entry)
+
+            def retire():
+                self.registry.retire(entry)
+                return self._wire(entry)
+            return self._local_phase("control.cleanup-done.retire", retire)
+        raise AssertionError("validated control action has no implementation")
+
+    def _begin_control(self, body, action):
+        def validate():
+            if self.fatal_capture_error:
+                raise ValueError(self.fatal_capture_error)
+            bodies = body.get("tasks") if action == "begin_batch" else [body]
             if not isinstance(bodies, list) or not bodies or len(bodies) > self.registry.capacity:
                 raise ValueError("invalid begin_batch size")
-            if any(item.get("server_epoch") != self.epoch for item in bodies):
+            if any(not isinstance(item, dict) or item.get("server_epoch") != self.epoch for item in bodies):
                 raise ValueError("capture server epoch changed")
-            tokens = self.broadcast([uuid.uuid4().hex for _ in bodies] if self.writer else None)
-            return {"server_epoch": self.epoch, "attempts": [self._wire(entry) for entry in self.registry.begin_batch(bodies, tokens)]}
-        if action == "begin":
-            token = self.broadcast(uuid.uuid4().hex if self.writer else None)
-            return self._wire(self.registry.begin(body, token))
+            return bodies
+
+        bodies = self._local_phase("control.begin.validate", validate)
+        tokens = self._writer_broadcast("control.begin.tokens", lambda: [uuid.uuid4().hex for _ in bodies])
+        prepared = self._local_phase("control.begin.preflight", lambda: self._begin_trial(bodies, tokens))
+
+        def proposal():
+            if prepared is None:
+                return "capacity-declined", self.registry.capacity
+            _, entries = prepared
+            return "ready", tuple((entry.identity, entry.attempt_id, entry.request_digest,
+                                    entry.token, entry.sequence, entry.object_key_layout) for entry in entries)
+
+        decision = self._local_phase("control.begin.proposal", proposal)
+        self._agree("control.begin.decision", decision)
+        if prepared is None:
+            # Every rank declined an uncommitted trial. No actual registry has
+            # granted anything in this operation, so this is the ONLY typed
+            # capacity refusal. Divergent preflights or commit failures are
+            # generic fail-closed errors, never proof of an ungranted mutation.
+            return {"error": "attempt registry capacity exhausted",
+                    "error_code": "capture_capacity_declined", "reservation_granted": False}
+        trial, entries = prepared
+        replies = self._local_phase("control.begin.reply", lambda: [self._wire(entry) for entry in entries])
+
+        def commit():
+            self.registry.active, self.registry.tokens, self.registry.sequence = (
+                trial.active, trial.tokens, trial.sequence)
+        self._local_phase("control.begin.commit", commit)
+        return {"server_epoch": self.epoch, "attempts": replies} if action == "begin_batch" else replies[0]
+
+    def _begin_trial(self, bodies, tokens):
+        trial = AttemptRegistry(self.registry.epoch, self.registry.capacity)
+        trial.active, trial.tokens, trial.sequence = (
+            dict(self.registry.active), dict(self.registry.tokens), self.registry.sequence)
         try:
-            entry = self.registry.lookup(body)
+            entries = trial.begin_batch(bodies, tokens)
+        except AttemptCapacityDeclined:
+            return None
+        return trial, entries
+
+    def _lookup_control(self, body):
+        try:
+            return "active", self.registry.lookup(body)
         except ValueError:
-            entry = next((x for x in self.registry.retired if x.token == body.get("reservation_token")
-                          and x.identity == self.registry.identity(body) and x.attempt_id == body.get("attempt_id")), None)
-            if entry is not None and action == "read_release":
-                pair = (body.get("reader_owner"), body.get("reader_token"))
-                if pair not in entry.released_readers:
-                    raise ValueError("unknown retired read permit")
-                return dict(self._wire(entry), reader_owner=pair[0], reader_token=pair[1], reader_released=True)
-            if entry is not None and action in ("cleanup_acquire", "cleanup_done", "resolve"):
-                if action == "cleanup_done" and body.get("cleanup_token") != entry.cleanup_token:
-                    raise ValueError("cleanup permit mismatch")
-                return self._wire(entry)
-            raise
-        if action == "resolve":
-            if body.get("cancel"):
-                self.invalidate(entry, "external-cancel")
-                if entry.request is not None:
-                    from sglang.srt.managers.io_struct import AbortReq
-                    self.s.abort_request(AbortReq(rid=entry.request.rid))
-            self._mark_drained(entry)
-            wire = self.broadcast(self._wire(entry) if self.writer else None)
-            entry.state = wire["state"]
-            return wire
-        if action == "read_acquire":
-            wire = self.broadcast(self._wire(entry) if self.writer else None)
-            entry.state = wire["state"]
-            token = self.broadcast(uuid.uuid4().hex if self.writer else None)
-            owner = str(body.get("reader_owner") or "")
-            if not owner:
-                raise ValueError("read owner is required")
-            existing = entry.readers.get(owner)
-            # A lost acquire reply must be recoverable for release after revoke.
-            # This returns only an already-held token, never a new read authority.
-            if existing is None:
-                if any(previous_owner == owner for previous_owner, _ in entry.released_readers):
-                    raise ValueError("released read owner cannot acquire again")
-                if len(entry.readers) + len(entry.released_readers) >= self.registry.capacity:
-                    raise ValueError("attempt read owner history capacity exhausted")
-                if entry.revoked or wire["state"] != "PUBLISHED" or entry.cleanup_token is not None:
-                    raise ValueError("attempt is not readable")
-                if sum(len(x.readers) for x in self.registry.active.values()) >= self.registry.capacity:
-                    raise ValueError("read permit capacity exhausted")
-                entry.readers[owner] = token
-            return dict(self._wire(entry), reader_owner=owner, reader_token=entry.readers[owner])
+            identity = self.registry.identity(body)
+            entry = next((entry for entry in self.registry.retired
+                          if entry.token == body.get("reservation_token") and entry.identity == identity
+                          and entry.attempt_id == body.get("attempt_id")), None)
+            if entry is None:
+                raise
+            return "retired", entry
+
+    def _retired_control(self, body, entry):
+        action = body["action"]
         if action == "read_release":
-            owner, token = body.get("reader_owner"), body.get("reader_token")
-            if entry.readers.get(owner) == token and token is not None:
-                entry.readers.pop(owner)
-                entry.released_readers.append((owner, token))
-            elif (owner, token) not in entry.released_readers:
-                raise ValueError("unknown read permit")
-            return dict(self._wire(entry), reader_owner=owner, reader_token=token, reader_released=True)
-        if action == "cleanup_acquire":
-            self._mark_drained(entry)
-            wire = self.broadcast(self._wire(entry) if self.writer else None)
-            entry.state = wire["state"]
-            token = self.broadcast(uuid.uuid4().hex if self.writer else None)
-            owner = str(body.get("cleanup_owner") or "")
-            if not owner or not wire["writer_drained"] or entry.readers:
-                raise ValueError("writer/readers not drained or cleanup owner absent")
-            if entry.cleanup_owner is not None and entry.cleanup_owner != owner:
-                raise ValueError("another store owns sample cleanup")
-            entry.cleanup_owner = owner
-            entry.cleanup_token = entry.cleanup_token or token
-            return self._wire(entry)
-        if action == "cleanup_done":
-            if entry.cleanup_token is None or body.get("cleanup_token") != entry.cleanup_token:
+            pair = body.get("reader_owner"), body.get("reader_token")
+            if pair not in entry.released_readers:
+                raise ValueError("unknown retired read permit")
+            return dict(self._wire(entry), reader_owner=pair[0], reader_token=pair[1], reader_released=True)
+        if action in ("cleanup_acquire", "cleanup_done", "resolve"):
+            if action == "cleanup_done" and body.get("cleanup_token") != entry.cleanup_token:
                 raise ValueError("cleanup permit mismatch")
-            self._mark_drained(entry)
-            wire = self.broadcast(self._wire(entry) if self.writer else None)
-            entry.state = wire["state"]
-            self.registry.retire(entry)
             return self._wire(entry)
-        raise ValueError("unknown capture control action")
+        raise ValueError("unknown, retired or mismatched reservation token")
