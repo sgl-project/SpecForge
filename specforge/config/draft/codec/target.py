@@ -33,6 +33,7 @@ def resolve_target_logits(target: Mapping) -> TargetLogitSpec:
         "logit_scale": 1,
         "logits_scale": 1,
         "logits_scaling": 1,
+        "lm_head_multiplier": 1,  # Falcon-H1 multiplies the head output
     }
     for name, neutral in neutral_values.items():
         value = target.get(name)
@@ -41,6 +42,13 @@ def resolve_target_logits(target: Mapping) -> TargetLogitSpec:
         finite_number(f"target_config.{name}", value)
         if value != neutral:
             raise ValueError(f"unsupported target logit setting {name}={value!r}")
+    if target.get("norm_head") not in (None, False):
+        # SGLang normalizes a Bailing head's weight at load
+        raise ValueError(f"unsupported target logit setting norm_head={target['norm_head']!r}")
+    base = target.get("dim_model_base")
+    if base is not None and base != target.get("hidden_size"):
+        # MiniCPM divides hidden states by hidden_size / dim_model_base before the head
+        raise ValueError(f"unsupported target logit setting dim_model_base={base!r}")
     multiplier = target.get("logits_mup_width_multiplier")
     if multiplier is None:
         return NoLogitTransformSpec()

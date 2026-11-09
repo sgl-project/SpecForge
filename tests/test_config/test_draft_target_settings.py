@@ -177,6 +177,21 @@ class TargetSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "vocab_size"):
             decode_config(payload, target_config={**TARGET, "vocab_size": 100})
 
+    def test_known_head_changing_fields_fail_closed(self):
+        for target in (
+            {"lm_head_multiplier": 0.0390625},
+            {"norm_head": True},
+            {"dim_model_base": 256, "hidden_size": 2560},
+        ):
+            with self.assertRaisesRegex(ValueError, "unsupported target logit setting"):
+                resolve_target_logits(target)
+        for target in (
+            {"lm_head_multiplier": 1},
+            {"norm_head": False},
+            {"dim_model_base": 2560, "hidden_size": 2560},
+        ):
+            self.assertEqual(resolve_target_logits(target), NoLogitTransformSpec())
+
 
 if __name__ == "__main__":
     unittest.main()
