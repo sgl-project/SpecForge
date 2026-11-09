@@ -24,7 +24,32 @@ class CustomRoPESpec(DefaultRoPESpec):
     bands: tuple[float, ...]
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CustomLogitSpec(MuPLogitTransformSpec):
+    type: ClassVar[str] = "test_custom_logits"
+
+
 class ModelSettingsTest(unittest.TestCase):
+    def test_registered_logit_settings_round_trip(self):
+        register_component_schema("logits", CustomLogitSpec)
+        payload = {"type": "test_custom_logits", "multiplier": 3.0}
+        node = decode_target_logits(payload)
+        self.assertIs(type(node), CustomLogitSpec)
+        self.assertEqual(encode_target_logits(node), payload)
+        with self.assertRaisesRegex(ValueError, "multiplier"):
+            decode_target_logits({**payload, "multiplier": True})
+        with self.assertRaisesRegex(ValueError, "unknown fields"):
+            decode_target_logits({**payload, "typo": 1})
+
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class Replacement(CustomLogitSpec):
+            pass
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            register_component_schema("logits", Replacement)
+        with self.assertRaisesRegex(ValueError, "registered configuration node"):
+            encode_target_logits(Replacement(multiplier=3.0))
+
     def test_registered_rope_round_trip_and_validation(self):
         register_component_schema("rope", CustomRoPESpec)
         register_component_schema("rope", CustomRoPESpec)
