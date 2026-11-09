@@ -1,13 +1,13 @@
 """Strict conversion of typed, nested configuration nodes to JSON values."""
 
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import is_dataclass
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
 from .._validation import finite_number
 from ..registry import component_kind
-from ._schema import _construct
+from ._schema import _construct, serialized_fields
 
 
 def _decode_value(annotation, value, path):
@@ -51,7 +51,7 @@ def decode_node(schema: type, payload: Mapping, path: str):
     if not isinstance(payload, Mapping):
         raise ValueError(f"{path}: expected a configuration object")
     annotations = get_type_hints(schema)
-    names = {field.name for field in fields(schema) if field.init}
+    names = {field.name for field in serialized_fields(schema)}
     values = {
         name: (
             _decode_value(annotations[name], value, f"{path}.{name}")
@@ -72,7 +72,7 @@ def encode_node(value):
             return encode_component(kind, value)
         return {
             field.name: encode_node(getattr(value, field.name))
-            for field in fields(value)
+            for field in serialized_fields(value)
         }
     if isinstance(value, tuple):
         return [encode_node(item) for item in value]

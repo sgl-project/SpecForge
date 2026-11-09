@@ -1,6 +1,7 @@
 """Type dispatch stays in configuration; layers only hold name references."""
 
 import copy
+import dataclasses
 import json
 import subprocess
 import sys
@@ -221,6 +222,34 @@ class ComponentCodecTest(unittest.TestCase):
             register_component_schema("mlp", MutableValue)
             with self.assertRaisesRegex(ValueError, "widths"):
                 decode_component("mlp", {"type": "test_mutable_value", "widths": [32]})
+
+    def test_derived_fields_are_not_serialized(self):
+        @dataclass(frozen=True, kw_only=True)
+        class Window:
+            size: int
+            half: int = dataclasses.field(init=False)
+
+            def __post_init__(self):
+                object.__setattr__(self, "half", self.size // 2)
+
+        @dataclass(frozen=True, kw_only=True)
+        class DerivedFFN(FFNSpec):
+            type: ClassVar[str] = "test_derived_ffn"
+            window: Window
+            width: int
+            doubled: int = dataclasses.field(init=False)
+
+            def __post_init__(self):
+                object.__setattr__(self, "doubled", 2 * self.width)
+
+        payload = {"type": "test_derived_ffn", "window": {"size": 4}, "width": 3}
+        with patch.dict(registry._SCHEMAS):
+            register_component_schema("mlp", DerivedFFN)
+            node = decode_component("mlp", payload)
+            self.assertEqual((node.doubled, node.window.half), (6, 2))
+            saved = json.loads(json.dumps(encode_component("mlp", node)))
+            self.assertEqual(saved, payload)
+            self.assertEqual(decode_component("mlp", saved), node)
 
     def test_registry_and_codec_import_without_model_dependencies(self):
         result = subprocess.run(

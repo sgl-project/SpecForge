@@ -4,7 +4,7 @@ Legacy aliases and defaults belong in the legacy codec, not in these readers.
 """
 
 from collections.abc import Mapping
-from dataclasses import asdict, fields
+from dataclasses import asdict
 
 from ..layer import LayerSpec
 from ..registry import (
@@ -13,7 +13,7 @@ from ..registry import (
     component_type,
     component_type_field,
 )
-from ._schema import _construct
+from ._schema import _construct, serialized_fields
 from .nodes import decode_node, encode_node
 
 
@@ -47,7 +47,8 @@ def encode_component(kind: str, node) -> dict:
     return {
         tag: name,
         **{
-            field.name: encode_node(getattr(node, field.name)) for field in fields(node)
+            field.name: encode_node(getattr(node, field.name))
+            for field in serialized_fields(node)
         },
     }
 
