@@ -46,7 +46,9 @@ class ContractsTest(unittest.TestCase):
             with self.subTest(architecture=name):
                 with self.assertRaisesRegex(ValueError, "mask_token_id"):
                     with_features(config, mask_token_id=config.vocab_size)
-                with self.assertRaisesRegex(ValueError, "draft_vocab_size == vocab_size"):
+                with self.assertRaisesRegex(
+                    ValueError, "draft_vocab_size == vocab_size"
+                ):
                     dataclasses.replace(
                         config,
                         draft_vocab_size=config.vocab_size - 1,
@@ -62,13 +64,18 @@ class ContractsTest(unittest.TestCase):
     def test_unknown_binding_names_are_rejected_on_their_own(self):
         with self.assertRaisesRegex(ValueError, "only embed_tokens and lm_head"):
             draft_config(
-                target_bindings=("embed_tokens", "lm_heads"), target_logit_transform=None
+                target_bindings=("embed_tokens", "lm_heads"),
+                target_logit_transform=None,
             )
 
     def test_an_embedding_binding_alone_checks_target_dimensions(self):
-        node = draft_config(target_bindings=("embed_tokens",), target_logit_transform=None)
+        node = draft_config(
+            target_bindings=("embed_tokens",), target_logit_transform=None
+        )
         with self.assertRaisesRegex(ValueError, "hidden_size"):
-            decode_config(encode_config(node), target_config={**TARGET, "hidden_size": 64})
+            decode_config(
+                encode_config(node), target_config={**TARGET, "hidden_size": 64}
+            )
 
     def test_components_declare_no_capability_by_default(self):
         @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -121,8 +128,12 @@ class ContractsTest(unittest.TestCase):
     def test_conv_kernel_is_bounded_by_the_protocol_slots(self):
         with_conv(dflash2_config(), GroupedCausalConvSpec(kernel_size=8, group_size=8))
         with self.assertRaisesRegex(ValueError, "kernel_size exceeds"):
-            with_conv(dflash2_config(), GroupedCausalConvSpec(kernel_size=9, group_size=8))
-        dspark = draft_config(architecture="DSparkDraftModel", spec_config=dspark_spec())
+            with_conv(
+                dflash2_config(), GroupedCausalConvSpec(kernel_size=9, group_size=8)
+            )
+        dspark = draft_config(
+            architecture="DSparkDraftModel", spec_config=dspark_spec()
+        )
         with_conv(dspark, GroupedCausalConvSpec(kernel_size=7, group_size=8))
         with self.assertRaisesRegex(ValueError, "kernel_size exceeds"):
             with_conv(dspark, GroupedCausalConvSpec(kernel_size=8, group_size=8))

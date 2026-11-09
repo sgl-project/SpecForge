@@ -19,7 +19,9 @@ class VocabularyRulesTest(unittest.TestCase):
         return draft_config(architecture="UnconstrainedDraftModel", **overrides)
 
     def test_a_bound_lm_head_needs_the_full_vocabulary(self):
-        with self.assertRaisesRegex(ValueError, "bound lm_head requires draft_vocab_size"):
+        with self.assertRaisesRegex(
+            ValueError, "bound lm_head requires draft_vocab_size"
+        ):
             self.config(draft_vocab_size=32)
 
     def test_draft_vocabulary_never_exceeds_the_vocabulary(self):

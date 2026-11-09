@@ -276,9 +276,7 @@ class ComponentCodecTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, r"norm/rms\.eps: expected a number, got str '1e-6'"
         ):
-            decode_component(
-                "norm", {"type": "rms", "eps": "1e-6", "weight_offset": 0}
-            )
+            decode_component("norm", {"type": "rms", "eps": "1e-6", "weight_offset": 0})
         with self.assertRaisesRegex(
             ValueError, r"attention/gqa\.head_dim: expected int, got str '128'"
         ):

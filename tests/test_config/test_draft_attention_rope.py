@@ -151,7 +151,9 @@ class AttentionRoPETest(unittest.TestCase):
         attention = dataclasses.replace(
             base.attention_configs["full"], rope_parameters=rope
         )
-        with self.assertRaisesRegex(ValueError, "full.rope_parameters: unknown rope type"):
+        with self.assertRaisesRegex(
+            ValueError, "full.rope_parameters: unknown rope type"
+        ):
             dataclasses.replace(base, attention_configs={"full": attention})
 
     def test_rope_override_on_a_non_rotary_kind_is_refused(self):
@@ -190,7 +192,9 @@ class AttentionRoPETest(unittest.TestCase):
         for name in ("conv_configs", "layer_configs", "layer_types"):
             payload.pop(name)
         node = parse_draft(payload, target_config=None)
-        self.assertEqual(node.attention_configs["default"].rope_parameters, NoRoPESpec())
+        self.assertEqual(
+            node.attention_configs["default"].rope_parameters, NoRoPESpec()
+        )
 
 
 if __name__ == "__main__":

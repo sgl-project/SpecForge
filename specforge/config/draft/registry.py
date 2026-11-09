@@ -13,10 +13,7 @@ from .architecture import (
     DSparkSpec,
     DSpineSpec,
 )
-from .architecture.constraints import (
-    validate_dflash2,
-    validate_target_context,
-)
+from .architecture.constraints import validate_dflash2, validate_target_context
 from .architecture.dspine import validate_dspine
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec

@@ -237,7 +237,9 @@ assert not any(x in sys.modules for x in ('torch', 'transformers', 'pydantic', '
 
         with patch.dict(registry._SPECS):
             with self.assertRaisesRegex(TypeError, "head.rank: structural fields"):
-                register_spec("DefaultedHeadDraftModel", WithDefaultedHead, lambda _: None)
+                register_spec(
+                    "DefaultedHeadDraftModel", WithDefaultedHead, lambda _: None
+                )
 
 
 if __name__ == "__main__":

@@ -44,7 +44,9 @@ def resolve_target_logits(target: Mapping) -> TargetLogitSpec:
             raise ValueError(f"unsupported target logit setting {name}={value!r}")
     if target.get("norm_head") not in (None, False):
         # SGLang normalizes a Bailing head's weight at load
-        raise ValueError(f"unsupported target logit setting norm_head={target['norm_head']!r}")
+        raise ValueError(
+            f"unsupported target logit setting norm_head={target['norm_head']!r}"
+        )
     base = target.get("dim_model_base")
     if base is not None and base != target.get("hidden_size"):
         # MiniCPM divides hidden states by hidden_size / dim_model_base before the head

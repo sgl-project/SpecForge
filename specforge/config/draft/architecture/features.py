@@ -21,8 +21,12 @@ class TargetFeatureSpec:
             raise ValueError("target_layer_ids must be a nonempty tuple")
         if any(type(layer) is not int or layer < 0 for layer in self.target_layer_ids):
             raise ValueError("target_layer_ids must contain nonnegative integers")
-        if any(a >= b for a, b in zip(self.target_layer_ids, self.target_layer_ids[1:])):
-            raise ValueError("target_layer_ids must be strictly increasing, the capture order")
+        if any(
+            a >= b for a, b in zip(self.target_layer_ids, self.target_layer_ids[1:])
+        ):
+            raise ValueError(
+                "target_layer_ids must be strictly increasing, the capture order"
+            )
 
     def validate_target(self, target: Mapping) -> None:
         count = target.get("num_hidden_layers")

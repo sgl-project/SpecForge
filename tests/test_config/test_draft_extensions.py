@@ -38,7 +38,9 @@ class ExtensionsTest(unittest.TestCase):
             for declared in ([], ["other"], ["other", "tests"]):
                 with self.assertRaisesRegex(ValueError, "extensions: declared"):
                     decode_config({**payload, "extensions": declared})
-        with self.assertRaisesRegex(ValueError, re.escape(f"requires extensions ['{package}']")):
+        with self.assertRaisesRegex(
+            ValueError, re.escape(f"requires extensions ['{package}']")
+        ):
             decode_config(payload)
 
     def test_declarations_are_a_sorted_list_of_names(self):
