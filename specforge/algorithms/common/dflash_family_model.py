@@ -17,7 +17,9 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
     create_dflash_sdpa_mask,
 )
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.draft.layers.attention.backends.flex_attention_backend import (
+    flex_attention_backend,
+)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -573,6 +575,7 @@ class OnlineDFlashModel(nn.Module):
             "is_causal": getattr(
                 getattr(self.draft_model, "config", None), "is_causal", None
             ),
+            "context_window": getattr(self.draft_model, "context_window", None),
         }
         if (
             self.attention_backend == "flex_attention"
@@ -603,7 +606,10 @@ class OnlineDFlashModel(nn.Module):
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        return_pre_norm_hidden: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Anchors, keep mask and draft hidden; plus the pre-norm readout when asked."""
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -647,13 +653,20 @@ class OnlineDFlashModel(nn.Module):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
+        if return_pre_norm_hidden:
+            draft_kwargs["return_pre_norm_hidden"] = True
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
             noise_embedding=noise_embedding,
             target_hidden=hidden_states,
             attention_mask=dflash_attn_mask,
+            # MoE layers count only the kept blocks' tokens for their balancing.
+            moe_token_mask=block_keep_mask.repeat_interleave(self.block_size, dim=1),
             **draft_kwargs,
         )
+        if return_pre_norm_hidden:
+            output_hidden, pre_norm_hidden = output_hidden
+            return anchor_positions, block_keep_mask, output_hidden, pre_norm_hidden
         return anchor_positions, block_keep_mask, output_hidden
 
     @staticmethod
@@ -2002,6 +2015,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         eval_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
         block_index: Optional[torch.Tensor] = None,
+        confidence_hidden: Optional[torch.Tensor] = None,
         *,
         total_blocks: int = 0,
     ) -> Tuple[torch.Tensor, ...]:
@@ -2036,9 +2050,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
+        # Passed only when present, so drafts without the parameter keep working.
+        confidence_kwargs = (
+            {}
+            if confidence_hidden is None
+            else {"pre_norm_hidden_states": confidence_hidden}
+        )
         confidence_pred = self.draft_model.predict_confidence(
             hidden,
             prev_token_ids=prev_token_ids,
+            **confidence_kwargs,
         )
         if confidence_pred is not None and self.dspark_confidence_head_alpha > 0:
             if accept_probability is None:
@@ -2108,6 +2129,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_last_hidden_states: Optional[torch.Tensor],
         anchor_positions: torch.Tensor,
         collect_detailed_metrics: bool,
+        pre_norm_hidden: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, object]]:
         """Token-pooled DSpark objective under the configured chunk/checkpoint policy."""
 
@@ -2118,6 +2140,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
             block_size,
             -1,
         )
+        confidence_hidden = None
+        if pre_norm_hidden is not None:
+            confidence_hidden = pre_norm_hidden.reshape(
+                batch_size, num_blocks, block_size, -1
+            )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
         need_target = self.dspark_l1_loss_alpha > 0 or (
@@ -2148,6 +2175,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 if collect_detailed_metrics
                 else None
             ),
+            confidence_hidden,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
             checkpoint=self.objective_checkpointing,
@@ -2249,12 +2277,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
+        # DeepSeek-V4.1's DSpark scores confidence on the readout before the final norm.
+        wants_pre_norm = (
+            getattr(self.draft_model, "confidence_head_input", None) == "pre_norm"
+        )
+        blocks = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
             max_valid_anchors=max_valid_anchors,
+            **({"return_pre_norm_hidden": True} if wants_pre_norm else {}),
         )
+        anchor_positions, block_keep_mask, output_hidden = blocks[:3]
+        pre_norm_hidden = blocks[3] if wants_pre_norm else None
 
         (
             target_ids,
@@ -2273,6 +2308,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss, metrics = self._compute_dspark_loss(
             output_hidden=output_hidden,
+            pre_norm_hidden=pre_norm_hidden,
             target_ids=target_ids,
             eval_mask=eval_mask,
             prev_token_ids=prev_token_ids,

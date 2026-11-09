@@ -1,12 +1,5 @@
-# adapt from https://github.com/feifeibear/long-context-attention/tree/main/yunchang
-from .ring_flash_attn import (
-    ring_flash_attn_func,
-    ring_flash_attn_kvpacked_func,
-    ring_flash_attn_qkvpacked_func,
-)
+"""Deprecated: moved to :mod:`specforge.modeling.draft.layers.ring`."""
 
-__all__ = [
-    "ring_flash_attn_func",
-    "ring_flash_attn_kvpacked_func",
-    "ring_flash_attn_qkvpacked_func",
-]
+from specforge._moved_module import alias_moved_module
+
+alias_moved_module(__name__, "specforge.modeling.draft.layers.ring")

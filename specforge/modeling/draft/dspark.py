@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .dflash import DFlashDraftModel, resolve_dflash_attention_mode
@@ -25,12 +26,17 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 class AcceptRatePredictor(nn.Module):
     """Predict target/draft distribution acceptance probability per draft step."""
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, bias: bool = True):
         super().__init__()
-        self.proj = nn.Linear(int(input_dim), 1)
+        self.proj = nn.Linear(int(input_dim), 1, bias=bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.proj(features).squeeze(-1)
+        # fp32 like DeepSeek's projection: the features may be an unnormalized readout.
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            bias = None if self.proj.bias is None else self.proj.bias.float()
+            return F.linear(features.float(), self.proj.weight.float(), bias).squeeze(
+                -1
+            )
 
 
 class VanillaMarkovHead(nn.Module):
@@ -350,13 +356,26 @@ class DSparkDraftModel(DFlashDraftModel):
             raise ValueError(
                 "confidence_head_with_markov=True requires markov_rank > 0"
             )
+        # DeepSeek-V4.1 scores confidence on the readout before the final norm.
+        self.confidence_head_input = str(
+            dflash_config.get("confidence_head_input", "post_norm")
+        )
+        if self.confidence_head_input not in ("post_norm", "pre_norm"):
+            raise ValueError(
+                "confidence_head_input must be 'post_norm' or 'pre_norm', got "
+                f"{self.confidence_head_input!r}"
+            )
 
         self.confidence_head = None
         if self.enable_confidence_head:
             input_dim = config.hidden_size
             if self.confidence_head_with_markov:
                 input_dim += self.markov_head.markov_rank
-            self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+            # DeepSeek-V4.1's confidence projection has no bias.
+            self.confidence_head = AcceptRatePredictor(
+                input_dim=input_dim,
+                bias=bool(dflash_config.get("confidence_head_bias", True)),
+            )
 
     def apply_logits_head(
         self,
@@ -382,9 +401,16 @@ class DSparkDraftModel(DFlashDraftModel):
         hidden_states: torch.Tensor,
         *,
         prev_token_ids: Optional[torch.Tensor] = None,
+        pre_norm_hidden_states: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self.confidence_head is None:
             return None
+        if self.confidence_head_input == "pre_norm":
+            if pre_norm_hidden_states is None:
+                raise ValueError(
+                    "confidence_head_input='pre_norm' needs pre_norm_hidden_states"
+                )
+            hidden_states = pre_norm_hidden_states
         if self.confidence_head_with_markov:
             assert self.markov_head is not None
             if prev_token_ids is None:
