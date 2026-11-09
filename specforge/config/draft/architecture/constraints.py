@@ -25,12 +25,8 @@ def validate_target_context(config: DraftConfig) -> None:
             )
 
 
-def validate_dflash(config: DraftConfig) -> None:
-    validate_target_context(config)
-
-
 def validate_dflash2(config: DraftConfig) -> None:
-    validate_dflash(config)
+    validate_target_context(config)
     if config.spec_config.selector_top_k > config.draft_vocab_size:
         raise ValueError("spec_config.selector_top_k must not exceed draft_vocab_size")
     for name, layer in config.layer_configs.items():

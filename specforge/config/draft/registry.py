@@ -14,7 +14,6 @@ from .architecture import (
     DSpineSpec,
 )
 from .architecture.constraints import (
-    validate_dflash,
     validate_dflash2,
     validate_target_context,
 )
@@ -230,7 +229,7 @@ register_component_schema(
     "conv", GroupedCausalConvSpec, validate=validate_grouped_causal
 )
 
-register_spec("DFlashDraftModel", DFlashSpec, validate_dflash)
+register_spec("DFlashDraftModel", DFlashSpec, validate_target_context)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
 register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
 register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
