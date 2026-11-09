@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import unittest
+from typing import ClassVar
 
 from specforge.config.draft.codec.settings import (
     decode_rope,
@@ -13,10 +14,44 @@ from specforge.config.draft.codec.settings import (
     encode_target_logits,
 )
 from specforge.config.draft.logits import MuPLogitTransformSpec
+from specforge.config.draft.registry import component_schema, register_component_schema
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class CustomRoPESpec(DefaultRoPESpec):
+    rope_type: ClassVar[str] = "test_custom_rope"
+    bands: tuple[float, ...]
+
+
 class ModelSettingsTest(unittest.TestCase):
+    def test_registered_rope_round_trip_and_validation(self):
+        register_component_schema("rope", CustomRoPESpec)
+        register_component_schema("rope", CustomRoPESpec)
+        payload = {
+            "rope_type": "test_custom_rope",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 1.0,
+            "bands": [1.0, 2.0],
+        }
+        node = decode_rope(payload)
+        self.assertIs(type(node), component_schema("rope", payload["rope_type"]))
+        self.assertEqual(node.bands, (1.0, 2.0))
+        self.assertEqual(encode_rope(node), payload)
+        with self.assertRaisesRegex(ValueError, "bands"):
+            decode_rope({**payload, "bands": [True]})
+        with self.assertRaisesRegex(ValueError, "unknown fields"):
+            decode_rope({**payload, "typo": 1})
+
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class Replacement(CustomRoPESpec):
+            pass
+
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            register_component_schema("rope", Replacement)
+        with self.assertRaisesRegex(ValueError, "registered configuration node"):
+            encode_rope(Replacement(**dataclasses.asdict(node)))
+
     def test_rope_and_logit_settings_round_trip(self):
         cases = (
             (decode_rope, encode_rope, {"rope_type": "none"}),

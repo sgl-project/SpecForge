@@ -24,6 +24,7 @@ from .conv import ConvSpec, GroupedCausalConvSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
+from .rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
 
 if TYPE_CHECKING:
     from .model import DraftConfig
@@ -34,6 +35,7 @@ _BASES = {
     "conv": ConvSpec,
     "norm": NormSpec,
     "residual": ResidualSpec,
+    "rope": RopeSpec,
 }
 _SCHEMAS: dict[tuple[str, str], type] = {}
 
@@ -46,7 +48,7 @@ def _validate_schema(schema: type, label: str) -> None:
     ):
         raise TypeError(f"{label} schema must be a concrete frozen dataclass")
     for field in fields(schema):
-        if field.name == "type":
+        if field.name in ("type", "rope_type"):
             raise TypeError(
                 "component type must be a ClassVar, not a configuration field"
             )
@@ -63,6 +65,11 @@ def _validate_schema(schema: type, label: str) -> None:
             raise TypeError(f"{label} capabilities must be a frozenset of names")
 
 
+def component_type(kind: str, node):
+    """Read the discriminator, preserving RoPE's serialized rope_type name."""
+    return getattr(node, "rope_type" if kind == "rope" else "type", None)
+
+
 def register_component_schema(kind: str, schema: type) -> None:
     """Register a frozen node under its kind and class-level type name.
 
@@ -74,7 +81,7 @@ def register_component_schema(kind: str, schema: type) -> None:
     if not isinstance(schema, type) or not issubclass(schema, _BASES[kind]):
         raise TypeError(f"{kind} schema must inherit {_BASES[kind].__name__}")
     _validate_schema(schema, kind)
-    name = getattr(schema, "type", None)
+    name = component_type(kind, schema)
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{kind} schema must declare a nonempty type name")
     key = (kind, name)
@@ -137,6 +144,9 @@ for _kind, _schema in (
     ("conv", GroupedCausalConvSpec),
     ("norm", RMSNormSpec),
     ("residual", StandardResidualSpec),
+    ("rope", DefaultRoPESpec),
+    ("rope", LinearRoPESpec),
+    ("rope", NoRoPESpec),
 ):
     register_component_schema(_kind, _schema)
 
