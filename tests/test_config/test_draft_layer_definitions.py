@@ -150,6 +150,20 @@ class LayerDefinitionsTest(unittest.TestCase):
         ):
             validate_layers(**config)
 
+    def test_an_unused_layer_is_reported_before_the_components_it_strands(self):
+        config = definitions()
+        attention = config["attention_configs"]
+        attention["orphan_attention"] = attention["full"]
+        config["layer_configs"]["orphan"] = LayerSpec(
+            attention="orphan_attention", mlp="dense"
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^layer_configs: unused definitions \['orphan'\]; "
+            r"attention_configs: unused definitions \['orphan_attention'\]$",
+        ):
+            validate_layers(**config)
+
 
 if __name__ == "__main__":
     unittest.main()

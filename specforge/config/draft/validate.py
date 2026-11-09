@@ -92,11 +92,12 @@ def validate_layers(
         raise ValueError(
             "layer_types must be a nonempty tuple of layer definition names"
         )
+    # layers first: an unused layer explains the components only it references
     tables = {
+        "layer": layer_configs,
         "attention": attention_configs,
         "mlp": mlp_configs,
         "conv": conv_configs,
-        "layer": layer_configs,
     }
     for kind, table in tables.items():
         if not isinstance(table, Mapping):
@@ -138,7 +139,10 @@ def validate_layers(
             except ValueError as exc:
                 raise ValueError(f"{path}.{field}: {exc}") from exc
 
-    for kind, table in tables.items():
-        unused = table.keys() - used[kind]
-        if unused:
-            raise ValueError(f"{kind}_configs: unused definitions {sorted(unused)}")
+    unused = [
+        f"{kind}_configs: unused definitions {sorted(table.keys() - used[kind])}"
+        for kind, table in tables.items()
+        if table.keys() - used[kind]
+    ]
+    if unused:
+        raise ValueError("; ".join(unused))
