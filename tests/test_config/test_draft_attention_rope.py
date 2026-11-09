@@ -4,7 +4,11 @@ import copy
 import dataclasses
 import json
 import unittest
+from typing import ClassVar
+from unittest.mock import patch
 
+from specforge.config.draft import registry
+from specforge.config.draft.attention import AttentionSpec
 from specforge.config.draft.codec import decode_config, encode_config, parse_draft
 from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.layer import LayerSpec
@@ -134,6 +138,47 @@ class AttentionRoPETest(unittest.TestCase):
             dataclasses.replace(attention, rope_parameters={"rope_type": "none"})
         with self.assertRaisesRegex(ValueError, "rope_parameters"):
             attention.effective_rope(None)
+
+    def test_unregistered_rope_nodes_are_rejected(self):
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class UnregisteredRoPE(DefaultRoPESpec):
+            rope_type = "test_unregistered"
+
+        base = draft_config()
+        rope = UnregisteredRoPE(rope_theta=10000, partial_rotary_factor=1.0)
+        with self.assertRaisesRegex(ValueError, "^rope_parameters: unknown rope type"):
+            dataclasses.replace(base, rope_parameters=rope)
+        attention = dataclasses.replace(
+            base.attention_configs["full"], rope_parameters=rope
+        )
+        with self.assertRaisesRegex(ValueError, "full.rope_parameters: unknown rope type"):
+            dataclasses.replace(base, attention_configs={"full": attention})
+
+    def test_rope_override_on_a_non_rotary_kind_is_refused(self):
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class NonRotaryAttention(AttentionSpec):
+            type: ClassVar[str] = "test_non_rotary_attention"
+            capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
+            num_heads: int
+
+            @property
+            def rotary_input_dim(self):
+                return None
+
+        with patch.dict(registry._SCHEMAS):
+            registry.register_component_schema("attention", NonRotaryAttention)
+            rope = LinearRoPESpec(rope_theta=1e4, partial_rotary_factor=1.0, factor=2.0)
+            draft_config(
+                attention_configs={
+                    "full": NonRotaryAttention(rope_parameters=None, num_heads=4)
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "no effect"):
+                draft_config(
+                    attention_configs={
+                        "full": NonRotaryAttention(rope_parameters=rope, num_heads=4)
+                    }
+                )
 
 
 if __name__ == "__main__":

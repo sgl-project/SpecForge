@@ -11,7 +11,12 @@ from .conv import ConvSpec
 from .layer import KIND_BY_REFERENCE_FIELD, LayerSpec
 from .logits import TargetLogitSpec
 from .mlp import FFNSpec
-from .registry import architecture_spec, component_schema, validate_component
+from .registry import (
+    architecture_spec,
+    component_schema,
+    component_type,
+    validate_component,
+)
 
 if TYPE_CHECKING:
     from .model import DraftConfig
@@ -40,8 +45,28 @@ def validate(config: DraftConfig) -> None:
     ):
         if type(node) is not component_schema(kind, getattr(node, "type", None)):
             raise ValueError(f"{kind}_config must use its registered schema")
+    for path, node in (
+        ("rope_parameters", config.rope_parameters),
+        *(
+            (f"attention_configs.{name}.rope_parameters", attention.rope_parameters)
+            for name, attention in config.attention_configs.items()
+            if attention.rope_parameters is not None
+        ),
+    ):
+        try:
+            schema = component_schema("rope", component_type("rope", node))
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+        if type(node) is not schema:
+            raise ValueError(f"{path} must use its registered schema")
     for name, attention in config.attention_configs.items():
-        if attention.rotary_input_dim is not None:
+        if attention.rotary_input_dim is None:
+            if attention.rope_parameters is not None:
+                raise ValueError(
+                    f"attention_configs.{name}: rope_parameters has no effect on "
+                    "an attention kind without a rotary subspace"
+                )
+        else:
             try:
                 attention.effective_rope(config.rope_parameters).rotary_dim(
                     attention.rotary_input_dim
