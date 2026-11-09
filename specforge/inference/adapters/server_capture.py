@@ -532,14 +532,20 @@ class SGLangServerCaptureAdapter:
         requests = []
         for item in prepared:
             item["begin_control_url"] = self._capture_protocol.url
+        retryable_payloads = {
+            id(payload) for item in prepared if item.get("registration_refused")
+            for payload in item["payloads"]
+        }
         for task, payload in zip(tasks, payloads):
             names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
             # Freeze the begin identity before crossing HTTP. Even a lost reply
             # must not let a late cleanup retarget a peer's replacement writer.
-            if "attempt_id" in payload and not all(item.get("registration_refused") for item in prepared):
+            if "attempt_id" in payload and id(payload) not in retryable_payloads:
                 raise RuntimeError("prepared capture registration cannot be replayed")
             payload.update(attempt_id=payload.get("attempt_id", uuid.uuid4().hex),
                            server_epoch=capability["server_epoch"], replace=False)
+            from specforge.inference.capture_protocol import request_digest
+            payload["request_digest"] = request_digest(task.payload["input_ids"], payload)
             requests.append((payload, task.payload["input_ids"], payload["attempt_id"], names))
         from specforge.inference.capture_protocol import CaptureCapacityDeclined
         try:
@@ -555,6 +561,26 @@ class SGLangServerCaptureAdapter:
             payload.update({name: fence[name] for name in ("protocol_version", "attempt_id", "reservation_token")})
             if fence.get("object_key_layout") == "attempt-v1":
                 payload["object_key_layout"] = "attempt-v1"
+
+    @staticmethod
+    def _verify_hs_feature_metadata(result, payload, capability):
+        """Check the complete negotiated schema, including passthrough dtype."""
+        schema = {item["name"]: item for item in capability["schema"]}
+        n = result.get("N")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise RuntimeError("negotiated capture returned invalid token count")
+        expected = {
+            name: ((1, n, int(schema[artifact]["width"])), schema[artifact]["dtype"])
+            for artifact, name in payload["features"].items()
+        }
+        expected.update({item["name"]: (tuple(item["shape"]), item["dtype"])
+                         for item in payload.get("passthrough", ())})
+        actual = result.get("features", {})
+        if set(actual) != set(expected):
+            raise RuntimeError("negotiated capture feature names mismatch")
+        for name, (shape, dtype) in expected.items():
+            if tuple(actual[name].get("shape", ())) != shape or actual[name].get("dtype") != dtype:
+                raise RuntimeError("negotiated capture feature shape/dtype mismatch: " + name)
 
     def unreturned_prepared(self, prepared, refs):
         """Retain only per-task failures for exact-attempt retirement."""
@@ -681,6 +707,10 @@ class SGLangServerCaptureAdapter:
                         if name == 'server_epoch':
                             self._capture_protocol.invalidate_epoch(result.get(name))
                         raise RuntimeError("negotiated capture response identity mismatch: " + name)
+                if self.hs_capture:
+                    if result.get("request_digest") != payload.get("request_digest"):
+                        raise RuntimeError("negotiated capture response request digest mismatch")
+                    self._verify_hs_feature_metadata(result, payload, capability)
                 if capability.get('published_ownership') == 'attempt-v1':
                     if result.get('publication_ownership') != 'attempt-v1' or result.get('state') != 'PUBLISHED' or not result.get('writer_drained'):
                         raise RuntimeError('capture response omitted drained ownership transfer')
@@ -691,7 +721,7 @@ class SGLangServerCaptureAdapter:
                         raise RuntimeError('capture response immutable keys mismatch')
                 if self.hs_capture:
                     N, L = len(task.payload["input_ids"]), result.get("L")
-                    if not isinstance(L, int) or not 0 <= L < N or result.get("N") != N or result.get("span") != [L, N]:
+                    if isinstance(L, bool) or not isinstance(L, int) or not 0 <= L < N or result.get("N") != N or result.get("span") != [L, N]:
                         raise RuntimeError("negotiated capture returned invalid absolute span")
             ref = self._ref_from_result(task, result, capture)
             if capability is not None and ref.estimated_bytes > self._output_bytes([task], capability):

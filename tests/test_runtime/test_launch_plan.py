@@ -7,6 +7,7 @@ import functools
 import json
 import os
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -2633,7 +2634,10 @@ class LaunchPlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)
             python = root / "capture-python"
-            python.symlink_to(sys.executable)
+            # A relocatable interpreter wrapper may resolve its prefix from
+            # argv[0]. Forward to its real entry point instead of moving it.
+            python.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+            python.chmod(0o755)
             packages = root / "packages"
             for name in (
                 "mooncake/store",

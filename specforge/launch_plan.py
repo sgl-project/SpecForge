@@ -772,7 +772,7 @@ def _managed_local_services(
         argv.extend(cfg.model.sglang_extra_args)
         argv.extend(server.extra_args)
         gpu_put = server.gpu_put if server.gpu_put is not None else default_gpu_put
-        hs_env = {}
+        hs_env = {"SPECFORGE_HS_CAPTURE": "0", "SPECFORGE_HS_CACHE": "0"}
         if deployment.hs_capture:
             if gpu_put:
                 raise ValueError("HS capture supports host publication only; disable gpu_put")

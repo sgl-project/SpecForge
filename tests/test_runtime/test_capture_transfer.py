@@ -14,6 +14,8 @@ class TransferServer(ProtocolServer):
     def __init__(self, backend):
         super().__init__(backend)
         self.capability.update(begin_batch=True, published_ownership='attempt-v1')
+        for feature in self.capability['schema']:
+            feature['dtype'] = 'bfloat16'
         self.calls = []
 
     def __call__(self, url, json_body, timeout):

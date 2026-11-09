@@ -38,7 +38,54 @@ class NativeHSConfiguration(unittest.TestCase):
             self.assertFalse(backend._d)
 
 
+    def test_negotiated_metadata_cannot_change_digest_dtype_or_feature_names(self):
+        for mutation in ("digest", "dtype", "extra"):
+            backend = _FakeMooncakeStore()
+            store = MooncakeFeatureStore(store=backend, store_id="run0")
+            server = TransferServer(backend)
+            def post(url, json_body, timeout):
+                rows = server(url, json_body, timeout)
+                if url.endswith("/generate"):
+                    result = rows[0]["meta_info"]["spec_capture"]
+                    if mutation == "digest":
+                        result["request_digest"] = "changed"
+                    elif mutation == "dtype":
+                        result["features"]["loss_mask"]["dtype"] = "float16"
+                    else:
+                        result["features"]["unexpected"] = dict(shape=[1, 1], dtype="int8")
+                return rows
+            adapter = SGLangServerCaptureAdapter("http://server", store, run_id="run0", algorithm="eagle3", schema=_capture_schema("eagle3"), post_fn=post, control_fn=post, hs_capture=True, hs_prefix_cache=True)
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(RuntimeError, "digest|shape/dtype|feature names"):
+                adapter.produce_refs([_task(0, 5)], capture=_eagle3_contract())
+            self.assertTrue(store._external_provisional)
+            store.discard_external_attempts()
+            self.assertFalse(backend._d)
+
+
 class CapacityBackpressure(unittest.TestCase):
+    def test_refused_and_new_prepared_groups_can_share_the_next_begin(self):
+        from specforge.inference.capture_protocol import CaptureCapacityDeclined
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        server = TransferServer(backend)
+        refuse = [True]
+        def post(url, json_body, timeout):
+            if json_body.get("action") == "begin_batch" and refuse[0]:
+                refuse[0] = False
+                return dict(error="full", error_code="capture_capacity_declined", reservation_granted=False)
+            return server(url, json_body, timeout)
+        adapter = SGLangServerCaptureAdapter("http://server", store, run_id="run0", algorithm="eagle3", schema=_capture_schema("eagle3"), post_fn=post, control_fn=post, hs_capture=True, hs_prefix_cache=True)
+        old = adapter.prepare_refs_batches([[_task(0, 5)]], capture=_eagle3_contract())
+        with self.assertRaises(CaptureCapacityDeclined):
+            adapter.register_prepared_batches(old)
+        attempt = old[0]["payloads"][0]["attempt_id"]
+        fresh = adapter.prepare_refs_batches([[_task(1, 5)]], capture=_eagle3_contract())
+        adapter.register_prepared_batches(old + fresh)
+        self.assertEqual(old[0]["payloads"][0]["attempt_id"], attempt)
+        self.assertFalse(store._capture_pending_begin)
+        for group in old + fresh:
+            self.assertEqual(len(adapter.produce_prepared(group, capture=_eagle3_contract())), 1)
+
     def test_atomic_refusal_retries_original_lease_without_prompt_failure(self):
         for concurrency in (1, 3):
             with self.subTest(concurrency=concurrency), tempfile.TemporaryDirectory() as root:
@@ -114,3 +161,22 @@ class FencedReceiveDrain(unittest.TestCase):
         self.assertFalse(consumer._capture_read_intents)
         self.assertFalse(consumer._quarantined_buffers)
         self.assertFalse(consumer._capture_quarantined_registrations)
+
+
+class NativeHSLaunch(unittest.TestCase):
+    def test_managed_launch_exports_explicit_protocol_budget_and_keeps_guards(self):
+        from tests.test_runtime.test_launch_plan import _managed_raw, _build_managed
+        raw = _managed_raw(protocol="tcp")
+        config = raw["deployment"]["disaggregated"]
+        config.update(hs_capture=True, hs_prefix_cache=True, hs_chunk_tokens=384, hs_output_bytes=987654)
+        capture = _build_managed(raw).services[1].command
+        self.assertEqual(capture.env["SPECFORGE_HS_CAPTURE"], "1")
+        self.assertEqual(capture.env["SPECFORGE_HS_CACHE"], "1")
+        self.assertEqual(capture.env["SPECFORGE_HS_CHUNK_TOKENS"], "384")
+        self.assertEqual(capture.env["SPECFORGE_HS_OUTPUT_BYTES"], "987654")
+        self.assertEqual(capture.env["SGLANG_SPEC_CAPTURE_GPU_PUT"], "0")
+        self.assertIsNone(capture.env["FLASHINFER_DISABLE_VERSION_CHECK"])
+        config.update(hs_capture=False, hs_prefix_cache=False)
+        native = _build_managed(raw).services[1].command
+        self.assertEqual(native.env["SPECFORGE_HS_CAPTURE"], "0")
+        self.assertEqual(native.env["SPECFORGE_HS_CACHE"], "0")
