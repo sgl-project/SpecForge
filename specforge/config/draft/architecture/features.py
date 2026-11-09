@@ -8,6 +8,24 @@ from .block import AnchoredBlockSpec
 
 
 @dataclass(frozen=True, kw_only=True)
+class FinalHiddenFeatureSpec:
+    """Target final hidden states after its final normalization."""
+
+    hidden_size: int
+
+    def __post_init__(self):
+        positive_int("target_features.hidden_size", self.hidden_size)
+
+    def validate_target(self, target: Mapping) -> None:
+        width = target.get("hidden_size")
+        positive_int("target_config.hidden_size", width)
+        if self.hidden_size != width:
+            raise ValueError(
+                "target_features.hidden_size must match target hidden_size"
+            )
+
+
+@dataclass(frozen=True, kw_only=True)
 class TargetFeatureSpec:
     """Tap k is decoder layer k's output before the final norm, read as layer k+1's input."""
 

@@ -12,7 +12,7 @@ class GQASpec(AttentionSpec):
     type: ClassVar[str] = "gqa"
 
     def capabilities(self) -> frozenset[str]:
-        flags = {"target_context_kv"}
+        flags = {"target_context_kv", "variable_input_width"}
         if self.is_causal:
             flags.add("causal")
         return frozenset(flags)

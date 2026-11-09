@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from specforge.config.draft import registry
 from specforge.config.draft.architecture import DFlashSpec
+from specforge.config.draft.architecture.features import TargetFeatureSpec
 from specforge.config.draft.attention import AttentionSpec
 from specforge.config.draft.codec import decode_config, encode_config, parse_draft
 from specforge.config.draft.conv import ConvSpec, GroupedCausalConvSpec
@@ -40,9 +41,11 @@ def with_conv(config, conv):
 
 
 class ContractsTest(unittest.TestCase):
-    def test_every_architecture_checks_its_target_context_and_layers(self):
+    def test_context_architectures_check_target_context_and_layers(self):
         for name, build in EXPECTED.items():
             config = build()
+            if not isinstance(config.spec_config.target_features, TargetFeatureSpec):
+                continue
             with self.subTest(architecture=name):
                 with self.assertRaisesRegex(ValueError, "mask_token_id"):
                     with_features(config, mask_token_id=config.vocab_size)
