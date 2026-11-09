@@ -65,6 +65,46 @@ class NativeHSConfiguration(unittest.TestCase):
 
 
 class CapacityBackpressure(unittest.TestCase):
+    def test_oversize_direct_registration_fails_before_creating_attempts(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        server = TransferServer(backend)
+        server.capability["limits"] = {"attempt_capacity": 1}
+        adapter = SGLangServerCaptureAdapter("http://server", store, run_id="run0", algorithm="eagle3", schema=_capture_schema("eagle3"), post_fn=server, control_fn=server, hs_capture=True, hs_prefix_cache=True)
+        prepared = adapter.prepare_refs_batches([[_task(0, 5)], [_task(1, 5)]], capture=_eagle3_contract())
+        with self.assertRaisesRegex(ValueError, "attempt capacity"):
+            adapter.register_prepared_batches(prepared)
+        self.assertFalse(store._capture_pending_begin)
+        self.assertNotIn("begin_batch", server.calls)
+        self.assertTrue(all("attempt_id" not in p for item in prepared for p in item["payloads"]))
+
+    def test_registration_and_each_lease_fit_advertised_capacity(self):
+        for capacity, lease, concurrency in ((1, 1, 2), (1, 3, 2), (2, 3, 3)):
+            with self.subTest(capacity=capacity, lease=lease, concurrency=concurrency), tempfile.TemporaryDirectory() as root:
+                backend = _FakeMooncakeStore()
+                store = MooncakeFeatureStore(store=backend, store_id="run0")
+                server = TransferServer(backend)
+                server.capability["limits"] = {"attempt_capacity": capacity}
+                sizes = []
+                def post(url, json_body, timeout):
+                    if json_body.get("action") == "begin_batch":
+                        sizes.append(len(json_body["tasks"]))
+                        if sizes[-1] > capacity:
+                            raise AssertionError("registration exceeded endpoint bound")
+                    return server(url, json_body, timeout)
+                adapter = _adapter(store, post)
+                adapter.hs_capture = adapter.hs_prefix_cache = True
+                from specforge.inference.capture_protocol import CaptureProtocol
+                adapter._capture_protocol = CaptureProtocol(adapter.base_url, post, 1)
+                channel = StreamingRefChannel(os.path.join(root, "refs"))
+                workers, drive = _build([adapter], _prompts(4), store, channel, lease=lease, producer_concurrency=concurrency, max_worker_failures=1, max_prompt_attempts=1, backpressure_poll_s=.001, peer_wait_timeout_s=2)
+                self.assertEqual(drive(), 4)
+                self.assertEqual(workers[0].controller.status()["prompts_failed"], 0)
+                self.assertEqual(channel.published, 4)
+                self.assertTrue(sizes)
+                self.assertLessEqual(max(sizes), capacity)
+                self.assertFalse(store._capture_pending_begin)
+
     def test_refused_and_new_prepared_groups_can_share_the_next_begin(self):
         from specforge.inference.capture_protocol import CaptureCapacityDeclined
         backend = _FakeMooncakeStore()

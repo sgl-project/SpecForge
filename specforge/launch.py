@@ -1387,6 +1387,14 @@ def build_disagg_online_producer(
             if getattr(source, "_capture_protocol", None) is None:
                 return run_worker_legacy(w)
 
+            # The endpoint's atomic reservation bound also limits each lease.
+            # Discover it before taking prompts so even a lease configured above
+            # the server capacity can be fulfilled without returning/failing it.
+            capacity_fn = getattr(source, "registration_capacity", None)
+            registration_capacity = capacity_fn() if callable(capacity_fn) else None
+            endpoint_lease = (min(worker_lease, registration_capacity)
+                              if registration_capacity is not None else worker_lease)
+
             # One endpoint's network registration has its own executor. The
             # coordinator only leases, reserves credits and harvests futures;
             # an in-flight begin never blocks independent ref publication.
@@ -1520,7 +1528,7 @@ def build_disagg_online_producer(
                                     record["stage"] = "generate"
                                     future = executor.submit(
                                         w.run_leased, record["tasks"],
-                                        max_tasks=worker_lease, prepared=record["prepared"],
+                                        max_tasks=endpoint_lease, prepared=record["prepared"],
                                     )
                                     futures[future] = record
 
@@ -1566,7 +1574,7 @@ def build_disagg_online_producer(
                         if accepting and not paused and submitted < round_budget and preparing is None:
                             group = []
                             while len(records) < producer_concurrency and submitted < round_budget:
-                                tasks = w.lease_tasks(worker_lease)
+                                tasks = w.lease_tasks(endpoint_lease)
                                 if not tasks:
                                     break
                                 record = dict(tasks=tasks, start=time.perf_counter(),
@@ -1580,17 +1588,23 @@ def build_disagg_online_producer(
                                     [r["tasks"] for r in group], capture=w.capture,
                                 ), group)
 
-                        # Take the entire ready snapshot. Initial idle slots
-                        # deterministically share one begin; late arrivals queue
-                        # behind an active registration and coalesce next turn.
+                        # Coalesce a ready snapshot within the endpoint's atomic
+                        # begin bound. Excess leases retain their place while
+                        # completed siblings publish and free server capacity.
                         budget_wait = False
                         if (registering is None and cleaning is None
                             and time.monotonic() >= next_registration_at):
                             group = []
+                            group_tasks = 0
                             for record in records:
                                 if record["stage"] != "pending":
                                     continue
+                                task_count = len(record["tasks"])
+                                if (registration_capacity is not None and
+                                    group_tasks + task_count > registration_capacity):
+                                    break
                                 if reserve(record):
+                                    group_tasks += task_count
                                     record["stage"] = "register"
                                     group.append(record)
                                 else:

@@ -518,6 +518,22 @@ class SGLangServerCaptureAdapter:
             per_token += 8
         return sum(len(task.payload["input_ids"]) * per_token for task in tasks)
 
+    def registration_capacity(self):
+        """Return the negotiated endpoint's atomic begin bound before leasing."""
+        if self._capture_protocol is None:
+            return None
+        return self._registration_capacity(self._capture_protocol.capability())
+
+    @staticmethod
+    def _registration_capacity(capability):
+        if capability is None:
+            return None
+        capacity = capability.get("limits", {}).get("attempt_capacity")
+        if capacity is not None and (isinstance(capacity, bool) or
+                                     not isinstance(capacity, int) or capacity < 1):
+            raise RuntimeError("invalid capture attempt capacity")
+        return capacity
+
     def register_prepared_batches(self, prepared):
         """Coalesce all currently ready leases into one endpoint begin_batch."""
         if not prepared:
@@ -529,6 +545,12 @@ class SGLangServerCaptureAdapter:
             return
         payloads = [payload for item in prepared for payload in item["payloads"]]
         tasks = [task for item in prepared for task in item["tasks"]]
+        capacity = self._registration_capacity(capability)
+        if capacity is not None and len(tasks) > capacity:
+            # No attempt identity or local begin intent exists yet. The producer
+            # splits ready groups before this boundary; direct callers receive a
+            # local error rather than an ambiguous partial remote reservation.
+            raise ValueError("registration batch exceeds capture attempt capacity")
         requests = []
         for item in prepared:
             item["begin_control_url"] = self._capture_protocol.url
