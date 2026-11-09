@@ -245,7 +245,8 @@ class HSCaptureRuntime:
         forbidden = {
             "chunked_prefill": schedule.chunked_prefill_size != -1,
             "PP": parallel.pp_size != 1,
-            "DP": parallel.dp_size != 1 or bool(args.enable_dp_attention),
+            "DP": parallel.dp_size != 1,
+            "attention_DP": parallel.attn_dp_size != 1,
             "CP": parallel.attn_cp_size != 1 or parallel.dcp_size != 1,
             "HiCache": bool(args.enable_hierarchical_cache),
             "LoRA": bool(args.enable_lora),
