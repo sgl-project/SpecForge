@@ -1,6 +1,11 @@
+draft: specforge/config/draft/presets/qwen3-8b-peagle.yaml
+
+initialization:
+  from_target:
+    embed_tokens: model.embed_tokens
+
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-peagle.json
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
   embedding_key: model.embed_tokens.weight
@@ -14,7 +19,11 @@ data:
   cache_dir: cache
 
 training:
-  strategy: peagle
+  objective_options:
+    mask_token_id: 151669
+    num_depths: 5
+    down_sample_ratio: 0.8
+    down_sample_ratio_min: 0.2
   num_epochs: 20
   max_steps: 10000
   batch_size: 1
@@ -22,10 +31,6 @@ training:
   warmup_ratio: 0.0025
   max_grad_norm: 1.0
   attention_backend: flex_attention
-  num_depths: 5
-  down_sample_ratio: 0.8
-  down_sample_ratio_min: 0.2
-  norm_before_residual: false
   save_interval: 50000
   log_interval: 50
   dist_timeout: 120

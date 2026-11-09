@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 try:
     import torch.distributed as dist

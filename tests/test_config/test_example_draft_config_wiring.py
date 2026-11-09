@@ -1,94 +1,28 @@
-from __future__ import annotations
+"""Bundled run recipes use complete canonical drafts and valid objective options."""
 
-import json
 import unittest
 from pathlib import Path
-from typing import Optional
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from specforge.application.composition import resolve_run
+from specforge.config import Config
+from specforge.config.draft.codec import parse_draft
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
-DRAFT_CONFIG_DIR = REPO_ROOT / "configs"
-
-
-def _yaml_scalar(path: Path, key: str) -> Optional[str]:
-    prefix = f"{key}:"
-    matches = []
-    for line in path.read_text().splitlines():
-        content = line.split("#", 1)[0].strip()
-        if not content.startswith(prefix):
-            continue
-        value = content[len(prefix) :].strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        matches.append(value)
-    if len(matches) > 1:
-        raise AssertionError(f"{path} defines {key} more than once")
-    return matches[0] if matches else None
+ROOT = Path(__file__).resolve().parents[2]
 
 
-def _local_draft_configs():
-    for recipe in sorted(EXAMPLE_CONFIG_DIR.rglob("*.yaml")):
-        source = _yaml_scalar(recipe, "draft_model_config")
-        if source is None or not source.endswith(".json"):
-            continue
-        strategy = _yaml_scalar(recipe, "strategy")
-        yield recipe, strategy, REPO_ROOT / source
-
-
-class ExampleDraftConfigWiringTest(unittest.TestCase):
-    def test_local_draft_architecture_matches_recipe_strategy(self):
-        recipes = list(_local_draft_configs())
-        self.assertTrue(recipes)
-        registry = builtin_algorithm_registry()
-
-        for recipe, strategy, draft_config in recipes:
-            with self.subTest(recipe=recipe.name):
-                algorithm = registry.resolve(strategy)
-                draft_provider = algorithm.providers.model.draft_config
-                self.assertTrue(draft_config.is_file(), draft_config)
-                payload = json.loads(draft_config.read_text())
-                architectures = payload.get("architectures")
-                self.assertIsInstance(architectures, list)
-                self.assertEqual(len(architectures), 1)
-                architecture = architectures[0]
-                self.assertIn(
-                    architecture,
-                    draft_provider.compatible_architectures,
+class TrainingPresetTest(unittest.TestCase):
+    def test_recipes_resolve_canonical_models_and_objectives(self):
+        for path in sorted((ROOT / "examples/configs").rglob("*.yaml")):
+            with self.subTest(recipe=path.relative_to(ROOT)):
+                cfg = Config.from_file(str(path))
+                resolved = resolve_run(cfg)
+                draft = parse_draft(resolved.config.draft, target_config=None)
+                self.assertEqual(
+                    resolved.algorithm.spec.draft.default_architecture,
+                    draft.architecture,
                 )
-                expected_auto_model = draft_provider.expected_auto_map_model
-                actual_auto_model = payload.get("auto_map", {}).get("AutoModel")
-                if (
-                    expected_auto_model is not None
-                    and architecture == draft_provider.architecture
-                ):
-                    self.assertEqual(
-                        actual_auto_model,
-                        expected_auto_model,
-                    )
-                elif actual_auto_model is not None:
-                    self.assertEqual(
-                        actual_auto_model.rsplit(".", 1)[-1],
-                        architecture,
-                    )
-
-    def test_only_future_vlm_draft_configs_lack_a_unified_recipe(self):
-        referenced = {
-            draft_config.resolve()
-            for _, _, draft_config in _local_draft_configs()
-            if draft_config.is_file()
-        }
-        checked_in = {path.resolve() for path in DRAFT_CONFIG_DIR.glob("*.json")}
-
-        self.assertEqual(
-            {path.name for path in checked_in - referenced},
-            {
-                "qwen2-5-vl-7b-eagle3.json",
-                "qwen2.5-vl-32b-eagle3.json",
-            },
-        )
+                self.assertIsNotNone(resolved.config.training.objective)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

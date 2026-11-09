@@ -1,11 +1,11 @@
+draft: specforge/config/draft/presets/kimi-k3-dspark.yaml
+
 model:
   target_model_path: moonshotai/Kimi-K3
-  draft_model_config: configs/kimi-k3-dspark.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: language_model.model.embed_tokens.weight
   lm_head_key: language_model.lm_head.weight
-  mask_token_id: 163824
   torch_dtype: bfloat16
   sglang_attention_backend: trtllm_mla
   sglang_mem_fraction_static: 0.76
@@ -25,7 +25,13 @@ data:
   dataloader_num_workers: 0
 
 training:
-  strategy: dspark
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 4.0
+    objective_chunk_blocks: 128
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
   num_epochs: 10
   # Four consumer ranks x one sequence x 32 microbatches preserves the old
   # effective global batch of 128 sequences.
@@ -36,12 +42,6 @@ training:
   warmup_ratio: 0
   max_grad_norm: 1
   attention_backend: flex_attention
-  num_anchors: 512
-  loss_decay_gamma: 4.0
-  objective_chunk_blocks: 128
-  dspark_ce_loss_alpha: 0.1
-  dspark_l1_loss_alpha: 0.9
-  dspark_confidence_head_alpha: 1.0
   save_interval: 8
   log_interval: 10
   dist_timeout: 30

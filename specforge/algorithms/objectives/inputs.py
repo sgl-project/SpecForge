@@ -17,11 +17,14 @@ def gather(sequence: Tensor, positions: Tensor) -> Tensor:
     ]
 
 
-def sequence_inputs(config, positions, visibility, *, key_positions=None):
+def sequence_inputs(
+    config, positions, visibility, *, active_queries=None, key_positions=None
+):
     layout = AttentionLayout(
         query_positions=positions,
         key_positions=positions if key_positions is None else key_positions,
-        visibility=visibility[:, None],
+        visibility=visibility if callable(visibility) else visibility[:, None],
+        active_queries=active_queries,
     )
     return tuple(
         LayerInputs(position_ids=positions, attention_layout=layout)
@@ -74,21 +77,20 @@ def prepare_blocks(
     if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
         raise ValueError("block objectives require unpacked sequences")
     valid = supervised[:, :-1] & supervised[:, 1:]
-    count = min(num_anchors, max(1, int(valid.sum(-1).max())))
-    scores = torch.rand(valid.shape, device=ids.device).masked_fill(~valid, 2)
-    anchors = scores.argsort(-1)[:, :count]
-    keep = valid.gather(1, anchors)
-    anchors = anchors.masked_fill(~keep, ids.shape[1]).sort(-1).values
-    keep = anchors < ids.shape[1]
-    anchors = anchors.masked_fill(~keep, 0)
+    anchors, keep = sample_anchors(valid, num_anchors, batch.get("max_valid_anchors"))
     spec, size = config.spec_config, config.spec_config.protocol.num_model_slots
     slots = torch.arange(size, device=ids.device)
     positions = anchors[..., None] + input_offset + slots
     label_positions = anchors[..., None] + label_offset + slots
     labels = gather(ids, label_positions)
     predecessors = gather(ids, label_positions - 1)
-    prediction = torch.zeros(size, dtype=torch.bool, device=ids.device)
-    prediction[list(spec.protocol.prediction_positions)] = True
+    predicted = spec.protocol.prediction_positions
+    if predicted == tuple(range(predicted[0], predicted[-1] + 1)):
+        prediction = (slots >= predicted[0]) & (slots <= predicted[-1])
+    else:
+        prediction = torch.zeros_like(slots, dtype=torch.bool)
+        for position in predicted:
+            prediction |= slots == position
     allowed = (
         keep[..., None]
         & (label_positions < ids.shape[1])
@@ -110,23 +112,23 @@ def prepare_blocks(
     query = positions.flatten(1)
     context = torch.arange(ids.shape[1], device=ids.device).expand(ids.shape[0], -1)
     keys = torch.cat((context, query), dim=1)
-    context_visible = (
-        context[:, None, None, :]
-        < (anchors + input_offset + context_offset)[..., None, None]
-    )
     padding = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.bool))
-    context_visible = context_visible & padding[:, None, None, :].bool()
-    context_visible = context_visible.expand(-1, -1, size, -1).reshape(
-        ids.shape[0], -1, ids.shape[1]
-    )
-    block_ids = torch.arange(count, device=ids.device).repeat_interleave(size)
-    draft_visible = (block_ids[:, None] == block_ids[None, :]).expand(
-        ids.shape[0], -1, -1
-    )
-    visible = torch.cat((context_visible, draft_visible), dim=-1)
-    visible &= keep.repeat_interleave(size, dim=1)[..., None]
+
+    def visible(b, h, q, k):
+        block = q // size
+        context_visible = (
+            (k < ids.shape[1])
+            & (k < anchors[b, block] + input_offset + context_offset)
+            & padding[b, k.clamp(max=ids.shape[1] - 1)].bool()
+        )
+        draft_visible = (k >= ids.shape[1]) & ((k - ids.shape[1]) // size == block)
+        return keep[b, block] & (context_visible | draft_visible)
+
     layout = AttentionLayout(
-        query_positions=query, key_positions=keys, visibility=visible[:, None]
+        query_positions=query,
+        key_positions=keys,
+        visibility=visible,
+        active_queries=keep[..., None].expand_as(positions).flatten(1),
     )
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)
@@ -142,3 +144,17 @@ def prepare_blocks(
         label_positions,
         entries,
     )
+
+
+def sample_anchors(valid, num_anchors, available=None):
+    """Sample supervised predecessor positions, preserving sequence order."""
+    if available is None:
+        available = int(valid.sum(-1).max())
+    count = min(num_anchors, max(1, available))
+    scores = torch.rand(valid.shape, device=valid.device).masked_fill(~valid, 2)
+    anchors = scores.argsort(-1)[:, :count]
+    keep = valid.gather(1, anchors)
+    anchors = anchors.masked_fill(~keep, valid.shape[1] + 1).sort(-1).values
+    keep = anchors < valid.shape[1] + 1
+    anchors = anchors.masked_fill(~keep, 0)
+    return anchors, keep

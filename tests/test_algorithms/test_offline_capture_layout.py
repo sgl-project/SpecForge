@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import OfflineCaptureLayout
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 
 class OfflineCaptureLayoutTest(unittest.TestCase):
@@ -18,8 +18,8 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
             "eagle3": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
-                "aux_hidden_state": "aux_hidden_states",
-                "hidden_state": "last_hidden_states",
+                "hidden_states": "aux_hidden_states",
+                "target_last_hidden_states": "last_hidden_states",
             },
             "dflash": {
                 "input_ids": "input_ids",
@@ -102,22 +102,11 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                         record["hidden_states"].shape[-1],
                     )
 
-    def test_dflash_family_normalizers_require_adjacent_supervision(self):
-        raw = {
-            "input_ids": torch.tensor([1, 2, 3]),
-            "loss_mask": torch.tensor([1, 0, 1]),
-            "hidden_states": torch.randn(1, 3, 8),
-            "target_last_hidden_states": torch.randn(1, 3, 8),
-        }
-        for strategy in ("dflash", "domino", "dspark"):
-            with self.subTest(strategy=strategy):
-                normalizer = (
-                    self.registry.resolve(strategy)
-                    .providers.offline_for("text")
-                    .build_normalizer(3)
-                )
-                with self.assertRaisesRegex(ValueError, "two consecutive"):
-                    normalizer(raw)
+    def test_block_capture_filters_require_adjacent_supervision(self):
+        for name in ("dflash", "domino", "dspark"):
+            keep = self.registry.resolve(name).providers.model.loss_mask_filter
+            self.assertTrue(keep([0, 1, 1]))
+            self.assertFalse(keep([1, 0, 1]))
 
     def test_duplicate_output_names_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "duplicate.*hidden_states"):

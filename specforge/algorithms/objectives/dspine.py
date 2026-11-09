@@ -1,15 +1,17 @@
 """DSpine's backbone, pair refinement and inter-layer alignment losses."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
-from specforge.core.fused_loss import ce_l1_loss
+from specforge.core.chunking import checkpointed_chunk_reduce
 
-from .base import check_options, reduce_loss
-from .dflash import COMMON_MODULES
+from ..losses.blocks import gather_teacher_hidden, logits_loss_terms
+from ..losses.dspine import dspine_chunk_terms
+from .base import COMMON_MODULES, ObjectiveResult, check_options
+from .block_options import BlockLossOptions
 from .inputs import prepare_blocks
 from .registry import register_objective
 
@@ -22,7 +24,7 @@ from .registry import register_objective
     trains=COMMON_MODULES + ("injection",),
 )
 @dataclass
-class DSpineObjective:
+class DSpineObjective(BlockLossOptions):
     num_anchors: int = 512
     loss_decay_gamma: float = 7.0
     top_k: int = 16
@@ -36,6 +38,7 @@ class DSpineObjective:
     candidate_mass_threshold: float = 1e-4
 
     def __post_init__(self):
+        super().__post_init__()
         check_options(
             counts={"num_anchors": self.num_anchors, "top_k": self.top_k},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
@@ -92,30 +95,59 @@ class DSpineObjective:
             blocks.layer_inputs,
             block_token_ids=blocks.labels,
             replace_masks=masks,
+            output_logits=False,
         )
-        teacher = runtime.teacher_logits(batch, blocks.label_positions - 1)
-        terms = ce_l1_loss(
-            output.logits, blocks.labels, teacher_logits=teacher, top_k=self.top_k
+        labels = blocks.labels[..., 1:].flatten(0, 1)
+        weights = blocks.weights[..., 1:].flatten(0, 1)
+        supervised = weights > 0
+        hidden = output.hidden_states[..., 1:, :].flatten(0, 1)
+        denominator = weights.sum().detach()
+        if context.get("ce_only", False):
+
+            def ce_terms(h, labels, weights, supervised):
+                terms = logits_loss_terms(self, model.lm_head(h), labels)
+                return (terms.cross_entropy * weights).sum(), (
+                    (terms.argmax_ids == labels) * supervised
+                ).sum().float()
+
+            ce_num, correct = checkpointed_chunk_reduce(
+                ce_terms,
+                hidden,
+                labels,
+                weights,
+                supervised,
+                chunk_size=self.objective_chunk_blocks,
+                checkpoint=False,
+            )
+            return ObjectiveResult(
+                ce_num,
+                denominator,
+                {
+                    "accuracy": (correct, supervised.sum()),
+                    "dspine/backbone_ce": (ce_num.detach(), denominator),
+                },
+            )
+        teacher_hidden = gather_teacher_hidden(
+            batch["target_last_hidden_states"], blocks.label_positions[..., 1:]
+        ).flatten(0, 1)
+        features = (
+            output.layer_features[..., 1:, :].permute(1, 2, 0, 3, 4).flatten(0, 1)
         )
-        refined = model.refine(output.pre_injection, blocks.predecessors)
-        weights = model.lm_head.candidate_weights(terms.topk_ids)
-        scores = torch.einsum("...h,...kh->...k", refined, weights).float()
-        covered = terms.topk_ids == blocks.labels[..., None]
-        refinement = ce_l1_loss(
-            scores,
-            covered.long().argmax(-1),
-            teacher_logits=teacher.gather(-1, terms.topk_ids),
+        ce_num, l1_num, refinement_num, alignment_num, correct, coverage = (
+            checkpointed_chunk_reduce(
+                partial(dspine_chunk_terms, model, self, runtime.target_head),
+                hidden,
+                output.pre_injection[..., 1:, :].flatten(0, 1),
+                features,
+                labels,
+                blocks.predecessors[..., 1:].flatten(0, 1),
+                teacher_hidden,
+                weights,
+                supervised,
+                chunk_size=self.objective_chunk_blocks,
+                checkpoint=self.objective_checkpointing,
+            )
         )
-        mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
-        refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(-1) + (
-            1 - self.ce_weight
-        ) * refinement.teacher_l1 * (mass > self.candidate_mass_threshold)
-        codes = F.embedding(blocks.labels, model.transfer_codes).float()
-        alignment = (
-            1 - F.cosine_similarity(output.layer_features.float(), codes[None], dim=-1)
-        ).sum(0)
-        ce_num = (terms.cross_entropy * blocks.weights).sum()
-        denominator = blocks.weights.sum().detach()
         if alignment_ce is None:
             totals = torch.stack((ce_num.detach(), denominator))
             if dist.is_initialized():
@@ -126,16 +158,22 @@ class DSpineObjective:
             if self.alignment_warmup_steps
             else 1
         )
-        loss = (
-            self.ce_weight * terms.cross_entropy
-            + (1 - self.ce_weight) * terms.teacher_l1
-            + refined_loss
-            + beta * alignment_ce.detach() * alignment
+        numerator = (
+            self.ce_weight * ce_num
+            + (1 - self.ce_weight) * l1_num
+            + refinement_num
+            + beta * alignment_ce.detach() * alignment_num
         )
-        return reduce_loss(
-            loss,
-            blocks.weights,
-            logits=output.logits,
-            labels=blocks.labels,
-            ratios={"dspine/backbone_ce": (ce_num.detach(), denominator)},
+        count = supervised.sum().detach()
+        return ObjectiveResult(
+            numerator,
+            denominator,
+            {
+                "accuracy": (correct.detach(), count),
+                "dspine/backbone_ce": (ce_num.detach(), denominator),
+                "dspine/backbone_l1": (l1_num.detach(), denominator),
+                "dspine/refinement_loss": (refinement_num.detach(), denominator),
+                "dspine/alignment_loss": (alignment_num.detach(), denominator),
+                "dspine/candidate_coverage": (coverage.detach(), count),
+            },
         )

@@ -9,8 +9,6 @@ import torch
 import torch.nn.functional as F
 
 from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
-from specforge.modeling.draft.dspine import AdjacentInjection as LegacyInjection
-from specforge.modeling.draft.dspine import DSpineConfig
 from specforge.modeling.draft.heads import AdjacentInjection
 from specforge.modeling.draft.pretrained import DraftPreTrainedModel
 from tests.test_modeling.test_draft_pretrained import model_config
@@ -31,15 +29,11 @@ class DFlashDraftModel(DraftPreTrainedModel):
 
 class AdjacentInjectionTest(unittest.TestCase):
     def test_runtime_mask_has_no_implicit_training_layer_cutoff(self):
-        legacy = LegacyInjection(
-            16, 2, DSpineConfig(transfer_rank=4, message_size=8, replacement_layers=1)
-        )
         node = AdjacentInjectionSpec(transfer_rank=4, message_size=8)
         module = AdjacentInjection(node, hidden_size=16, num_layers=2)
         with torch.no_grad():
-            for parameter in legacy.parameters():
+            for parameter in module.parameters():
                 parameter.normal_(std=0.1)
-        module.load_state_dict(legacy.state_dict(), strict=True)
         hidden = torch.randn(2, 2, 4, 16)
         ids = torch.randint(0, 32, (2, 2, 4))
         codes = torch.randn(32, 4)
@@ -73,9 +67,6 @@ class AdjacentInjectionTest(unittest.TestCase):
             )
             expected = torch.cat(
                 (hidden[..., :1, :], hidden[..., 1:, :] + scale * delta), -2
-            )
-            torch.testing.assert_close(
-                legacy(hidden, layer, ids, codes, replace), expected, rtol=0, atol=0
             )
             actual = module(hidden, layer, ids, codes, replace if layer == 0 else None)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -152,7 +143,7 @@ class AdjacentInjectionTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     AdjacentInjection(node, hidden_size=width, num_layers=layers)
             with self.assertRaises(TypeError):
-                AdjacentInjection(DSpineConfig(), hidden_size=16, num_layers=2)
+                AdjacentInjection(object(), hidden_size=16, num_layers=2)
             allocate.assert_not_called()
 
 

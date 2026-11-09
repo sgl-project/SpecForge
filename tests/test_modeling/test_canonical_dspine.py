@@ -9,19 +9,14 @@ from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.block import AnchoredBlockSpec
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
-from specforge.modeling.draft.dspine import DSpineDraftModel as LegacyDSpineDraftModel
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DSpineDraftModel
 from tests.test_config.test_draft_dspine_spec import dspine_config
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
+from tests.test_modeling.test_draft_attention_masks import create_dflash_sdpa_mask
 
 
 def model_config():
@@ -76,107 +71,6 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
 
 
 class CanonicalDSpineTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        if device == "cpu":
-            tolerance = 0
-        torch.manual_seed(0)
-        for cutoff in (0, 1, 2):
-            with self.subTest(device=device, dtype=dtype, cutoff=cutoff):
-                actual = initialized_model(device, dtype)
-                config = actual.config.draft
-                legacy = legacy_dflash_config(
-                    block_size=4,
-                    dflash_config={"target_layer_ids": [1, 3], "mask_token_id": 63},
-                    dspine_config={
-                        "transfer_rank": 8,
-                        "message_size": 4,
-                        "replacement_layers": cutoff,
-                    },
-                )
-                reference = LegacyDSpineDraftModel(legacy).to(
-                    device=device, dtype=dtype
-                )
-                # Rebuild FP32 inv_freq on the test device to match canonical RoPE;
-                # legacy .to(bfloat16) rounds it, changing the parity reference.
-                with torch.device(device):
-                    reference.rotary_emb = Qwen3RotaryEmbedding(legacy)
-                reference.load_state_dict(
-                    {legacy_name(n) or n: v for n, v in actual.state_dict().items()},
-                    strict=True,
-                )
-                embedding, head = actual.embed_tokens, actual.lm_head
-                (ids, features, entries), tokens, mask = model_inputs(
-                    config, device, dtype
-                )
-                other = features.detach().clone().requires_grad_()
-                output = actual(
-                    ids,
-                    features,
-                    entries,
-                    block_token_ids=tokens,
-                    replace_masks=[mask if i < cutoff else None for i in range(2)],
-                )
-                expected = reference(
-                    entries[0].position_ids,
-                    attention_mask=entries[0].attention_layout.visibility,
-                    noise_embedding=embedding(ids),
-                    target_hidden=other,
-                    block_token_ids=tokens,
-                    replace_mask=mask,
-                )
-                expected_logits = head(expected.hidden_states)
-                refined = actual.refine(
-                    output.pre_injection[..., 1:, :], tokens[..., :-1]
-                )
-                expected_refined = reference.refine(
-                    expected.pre_injection[..., 1:, :], tokens[..., :-1]
-                )
-                values = (
-                    output.hidden_states,
-                    output.pre_injection,
-                    output.layer_features,
-                    output.logits,
-                    refined,
-                )
-                references = (*expected, expected_logits, expected_refined)
-                gradients = [torch.randn_like(value) for value in values]
-                torch.testing.assert_close(
-                    values, references, rtol=tolerance, atol=tolerance
-                )
-                sum(
-                    value.mul(grad).sum() for value, grad in zip(values, gradients)
-                ).backward()
-                sum(
-                    value.mul(grad).sum() for value, grad in zip(references, gradients)
-                ).backward()
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=tolerance, atol=tolerance
-                )
-                for name, parameter in actual.named_parameters():
-                    if not parameter.requires_grad:
-                        self.assertIsNone(parameter.grad, name)
-                        continue
-                    ref = dict(reference.named_parameters())[legacy_name(name) or name]
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-                    )
-
-    def test_cpu_legacy_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_explicit_late_replacement_and_block_isolation(self):
         model = initialized_model()

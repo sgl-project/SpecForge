@@ -1,6 +1,7 @@
+draft: specforge/config/draft/presets/qwen3.5-35b-a3b-dflash.yaml
+
 model:
   target_model_path: "Qwen/Qwen3.5-35B-A3B"
-  draft_model_config: "configs/qwen3.5-35b-a3b-dflash.json"
   target_backend: "sglang"
   embedding_key: "model.language_model.embed_tokens.weight"
   torch_dtype: "bfloat16"
@@ -12,7 +13,9 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
-  strategy: "dflash"
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 7
   num_epochs: 10
   max_steps: 10000
   batch_size: 2
@@ -20,8 +23,6 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "flex_attention"
-  num_anchors: 512
-  loss_decay_gamma: 7
   save_interval: 10000
   log_interval: 50
   dist_timeout: 30

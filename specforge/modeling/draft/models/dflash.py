@@ -26,7 +26,7 @@ class DFlashDraftModel(DraftPreTrainedModel):
 
     Inputs contain aligned target features and explicit per-layer attention
     layouts/positions. Sampling, loss computation and mutable serving caches
-    belong to their callers. The legacy DFlash entry point remains independent.
+    belong to their callers.
     """
 
     _no_split_modules = ["DecoderLayer"]

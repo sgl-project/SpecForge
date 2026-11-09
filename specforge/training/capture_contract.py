@@ -29,7 +29,7 @@ def resolve_server_capture_contract(
         target_text_config,
         target_vocab_size,
     )
-    from specforge.training.model_loading import draft_config_dict
+    from specforge.training.model_loading import resolve_draft_config
 
     streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
 
@@ -40,7 +40,7 @@ def resolve_server_capture_contract(
     )
     target_cfg = target_text_config(target_cfg)
     model_provider = algorithm.providers.model
-    draft_cfg = draft_config_dict(cfg, provider=model_provider.draft_config)
+    draft_cfg = resolve_draft_config(cfg)
     layers = model_provider.resolve_capture_layers(cfg, draft_cfg, target_cfg)
     if not layers:
         raise ValueError("draft config does not define target capture layer ids")
@@ -62,9 +62,7 @@ def resolve_server_capture_contract(
         aux_layer_ids=tuple(layers),
         target_hidden_size=int(target_cfg.hidden_size),
         target_vocab_size=target_vocab_size(target_cfg),
-        draft_vocab_size=int(
-            draft_cfg.get("draft_vocab_size") or draft_cfg["vocab_size"]
-        ),
+        draft_vocab_size=draft_cfg.draft_vocab_size,
     )
 
 

@@ -252,12 +252,8 @@ class FSDPTrainingBackend(TrainingBackend):
 
             pc = self.parallel_config
             ignored_frozen_modules = self._frozen_target_modules(model)
-            # DFlash-family models expose their transformer block class through
-            # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
-            # it overlaps all-gather/reduce-scatter with decoder compute and is
-            # required for the memory envelope of the larger recipes.  EAGLE
-            # models do not advertise block classes and retain a single root
-            # FSDP unit.
+            # Each model advertises its indivisible stages. Their forward calls
+            # remain the FSDP gather/reduce boundaries, including cached rollout.
             block_names = set(
                 getattr(optimizer_target, "_no_split_modules", None) or ()
             )

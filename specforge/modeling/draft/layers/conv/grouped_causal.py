@@ -1,5 +1,7 @@
 """Dynamic, block-local convolution around one attention or FFN sublayer."""
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -25,8 +27,8 @@ class GroupedCausalConv(nn.Module):
     ``finish`` after executing the sublayer. They stay in the autograd graph,
     never in module state, so overlapping forwards and checkpointing are safe.
 
-    This is the eager implementation. It preserves the existing per-tap rounding
-    and checkpoint layout; it does not select an optional fused kernel.
+    CUDA uses the fused kernel when supported. The eager path remains available
+    through SPECFORGE_DFLASH2_FUSED_CONV=0 and on other devices.
     """
 
     def __init__(
@@ -79,6 +81,27 @@ class GroupedCausalConv(nn.Module):
             raise ValueError("sequence length must be divisible by block_size")
 
     def _convolve(self, hidden: Tensor, delta: Tensor, *, side: int) -> Tensor:
+        base = self.base_kernel[side]
+        if (
+            os.environ.get("SPECFORGE_DFLASH2_FUSED_CONV", "1") != "0"
+            and hidden.is_cuda
+            and delta.is_cuda
+            and base.is_cuda
+            and hidden.numel() > 0
+            and hidden.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and hidden.dtype == delta.dtype == base.dtype
+            and not torch.compiler.is_compiling()
+        ):
+            try:
+                from .triton import dflash2_grouped_conv_fused, supports_group_size
+            except ModuleNotFoundError as exc:
+                if not (exc.name == "triton" or (exc.name or "").startswith("triton.")):
+                    raise
+            else:
+                if supports_group_size(self.config.group_size):
+                    return dflash2_grouped_conv_fused(
+                        hidden, delta, base, self.block_size, self.config.group_size
+                    )
         batch, length, width = hidden.shape
         blocks = hidden.reshape(
             batch,

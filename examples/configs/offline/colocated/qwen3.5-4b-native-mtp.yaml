@@ -19,7 +19,6 @@ data:
   hidden_states_path: ./cache/hidden_states/qwen3.5-4b-native-mtp
   max_length: 512
 training:
-  strategy: mtp
   attention_backend: sdpa
   objective_options:
     objective_chunk_size: 4096

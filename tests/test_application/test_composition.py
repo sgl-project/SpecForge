@@ -10,6 +10,7 @@ from specforge.algorithms.contracts import FeatureMode
 from specforge.application import resolve_run
 from specforge.application.planning import _validate_training_topology
 from specforge.config import Config, TrainingConfig
+from tests.test_algorithms.fixtures import PRESETS
 
 
 def _payload(
@@ -20,24 +21,26 @@ def _payload(
 ) -> dict:
     model = {
         "target_model_path": "target",
-        "draft_model_config": "draft.json",
         "input_modality": modality,
     }
     if algorithm in {"eagle3", "peagle"} and mode == "online":
         model["vocab_mapping_path"] = "mapping.pt"
     training = {
-        "strategy": algorithm,
+        "objective_options": {"mask_token_id": 0} if algorithm == "peagle" else {},
         "max_steps": 1,
         "attention_backend": "flex_attention",
         "batch_size": 1,
     }
+    draft = str(PRESETS / f"qwen3-8b-{algorithm}.yaml")
     if mode == "offline":
         return {
+            "draft": draft,
             "model": model,
             "data": {"hidden_states_path": "features"},
             "training": training,
         }
     return {
+        "draft": draft,
         "model": model,
         "data": {"train_data_path": "prompts.jsonl"},
         "training": training,
@@ -58,13 +61,15 @@ class ApplicationCompositionTest(unittest.TestCase):
 
         resolved = resolve_run(config)
 
-        self.assertIs(config, resolved.config)
+        self.assertEqual(config.model, resolved.config.model)
         self.assertEqual("eagle3", resolved.algorithm.name)
 
     def test_unknown_algorithm_fails_at_the_composition_root(self):
-        config = Config.model_validate(_payload("unknown"))
+        payload = _payload()
+        payload["training"]["objective"] = "unknown"
+        config = Config.model_validate(payload)
 
-        with self.assertRaisesRegex(ValueError, "registered algorithms"):
+        with self.assertRaisesRegex(ValueError, "incompatible"):
             resolve_run(config)
 
     def test_training_domain_has_no_duplicate_deployment_fields(self):
@@ -83,11 +88,13 @@ class ApplicationCompositionTest(unittest.TestCase):
         ):
             resolve_run(config)
 
-    def test_peagle_offline_remains_unsupported(self):
+    def test_peagle_offline_uses_canonical_features(self):
         config = Config.model_validate(_payload("peagle", mode="offline"))
 
-        with self.assertRaisesRegex(ValueError, "no offline feature contract"):
-            resolve_run(config)
+        self.assertEqual(
+            resolve_run(config).algorithm.providers.offline_for("text").normalizer_id,
+            "canonical_unshifted_v1",
+        )
 
     def test_dspark_offline_resolves_its_registered_provider(self):
         resolved = resolve_run(
@@ -95,7 +102,7 @@ class ApplicationCompositionTest(unittest.TestCase):
         )
 
         provider = resolved.algorithm.providers.offline_for("text")
-        self.assertEqual("dspark_offline_v1", provider.normalizer_id)
+        self.assertEqual("canonical_unshifted_v1", provider.normalizer_id)
 
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))
@@ -117,16 +124,12 @@ class ApplicationCompositionTest(unittest.TestCase):
         payload = _payload("eagle3")
         payload["model"]["draft_num_hidden_layers"] = 2
 
-        with self.assertRaisesRegex(
-            ValueError, "requires model.draft_num_hidden_layers=1"
-        ):
+        with self.assertRaisesRegex(ValueError, "Extra inputs are not permitted"):
             resolve_run(Config.model_validate(payload))
 
         domino = _payload("domino")
         domino["model"]["draft_block_size"] = 8
-        with self.assertRaisesRegex(
-            ValueError, "does not support model.draft_block_size"
-        ):
+        with self.assertRaisesRegex(ValueError, "Extra inputs are not permitted"):
             resolve_run(Config.model_validate(domino))
 
     def test_disaggregated_vocab_mapping_is_provider_owned(self):
@@ -162,10 +165,10 @@ class ApplicationCompositionTest(unittest.TestCase):
         self.assertNotEqual(original, changed)
 
     def test_model_resume_provenance_records_resolved_capture_layers(self):
-        from specforge.training.assembly import _model_resume_provenance
+        from specforge.training.provenance import model_resume_provenance
 
         config = Config.model_validate(_payload())
-        provenance = _model_resume_provenance(
+        provenance = model_resume_provenance(
             config,
             SimpleNamespace(_name_or_path="draft.json", _commit_hash="draft-rev"),
             SimpleNamespace(_commit_hash="target-rev"),

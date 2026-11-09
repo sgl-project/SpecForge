@@ -14,8 +14,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention, Qwen3
 from specforge.config.draft.attention import MHASpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
-from specforge.modeling.draft.dflash import Qwen3DFlashAttention
-from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import GQAAttention, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import (
@@ -24,6 +22,7 @@ from specforge.modeling.draft.layers.attention.masks import (
 )
 from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
 from tests.test_config.draft_fixtures import UnpairedRoPESpec, draft_config
+from tests.test_modeling.attention_reference import context_gqa
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
 
@@ -138,8 +137,6 @@ class GQATest(unittest.TestCase):
                         cfg = Qwen3_5Config(text_config=config_args).text_config
                         cfg._attn_implementation = "eager"
                         reference = Qwen3_5Attention(cfg, 0)
-                    elif kind == "context":
-                        reference = Qwen3DFlashAttention(cfg, 0, DEFAULT_DFLASH_KERNELS)
                     else:
                         reference = Qwen3Attention(cfg, 0)
                     if wide:
@@ -229,9 +226,9 @@ class GQATest(unittest.TestCase):
                                 attention_mask=bias,
                             )[0]
                         else:
-                            expected = reference(
-                                other, other_context, embeddings, bias
-                            )[0]
+                            expected = context_gqa(
+                                reference, other, other_context, embeddings, bias
+                            )
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)

@@ -138,7 +138,13 @@ class ObjectiveTest(unittest.TestCase):
             )
         )
         self.assertFalse(blocks.weights[..., 0].any())
-        visible = blocks.layer_inputs[0].attention_layout.visibility[0, 0]
+        from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
+
+        visible = dense_attention_mask(
+            blocks.layer_inputs[0].attention_layout,
+            is_causal=False,
+            sliding_window=None,
+        )[0, 0]
         for index, anchor in enumerate(blocks.anchors[0]):
             self.assertFalse(visible[index * 4, anchor:9].any())
         self.assertFalse(visible[:4, 13:].any())
@@ -170,17 +176,17 @@ class ObjectiveTest(unittest.TestCase):
             blocks = prepare_blocks(
                 config, batch, num_anchors=2, label_offset=int(shifted)
             )
-            captured = []
-            model.register_forward_hook(
-                lambda module, args, output: captured.append(output)
+            runtime = build_objective_model(
+                model, options={"num_anchors": 2, "objective_checkpointing": False}
             )
-            runtime = build_objective_model(model, options={"num_anchors": 2})
             with (
                 patch(
                     "specforge.algorithms.objectives.domino.prepare_blocks",
                     return_value=blocks,
                 ),
-                patch.object(model, "forward", wraps=model.forward) as forward,
+                patch.object(
+                    model.embed_tokens, "forward", wraps=model.embed_tokens.forward
+                ) as embedding,
                 patch.object(
                     model.lm_head, "forward", wraps=model.lm_head.forward
                 ) as projection,
@@ -189,12 +195,16 @@ class ObjectiveTest(unittest.TestCase):
                 result.loss.backward()
                 self.assertEqual(projection.call_count, 1)
                 torch.testing.assert_close(
-                    forward.call_args.kwargs["predecessor_ids"],
-                    blocks.predecessors.flatten(1),
+                    embedding.call_args.args[0], blocks.predecessors
                 )
-            output = captured[0]
-            labels = blocks.labels.flatten()
-            weights = blocks.weights.flatten()
+            with torch.no_grad():
+                output = model(
+                    blocks.input_ids,
+                    batch["hidden_states"],
+                    blocks.layer_inputs,
+                    predecessor_ids=blocks.predecessors.flatten(1),
+                )
+            labels, weights = blocks.labels.flatten(), blocks.weights.flatten()
 
             def ce(logits):
                 return torch.nn.functional.cross_entropy(
@@ -203,7 +213,7 @@ class ObjectiveTest(unittest.TestCase):
 
             expected = (
                 (0.8 * ce(output.base_logits) + 0.2 * ce(output.logits)) * weights
-            ).sum() / weights.sum()
+            ).sum() / (weights.sum() + 1e-6)
             torch.testing.assert_close(result.loss, expected)
             self.assertIsNone(output.correction_logits)
 

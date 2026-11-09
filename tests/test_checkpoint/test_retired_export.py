@@ -1,4 +1,4 @@
-"""One native publisher, isolated canonical imports and legacy-file entry."""
+"""One native publisher, isolated canonical imports and canonical training entry."""
 
 import json
 import subprocess
@@ -61,35 +61,21 @@ class RetiredExportTest(unittest.TestCase):
                     4096,
                 )
 
-    def test_legacy_config_file_resolves_through_codec(self):
+    def test_training_rejects_legacy_config_files(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
             target = target_directory(root)
             payload = mtp_payload() | {"hidden_size": 32, "vocab_size": 64}
-            expected = decode_legacy_config(
+            canonical = decode_legacy_config(
                 payload, target_config={"hidden_size": 32, "vocab_size": 64}
             )
             path = root / "old.json"
             path.write_text(json.dumps(payload))
-            cfg = run_config(target, expected).model_copy(update={"draft": str(path)})
-            self.assertEqual(resolve_config(cfg), expected)
-            self.assertEqual(
-                resolve_run(cfg).config.draft["architectures"], ["MTPDraftModel"]
-            )
-            old_recipe = cfg.model_copy(update={"draft": None})
-            old_recipe.training = cfg.training.model_copy(update={"strategy": "mtp"})
-            with self.assertRaisesRegex(ValueError, "MTP now requires draft"):
-                resolve_run(old_recipe)
-            cfg.training.mtp_objective_chunk_size = 128
-            self.assertEqual(
-                resolve_run(cfg).config.training.objective_options[
-                    "objective_chunk_size"
-                ],
-                128,
-            )
-            cfg.training.objective_options = {"objective_chunk_size": 64}
-            with self.assertRaisesRegex(ValueError, "conflicting MTP"):
-                resolve_run(cfg)
+            cfg = run_config(target, canonical).model_copy(update={"draft": str(path)})
+            with self.assertRaisesRegex(ValueError, "model_type"):
+                resolve_config(cfg)
+            with self.assertRaisesRegex(ValueError, "requires draft or a checkpoint"):
+                resolve_run(cfg.model_copy(update={"draft": None}))
 
 
 if __name__ == "__main__":

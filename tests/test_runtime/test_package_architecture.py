@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import json
 import re
 import tokenize
 import tomllib
@@ -96,7 +95,7 @@ CAPABILITY_TEST_REPLACEMENTS = {
     ),
     "tests/test_scripts/test_train_peagle_resume.py": (
         "tests/test_runtime/test_checkpoint_resume.py",
-        "tests/test_runtime/test_peagle_strategy.py",
+        "tests/test_runtime/test_peagle_gpu_smoke.py",
     ),
     "tests/test_utils/test_compact_teacher.py": (
         "tests/test_runtime/test_compact_teacher_strategy.py",
@@ -703,50 +702,23 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertIn("OfflineCaptureClient", source)
         self.assertNotIn("ModelRunner", source)
 
-    def test_only_canonical_draft_configs_are_checked_in(self):
-        present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
-        self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
+    def test_presets_replace_root_legacy_configuration_catalog(self):
+        import yaml
 
-    def test_dspark_configs_are_qwen3_family(self):
-        dspark_configs = {}
-        for path in sorted((REPO_ROOT / "configs").glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if "DSparkDraftModel" in payload.get("architectures", []):
-                dspark_configs[path.name] = payload
+        from specforge.config.draft.codec import parse_draft
 
-        self.assertEqual(
-            set(dspark_configs),
-            {
-                "deepseek-v4-flash-dspark.json",
-                "glm-5.2-dspark.json",
-                "inkling-dspark.json",
-                "kimi-k3-dspark.json",
-                "ling-3.0-tiny-dspark.json",
-                "minimax-m3-dspark.json",
-                "qwen3-4b-dspark.json",
-                "qwen3-8b-dspark.json",
-                "qwen3.6-27b-dspark.json",
-            },
+        self.assertFalse((REPO_ROOT / "configs").exists())
+        presets = REPO_ROOT / "specforge/config/draft/presets"
+        present = {path.stem for path in presets.glob("*.yaml")}
+        self.assertTrue(
+            {Path(name).stem for name in CANONICAL_DRAFT_CONFIGS} <= present
         )
-        for name, payload in dspark_configs.items():
-            with self.subTest(config=name):
-                self.assertEqual(payload["model_type"], "qwen3")
-                attention_mode = payload["dflash_config"]["attention_mode"]
-                # 'mla' carries its own head geometry and is validated by
-                # validate_dflash_mla_config, so a checked-in MLA DSpark config
-                # must extend this guard deliberately rather than slip through.
-                self.assertIn(attention_mode, {"gqa", "mha"})
-                num_heads = payload["num_attention_heads"]
-                num_kv_heads = payload["num_key_value_heads"]
-                self.assertEqual(num_heads % num_kv_heads, 0)
-                if attention_mode == "gqa":
-                    # DSparkDraftModel rejects gqa with num_key_value_heads >=
-                    # num_attention_heads and points at mha instead.
-                    self.assertLess(num_kv_heads, num_heads)
-                else:
-                    # validate_dflash_attention_config requires equal query and
-                    # KV head counts for mha.
-                    self.assertEqual(num_kv_heads, num_heads)
+        for path in presets.glob("*.yaml"):
+            with self.subTest(preset=path.name):
+                draft = parse_draft(
+                    yaml.safe_load(path.read_text()), target_config=None
+                )
+                self.assertEqual(draft.num_hidden_layers, len(draft.layer_types))
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []

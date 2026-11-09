@@ -4,13 +4,13 @@
 import unittest
 from unittest import mock
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.launch import (
     _offline_io,
     _shard_offline_refs,
     build_disagg_offline_runtime,
     build_offline_runtime,
 )
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 
 class ParallelTopologyTest(unittest.TestCase):

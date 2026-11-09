@@ -30,7 +30,6 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.inference.adapters.server_capture import (
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
@@ -40,6 +39,7 @@ from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime.test_server_capture import (
     AUX_LAYERS,
     HIDDEN,

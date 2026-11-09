@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from transformers import Qwen3Config
 
 from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
@@ -14,13 +15,13 @@ from scripts.prepare_hidden_states import (
     parse_args,
     resolve_offline_capture_plan,
 )
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
-    def test_cli_defaults_to_legacy_eagle3_capture(self):
+    def test_cli_requires_explicit_draft(self):
         argv = [
             "prepare_hidden_states.py",
             "--server-urls",
@@ -30,65 +31,44 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "--data-path",
             "data.jsonl",
         ]
-        with mock.patch("sys.argv", argv):
+        with mock.patch("sys.argv", argv), self.assertRaises(SystemExit):
+            parse_args()
+        preset = "specforge/config/draft/presets/qwen3-4b-dspark.yaml"
+        with mock.patch("sys.argv", argv + ["--draft", preset]):
             args = parse_args()
-
-        self.assertEqual("eagle3", args.strategy)
-        self.assertIsNone(args.draft_model_config)
-        self.assertEqual(args.server_urls, ["http://localhost:30000"])
-        self.assertFalse(hasattr(args, "tp_size"))
-        self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
-        self.assertFalse(hasattr(args, "draft_block_size"))
-        self.assertFalse(hasattr(args, "capture_layers"))
-
-    def test_cli_accepts_dflash_family_config(self):
-        argv = [
-            "prepare_hidden_states.py",
-            "--server-urls",
-            "http://localhost:30000",
-            "--target-model-path",
-            "target",
-            "--data-path",
-            "data.jsonl",
-            "--strategy",
-            "dspark",
-            "--draft-model-config",
-            "configs/qwen3-4b-dspark.json",
-        ]
-        with mock.patch("sys.argv", argv):
-            args = parse_args()
-
-        self.assertEqual("dspark", args.strategy)
-        self.assertEqual(
-            "configs/qwen3-4b-dspark.json",
-            args.draft_model_config,
-        )
-        self.assertFalse(hasattr(args, "capture_layers"))
+        self.assertEqual(args.draft, preset)
+        self.assertIsNone(args.objective)
+        self.assertFalse(hasattr(args, "strategy"))
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
             "eagle3": (
-                "qwen3-8b-eagle3.json",
-                (1, 19, 36),
+                "qwen3-8b-eagle3.yaml",
+                (1, 17, 32),
                 {
                     "input_ids",
                     "loss_mask",
-                    "aux_hidden_state",
-                    "hidden_state",
+                    "hidden_states",
+                    "target_last_hidden_states",
                 },
             ),
             "dflash": (
-                "qwen3-8b-dflash.json",
+                "qwen3-8b-dflash.yaml",
                 (1, 9, 17, 25, 33),
-                {"input_ids", "loss_mask", "hidden_states"},
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                    "target_last_hidden_states",
+                },
             ),
             "domino": (
-                "qwen3-8b-domino.json",
+                "qwen3-8b-domino.yaml",
                 (1, 9, 17, 25, 33),
                 {"input_ids", "loss_mask", "hidden_states"},
             ),
             "dspark": (
-                "qwen3-4b-dspark.json",
+                "qwen3-4b-dspark.yaml",
                 (1, 9, 17, 25, 33),
                 {
                     "input_ids",
@@ -98,17 +78,21 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 },
             ),
         }
-        target_config = SimpleNamespace(num_hidden_layers=40)
-
         for strategy, (config_name, layers, feature_names) in expected.items():
             args = SimpleNamespace(
-                strategy=strategy,
+                objective=None,
+                objective_options={},
                 target_model_path="target",
-                draft_model_config=str(REPO_ROOT / "configs" / config_name),
+                draft=str(REPO_ROOT / "specforge/config/draft/presets" / config_name),
                 trust_remote_code=False,
                 cache_dir=None,
                 output_path="offline-features",
                 max_length=128,
+            )
+            target_config = Qwen3Config(
+                num_hidden_layers=40,
+                hidden_size=2560 if strategy == "dspark" else 4096,
+                vocab_size=151936,
             )
             with self.subTest(strategy=strategy):
                 plan = resolve_offline_capture_plan(args, target_config)

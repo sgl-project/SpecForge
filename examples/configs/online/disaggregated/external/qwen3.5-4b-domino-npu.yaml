@@ -1,6 +1,7 @@
+draft: specforge/config/draft/presets/qwen3.5-4b-domino.yaml
+
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-domino.json"
   target_backend: sglang
   trust_remote_code: true
   embedding_key: "model.language_model.embed_tokens.weight"
@@ -12,7 +13,11 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
-  strategy: "domino"
+  objective_options:
+    num_anchors: 16
+    loss_decay_gamma: 7
+    lambda_base_start: 1
+    lambda_base_decay_ratio: 1
   num_epochs: 10
   batch_size: 1
   accumulation_steps: 4
@@ -20,10 +25,6 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "sdpa"
-  num_anchors: 16
-  loss_decay_gamma: 7
-  lambda_base_start: 1
-  lambda_base_decay_ratio: 1
   save_interval: 3000
   log_interval: 50
   dist_timeout: 30

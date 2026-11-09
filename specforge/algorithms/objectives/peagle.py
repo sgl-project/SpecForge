@@ -4,14 +4,10 @@ from dataclasses import dataclass
 
 import torch
 
-from specforge.algorithms.peagle.model import (
-    create_peagle_mask_mod,
-    generate_cod_sample_indices,
-)
-
-from .base import check_options, reduce_loss
-from .eagle3 import teacher_distribution
+from ..losses.eagle_teacher import teacher_distribution
+from .base import ObjectiveResult, check_options
 from .inputs import gather, sequence_inputs, valid_tokens
+from .peagle_inputs import create_peagle_mask_mod, generate_cod_sample_indices
 from .registry import register_objective
 
 
@@ -57,18 +53,35 @@ class PEagleObjective:
         original = (anchors + depths)[None]
         feature_mask = (depths > 0)[None]
         sampled = shifted[:, anchors + depths]
-        index = torch.arange(anchors.numel(), device=ids.device)
         mask_mod = create_peagle_mask_mod(anchors, depths, lengths, ids.shape[1])
-        visible = mask_mod(0, 0, index[:, None], index[None])[None]
         output = model(
             sampled,
             gather(batch["hidden_states"], original),
-            sequence_inputs(model.config.draft, original, visible),
+            sequence_inputs(
+                model.config.draft,
+                original,
+                mask_mod,
+                active_queries=(anchors < lengths.sum())[None],
+            ),
             feature_mask=feature_mask,
         )
         teacher, included = teacher_distribution(
             model, runtime.teacher_logits(batch, original + 1)
         )
         weight = gather(supervised, original).float() * included
-        ce = -(teacher * output.logits.float().log_softmax(-1)).sum(-1)
-        return reduce_loss(ce, weight, logits=output.logits, labels=teacher.argmax(-1))
+        if output.logits.is_cuda:
+            from specforge.core.loss import LogSoftmaxLoss
+
+            numerator = (
+                LogSoftmaxLoss.apply(output.logits, teacher, weight[..., None])
+                * weight.numel()
+            )
+        else:
+            ce = -(teacher * output.logits.float().log_softmax(-1)).sum(-1)
+            numerator = (ce * weight).sum()
+        correct = (output.logits.argmax(-1) == teacher.argmax(-1)).detach()
+        ratios = {"accuracy": ((correct * weight).sum(), weight.sum())}
+        for depth in range(self.num_depths):
+            mask = (depths == depth)[None] * weight
+            ratios[f"position_{depth}_accuracy"] = ((correct * mask).sum(), mask.sum())
+        return ObjectiveResult(numerator, weight.sum().detach(), ratios)

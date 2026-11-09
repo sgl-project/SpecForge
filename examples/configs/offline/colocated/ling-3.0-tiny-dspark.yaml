@@ -1,3 +1,5 @@
+draft: specforge/config/draft/presets/ling-3.0-tiny-dspark.yaml
+
 # Ling-3.0-tiny DSpark, offline (capture -> train) recipe.
 #
 # Export with `specforge export --format sglang`; the converter writes explicit serving fields.
@@ -7,7 +9,6 @@
 # See scripts/gates/README.md.
 model:
   target_model_path: inclusionAI/Ling-3.0-tiny
-  draft_model_config: configs/ling-3.0-tiny-dspark.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: model.word_embeddings.weight
@@ -20,7 +21,8 @@ data:
   cache_dir: ./cache
 
 training:
-  strategy: dspark
+  objective_options:
+    num_anchors: 128
   num_epochs: 20
   batch_size: 1
   learning_rate: 6.0e-4
@@ -29,7 +31,6 @@ training:
   attention_backend: flex_attention
   # Ling-3.0's 157k vocabulary makes the anchor loss the peak allocation of the
   # step; 128 anchors keeps it inside a 24GB card. Raise it on larger GPUs.
-  num_anchors: 128
   save_interval: 1000
   log_interval: 50
   dist_timeout: 30

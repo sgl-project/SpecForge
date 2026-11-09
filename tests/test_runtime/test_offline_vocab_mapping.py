@@ -9,7 +9,6 @@ from types import SimpleNamespace
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
@@ -17,6 +16,7 @@ from specforge.training.assembly import (
     _prompt_cache_key,
 )
 from specforge.training.vocab_mapping import count_effective_feature_tokens
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 

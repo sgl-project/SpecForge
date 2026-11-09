@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 CUDA = torch.cuda.is_available()
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
@@ -66,7 +66,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
         )
 
         module = trainer.core.strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(trainer.core.strategy.model, FSDP)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 

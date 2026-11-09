@@ -122,75 +122,13 @@ def checkpoint_key_fingerprint(model: Any, keys: Iterable[str]) -> str:
 
 
 @dataclass(frozen=True)
-class TargetDerivedDraftDefaults:
-    """Defaults used when a target config generates a draft config.
-
-    ``populate`` is the algorithm-owned seam for derived values such as
-    DFlash target-layer IDs.  Reading a config and resolving its model/config
-    class remain responsibilities of ``DraftModelRegistry``.
-    """
-
-    model_type: str
-    num_hidden_layers: int
-    draft_vocab_size: int | None = None
-    populate: Factory | None = None
-
-    def __post_init__(self) -> None:
-        _non_empty(self.model_type, field_name="model_type")
-        if (
-            isinstance(self.num_hidden_layers, bool)
-            or not isinstance(self.num_hidden_layers, int)
-            or self.num_hidden_layers <= 0
-        ):
-            raise ValueError("num_hidden_layers must be a positive integer")
-        if self.draft_vocab_size is not None and (
-            isinstance(self.draft_vocab_size, bool)
-            or not isinstance(self.draft_vocab_size, int)
-            or self.draft_vocab_size <= 0
-        ):
-            raise ValueError("draft_vocab_size must be a positive integer or None")
-        if self.populate is not None and not callable(self.populate):
-            raise TypeError("populate must be callable or None")
-
-
-@dataclass(frozen=True)
 class DraftConfigProvider:
-    """Algorithm policy around a registered draft architecture.
-
-    This object does not contain a model/config class and does not load a
-    config.  It supplies algorithm-specific generation and override behavior
-    to the composition root after ``DraftModelRegistry`` resolves the class.
-    """
+    """Resolved architecture identity; construction belongs to modeling."""
 
     architecture: str
-    target_defaults: TargetDerivedDraftDefaults | None = None
-    expected_auto_map_model: str | None = None
-    apply_overrides: Factory | None = None
-    compatible_architectures: FrozenSet[str] | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         _non_empty(self.architecture, field_name="architecture")
-        compatible = self.compatible_architectures
-        if compatible is None:
-            compatible = frozenset({self.architecture})
-        else:
-            compatible = frozenset(compatible)
-            if not compatible:
-                raise ValueError("compatible_architectures must not be empty")
-            for item in compatible:
-                _non_empty(item, field_name="compatible_architectures item")
-            if self.architecture not in compatible:
-                raise ValueError(
-                    "architecture must be included in compatible_architectures"
-                )
-        object.__setattr__(self, "compatible_architectures", compatible)
-        if self.expected_auto_map_model is not None:
-            _non_empty(
-                self.expected_auto_map_model,
-                field_name="expected_auto_map_model",
-            )
-        if self.apply_overrides is not None and not callable(self.apply_overrides):
-            raise TypeError("apply_overrides must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -362,32 +300,25 @@ class StepProvider:
 
 @dataclass(frozen=True)
 class ModelProvider:
-    """Algorithm-owned model assembly hooks.
+    """Capture and data policies resolved from a canonical draft.
 
-    Keeping concrete model imports inside hook functions lets the immutable
-    registry resolve without importing Torch or Transformers.
+    Models, objectives and file loading have independent owners; this runtime
+    port contains no model constructor or configuration mutation hooks.
     """
 
     draft_config: DraftConfigProvider
-    build_draft: Factory
-    build_training_model: Factory
     resolve_capture_layers: Factory
     minimum_loss_tokens: Factory
-    needs_input_tools: Factory
     default_dataloader_num_workers: int
-    allow_missing_warm_start_embedding: bool = False
     loss_mask_filter: Factory | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         if not isinstance(self.draft_config, DraftConfigProvider):
             raise TypeError("draft_config must be a DraftConfigProvider")
         _factories_are_callable(
             (
-                ("build_draft", self.build_draft),
-                ("build_training_model", self.build_training_model),
                 ("resolve_capture_layers", self.resolve_capture_layers),
                 ("minimum_loss_tokens", self.minimum_loss_tokens),
-                ("needs_input_tools", self.needs_input_tools),
             )
         )
         if (
@@ -398,8 +329,6 @@ class ModelProvider:
             raise ValueError(
                 "default_dataloader_num_workers must be a non-negative integer"
             )
-        if not isinstance(self.allow_missing_warm_start_embedding, bool):
-            raise TypeError("allow_missing_warm_start_embedding must be a bool")
         if self.loss_mask_filter is not None and not callable(self.loss_mask_filter):
             raise TypeError("loss_mask_filter must be callable or None")
 
@@ -857,7 +786,6 @@ __all__ = [
     "ServerStreamingProvider",
     "StepProvider",
     "StepRuntimeConfig",
-    "TargetDerivedDraftDefaults",
     "checkpoint_key_fingerprint",
     "make_registration",
     "resolve_server_capture_layout",

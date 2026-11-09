@@ -29,7 +29,6 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
-  strategy: "mtp"
   num_epochs: 10
   max_steps: 10000
   batch_size: 2

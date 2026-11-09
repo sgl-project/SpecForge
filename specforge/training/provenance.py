@@ -267,7 +267,7 @@ def _compute_model_resume_provenance(
     *,
     capture_layers: Optional[list[int]],
 ) -> dict[str, Any]:
-    draft_source = cfg.model.draft_model_config or getattr(
+    draft_source = getattr(
         draft_config,
         "_name_or_path",
         None,
@@ -281,7 +281,6 @@ def _compute_model_resume_provenance(
         "vocab_mapping": model_source_identity(cfg.model.vocab_mapping_path or None),
         "embedding_key": cfg.model.embedding_key,
         "lm_head_key": cfg.model.lm_head_key,
-        "load_target_embedding": cfg.model.load_target_embedding,
         "capture_layers": (
             tuple(int(layer_id) for layer_id in capture_layers)
             if capture_layers is not None

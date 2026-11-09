@@ -11,7 +11,7 @@ Reports, for eager and fused (``SPECFORGE_DFLASH2_FUSED_CONV=0`` / unset):
 Example::
 
     python -m specforge.benchmarks.benchmark_dflash2_conv \\
-        --config configs/qwen3.8-27b-dflash2.json --batch-size 2 \\
+        --config specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml --batch-size 2 \\
         --num-anchors 512 --context-length 4608
 """
 
@@ -19,20 +19,18 @@ import argparse
 import contextlib
 import copy
 import os
+from dataclasses import replace
+from pathlib import Path
 
 import torch
+import yaml
 
-from specforge.algorithms.common.dflash_family_model import (
-    OnlineDFlashModel,
-    create_dflash_block_mask,
-)
-from specforge.modeling.auto import AutoDraftModelConfig
-from specforge.modeling.draft.dflash2 import (
-    FUSED_CONV_ENV,
-    DFlash2DraftModel,
-    DFlashGroupedConv,
-)
-from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.algorithms.objectives.inputs import prepare_blocks
+from specforge.config.draft.codec import parse_draft
+from specforge.modeling import build_draft_model
+from specforge.modeling.draft.layers.conv import GroupedCausalConv
+
+FUSED_CONV_ENV = "SPECFORGE_DFLASH2_FUSED_CONV"
 
 
 @contextlib.contextmanager
@@ -53,7 +51,7 @@ def randomize_convs(model, generator_seed=0):
     generator = torch.Generator(device="cpu").manual_seed(generator_seed)
     with torch.no_grad():
         for module in model.modules():
-            if isinstance(module, DFlashGroupedConv):
+            if isinstance(module, GroupedCausalConv):
                 base = torch.randn(module.base_kernel.shape, generator=generator)
                 base = base * 0.1
                 base[:, 0] += 1.0
@@ -111,7 +109,13 @@ def report_numerics(conv, batch_size, num_tokens):
     shape = (batch_size, num_tokens, hidden)
     inputs = torch.randn(shape, device="cuda").bfloat16()
     delta = (
-        torch.randn(batch_size, num_tokens, conv.taps, conv.num_groups, device="cuda")
+        torch.randn(
+            batch_size,
+            num_tokens,
+            conv.config.kernel_size,
+            conv.num_groups,
+            device="cuda",
+        )
         * 0.1
     ).bfloat16()
     grad_output = torch.randn(shape, device="cuda").bfloat16()
@@ -176,7 +180,7 @@ def benchmark_layer_convs(layer, batch_size, num_tokens, warmup, iters):
             torch.randn(
                 batch_size,
                 num_tokens,
-                conv.taps,
+                conv.config.kernel_size,
                 conv.num_groups,
                 device="cuda",
                 dtype=torch.bfloat16,
@@ -230,76 +234,32 @@ def benchmark_draft(model, config, args):
     """Time the full draft forward+backward on DFlash training-shaped inputs."""
     device = torch.device("cuda")
     batch_size, seq_len = args.batch_size, args.context_length
-    block_size = model.block_size
-    embed = torch.nn.Embedding(config.vocab_size, config.hidden_size).to(
-        device=device, dtype=torch.bfloat16
-    )
-    embed.requires_grad_(False)
-    online = OnlineDFlashModel(
-        draft_model=model,
-        target_lm_head=torch.nn.Identity(),
-        target_embed_tokens=embed,
-        mask_token_id=model.mask_token_id,
-        block_size=block_size,
-        attention_backend="flex_attention",
-        num_anchors=args.num_anchors,
-    )
-    input_ids = torch.randint(
-        0, config.vocab_size, (batch_size, seq_len), device=device
-    )
-    loss_mask = torch.ones(batch_size, seq_len, device=device)
+    block_size = config.spec_config.block.block_size
+    input_ids = torch.randint(config.vocab_size, (batch_size, seq_len), device=device)
     target_hidden = torch.randn(
         batch_size,
         seq_len,
-        len(model.target_layer_ids) * config.hidden_size,
+        len(config.spec_config.target_features.target_layer_ids) * config.hidden_size,
         device=device,
         dtype=torch.bfloat16,
     )
     torch.manual_seed(0)
-    anchors, keep = online._sample_anchor_positions(seq_len, loss_mask, device)
-    noise = online._create_noise_embed(input_ids, anchors, keep)
-    position_ids = torch.cat(
-        [
-            torch.arange(seq_len, device=device).expand(batch_size, -1),
-            online._create_position_ids(anchors),
-        ],
-        dim=1,
+    blocks = prepare_blocks(
+        config,
+        {"input_ids": input_ids, "loss_mask": torch.ones_like(input_ids)},
+        num_anchors=args.num_anchors,
     )
-    mask_args = dict(
-        anchor_positions=anchors,
-        block_keep_mask=keep,
-        S=seq_len,
-        block_size=block_size,
-        device=device,
-        is_causal=getattr(model.config, "is_causal", None),
+    anchors = blocks.anchors
+    grad_output = torch.randn(
+        *blocks.input_ids.shape, config.hidden_size, device=device, dtype=torch.bfloat16
     )
-    if flex_attention_backend() == "FLASH":
-        mask_args["BLOCK_SIZE"] = (256, 128)
-    attention_mask = create_dflash_block_mask(**mask_args)
-    if model.sliding_window is not None:
-        attention_mask = {
-            "full_attention": attention_mask,
-            "sliding_attention": create_dflash_block_mask(
-                **mask_args, sliding_window=model.sliding_window
-            ),
-        }
-    kernel_options = (
-        {"BACKEND": "TRITON"}
-        if torch.__version__ >= "2.11"
-        else {"FORCE_USE_FLEX_ATTENTION": True}
-    )
-    grad_output = torch.randn(noise.shape, device=device, dtype=torch.bfloat16)
 
     def step():
         model.zero_grad(set_to_none=True)
         output = model(
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            noise_embedding=noise,
-            target_hidden=target_hidden,
-            kernel_options=kernel_options,
+            blocks.input_ids, target_hidden, blocks.layer_inputs, output_logits=False
         )
-        output.backward(grad_output)
+        output.hidden_states.backward(grad_output)
 
     print(
         f"\n=== Full DFlash2 draft ({config.num_hidden_layers} layers): "
@@ -320,7 +280,9 @@ def benchmark_draft(model, config, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default="configs/qwen3.8-27b-dflash2.json")
+    parser.add_argument(
+        "--config", default="specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml"
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-anchors", type=int, default=512)
     parser.add_argument("--context-length", type=int, default=4608)
@@ -330,16 +292,22 @@ def main():
     args = parser.parse_args()
 
     print("PyTorch:", torch.__version__, "GPU:", torch.cuda.get_device_name())
-    config = AutoDraftModelConfig.from_file(args.config)
-    config._attn_implementation = "flex_attention"
+    config = parse_draft(
+        yaml.safe_load(Path(args.config).read_text()), target_config=None
+    )
+    config = replace(config, target_bindings=(), target_logit_transform=None)
     torch.manual_seed(0)
-    model = DFlash2DraftModel(config).to(device="cuda", dtype=torch.bfloat16)
+    model = build_draft_model(
+        config, backend="flex_attention", device="cuda", dtype=torch.bfloat16
+    )
     randomize_convs(model)
-    num_tokens = args.num_anchors * model.block_size
+    num_tokens = args.num_anchors * config.spec_config.block.block_size
 
-    report_numerics(model.layers[0].attention_conv, args.batch_size, num_tokens)
+    report_numerics(
+        model.backbone.layers[0].attention_conv, args.batch_size, num_tokens
+    )
     benchmark_layer_convs(
-        model.layers[0], args.batch_size, num_tokens, args.warmup, args.iters
+        model.backbone.layers[0], args.batch_size, num_tokens, args.warmup, args.iters
     )
     if not args.skip_draft:
         benchmark_draft(model, config, args)

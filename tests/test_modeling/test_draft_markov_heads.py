@@ -1,11 +1,10 @@
-"""Independent references for the Markov gates reused by legacy DSpark."""
+"""Independent references for the DSpark Markov gates."""
 
 import unittest
 
 import torch
 import torch.nn.functional as F
 
-from specforge.modeling.draft import dspark
 from specforge.modeling.draft.heads.markov import GatedMarkovHead, RNNMarkovHead
 
 
@@ -16,7 +15,6 @@ class MarkovHeadTest(unittest.TestCase):
         ids = torch.randint(0, 11, (2, 3))
         for kind in (GatedMarkovHead, RNNMarkovHead):
             head = kind(vocab_size=11, markov_rank=4, hidden_size=8)
-            self.assertIs(getattr(dspark, kind.__name__), kind)
             embeddings = F.embedding(ids, head.markov_w1.weight)
             if kind is GatedMarkovHead:
                 gate = F.linear(

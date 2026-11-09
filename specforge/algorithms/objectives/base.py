@@ -1,21 +1,13 @@
 """Objective contracts and the composite module executed by distributed training."""
 
 import math
-from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor, nn
 
+from ..result import ObjectiveResult
 
-@dataclass
-class ObjectiveResult:
-    numerator: Tensor
-    denominator: Tensor
-    ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
-
-    @property
-    def loss(self):
-        return self.numerator / self.denominator.clamp_min(1)
+COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 
 
 def reduce_loss(per_token, weights, *, logits=None, labels=None, ratios=None):
@@ -68,7 +60,16 @@ class ObjectiveModel(nn.Module):
             hidden = batch["target_last_hidden_states"]
             return self.target_head(gather(hidden, positions).detach())
 
-    def forward(self, batch, *, step=0, total_steps=None, alignment_ce=None):
+    def forward(
+        self,
+        batch,
+        *,
+        step=0,
+        total_steps=None,
+        alignment_ce=None,
+        collect_detailed_metrics=True,
+        ce_only=False,
+    ):
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
             key: value.detach() if isinstance(value, Tensor) else value
@@ -79,7 +80,13 @@ class ObjectiveModel(nn.Module):
             if key in batch:
                 batch[key] = batch[key].to(dtype=dtype)
         return self.objective(
-            self, batch, step=step, total_steps=total_steps, alignment_ce=alignment_ce
+            self,
+            batch,
+            step=step,
+            total_steps=total_steps,
+            alignment_ce=alignment_ce,
+            collect_detailed_metrics=collect_detailed_metrics,
+            ce_only=ce_only,
         )
 
 

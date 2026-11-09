@@ -1,6 +1,7 @@
+draft: specforge/config/draft/presets/qwen3-8b-eagle3.yaml
+
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-eagle3.json
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
   embedding_key: model.embed_tokens.weight
@@ -15,13 +16,13 @@ data:
   cache_dir: cache
 
 training:
-  strategy: eagle3
+  objective_options:
+    ttt_length: 7
   num_epochs: 10
   max_steps: 10000
   batch_size: 1
   learning_rate: 1.0e-4
   max_grad_norm: 0.5
-  ttt_length: 7
   attention_backend: flex_attention
   save_interval: 1000
   log_interval: 50

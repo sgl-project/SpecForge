@@ -22,9 +22,8 @@ Llama target and EAGLE3 layer IDs. Then run the CPU preparation client:
 ```bash
 python scripts/prepare_hidden_states.py \
   --server-urls http://127.0.0.1:30000 \
-  --strategy eagle3 \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model-config configs/llama3-8B-eagle3.json \
+  --draft specforge/config/draft/presets/llama3-8B-eagle3.yaml \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \

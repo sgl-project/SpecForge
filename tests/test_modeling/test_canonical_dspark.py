@@ -6,7 +6,6 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import torch
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.block import DraftOnlyBlockSpec
 from specforge.config.draft.architecture.dspark import (
@@ -14,14 +13,10 @@ from specforge.config.draft.architecture.dspark import (
     MarkovHeadSpec,
 )
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dspark import DSparkDraftModel as LegacyDSparkDraftModel
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DSparkDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_dspark_spec import dspark_spec
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -51,111 +46,6 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
 
 
 class CanonicalDSparkTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        torch.manual_seed(0)
-        for kind, with_markov in (
-            (None, False),
-            ("vanilla", True),
-            ("gated", False),
-            ("rnn", True),
-        ):
-            with self.subTest(device=device, dtype=dtype, kind=kind):
-                config = model_config(kind, with_markov=with_markov)
-                actual = build_draft_model(config, device=device, dtype=dtype)
-                legacy = legacy_dflash_config(
-                    block_size=4,
-                    dflash_config={
-                        "target_layer_ids": [1, 3],
-                        "mask_token_id": 63,
-                        "markov_rank": 4 if kind else 0,
-                        "markov_head_type": kind,
-                        "enable_confidence_head": True,
-                        "confidence_head_with_markov": with_markov,
-                    },
-                )
-                reference = LegacyDSparkDraftModel(legacy).to(
-                    device=device, dtype=dtype
-                )
-                reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
-                reference.load_state_dict(
-                    {
-                        legacy_name(n) or n: v
-                        for n, v in actual.state_dict().items()
-                        if n not in ("embed_tokens.weight", "lm_head.weight")
-                    },
-                    strict=True,
-                )
-                embedding, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-                    actual.lm_head
-                )
-                (ids, features, entries), previous = model_inputs(config, device, dtype)
-                other = features.detach().clone().requires_grad_()
-                output = actual(ids, features, entries, predecessor_ids=previous)
-                hidden = reference(
-                    entries[0].position_ids,
-                    noise_embedding=embedding(ids),
-                    target_hidden=other,
-                )
-                base = head(hidden)
-                logits = reference.apply_logits_head(
-                    base.reshape(2, 2, 4, 64),
-                    prev_token_ids=previous.reshape(2, 2, 4),
-                    hidden_states=hidden.reshape(2, 2, 4, 32),
-                ).reshape(2, 8, 64)
-                confidence = reference.predict_confidence(
-                    hidden, prev_token_ids=previous
-                )
-                torch.testing.assert_close(
-                    (output.hidden_states, output.logits, output.confidence_scores),
-                    (hidden, logits, confidence),
-                    rtol=tolerance,
-                    atol=tolerance,
-                )
-                grad, confidence_grad = torch.randn_like(logits), torch.randn_like(
-                    confidence
-                )
-                (
-                    output.logits.mul(grad).sum()
-                    + output.confidence_scores.mul(confidence_grad).sum()
-                ).backward()
-                (
-                    logits.mul(grad).sum() + confidence.mul(confidence_grad).sum()
-                ).backward()
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=tolerance, atol=tolerance
-                )
-                for name, parameter in actual.named_parameters():
-                    ref = (
-                        embedding.weight
-                        if name == "embed_tokens.weight"
-                        else (
-                            head.weight
-                            if name == "lm_head.weight"
-                            else dict(reference.named_parameters())[
-                                legacy_name(name) or name
-                            ]
-                        )
-                    )
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-                    )
-
-    def test_cpu_legacy_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_recurrence_resets_at_block_boundaries(self):
         actual = build_draft_model(model_config())

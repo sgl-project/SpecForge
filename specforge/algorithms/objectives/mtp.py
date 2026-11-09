@@ -7,8 +7,7 @@ import torch
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.fused_loss import ce_l1_loss
 
-from .base import ObjectiveResult, check_options
-from .dflash import COMMON_MODULES
+from .base import COMMON_MODULES, ObjectiveResult, check_options
 from .inputs import gather, sequence_inputs, valid_tokens
 from .registry import register_objective
 

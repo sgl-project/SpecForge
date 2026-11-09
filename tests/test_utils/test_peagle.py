@@ -1,128 +1,16 @@
-import tempfile
+"""P-EAGLE COD sampling preserves target validity and document boundaries."""
+
 import unittest
-from unittest.mock import MagicMock, patch
 
 import torch
-from transformers import LlamaConfig
 
-from specforge.algorithms.peagle.model import (
-    OnlinePEagleModel,
-    compute_peagle_metrics,
+from specforge.algorithms.objectives.peagle_inputs import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
-from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.peagle import PEagleDraftModel
-from specforge.training.model_utils import resolve_mask_token_id
 
 
-class TestPEagleTrainingSemantics(unittest.TestCase):
-    def _tiny_config(self):
-        return LlamaConfig(
-            vocab_size=32,
-            draft_vocab_size=16,
-            hidden_size=16,
-            intermediate_size=32,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            num_hidden_layers=2,
-            max_position_embeddings=64,
-            pad_token_id=0,
-            rms_norm_eps=1e-5,
-        )
-
-    def test_mask_hidden_is_part_of_draft_checkpoint_state(self):
-        config = self._tiny_config()
-        model = PEagleDraftModel(config)
-
-        with torch.no_grad():
-            model.mask_hidden.fill_(3.0)
-
-        reloaded = PEagleDraftModel(config)
-        reloaded.load_state_dict(model.state_dict())
-
-        torch.testing.assert_close(reloaded.mask_hidden, model.mask_hidden)
-
-    def test_rope_parameters_theta_is_used(self):
-        config = self._tiny_config()
-        config.rope_parameters = {"rope_type": "default", "rope_theta": 123456.0}
-
-        model = PEagleDraftModel(config)
-        self.assertEqual(model.rotary_emb.base, 123456.0)
-
-        model._rebuild_rotary_embedding()
-        self.assertEqual(model.rotary_emb.base, 123456.0)
-
-    def test_online_wrapper_uses_draft_model_mask_hidden(self):
-        config = self._tiny_config()
-        draft_model = PEagleDraftModel(config)
-        wrapper = OnlinePEagleModel(draft_model=draft_model, mask_token_id=0)
-
-        self.assertIs(wrapper.draft_model.mask_hidden, draft_model.mask_hidden)
-        self.assertNotIn("mask_hidden", dict(wrapper.named_parameters(recurse=False)))
-
-    def test_peagle_embeddings_are_trainable_by_default(self):
-        config = self._tiny_config()
-        model = PEagleDraftModel(config)
-
-        self.assertTrue(model.embed_tokens.weight.requires_grad)
-
-    def test_norm_before_residual_round_trips_through_config(self):
-        config = self._tiny_config()
-        model = PEagleDraftModel(config, norm_before_residual=True)
-
-        self.assertTrue(model.config.norm_before_residual)
-        with tempfile.TemporaryDirectory() as output_dir:
-            model.save_pretrained(output_dir)
-            direct = PEagleDraftModel.from_pretrained(output_dir)
-            automatic = AutoDraftModel.from_pretrained(output_dir)
-
-        for reloaded in (direct, automatic):
-            self.assertIsInstance(reloaded, PEagleDraftModel)
-            self.assertTrue(reloaded.config.norm_before_residual)
-            self.assertTrue(reloaded.norm_before_residual)
-            self.assertTrue(reloaded.layers[0].norm_before_residual)
-
-    def test_compute_metrics_masks_targets_outside_draft_vocab(self):
-        logits = torch.tensor(
-            [
-                [
-                    [0.0, 4.0],
-                    [4.0, 0.0],
-                    [0.0, 4.0],
-                ]
-            ],
-            dtype=torch.float32,
-        )
-        targets = torch.full((1, 3, 4), -10.0, dtype=torch.float32)
-        targets[0, 0, 1] = 10.0
-        targets[0, 1, 2] = 10.0
-        targets[0, 2, 0] = 10.0
-        loss_mask = torch.ones(1, 3)
-        anchor_pos = torch.tensor([0, 1, 2])
-        depth = torch.tensor([0, 0, 0])
-        t2d = torch.tensor([True, True, False, False])
-
-        def fake_loss(logits, target_p, position_mask):
-            return torch.tensor(0.0, device=logits.device)
-
-        with patch(
-            "specforge.algorithms.peagle.model.LogSoftmaxLoss.apply",
-            side_effect=fake_loss,
-        ):
-            _loss, metrics = compute_peagle_metrics(
-                logits=logits,
-                targets=targets,
-                loss_mask=loss_mask,
-                anchor_pos=anchor_pos,
-                depth=depth,
-                num_depths=1,
-                t2d=t2d,
-            )
-
-        self.assertEqual(metrics["position_0_acc_total"].item(), 2.0)
-        self.assertEqual(metrics["position_0_acc_sum"].item(), 1.0)
-
+class PEagleInputsTest(unittest.TestCase):
     def test_cod_sampling_uses_valid_targets_for_parallel_depths(self):
         torch.manual_seed(0)
         loss_mask = torch.tensor([[0, 1, 1, 1, 0, 1]])
@@ -186,23 +74,6 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
             )
         )
 
-    def test_online_wrapper_rejects_batch_larger_than_one(self):
-        config = self._tiny_config()
-        wrapper = OnlinePEagleModel(
-            draft_model=PEagleDraftModel(config),
-            mask_token_id=0,
-        )
-        input_ids = torch.ones(2, 4, dtype=torch.long)
-
-        with self.assertRaisesRegex(ValueError, "batch size 1"):
-            wrapper(
-                input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                target=torch.zeros(2, 4, config.vocab_size),
-                loss_mask=torch.ones_like(input_ids),
-                hidden_states=torch.zeros(2, 4, 3 * config.hidden_size),
-            )
-
     def test_peagle_mask_respects_documents_depth_order_and_padding(self):
         anchor_pos = torch.tensor([0, 1, 1, 2, 4, 4, 5])
         depth = torch.tensor([0, 0, 1, 0, 0, 1, 0])
@@ -229,63 +100,3 @@ class TestPEagleTrainingSemantics(unittest.TestCase):
         self.assertFalse(allowed(1, 2))  # depth 0 cannot attend a future depth
         self.assertFalse(allowed(4, 3))  # different packed documents
         self.assertFalse(allowed(6, 6))  # padding anchor position
-
-
-class TestPEagleMaskTokenResolution(unittest.TestCase):
-    def _resolve(self, tokenizer, explicit=None):
-        return resolve_mask_token_id(
-            explicit=explicit,
-            tokenizer=tokenizer,
-            embedding_vocab_size=32,
-        )
-
-    def test_explicit_mask_token_is_validated(self):
-        tokenizer = MagicMock()
-        with self.assertRaises(ValueError):
-            self._resolve(tokenizer, explicit=33)
-        with self.assertRaises(ValueError):
-            self._resolve(tokenizer, explicit=-1)
-
-        self.assertEqual(self._resolve(tokenizer, explicit=31), 31)
-
-    def test_tokenizer_mask_token_takes_priority(self):
-        tokenizer = MagicMock()
-        tokenizer.mask_token_id = 7
-        tokenizer.__len__.return_value = 30
-
-        self.assertEqual(self._resolve(tokenizer), 7)
-
-    def test_unused_embedding_slot_takes_priority_over_pad(self):
-        tokenizer = MagicMock()
-        tokenizer.mask_token_id = None
-        tokenizer.pad_token_id = 3
-        tokenizer.eos_token_id = 4
-        tokenizer.unk_token_id = 5
-        tokenizer.__len__.return_value = 30
-
-        self.assertEqual(self._resolve(tokenizer), 30)
-
-    def test_pad_fallback_when_no_mask_or_unused_slot(self):
-        tokenizer = MagicMock()
-        tokenizer.mask_token_id = None
-        tokenizer.pad_token_id = 3
-        tokenizer.eos_token_id = 4
-        tokenizer.unk_token_id = 5
-        tokenizer.__len__.return_value = 32
-
-        self.assertEqual(self._resolve(tokenizer), 3)
-
-    def test_fallback_token_must_fit_embedding_vocab(self):
-        tokenizer = MagicMock()
-        tokenizer.mask_token_id = None
-        tokenizer.pad_token_id = 33
-        tokenizer.eos_token_id = None
-        tokenizer.unk_token_id = None
-        tokenizer.__len__.return_value = 32
-
-        with self.assertRaises(ValueError):
-            self._resolve(tokenizer)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)

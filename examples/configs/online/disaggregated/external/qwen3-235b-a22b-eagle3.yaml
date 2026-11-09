@@ -1,7 +1,8 @@
+draft: specforge/config/draft/presets/qwen3-235B-A22B-eagle3.yaml
+
 # Corrects the legacy qwen3-235b launcher, which accidentally targeted Qwen3-Next-80B.
 model:
   target_model_path: "Qwen/Qwen3-235B-A22B-Instruct-2507"
-  draft_model_config: "configs/qwen3-235B-A22B-eagle3.json"
   vocab_mapping_path: cache/vocab_mapping/qwen3-235b-a22b-eagle3.pt
   target_backend: "sglang"
   embedding_key: "model.embed_tokens.weight"
@@ -13,13 +14,13 @@ data:
   build_dataset_num_proc: 64
   cache_dir: "./cache"
 training:
-  strategy: "eagle3"
+  objective_options:
+    ttt_length: 7
   num_epochs: 2
   max_steps: 10000
   batch_size: 1
   learning_rate: 0.0001
   max_grad_norm: 0.5
-  ttt_length: 7
   attention_backend: "flex_attention"
   tp_size: 1
   save_interval: 1000

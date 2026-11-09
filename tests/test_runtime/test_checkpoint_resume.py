@@ -1069,13 +1069,11 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -1085,19 +1083,8 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=N)
         out_dir = os.path.join(workdir, "out")
 
-        draft_config = AutoDraftModelConfig.from_file(cfg)
-
         def build_model():
-            dm = AutoDraftModel.from_config(
-                draft_config,
-                attention_backend="flex_attention",
-                torch_dtype=torch.bfloat16,
-            ).cuda()
-            dm.load_vocab_mapping(vocab_path)
-            dm.freeze_embedding()
-            return OnlineEagle3Model(
-                dm, length=TTT, attention_backend="flex_attention"
-            ).cuda()
+            return fx.load_eagle3(cfg, target_dir, vocab_path, ttt=TTT)
 
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
         loader = fx.build_offline_eagle3_loader(
@@ -1119,7 +1106,7 @@ class TestCheckpointResume(unittest.TestCase):
         backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
-        strategy = Eagle3TrainStrategy(model, target_head=head)
+        strategy = build_strategy(model, target_head=head)
         core = TrainerCore(strategy, backend)
         ctrl = TrainerController(
             core, run_id="r", output_dir=out_dir, max_steps=3, num_epochs=2
@@ -1204,7 +1191,7 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
@@ -1237,7 +1224,7 @@ class TestCheckpointResume(unittest.TestCase):
                     total_steps=100,
                 )
             )
-            core = TrainerCore(Eagle3TrainStrategy(model, target_head=head), backend)
+            core = TrainerCore(build_strategy(model, target_head=head), backend)
             return model, backend, core
 
         # Reference: one uninterrupted run of TOTAL steps (loss + lr per step).

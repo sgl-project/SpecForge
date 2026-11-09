@@ -67,7 +67,9 @@ class TestTrimPackGolden(unittest.TestCase):
         # position: a legal teacher, never a loss row.
         #   step0: {s : s-0 < 6} = {4,5}   -> rows [4,5],   n=2
         #   step1: all of {4,5,6}          -> rows [3,4,5], n=3
-        from specforge.algorithms.eagle3.model import _build_trim_pack
+        from specforge.algorithms.losses.eagle_teacher import (
+            build_trim_pack as _build_trim_pack,
+        )
 
         tgt, t2d, lm = self._mk([0, 0, 0, 0, 1, 1, 1, 0])
         p = _build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6)
@@ -82,7 +84,9 @@ class TestTrimPackGolden(unittest.TestCase):
     def test_usp_dead_step(self):
         # Supervision only at {6,7} (pure tail). Position 7 can never reach a
         # row (needs j >= 2) and is filtered; 6 is unreachable at step 0.
-        from specforge.algorithms.eagle3.model import _build_trim_pack
+        from specforge.algorithms.losses.eagle_teacher import (
+            build_trim_pack as _build_trim_pack,
+        )
 
         tgt, t2d, lm = self._mk([0, 0, 0, 0, 0, 0, 1, 1])
         p = _build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6)
@@ -93,19 +97,23 @@ class TestTrimPackGolden(unittest.TestCase):
         self.assertEqual(p["nrows_steps"][1], 1)
 
     def test_unreachable_supervision_falls_back(self):
-        from specforge.algorithms.eagle3.model import _build_trim_pack
+        from specforge.algorithms.losses.eagle_teacher import (
+            build_trim_pack as _build_trim_pack,
+        )
 
         tgt, t2d, lm = self._mk([0, 0, 0, 0, 0, 0, 0, 1])
         self.assertIsNone(_build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6))
 
     def test_empty_supervision_falls_back(self):
-        from specforge.algorithms.eagle3.model import _build_trim_pack
+        from specforge.algorithms.losses.eagle_teacher import (
+            build_trim_pack as _build_trim_pack,
+        )
 
         tgt, t2d, lm = self._mk([0] * 8)
         self.assertIsNone(_build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6))
 
     def test_reuses_position_mask_from_teacher_computation(self):
-        from specforge.algorithms.eagle3 import model as eagle_model
+        from specforge.algorithms.losses import eagle_teacher as eagle_model
 
         tgt, t2d, lm = self._mk([0, 1, 0, 1])
         nrows = 2
@@ -117,16 +125,18 @@ class TestTrimPackGolden(unittest.TestCase):
             torch.full((1, nrows, 1), 7),
         )
         with mock.patch.object(
-            eagle_model, "_compute_target_p_eager", return_value=teacher
+            eagle_model, "compute_target_p_eager", return_value=teacher
         ):
-            pack = eagle_model._build_trim_pack(tgt, t2d, lm, length=2)
+            pack = eagle_model.build_trim_pack(tgt, t2d, lm, length=2)
 
         self.assertIs(pack["position_mask_sup"], teacher[3])
 
     def test_non_usp_backcompat(self):
         # chunk_len=None -> C=L: the pre-USP semantics, plus full_len now comes
         # from the row count rather than the (possibly padded) mask length.
-        from specforge.algorithms.eagle3.model import _build_trim_pack
+        from specforge.algorithms.losses.eagle_teacher import (
+            build_trim_pack as _build_trim_pack,
+        )
 
         tgt, t2d, lm = self._mk([1, 0, 0, 0, 1, 0, 0, 1])
         p = _build_trim_pack(tgt, t2d, lm, length=2)
@@ -135,57 +145,6 @@ class TestTrimPackGolden(unittest.TestCase):
         self.assertEqual(p["rows_steps"][1].tolist(), [3, 6])
         self.assertEqual(p["keep_steps"][1].tolist(), [1, 2])
         self.assertEqual(p["nrows_steps"][1], 2)
-
-
-class TestTrimAdapterViews(unittest.TestCase):
-    def _inputs(self):
-        return {
-            "global_input_ids": torch.arange(8).view(1, 8),
-            "hidden_states": torch.arange(24).view(1, 8, 3),
-            "attention_mask": torch.ones(1, 8),
-            "position_ids": torch.arange(16).view(1, 16),
-        }
-
-    def test_default_adapter_keeps_full_backbone_view(self):
-        from specforge.core.eagle3_adapters import BackendAdapter
-
-        adapter = BackendAdapter(model=None)
-        inputs = self._inputs()
-        self.assertEqual(adapter.backbone_row_count(seq_length=8, ttt_length=2), 8)
-
-        view = adapter.backbone_view(row_count=8, **inputs)
-
-        self.assertIs(view.input_ids, inputs["global_input_ids"])
-        self.assertIs(view.hidden_states, inputs["hidden_states"])
-        self.assertIs(view.attention_mask, inputs["attention_mask"])
-        self.assertIs(view.position_ids, inputs["position_ids"])
-
-    def test_usp_adapter_owns_chunk_and_position_slicing(self):
-        from specforge.core import eagle3_adapters
-
-        world_sizes = {"sp": 4, "ulysses": 2}
-        with (
-            mock.patch.object(eagle3_adapters, "get_draft_sp_group", return_value="sp"),
-            mock.patch.object(
-                eagle3_adapters, "get_sp_ulysses_group", return_value="ulysses"
-            ),
-            mock.patch.object(
-                eagle3_adapters.dist,
-                "get_world_size",
-                side_effect=lambda group: world_sizes[group],
-            ),
-        ):
-            adapter = eagle3_adapters.UspAdapter(model=None)
-
-        inputs = self._inputs()
-        row_count = adapter.backbone_row_count(seq_length=8, ttt_length=2)
-        view = adapter.backbone_view(row_count=row_count, **inputs)
-
-        self.assertEqual(row_count, 6)
-        self.assertEqual(view.input_ids.shape, (1, 6))
-        self.assertEqual(view.hidden_states.shape, (1, 6, 3))
-        self.assertEqual(view.attention_mask.shape, (1, 6))
-        self.assertEqual(view.position_ids.shape, (1, 6))
 
 
 @unittest.skipUnless(CUDA, "loss kernel is a Triton kernel")
@@ -265,24 +224,20 @@ def _worker(rank, world_size, port, workdir):
     try:
         import torch.distributed as dist
 
-        from specforge.algorithms.builtin import builtin_algorithm_registry
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+        from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        cfg = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
-        dm = AutoDraftModel.from_config(
-            cfg, attention_backend="usp", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
-        dm.freeze_embedding()
-        model = OnlineEagle3Model(
-            draft_model=dm, length=TTT, attention_backend="usp"
-        ).cuda()
+        model = fx.load_eagle3(
+            os.path.join(workdir, "draft.json"),
+            os.path.join(workdir, "target"),
+            os.path.join(workdir, "vocab_mapping.pt"),
+            ttt=TTT,
+            backend="usp",
+        )
         model.train()
         target_head = TargetHead.from_pretrained(
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
@@ -311,6 +266,9 @@ def _worker(rank, world_size, port, workdir):
             batch = next(iter(loader))
 
             def step_losses(trim):
+                from dataclasses import replace
+
+                model.objective = replace(model.objective, trim_loss_positions=trim)
                 strat = algorithm.providers.step.build(
                     model,
                     target_head=target_head,
@@ -318,7 +276,15 @@ def _worker(rank, world_size, port, workdir):
                 )
                 with torch.no_grad():
                     out = strat.forward_loss(batch)
-                return [float(p.item()) for p in out.metrics["plosses"]]
+                return [
+                    float(
+                        (
+                            out.ratio_metrics[f"position_{i}_loss"][0]
+                            / out.ratio_metrics[f"position_{i}_loss"][1]
+                        ).item()
+                    )
+                    for i in range(TTT)
+                ]
 
             results[case] = {"full": step_losses(False), "trim": step_losses(True)}
 

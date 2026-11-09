@@ -7,7 +7,7 @@ Start the capture service separately (see examples/offline/README.md), then:
         --target-model-path Qwen/Qwen3-8B \
         --data-path ./cache/dataset/sharegpt_train.jsonl \
         --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
-        --chat-template qwen --strategy eagle3
+        --chat-template qwen --draft specforge/config/draft/presets/qwen3-8b-eagle3.yaml
 
 Optional torchrun workers shard samples on CPU; model TP belongs to the server.
 """
@@ -15,6 +15,7 @@ Optional torchrun workers shard samples on CPU; model TP belongs to the server.
 import argparse
 import gzip
 import hashlib
+import json
 import os
 import tempfile
 import uuid
@@ -30,7 +31,6 @@ import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.application import resolve_offline_capture
@@ -39,6 +39,7 @@ from specforge.data.preprocessing import (
     build_eagle3_dataset,
     generate_vocab_mapping_file,
 )
+from specforge.modeling.target.target_utils import load_target_config
 from specforge.offline_capture import OfflineCaptureClient
 from specforge.utils import (
     load_tokenizer,
@@ -66,20 +67,10 @@ def parse_args():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
     model_group.add_argument(
-        "--strategy",
-        type=str,
-        default="eagle3",
-        help="Offline draft strategy (default: eagle3)",
+        "--draft", required=True, help="Complete canonical draft YAML/JSON"
     )
-    model_group.add_argument(
-        "--draft-model-config",
-        type=str,
-        default=None,
-        help=(
-            "Draft config used to resolve capture layers; required by strategies "
-            "without target-derived defaults"
-        ),
-    )
+    model_group.add_argument("--objective", default=None)
+    model_group.add_argument("--objective-options", type=json.loads, default={})
     model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -242,24 +233,26 @@ def _generate_shared_vocab_mapping(
 
 def resolve_offline_capture_plan(
     args: argparse.Namespace,
-    target_config: AutoConfig,
+    target_config,
 ) -> OfflineCapturePlan:
     """Resolve capture layers and output keys through the algorithm registry."""
 
-    strategy = getattr(args, "strategy", "eagle3")
     model = {
         "target_model_path": args.target_model_path,
-        "draft_model_config": getattr(args, "draft_model_config", None),
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }
     cfg = Config(
+        draft=args.draft,
         model=model,
         data={
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        training={
+            "objective": args.objective,
+            "objective_options": args.objective_options,
+        },
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(
@@ -495,7 +488,7 @@ def main():
             Path(__file__).parent.parent, "cache", "hidden_states"
         )
 
-    target_model_config = AutoConfig.from_pretrained(
+    target_model_config = load_target_config(
         args.target_model_path,
         cache_dir=args.cache_dir,
         trust_remote_code=args.trust_remote_code,
@@ -510,7 +503,9 @@ def main():
         print_args_with_dots(args)
         if _rank() == 0:
             print("Resolved draft model config:")
-            print(capture_plan.draft_config.to_json_string(use_diff=False))
+            from specforge.config.draft.codec import encode_config
+
+            print(json.dumps(encode_config(capture_plan.draft_config), indent=2))
         print_with_rank(
             f"Resolved {capture_plan.strategy} offline "
             f"capture method {capture_plan.capture_method!r}, layers: "

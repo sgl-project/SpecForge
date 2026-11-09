@@ -10,7 +10,6 @@ import types
 import unittest
 from unittest import mock
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import bind_run
 from specforge.cli import (
     _bootstrap_single_process_env,
@@ -21,6 +20,7 @@ from specforge.cli import (
     main,
 )
 from specforge.config import Config
+from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
@@ -29,6 +29,8 @@ from specforge.training.disaggregated import (
     _mooncake_store,
     build_disaggregated_run,
 )
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -64,9 +66,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_online_consumer_closes_its_store_after_fit_on_success_and_failure(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "prompts.jsonl"},
-                "training": {"strategy": "dflash", "role": "consumer", "max_steps": 1},
+                "training": {"role": "consumer", "max_steps": 1},
                 "deployment": _disaggregated_deployment(
                     "/shared/close-test", server_urls=["http://capture:30000"]
                 ),
@@ -79,7 +82,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 store.close.side_effect = lambda: events.append("store.close")
                 trainer = _FakeTrainer(error=error, events=events)
                 bundle = types.SimpleNamespace(
-                    model=object(), target_head=None, strategy_kwargs={}
+                    model=types.SimpleNamespace(
+                        objective=types.SimpleNamespace(num_anchors=512)
+                    ),
+                    target_head=None,
+                    strategy_kwargs={},
                 )
                 preflight = mock.Mock(
                     side_effect=lambda _cfg: events.append("preflight")
@@ -134,19 +141,22 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 root = tempfile.mkdtemp(prefix="producer_layout_")
                 cfg = Config.model_validate(
                     {
-                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "model": {"target_model_path": "t"},
+                        "draft": encode_config(draft_config()),
                         "data": {"prompts_path": "prompts.jsonl"},
                         "training": {
-                            "strategy": "dflash",
                             "role": "producer",
                             "max_steps": 1,
-                            "dflash_teacher_metrics": teacher_metrics,
+                            "objective_options": {"teacher_metrics": teacher_metrics},
                         },
                         "deployment": _disaggregated_deployment(
                             root, server_urls=["http://capture:30000"]
                         ),
                     }
                 )
+                from specforge.application import resolve_run
+
+                resolved = resolve_run(cfg)
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
                 preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
                 with (
@@ -176,7 +186,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 ):
                     _build_online(
                         cfg,
-                        algorithm=ALGORITHM,
+                        algorithm=resolved.algorithm,
                         build_model_bundle=mock.Mock(),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
@@ -239,7 +249,8 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_mooncake_quarantine_budget_comes_from_typed_runtime(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
                 "runtime": {"feature_store_max_quarantined_bytes": 1234},
             }
@@ -302,11 +313,9 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     {
                         "model": {
                             "target_model_path": "t",
-                            "draft_model_config": "d",
                         },
                         "data": {"prompts_path": "/prompts.jsonl"},
                         "training": {
-                            "strategy": "dflash",
                             "role": role,
                             "max_steps": 1,
                         },
@@ -350,13 +359,14 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 control = os.path.join(root, "control")
                 cfg = Config.model_validate(
                     {
-                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "model": {"target_model_path": "t"},
+                        "draft": encode_config(draft_config()),
                         "data": (
                             {"hidden_states_path": "/features"}
                             if mode == "offline"
                             else {"prompts_path": "/prompts.jsonl"}
                         ),
-                        "training": {"strategy": "dflash", "role": "consumer"},
+                        "training": {"role": "consumer"},
                         "deployment": _disaggregated_deployment(root),
                     }
                 )
@@ -401,9 +411,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_disaggregated_run_preflights_the_resolved_draft_kernels(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
-                "training": {"strategy": "dflash", "role": "consumer"},
+                "training": {"role": "consumer"},
                 "deployment": _disaggregated_deployment("/shared/attempt"),
             }
         )
@@ -430,10 +441,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
             stream.write("pid=999999\n")
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "producer",
                     "max_steps": 1,
                 },
@@ -495,12 +506,10 @@ class TestCliLifecycle(unittest.TestCase):
             {
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft",
                     "target_backend": "sglang",
                 },
                 "data": {"train_data_path": "train.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "producer",
                     "total_steps": 1,
                 },
@@ -539,7 +548,8 @@ class TestCliLifecycle(unittest.TestCase):
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
                 "training": {
                     "attention_backend": "usp",
@@ -554,10 +564,10 @@ class TestCliLifecycle(unittest.TestCase):
 
         consumer = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "consumer",
                     "total_steps": 10,
                 },

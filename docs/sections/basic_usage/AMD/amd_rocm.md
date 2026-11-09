@@ -139,7 +139,7 @@ see the [Data Preparation](../data_preparation.md) guide.
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
 training loop, and needs no capture service or Mooncake. This section trains a
-**Qwen3.5-4B DFlash** draft (`configs/qwen3.5-4b-dflash.json`).
+**Qwen3.5-4B DFlash** draft (`specforge/config/draft/presets/qwen3.5-4b-dflash.yaml`).
 
 ### Step 1: Capture hidden states
 
@@ -159,8 +159,7 @@ and server flags `--attention-backend aiter --disable-radix-cache
 python scripts/prepare_hidden_states.py \
   --server-urls http://127.0.0.1:30000 \
   --target-model-path Qwen/Qwen3.5-4B \
-  --strategy dflash \
-  --draft-model-config configs/qwen3.5-4b-dflash.json \
+  --draft specforge/config/draft/presets/qwen3.5-4b-dflash.yaml \
   --trust-remote-code \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/qwen3.5-4b-dflash-sharegpt \
@@ -263,7 +262,7 @@ mooncake_master --enable_http_metadata_server=true \
 
 Start the plugin-enabled capture server on GPU 0. **The `--return-aux-hidden-state-layer-ids`
 must match the draft's `target_layer_ids`** — for DFlash these are read straight
-from `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29` (this is not the EAGLE3
+from `specforge/config/draft/presets/qwen3.5-4b-dflash.yaml`: `1 8 15 22 29` (this is not the EAGLE3
 `[1, num_layers//2 - 1, num_layers - 4]` formula). A mismatch produces zero
 features with no error. Because Qwen3.5-4B is a hybrid Mamba target, the server
 must run under **AITER** with `--attention-backend aiter` and

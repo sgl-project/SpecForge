@@ -14,6 +14,9 @@ from unittest import mock
 
 import torch
 
+from specforge.config.draft.codec import encode_config
+from tests.test_config.draft_fixtures import draft_config
+
 CUDA = torch.cuda.is_available()
 
 
@@ -38,18 +41,17 @@ class TestCliConfigBuild(unittest.TestCase):
         feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=4)
 
         run_config = {
+            "draft": cfg_path,
             "model": {
                 "target_model_path": target_dir,
-                "draft_model_config": cfg_path,
                 "vocab_mapping_path": vocab_path,
                 # fixture target dir holds only the lm_head, not an embedding
-                "load_target_embedding": False,
             },
             "data": {"hidden_states_path": feat_dir, "max_length": 512},
             "training": {
                 "batch_size": 2,
                 "accumulation_steps": 1,
-                "ttt_length": 3,
+                "objective_options": {"ttt_length": 3},
                 "max_steps": 4,
                 "max_checkpoints": 2,
                 "log_interval": 1,
@@ -91,9 +93,10 @@ class TestCliDispatch(unittest.TestCase):
 
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
-                "training": {"strategy": "dflash"},
+                "training": {},
             }
         )
         with (
@@ -105,7 +108,7 @@ class TestCliDispatch(unittest.TestCase):
         train.assert_called_once()
         resolved = train.call_args.args[0]
         self.assertIsInstance(resolved, ResolvedRun)
-        self.assertEqual(resolved.config, cfg)
+        self.assertEqual(resolved.config.draft, cfg.draft)
         self.assertEqual(resolved.algorithm.name, "dflash")
 
 

@@ -6,20 +6,17 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
 from unittest import mock
 
 from pydantic import ValidationError
 
-from specforge.algorithms import AlgorithmRegistration, AlgorithmRegistry
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import resolve_run
 from specforge.config import Config, apply_overrides, load_config
 
 MINIMAL = {
+    "draft": "specforge/config/draft/presets/qwen3-8b-eagle3.yaml",
     "model": {
         "target_model_path": "some/target",
-        "draft_model_config": "draft.json",
         "vocab_mapping_path": "/mapping.pt",
     },
     "data": {"hidden_states_path": "/features"},
@@ -39,7 +36,10 @@ def _online_payload(strategy: str = "eagle3") -> dict:
     payload = copy.deepcopy(MINIMAL)
     payload["model"]["target_backend"] = "sglang"
     payload["data"] = {"train_data_path": "/train.jsonl"}
-    payload["training"] = {"strategy": strategy, "max_steps": 1}
+    payload["training"] = {"max_steps": 1}
+    payload["draft"] = f"specforge/config/draft/presets/qwen3-8b-{strategy}.yaml"
+    if strategy == "peagle":
+        payload["training"]["objective_options"] = {"mask_token_id": 151669}
     payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
     if strategy == "mtp":
         from specforge.config.draft.codec import encode_config
@@ -302,12 +302,8 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_target_output_sharding_is_unavailable_with_server_capture(self):
         payload = _online_payload()
         payload["model"]["shard_target_output"] = True
-        cfg = Config.model_validate(payload)
-        self.assertTrue(cfg.model.shard_target_output)
-        with self.assertRaisesRegex(
-            ValueError, "unavailable with external server capture"
-        ):
-            resolve_run(cfg)
+        with self.assertRaisesRegex(ValidationError, "shard_target_output"):
+            Config.model_validate(payload)
 
     def test_sglang_expert_parallelism_must_fit_target_tensor_parallelism(self):
         payload = _managed_local_payload(ep_size=2)
@@ -370,7 +366,7 @@ class ConfigSchemaTest(unittest.TestCase):
             cfg = Config.from_file(path)
             self.assertEqual(cfg.model.target_model_path, "some/target")
             self.assertEqual(cfg.mode, "offline")
-            self.assertEqual(cfg.training.strategy, "eagle3")  # defaults applied
+            self.assertIsNone(cfg.training.objective)
 
     def test_exactly_one_data_source(self):
         with self.assertRaises(ValidationError):
@@ -492,7 +488,6 @@ class ConfigSchemaTest(unittest.TestCase):
             }
         )
         disagg_consumer = Config.model_validate(consumer_payload)
-        resolve_run(disagg_consumer)
         self.assertEqual(
             disagg_consumer.training.resume_from, "/checkpoints/run-latest"
         )
@@ -549,192 +544,77 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_mode"):
             Config.model_validate(payload)
 
-    def test_objective_chunk_blocks_is_shared_and_typed(self):
-        for strategy in ("dflash", "domino", "dspark"):
-            payload = _online_payload(strategy)
-            payload["training"]["objective_chunk_blocks"] = 0
-            payload["training"]["objective_checkpointing"] = False
-            with self.subTest(strategy=strategy):
-                config = Config.model_validate(payload)
-                self.assertEqual(config.training.objective_chunk_blocks, 0)
-                self.assertFalse(config.training.objective_checkpointing)
-
-        payload = _online_payload("dflash")
-        payload["training"]["objective_chunk_blocks"] = -1
-        with self.assertRaisesRegex(ValidationError, "objective_chunk_blocks"):
-            Config.model_validate(payload)
-
-        payload = _online_payload("dspark")
-        payload["training"]["dspark_objective_chunk_blocks"] = 1
-        with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
-            Config.model_validate(payload)
+    def test_objective_options_are_validated_before_assembly(self):
+        for family in ("dflash", "domino", "dspark"):
+            payload = _online_payload(family)
+            payload["training"]["objective_options"] = {
+                "objective_chunk_blocks": 0,
+                "objective_checkpointing": False,
+                "fused_logits_loss": False,
+            }
+            run = resolve_run(Config.model_validate(payload))
+            self.assertFalse(run.config.training.objective_options["fused_logits_loss"])
+            for key, value in (
+                ("objective_chunk_blocks", -1),
+                ("fused_logits_loss", None),
+            ):
+                payload["training"]["objective_options"] = {key: value}
+                with (
+                    self.subTest(family=family, key=key),
+                    self.assertRaisesRegex(ValueError, key),
+                ):
+                    resolve_run(Config.model_validate(payload))
 
     def test_mtp_objective_chunk_size_yaml_reaches_model(self):
         from specforge.algorithms.objectives.mtp import MTPObjective
 
-        for chunk_size in (None, 0, 17):
-            with self.subTest(chunk_size=chunk_size):
-                payload = _online_payload("mtp")
-                if chunk_size is not None:
-                    payload["training"]["mtp_objective_chunk_size"] = chunk_size
-                path = _write(payload, ".yaml")
-                try:
-                    config = load_config(path)
-                finally:
-                    os.unlink(path)
-                # Construction does not run the draft: this tests YAML ->
-                # validated config -> provider -> objective without weights.
-                resolved = resolve_run(config)
-                objective = MTPObjective(**resolved.config.training.objective_options)
-                expected = 4096 if chunk_size is None else chunk_size
-                self.assertEqual(config.training.mtp_objective_chunk_size, expected)
-                self.assertEqual(objective.objective_chunk_size, expected)
-
-        for invalid in (-1, 1.5):
+        for chunk_size in (0, 17):
             payload = _online_payload("mtp")
-            payload["training"]["mtp_objective_chunk_size"] = invalid
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(
-                    ValidationError, "mtp_objective_chunk_size"
-                ):
-                    Config.model_validate(payload)
+            payload["training"]["objective_options"] = {
+                "objective_chunk_size": chunk_size
+            }
+            path = _write(payload, ".yaml")
+            self.addCleanup(os.unlink, path)
+            run = resolve_run(load_config(path))
+            self.assertEqual(
+                MTPObjective(
+                    **run.config.training.objective_options
+                ).objective_chunk_size,
+                chunk_size,
+            )
 
     def test_dflash2_selector_objective_settings_are_bounded(self):
         payload = _online_payload("dflash")
-        payload["training"]["dflash2_selector_loss_alpha"] = 0.25
-        payload["training"]["dflash2_selector_warmup_ratio"] = 0.1
-        payload["training"]["dflash2_selector_ramp_ratio"] = 0.2
-        payload["training"]["dflash2_selector_stop_gradient"] = True
-        config = Config.model_validate(payload)
-        self.assertEqual(config.training.dflash2_selector_loss_alpha, 0.25)
-        self.assertEqual(config.training.dflash2_selector_warmup_ratio, 0.1)
-        self.assertEqual(config.training.dflash2_selector_ramp_ratio, 0.2)
-        self.assertTrue(config.training.dflash2_selector_stop_gradient)
-
-        default_config = Config.model_validate(_online_payload("dflash"))
-        self.assertFalse(default_config.training.dflash2_selector_stop_gradient)
-
-        for field, invalid in (
-            ("dflash2_selector_loss_alpha", -0.1),
-            ("dflash2_selector_warmup_ratio", -0.1),
-            ("dflash2_selector_warmup_ratio", 1.1),
-            ("dflash2_selector_ramp_ratio", -0.1),
-            ("dflash2_selector_ramp_ratio", 1.1),
+        payload["draft"] = "specforge/config/draft/presets/qwen3.5-4b-dflash2.yaml"
+        for key, value in (
+            ("selector_loss_alpha", -0.1),
+            ("selector_warmup_ratio", 1.1),
+            ("selector_ramp_ratio", -0.1),
         ):
-            with self.subTest(field=field, invalid=invalid):
-                invalid_payload = _online_payload("dflash")
-                invalid_payload["training"][field] = invalid
-                with self.assertRaisesRegex(ValidationError, field):
-                    Config.model_validate(invalid_payload)
+            payload["training"]["objective_options"] = {key: value}
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                resolve_run(Config.model_validate(payload))
 
-    def test_dflash_teacher_metrics_is_typed_and_dflash_only(self):
-        default_config = Config.model_validate(_online_payload("dflash"))
-        self.assertTrue(default_config.training.dflash_teacher_metrics)
-
-        online = _online_payload("dflash")
-        online["training"]["dflash_teacher_metrics"] = False
-        offline = copy.deepcopy(MINIMAL)
-        offline["training"] = {"strategy": "dflash", "dflash_teacher_metrics": False}
-        for payload in (online, offline):
-            with self.subTest(data=payload["data"]):
-                resolved = resolve_run(Config.model_validate(payload))
-                self.assertFalse(resolved.config.training.dflash_teacher_metrics)
-
-        for invalid in ("maybe", 2, None):
-            with self.subTest(invalid=invalid):
-                payload = _online_payload("dflash")
-                payload["training"]["dflash_teacher_metrics"] = invalid
-                with self.assertRaisesRegex(ValidationError, "dflash_teacher_metrics"):
-                    Config.model_validate(payload)
-
-        # DSpark and MTP train on the final hidden state; the other families
-        # never request it, so the opt-out would be silently meaningless there.
-        for strategy in ("domino", "dspark", "eagle3", "mtp", "peagle"):
-            with self.subTest(strategy=strategy):
-                payload = _online_payload(strategy)
-                payload["training"]["dflash_teacher_metrics"] = False
-                if strategy == "mtp":
-                    payload["training"]["attention_backend"] = "sdpa"
-                with self.assertRaisesRegex(
-                    ValueError, "does not support training.dflash_teacher_metrics"
-                ):
-                    resolve_run(Config.model_validate(payload))
-
-    def test_dflash_teacher_metrics_reaches_the_training_model(self):
-        from unittest import mock
-
-        from specforge.algorithms.dflash.providers import build_training_model
-
+    def test_teacher_metrics_controls_the_capture_contract(self):
         for enabled in (True, False):
-            with self.subTest(dflash_teacher_metrics=enabled):
-                payload = _online_payload("dflash")
-                payload["training"]["dflash_teacher_metrics"] = enabled
-                config = Config.model_validate(payload)
-                # Construction only: the family builder hands the factory its
-                # shared kwargs, and the objective records the config value.
-                with (
-                    mock.patch(
-                        "specforge.algorithms.common.dflash_family_model."
-                        "OnlineDFlashModel"
-                    ) as model_cls,
-                    mock.patch(
-                        "specforge.algorithms.model_providers."
-                        "_build_dflash_family_model",
-                        side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
-                    ),
-                ):
-                    build_training_model(config, None, None, None, None)
-                self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
-
-    def test_fused_logits_loss_reaches_dflash_family(self):
-        from unittest import mock
-
-        from specforge.algorithms import model_providers
-
-        payload = _online_payload("dflash")
-        self.assertTrue(Config.model_validate(payload).training.fused_logits_loss)
-        payload["training"]["fused_logits_loss"] = None
-        with self.assertRaisesRegex(ValidationError, "fused_logits_loss"):
-            Config.model_validate(payload)
-
-        for strategy, model_name in (
-            ("dflash", "OnlineDFlashModel"),
-            ("dspark", "OnlineDSparkModel"),
-            ("domino", "OnlineDominoModel"),
-            ("dspine", "OnlineDSpineModel"),
-        ):
-            for enabled in (False, True):
-                with self.subTest(strategy=strategy, enabled=enabled):
-                    payload = _online_payload(strategy)
-                    payload["training"]["fused_logits_loss"] = enabled
-                    config = Config.model_validate(payload)
-                    model_module = (
-                        "specforge.algorithms.dspine.model"
-                        if strategy == "dspine"
-                        else "specforge.algorithms.common.dflash_family_model"
-                    )
-                    with (
-                        mock.patch(f"{model_module}.{model_name}") as model_cls,
-                        mock.patch.object(
-                            model_providers,
-                            "_build_dflash_family_model",
-                            side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
-                        ),
-                    ):
-                        getattr(model_providers, f"build_{strategy}_model")(
-                            config, None, None, None, None
-                        )
-                    self.assertIs(
-                        model_cls.call_args.kwargs["fused_logits_loss"], enabled
-                    )
+            payload = _online_payload("dflash")
+            payload["training"]["objective_options"] = {"teacher_metrics": enabled}
+            run = resolve_run(Config.model_validate(payload))
+            layout = run.algorithm.providers.server_streaming_for("text").layout
+            self.assertEqual(
+                layout.last_hidden_feature,
+                "target_last_hidden_states" if enabled else None,
+            )
+        payload = _online_payload("dspark")
+        payload["training"]["objective_options"] = {"teacher_metrics": False}
+        with self.assertRaisesRegex(TypeError, "teacher_metrics"):
+            resolve_run(Config.model_validate(payload))
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
-        payload["training"]["lk_loss_type"] = "tv"
-
-        config = Config.model_validate(payload)
-
-        self.assertEqual(config.training.lk_loss_type, "tv")
+        payload["training"]["objective_options"] = {"lk_loss_type": "tv"}
+        run = resolve_run(Config.model_validate(payload))
+        self.assertEqual(run.config.training.objective_options["lk_loss_type"], "tv")
 
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):
@@ -762,7 +642,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 }
             )
         offline_dflash = Config.model_validate(
-            {**MINIMAL, "training": {"strategy": "dflash"}}
+            {**MINIMAL, "draft": "specforge/config/draft/presets/qwen3-8b-dflash.yaml"}
         )
         resolve_run(offline_dflash)
         self.assertEqual(offline_dflash.mode, "offline")
@@ -776,8 +656,7 @@ class ConfigSchemaTest(unittest.TestCase):
         dspark_payload = _online_payload("dspark")
         dspark_payload["training"].update({"role": "producer", "total_steps": 10})
         dspark = Config.model_validate(dspark_payload)
-        resolve_run(dspark)
-        self.assertEqual(dspark.training.strategy, "dspark")
+        self.assertEqual(resolve_run(dspark).algorithm.name, "dspark")
         # The in-process HF/custom backends were removed with the server-only
         # cutover; retired names must fail at load for BOTH topologies rather
         # than being silently ignored on offline runs.
@@ -791,97 +670,42 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(offline_backend)
 
         unknown = copy.deepcopy(MINIMAL)
-        unknown["training"] = {"strategy": "unknown_algorithm"}
+        unknown["training"] = {"objective": "unknown_algorithm"}
         cfg = Config.model_validate(unknown)
-        with self.assertRaisesRegex(ValueError, "unknown algorithm"):
+        with self.assertRaisesRegex(ValueError, "incompatible"):
             resolve_run(cfg)
 
-    def test_registered_strategy_needs_no_schema_edit(self):
-        name = "config_registry_test"
-        builtin = builtin_algorithm_registry()
-        base = builtin.resolve("eagle3")
-        registration = AlgorithmRegistration(
-            spec=replace(base.spec, name=name),
-            providers=replace(base.providers, algorithm_name=name),
+    def test_registered_objective_needs_no_schema_edit(self):
+        from specforge.algorithms.objectives.registry import (
+            _OBJECTIVES,
+            register_objective,
         )
-        registry = AlgorithmRegistry((registration,))
 
-        payload = copy.deepcopy(MINIMAL)
-        payload["training"] = {"strategy": name}
-        cfg = Config.model_validate(payload)
-        self.assertEqual(cfg.training.strategy, name)
-        self.assertIs(resolve_run(cfg, registry).algorithm, registration)
-        self.assertNotIn(name, builtin.names)
+        entry = _OBJECTIVES["eagle3"]
+        with mock.patch.dict(_OBJECTIVES):
+            register_objective(
+                "custom_loss",
+                architectures=entry.architectures,
+                inputs=entry.inputs,
+                outputs=entry.outputs,
+                trains=entry.trains,
+                default=False,
+            )(entry.factory)
+            run = resolve_run(
+                Config.model_validate(
+                    {**MINIMAL, "training": {"objective": "custom_loss"}}
+                )
+            )
+            self.assertEqual(run.config.training.objective, "custom_loss")
+            self.assertEqual(run.algorithm.name, "eagle3")
 
-    def test_strategy_specific_capture_and_attention_are_validated(self):
-        online = _online_payload()
-        with self.assertRaisesRegex(ValueError, "exactly three"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **online,
-                        "model": {
-                            **online["model"],
-                            "aux_hidden_state_layer_ids": [1, 2],
-                        },
-                    }
-                )
-            )
-
-        with self.assertRaisesRegex(ValueError, "would be ignored"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **online,
-                        "model": {
-                            **online["model"],
-                            "aux_hidden_state_layer_ids": [1, 2, 3],
-                        },
-                        "training": {
-                            **online["training"],
-                            "strategy": "dflash",
-                        },
-                    }
-                )
-            )
-        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **online,
-                        "training": {
-                            **online["training"],
-                            "strategy": "peagle",
-                            "attention_backend": "sdpa",
-                        },
-                    }
-                )
-            )
-        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **online,
-                        "training": {
-                            **online["training"],
-                            "attention_backend": "eager",
-                        },
-                    }
-                )
-            )
-        with self.assertRaisesRegex(ValueError, "does not support attention_backend"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **online,
-                        "training": {
-                            **online["training"],
-                            "strategy": "dflash",
-                            "attention_backend": "fa",
-                        },
-                    }
-                )
-            )
+    def test_architecture_specific_attention_is_validated(self):
+        payload = _online_payload("dflash")
+        payload["training"]["attention_backend"] = "fa"
+        with self.assertRaisesRegex(ValueError, "FA/USP requires EAGLE3"):
+            resolve_run(Config.model_validate(payload))
+        payload["training"]["attention_backend"] = "sdpa"
+        resolve_run(Config.model_validate(payload))
 
     def test_legacy_deployment_fields_are_not_domain_model_fields(self):
         for field, value in (

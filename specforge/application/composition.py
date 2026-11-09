@@ -47,29 +47,9 @@ def resolve_run(
 ) -> ResolvedRun:
     """Resolve and validate all algorithm-owned behavior exactly once."""
 
-    if registry is None:
-        from specforge.algorithms.builtin import builtin_algorithm_registry
-
-        registry = builtin_algorithm_registry()
-    from specforge.training.canonical import enabled
     from specforge.training.canonical import resolve_run as resolve_canonical_run
 
-    if enabled(cfg):
-        cfg, algorithm = resolve_canonical_run(
-            cfg, registry, target_config=target_config
-        )
-        return bind_run(cfg, algorithm)
-    if cfg.training.strategy == "mtp":
-        raise ValueError(
-            "MTP now requires draft and initialization (or resume); "
-            "use the native preset for target initialization, or "
-            "initialization.checkpoint to import historical draft weights"
-        )
-    try:
-        algorithm = registry.resolve(cfg.training.strategy)
-    except KeyError as exc:
-        raise ValueError(str(exc)) from exc
-
+    cfg, algorithm = resolve_canonical_run(cfg, registry, target_config=target_config)
     return bind_run(cfg, algorithm)
 
 
@@ -90,26 +70,22 @@ def resolve_offline_capture(
         raise ValueError("offline capture preparation requires an offline run config")
 
     if target_config is None:
-        from transformers import AutoConfig
+        from specforge.modeling.target.target_utils import load_target_config
 
-        target_config = AutoConfig.from_pretrained(
+        target_config = load_target_config(
             cfg.model.target_model_path,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
 
     from specforge.modeling.target.target_utils import target_text_config
-    from specforge.training.canonical import enabled
     from specforge.training.model_loading import resolve_draft_config
 
-    target = target_text_config(target_config).to_dict() if enabled(cfg) else None
+    target = target_text_config(target_config).to_dict()
     resolved = resolve_run(cfg, registry, target_config=target)
 
     model_provider = resolved.algorithm.providers.model
-    draft_config = resolve_draft_config(
-        resolved.config,
-        provider=model_provider.draft_config,
-    )
+    draft_config = resolve_draft_config(resolved.config, target_config=target)
     layers = tuple(
         model_provider.resolve_capture_layers(cfg, draft_config, target_config)
     )
@@ -159,14 +135,13 @@ def build_application_run(
 ):
     """Build one executable run from the public config contract."""
 
-    from specforge.training.canonical import enabled
     from specforge.training.model_loading import training_target_config
 
-    if isinstance(run, ResolvedRun):
-        resolved = run
-    else:
-        target_config = training_target_config(run) if enabled(run) else None
-        resolved = resolve_run(run, registry, target_config=target_config)
+    resolved = (
+        run
+        if isinstance(run, ResolvedRun)
+        else resolve_run(run, registry, target_config=training_target_config(run))
+    )
     from specforge.training.assembly import build_training_run
 
     return build_training_run(

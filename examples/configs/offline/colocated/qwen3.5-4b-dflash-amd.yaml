@@ -1,10 +1,11 @@
+draft: specforge/config/draft/presets/qwen3.5-4b-dflash.yaml
+
 # Qwen3.5-4B DFlash draft, offline (features captured to disk) — AMD ROCm.
 # Trainer runs on ROCm unchanged (flex_attention). Capture the hidden states with
 # scripts/prepare_hidden_states.py --server-urls pointing at an AITER plugin
 # server with --disable-radix-cache (see docs/sections/basic_usage/AMD/amd_rocm.md, Section 3).
 model:
   target_model_path: "Qwen/Qwen3.5-4B"
-  draft_model_config: "configs/qwen3.5-4b-dflash.json"
   target_backend: "sglang"
   trust_remote_code: true
   embedding_key: "model.language_model.embed_tokens.weight"
@@ -20,7 +21,10 @@ data:
   chat_template: "qwen3.5"
   cache_dir: "./cache"
 training:
-  strategy: "dflash"
+  objective_options:
+    teacher_metrics: false
+    num_anchors: 512
+    loss_decay_gamma: 7
   num_epochs: 10
   max_steps: 10000
   batch_size: 2
@@ -29,8 +33,6 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: "flex_attention"
-  num_anchors: 512
-  loss_decay_gamma: 7
   save_interval: 1000
   log_interval: 50
   dist_timeout: 30

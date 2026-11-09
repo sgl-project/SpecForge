@@ -20,9 +20,9 @@ from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
+from specforge.config.draft.codec import encode_config
 from specforge.launch_plan import (
     _SERVER_CAPTURE_REQUIREMENTS,
     CommandSpec,
@@ -38,6 +38,8 @@ from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
@@ -106,13 +108,14 @@ def _mooncake_clients(plan):
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     raw = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft"},
+        "model": {"target_model_path": "target"},
+        "draft": encode_config(draft_config()),
         "data": (
             {"prompts_path": "prompts.jsonl"}
             if mode == "disaggregated"
             else {"hidden_states_path": "features"}
         ),
-        "training": {"strategy": "dflash", "max_steps": 1},
+        "training": {"max_steps": 1},
         "deployment": {
             "mode": mode,
             "trainer": {
@@ -2903,74 +2906,12 @@ class LaunchPlanTest(unittest.TestCase):
             getrlimit.assert_not_called()
 
     def test_managed_plan_defers_the_trainer_liger_import_check(self):
-        with tempfile.TemporaryDirectory() as root:
-            cfg = _managed_config(os.path.join(root, "attempt"))
-            raw = cfg.model_dump()
-            raw["model"]["use_liger_kernel"] = False
-            disabled = Config.model_validate(raw)
-            with (
-                mock.patch(
-                    "specforge.training.capture_contract.resolve_server_capture_contract",
-                    return_value=CAPTURE_CONTRACT,
-                ),
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config"
-                ) as resolve_draft_config,
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
-                disabled_plan = build_launch_plan(
-                    disabled, config_path="run.yaml", env={}
-                )
-                # Planning only records the check; the preflight runs it.
-                resolve_draft_config.assert_not_called()
-                self.assertEqual(1, len(plan.preflight_checks))
-                self.assertEqual(1, len(disabled_plan.preflight_checks))
-                # An explicit false never resolves the draft or imports Liger.
-                disabled_plan.preflight_checks[0]()
-            resolve_draft_config.assert_not_called()
-            load_liger.assert_not_called()
-
-            draft_config = mock.Mock(hidden_act="silu")
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="rocm",
-                ),
-                mock.patch.dict(
-                    sys.modules,
-                    {"liger_kernel": None, "liger_kernel.transformers": None},
-                ),
-                self.assertRaisesRegex(
-                    ImportError,
-                    r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
-                    r'not be imported.*pip install --no-deps "liger-kernel>=',
-                ),
-            ):
-                plan.preflight_checks[0]()
-
-            draft_config.hidden_act = "gelu"
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="cuda",
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan.preflight_checks[0]()
-            load_liger.assert_not_called()
+        with mock.patch("specforge.training.kernels.resolve_liger") as resolve:
+            plan = _build_managed(_managed_raw("/unused"))
+            resolve.assert_not_called()
+            self.assertEqual(len(plan.preflight_checks), 1)
+            plan.preflight_checks[0]()
+            resolve.assert_called_once()
 
     @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
     def test_managed_preflight_runs_trainer_checks_before_spawning(
@@ -3007,40 +2948,16 @@ class LaunchPlanTest(unittest.TestCase):
         plan = build_launch_plan(
             _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
         )
-        self.assertEqual("supervisor", plan.kind)
-        self.assertEqual(1, len(plan.preflight_checks))
-
-        draft_config = mock.Mock(hidden_act="silu")
         popen = mock.Mock()
         with (
             mock.patch(
-                "specforge.training.model_loading.resolve_draft_config",
-                return_value=draft_config,
+                "specforge.training.kernels.resolve_liger",
+                side_effect=RuntimeError("liger missing"),
             ),
-            mock.patch(
-                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                return_value="cuda",
-            ),
-            mock.patch.dict(
-                sys.modules,
-                {"liger_kernel": None, "liger_kernel.transformers": None},
-            ),
-            self.assertRaisesRegex(
-                ImportError,
-                r"resolved to true \(auto: DFlash on CUDA\) but Liger could not "
-                r'be imported.*Install it \(pip install "liger-kernel>=',
-            ),
+            self.assertRaisesRegex(RuntimeError, "liger missing"),
         ):
             run_commands(plan, popen=popen)
         popen.assert_not_called()
-
-        # A plan built without a registration has nothing to check.
-        self.assertEqual(
-            (),
-            _build_launch_plan(
-                _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
-            ).preflight_checks,
-        )
 
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(

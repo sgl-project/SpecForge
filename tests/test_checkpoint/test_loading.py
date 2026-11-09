@@ -17,8 +17,7 @@ from specforge.checkpoint.tensors import TensorStore
 from specforge.config.draft.codec import decode_legacy_config
 from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
-from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import AutoDraftConfig
+from tests.test_checkpoint.legacy_weights import legacy_state
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_legacy_dflash import legacy_payload
 from tests.test_config.test_draft_legacy_domino import domino_payload
@@ -138,10 +137,6 @@ class LoadingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "does not match"):
                 read_draft(path, adapter="legacy")
-            with self.assertRaisesRegex(ValueError, "canonical"):
-                AutoDraftConfig.from_dict(original.config.to_dict())
-            with self.assertRaisesRegex(ValueError, "canonical"):
-                AutoDraftModel.from_config(original.config)
             with patch("huggingface_hub.snapshot_download", return_value=str(path)):
                 restored = load_draft("test/draft", target=target)
             torch.testing.assert_close(
@@ -297,13 +292,9 @@ class LoadingTest(unittest.TestCase):
                     )
                     payload = json.loads((fixture / "config.json").read_text())
                     state = load_file(fixture / "model.safetensors")
-                    old = SimpleNamespace(state_dict=lambda: state)
                 else:
-                    old = AutoDraftModel.from_config(
-                        AutoDraftConfig.from_dict(payload)
-                    ).float()
-                if factory is eagle_payload:
-                    old.t2d[32:] = False
+                    state = legacy_state(payload["architectures"][0])
+                old = SimpleNamespace(state_dict=lambda state=state: state)
                 path, target = Path(tmp) / "draft", Path(tmp) / "target"
                 path.mkdir()
                 write_target(target)
@@ -337,7 +328,7 @@ class LoadingTest(unittest.TestCase):
                 self.assertEqual(
                     restored.config.draft, read_draft(path, target=target).config
                 )
-                # Every persisted destination is backed by the actual old model.
+                # Every persisted destination is backed by a recorded historical tensor layout.
                 artifact = read_draft(path, target=target)
                 for key, ref in artifact.weights.items():
                     torch.testing.assert_close(

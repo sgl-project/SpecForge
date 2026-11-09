@@ -85,121 +85,30 @@ EAGLE3 offline sequence parallelism is selected with
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
 
-## DFlash-family attention modes
+## Draft components and architectures
 
-DFlash-family draft models select their attention parameterization with
-`dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
-swaps only the attention projections inside the shared decoder layer; the
-`DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
-`DSparkDraftModel` architectures, target-context injection, per-layer
-full/sliding masks, objectives, capture contract, and
-`eager`/`sdpa`/`flex_attention` backend selection are identical across modes.
-Multi-head Latent Attention is therefore a draft JSON change, not a new
-architecture:
+Copy a YAML file from `specforge/config/draft/presets/` and pass its path as
+`draft` in the run config. Named `attention_configs` select GQA, MHA or MLA;
+`mlp_configs` define FFNs; `layer_configs` composes these nodes and `layer_types`
+selects one named layer per position. Attention direction and sliding windows are
+explicit on each attention node. Changing components does not require a new
+training launcher.
 
-```json
-{
-  "architectures": ["DSparkDraftModel"],
-  "hidden_size": 4096,
-  "num_attention_heads": 32,
-  "q_lora_rank": 1536,
-  "kv_lora_rank": 512,
-  "qk_nope_head_dim": 128,
-  "qk_rope_head_dim": 64,
-  "v_head_dim": 128,
-  "dflash_config": {
-    "projector_type": "dspark",
-    "attention_mode": "mla"
-  }
-}
-```
+The canonical codec parses complete configurations into frozen nodes before model
+construction. Architecture schemas register in `config.draft`; model classes use
+`register_draft_model` in `modeling.draft.models`. Component schemas and builders
+register separately. `build_draft_model` dispatches on the single `architectures`
+entry and constructs the declared components without reading files.
 
-MLA dimensions and behavior use the standard top-level Hugging Face fields:
-`q_lora_rank` (`null` selects a direct query projection), `kv_lora_rank`, the
-head dims (`qk_nope_head_dim` may be zero; `qk_rope_head_dim` must be even),
-and `rope_interleave` for the rotation convention (omitted means interleaved,
-the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
-`attention_mode` preserves the existing GQA path; `"mha"` requires equal
-query/KV head counts.
+An objective registers independently in `algorithms.objectives`: it declares the
+architectures, inputs, outputs and trainable modules it supports. The model owns
+learned execution, fusion and heads; the objective owns supervision and loss.
+`training.objective_options` contains training-only settings. See
+[draft training](../../draft_training.md) for loading and optimization options.
 
-MLA checkpoints can be exported as canonical HF artifacts. Use `--format sglang`
-for serving; the converter validates the projection and rotary settings against
-the pinned loader, and rejects unsupported combinations. DFlash2 follows the
-same mode selection; its convolution and selector do not change the attention
-projection contract.
-
-## Draft architectures
-
-Draft classes register through `@register_draft`. The key defaults to the
-class name and must match the single entry in the draft JSON's
-`architectures` list:
-
-```python
-from transformers import PretrainedConfig
-
-from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.registry import register_draft
-
-
-class MyDraftConfig(PretrainedConfig):
-    model_type = "my-draft"
-
-
-@register_draft
-class MyEagle3Draft(Eagle3DraftModel):
-    config_class = MyDraftConfig
-
-    def __init__(self, config, **kwargs):
-        super().__init__(config)
-        ...
-```
-
-Import the module from `specforge/modeling/draft/__init__.py` so registration
-runs before config resolution. A minimal draft config then contains:
-
-```json
-{
-  "architectures": ["MyEagle3Draft"],
-  "model_type": "my-draft",
-  "vocab_size": 128256,
-  "draft_vocab_size": 32000
-}
-```
-
-Point `model.draft_model_config` at that JSON. `AutoDraftConfig` (also available
-under the legacy name `AutoDraftModelConfig`) and the model assembler resolve both the config and model class from the registry; do
-not add a method-specific training launcher.
-
-An architecture alone does not define a new loss. A genuinely new training
-algorithm also needs a pure `AlgorithmSpec`, executable `AlgorithmProviders`,
-and one immutable `AlgorithmRegistration` under `specforge/algorithms`. Its
-step provider may construct a `DraftTrainStrategy`, while its model and data
-providers own algorithm-specific assembly. Add builtin registrations to the
-explicit catalog used by the application composition root; do not add a
-method-specific launcher or a second mutable registry.
-
-### Draft configuration parsing
-
-`specforge.modeling.draft.config.AutoDraftConfig` is the shared loader used by
-training, export, and `AutoDraftModel.from_pretrained` when no explicit config
-object is supplied. Use `from_dict`, `from_file`, or `from_pretrained` (a JSON
-file, directory, or Hugging Face repository). The registered draft model's
-`config_class` remains the authority for HF configuration fields; repository
-loading reads JSON without executing an `auto_map` config implementation.
-Custom draft architectures must be registered locally before loading.
-
-All entry points require exactly one registered `architectures` entry, force
-`tie_word_embeddings=False`, and default an omitted or null `draft_vocab_size`
-to the resolved `vocab_size`, including through the legacy loader. Explicit
-non-positive or non-integer draft vocabulary values are rejected. Nested custom
-fields are preserved and copied so parsing does not modify the caller's input.
-
-Training policy remains separate: explicit `model.draft_model_config` takes
-precedence over checkpoint configuration, then target-derived defaults are used
-when the algorithm supports them. Run overrides are applied afterward by the
-training resolver. Architecture-specific validation still lives in the existing
-providers and model constructors; loading a config alone does not validate all
-model-specific constraints or allocate model weights.
+Export uses `specforge export --format sglang`. The converter checks the complete
+structure against supported serving implementations and rejects incompatible
+component combinations.
 
 ## Fused token losses
 
@@ -244,13 +153,13 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.fused_logits_loss` is a boolean, defaulting to `true` for all supported
+`training.objective_options.fused_logits_loss` is a boolean, defaulting to `true` for all supported
 models, including DFlash2 and Domino. Set `false` to use eager losses.
 Unsupported devices and dtypes fall back to eager. Domino uses its specialized
 CE kernel under the same flag.
 
-`training.objective_chunk_blocks` sets the chunk size, and
-`training.objective_checkpointing` (default `true`) independently controls
+`training.objective_options.objective_chunk_blocks` sets the chunk size, and
+`training.objective_options.objective_checkpointing` (default `true`) independently controls
 recomputation of each chunk's projection and objective. A zero chunk size treats
 the whole objective as one chunk; checkpointing still follows its own flag.
 Without checkpointing, all chunks can retain
@@ -260,7 +169,7 @@ DSpark supervises every slot. Detailed diagnostics retain the full blocks.
 
 The selector consumes top-k candidates and hidden states, computes its own CE,
 and joins the logits backward only through candidate values. Its direct hidden
-state gradient is separate; `training.dflash2_selector_stop_gradient` detaches
+state gradient is separate; `training.objective_options.selector_stop_gradient` detaches
 both inputs.
 Weights, masks and loss coefficients are applied outside the logits operators.
 

@@ -1,22 +1,17 @@
 # coding=utf-8
 """Compact EAGLE3 teacher stays behind the canonical strategy seam."""
 
-import types
 import unittest
 from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.core.compact_teacher import (
     compute_target_from_hidden,
     compute_target_p_padded_from_hidden,
     tiled_logsumexp_argmax,
 )
-from specforge.core.eagle3_adapters import SdpaLikeAdapter
-from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import Eagle3TrainStrategy
-from specforge.utils import padding
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 EAGLE3 = builtin_algorithm_registry().resolve("eagle3")
 
@@ -71,62 +66,6 @@ def _assert_teacher_close(test_case, actual, expected):
     torch.testing.assert_close(actual[1], expected[1], rtol=1e-4, atol=1e-5)
     test_case.assertTrue(torch.equal(actual[2], expected[2]))
     test_case.assertTrue(torch.equal(actual[3], expected[3]))
-
-
-class _TargetHead(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc = torch.nn.Linear(4, 8, bias=False)
-        self.forward_calls = 0
-
-    def preprocess(self, input_ids, target, loss_mask):
-        return (
-            padding(input_ids, left=False),
-            padding(target, left=False),
-            padding(loss_mask, left=False)[..., None],
-        )
-
-    def forward(self, hidden):
-        self.forward_calls += 1
-        return self.fc(hidden)
-
-
-class _Draft(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.config = types.SimpleNamespace(draft_vocab_size=3)
-        t2d, d2t = _mapping()
-        self.register_buffer("t2d", t2d)
-        self.register_buffer("d2t", d2t)
-        self.weight = torch.nn.Parameter(torch.zeros(1))
-
-
-class _Eagle3(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.draft_model = _Draft()
-        self.kwargs = None
-
-    def forward(self, **kwargs):
-        self.kwargs = kwargs
-        value = self.draft_model.weight.sum() + 1.0
-        one = [value]
-        return one, one, one, one, one, one, one
-
-
-def _batch(target_repr="hidden_state"):
-    return TrainBatch(
-        tensors={
-            "input_ids": torch.tensor([[1, 2, 3, 4]]),
-            "attention_mask": torch.ones(1, 4, dtype=torch.long),
-            "loss_mask": torch.ones(1, 4, dtype=torch.long),
-            "hidden_state": torch.randn(1, 4, 4),
-            "target": torch.randn(1, 4, 4 if target_repr == "hidden_state" else 8),
-        },
-        sample_ids=["sample-0"],
-        strategy="eagle3",
-        metadata={"target_repr": target_repr},
-    )
 
 
 class CompactTeacherStrategyTest(unittest.TestCase):
@@ -214,69 +153,6 @@ class CompactTeacherStrategyTest(unittest.TestCase):
         self.assertTrue(torch.all(actual[1][:, -length:] == 0.0))
         self.assertTrue(torch.all(actual[2][:, -length:] == 0))
 
-    def test_multistep_teacher_views_match_full_vocab_reference(self):
-        hidden, weight, t2d, loss_mask = _numerical_inputs(torch.bfloat16)
-        full_logits = torch.nn.functional.linear(hidden, weight)
-        ttt_length = 3
-        expected = _reference_padded_teacher(full_logits, t2d, loss_mask, ttt_length)
-        actual = compute_target_p_padded_from_hidden(
-            hidden, weight, t2d, loss_mask, ttt_length, chunk_size=7
-        )
-        adapter = SdpaLikeAdapter(model=None)
-        input_ids = torch.zeros(hidden.shape[:2], dtype=torch.long)
-        expected_position_mask = expected[3]
-        actual_position_mask = actual[3]
-        expected_loss_mask = loss_mask.clone()
-        actual_loss_mask = loss_mask.clone()
-
-        for step in range(ttt_length):
-            common = {
-                "idx": step,
-                "ttt_length": ttt_length,
-                "global_input_ids": input_ids,
-                "attention_mask": None,
-                "position_ids": None,
-                "hidden_states": hidden,
-                "seq_length": hidden.shape[1],
-            }
-            expected_view = adapter.step_view(
-                loss_mask=expected_loss_mask,
-                target_p_padded=expected[0],
-                target_p_on_draft_padded=expected[1],
-                target_token_ids_padded=expected[2],
-                position_mask=expected_position_mask,
-                **common,
-            )
-            actual_view = adapter.step_view(
-                loss_mask=actual_loss_mask,
-                target_p_padded=actual[0],
-                target_p_on_draft_padded=actual[1],
-                target_token_ids_padded=actual[2],
-                position_mask=actual_position_mask,
-                **common,
-            )
-            _assert_teacher_close(
-                self,
-                (
-                    actual_view.target_p,
-                    actual_view.target_p_on_draft,
-                    actual_view.target_token_ids,
-                    actual_view.position_mask,
-                ),
-                (
-                    expected_view.target_p,
-                    expected_view.target_p_on_draft,
-                    expected_view.target_token_ids,
-                    expected_view.position_mask,
-                ),
-            )
-            self.assertTrue(torch.equal(actual_view.loss_mask, expected_view.loss_mask))
-            if step != ttt_length - 1:
-                expected_position_mask = padding(expected_position_mask, left=False)
-                actual_position_mask = padding(actual_position_mask, left=False)
-                expected_loss_mask = padding(expected_loss_mask, left=False)
-                actual_loss_mask = padding(actual_loss_mask, left=False)
-
     def test_numerical_inputs_are_validated(self):
         hidden, weight, t2d, loss_mask = _numerical_inputs()
         cases = (
@@ -306,80 +182,6 @@ class CompactTeacherStrategyTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     operation()
 
-    def test_compact_path_skips_full_vocab_target_projection(self):
-        model = _Eagle3()
-        head = _TargetHead()
-        strategy = Eagle3TrainStrategy(
-            model,
-            target_head=head,
-            compact_teacher=True,
-            compact_teacher_chunk_size=2,
-        )
-
-        strategy.forward_loss(_batch())
-
-        self.assertEqual(head.forward_calls, 0)
-        self.assertIsNone(model.kwargs["target"])
-        self.assertEqual(model.kwargs["target_hidden_for_compact"].shape, (1, 4, 4))
-        self.assertIs(model.kwargs["target_head_weight"], head.fc.weight)
-        self.assertEqual(model.kwargs["compact_teacher_chunk_size"], 2)
-        self.assertEqual(model.kwargs["loss_mask"].shape, (1, 4, 1))
-        self.assertEqual(model.kwargs["loss_mask"].squeeze(-1).tolist(), [[1, 1, 1, 0]])
-
-    def test_default_path_remains_full_vocab_projection(self):
-        model = _Eagle3()
-        head = _TargetHead()
-
-        Eagle3TrainStrategy(model, target_head=head).forward_loss(_batch())
-
-        self.assertEqual(head.forward_calls, 1)
-        self.assertEqual(model.kwargs["target"].shape, (1, 4, 8))
-        self.assertNotIn("target_hidden_for_compact", model.kwargs)
-        self.assertFalse(model.kwargs["trim_loss_positions"])
-
-    def test_compact_path_rejects_online_target_repr(self):
-        strategy = Eagle3TrainStrategy(
-            _Eagle3(), target_head=_TargetHead(), compact_teacher=True
-        )
-        with self.assertRaisesRegex(ValueError, "offline-only"):
-            strategy.forward_loss(_batch(target_repr="logits"))
-
-    def test_step_provider_forwards_eagle3_strategy_kwargs(self):
-        model = _Eagle3()
-        strategy = EAGLE3.providers.step.build(
-            model,
-            target_head=_TargetHead(),
-            trim_loss_positions=True,
-            compact_teacher=True,
-            compact_teacher_chunk_size=4,
-        )
-        strategy.forward_loss(_batch())
-        self.assertTrue(strategy.trim_loss_positions)
-        self.assertTrue(model.kwargs["trim_loss_positions"])
-        self.assertTrue(strategy.compact_teacher)
-        self.assertEqual(strategy.compact_teacher_chunk_size, 4)
-
-    def test_invalid_mapping_fails_during_assembly(self):
-        model = _Eagle3()
-        model.draft_model.d2t[0] += 1
-        with self.assertRaisesRegex(ValueError, "inconsistent"):
-            Eagle3TrainStrategy(model, target_head=_TargetHead(), compact_teacher=True)
-
-    def test_strategy_rejects_invalid_compact_configuration(self):
-        cases = (
-            ({"target_head": None}, "requires the offline target_head"),
-            ({"compact_teacher_chunk_size": 0}, "positive integer"),
-        )
-        for kwargs, message in cases:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValueError, message):
-                    parameters = {
-                        "target_head": _TargetHead(),
-                        "compact_teacher": True,
-                        **kwargs,
-                    }
-                    Eagle3TrainStrategy(_Eagle3(), **parameters)
-
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

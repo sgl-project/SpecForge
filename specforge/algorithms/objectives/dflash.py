@@ -2,13 +2,11 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
-
-from .base import check_options, reduce_loss
+from ..losses.dflash_reduction import reduce_dflash
+from .base import COMMON_MODULES
+from .block_options import DFlashLossOptions
 from .inputs import prepare_blocks
 from .registry import register_objective
-
-COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 
 
 @register_objective(
@@ -19,27 +17,22 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
     trains=COMMON_MODULES,
 )
 @dataclass
-class DFlashObjective:
-    num_anchors: int = 512
-    loss_decay_gamma: float | None = None
-
-    def __post_init__(self):
-        check_options(
-            counts={"num_anchors": self.num_anchors},
-            positive={"loss_decay_gamma": self.loss_decay_gamma},
-        )
-
-    def __call__(self, runtime, batch, **context):
+class DFlashObjective(DFlashLossOptions):
+    def __call__(self, runtime, batch, *, collect_detailed_metrics=True, **context):
         model = runtime.draft_model
-        blocks = prepare_blocks(
-            model.config.draft,
-            batch,
-            num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+        blocks = prepare_blocks(model.config.draft, batch, num_anchors=self.num_anchors)
+        output = model(
+            blocks.input_ids,
+            batch["hidden_states"],
+            blocks.layer_inputs,
+            output_logits=False,
         )
-        output = model(blocks.input_ids, batch["hidden_states"], blocks.layer_inputs)
-        logits = output.logits.reshape(*blocks.labels.shape, -1)
-        terms = ce_l1_loss(logits, blocks.labels)
-        return reduce_loss(
-            terms.cross_entropy, blocks.weights, logits=logits, labels=blocks.labels
+        return reduce_dflash(
+            model,
+            self,
+            runtime.target_head,
+            output.hidden_states,
+            blocks,
+            target_last_hidden_states=batch.get("target_last_hidden_states"),
+            collect_detailed_metrics=collect_detailed_metrics,
         )

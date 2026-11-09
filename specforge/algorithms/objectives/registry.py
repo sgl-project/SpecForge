@@ -45,7 +45,7 @@ def build_objective_model(
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
-    for prefix in frozen:
+    for prefix in (*frozen, *getattr(objective, "frozen_modules", ())):
         try:
             module = draft_model.get_submodule(prefix)
         except AttributeError:

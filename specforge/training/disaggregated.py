@@ -478,7 +478,7 @@ def _build_offline(
                         cfg.model.input_modality
                     ).build_reader,
                     run_id=cfg.run_id,
-                    ttt_length=cfg.training.ttt_length,
+                    ttt_length=cfg.training.objective_options.get("ttt_length", 7),
                     max_len=cfg.data.max_length,
                     on_ref=tracked_refs.append,
                 )
@@ -553,7 +553,7 @@ def _build_offline(
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
-        ttt_length=cfg.training.ttt_length,
+        ttt_length=cfg.training.objective_options.get("ttt_length", 7),
         max_len=cfg.data.max_length,
         batch_size=cfg.training.batch_size,
         accumulation_steps=accumulation_steps,
@@ -659,7 +659,6 @@ def _build_online(
         )
         draft_config = resolve_draft_config(
             cfg,
-            provider=algorithm.providers.model.draft_config,
         )
         if input_adapter is None:
             prompts = prepare_prompts(
@@ -858,7 +857,7 @@ def _build_online(
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
         consumer_dispatch=cfg.runtime.consumer_dispatch,
-        dispatch_num_anchors=cfg.training.num_anchors,
+        dispatch_num_anchors=getattr(bundle.model.objective, "num_anchors", None),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

@@ -1,12 +1,11 @@
 """RoPE positions describe local token chunks before Ulysses exchanges."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
-from specforge.core.eagle3_adapters import UspAdapter
-from specforge.data.preprocessing import OfflineEagle3Dataset
-from specforge.data.utils import DataCollatorWithPadding
+from specforge.training.canonical_data import normalize_sample, shard_sequence
 
 
 def _raw(length):
@@ -14,37 +13,18 @@ def _raw(length):
     return {
         "input_ids": ids,
         "loss_mask": torch.ones_like(ids),
-        "aux_hidden_state": ids.unsqueeze(-1).expand(-1, -1, 6).float(),
-        "hidden_state": ids.unsqueeze(-1).expand(-1, -1, 2).float(),
+        "hidden_states": ids.unsqueeze(-1).expand(-1, -1, 6).float(),
+        "target_last_hidden_states": ids.unsqueeze(-1).expand(-1, -1, 2).float(),
     }
 
 
 def _batch_and_view(raw, *, rank, ulysses, ring, max_len, overlap):
-    shard = OfflineEagle3Dataset.process_data_usp(
-        raw,
-        max_len=max_len,
-        ttt_length=overlap,
-        sp_rank=rank,
-        sp_size=ulysses * ring,
-        ring_rank=rank // ulysses,
-        sp_ring_size=ring,
-    )
-    # Only topology sizes are needed for these CPU-only contracts.
-    collator = DataCollatorWithPadding.__new__(DataCollatorWithPadding)
-    collator.sp_degree = ulysses * ring
-    collator.ulysses_degree = ulysses
-    batch = collator([shard])
-    adapter = UspAdapter.__new__(UspAdapter)
-    adapter.sp_ulysses_degree = ulysses
-    rows = adapter.backbone_row_count(
-        seq_length=batch["hidden_state"].shape[1], ttt_length=overlap
-    )
-    view = adapter.backbone_view(
-        row_count=rows,
-        global_input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        position_ids=batch["position_ids"],
-        hidden_states=batch["hidden_state"],
+    sample = normalize_sample(raw, keys=tuple(raw), max_len=max_len)
+    shard = shard_sequence(sample, rank=rank, size=ulysses * ring, overlap=overlap)
+    rows = shard["hidden_states"].shape[1] - overlap
+    view = SimpleNamespace(
+        position_ids=shard["position_ids"],
+        hidden_states=shard["hidden_states"][:, :rows],
     )
     return shard, view
 
@@ -112,7 +92,7 @@ class UspPositionIdsTest(unittest.TestCase):
                             expected_attention = torch.zeros_like(expected_ids)
                             expected_attention[:, :valid] = 1
                             torch.testing.assert_close(
-                                shard["attention_mask"], expected_attention
+                                shard["attention_mask"], expected_attention.bool()
                             )
                             expected_loss = expected_attention.clone()
                             last = global_len - 1 - start
@@ -121,7 +101,10 @@ class UspPositionIdsTest(unittest.TestCase):
                             torch.testing.assert_close(
                                 shard["loss_mask"], expected_loss
                             )
-                            for name, width in (("hidden_state", 6), ("target", 2)):
+                            for name, width in (
+                                ("hidden_states", 6),
+                                ("target_last_hidden_states", 2),
+                            ):
                                 torch.testing.assert_close(
                                     shard[name],
                                     expected_ids.unsqueeze(-1)

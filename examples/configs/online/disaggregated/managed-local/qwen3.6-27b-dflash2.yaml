@@ -1,11 +1,11 @@
+draft: specforge/config/draft/presets/qwen3.6-27b-dflash2.yaml
+
 model:
   target_model_path: /disk3/wjp/pretrained_models/Qwen3.6-27B
-  draft_model_config: configs/qwen3.6-27b-dflash2.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: model.language_model.embed_tokens.weight
   torch_dtype: bfloat16
-  mask_token_id: 248070
   sglang_context_length: 8250
 
 data:
@@ -16,9 +16,18 @@ data:
   build_dataset_num_proc: 64
 
 training:
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 7.0
+    lk_loss_type: lambda
+    loss_type: dpace
+    objective_chunk_blocks: 128
+    objective_checkpointing: false
+    selector_loss_alpha: 1.0
+    selector_warmup_ratio: 0.0005
+    selector_ramp_ratio: 0.0005
   # DFlash2 shares DFlash capture/data semantics; the draft architecture turns
   # on the local convolutions and candidate-selector objective.
-  strategy: dflash
   num_epochs: 60000
   max_steps: 100000
   batch_size: 1
@@ -27,17 +36,8 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1.0
   attention_backend: flex_attention
-  num_anchors: 512
-  loss_decay_gamma: 7.0
-  lk_loss_type: lambda
-  loss_type: dpace
-  objective_chunk_blocks: 128
   # Measured without objective checkpointing: keep each chunk's logits for
   # backward instead of recomputing the 248k-vocabulary projection.
-  objective_checkpointing: false
-  dflash2_selector_loss_alpha: 1.0
-  dflash2_selector_warmup_ratio: 0.0005
-  dflash2_selector_ramp_ratio: 0.0005
   save_interval: 200
   log_interval: 1
   dist_timeout: 30

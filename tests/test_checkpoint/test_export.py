@@ -97,8 +97,7 @@ class CanonicalExportTest(unittest.TestCase):
             self.assertFalse((root / "bad").exists())
 
     def test_legacy_import_requires_target_and_preserves_precision(self):
-        from specforge.modeling.auto import AutoDraftModel
-        from specforge.modeling.draft.config import AutoDraftConfig
+        from tests.test_checkpoint.legacy_weights import legacy_state
         from tests.test_checkpoint.test_loading import write_target
         from tests.test_config.test_draft_legacy_dflash import legacy_payload
 
@@ -120,13 +119,12 @@ class CanonicalExportTest(unittest.TestCase):
                 payload["dflash_config"].update(
                     mask_token_id=63, target_layer_ids=[1, 3]
                 )
-                old = AutoDraftModel.from_config(AutoDraftConfig.from_dict(payload)).to(
-                    dtype
-                )
+                state = {
+                    k: v.to(dtype) if v.is_floating_point() else v
+                    for k, v in legacy_state("DFlashDraftModel").items()
+                }
                 (root / "legacy.json").write_text(json.dumps(payload))
-                torch.save(
-                    {"draft_state_dict": old.state_dict()}, root / "training_state.pt"
-                )
+                torch.save({"draft_state_dict": state}, root / "training_state.pt")
                 write_target(root / "target")
                 with self.assertRaisesRegex(ValueError, "target configuration"):
                     export_to_hf(
@@ -141,5 +139,5 @@ class CanonicalExportTest(unittest.TestCase):
                 restored = load_draft(root / "hf", target=root / "target")
                 self.assertEqual(restored.fusion.fc.weight.dtype, dtype)
                 torch.testing.assert_close(
-                    restored.fusion.fc.weight, old.fc.weight, rtol=0, atol=0
+                    restored.fusion.fc.weight, state["fc.weight"], rtol=0, atol=0
                 )

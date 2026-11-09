@@ -1,4 +1,4 @@
-"""Canonical model implementations; legacy entry points remain during migration."""
+"""Canonical model implementations and their independent registry."""
 
 from .dflash import DFlashDraftModel
 from .dflash2 import DFlash2DraftModel

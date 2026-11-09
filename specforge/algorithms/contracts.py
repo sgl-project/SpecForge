@@ -241,7 +241,7 @@ class AlgorithmCapabilities:
     supports_trim_loss_positions: bool = False
     supports_vocab_mapping: bool = False
     allows_aux_layer_override: bool = False
-    #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
+    #: ``training.objective_options.teacher_metrics=false`` can drop the teacher-only
     #: final hidden state from the streaming capture.
     supports_teacher_metrics_opt_out: bool = False
     #: The draft builder wires ``model.use_liger_kernel`` into its modules.

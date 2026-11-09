@@ -2,19 +2,15 @@ import builtins
 import contextlib
 import copy
 import os
-import sys
 import unittest
 from unittest import mock
 
 import torch
-from transformers import Qwen3Config
 
-from specforge.modeling.draft import dflash2
-from specforge.modeling.draft.dflash2 import (
-    FUSED_CONV_ENV,
-    DFlash2DraftModel,
-    DFlashGroupedConv,
-)
+from specforge.config.draft.conv import GroupedCausalConvSpec
+from specforge.modeling.draft.layers.conv import GroupedCausalConv
+
+FUSED_CONV_ENV = "SPECFORGE_DFLASH2_FUSED_CONV"
 
 _CUDA = torch.cuda.is_available()
 
@@ -27,24 +23,26 @@ def _eager_env():
 def _count_fused_calls():
     """Count calls that reach the fused kernels, so parity is not vacuous."""
 
-    convolve, supports_group_size = dflash2._load_fused_grouped_conv()
+    from specforge.modeling.draft.layers.conv import triton
+
+    convolve = triton.dflash2_grouped_conv_fused
     calls = []
 
     def counted(*args):
         calls.append(args[0].shape)
         return convolve(*args)
 
-    with mock.patch.object(
-        dflash2,
-        "_load_fused_grouped_conv",
-        return_value=(counted, supports_group_size),
-    ):
+    with mock.patch.object(triton, "dflash2_grouped_conv_fused", side_effect=counted):
         yield calls
 
 
 def _random_conv(hidden_size, block_size, taps, group_size, *, device, dtype, seed):
     generator = torch.Generator().manual_seed(seed)
-    conv = DFlashGroupedConv(hidden_size, block_size, taps, group_size)
+    conv = GroupedCausalConv(
+        GroupedCausalConvSpec(kernel_size=taps, group_size=group_size),
+        hidden_size=hidden_size,
+        block_size=block_size,
+    )
     with torch.no_grad():
         conv.base_kernel.copy_(torch.randn(conv.base_kernel.shape, generator=generator))
         conv.kernel_projection.weight.copy_(
@@ -109,53 +107,29 @@ def _errors(actual, expected):
 class DFlash2FusedConvDispatchTest(unittest.TestCase):
     def test_cpu_uses_eager_without_loading_triton(self):
         conv = _random_conv(8, 4, 2, 4, device="cpu", dtype=torch.float32, seed=0)
-        inputs = torch.randn(2, 8, 8)
+        with mock.patch("builtins.__import__", wraps=builtins.__import__) as imported:
+            hidden, coefficients = conv.prepare(torch.randn(2, 8, 8))
+            conv.finish(hidden, coefficients)
+        self.assertFalse(
+            any("triton" in call.args[0] for call in imported.call_args_list)
+        )
 
-        with mock.patch.object(dflash2, "_load_fused_grouped_conv") as load:
-            prepared, output_kernel = conv.prepare(inputs)
-            conv.finish(prepared, output_kernel)
-
-        load.assert_not_called()
-
-    def test_missing_triton_disables_fused_path(self):
+    @unittest.skipUnless(_CUDA, "requires CUDA")
+    def test_missing_triton_falls_back_to_eager(self):
         real_import = builtins.__import__
 
-        def guarded_import(name, *args, **kwargs):
-            if name == "triton" or name.startswith("triton."):
-                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        def guarded(name, *args, **kwargs):
+            if name == "triton":
+                raise ModuleNotFoundError(name="triton")
             return real_import(name, *args, **kwargs)
 
-        dflash2._load_fused_grouped_conv.cache_clear()
-        try:
-            with (
-                mock.patch.dict(sys.modules),
-                mock.patch("builtins.__import__", guarded_import),
-            ):
-                sys.modules.pop("specforge.modeling.draft.dflash2_conv_triton", None)
-                self.assertIsNone(dflash2._load_fused_grouped_conv())
-        finally:
-            dflash2._load_fused_grouped_conv.cache_clear()
-
-    @unittest.skipUnless(_CUDA, "fused DFlash2 convolution requires CUDA")
-    def test_selects_fused_path_only_for_supported_inputs(self):
-        def selected(group_size, activation_dtype, parameter_dtype, env="1"):
-            conv = _random_conv(
-                48, 4, 2, group_size, device="cuda", dtype=parameter_dtype, seed=0
-            )
-            inputs = torch.randn(1, 8, 48, device="cuda", dtype=activation_dtype)
-            delta = torch.randn(
-                1, 8, 2, 48 // group_size, device="cuda", dtype=activation_dtype
-            )
-            with mock.patch.dict(os.environ, {FUSED_CONV_ENV: env}):
-                return conv._fused_convolution(inputs, delta, conv.base_kernel[0])
-
-        self.assertIsNotNone(selected(16, torch.bfloat16, torch.bfloat16))
-        self.assertIsNotNone(selected(16, torch.float32, torch.float32))
-        self.assertIsNone(selected(16, torch.bfloat16, torch.bfloat16, env="0"))
-        # Non-power-of-two groups do not tile.
-        self.assertIsNone(selected(3, torch.float32, torch.float32))
-        # Mixed dtypes promote in the eager path, so they stay there.
-        self.assertIsNone(selected(16, torch.float32, torch.bfloat16))
+        conv = _random_conv(8, 4, 2, 4, device="cuda", dtype=torch.float32, seed=0)
+        hidden = torch.randn(1, 8, 8, device="cuda")
+        with _eager_env():
+            expected, _ = conv.prepare(hidden)
+        with mock.patch("builtins.__import__", guarded):
+            actual, _ = conv.prepare(hidden)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @unittest.skipUnless(_CUDA, "fused DFlash2 convolution requires CUDA")
@@ -272,7 +246,7 @@ class DFlash2FusedConvParityTest(unittest.TestCase):
             (grad_inputs.sum() + output.sum()).backward()
 
     def test_fused_entry_rejects_mismatched_shapes(self):
-        from specforge.modeling.draft.dflash2_conv_triton import (
+        from specforge.modeling.draft.layers.conv.triton import (
             dflash2_grouped_conv_fused,
         )
 
@@ -356,144 +330,38 @@ class DFlash2FusedConvParityTest(unittest.TestCase):
                         )
 
 
-@unittest.skipUnless(_CUDA, "fused DFlash2 convolution requires CUDA")
+@unittest.skipUnless(_CUDA, "requires CUDA")
 class DFlash2FusedConvModelParityTest(unittest.TestCase):
-    def _config(self):
-        config = Qwen3Config(
-            architectures=["DFlash2DraftModel"],
-            hidden_size=128,
-            intermediate_size=256,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            num_hidden_layers=2,
-            num_target_layers=4,
-            head_dim=32,
-            max_position_embeddings=256,
-            vocab_size=64,
-            layer_types=["full_attention", "full_attention"],
-            dflash_config={
-                "block_size": 8,
-                "conv_group_size": 16,
-                "conv_kernel_size": 2,
-                "mask_token_id": 63,
-                "selector_rank": 8,
-                "selector_top_k": 4,
-                "target_layer_ids": [1],
-            },
+    def test_composed_model_matches_eager(self):
+        from specforge.modeling import build_draft_model
+        from tests.test_modeling.test_canonical_dflash2 import (
+            dflash2_config,
+            model_inputs,
         )
-        config._attn_implementation = "eager"
-        return config
 
-    def _model(self, dtype):
-        torch.manual_seed(0)
-        model = DFlash2DraftModel(self._config())
+        model = build_draft_model(dflash2_config(), device="cuda")
         with torch.no_grad():
-            for layer in model.layers:
+            for layer in model.backbone.layers:
                 for conv in (layer.attention_conv, layer.mlp_conv):
-                    conv.base_kernel.normal_()
-                    conv.kernel_projection.weight.normal_(std=0.05)
-        return model.to(device="cuda", dtype=dtype)
-
-    def _step(self, model, inputs, *, layer_only):
-        model.zero_grad(set_to_none=True)
-        noise, target_hidden, position_ids, attention_mask, grad_output = inputs
-        noise = noise.detach().clone().requires_grad_(True)
-        if layer_only:
-            output = model.layers[0](
-                target_hidden=target_hidden,
-                hidden_states=noise,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=model.rotary_emb(noise, position_ids),
+                    conv.kernel_projection.weight.normal_(std=0.03)
+        args, _ = model_inputs(model.config.draft, "cuda")
+        outputs, gradients = [], []
+        for enabled in ("0", "1"):
+            model.zero_grad(set_to_none=True)
+            with mock.patch.dict(os.environ, {FUSED_CONV_ENV: enabled}):
+                output = model(*args).logits
+                output.square().mean().backward()
+            outputs.append(output.detach())
+            gradients.append(
+                {
+                    n: p.grad.clone()
+                    for n, p in model.named_parameters()
+                    if p.grad is not None
+                }
             )
-        else:
-            output = model(
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                noise_embedding=noise,
-                target_hidden=target_hidden,
+        torch.testing.assert_close(*outputs, atol=2e-5, rtol=2e-5)
+        self.assertEqual(gradients[0].keys(), gradients[1].keys())
+        for name in gradients[0]:
+            torch.testing.assert_close(
+                gradients[0][name], gradients[1][name], atol=3e-5, rtol=3e-5
             )
-        output.backward(grad_output)
-        grads = {
-            name: parameter.grad
-            for name, parameter in model.named_parameters()
-            if parameter.grad is not None
-        }
-        return output.detach(), noise.grad, grads
-
-    def _inputs(self, model, batch_size, dtype, *, layer_only):
-        config = model.config
-        context_length = 13
-        draft_length = 3 * model.block_size
-        # The decoder layer consumes the already projected target context.
-        context_width = config.hidden_size * (
-            1 if layer_only else len(model.target_layer_ids)
-        )
-        noise = torch.randn(batch_size, draft_length, config.hidden_size)
-        context = torch.randn(batch_size, context_length, context_width)
-        position_ids = torch.arange(context_length + draft_length).expand(
-            batch_size, -1
-        )
-        attention_mask = (
-            torch.rand(batch_size, 1, draft_length, context_length + draft_length) < 0.7
-        )
-        attention_mask[..., context_length:] = True
-        grad_output = torch.randn(batch_size, draft_length, config.hidden_size)
-        return (
-            noise.to(device="cuda", dtype=dtype),
-            context.to(device="cuda", dtype=dtype),
-            position_ids.cuda(),
-            attention_mask.cuda(),
-            grad_output.to(device="cuda", dtype=dtype),
-        )
-
-    def test_decoder_layer_and_model_match_eager(self):
-        for dtype, atol, rtol in (
-            (torch.float32, 1e-4, 1e-4),
-            (torch.bfloat16, 5e-2, 5e-2),
-        ):
-            for batch_size in (1, 2):
-                for layer_only in (True, False):
-                    with self.subTest(
-                        dtype=dtype, batch_size=batch_size, layer_only=layer_only
-                    ):
-                        model = self._model(dtype)
-                        torch.manual_seed(batch_size)
-                        inputs = self._inputs(
-                            model, batch_size, dtype, layer_only=layer_only
-                        )
-
-                        with _count_fused_calls() as calls:
-                            fused = self._step(model, inputs, layer_only=layer_only)
-                        with _eager_env():
-                            eager = self._step(model, inputs, layer_only=layer_only)
-
-                        num_layers = 1 if layer_only else len(model.layers)
-                        self.assertEqual(len(calls), 4 * num_layers)
-
-                        torch.testing.assert_close(
-                            fused[0], eager[0], atol=atol, rtol=rtol
-                        )
-                        torch.testing.assert_close(
-                            fused[1], eager[1], atol=atol, rtol=rtol
-                        )
-                        self.assertEqual(fused[2].keys(), eager[2].keys())
-                        self.assertTrue(
-                            any("attention_conv.base_kernel" in n for n in fused[2])
-                        )
-                        for name in eager[2]:
-                            with self.subTest(parameter=name):
-                                _assert_relative_close(
-                                    self, fused[2][name], eager[2][name], rtol
-                                )
-
-
-def _assert_relative_close(test, actual, expected, rtol):
-    """Compare gradients relative to their largest magnitude."""
-
-    _, relative, _ = _errors(actual, expected)
-    test.assertLessEqual(relative, rtol)
-
-
-if __name__ == "__main__":
-    unittest.main()

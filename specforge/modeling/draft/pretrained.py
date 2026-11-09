@@ -1,4 +1,4 @@
-"""Family-independent HF base; legacy base.py remains during migration."""
+"""Family-independent HF base for composed draft models."""
 
 from itertools import chain
 

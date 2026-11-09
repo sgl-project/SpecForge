@@ -1,6 +1,6 @@
 # Unified training recipe catalog
 
-Every draft model JSON under `configs/` has at least one typed YAML recipe in
+Every supported text draft YAML under `specforge/config/draft/presets/` has at least one typed YAML recipe in
 this catalog. Choose a recipe by answering three separate questions:
 
 1. **When are target features produced?** `online` captures them during the
@@ -53,12 +53,11 @@ Run any recipe through the one public training entry:
 specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
-`model.draft_model_config` may name a local JSON file, a local model directory,
-or a Hugging Face repository. Fresh EAGLE3, P-EAGLE, and DFlash runs may omit it
-and derive the draft architecture from the target; see the
-[training guide](../../docs/sections/basic_usage/training.md#draft-configuration-and-model-initialization)
-for layer/block overrides and the distinction between weights-only
-`model.draft_checkpoint_path` and full `training.resume_from`.
+`draft` accepts a complete configuration mapping or a local YAML/JSON file.
+Bundled presets are ordinary YAML files under `specforge/config/draft/presets/`.
+The filename does not select an architecture; the configuration does. Use
+`initialization.checkpoint` for a weights-only warm start and `resume` for a full
+training restart. See the [draft training guide](../../docs/draft_training.md).
 
 Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
@@ -103,7 +102,7 @@ its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
 (one node, four capture servers plus a DP4 trainer) and
 `qwen3.8-27b-dflash2-5server-dp3-h200.yaml` (one 8x H200 node,
 five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
-loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+loopback) train the DFlash2 drafter in `specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml` for
 Qwen3.8-27B. Their
 [runbook](../../docs/recipes/qwen3.8-27b-dflash2-disaggregated.md) records the
 server/trainer splits, Mooncake lease, in-flight watermarks and throughput
@@ -124,16 +123,17 @@ schema. This section explains what belongs in each YAML section and records the
 defaults that matter when writing a recipe. Unknown or misspelled fields are
 errors; YAML files and dotted CLI overrides go through the same validation.
 
-New checked-in recipes should explicitly set `training.strategy`,
+New checked-in recipes should explicitly set `draft`,
 `deployment.mode`, `deployment.trainer.nnodes`,
 `deployment.trainer.nproc_per_node`, `run_id`, and `output_dir`, even when the
 schema has the same default. A minimal online recipe with externally managed
 services looks like:
 
 ```yaml
+draft: specforge/config/draft/presets/qwen3-8b-eagle3.yaml
+
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-eagle3.json
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
 
@@ -143,7 +143,6 @@ data:
   chat_template: qwen
 
 training:
-  strategy: eagle3
   max_steps: 10000
   batch_size: 1
   learning_rate: 0.0001
@@ -200,30 +199,29 @@ historical suffixes.
 
 The top-level `model` and `data` sections are required. `training`, `tracking`,
 `profiling`, `runtime`, and `deployment` have defaults, but checked-in recipes
-should make their training strategy and topology explicit.
+should make their draft source and topology explicit.
 
-### `model`: target, draft, and capture backend
+`draft` defines the model structure. `initialization` selects `checkpoint`,
+`weights_from`, or `from_target`; `resume` restores the full training state.
+`training.objective` overrides the architecture's default objective when compatible;
+`training.objective_options` contains its loss/sampling/optimization settings.
+`training.frozen` lists module or parameter paths excluded from training.
+
+### `model`: target and capture backend
 
 | Field | Default | What to write |
 | --- | --- | --- |
 | `model.target_model_path` | required | Local target directory or Hugging Face repository ID. |
-| `model.draft_model_config` | `null` | Draft JSON, model directory containing `config.json`, or Hugging Face repository. EAGLE3, P-EAGLE, and DFlash may omit it and derive a fresh config; Domino and DSpark require one. |
-| `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
-| `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
-| `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
+| `initialization.checkpoint` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
-| `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
+| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for DFlash/DFlash2 on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the composed eager modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
-| `model.load_target_embedding` | `true` | Copy the frozen target embedding into a fresh draft when supported. |
-| `model.aux_hidden_state_layer_ids` | `null` | Optional EAGLE3/P-EAGLE capture override containing exactly three non-negative layer IDs. Other strategies derive layers from the draft config. |
 | `model.torch_dtype` | `bfloat16` | `bfloat16`, `float16`, or `float32`. |
 | `model.cache_dir` | `null` | Model/tokenizer download cache. This is distinct from `data.cache_dir`. |
-| `model.mask_token_id` | `null` | DFlash-family/P-EAGLE mask token override. Otherwise it resolves from the draft config and then the tokenizer. |
 | `model.tokenizer_pad_token_id` | `null` | Explicit non-negative tokenizer pad ID. Use it for released tokenizers that omit padding metadata. |
 | `model.sglang_attention_backend` | `flashinfer` | SGLang attention implementation for an in-process or managed capture server. |
 | `model.sglang_mem_fraction_static` | `0.4` | SGLang static-memory fraction in `(0, 1]`; inherited by managed capture servers unless they override it. |
@@ -284,7 +282,6 @@ Common fields:
 
 | Field | Default | What to write |
 | --- | --- | --- |
-| `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
 | `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
@@ -295,8 +292,8 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
-| `training.fused_logits_loss` | `true` | Optimized FP32 logits loss, including Domino's specialized CE. Enabled by default for all supported models. `false` uses eager losses. Independent of projection and checkpointing. |
-| `training.objective_checkpointing` | `true` | Recompute DFlash-family objective chunks during backward, including projection. With `objective_chunk_blocks=0`, checkpoints the whole objective. Without it, saved logits accumulate across chunks. |
+| `training.objective_options.fused_logits_loss` | `true` | Optimized FP32 logits loss, including Domino's specialized CE. Enabled by default for all supported models. `false` uses eager losses. Independent of projection and checkpointing. |
+| `training.objective_options.objective_checkpointing` | `true` | Recompute DFlash-family objective chunks during backward, including projection. With `objective_chunk_blocks=0`, checkpoints the whole objective. Without it, saved logits accumulate across chunks. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
@@ -311,11 +308,11 @@ Common fields:
 | `training.eval_interval` | `0` | Evaluate every N optimizer steps; 0 disables evaluation. |
 | `training.log_interval` | `50` | Positive optimizer-step logging interval. |
 | `training.max_checkpoints` | `0` | Keep the newest N checkpoints; 0 keeps all. |
-| `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
-| `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
-| `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
-| `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
-| `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
+| `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `initialization.checkpoint`. |
+| `training.objective_options.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
+| `training.objective_options.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
+| `training.objective_options.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
+| `training.objective_options.teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
@@ -324,13 +321,13 @@ Strategy-specific fields should be written only when tuning that objective:
 
 | Strategy | Fields and defaults |
 | --- | --- |
-| EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
-| DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
-| P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
-| MTP | `training.objective_options.objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). `training.mtp_objective_chunk_size` remains a compatibility alias; conflicting non-default values are rejected. |
+| EAGLE3 | `training.objective_options.ttt_length` (`7`), `training.objective_options.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.objective_options.kl_scale` (`1.0`), `training.objective_options.kl_decay` (`1.0`) |
+| DFlash / DFlash 2 / Domino / D-PACE | `training.objective_options.num_anchors` (`512`), `training.objective_options.loss_decay_gamma` (`null`), `training.objective_options.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.objective_options.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.objective_options.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.objective_options.kl_scale` (`1.0`), `training.objective_options.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.objective_options.selector_loss_alpha` (`1.0`), `training.objective_options.selector_warmup_ratio` (`0.0`), `training.objective_options.selector_ramp_ratio` (`0.0`), and `training.objective_options.selector_stop_gradient` (`false`), `training.objective_options.dpace_alpha` (`0.5`), `training.objective_options.lambda_base_start` (`1.0`), `training.objective_options.lambda_base_decay_ratio` (`0.5`) |
+| DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.objective_options.num_anchors` (`512`), `training.objective_options.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_options.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.objective_options.ce_loss_alpha` (`0.1`), `training.objective_options.l1_loss_alpha` (`0.9`), and `training.objective_options.confidence_loss_alpha` (`1.0`). |
+| P-EAGLE | `training.objective_options.num_depths` (`8`), `training.objective_options.down_sample_ratio` (`0.8`), `training.objective_options.down_sample_ratio_min` (`0.2`), `spec_config.norm_before_residual` in the draft YAML |
+| MTP | `training.objective_options.objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 
-New recipes must not write the loader-only migration fields
+The schema rejects the retired fields
 `training.deployment_mode`, `training.server_urls`, or
 `training.metadata_db_path`; use the typed `deployment.*` surface below.
 
@@ -563,7 +560,7 @@ unless tuning throughput or memory pressure.
   requires batch size 1.
 - VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
   text inputs only.
-- `training.compact_teacher` is offline text EAGLE3 only.
+- `training.objective_options.compact_teacher` is offline text EAGLE3 only.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.
 
@@ -597,14 +594,14 @@ For deeper lifecycle and recovery semantics, see the
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
 `qwen3-8b-dpace.yaml` is the D-PACE recipe. It deliberately uses the
-shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
+shared DFlash strategy with `training.objective_options.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
 
 DFlash 2 treats the token objective and position weighting as independent A/B
-axes. `training.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the
+axes. `training.objective_options.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the
 one-hot total-variation objective, and `lambda` adaptively mixes CE with TV;
 `alpha` is equivalent to CE for these hard targets. Independently,
-`training.loss_type: dflash` uses `loss_decay_gamma`, while `dpace` applies one
+`training.objective_options.loss_type: dflash` uses `loss_decay_gamma`, while `dpace` applies one
 detached dynamic position weight to both the unary and candidate-selector
 objectives. For example, LK-lambda with D-PACE uses:
 
@@ -620,7 +617,7 @@ training:
 Evaluation is currently offline-only and pairs `training.eval_interval` with
 `data.eval_hidden_states_path`. Best checkpoints are
 linked as `<run_id>-best`. Offline text EAGLE3 may enable
-`training.compact_teacher`; `tracking.report_to` selects `none`, W&B,
+`training.objective_options.compact_teacher`; `tracking.report_to` selects `none`, W&B,
 TensorBoard, SwanLab, or MLflow.
 
 ## Ascend NPU launch

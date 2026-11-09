@@ -1,0 +1,72 @@
+schema_version: 1
+model_type: specforge_draft
+architectures:
+- DFlashDraftModel
+extensions: []
+hidden_size: 2048
+vocab_size: 248320
+draft_vocab_size: 248320
+max_position_embeddings: 262144
+initializer_range: 0.02
+tie_word_embeddings: false
+attention_configs:
+  full_attention:
+    type: gqa
+    rope_parameters: null
+    num_attention_heads: 32
+    num_key_value_heads: 4
+    head_dim: 128
+    qk_norm: true
+    attention_bias: false
+    output_gate: false
+    is_causal: false
+    sliding_window: null
+    attention_dropout: 0.0
+mlp_configs:
+  default:
+    type: dense
+    intermediate_size: 6144
+    hidden_act: silu
+conv_configs: {}
+layer_configs:
+  full_attention:
+    attention: full_attention
+    mlp: default
+    sublayer_conv: null
+layer_types:
+- full_attention
+- full_attention
+- full_attention
+- full_attention
+- full_attention
+- full_attention
+- full_attention
+- full_attention
+num_hidden_layers: 8
+norm_config:
+  type: rms
+  eps: 1.0e-06
+  weight_offset: 0
+residual_config:
+  type: standard
+rope_parameters:
+  rope_type: default
+  rope_theta: 10000000
+  partial_rotary_factor: 1.0
+spec_config:
+  block:
+    block_size: 16
+  target_features:
+    hidden_size: 2048
+    mask_token_id: 248070
+    target_layer_ids:
+    - 1
+    - 10
+    - 19
+    - 28
+    - 37
+target_bindings:
+- embed_tokens
+- lm_head
+target_logit_transform:
+  type: none

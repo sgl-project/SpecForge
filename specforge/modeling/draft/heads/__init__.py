@@ -1,4 +1,4 @@
-"""Algorithm heads shared by legacy and composed draft models."""
+"""Algorithm heads used by composed draft models."""
 
 from .adjacent_injection import AdjacentInjection
 from .candidate_selector import CandidateSelector

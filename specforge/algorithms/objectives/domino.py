@@ -2,10 +2,9 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
-
-from .base import check_options, reduce_loss
-from .dflash import COMMON_MODULES
+from ..losses.domino_reduction import reduce_domino
+from .base import COMMON_MODULES, check_options
+from .block_options import BlockLossOptions
 from .inputs import prepare_blocks
 from .registry import register_objective
 
@@ -18,13 +17,12 @@ from .registry import register_objective
     trains=COMMON_MODULES + ("gru_head",),
 )
 @dataclass
-class DominoObjective:
-    num_anchors: int = 512
-    loss_decay_gamma: float | None = None
+class DominoObjective(BlockLossOptions):
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
 
     def __post_init__(self):
+        super().__post_init__()
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
@@ -34,30 +32,36 @@ class DominoObjective:
             },
         )
 
-    def __call__(self, runtime, batch, *, step, total_steps, **context):
-        model, spec = runtime.draft_model, runtime.draft_model.config.draft.spec_config
+    def __call__(
+        self,
+        runtime,
+        batch,
+        *,
+        step,
+        total_steps,
+        collect_detailed_metrics=True,
+        **context,
+    ):
+        if self.lambda_base_start and not total_steps:
+            raise ValueError("Domino base-loss schedule requires total_steps")
+        warmup = max(1, int((total_steps or 1) * self.lambda_base_decay_ratio))
+        weight = self.lambda_base_start * max(0, 1 - step / warmup)
+        model = runtime.draft_model
+        offset = int(model.config.draft.spec_config.block.shift_label)
         blocks = prepare_blocks(
-            model.config.draft,
-            batch,
-            num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
-            label_offset=int(spec.block.shift_label),
+            model.config.draft, batch, num_anchors=self.num_anchors, label_offset=offset
         )
         output = model(
             blocks.input_ids,
             batch["hidden_states"],
             blocks.layer_inputs,
-            predecessor_ids=blocks.predecessors.flatten(1),
+            output_logits=False,
         )
-        labels = blocks.labels.flatten(1)
-        if self.lambda_base_start and not total_steps:
-            raise ValueError("Domino base-loss schedule requires total_steps")
-        warmup = max(1, (total_steps or 1) * self.lambda_base_decay_ratio)
-        weight = self.lambda_base_start * max(0, 1 - step / warmup)
-        loss = (
-            weight * ce_l1_loss(output.base_logits, labels).cross_entropy
-            + (1 - weight) * ce_l1_loss(output.logits, labels).cross_entropy
-        )
-        return reduce_loss(
-            loss, blocks.weights.flatten(1), logits=output.logits, labels=labels
+        return reduce_domino(
+            model,
+            self,
+            output.hidden_states,
+            blocks,
+            lambda_base=weight,
+            collect_detailed_metrics=collect_detailed_metrics,
         )

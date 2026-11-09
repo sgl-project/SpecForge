@@ -232,10 +232,9 @@ def train(
     cfg = load_config(config_path, overrides)
     from specforge.application import bind_run, resolve_run
     from specforge.launch_plan import build_launch_plan, run_commands
-    from specforge.training.canonical import enabled
     from specforge.training.model_loading import training_target_config
 
-    target_config = training_target_config(cfg) if enabled(cfg) else None
+    target_config = training_target_config(cfg)
     resolved = resolve_run(cfg, target_config=target_config)
     launch = build_launch_plan(
         resolved.config,

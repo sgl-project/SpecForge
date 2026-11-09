@@ -8,22 +8,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-from transformers import LlamaConfig
 
 from specforge.config.draft.rope import DynamicNTKRoPESpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaForCausalLMEagle3,
-    LlamaRotaryEmbedding,
-)
 from specforge.modeling.draft.models import Eagle3DraftModel
-from tests.test_modeling.legacy_rope_reference import (
-    eager_legacy_reference,
-    legacy_fp32_rope,
-)
 from tests.test_modeling.test_draft_eagle_backbone import config_for
-from tests.test_modeling.test_draft_eagle_fusion import eager_reference
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -68,162 +58,7 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
     return ids, features, entries
 
 
-def sdpa_eager(query, key, value, *, attn_mask, **kwargs):
-    return eager_reference(
-        query=query, key=key, value=value, block_mask=attn_mask, enable_gqa=True
-    )
-
-
-def legacy_name(name):
-    for prefix, target in (
-        ("backbone.layers.0.", "midlayer."),
-        ("backbone.final_norm.", "norm."),
-        ("fusion.", ""),
-        ("vocabulary.", ""),
-    ):
-        if name.startswith(prefix):
-            return target + name[len(prefix) :]
-    return name
-
-
-def legacy_model(actual, device="cpu", dtype=torch.float32):
-    spec = actual.config.draft.spec_config
-    normalize, norm_output = spec.normalize_features, spec.norm_output
-    legacy = LlamaConfig(
-        hidden_size=32,
-        target_hidden_size=48,
-        intermediate_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        num_hidden_layers=1,
-        vocab_size=64,
-        draft_vocab_size=32,
-        max_position_embeddings=128,
-        rms_norm_eps=1e-6,
-        hidden_act="silu",
-        pretraining_tp=1,
-        fc_norm=normalize,
-        norm_output=norm_output,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
-    )
-    reference = LlamaForCausalLMEagle3(legacy).to(device=device, dtype=dtype)
-    # Keep legacy frequency buffers in FP32, matching canonical RoPE.
-    reference.midlayer.self_attn.rotary_emb = LlamaRotaryEmbedding(
-        8, max_position_embeddings=128, base=10000, device=device
-    )
-    reference.load_state_dict(
-        {legacy_name(n): v for n, v in actual.state_dict().items()},
-        strict=True,
-    )
-    return reference
-
-
 class CanonicalEagle3Test(unittest.TestCase):
-    # Compare eager math on both sides, without compiler fusion differences.
-    @eager_legacy_reference()
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        torch.manual_seed(0)
-        for normalize, norm_output in (
-            (False, False),
-            (False, True),
-            (True, False),
-            (True, True),
-        ):
-            with self.subTest(
-                device=device, dtype=dtype, normalize=normalize, norm_output=norm_output
-            ):
-                config = model_config(normalize=normalize, norm_output=norm_output)
-                actual = build_draft_model(config, device=device, dtype=dtype)
-                install_mapping(actual)
-                reference = legacy_model(actual, device, dtype)
-                ids, features, entries = model_inputs(config, device, dtype)
-                other = features.detach().clone().requires_grad_()
-                mask = (
-                    entries[0].attention_layout.key_positions[:, None, None, :]
-                    <= entries[0].attention_layout.query_positions[:, None, :, None]
-                )
-                first = actual(ids, features, entries)
-                # Match the composed stage's concat/split boundary so residual
-                # gradients accumulate before returning to the recurrent input.
-                projected = reference.project_hidden_states(other)
-                embeds, projected = torch.cat(
-                    (reference.embed_tokens(ids), projected), dim=-1
-                ).split(32, dim=-1)
-                with patch(
-                    "torch.nn.functional.scaled_dot_product_attention", sdpa_eager
-                ):
-                    initial = reference.backbone(
-                        embeds,
-                        projected,
-                        None,
-                        mask,
-                        entries[0].position_ids,
-                        use_cache=False,
-                    )
-                initial_logits = reference.compute_logits(initial)
-                second = actual(
-                    ids, None, entries, recurrent_hidden=first.hidden_states
-                )
-                embeds, projected = torch.cat(
-                    (reference.embed_tokens(ids), initial), dim=-1
-                ).split(32, dim=-1)
-                with patch(
-                    "torch.nn.functional.scaled_dot_product_attention", sdpa_eager
-                ):
-                    recurrent = reference.backbone(
-                        embeds,
-                        projected,
-                        None,
-                        mask,
-                        entries[0].position_ids,
-                        use_cache=False,
-                    )
-                recurrent_logits = reference.compute_logits(recurrent)
-                values = (
-                    first.hidden_states,
-                    first.logits,
-                    second.hidden_states,
-                    second.logits,
-                )
-                expected = (initial, initial_logits, recurrent, recurrent_logits)
-                torch.testing.assert_close(
-                    values, expected, rtol=tolerance, atol=tolerance
-                )
-                upstream = [torch.randn_like(value) for value in values]
-                sum(
-                    value.mul(grad).sum() for value, grad in zip(values, upstream)
-                ).backward()
-                sum(
-                    value.mul(grad).sum() for value, grad in zip(expected, upstream)
-                ).backward()
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=tolerance, atol=tolerance
-                )
-                for name, parameter in actual.named_parameters():
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad,
-                        dict(reference.named_parameters())[legacy_name(name)].grad,
-                        rtol=tolerance,
-                        atol=tolerance,
-                    )
-
-    def test_cpu_legacy_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_projected_prefix_matches_replay_and_gradients(self):
         config = model_config(normalize=True)

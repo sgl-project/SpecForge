@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 from specforge.core.fused_loss import ce_l1_loss
 
-from .base import check_options, reduce_loss
-from .dflash import COMMON_MODULES
+from .base import COMMON_MODULES, check_options, reduce_loss
 from .inputs import gather, prepare_blocks
 from .registry import register_objective
 

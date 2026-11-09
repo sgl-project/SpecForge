@@ -1,457 +1,249 @@
-# coding=utf-8
-# Copyright 2024 The SpecForge team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Draft configuration and weights-only initialization for unified training.
+"""Resolve draft sources and assemble training modules; checkpoint owns file I/O."""
 
-This module deliberately keeps model initialization separate from training
-resume.  A warm start can read draft weights from a Hugging Face checkpoint or
-from SpecForge's shared ``training_state.pt`` payload, but it has no access to
-an optimizer, scheduler, controller counters, or RNG state.
-"""
-
-from __future__ import annotations
-
-import glob
-import logging
-import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
-
-if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
-    from specforge.algorithms.common.providers import DraftConfigProvider
-    from specforge.algorithms.registry import AlgorithmRegistration
-    from specforge.config import Config
-
-logger = logging.getLogger(__name__)
-
-_CONFIG_FILE = "config.json"
-_STATE_FILE = "training_state.pt"
-
-# These are the architecture fields the legacy EAGLE generator copied from the
-# target, plus RoPE/attention fields needed by newer Qwen-family targets.  A
-# whitelist avoids feeding a target-specific nested config into the registered
-# Llama/Qwen3 draft classes.
-_TARGET_ARCHITECTURE_FIELDS = (
-    "vocab_size",
-    "hidden_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "intermediate_size",
-    "max_position_embeddings",
-    "rms_norm_eps",
-    "hidden_act",
-    "initializer_range",
-    "attention_bias",
-    "attention_dropout",
-    "head_dim",
-    "rope_theta",
-    "rope_scaling",
-    "bos_token_id",
-    "eos_token_id",
-    "pad_token_id",
-    "sliding_window",
-    "use_sliding_window",
-    "max_window_layers",
-)
+from dataclasses import asdict
+from pathlib import Path
 
 
-@dataclass(frozen=True)
-class WarmStartReport:
-    """Observable result of loading draft weights without training state."""
+def resolve_draft_config(cfg, *, target_config=None):
+    from specforge.config.draft.codec import parse_draft
 
-    source: str
-    checkpoint_format: Literal["specforge", "pretrained"]
-    loaded_keys: int
-    missing_keys: Tuple[str, ...]
-    loaded_embedding: bool
+    draft = cfg.draft
+    if isinstance(draft, str):
+        import json
 
+        import yaml
 
-def _without_file_uri(source: str) -> str:
-    return source[len("file://") :] if source.startswith("file://") else source
-
-
-def _looks_like_local_path(source: str) -> bool:
-    return (
-        source.startswith((".", "/", "~", "file://"))
-        or source.endswith(".json")
-        or os.path.exists(os.path.expanduser(_without_file_uri(source)))
+        text = Path(draft).read_text()
+        try:
+            draft = json.loads(text)
+        except json.JSONDecodeError:
+            draft = yaml.safe_load(text)
+    supplied = (
+        parse_draft(draft, target_config=target_config) if draft is not None else None
     )
+    initialization = cfg.initialization
+    source = initialization.checkpoint if initialization else None
+    if cfg.training.resume_from:
+        from specforge.training.checkpoint import CheckpointManager
+
+        source = CheckpointManager.resolve_resume_dir(cfg.training.resume_from)
+    if source:
+        from specforge.loading import read_draft
+
+        loaded = read_draft(
+            source,
+            target=cfg.model.target_model_path,
+            cache_dir=cfg.model.cache_dir,
+            adapter=initialization.adapter if initialization else None,
+            legacy_config=initialization.legacy_config if initialization else None,
+        ).config
+        if supplied is not None and supplied != loaded:
+            raise ValueError(
+                "draft must exactly match checkpoint structure; use weights_from to change it"
+            )
+        return loaded
+    if supplied is None:
+        raise ValueError("canonical training requires draft or a checkpoint")
+    return supplied
 
 
-def _checkpoint_config_source(checkpoint_source: Optional[str]) -> Optional[str]:
-    """Return a config-bearing warm-start source, if it can be identified."""
+def capture_layers(cfg, draft, target_config):
+    from specforge.config.draft.codec import parse_draft
+    from specforge.modeling.target.target_utils import target_text_config
 
-    if not checkpoint_source:
-        return None
-    raw_source = str(checkpoint_source)
-    local_source = os.path.abspath(os.path.expanduser(_without_file_uri(raw_source)))
-    if os.path.isfile(local_source):
-        if os.path.basename(local_source) == _CONFIG_FILE:
-            return local_source
-        sibling = os.path.join(os.path.dirname(local_source), _CONFIG_FILE)
-        return sibling if os.path.isfile(sibling) else None
-    if os.path.isdir(local_source):
-        direct = os.path.join(local_source, _CONFIG_FILE)
-        if os.path.isfile(direct):
-            return direct
-        # A run root may point at a future checkpoint layout that also persists
-        # config.json.  Do not resolve or read training state just to find it.
-        candidates = []
-        for pointer in glob.glob(os.path.join(local_source, "*-latest")):
-            candidate = os.path.join(os.path.realpath(pointer), _CONFIG_FILE)
-            if os.path.isfile(candidate):
-                candidates.append(candidate)
-        if len(set(candidates)) == 1:
-            return candidates[0]
-        return None
-    if _looks_like_local_path(raw_source):
-        return None
-    # A non-local warm-start source is an HF repository. Its config is the best
-    # architecture contract unless the run supplies an explicit config source.
-    return raw_source
-
-
-def _target_text_config(config: "PretrainedConfig") -> "PretrainedConfig":
-    return getattr(config, "text_config", config)
-
-
-def _serializable_config_value(value: Any) -> Any:
-    try:
-        import torch
-
-        if isinstance(value, torch.dtype):
-            return str(value).replace("torch.", "")
-    except ImportError:
-        pass
-    return value
-
-
-def _generate_draft_config(
-    cfg: "Config", provider: "DraftConfigProvider"
-) -> "PretrainedConfig":
-    defaults = provider.target_defaults
-    if defaults is None:
-        raise ValueError(
-            f"training.strategy={cfg.training.strategy!r} requires "
-            "model.draft_model_config "
-            "or a pretrained model.draft_checkpoint_path containing config.json"
+    if isinstance(draft, dict):
+        draft = parse_draft(
+            draft, target_config=target_text_config(target_config).to_dict()
         )
+    features = draft.spec_config.target_features
+    if hasattr(features, "target_layer_ids"):
+        return list(features.target_layer_ids)
+    target = getattr(target_config, "text_config", target_config)
+    return [target.num_hidden_layers - 1]
 
+
+def build_bundle(cfg, algorithm):
+    import torch
+
+    from specforge.algorithms.common.providers import (
+        MODEL_PROVENANCE_CONTRACT_KEY,
+        StepRuntimeConfig,
+    )
+    from specforge.algorithms.objectives import build_objective_model
+    from specforge.config.draft.codec import encode_config
+    from specforge.config.draft.codec.target import resolve_target_logits
+    from specforge.loading import initialize_draft, load_draft
+    from specforge.modeling.draft.bindings import BoundLMHead
+    from specforge.modeling.target.target_head import TargetHead
     from specforge.modeling.target.target_utils import (
         load_target_config,
+        target_hidden_size,
         target_text_config,
         target_vocab_size,
     )
+    from specforge.training.assembly import ModelBundle, _device
 
-    target_config = load_target_config(
+    target = load_target_config(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
     )
-    target_config = target_text_config(target_config)
-    payload: Dict[str, Any] = {}
-    for field in _TARGET_ARCHITECTURE_FIELDS:
-        value = getattr(target_config, field, None)
-        if value is not None:
-            payload[field] = _serializable_config_value(value)
-    payload["vocab_size"] = target_vocab_size(target_config)
+    draft = resolve_draft_config(
+        cfg, target_config=target_text_config(target).to_dict()
+    )
+    dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
+    init = cfg.initialization
+    source = init.checkpoint if init else None
+    if cfg.training.resume_from:
+        from specforge.training.checkpoint import CheckpointManager
 
-    required = [name for name in ("vocab_size", "hidden_size") if name not in payload]
-    if required:
-        raise ValueError(
-            f"target config {cfg.model.target_model_path!r} cannot generate a "
-            f"draft config; missing {required}"
-        )
-    payload["architectures"] = [provider.architecture]
-    payload["model_type"] = defaults.model_type
-    payload["num_hidden_layers"] = defaults.num_hidden_layers
-    payload["tie_word_embeddings"] = False
-    payload["use_cache"] = True
-    if payload.get("pad_token_id") is None:
-        payload["pad_token_id"] = 0
-    if defaults.draft_vocab_size is not None:
-        payload["draft_vocab_size"] = defaults.draft_vocab_size
-    if defaults.populate is not None:
-        defaults.populate(payload, target_config, cfg)
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    return AutoDraftConfig.from_dict(payload)
-
-
-def _apply_draft_overrides(
-    cfg: "Config",
-    draft_config: "PretrainedConfig",
-    provider: "DraftConfigProvider",
-) -> None:
-    num_layers = cfg.model.draft_num_hidden_layers
-    if num_layers is not None:
-        draft_config.num_hidden_layers = num_layers
-    if cfg.model.draft_block_size is not None:
-        draft_config.block_size = cfg.model.draft_block_size
-    if provider.apply_overrides is not None:
-        provider.apply_overrides(cfg, draft_config)
-
-
-def resolve_draft_config(
-    cfg: "Config", *, provider: "DraftConfigProvider"
-) -> "PretrainedConfig":
-    """Resolve and validate the draft architecture for one typed run config."""
-
-    from specforge.training.canonical import enabled, resolve_config
-
-    if enabled(cfg):
-        return resolve_config(cfg)
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    source = cfg.model.draft_model_config
-    if not source:
-        source = _checkpoint_config_source(cfg.model.draft_checkpoint_path)
+        source = CheckpointManager.resolve_resume_dir(cfg.training.resume_from)
+    common = dict(
+        target=cfg.model.target_model_path,
+        draft=draft,
+        device=device,
+        dtype=dtype,
+        backend=(
+            "eager"
+            if cfg.training.attention_backend in ("fa", "usp")
+            else cfg.training.attention_backend
+        ),
+        cache_dir=cfg.model.cache_dir,
+    )
     if source:
-        draft_config = AutoDraftConfig.from_pretrained(
+        model = load_draft(
             source,
+            **common,
+            adapter=init.adapter if init else None,
+            legacy_config=init.legacy_config if init else None,
+        ).train()
+    else:
+        weights = init.weights_from if init else None
+        model = initialize_draft(
+            **common,
+            weights_from=weights.checkpoint if weights else None,
+            mapping=weights.mapping if weights else None,
+            allow_new=weights.allow_new if weights else (),
+            from_target=init.from_target if init else None,
+            legacy_config=init.legacy_config if init else None,
+        )
+    teacher = None
+    needs_teacher = cfg.training.objective in (
+        "eagle3",
+        "peagle",
+        "dspark",
+        "dspine",
+    ) or (
+        cfg.training.objective in ("dflash", "dflash2")
+        and cfg.training.objective_options.get("teacher_metrics", True)
+    )
+    if needs_teacher and "lm_head" in draft.target_bindings:
+        teacher = model.lm_head
+    elif needs_teacher:
+        loaded = TargetHead.from_pretrained(
+            cfg.model.target_model_path,
+            lm_head_key=cfg.model.lm_head_key,
+            embedding_key=cfg.model.embedding_key,
+            dtype=dtype,
             cache_dir=cfg.model.cache_dir,
             trust_remote_code=cfg.model.trust_remote_code,
         )
-    else:
-        draft_config = _generate_draft_config(cfg, provider)
-
-    expected = provider.architecture
-    compatible = provider.compatible_architectures or frozenset({expected})
-    architectures = list(getattr(draft_config, "architectures", None) or [])
-    if len(architectures) != 1 or architectures[0] not in compatible:
-        raise ValueError(
-            f"training.strategy={cfg.training.strategy!r} requires draft "
-            f"architecture in {sorted(compatible)!r}, got {architectures!r}"
+        teacher = BoundLMHead(
+            resolve_target_logits(target_text_config(target).to_dict()),
+            vocab_size=target_vocab_size(target),
+            hidden_size=target_hidden_size(target),
+            device=device,
+            dtype=dtype,
         )
-    _apply_draft_overrides(cfg, draft_config, provider)
-    return draft_config
-
-
-def preflight_draft_kernels(
-    cfg: "Config", *, algorithm: "AlgorithmRegistration"
-) -> None:
-    """Import the Liger kernels this host's trainer draft build will resolve.
-
-    A supervisor about to start services or workers, and a disaggregated
-    consumer about to wait on its producer, call this so a missing install
-    fails at startup. The trainer's ``build_draft`` still owns the resolution.
-    """
-
-    if (
-        cfg.model.use_liger_kernel is False
-        or (
-            cfg.model.use_liger_kernel is None
-            and cfg.training.strategy in ("domino", "dspark", "dspine")
+        teacher.load_target_weight(loaded.fc.weight)
+    if hasattr(model, "initialize_transfer_space") and not bool(model.transfer_ready):
+        if source:
+            raise ValueError("DSpine checkpoint has no initialized transfer space")
+        model.initialize_transfer_space(teacher.bound_weight())
+    if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
+        mapping = torch.load(
+            cfg.model.vocab_mapping_path, map_location=device, weights_only=True
         )
-        or not algorithm.spec.capabilities.supports_liger_kernel
-    ):
-        return
-    from specforge.modeling.draft.dflash_kernels import (
-        load_liger_dflash_kernels,
-        resolve_draft_liger_kernel_choice,
+        if (
+            source
+            and bool(model.vocabulary.ready)
+            and (
+                not torch.equal(model.vocabulary.t2d, mapping["t2d"])
+                or not torch.equal(model.vocabulary.d2t, mapping["d2t"])
+            )
+        ):
+            raise ValueError("vocab_mapping_path disagrees with checkpoint vocabulary")
+        model.vocabulary.load_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
+    runtime = build_objective_model(
+        model,
+        name=cfg.training.objective,
+        options=cfg.training.objective_options,
+        frozen=cfg.training.frozen,
+        target_head=teacher,
     )
+    from .kernels import configure_liger
 
-    draft_config = resolve_draft_config(
-        cfg, provider=algorithm.providers.model.draft_config
+    configure_liger(
+        model,
+        cfg.model.use_liger_kernel,
+        default_enabled=cfg.training.objective in ("dflash", "dflash2"),
     )
-    choice = resolve_draft_liger_kernel_choice(cfg.model.use_liger_kernel, draft_config)
-    if choice.enabled:
-        load_liger_dflash_kernels(choice)
+    runtime.attention_backend = cfg.training.attention_backend
+    if runtime.attention_backend == "usp":
+        from .sequence_parallel import configure_sequence_parallel
 
-
-def draft_config_dict(
-    cfg: "Config", *, provider: "DraftConfigProvider"
-) -> Dict[str, Any]:
-    """JSON-compatible resolved draft config for capture-only producer roles."""
-
-    resolved = resolve_draft_config(cfg, provider=provider)
-    from specforge.config.draft import DraftConfig
-    from specforge.config.draft.codec import encode_config
-
-    return (
-        encode_config(resolved)
-        if isinstance(resolved, DraftConfig)
-        else resolved.to_dict()
-    )
-
-
-def _has_pretrained_weights(path: str) -> bool:
-    names = (
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-    )
-    return any(os.path.isfile(os.path.join(path, name)) for name in names)
-
-
-def _runtime_state_file(source: str) -> Optional[str]:
-    """Resolve SpecForge checkpoint storage without loading resume state."""
-
-    path = os.path.abspath(os.path.expanduser(_without_file_uri(str(source))))
-    if os.path.isfile(path):
-        return path if os.path.basename(path) == _STATE_FILE else None
-    if not os.path.isdir(path):
-        return None
-
-    direct = os.path.join(path, _STATE_FILE)
-    if os.path.isfile(direct) and not _has_pretrained_weights(path):
-        return direct
-    has_run_pointers = bool(
-        glob.glob(os.path.join(path, "*-latest"))
-        or glob.glob(os.path.join(path, "*-step*"))
-    )
-    if not has_run_pointers:
-        return None
-
-    from specforge.training.checkpoint import CheckpointManager
-
-    checkpoint_dir = CheckpointManager.resolve_resume_dir(path)
-    return os.path.join(checkpoint_dir, _STATE_FILE)
-
-
-def _load_specforge_draft_state(
-    state_path: str, *, expected_strategy: str
-) -> Dict[str, Any]:
-    import torch
-
-    try:
-        # The restricted unpickler accepts tensors and primitive metadata while
-        # refusing arbitrary checkpoint objects. Only draft_state_dict is used.
-        state = torch.load(state_path, map_location="cpu", weights_only=True)
-    except Exception as exc:
-        raise ValueError(
-            f"cannot read weights-only SpecForge checkpoint {state_path}: {exc}"
-        ) from exc
-    if not isinstance(state, dict) or not isinstance(
-        state.get("draft_state_dict"), dict
-    ):
-        raise ValueError(
-            f"SpecForge warm-start checkpoint has no draft_state_dict: {state_path}"
+        configure_sequence_parallel(runtime)
+    runtime.frozen_target_modules = tuple(
+        dict.fromkeys(
+            [model.get_submodule(name) for name in draft.target_bindings]
+            + ([teacher] if teacher is not None else [])
         )
-    saved_strategy = state.get("strategy")
-    if saved_strategy is not None and saved_strategy != expected_strategy:
-        raise ValueError(
-            f"warm-start checkpoint {state_path} was written by strategy "
-            f"{saved_strategy!r}; this run trains {expected_strategy!r}"
-        )
-    return state["draft_state_dict"]
-
-
-def _load_pretrained_draft_state(
-    source: str,
-    *,
-    draft_config: "PretrainedConfig",
-    cache_dir: Optional[str],
-    trust_remote_code: bool,
-) -> Dict[str, Any]:
-    from specforge.modeling.auto import AutoDraftModel
-
-    loaded, loading_info = AutoDraftModel.from_pretrained(
-        source,
-        config=draft_config,
-        cache_dir=cache_dir,
-        trust_remote_code=trust_remote_code,
-        output_loading_info=True,
     )
-    missing_from_source = set(loading_info.get("missing_keys") or [])
-    state = {
-        key: value.detach().cpu()
-        for key, value in loaded.state_dict().items()
-        if key not in missing_from_source
+    runtime.fsdp_param_dtype = dtype
+    contract = {
+        "canonical_draft_config": encode_config(draft),
+        "canonical_objective": runtime.objective_name,
+        "canonical_objective_options": asdict(runtime.objective),
+        "canonical_frozen": tuple(cfg.training.frozen),
     }
-    del loaded
-    return state
+    from specforge.training.provenance import model_resume_provenance
 
-
-def warm_start_draft_model(
-    model: Any,
-    source: str,
-    *,
-    draft_config: "PretrainedConfig",
-    strategy: str,
-    allow_missing_embedding: bool = False,
-    cache_dir: Optional[str] = None,
-    trust_remote_code: bool = False,
-) -> WarmStartReport:
-    """Load only draft weights, never optimizer/counters/RNG training state."""
-
-    runtime_state = _runtime_state_file(source)
-    if runtime_state is not None:
-        checkpoint_format: Literal["specforge", "pretrained"] = "specforge"
-        state = _load_specforge_draft_state(runtime_state, expected_strategy=strategy)
-    else:
-        checkpoint_format = "pretrained"
-        state = _load_pretrained_draft_state(
-            source,
-            draft_config=draft_config,
-            cache_dir=cache_dir,
-            trust_remote_code=trust_remote_code,
-        )
-
-    if not state:
-        raise ValueError(f"warm-start checkpoint {source!r} contains no draft weights")
-    try:
-        result = model.load_state_dict(state, strict=False)
-    except RuntimeError as exc:
-        raise ValueError(
-            f"warm-start checkpoint {source!r} has incompatible draft tensor "
-            f"shapes: {exc}"
-        ) from exc
-    loaded_keys = len(state) - len(result.unexpected_keys)
-    if result.unexpected_keys or loaded_keys == 0:
-        raise ValueError(
-            f"warm-start checkpoint {source!r} does not match this draft model: "
-            f"loaded={loaded_keys}/{len(state)}, "
-            f"unexpected={sorted(result.unexpected_keys)}"
-        )
-    allowed_missing = set()
-    if allow_missing_embedding:
-        allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
-    required_missing = sorted(set(result.missing_keys) - allowed_missing)
-    if required_missing:
-        raise ValueError(
-            f"warm-start checkpoint {source!r} is missing draft weights required "
-            f"by this architecture: {required_missing}"
-        )
-
-    report = WarmStartReport(
-        source=str(source),
-        checkpoint_format=checkpoint_format,
-        loaded_keys=loaded_keys,
-        missing_keys=tuple(sorted(result.missing_keys)),
-        loaded_embedding=any("embed" in key.lower() for key in state),
+    provenance = model_resume_provenance(
+        cfg, draft, target, capture_layers=capture_layers(cfg, draft, target)
     )
-    logger.info(
-        "Warm-started %d draft tensors from %s (%s); missing=%s",
-        report.loaded_keys,
-        report.source,
-        report.checkpoint_format,
-        list(report.missing_keys),
+    contract[MODEL_PROVENANCE_CONTRACT_KEY] = tuple(sorted(provenance.items()))
+    return ModelBundle(
+        model=runtime,
+        draft_model=model,
+        draft_config=draft,
+        target_head=teacher,
+        target_hidden_size=target_hidden_size(target),
+        target_vocab_size=target_vocab_size(target),
+        draft_vocab_size=draft.draft_vocab_size,
+        capture_layers=capture_layers(cfg, draft, target),
+        strategy_kwargs=StepRuntimeConfig(
+            options={
+                "name": algorithm.name,
+                "objective": runtime.objective_name,
+                "required_features": tuple(runtime.registration.inputs),
+            },
+            resume_contract=contract,
+            allowed_missing_checkpoint_keys=frozenset(),
+        ),
     )
-    return report
 
 
-__all__ = [
-    "WarmStartReport",
-    "draft_config_dict",
-    "preflight_draft_kernels",
-    "resolve_draft_config",
-    "warm_start_draft_model",
-]
+def preflight_draft_kernels(cfg, *, algorithm):
+    from specforge.training.assembly import _device
+    from specforge.training.kernels import resolve_liger
+
+    draft = resolve_draft_config(cfg)
+    resolve_liger(
+        cfg.model.use_liger_kernel,
+        activations=[node.hidden_act for node in draft.mlp_configs.values()],
+        device=_device().type,
+        default_enabled=draft.architecture in ("DFlashDraftModel", "DFlash2DraftModel"),
+    )
 
 
 def training_target_config(cfg):

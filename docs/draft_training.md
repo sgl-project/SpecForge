@@ -9,12 +9,22 @@ prefixes it trains. A trainable parameter outside that coverage fails constructi
 explicitly frozen parameters and target bindings are excluded.
 
 The default objectives cover EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino,
-DSpine, MTP and DMTP. They reuse explicit-label CE/L1 loss primitives and functional
-sampling/mask construction. EAGLE3 replays its recurrent tree with explicit dense
-visibility; it does not add algorithm hooks or mutable KV caches to the backbone.
-This is an eager reference path, including dense vocabulary projections; fused
-losses, sparse attention and sequence parallel execution are not implemented here.
-The legacy training path retains those optimizations and its optional loss variants.
+DSpine, MTP and DMTP. Shared sampling and mask construction are functions;
+objectives do not inherit from or wrap another algorithm's training model.
+`algorithms/losses/` holds chunked reductions and selects the numerical kernels
+in `core/`; `algorithms/metrics/` holds diagnostics. Teacher and draft projections
+receive separate heads.
+
+Attention backends live in `modeling/draft/layers/attention/backends/`. Eager and
+SDPA materialize visibility; Flex keeps callable visibility sparse. EAGLE owns
+its recurrent execution and caller-scoped KV cache in `models/eagle_rollout.py`,
+while its objective owns rollout depth and supervision. `training/sequence_parallel.py`
+supplies USP process groups, and `training/canonical_data.py` prepares owned rows,
+teacher overlap and global positions. Shared backbone execution has no algorithm hooks.
+
+The composed components support optional Liger RMSNorm/SwiGLU and fused grouped
+convolution without replacing modules or changing checkpoint keys. Runtime kernel
+selection belongs to training; structural configuration nodes remain unchanged.
 
 Input batches use **unshifted** `input_ids`, `loss_mask` and teacher features at the
 same original sequence positions. Teacher tensors are detached at the boundary.
@@ -39,8 +49,24 @@ mapping or an ordinary YAML/JSON file. Presets use this same file path; there is
 no separate preset selector. The architecture chooses the default objective.
 `training.objective` can select another compatible registration, and its settings
 are passed through `training.objective_options` (unknown options are errors).
-Legacy algorithm switches remain on the legacy route; use objective options on
-the canonical route. Nondefault legacy loss/sampling settings are rejected.
+Retired `model.draft_*` and top-level algorithm switches are rejected. Model
+structure belongs to the draft YAML; loss and optimization settings belong to
+`training.objective_options`.
+
+Optimization options use `training.objective_options`:
+
+| Objectives | Options |
+|---|---|
+| DFlash, DFlash2, Domino, DSpark, DSpine | `objective_chunk_blocks`, `objective_checkpointing`, `fused_logits_loss` |
+| DFlash, DFlash2 | `loss_type` (including D-PACE), `lk_loss_type`, `kl_scale`, `kl_decay`, `teacher_metrics` |
+| DFlash2 | `selector_loss_alpha`, `selector_stop_gradient`, warmup/ramp steps or ratios |
+| EAGLE3 | `ttt_length`, `lk_loss_type`, `compact_teacher`, `compact_teacher_chunk_size`, `trim_loss_positions` |
+
+`training.attention_backend` selects `eager`, `sdpa` or `flex_attention`.
+EAGLE3 also supports cached `fa` and offline `usp` with causal full GQA/MHA.
+USP uses `training.sp_ulysses_size` and `training.sp_ring_size`; trainer TP remains
+unsupported. `model.use_liger_kernel` selects runtime Liger kernels. Setting
+`SPECFORGE_DFLASH2_FUSED_CONV=0` selects the eager grouped convolution.
 
 ```yaml
 model:
@@ -77,7 +103,7 @@ Only one loading path may be selected:
 
 `initialization.adapter` and `initialization.legacy_config` handle explicit
 external checkpoint import. `resume` and initialization are mutually exclusive;
-none of these fields may mix with legacy `model.draft_*` source fields.
+retired `model.draft_*` source fields are not accepted.
 
 Checkpoints contain the canonical `config.json` alongside the existing
 `training_state.pt` and per-rank optimizer/RNG files. The public loader reads only
@@ -87,17 +113,17 @@ An existing vocabulary mapping is preserved on resume; it is not regenerated fro
 the dataset. `training.frozen` lists module or parameter paths excluded from
 training, and is part of the resume contract.
 
-Canonical records use the tensor names listed above; EAGLE records using legacy
-`hidden_state` / `aux_hidden_state` names must be regenerated with the canonical
-capture layout or explicitly converted. The generic offline preparation and
+Canonical records use the tensor names listed above. The offline reader also
+accepts existing EAGLE `hidden_state` / `aux_hidden_state` fields and maps them
+to canonical names without shifting their tokens. Packed P-EAGLE records retain
+their optional `lengths` tensor. The generic offline preparation and
 server capture adapters now supply unshifted canonical records. DMTP currently
 accepts offline records with `mtp_hidden_states`; the generic capture service
 cannot produce frozen-MTP features and DMTP streaming fails validation.
 
-The new route supports eager attention and data parallel training, including FSDP
-and DDP. Frozen target bindings and the teacher head remain replicated outside
+The training route supports the attention backends above and data parallel
+training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
 FSDP, matching the existing training backend's frozen-table policy. The canonical
-model's requested dtype also controls FSDP computation. Optimized backends and
-legacy optional loss variants remain on the legacy route. Online wiring is
+model's requested dtype also controls FSDP computation. Online wiring is
 validated through capture contracts; a live SGLang capture run is not part of the
 current integration tests.

@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from .base import DraftTrainStrategy, StepContext, StepOutput
 
@@ -14,9 +15,12 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.name = name
         self.objective = objective
         self.required_features = set(required_features)
+        # DDP does not proxy attributes; forward must still use the wrapper.
+        runtime = model.module if isinstance(model, DistributedDataParallel) else model
+        self.draft_model = runtime.draft_model
         seen = set()
         self._duplicate_parameters = set()
-        for key, value in model.draft_model.named_parameters(remove_duplicate=False):
+        for key, value in self.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
             seen.add(id(value))
@@ -24,7 +28,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self._alignment_ce = None
 
     def trainable_module(self):
-        return self.model.draft_model
+        return self.draft_model
 
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
@@ -35,23 +39,35 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             and key[len(prefix) :] not in self._duplicate_parameters
         }
 
-    def _forward(self, batch, ctx, alignment_ce=None):
+    def _forward(self, batch, ctx, alignment_ce=None, *, ce_only=False):
         self.validate_batch(batch)
         device = next(self.model.parameters()).device
         tensors = {
             key: value.to(device, non_blocking=True)
             for key, value in batch.tensors.items()
         }
+        mask = batch.tensors.get("loss_mask")
+        if mask is not None and mask.device.type == "cpu":
+            supervised = mask > 0.5
+            padding = batch.tensors.get("attention_mask")
+            if padding is not None:
+                supervised = supervised & padding.bool()
+            tensors["max_valid_anchors"] = int(
+                (supervised[:, :-1] & supervised[:, 1:]).sum(-1).max()
+            )
         result = self.model(
             tensors,
             step=ctx.global_step,
             total_steps=ctx.total_steps,
             alignment_ce=alignment_ce,
+            collect_detailed_metrics=ctx.collect_detailed_metrics,
+            ce_only=ce_only,
         )
         return StepOutput(
             loss=result.loss,
-            metrics={},
+            metrics=result.metrics,
             ratio_metrics=result.ratios,
+            sum_metrics=result.sums,
             loss_terms=(result.numerator, result.denominator),
         )
 
@@ -69,7 +85,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         cpu_rng = torch.get_rng_state()
         device_rng = [device_module.get_rng_state(index) for index in devices]
         with torch.no_grad():
-            output = self._forward(batch, ctx)
+            output = self._forward(batch, ctx, ce_only=True)
         replay_batch = replace(
             batch,
             tensors={key: value.detach().cpu() for key, value in batch.tensors.items()},

@@ -8,8 +8,7 @@ load target model classes or derive dimensions from the target configuration.
 ## Qwen3.5-4B native MTP
 
 The bundled preset matches the dense [Qwen3.5-4B configuration](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json), including offset RMSNorm, gated attention and interleaved partial RoPE.
-Add the following to a recipe with `model.target_model_path: Qwen/Qwen3.5-4B`
-and `training.strategy: mtp`:
+Add the following to a recipe with `model.target_model_path: Qwen/Qwen3.5-4B`:
 
 ```yaml
 draft: specforge/config/draft/presets/native/qwen3_5_4b_mtp.yaml

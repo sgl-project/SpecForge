@@ -1,5 +1,6 @@
 """Aligned Domino heads retain GRU numerics, gradients and HF loading."""
 
+import copy
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -9,7 +10,6 @@ import torch
 from specforge.config.draft.architecture.domino import GRUHeadSpec
 from specforge.modeling.draft.heads import DominoGRUHead
 from specforge.modeling.draft.pretrained import DraftPreTrainedModel
-from tests.test_modeling.test_domino_model import _bare_domino
 from tests.test_modeling.test_draft_pretrained import model_config
 
 
@@ -23,7 +23,7 @@ class DFlashDraftModel(DraftPreTrainedModel):
 
 
 class DominoGRUTest(unittest.TestCase):
-    def test_aligned_head_matches_legacy_interface_for_both_label_conventions(self):
+    def test_aligned_head_matches_gru_for_both_label_conventions(self):
         cases = [("cpu", torch.float32), ("cpu", torch.bfloat16)]
         if torch.cuda.is_available():
             cases.extend(
@@ -36,11 +36,6 @@ class DominoGRUTest(unittest.TestCase):
                     with self.subTest(
                         device=device, dtype=dtype, shifted=shifted, prefix=prefix
                     ):
-                        legacy = _bare_domino().to(device=device, dtype=dtype)
-                        legacy.shift_label, legacy.pure_draft_prefix_len = (
-                            shifted,
-                            prefix,
-                        )
                         head = DominoGRUHead(
                             GRUHeadSpec(hidden_size=3, projection_size=2),
                             hidden_size=4,
@@ -48,41 +43,24 @@ class DominoGRUTest(unittest.TestCase):
                             device=device,
                             dtype=dtype,
                         )
-                        head.load_state_dict(legacy.state_dict(), strict=True)
+                        reference = copy.deepcopy(head)
+                        suffix_start = prefix + 1 - int(shifted)
                         hidden = torch.randn(
                             2, 2, 4, 4, device=device, dtype=dtype, requires_grad=True
                         )
                         embeddings = torch.randn_like(hidden, requires_grad=True)
                         other_hidden = hidden.detach().clone().requires_grad_()
                         other_embeddings = embeddings.detach().clone().requires_grad_()
-                        # Independent alignment reference from the original Domino path.
-                        prefix_tokens = embeddings if shifted else embeddings[:, :, :-1]
-                        states = legacy.prefix_gru(
-                            prefix_tokens.reshape(-1, prefix_tokens.shape[-2], 4)
-                        )[0]
-                        states = states.reshape(2, 2, prefix_tokens.shape[-2], 3)
-                        start = (
-                            legacy.suffix_start if shifted else legacy.suffix_start - 1
-                        )
-                        expected = legacy.embed_proj(
-                            torch.cat(
-                                (
-                                    hidden[:, :, legacy.suffix_start :],
-                                    states[:, :, start:],
-                                ),
-                                -1,
-                            )
-                        )
-                        torch.testing.assert_close(
-                            legacy.compute_correction_logits(
-                                prev_token_embeddings=embeddings, hidden_states=hidden
-                            ),
-                            expected,
-                            rtol=0,
-                            atol=0,
+                        aligned = embeddings if shifted else embeddings[:, :, :-1]
+                        states, _ = reference.prefix_gru(aligned.flatten(0, 1))
+                        states = states.reshape(2, 2, aligned.shape[2], 3)[
+                            :, :, prefix:
+                        ]
+                        expected = reference.embed_proj(
+                            torch.cat((hidden[:, :, suffix_start:], states), dim=-1)
                         )
                         actual = head(
-                            other_hidden[:, :, legacy.suffix_start :],
+                            other_hidden[:, :, suffix_start:],
                             (
                                 other_embeddings
                                 if shifted
@@ -101,10 +79,24 @@ class DominoGRUTest(unittest.TestCase):
                         for name, parameter in head.named_parameters():
                             torch.testing.assert_close(
                                 parameter.grad,
-                                dict(legacy.named_parameters())[name].grad,
+                                dict(reference.named_parameters())[name].grad,
                                 rtol=0,
                                 atol=0,
                             )
+
+    def test_npu_bf16_fallback_keeps_registered_gradients(self):
+        from specforge.modeling.draft.heads.domino_gru import _run_gru
+
+        gru = torch.nn.GRU(4, 3, batch_first=True, bias=False).to(torch.bfloat16)
+        output = _run_gru(
+            gru, torch.randn(2, 5, 4, dtype=torch.bfloat16), device_type="npu"
+        )
+        output.float().square().mean().backward()
+        self.assertEqual(output.dtype, torch.bfloat16)
+        for parameter in gru.parameters():
+            self.assertEqual(parameter.dtype, torch.bfloat16)
+            self.assertIsNotNone(parameter.grad)
+            self.assertGreater(parameter.grad.abs().sum().item(), 0)
 
     def test_prefix_causality_and_empty_suffix(self):
         head = DominoGRUHead(

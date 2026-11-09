@@ -216,3 +216,60 @@ def dense_attention_mask(
         layout.key_positions.shape[1],
         device=layout.query_positions.device,
     )
+
+
+def prepare_attention_mask(
+    layout, *, is_causal, sliding_window, backend, batch_size=None, num_heads=None
+):
+    """Keep visibility symbolic for FlexAttention; materialize only for dense kernels."""
+    if backend != "flex_attention":
+        return dense_attention_mask(
+            layout,
+            is_causal=is_causal,
+            sliding_window=sliding_window,
+            batch_size=batch_size,
+            num_heads=num_heads,
+        )
+    if not isinstance(layout, AttentionLayout):
+        raise TypeError("attention requires AttentionLayout")
+    boolean("is_causal", is_causal)
+    if sliding_window is not None:
+        positive_int("sliding_window", sliding_window)
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    from specforge.modeling.draft.layers.attention.backends.policy import (
+        flex_attention_backend,
+    )
+
+    q, k = layout.query_positions, layout.key_positions
+    visibility = layout.visibility
+
+    def allowed(b, h, qi, ki):
+        within = (qi < q.shape[1]) & (ki < k.shape[1])
+        qi, ki = qi.clamp(max=q.shape[1] - 1), ki.clamp(max=k.shape[1] - 1)
+        if callable(visibility):
+            result = visibility(b, h, qi, ki)
+        else:
+            result = visibility[
+                b % visibility.shape[0], h % visibility.shape[1], qi, ki
+            ]
+        qp, kp = q[b % q.shape[0], qi], k[b % k.shape[0], ki]
+        if is_causal:
+            result = result & (qp >= kp)
+        if sliding_window is not None:
+            result = result & ((qp - kp).abs() < sliding_window)
+        return within & result
+
+    return create_block_mask(
+        allowed,
+        B=q.shape[0],
+        H=(
+            None
+            if callable(visibility) or visibility.shape[1] == 1
+            else visibility.shape[1]
+        ),
+        Q_LEN=q.shape[1],
+        KV_LEN=k.shape[1],
+        device=q.device,
+        BLOCK_SIZE=(256, 128) if flex_attention_backend() == "FLASH" else 128,
+    )

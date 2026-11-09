@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
+from specforge.algorithms.metrics.prefix import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
 
 

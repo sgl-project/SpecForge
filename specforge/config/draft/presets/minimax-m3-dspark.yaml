@@ -1,0 +1,76 @@
+schema_version: 1
+model_type: specforge_draft
+architectures:
+- DSparkDraftModel
+extensions: []
+hidden_size: 6144
+vocab_size: 200064
+draft_vocab_size: 200064
+max_position_embeddings: 1048576
+initializer_range: 0.02
+tie_word_embeddings: false
+attention_configs:
+  sliding_attention:
+    type: gqa
+    rope_parameters: null
+    num_attention_heads: 32
+    num_key_value_heads: 8
+    head_dim: 128
+    qk_norm: true
+    attention_bias: false
+    output_gate: false
+    is_causal: true
+    sliding_window: 2048
+    attention_dropout: 0.0
+mlp_configs:
+  default:
+    type: dense
+    intermediate_size: 12288
+    hidden_act: silu
+conv_configs: {}
+layer_configs:
+  sliding_attention:
+    attention: sliding_attention
+    mlp: default
+    sublayer_conv: null
+layer_types:
+- sliding_attention
+- sliding_attention
+- sliding_attention
+- sliding_attention
+- sliding_attention
+- sliding_attention
+num_hidden_layers: 6
+norm_config:
+  type: rms
+  eps: 1.0e-06
+  weight_offset: 0
+residual_config:
+  type: standard
+rope_parameters:
+  rope_type: default
+  rope_theta: 5000000
+  partial_rotary_factor: 1.0
+spec_config:
+  block:
+    block_size: 16
+  target_features:
+    hidden_size: 6144
+    mask_token_id: 200063
+    target_layer_ids:
+    - 1
+    - 12
+    - 23
+    - 35
+    - 46
+    - 57
+  markov:
+    type: vanilla
+    rank: 256
+  confidence:
+    with_markov: true
+target_bindings:
+- embed_tokens
+- lm_head
+target_logit_transform:
+  type: none

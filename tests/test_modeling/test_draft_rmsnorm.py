@@ -4,11 +4,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling.draft.layers.norm import RMSNorm
-from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm
 from tests.test_modeling.mtp_reference import OffsetRMSNorm
 
 
@@ -43,11 +43,7 @@ class RMSNormTest(unittest.TestCase):
                             2, 3, 16, device=device, dtype=input_dtype
                         ).requires_grad_()
                         right = left.detach().clone().requires_grad_()
-                        # Compare eager primitives; compilation is a separate backend choice.
-                        with patch.object(
-                            LlamaRMSNorm, "forward", LlamaRMSNorm.forward.__wrapped__
-                        ):
-                            expected_output = expected(left)
+                        expected_output = expected(left)
                         actual_output = actual(right)
                         torch.testing.assert_close(
                             actual_output, expected_output, rtol=0, atol=0

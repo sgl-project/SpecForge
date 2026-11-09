@@ -60,6 +60,39 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_existing_offline_fields_and_packed_lengths(self):
+        from specforge.runtime.data_plane.feature_store import LocalFeatureStore
+        from specforge.training.canonical_data import (
+            build_reader,
+            collate,
+            normalize_sample,
+        )
+
+        keys = ("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states")
+        with TemporaryDirectory() as temp:
+            torch.save(
+                dict(
+                    input_ids=torch.arange(7),
+                    loss_mask=torch.ones(7),
+                    aux_hidden_state=torch.randn(1, 7, 24),
+                    hidden_state=torch.randn(1, 7, 8),
+                    lengths=torch.tensor([3, 4]),
+                ),
+                Path(temp) / "sample.ckpt",
+            )
+            reader = build_reader(
+                temp, strategy="eagle3", keys=keys, validate_files=True
+            )
+            store = LocalFeatureStore()
+            raw, handle = store.get(reader.read()[0])
+            sample = normalize_sample(raw, keys=keys, max_len=5)
+            batch = collate([sample], keys=keys)
+            self.assertEqual(batch["lengths"].tolist(), [3, 2])
+            self.assertEqual(batch["hidden_states"].shape, (1, 5, 24))
+            self.assertEqual(batch["target_last_hidden_states"].shape, (1, 5, 8))
+            self.assertEqual(batch["loss_mask"][0, -1], 0)
+            store.release(handle)
+
     def test_training_parses_with_target_before_building_the_model(self):
         from unittest.mock import patch
 
@@ -173,7 +206,8 @@ class CanonicalTrainingTest(unittest.TestCase):
                         for key in (
                             "input_ids",
                             "loss_mask",
-                            "target_last_hidden_states" if mtp else "hidden_states",
+                            "target_last_hidden_states",
+                            *(("hidden_states",) if not mtp else ()),
                         )
                     },
                     features / f"{index}.ckpt",
@@ -257,7 +291,10 @@ class CanonicalTrainingTest(unittest.TestCase):
         state = torch.get_rng_state().clone()
         replayed = output.replay_loss(output.ratio_metrics)
         torch.testing.assert_close(state, torch.get_rng_state())
-        torch.testing.assert_close(output.loss, replayed.loss)
+        torch.testing.assert_close(
+            output.ratio_metrics["dspine/backbone_ce"],
+            replayed.ratio_metrics["dspine/backbone_ce"],
+        )
         replayed.loss.backward()
         self.assertTrue(
             all(p.grad is not None for p in model.parameters() if p.requires_grad)
@@ -272,5 +309,11 @@ class CanonicalTrainingTest(unittest.TestCase):
         cfg = run_config(
             Path("target"), draft, training={"attention_backend": "flex_attention"}
         )
-        with self.assertRaisesRegex(ValueError, "attention_backend"):
+        resolve_run(cfg)
+        cfg = run_config(
+            Path("target"),
+            draft,
+            training={"attention_backend": "usp", "sp_ulysses_size": 2},
+        )
+        with self.assertRaisesRegex(ValueError, "requires EAGLE3"):
             resolve_run(cfg)

@@ -1,8 +1,9 @@
+draft: specforge/config/draft/presets/qwen3-8b-dflash.yaml
+
 # 4-rank variant of qwen3-8b-dflash.yaml with one external capture server.
 # Disables experiment reporting (report_to: none).
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-dflash.json
   target_backend: sglang
 data:
   train_data_path: ./cache/dataset/sharegpt_train.jsonl
@@ -11,15 +12,15 @@ data:
   cache_dir: cache
   build_dataset_num_proc: 32
 training:
-  strategy: dflash
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 7.0
   num_epochs: 6
   max_steps: 10000
   batch_size: 4
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
-  num_anchors: 512
-  loss_decay_gamma: 7.0
   save_interval: 1000
   dist_timeout: 30
   seed: 42

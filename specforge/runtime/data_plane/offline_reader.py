@@ -48,9 +48,15 @@ _VALIDATE_ENV = "SPECFORGE_VALIDATE_OFFLINE_FEATURES"
 
 
 def _inspect_feature_file(
-    path: str, feature_keys: Tuple[str, ...]
+    path: str, feature_keys: Tuple[str, ...], aliases=None
 ) -> Tuple[Dict[str, FeatureSpec], int, int]:
     raw = load_feature_file(path)
+    for key, candidates in (aliases or {}).items():
+        if key not in raw:
+            for candidate in candidates:
+                if candidate in raw:
+                    raw[key] = raw[candidate]
+                    break
     missing = [key for key in feature_keys if key not in raw]
     if missing:
         raise KeyError(f"{path} missing required offline feature keys {missing}")
@@ -98,6 +104,8 @@ class OfflineManifestReader:
         max_len: int = 2048,
         target_repr: Optional[str] = "hidden_state",
         validate_files: Optional[bool] = None,
+        feature_aliases=None,
+        optional_features=(),
     ) -> None:
         self.hidden_states_path = hidden_states_path
         self.run_id = run_id
@@ -105,6 +113,8 @@ class OfflineManifestReader:
         self.target_model_version = target_model_version
         self.tokenizer_version = tokenizer_version
         self.feature_keys = tuple(feature_keys)
+        self.feature_aliases = feature_aliases or {}
+        self.optional_features = tuple(optional_features)
         self.ttt_length = ttt_length
         self.max_len = max_len
         self.target_repr = target_repr
@@ -125,7 +135,7 @@ class OfflineManifestReader:
         estimated_bytes = 0
         if self.validate_files:
             specs, num_tokens, estimated_bytes = _inspect_feature_file(
-                path, self.feature_keys
+                path, self.feature_keys, self.feature_aliases
             )
         return SampleRef(
             sample_id=sample_id,
@@ -142,6 +152,8 @@ class OfflineManifestReader:
             estimated_bytes=estimated_bytes,
             metadata={
                 "format": f"offline_{self.strategy}",
+                "file_feature_aliases": self.feature_aliases,
+                "optional_file_features": self.optional_features,
                 "target_repr": self.target_repr,
                 "schema_version": SCHEMA_VERSION,
                 "ttt_length": self.ttt_length,

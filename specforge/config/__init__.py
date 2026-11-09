@@ -18,7 +18,6 @@ __all__ = [
     "TrainerDeploymentConfig",
     "load_config",
     "apply_overrides",
-    "migrate_legacy_config",
 ]
 
 

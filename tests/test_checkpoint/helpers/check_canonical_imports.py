@@ -10,8 +10,7 @@ assert model.config.draft.architecture == "DFlashDraftModel"
 for name in ("legacy", "dflash", "llama3_eagle", "mtp", "registry", "config"):
     assert f"specforge.modeling.draft.{name}" not in sys.modules, name
 
-# Explicit old API use still registers every historical architecture.
-from specforge.modeling.draft import available_drafts
+# Model registration belongs to the canonical modeling package.
+from specforge.modeling.draft.models.registry import resolve_draft_model
 
-assert "Qwen3_5MTPDraftModel" not in available_drafts()
-assert "DFlashDraftModel" in available_drafts()
+assert resolve_draft_model("DFlashDraftModel") is type(model)

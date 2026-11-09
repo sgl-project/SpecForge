@@ -47,7 +47,7 @@ retained transport state; export the final checkpoint before serving:
 ```bash
 specforge export --format sglang \
   --checkpoint ./outputs/llama3.1-8b-eagle3-online/llama3.1-8b-eagle3-online-latest \
-  --draft-config configs/llama3-8B-eagle3.json \
+  --draft-config specforge/config/draft/presets/llama3-8B-eagle3.yaml \
   --target-model /path/to/Llama-3.1-8B-Instruct \
   --output-dir ./exports/llama3.1-8b-eagle3-sglang
 ```

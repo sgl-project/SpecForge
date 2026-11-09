@@ -1,3 +1,5 @@
+draft: specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml
+
 # Qwen3.8-27B DFlash2 across two 8-GPU nodes with externally managed services:
 # eight TP=1 SGLang capture servers and the Mooncake master on the
 # capture node, a DP=8 DFlash2 trainer on the trainer node.
@@ -10,12 +12,10 @@
 # 10 servers + DP6 split.
 model:
   target_model_path: Qwen/Qwen3.8-27B
-  draft_model_config: configs/qwen3.8-27b-dflash2.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: model.language_model.embed_tokens.weight
   torch_dtype: bfloat16
-  mask_token_id: 248070
   sglang_attention_backend: triton
   sglang_disable_radix_cache: true
   sglang_context_length: 8199
@@ -29,7 +29,14 @@ data:
   cache_dir: cache/qwen3.8-27b-dflash2
 
 training:
-  strategy: dflash
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 7.0
+    objective_chunk_blocks: 128
+    objective_checkpointing: false
+    loss_type: dflash
+    selector_loss_alpha: 1.0
+    selector_stop_gradient: false
   num_epochs: 1
   tp_size: 1
   # 8 ranks x 2 x 4 = 64 samples per optimizer step.
@@ -41,15 +48,8 @@ training:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   attention_backend: flex_attention
-  num_anchors: 512
-  loss_decay_gamma: 7.0
-  objective_chunk_blocks: 128
   # Measured without objective checkpointing: keep each chunk's logits for
   # backward instead of recomputing the 248k-vocabulary projection.
-  objective_checkpointing: false
-  loss_type: dflash
-  dflash2_selector_loss_alpha: 1.0
-  dflash2_selector_stop_gradient: false
   save_interval: 500
   log_interval: 10
   dist_timeout: 30

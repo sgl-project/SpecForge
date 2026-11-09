@@ -13,9 +13,9 @@ from unittest import mock
 import torch
 
 from scripts.prepare_hidden_states import HiddenStatesGenerator, sample_range
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.offline_capture import OfflineCaptureClient
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime.test_server_capture import _FakeMooncakeStore, _request_specs
 
 sys.path.insert(

@@ -2,12 +2,9 @@
 
 from dataclasses import dataclass
 
-import torch.nn.functional as F
-
-from specforge.core.fused_loss import ce_l1_loss
-
-from .base import check_options, reduce_loss
-from .dflash import COMMON_MODULES
+from ..losses.dspark_reduction import reduce_dspark
+from .base import COMMON_MODULES, check_options
+from .block_options import BlockLossOptions
 from .inputs import prepare_blocks
 from .registry import register_objective
 
@@ -20,14 +17,13 @@ from .registry import register_objective
     trains=COMMON_MODULES + ("markov_head", "confidence_head"),
 )
 @dataclass
-class DSparkObjective:
-    num_anchors: int = 512
-    loss_decay_gamma: float | None = None
+class DSparkObjective(BlockLossOptions):
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9
     confidence_loss_alpha: float = 1.0
 
     def __post_init__(self):
+        super().__post_init__()
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
@@ -38,38 +34,31 @@ class DSparkObjective:
             },
         )
 
-    def __call__(self, runtime, batch, **context):
+    def __call__(self, runtime, batch, *, collect_detailed_metrics=True, **context):
         model = runtime.draft_model
         blocks = prepare_blocks(
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
             label_offset=1,
+            prefix=True,
         )
         output = model(
             blocks.input_ids,
             batch["hidden_states"],
             blocks.layer_inputs,
-            predecessor_ids=blocks.predecessors.flatten(1),
+            output_logits=False,
         )
-        labels = blocks.labels.flatten(1)
-        teacher = runtime.teacher_logits(batch, blocks.label_positions.flatten(1) - 1)
-        terms = ce_l1_loss(output.logits, labels, teacher_logits=teacher)
-        loss = (
-            self.ce_loss_alpha * terms.cross_entropy
-            + self.l1_loss_alpha * terms.teacher_l1
-        )
-        if output.confidence_scores is not None:
-            acceptance = (1 - terms.teacher_l1.detach() / 2).clamp(0, 1)
-            confidence = output.confidence_scores.reshape_as(labels)
-            loss = (
-                loss
-                + self.confidence_loss_alpha
-                * F.binary_cross_entropy_with_logits(
-                    confidence, acceptance, reduction="none"
-                )
-            )
-        return reduce_loss(
-            loss, blocks.weights.flatten(1), logits=output.logits, labels=labels
+        return reduce_dspark(
+            model,
+            self,
+            runtime.target_head,
+            output_hidden=output.hidden_states,
+            target_ids=blocks.labels,
+            eval_mask=blocks.weights.bool(),
+            prev_token_ids=blocks.predecessors,
+            safe_label_indices=blocks.label_positions,
+            target_last_hidden_states=batch.get("target_last_hidden_states"),
+            anchor_positions=blocks.anchors,
+            collect_detailed_metrics=collect_detailed_metrics,
         )

@@ -49,7 +49,13 @@ def read_json(source):
 
 def target_configuration(directory):
     config = read_json(Path(directory) / "config.json")
-    return config.get("text_config", config)
+    config = dict(config.get("text_config", config))
+    if (
+        "LongcatFlashForCausalLM" in config.get("architectures", ())
+        and "num_hidden_layers" not in config
+    ):
+        config["num_hidden_layers"] = config["num_layers"]
+    return config
 
 
 @dataclass(frozen=True)

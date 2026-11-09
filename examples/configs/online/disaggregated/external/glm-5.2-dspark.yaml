@@ -1,6 +1,7 @@
+draft: specforge/config/draft/presets/glm-5.2-dspark.yaml
+
 model:
   target_model_path: zai-org/GLM-5.2-FP8
-  draft_model_config: configs/glm-5.2-dspark.json
   target_backend: sglang
   trust_remote_code: true
 data:
@@ -10,7 +11,10 @@ data:
   cache_dir: cache
   build_dataset_num_proc: 64
 training:
-  strategy: dspark
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 4.0
+    objective_chunk_blocks: 128
   num_epochs: 10
   # Portable one-rank equivalent of the source recipe's global batch 512.
   batch_size: 1
@@ -18,9 +22,6 @@ training:
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
-  num_anchors: 512
-  loss_decay_gamma: 4.0
-  objective_chunk_blocks: 128
   # Optimizer-step equivalent of about 500 source microsteps at microbatch 16.
   save_interval: 16
   dist_timeout: 30

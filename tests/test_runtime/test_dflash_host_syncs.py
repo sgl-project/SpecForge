@@ -18,62 +18,46 @@ import torch
 from torch import nn
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import (
-    DFlashTrainStrategy,
-    DominoTrainStrategy,
-    DSparkTrainStrategy,
-    StepContext,
-    StepOutput,
-)
+from specforge.training.strategies.base import StepContext, StepOutput
+from specforge.training.strategies.canonical import CanonicalTrainStrategy
+from tests.test_runtime._fixtures import build_strategy
 
 CUDA = torch.cuda.is_available()
 _CTX = StepContext(global_step=5, total_steps=100, collect_detailed_metrics=False)
 
 
 def _tiny_dflash2(attention_backend, *, sliding):
-    from transformers import Qwen3Config
+    from dataclasses import replace
 
-    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-    from specforge.modeling.draft.dflash2 import DFlash2DraftModel
+    from specforge.algorithms.objectives import build_objective_model
+    from specforge.modeling import build_draft_model
+    from tests.test_modeling.test_canonical_dflash2 import dflash2_config
 
-    config = Qwen3Config(
-        architectures=["DFlash2DraftModel"],
+    config = dflash2_config()
+    config = replace(
+        config,
         hidden_size=64,
-        intermediate_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_hidden_layers=2,
-        num_target_layers=4,
-        head_dim=16,
-        max_position_embeddings=512,
-        vocab_size=64,
-        layer_types=["sliding_attention" if sliding else "full_attention"] * 2,
-        sliding_window=32 if sliding else None,
-        use_sliding_window=sliding,
-        dflash_config={
-            "block_size": 4,
-            "conv_group_size": 4,
-            "conv_kernel_size": 2,
-            "mask_token_id": 63,
-            "selector_rank": 4,
-            "selector_top_k": 3,
-            "target_layer_ids": [1, 2],
+        attention_configs={
+            "full": replace(
+                config.attention_configs["full"],
+                head_dim=16,
+                is_causal=sliding,
+                sliding_window=32 if sliding else None,
+            )
         },
+        mlp_configs={
+            "dense": replace(config.mlp_configs["dense"], intermediate_size=128)
+        },
+        spec_config=replace(
+            config.spec_config, block=replace(config.spec_config.block, block_size=4)
+        ),
     )
-    config._attn_implementation = attention_backend
-    device = torch.device("cuda")
-    draft = DFlash2DraftModel(config).to(device, torch.bfloat16)
-    return OnlineDFlashModel(
-        draft_model=draft,
-        target_lm_head=nn.Linear(64, 64, bias=False).to(device, torch.bfloat16),
-        target_embed_tokens=nn.Embedding(64, 64).to(device, torch.bfloat16),
-        mask_token_id=63,
-        block_size=4,
-        attention_backend=attention_backend,
-        num_anchors=16,
-        loss_decay_gamma=7.0,
-        selector_loss_alpha=1.0,
-    ).to(device)
+    draft = build_draft_model(
+        config, backend=attention_backend, device="cuda", dtype=torch.bfloat16
+    )
+    return build_objective_model(
+        draft, options=dict(num_anchors=16, teacher_metrics=False)
+    )
 
 
 def _features(seq_len=256, seed=0):
@@ -131,47 +115,32 @@ class _RecordingModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(()))
+        self.draft_model = nn.Linear(4, 4)
         self.kwargs = None
 
-    def forward(self, **kwargs):
-        self.kwargs = kwargs
-        loss = self.weight * kwargs["hidden_states"].float().sum()
-        return loss, torch.zeros(()), {}
+    def forward(self, batch, **kwargs):
+        from specforge.algorithms.result import ObjectiveResult
+
+        self.kwargs = batch
+        loss = self.draft_model(batch["hidden_states"]).sum()
+        return ObjectiveResult(loss, loss.new_ones(()))
 
 
 class TestHostAnchorSizing(unittest.TestCase):
-    """CPU: every DFlash-family strategy sizes anchors from a host loss mask."""
-
-    def test_strategies_pass_host_anchor_width_with_device_hidden_states(self):
+    def test_host_anchor_width_includes_padding(self):
         device = "cuda" if CUDA else "cpu"
-        loss_mask = torch.tensor([[1, 1, 0, 1, 1, 1], [1, 0, 1, 0, 1, 1]])
-        tensors = {
-            "input_ids": torch.zeros(2, 6, dtype=torch.long),
-            "loss_mask": loss_mask,
-            "hidden_states": torch.randn(2, 6, 4, device=device),
-            "target_last_hidden_states": torch.randn(2, 6, 4, device=device),
-        }
-        for strategy_type in (
-            DFlashTrainStrategy,
-            DSparkTrainStrategy,
-            DominoTrainStrategy,
-        ):
-            with self.subTest(strategy=strategy_type.name):
-                model = _RecordingModel().to(device)
-                strategy = strategy_type(model)
-                strategy.forward_loss(
-                    TrainBatch(
-                        sample_ids=["a", "b"],
-                        strategy=strategy.name,
-                        tensors=tensors,
-                        metadata={},
-                    ),
-                    _CTX,
-                )
-                # Row 0 has anchors at 0, 3, 4; row 1 only at 4.
-                self.assertEqual(model.kwargs["max_valid_anchors"], 3)
-                self.assertEqual(model.kwargs["loss_mask"].device.type, device)
+        tensors = dict(
+            input_ids=torch.zeros(2, 6, dtype=torch.long),
+            loss_mask=torch.tensor([[1, 1, 0, 1, 1, 1], [1, 0, 1, 0, 1, 1]]),
+            hidden_states=torch.randn(2, 6, 4, device=device),
+        )
+        model = _RecordingModel().to(device)
+        strategy = CanonicalTrainStrategy(
+            model, name="dflash", objective="dflash", required_features=tensors.keys()
+        )
+        strategy.forward_loss(TrainBatch(["a", "b"], "dflash", tensors), _CTX)
+        self.assertEqual(model.kwargs["max_valid_anchors"], 3)
+        self.assertEqual(model.kwargs["loss_mask"].device.type, device)
 
 
 @unittest.skipUnless(CUDA, "requires CUDA")
@@ -179,7 +148,7 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
     def test_micro_step_is_sync_free_with_host_loss_mask(self):
         for backend, sliding in (("sdpa", False), ("flex_attention", True)):
             with self.subTest(backend=backend, sliding=sliding):
-                strategy = DFlashTrainStrategy(_tiny_dflash2(backend, sliding=sliding))
+                strategy = build_strategy(_tiny_dflash2(backend, sliding=sliding))
                 for _ in range(2):  # compile / allocator warm-up
                     _micro_step(strategy, _batch("cpu"))
                 batch = _batch("cpu")
@@ -191,7 +160,7 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
                     torch.cuda.set_sync_debug_mode("default")
 
     def test_device_loss_mask_still_falls_back_to_a_detected_sync(self):
-        strategy = DFlashTrainStrategy(_tiny_dflash2("sdpa", sliding=False))
+        strategy = build_strategy(_tiny_dflash2("sdpa", sliding=False))
         _micro_step(strategy, _batch("cpu"))
         batch = _batch("cuda")
         torch.cuda.synchronize()
@@ -203,9 +172,9 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
             torch.cuda.set_sync_debug_mode("default")
 
     def test_pinned_mooncake_batches_feed_a_sync_free_micro_step(self):
-        from specforge.algorithms.common.hidden_states_data import build_collator
         from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
         from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        from specforge.training.canonical_data import build_collator
         from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore, _meta
 
         store = MooncakeFeatureStore(
@@ -225,7 +194,7 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
             store,
             refs=refs,
             batch_size=2,
-            collate_fn=build_collator(),
+            collate_fn=build_collator(keys=("input_ids", "hidden_states", "loss_mask")),
             device=store.consumer_device(),
             num_workers=1,
             pin_memory=True,
@@ -252,7 +221,7 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
                 atol=0,
             )
 
-        strategy = DFlashTrainStrategy(_tiny_dflash2("sdpa", sliding=False))
+        strategy = build_strategy(_tiny_dflash2("sdpa", sliding=False))
         _micro_step(strategy, _batch("cpu"))
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")

@@ -21,13 +21,10 @@ def _cache_config(path: str):
         ),
         model=SimpleNamespace(
             target_model_path="org/target-model",
-            draft_model_config="configs/draft.json",
-            draft_checkpoint_path=None,
-            draft_num_hidden_layers=None,
-            draft_block_size=None,
             input_modality="text",
         ),
-        training=SimpleNamespace(strategy="eagle3"),
+        draft={"architecture": "Eagle3DraftModel"},
+        training=SimpleNamespace(objective="eagle3"),
     )
 
 

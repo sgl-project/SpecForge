@@ -19,6 +19,7 @@ class RMSNorm(nn.Module):
             raise TypeError("RMSNorm requires RMSNormSpec")
         positive_int("hidden_size", hidden_size)
         self.config = config
+        self.use_liger_kernel = False
         self.weight = (
             nn.Parameter(torch.empty(hidden_size, device=device, dtype=dtype))
             if config.has_weight
@@ -32,6 +33,18 @@ class RMSNorm(nn.Module):
             init.constant_(self.weight, 1 - self.config.weight_offset)
 
     def forward(self, hidden: Tensor) -> Tensor:
+        if self.use_liger_kernel and self.weight is not None:
+            from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+
+            return LigerRMSNormFunction.apply(
+                hidden,
+                self.weight,
+                self.config.eps,
+                self.config.weight_offset,
+                "gemma" if self.config.weight_offset else "llama",
+                False,
+                None,
+            )
         input_dtype = hidden.dtype
         hidden = hidden.to(torch.float32)
         variance = hidden.pow(2).mean(-1, keepdim=True)

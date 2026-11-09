@@ -1,12 +1,12 @@
+draft: specforge/config/draft/presets/deepseek-v4-flash-dspark.yaml
+
 model:
   target_model_path: deepseek-ai/DeepSeek-V4-Flash-0731
-  draft_model_config: configs/deepseek-v4-flash-dspark.json
   target_backend: sglang
   trust_remote_code: true
   # DeepSeek-V4 checkpoints use the native inference weight layout.
   embedding_key: embed.weight
   lm_head_key: head.weight
-  mask_token_id: 128799
   torch_dtype: bfloat16
   sglang_mem_fraction_static: 0.85
   # data.max_length plus headroom: capture rejects inputs at exactly context length.
@@ -25,7 +25,13 @@ data:
   dataloader_num_workers: 8
 
 training:
-  strategy: dspark
+  objective_options:
+    num_anchors: 512
+    loss_decay_gamma: 4.0
+    objective_chunk_blocks: 128
+    ce_loss_alpha: 0.1
+    l1_loss_alpha: 0.9
+    confidence_loss_alpha: 1.0
   num_epochs: 2
   # 4 ranks x 32 microbatches -> global batch 128.
   batch_size: 1
@@ -35,12 +41,6 @@ training:
   warmup_ratio: 0
   max_grad_norm: 1
   attention_backend: flex_attention
-  num_anchors: 512
-  loss_decay_gamma: 4.0
-  objective_chunk_blocks: 128
-  dspark_ce_loss_alpha: 0.1
-  dspark_l1_loss_alpha: 0.9
-  dspark_confidence_head_alpha: 1.0
   save_interval: 128
   log_interval: 10
   dist_timeout: 30

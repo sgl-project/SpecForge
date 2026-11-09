@@ -3,7 +3,7 @@
 """Compact (draft-vocabulary) teacher distribution for EAGLE-3 training.
 
 Reproduces the teacher quantities of
-``specforge.algorithms.eagle3.model._compute_target_p`` from the target's last hidden
+``specforge.algorithms.losses.eagle_teacher.teacher_distribution`` from the target's last hidden
 states and ``lm_head`` weight without materializing the full ``[B, S, vocab_size]``
 fp32 logits: the draft-vocab logits are retained while the full-vocab
 ``logsumexp``/``argmax`` streams over vocabulary chunks.
