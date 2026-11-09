@@ -64,6 +64,10 @@ def default_target_layer_ids(
         raise ValueError(
             "default target_layer_ids are out of range; supply explicit layers"
         )
+    if len(set(layers)) != len(layers):
+        raise ValueError(
+            "default target_layer_ids contain duplicates; supply explicit distinct layers"
+        )
     return layers
 
 

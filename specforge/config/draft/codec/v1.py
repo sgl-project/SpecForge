@@ -5,14 +5,21 @@ DraftConfig. This codec accepts resolved structural settings only.
 """
 
 from collections.abc import Mapping
+from typing import get_type_hints
 
 from .._validation import positive_int
+from ..architecture.features import TargetFeatureSpec
 from ..model import DraftConfig
 from ..registry import architecture_spec
 from ._schema import _construct
 from .components import decode_component, decode_layer, encode_component, encode_layer
 from .nodes import decode_node, encode_node
-from .target import resolve_target_logits, validate_target
+from .target import (
+    _text_config,
+    default_target_layer_ids,
+    resolve_target_logits,
+    validate_target,
+)
 
 SCHEMA_VERSION = 1
 MODEL_TYPE = "specforge_draft"
@@ -164,7 +171,8 @@ def parse_draft(
     """Parse a resolved YAML draft mapping, expanding only documented shorthand.
 
     Vocabulary size derives from vocab_size when omitted. initializer_range is
-    non-structural and defaults to 0.02. Legacy aliases/defaults are not accepted.
+    non-structural and defaults to 0.02. Omitted TargetFeatureSpec layer IDs
+    derive from target_config and draft depth. Canonical decoding stays strict.
     """
     if not isinstance(payload, Mapping):
         raise ValueError("draft: expected a configuration object")
@@ -205,6 +213,29 @@ def parse_draft(
     if "draft_vocab_size" not in values and "vocab_size" in values:
         values["draft_vocab_size"] = values["vocab_size"]
     values.setdefault("initializer_range", 0.02)
+    architectures = values.get("architectures")
+    spec = values.get("spec_config")
+    if (
+        target_config is not None
+        and isinstance(architectures, (list, tuple))
+        and len(architectures) == 1
+        and type(architectures[0]) is str
+        and isinstance(spec, Mapping)
+    ):
+        schema = architecture_spec(architectures[0]).schema
+        features = spec.get("target_features")
+        if (
+            get_type_hints(schema).get("target_features") is TargetFeatureSpec
+            and isinstance(features, Mapping)
+            and "target_layer_ids" not in features
+        ):
+            target = _text_config(target_config)
+            depth = len(_array(values.get("layer_types"), "layer_types"))
+            layers = default_target_layer_ids(target.get("num_hidden_layers"), depth)
+            values["spec_config"] = {
+                **spec,
+                "target_features": {**features, "target_layer_ids": layers},
+            }
     bindings = values.get("target_bindings")
     if (
         target_config is not None

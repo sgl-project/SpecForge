@@ -42,7 +42,6 @@ class ArchitectureSpecsTest(unittest.TestCase):
                 self.assertEqual(node.num_external_candidates, external)
                 self.assertEqual(node.verify_window, window)
                 self.assertEqual(node.prediction_positions, positions)
-        self.assertEqual(DraftOnlyBlockSpec(block_size=1).verify_window, 2)
 
     def test_invalid_block_sizes_are_rejected(self):
         for schema in (AnchoredBlockSpec, DraftOnlyBlockSpec, ExternalFirstBlockSpec):
@@ -52,15 +51,15 @@ class ArchitectureSpecsTest(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "block_size"),
                 ):
                     schema(block_size=value)
-        for schema in (AnchoredBlockSpec, ExternalFirstBlockSpec):
+        for schema in (AnchoredBlockSpec, DraftOnlyBlockSpec, ExternalFirstBlockSpec):
             with self.assertRaisesRegex(ValueError, "at least 2"):
                 schema(block_size=1)
 
     def test_target_feature_order_and_width(self):
-        node = TargetFeatureSpec(mask_token_id=0, target_layer_ids=(7, 1, 7))
-        self.assertEqual(node.target_layer_ids, (7, 1, 7))
+        node = TargetFeatureSpec(mask_token_id=0, target_layer_ids=(7, 1, 4))
+        self.assertEqual(node.target_layer_ids, (7, 1, 4))
         self.assertEqual(node.input_width(96), 288)
-        for value in ([], (), (True,), (-1,), ("1",), [1, 2]):
+        for value in ([], (), (True,), (-1,), ("1",), [1, 2], (7, 1, 7)):
             with self.assertRaisesRegex(ValueError, "target_layer_ids"):
                 TargetFeatureSpec(mask_token_id=0, target_layer_ids=value)
         for value in (True, -1, 0.0, "0", None):

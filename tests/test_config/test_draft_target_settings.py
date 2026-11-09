@@ -10,6 +10,7 @@ from specforge.config.draft.codec.target import (
 )
 from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransformSpec
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_canonical_codec import shorthand
 
 TARGET = {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 8}
 
@@ -36,6 +37,38 @@ class TargetSettingsTest(unittest.TestCase):
             parse_draft(payload)
         with self.assertRaisesRegex(ValueError, "target_logit_transform"):
             decode_config(payload, target_config=target)
+
+    def test_yaml_resolves_feature_layers_and_saves_explicit_ids(self):
+        named = encode_config(draft_config())
+        named.pop("num_hidden_layers")
+        for payload in (named, shorthand()):
+            del payload["spec_config"]["target_features"]["target_layer_ids"]
+            original = copy.deepcopy((payload, TARGET))
+            node = parse_draft(payload, target_config=TARGET)
+            saved = encode_config(node)
+            self.assertEqual(
+                saved["spec_config"]["target_features"]["target_layer_ids"], [1, 5]
+            )
+            self.assertEqual(decode_config(saved), node)
+            self.assertEqual((payload, TARGET), original)
+            with self.assertRaisesRegex(ValueError, "target_layer_ids"):
+                parse_draft(payload)
+        with self.assertRaisesRegex(ValueError, "target_layer_ids"):
+            decode_config(named, target_config=TARGET)
+        with self.assertRaisesRegex(ValueError, "duplicates"):
+            parse_draft(named, target_config={**TARGET, "num_hidden_layers": 4})
+
+    def test_explicit_feature_layers_preserve_order_and_reject_duplicates(self):
+        payload = encode_config(draft_config())
+        features = payload["spec_config"]["target_features"]
+        for reader in (parse_draft, decode_config):
+            features["target_layer_ids"] = [6, 1]
+            node = reader(payload, target_config=TARGET)
+            self.assertEqual(node.spec_config.target_features.target_layer_ids, (6, 1))
+            for ids in (None, [], [7, 1, 7]):
+                features["target_layer_ids"] = ids
+                with self.assertRaisesRegex(ValueError, "target_layer_ids"):
+                    reader(payload, target_config=TARGET)
 
     def test_explicit_or_saved_settings_are_checked_not_overwritten(self):
         payload = encode_config(draft_config())
@@ -96,7 +129,8 @@ class TargetSettingsTest(unittest.TestCase):
         self.assertEqual(default_target_layer_ids(28, 5), (1, 7, 13, 19, 25))
         self.assertEqual(default_target_layer_ids(36, 1), (18,))
         self.assertEqual(default_target_layer_ids(7, 3), (1, 2, 4))
-        self.assertEqual(default_target_layer_ids(4, 3), (1, 1, 1))
+        with self.assertRaisesRegex(ValueError, "duplicates.*explicit distinct"):
+            default_target_layer_ids(4, 3)
         for value in (True, 0, -1, 2.5):
             with self.assertRaisesRegex(ValueError, "num_target_layers"):
                 default_target_layer_ids(value, 2)

@@ -63,6 +63,11 @@ class AnchoredBlockSpec(BlockProtocol):
 class DraftOnlyBlockSpec(BlockProtocol):
     """DSpark's draft-only layout: every model slot predicts a candidate."""
 
+    def __post_init__(self):
+        super().__post_init__()
+        if self.block_size < 2:
+            raise ValueError("DSpark block_size must be at least 2")
+
     @property
     def num_draft_tokens(self) -> int:
         return self.block_size

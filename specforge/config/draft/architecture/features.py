@@ -18,6 +18,8 @@ class TargetFeatureSpec:
             raise ValueError("target_layer_ids must be a nonempty tuple")
         if any(type(layer) is not int or layer < 0 for layer in self.target_layer_ids):
             raise ValueError("target_layer_ids must contain nonnegative integers")
+        if len(set(self.target_layer_ids)) != len(self.target_layer_ids):
+            raise ValueError("target_layer_ids must be distinct")
 
     def input_width(self, target_hidden_size: int) -> int:
         positive_int("target_hidden_size", target_hidden_size)

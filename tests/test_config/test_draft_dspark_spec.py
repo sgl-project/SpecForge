@@ -13,7 +13,7 @@ from specforge.config.draft.architecture.dspark import (
     ConfidenceHeadSpec,
     MarkovHeadSpec,
 )
-from specforge.config.draft.codec import decode_config, encode_config
+from specforge.config.draft.codec import decode_config, encode_config, parse_draft
 from tests.test_config.draft_fixtures import draft_config
 
 
@@ -40,6 +40,17 @@ class DSparkSpecTest(unittest.TestCase):
             restored = decode_config(json.loads(json.dumps(encode_config(node))))
             self.assertEqual(restored, node)
             self.assertEqual(hash(restored), hash(node))
+
+    def test_single_slot_is_rejected_when_loading_config(self):
+        payload = encode_config(
+            draft_config(architecture="DSparkDraftModel", spec_config=dspark_spec())
+        )
+        for reader in (parse_draft, decode_config):
+            payload["spec_config"]["block"]["block_size"] = 1
+            with self.assertRaisesRegex(ValueError, "DSpark block_size.*at least 2"):
+                reader(payload)
+            payload["spec_config"]["block"]["block_size"] = 2
+            self.assertEqual(reader(payload).spec_config.protocol.num_draft_tokens, 2)
 
     def test_heads_are_explicitly_optional(self):
         for markov in (None, MarkovHeadSpec(type="gated", rank=4)):
