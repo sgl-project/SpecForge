@@ -10,6 +10,12 @@ It compares three layouts using the same weight, hidden values, and fixed random
 
 Layout conversion happens inside every measured invocation. The teacher phase measures no-grad forward; the draft phase measures forward plus dHidden with the weight frozen. These are projection-only measurements with an arbitrary fixed upstream gradient, not CE/L1 training, an optimizer step, or end-to-end training throughput.
 
+## Training helper change
+
+The shared DFlash-family training helper makes the three-dimensional input contiguous before calling the existing LM-head module. This covers draft and teacher projections, including DSpark objective chunks and checkpoint recomputation. It retains the head's three-dimensional call shape, module forward/hooks, full vocabulary, and the caller's losses and normalization. It does not alter the separate inference-time draft-head implementations.
+
+An already-contiguous input needs no packing allocation. A strided chunk can require a hidden-state copy; the benchmark includes that conversion cost. Input stride and storage aliasing can change even though the module call shape is retained.
+
 ## CPU sanity checks
 
 The default sizes are deliberately small and use CPU:
@@ -62,6 +68,79 @@ All forward comparisons were bitwise equal. Input-gradient relative L2 differenc
 
 Packing while preserving the 3D call shape and explicitly flattening had similar component timings in this run. These results describe the isolated random-weight projection, with no model/data downloads or optimizer; full-model training measurements are separate.
 
-## Relationship to existing work
+## Actual shared training helper validation
 
-This complements the flattened/cached projection work in SpecForge PR #974 and the historical #964 proposal. It adds a reproducible measurement tool, including a same-head-shape contiguous alternative, rather than another runtime projection flag or caching implementation. The benchmark can help assess a targeted main-branch fix and the larger optional optimization stack independently.
+The patched production `OnlineDFlashModel._project_logits` was also called directly instead of the benchmark's mirrored contiguous branch, on the same A100/PyTorch/BF16 setup above. B=3 and B=2 match uneven-DP local batch shapes. Five warmups, three paired ABBA repeats and ten invocations per block include packing. The six cases made 804 actual-helper calls and used an 8 GiB PyTorch allocator cap, with zero target capture queries and zero optimizer updates.
+
+| B | m in [B,m,2560] | Teacher native → actual contiguous (ms) | Draft forward+dHidden native → actual contiguous (ms) |
+|---:|---:|---:|---:|
+| 3 | 336 | 5.954 → 3.064 (1.94×) | 11.513 → 6.043 (1.90×) |
+| 3 | 714 | 12.074 → 6.763 (1.79×) | 23.870 → 13.354 (1.79×) |
+| 3 | 896 | 13.898 → 8.400 (1.65×) | 26.139 → 16.364 (1.60×) |
+| 2 | 336 | 3.958 → 2.276 (1.74×) | 8.565 → 4.434 (1.93×) |
+| 2 | 714 | 8.007 → 4.611 (1.74×) | 15.492 → 9.084 (1.71×) |
+| 2 | 896 | 9.276 → 5.510 (1.68×) | 17.846 → 10.858 (1.64×) |
+
+Actual-helper versus flatten teacher/draft outputs and draft dHidden were bitwise equal in every case. Native-strided versus either alternative forward outputs were bitwise equal; dHidden relative L2 differences were 0.265%–0.405%, with cosine at least 0.9999918, within the original checks. These remain projection-only results, not training-step or inference-TPS speedups.
+
+| B | m | Teacher allocated peak increase (MiB) | Draft allocated peak increase (MiB) |
+|---:|---:|---:|---:|
+| 3 | 336 | 4.922 | 0.000 |
+| 3 | 714 | 10.459 | 0.000 |
+| 3 | 896 | 14.000 | 0.000 |
+| 2 | 336 | 3.281 | 0.000 |
+| 2 | 714 | 6.973 | 0.000 |
+| 2 | 896 | 8.750 | 0.000 |
+
+These are differences in the maximum allocated peak over each native/contiguous contrast. Absolute peaks include the resident weight, full hidden storage and the draft gradient probe because both phases were requested. They do not measure the whole process footprint or optimizer memory. Allocator granularity can differ from the logical hidden-copy size.
+
+To execute the actual training helper, run this adapter from the repository root on an explicitly allocated GPU. This example uses cuda:0 and B=3, m=896. Use B=3/2 and `(anchors,chunk,offset)` values `(176,48,128)`, `(486,102,384)` or `(512,128,384)` for the six cases.
+
+```bash
+python - --device cuda:0 --dtype bfloat16 --batch 3 \
+  --anchors 512 --chunk 128 --offset 384 --block-size 7 \
+  --hidden-size 2560 --vocab-size 151936 \
+  --warmup 5 --iterations 10 --repeats 3 --output actual_helper.json <<'PY'
+import importlib.util
+from types import SimpleNamespace
+
+import torch
+from tests.test_utils.test_dflash_losses import OnlineDFlashModel
+
+spec = importlib.util.spec_from_file_location(
+    "projection_bench", "benchmarks/bench_vocab_projection.py"
+)
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+project_reference = bench.project
+checks_reference = bench.numerical_checks
+torch.cuda.set_per_process_memory_fraction(
+    (8 << 30) / torch.cuda.get_device_properties(0).total_memory, 0
+)
+
+def project(case, variant):
+    if variant == "contiguous":
+        return OnlineDFlashModel._project_logits(
+            SimpleNamespace(lm_head=case.head), case.hidden
+        )
+    return project_reference(case, variant)
+
+def checks(case):
+    result = checks_reference(case)
+    for phase in case.args.phases:
+        left, left_grad = bench.invoke(case, "contiguous", phase, True)
+        right, right_grad = bench.invoke(case, "flatten", phase, True)
+        assert left.equal(right)
+        if phase == "draft":
+            assert left_grad.equal(right_grad)
+        del left, left_grad, right, right_grad
+    case.hidden.grad = None
+    return result
+
+bench.project = project
+bench.numerical_checks = checks
+bench.main()
+PY
+```
+
+The test module supplies the existing lightweight loader for the production class method; no draft/target model is constructed by this adapter. The standalone benchmark itself still imports no SpecForge model. The adapter checks exact helper/flatten equality in addition to the standard native-reference diagnostics.
