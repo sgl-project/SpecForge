@@ -22,6 +22,7 @@ from .architecture.dspine import validate_dspine
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .conv.constraints import validate_grouped_causal
+from .layer import KIND_BY_REFERENCE_FIELD
 from .logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
@@ -95,16 +96,23 @@ def register_component_schema(
 
     Repeating the same registration is harmless; replacing a schema is an
     error. LayerSpec is a fixed reference schema and is not registered here.
-    An optional pure validator accepts the node and caller-supplied context.
-    Omitting it on a repeated registration preserves the existing validator.
+    An optional pure validator receives a node that a layer references, with
+    keyword arguments `hidden_size` and `num_model_slots`. Omitting it on a
+    repeated registration preserves the existing validator.
     """
     if not isinstance(kind, str) or kind not in _BASES:
         raise ValueError(f"unknown component kind {kind!r}; expected {sorted(_BASES)}")
     if not isinstance(schema, type) or not issubclass(schema, _BASES[kind]):
         raise TypeError(f"{kind} schema must inherit {_BASES[kind].__name__}")
     _validate_schema(schema, kind)
-    if validate is not None and not callable(validate):
-        raise TypeError("component validation must be callable")
+    if validate is not None:
+        if kind not in KIND_BY_REFERENCE_FIELD.values():
+            raise ValueError(
+                f"{kind} nodes receive no layer context; validate= applies to "
+                f"{sorted(set(KIND_BY_REFERENCE_FIELD.values()))}"
+            )
+        if not callable(validate):
+            raise TypeError("component validation must be callable")
     name = component_type(kind, schema)
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{kind} schema must declare a nonempty type name")

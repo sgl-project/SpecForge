@@ -1,6 +1,7 @@
 """References composing an ordinary decoder layer, with no type dispatch."""
 
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from ._validation import nonempty_string
 
@@ -16,3 +17,8 @@ class LayerSpec:
         nonempty_string("mlp", self.mlp)
         if self.sublayer_conv is not None:
             nonempty_string("sublayer_conv", self.sublayer_conv)
+
+
+KIND_BY_REFERENCE_FIELD = MappingProxyType(
+    {"attention": "attention", "mlp": "mlp", "sublayer_conv": "conv"}
+)

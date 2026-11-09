@@ -6,9 +6,14 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from specforge.config.draft import registry
+from specforge.config.draft.attention import GQASpec
 from specforge.config.draft.conv import ConvSpec, GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.logits import NoLogitTransformSpec
+from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.registry import register_component_schema
+from specforge.config.draft.residual import StandardResidualSpec
+from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.config.draft.validate import validate_layers
 from tests.test_config.test_draft_layer_definitions import definitions
 
@@ -75,6 +80,31 @@ class ConvValidationTest(unittest.TestCase):
                 ValueError, "sublayer_conv: custom width mismatch"
             ):
                 check_layers(CustomConv(width_multiple=3))
+
+    def test_attention_validator_receives_layer_context(self):
+        seen = []
+        with patch.dict(registry._VALIDATORS):
+            register_component_schema(
+                "attention",
+                GQASpec,
+                validate=lambda node, **context: seen.append(context),
+            )
+            check_layers(GroupedCausalConvSpec(kernel_size=8, group_size=8))
+        self.assertEqual(seen, [{"hidden_size": 32, "num_model_slots": 8}])
+
+    def test_model_level_kinds_reject_validators_that_would_never_run(self):
+        for kind, schema in (
+            ("norm", RMSNormSpec),
+            ("residual", StandardResidualSpec),
+            ("rope", DefaultRoPESpec),
+            ("logits", NoLogitTransformSpec),
+        ):
+            with (
+                self.subTest(kind=kind),
+                patch.dict(registry._VALIDATORS),
+                self.assertRaisesRegex(ValueError, "no layer context"),
+            ):
+                register_component_schema(kind, schema, validate=lambda node, **c: None)
 
 
 if __name__ == "__main__":

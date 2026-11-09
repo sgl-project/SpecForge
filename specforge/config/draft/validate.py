@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from ._validation import nonempty_string, positive_int
 from .attention import AttentionSpec
 from .conv import ConvSpec
-from .layer import LayerSpec
+from .layer import KIND_BY_REFERENCE_FIELD, LayerSpec
 from .logits import TargetLogitSpec
 from .mlp import FFNSpec
 from .registry import architecture_spec, component_schema, validate_component
@@ -123,19 +123,20 @@ def validate_layers(
     for index, name in enumerate(layer_types):
         layer = require("layer", name, f"layer_types[{index}]")
         path = f"layer_configs.{name}"
-        require("attention", layer.attention, f"{path}.attention")
-        require("mlp", layer.mlp, f"{path}.mlp")
-        if layer.sublayer_conv is not None:
-            conv = require("conv", layer.sublayer_conv, f"{path}.sublayer_conv")
+        for field, kind in KIND_BY_REFERENCE_FIELD.items():
+            reference = getattr(layer, field)
+            if reference is None:
+                continue
+            node = require(kind, reference, f"{path}.{field}")
             try:
                 validate_component(
-                    "conv",
-                    conv,
+                    kind,
+                    node,
                     hidden_size=hidden_size,
                     num_model_slots=num_model_slots,
                 )
             except ValueError as exc:
-                raise ValueError(f"{path}.sublayer_conv: {exc}") from exc
+                raise ValueError(f"{path}.{field}: {exc}") from exc
 
     for kind, table in tables.items():
         unused = table.keys() - used[kind]
