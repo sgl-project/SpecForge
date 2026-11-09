@@ -9,10 +9,7 @@ from specforge.config.draft import registry
 from specforge.config.draft.architecture.base import ArchitectureSpec
 from specforge.config.draft.architecture.features import TargetFeatureSpec
 from specforge.config.draft.codec import decode_config, encode_config, parse_draft
-from specforge.config.draft.codec.target import (
-    default_target_layer_ids,
-    resolve_target_logits,
-)
+from specforge.config.draft.codec.target import resolve_target_logits
 from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransformSpec
 from specforge.config.draft.registry import register_spec
 from tests.test_config.draft_fixtures import draft_config
@@ -85,29 +82,19 @@ class TargetSettingsTest(unittest.TestCase):
             NoLogitTransformSpec,
         )
         with self.assertRaisesRegex(ValueError, "target_logit_transform"):
-            parse_draft(payload)
+            parse_draft(payload, target_config=None)
         with self.assertRaisesRegex(ValueError, "target_logit_transform"):
             decode_config(payload, target_config=target)
 
-    def test_yaml_resolves_feature_layers_and_saves_explicit_ids(self):
-        named = encode_config(draft_config())
-        named.pop("num_hidden_layers")
-        for payload in (named, shorthand()):
-            del payload["spec_config"]["target_features"]["target_layer_ids"]
-            original = copy.deepcopy((payload, TARGET))
-            node = parse_draft(payload, target_config=TARGET)
-            saved = encode_config(node)
-            self.assertEqual(
-                saved["spec_config"]["target_features"]["target_layer_ids"], [1, 5]
-            )
-            self.assertEqual(decode_config(saved), node)
-            self.assertEqual((payload, TARGET), original)
-            with self.assertRaisesRegex(ValueError, "target_layer_ids"):
-                parse_draft(payload)
-        with self.assertRaisesRegex(ValueError, "target_layer_ids"):
-            decode_config(named, target_config=TARGET)
-        with self.assertRaisesRegex(ValueError, "duplicates"):
-            parse_draft(named, target_config={**TARGET, "num_hidden_layers": 4})
+    def test_yaml_requires_feature_layers_and_mask_token(self):
+        for source in (encode_config(draft_config()), shorthand()):
+            for field in ("target_layer_ids", "mask_token_id"):
+                payload = copy.deepcopy(source)
+                del payload["spec_config"]["target_features"][field]
+                for target in (TARGET, None):
+                    with self.subTest(field=field, target=target):
+                        with self.assertRaisesRegex(ValueError, field):
+                            parse_draft(payload, target_config=target)
 
     def test_explicit_feature_layers_preserve_order_and_reject_duplicates(self):
         payload = encode_config(draft_config())
@@ -174,21 +161,6 @@ class TargetSettingsTest(unittest.TestCase):
             encode_config(node), target_config={**TARGET, "final_logit_softcapping": 30}
         )
         self.assertIsNone(restored.target_logit_transform)
-
-    def test_default_feature_layers_preserve_historical_rounding(self):
-        self.assertEqual(default_target_layer_ids(36, 5), (1, 9, 17, 25, 33))
-        self.assertEqual(default_target_layer_ids(28, 5), (1, 7, 13, 19, 25))
-        self.assertEqual(default_target_layer_ids(36, 1), (18,))
-        self.assertEqual(default_target_layer_ids(7, 3), (1, 2, 4))
-        with self.assertRaisesRegex(ValueError, "duplicates.*explicit distinct"):
-            default_target_layer_ids(4, 3)
-        for value in (True, 0, -1, 2.5):
-            with self.assertRaisesRegex(ValueError, "num_target_layers"):
-                default_target_layer_ids(value, 2)
-            with self.assertRaisesRegex(ValueError, "num_draft_layers"):
-                default_target_layer_ids(8, value)
-        with self.assertRaisesRegex(ValueError, "out of range"):
-            default_target_layer_ids(2, 3)
 
 
 if __name__ == "__main__":

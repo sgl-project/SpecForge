@@ -103,7 +103,7 @@ class AttentionRoPETest(unittest.TestCase):
         original = copy.deepcopy(payload)
         with self.assertRaisesRegex(ValueError, "rope_parameters"):
             decode_config(payload)
-        self.assertEqual(parse_draft(payload), draft_config())
+        self.assertEqual(parse_draft(payload, target_config=None), draft_config())
         self.assertEqual(payload, original)
         attention = payload.pop("attention_configs")["full"]
         payload.pop("conv_configs")
@@ -112,7 +112,9 @@ class AttentionRoPETest(unittest.TestCase):
         payload["attention"] = attention
         payload["mlp"] = payload.pop("mlp_configs")["dense"]
         self.assertIsNone(
-            parse_draft(payload).attention_configs["default"].rope_parameters
+            parse_draft(payload, target_config=None)
+            .attention_configs["default"]
+            .rope_parameters
         )
 
     def test_malformed_overrides_do_not_fall_back_to_model_settings(self):

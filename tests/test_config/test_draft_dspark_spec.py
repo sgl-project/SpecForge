@@ -48,9 +48,14 @@ class DSparkSpecTest(unittest.TestCase):
         for reader in (parse_draft, decode_config):
             payload["spec_config"]["block"]["block_size"] = 1
             with self.assertRaisesRegex(ValueError, "DSpark block_size.*at least 2"):
-                reader(payload)
+                reader(payload, target_config=None)
             payload["spec_config"]["block"]["block_size"] = 2
-            self.assertEqual(reader(payload).spec_config.protocol.num_draft_tokens, 2)
+            self.assertEqual(
+                reader(
+                    payload, target_config=None
+                ).spec_config.protocol.num_draft_tokens,
+                2,
+            )
 
     def test_heads_are_explicitly_optional(self):
         for markov in (None, MarkovHeadSpec(type="gated", rank=4)):

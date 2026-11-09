@@ -47,29 +47,6 @@ def resolve_target_logits(target: Mapping) -> TargetLogitSpec:
     return MuPLogitTransformSpec(multiplier=multiplier)
 
 
-def default_target_layer_ids(
-    num_target_layers: int, num_draft_layers: int
-) -> tuple[int, ...]:
-    """Historical DFlash feature selection, resolved before node construction."""
-    positive_int("num_target_layers", num_target_layers)
-    positive_int("num_draft_layers", num_draft_layers)
-    if num_draft_layers == 1:
-        return (num_target_layers // 2,)
-    layers = tuple(
-        int(round(1 + index * (num_target_layers - 4) / (num_draft_layers - 1)))
-        for index in range(num_draft_layers)
-    )
-    if any(layer < 0 or layer >= num_target_layers for layer in layers):
-        raise ValueError(
-            "default target_layer_ids are out of range; supply explicit layers"
-        )
-    if len(set(layers)) != len(layers):
-        raise ValueError(
-            "default target_layer_ids contain duplicates; supply explicit distinct layers"
-        )
-    return layers
-
-
 def validate_target(config: DraftConfig, target: Mapping) -> None:
     """Recheck saved semantics and binding dimensions against the supplied target."""
     target = _text_config(target)

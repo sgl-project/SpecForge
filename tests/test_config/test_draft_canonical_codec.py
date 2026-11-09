@@ -112,12 +112,12 @@ class CanonicalCodecTest(unittest.TestCase):
         payload = shorthand()
         before = copy.deepcopy(payload)
         parsed_yaml = yaml.safe_load(yaml.safe_dump({"draft": payload}))
-        node = parse_draft(parsed_yaml["draft"])
+        node = parse_draft(parsed_yaml["draft"], target_config=None)
         self.assertEqual(node.num_hidden_layers, 2)
         self.assertEqual(node.layer_types, ("default", "default"))
         self.assertEqual(node.draft_vocab_size, node.vocab_size)
         self.assertEqual(node.initializer_range, 0.02)
-        self.assertEqual(parse_draft(encode_config(node)), node)
+        self.assertEqual(parse_draft(encode_config(node), target_config=None), node)
         self.assertEqual(decode_config(encode_config(node)), node)
         self.assertEqual(payload, before)
 
@@ -130,12 +130,12 @@ class CanonicalCodecTest(unittest.TestCase):
             "layer_types",
         ):
             with self.assertRaisesRegex(ValueError, "cannot mix shorthand"):
-                parse_draft({**shorthand(), name: {}})
+                parse_draft({**shorthand(), name: {}}, target_config=None)
         for name in ("attention", "mlp", "num_hidden_layers"):
             payload = shorthand()
             payload.pop(name)
             with self.assertRaisesRegex(ValueError, name):
-                parse_draft(payload)
+                parse_draft(payload, target_config=None)
 
     def test_dflash2_round_trip_with_convolution_and_selector(self):
         source = draft_config()
@@ -169,7 +169,7 @@ class CanonicalCodecTest(unittest.TestCase):
             "kernel_size": 3,
             "group_size": 8,
         }
-        self.assertEqual(parse_draft(compact).spec_config, spec)
+        self.assertEqual(parse_draft(compact, target_config=None).spec_config, spec)
 
     def test_version_architecture_and_depth_are_checked(self):
         for name, values in (
@@ -211,7 +211,7 @@ class CanonicalCodecTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, name):
                 decode_config({**encode_config(draft_config()), name: {}})
         with self.assertRaisesRegex(ValueError, "draft_vocab_size"):
-            parse_draft({**shorthand(), "draft_vocab_size": None})
+            parse_draft({**shorthand(), "draft_vocab_size": None}, target_config=None)
 
     def test_nested_architecture_nodes_are_strict(self):
         for field, value in (("block_size", True), ("block_size", "8"), ("extra", 1)):
