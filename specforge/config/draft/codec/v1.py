@@ -139,7 +139,7 @@ def _decode_structure(values: dict) -> DraftConfig:
             values[name] = _array(values[name], name)
     for field, kind in (("norm_config", "norm"), ("residual_config", "residual")):
         if field in values:
-            values[field] = decode_component(kind, values[field])
+            values[field] = decode_component(kind, values[field], path=field)
     if "rope_parameters" in values:
         values["rope_parameters"] = decode_component(
             "rope", values["rope_parameters"], path="rope_parameters"
@@ -204,7 +204,7 @@ def encode_config(config: DraftConfig) -> dict:
 def parse_draft(payload: Mapping, *, target_config: Mapping | None) -> DraftConfig:
     """Parse a resolved YAML draft mapping, expanding only documented shorthand.
 
-    Vocabulary size derives from vocab_size when omitted. initializer_range is
+    draft_vocab_size defaults to vocab_size. initializer_range is
     non-structural and defaults to 0.02. Feature layer IDs and mask_token_id
     must be explicit. Only target_logit_transform derives from target_config.
     """

@@ -43,7 +43,7 @@ def validate(config: DraftConfig) -> None:
         ("norm", config.norm_config),
         ("residual", config.residual_config),
     ):
-        if type(node) is not component_schema(kind, getattr(node, "type", None)):
+        if type(node) is not component_schema(kind, component_type(kind, node)):
             raise ValueError(f"{kind}_config must use its registered schema")
     for path, node in (
         ("rope_parameters", config.rope_parameters),
@@ -88,7 +88,7 @@ def validate(config: DraftConfig) -> None:
             raise ValueError(
                 "bound lm_head requires an explicit supported target_logit_transform"
             )
-        if type(node) is not component_schema("logits", getattr(node, "type", None)):
+        if type(node) is not component_schema("logits", component_type("logits", node)):
             raise ValueError("target_logit_transform must use its registered schema")
     elif config.target_logit_transform is not None:
         raise ValueError("target_logit_transform requires lm_head in target_bindings")
