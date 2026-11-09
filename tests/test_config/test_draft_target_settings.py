@@ -162,6 +162,13 @@ class TargetSettingsTest(unittest.TestCase):
         )
         self.assertIsNone(restored.target_logit_transform)
 
+    def test_bound_vocab_uses_the_padded_target_size(self):
+        payload = encode_config(draft_config(vocab_size=128, draft_vocab_size=128))
+        padded = {**TARGET, "vocab_size": 100, "padded_vocab_size": 128}
+        self.assertEqual(decode_config(payload, target_config=padded).vocab_size, 128)
+        with self.assertRaisesRegex(ValueError, "vocab_size"):
+            decode_config(payload, target_config={**TARGET, "vocab_size": 100})
+
 
 if __name__ == "__main__":
     unittest.main()

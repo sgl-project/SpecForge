@@ -47,15 +47,23 @@ def resolve_target_logits(target: Mapping) -> TargetLogitSpec:
     return MuPLogitTransformSpec(multiplier=multiplier)
 
 
+def bound_vocab_size(target: Mapping) -> int:
+    """Rows of the target's embedding and LM head: padded when the target pads."""
+    value = target.get("padded_vocab_size") or target.get("vocab_size")
+    positive_int("target_config.vocab_size", value)
+    return value
+
+
 def validate_target(config: DraftConfig, target: Mapping) -> None:
     """Recheck saved semantics and binding dimensions against the supplied target."""
     target = _text_config(target)
     if config.target_bindings:
-        for name in ("hidden_size", "vocab_size"):
-            value = target.get(name)
-            positive_int(f"target_config.{name}", value)
-            if value != getattr(config, name):
-                raise ValueError(f"bound target {name} must match draft {name}")
+        hidden_size = target.get("hidden_size")
+        positive_int("target_config.hidden_size", hidden_size)
+        if hidden_size != config.hidden_size:
+            raise ValueError("bound target hidden_size must match draft hidden_size")
+        if bound_vocab_size(target) != config.vocab_size:
+            raise ValueError("bound target vocab_size must match draft vocab_size")
     if "lm_head" in config.target_bindings:
         if config.target_logit_transform != resolve_target_logits(target):
             raise ValueError("target_logit_transform does not match target_config")
