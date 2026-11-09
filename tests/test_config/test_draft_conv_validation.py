@@ -10,7 +10,7 @@ from specforge.config.draft.conv import ConvSpec, GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.registry import register_component_schema
 from specforge.config.draft.validate import validate_layers
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_layer_definitions import definitions
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -20,11 +20,11 @@ class CustomConv(ConvSpec):
 
 
 def check_layers(conv, *, slots=8):
-    base = draft_config()
+    base = definitions()
     validate_layers(
-        hidden_size=base.hidden_size,
-        attention_configs=base.attention_configs,
-        mlp_configs=base.mlp_configs,
+        hidden_size=32,
+        attention_configs={"full": base["attention_configs"]["full"]},
+        mlp_configs=base["mlp_configs"],
         conv_configs={"conv": conv},
         layer_configs={
             "with_conv": LayerSpec(attention="full", mlp="dense", sublayer_conv="conv")
