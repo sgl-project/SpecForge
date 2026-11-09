@@ -19,6 +19,7 @@ from specforge.config.draft.codec.components import (
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import FFNSpec
 from specforge.config.draft.registry import component_schema, register_component_schema
+from specforge.config.draft.rope import RopeSpec
 
 COMPONENTS = {
     "attention": {
@@ -37,10 +38,39 @@ COMPONENTS = {
     "conv": {"type": "grouped_causal", "kernel_size": 3, "group_size": 8},
     "norm": {"type": "rms", "eps": 1e-6, "weight_offset": 1},
     "residual": {"type": "standard"},
+    "rope": {"rope_type": "none"},
+    "logits": {"type": "mup", "multiplier": 8.0},
 }
 
 
+@dataclass(frozen=True, kw_only=True)
+class RouterSettings:
+    top_k: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class NestedFFN(FFNSpec):
+    type: ClassVar[str] = "test_nested_ffn"
+    router: RouterSettings
+    rope: RopeSpec
+
+
 class ComponentCodecTest(unittest.TestCase):
+    def test_nested_nodes_and_components_use_the_same_codec(self):
+        register_component_schema("mlp", NestedFFN)
+        payload = {
+            "type": "test_nested_ffn",
+            "router": {"top_k": 2},
+            "rope": {"rope_type": "none"},
+        }
+        node = decode_component("mlp", payload)
+        self.assertEqual(encode_component("mlp", node), payload)
+        self.assertEqual(decode_component("mlp", json.loads(json.dumps(payload))), node)
+        with self.assertRaisesRegex(ValueError, "router.top_k"):
+            decode_component("mlp", payload | {"router": {"top_k": True}})
+        with self.assertRaisesRegex(ValueError, "rope.rope_type"):
+            decode_component("mlp", payload | {"rope": {"rope_type": "unknown"}})
+
     def test_components_round_trip_through_json(self):
         for kind, payload in COMPONENTS.items():
             with self.subTest(kind=kind):
@@ -188,7 +218,7 @@ class ComponentCodecTest(unittest.TestCase):
 
         with patch.dict(registry._SCHEMAS):
             register_component_schema("mlp", MutableValue)
-            with self.assertRaisesRegex(ValueError, "unhashable"):
+            with self.assertRaisesRegex(ValueError, "widths"):
                 decode_component("mlp", {"type": "test_mutable_value", "widths": [32]})
 
     def test_registry_and_codec_import_without_model_dependencies(self):

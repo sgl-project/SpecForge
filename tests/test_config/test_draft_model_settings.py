@@ -7,12 +7,7 @@ import sys
 import unittest
 from typing import ClassVar
 
-from specforge.config.draft.codec.settings import (
-    decode_rope,
-    decode_target_logits,
-    encode_rope,
-    encode_target_logits,
-)
+from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.config.draft.registry import component_schema, register_component_schema
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
@@ -33,13 +28,13 @@ class ModelSettingsTest(unittest.TestCase):
     def test_registered_logit_settings_round_trip(self):
         register_component_schema("logits", CustomLogitSpec)
         payload = {"type": "test_custom_logits", "multiplier": 3.0}
-        node = decode_target_logits(payload)
+        node = decode_component("logits", payload)
         self.assertIs(type(node), CustomLogitSpec)
-        self.assertEqual(encode_target_logits(node), payload)
+        self.assertEqual(encode_component("logits", node), payload)
         with self.assertRaisesRegex(ValueError, "multiplier"):
-            decode_target_logits({**payload, "multiplier": True})
+            decode_component("logits", {**payload, "multiplier": True})
         with self.assertRaisesRegex(ValueError, "unknown fields"):
-            decode_target_logits({**payload, "typo": 1})
+            decode_component("logits", {**payload, "typo": 1})
 
         @dataclasses.dataclass(frozen=True, kw_only=True)
         class Replacement(CustomLogitSpec):
@@ -47,8 +42,8 @@ class ModelSettingsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_component_schema("logits", Replacement)
-        with self.assertRaisesRegex(ValueError, "registered configuration node"):
-            encode_target_logits(Replacement(multiplier=3.0))
+        with self.assertRaisesRegex(ValueError, "expected CustomLogitSpec"):
+            encode_component("logits", Replacement(multiplier=3.0))
 
     def test_registered_rope_round_trip_and_validation(self):
         register_component_schema("rope", CustomRoPESpec)
@@ -59,14 +54,14 @@ class ModelSettingsTest(unittest.TestCase):
             "partial_rotary_factor": 1.0,
             "bands": [1.0, 2.0],
         }
-        node = decode_rope(payload)
+        node = decode_component("rope", payload)
         self.assertIs(type(node), component_schema("rope", payload["rope_type"]))
         self.assertEqual(node.bands, (1.0, 2.0))
-        self.assertEqual(encode_rope(node), payload)
+        self.assertEqual(encode_component("rope", node), payload)
         with self.assertRaisesRegex(ValueError, "bands"):
-            decode_rope({**payload, "bands": [True]})
+            decode_component("rope", {**payload, "bands": [True]})
         with self.assertRaisesRegex(ValueError, "unknown fields"):
-            decode_rope({**payload, "typo": 1})
+            decode_component("rope", {**payload, "typo": 1})
 
         @dataclasses.dataclass(frozen=True, kw_only=True)
         class Replacement(CustomRoPESpec):
@@ -74,15 +69,14 @@ class ModelSettingsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_component_schema("rope", Replacement)
-        with self.assertRaisesRegex(ValueError, "registered configuration node"):
-            encode_rope(Replacement(**dataclasses.asdict(node)))
+        with self.assertRaisesRegex(ValueError, "expected CustomRoPESpec"):
+            encode_component("rope", Replacement(**dataclasses.asdict(node)))
 
     def test_rope_and_logit_settings_round_trip(self):
         cases = (
-            (decode_rope, encode_rope, {"rope_type": "none"}),
+            ("rope", {"rope_type": "none"}),
             (
-                decode_rope,
-                encode_rope,
+                "rope",
                 {
                     "rope_type": "default",
                     "rope_theta": 10000.0,
@@ -90,8 +84,7 @@ class ModelSettingsTest(unittest.TestCase):
                 },
             ),
             (
-                decode_rope,
-                encode_rope,
+                "rope",
                 {
                     "rope_type": "linear",
                     "rope_theta": 10000.0,
@@ -99,27 +92,30 @@ class ModelSettingsTest(unittest.TestCase):
                     "factor": 8.0,
                 },
             ),
-            (decode_target_logits, encode_target_logits, {"type": "none"}),
+            ("logits", {"type": "none"}),
             (
-                decode_target_logits,
-                encode_target_logits,
+                "logits",
                 {"type": "mup", "multiplier": 8.0},
             ),
         )
-        for decode, encode, payload in cases:
+        for kind, payload in cases:
             with self.subTest(payload=payload):
-                node = decode(payload)
-                self.assertEqual(encode(node), payload)
-                restored = decode(json.loads(json.dumps(encode(node))))
+                node = decode_component(kind, payload)
+                self.assertEqual(encode_component(kind, node), payload)
+                restored = decode_component(
+                    kind, json.loads(json.dumps(encode_component(kind, node)))
+                )
                 self.assertEqual(node, restored)
                 self.assertEqual(hash(node), hash(restored))
                 with self.assertRaises(dataclasses.FrozenInstanceError):
                     node.new_setting = 1
                 with self.assertRaisesRegex(ValueError, "unknown fields"):
-                    decode({**payload, "typo": True})
+                    decode_component(kind, {**payload, "typo": True})
                 for field in payload:
                     with self.assertRaisesRegex(ValueError, field):
-                        decode({k: v for k, v in payload.items() if k != field})
+                        decode_component(
+                            kind, {k: v for k, v in payload.items() if k != field}
+                        )
 
     def test_rotary_geometry_is_derived_and_validated(self):
         full = DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1.0)
@@ -144,19 +140,20 @@ class ModelSettingsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
                     DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=value)
                 with self.assertRaisesRegex(ValueError, "factor"):
-                    decode_rope(
+                    decode_component(
+                        "rope",
                         {
                             "rope_type": "linear",
                             "rope_theta": 10000,
                             "partial_rotary_factor": 1.0,
                             "factor": value,
-                        }
+                        },
                     )
         with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
             DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1.1)
 
     def test_unknown_formats_fail_instead_of_defaulting(self):
-        for decode in (decode_rope, decode_target_logits):
+        for kind in ("rope", "logits"):
             for value in (
                 None,
                 [],
@@ -166,11 +163,11 @@ class ModelSettingsTest(unittest.TestCase):
                 {"rope_type": "unknown"},
             ):
                 with self.assertRaises(ValueError):
-                    decode(value)
+                    decode_component(kind, value)
         with self.assertRaisesRegex(ValueError, "unsupported node"):
-            encode_rope({"rope_type": "none"})
+            encode_component("rope", {"rope_type": "none"})
         with self.assertRaisesRegex(ValueError, "unsupported node"):
-            encode_target_logits(NoRoPESpec())
+            encode_component("logits", NoRoPESpec())
 
     def test_settings_import_without_compute_packages(self):
         result = subprocess.run(
@@ -180,9 +177,9 @@ class ModelSettingsTest(unittest.TestCase):
                 "-c",
                 """
 import sys
-from specforge.config.draft.codec.settings import decode_rope, decode_target_logits
-decode_rope({'rope_type': 'none'})
-decode_target_logits({'type': 'none'})
+from specforge.config.draft.codec.components import decode_component
+decode_component("rope", {'rope_type': 'none'})
+decode_component("logits", {'type': 'none'})
 assert not any(x in sys.modules for x in ('torch', 'transformers', 'pydantic'))
 """,
             ],
