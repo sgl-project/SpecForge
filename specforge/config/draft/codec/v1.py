@@ -5,6 +5,7 @@ DraftConfig. This codec accepts resolved structural settings only.
 """
 
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 
 from .._validation import positive_int
 from ..model import DraftConfig
@@ -49,6 +50,33 @@ def _map(value, path, decode):
     return result
 
 
+def _extension_packages(config: DraftConfig) -> set[str]:
+    """Top-level packages that define the configuration's out-of-tree nodes."""
+    packages, pending = set(), [config]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Mapping):
+            pending.extend(value.values())
+        elif isinstance(value, tuple):
+            pending.extend(value)
+        elif is_dataclass(value) and not isinstance(value, type):
+            module = type(value).__module__
+            if module != "specforge" and not module.startswith("specforge."):
+                packages.add(module.split(".")[0])
+            pending.extend(getattr(value, field.name) for field in fields(value))
+    return packages
+
+
+def _decode_extensions(value) -> tuple[str, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or any(type(name) is not str or not name for name in value)
+        or list(value) != sorted(set(value))
+    ):
+        raise ValueError("extensions: expected a sorted list of distinct package names")
+    return tuple(value)
+
+
 def decode_config(
     payload: Mapping, *, target_config: Mapping | None = None
 ) -> DraftConfig:
@@ -56,6 +84,27 @@ def decode_config(
     if not isinstance(payload, Mapping):
         raise ValueError("draft: expected a configuration object")
     values = dict(payload)
+    extensions = _decode_extensions(values.pop("extensions", []))
+    try:
+        config = _decode_structure(values)
+    except ValueError as exc:
+        if extensions:
+            raise ValueError(
+                f"{exc} (the configuration requires extensions {list(extensions)})"
+            ) from exc
+        raise
+    used = _extension_packages(config)
+    if used != set(extensions):
+        raise ValueError(
+            f"extensions: declared {list(extensions)}, but the configuration uses "
+            f"kinds from {sorted(used)}"
+        )
+    if target_config is not None:
+        validate_target(config, target_config)
+    return config
+
+
+def _decode_structure(values: dict) -> DraftConfig:
     version = values.pop("schema_version", None)
     if type(version) is not int or version != SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version {version!r}")
@@ -72,13 +121,9 @@ def decode_config(
         raise ValueError("unknown field 'architecture'; use 'architectures'")
     values["architecture"] = architectures[0]
     registration = architecture_spec(architectures[0])
-    extensions = values.pop("extensions", [])
-    if not isinstance(extensions, (list, tuple)) or extensions:
-        raise ValueError(
-            "extensions: external extension loading is not implemented by this codec"
-        )
+    has_declared_depth = "num_hidden_layers" in values
     declared_depth = values.pop("num_hidden_layers", None)
-    if "num_hidden_layers" in payload:
+    if has_declared_depth:
         positive_int("num_hidden_layers", declared_depth)
     for field, kind in _GROUPS.items():
         if field in values:
@@ -118,8 +163,6 @@ def decode_config(
     config = _construct(DraftConfig, values, "draft")
     if declared_depth is not None and declared_depth != config.num_hidden_layers:
         raise ValueError("num_hidden_layers must equal len(layer_types)")
-    if target_config is not None:
-        validate_target(config, target_config)
     return config
 
 
@@ -131,7 +174,7 @@ def encode_config(config: DraftConfig) -> dict:
         "schema_version": SCHEMA_VERSION,
         "model_type": MODEL_TYPE,
         "architectures": [config.architecture],
-        "extensions": [],
+        "extensions": sorted(_extension_packages(config)),
         **{name: getattr(config, name) for name in _DIMENSIONS},
         **{
             field: {
