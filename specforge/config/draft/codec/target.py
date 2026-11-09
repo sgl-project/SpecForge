@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from .._validation import finite_number, positive_int
-from ..architecture.features import TargetFeatureSpec
 from ..logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 
 if TYPE_CHECKING:
@@ -83,9 +82,4 @@ def validate_target(config: DraftConfig, target: Mapping) -> None:
     if "lm_head" in config.target_bindings:
         if config.target_logit_transform != resolve_target_logits(target):
             raise ValueError("target_logit_transform does not match target_config")
-    features = getattr(config.spec_config, "target_features", None)
-    if isinstance(features, TargetFeatureSpec):
-        count = target.get("num_hidden_layers")
-        positive_int("target_config.num_hidden_layers", count)
-        if any(layer >= count for layer in features.target_layer_ids):
-            raise ValueError("target_layer_ids exceed target num_hidden_layers")
+    config.spec_config.validate_target(target)

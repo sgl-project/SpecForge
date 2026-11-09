@@ -1,5 +1,6 @@
 """DSpark composes its draft-only protocol and optional prediction heads."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .._validation import boolean, positive_int
@@ -54,6 +55,9 @@ class DSparkSpec(ArchitectureSpec):
                 raise ValueError("confidence must be a ConfidenceHeadSpec or None")
             if self.confidence.with_markov and self.markov is None:
                 raise ValueError("confidence.with_markov requires a Markov head")
+
+    def validate_target(self, target: Mapping) -> None:
+        self.target_features.validate_target(target)
 
     @property
     def protocol(self) -> DraftOnlyBlockSpec:

@@ -1,5 +1,6 @@
 """Resolved target feature selection; no target-family configuration objects."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .._validation import positive_int
@@ -20,6 +21,12 @@ class TargetFeatureSpec:
             raise ValueError("target_layer_ids must contain nonnegative integers")
         if len(set(self.target_layer_ids)) != len(self.target_layer_ids):
             raise ValueError("target_layer_ids must be distinct")
+
+    def validate_target(self, target: Mapping) -> None:
+        count = target.get("num_hidden_layers")
+        positive_int("target_config.num_hidden_layers", count)
+        if any(layer >= count for layer in self.target_layer_ids):
+            raise ValueError("target_layer_ids exceed target num_hidden_layers")
 
     def input_width(self, target_hidden_size: int) -> int:
         positive_int("target_hidden_size", target_hidden_size)

@@ -2,20 +2,71 @@
 
 import copy
 import unittest
+from dataclasses import dataclass, replace
+from unittest.mock import patch
 
+from specforge.config.draft import registry
+from specforge.config.draft.architecture.base import ArchitectureSpec
+from specforge.config.draft.architecture.features import TargetFeatureSpec
 from specforge.config.draft.codec import decode_config, encode_config, parse_draft
 from specforge.config.draft.codec.target import (
     default_target_layer_ids,
     resolve_target_logits,
 )
 from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransformSpec
+from specforge.config.draft.registry import register_spec
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_canonical_codec import shorthand
 
 TARGET = {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 8}
 
 
+@dataclass(frozen=True, kw_only=True)
+class RenamedFeaturesSpec(ArchitectureSpec):
+    inputs: tuple[TargetFeatureSpec, ...]
+
+    @property
+    def protocol(self):
+        return None
+
+    def validate_target(self, target):
+        for node in self.inputs:
+            node.validate_target(target)
+
+
 class TargetSettingsTest(unittest.TestCase):
+    def test_custom_architecture_validates_its_own_nested_features(self):
+        features = draft_config().spec_config.target_features
+        with patch.dict(registry._SPECS):
+            register_spec(
+                "RenamedFeaturesDraftModel", RenamedFeaturesSpec, lambda _: None
+            )
+            config = draft_config(
+                architecture="RenamedFeaturesDraftModel",
+                spec_config=RenamedFeaturesSpec(inputs=(features, features)),
+            )
+            self.assertEqual(
+                decode_config(encode_config(config), target_config=TARGET), config
+            )
+            invalid = replace(
+                config,
+                spec_config=RenamedFeaturesSpec(
+                    inputs=(features, replace(features, target_layer_ids=(99,)))
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "target_layer_ids"):
+                decode_config(encode_config(invalid), target_config=TARGET)
+
+    def test_registration_requires_an_explicit_target_validator(self):
+        @dataclass(frozen=True)
+        class MissingTargetCheck(ArchitectureSpec):
+            @property
+            def protocol(self):
+                return None
+
+        with self.assertRaisesRegex(TypeError, "concrete frozen dataclass"):
+            register_spec("MissingTargetCheck", MissingTargetCheck, lambda _: None)
+
     def test_yaml_derives_bound_head_setting_without_mutating_inputs(self):
         payload = encode_config(draft_config())
         payload.pop("target_logit_transform")

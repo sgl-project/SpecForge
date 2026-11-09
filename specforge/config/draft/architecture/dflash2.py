@@ -1,5 +1,6 @@
 """DFlash2 composes shared inputs with its own selector and logit settings."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .._validation import positive_int, positive_number
@@ -24,6 +25,9 @@ class DFlash2Spec(ArchitectureSpec):
         positive_number("output_multiplier", self.output_multiplier)
         if self.final_logit_softcapping is not None:
             positive_number("final_logit_softcapping", self.final_logit_softcapping)
+
+    def validate_target(self, target: Mapping) -> None:
+        self.target_features.validate_target(target)
 
     @property
     def protocol(self) -> AnchoredBlockSpec:

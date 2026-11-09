@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,9 @@ class DSpineSpec(ArchitectureSpec):
         validate_anchored_inputs(self.block, self.target_features)
         if type(self.injection) is not AdjacentInjectionSpec:
             raise ValueError("injection must be an AdjacentInjectionSpec")
+
+    def validate_target(self, target: Mapping) -> None:
+        self.target_features.validate_target(target)
 
     @property
     def protocol(self) -> AnchoredBlockSpec:
