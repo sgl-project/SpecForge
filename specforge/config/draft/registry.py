@@ -21,6 +21,7 @@ from .architecture.constraints import (
 from .architecture.dspine import validate_dspine
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
+from .logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
@@ -36,6 +37,7 @@ _BASES = {
     "norm": NormSpec,
     "residual": ResidualSpec,
     "rope": RopeSpec,
+    "logits": TargetLogitSpec,
 }
 _SCHEMAS: dict[tuple[str, str], type] = {}
 
@@ -147,6 +149,8 @@ for _kind, _schema in (
     ("rope", DefaultRoPESpec),
     ("rope", LinearRoPESpec),
     ("rope", NoRoPESpec),
+    ("logits", NoLogitTransformSpec),
+    ("logits", MuPLogitTransformSpec),
 ):
     register_component_schema(_kind, _schema)
 

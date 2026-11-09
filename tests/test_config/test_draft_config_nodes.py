@@ -12,13 +12,32 @@ from specforge.config.draft.architecture import DFlash2Spec, DFlashSpec
 from specforge.config.draft.attention import GQASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
-from specforge.config.draft.logits import MuPLogitTransformSpec
+from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransformSpec
 from specforge.config.draft.registry import register_component_schema, register_spec
 from specforge.config.draft.rope import DefaultRoPESpec
 from tests.test_config.draft_fixtures import draft_config
 
 
 class DraftConfigNodesTest(unittest.TestCase):
+    def test_registered_logits_survive_canonical_round_trip(self):
+        from specforge.config.draft.codec import decode_config, encode_config
+
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class CustomLogits(NoLogitTransformSpec):
+            type: ClassVar[str] = "test_config_logits"
+
+        register_component_schema("logits", CustomLogits)
+        node = draft_config(target_logit_transform=CustomLogits())
+        self.assertEqual(decode_config(encode_config(node)), node)
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            decode_config(
+                encode_config(node),
+                target_config={
+                    "hidden_size": node.hidden_size,
+                    "vocab_size": node.vocab_size,
+                },
+            )
+
     def test_graph_is_an_immutable_snapshot(self):
         source = {"full_dense": LayerSpec(attention="full", mlp="dense")}
         node = draft_config(layer_configs=source)

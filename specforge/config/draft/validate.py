@@ -9,7 +9,7 @@ from ._validation import nonempty_string, positive_int
 from .attention import AttentionSpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .layer import LayerSpec
-from .logits import MuPLogitTransformSpec, NoLogitTransformSpec
+from .logits import TargetLogitSpec
 from .mlp import FFNSpec
 from .registry import architecture_spec, component_schema
 
@@ -58,13 +58,13 @@ def validate(config: DraftConfig) -> None:
         if config.draft_vocab_size != config.vocab_size:
             raise ValueError("tie_word_embeddings requires equal vocabulary sizes")
     if "lm_head" in config.target_bindings:
-        if type(config.target_logit_transform) not in (
-            NoLogitTransformSpec,
-            MuPLogitTransformSpec,
-        ):
+        node = config.target_logit_transform
+        if not isinstance(node, TargetLogitSpec):
             raise ValueError(
                 "bound lm_head requires an explicit supported target_logit_transform"
             )
+        if type(node) is not component_schema("logits", getattr(node, "type", None)):
+            raise ValueError("target_logit_transform must use its registered schema")
     elif config.target_logit_transform is not None:
         raise ValueError("target_logit_transform requires lm_head in target_bindings")
     registration.validate(config)
