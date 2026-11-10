@@ -92,14 +92,25 @@ class CanonicalDominoTest(unittest.TestCase):
                 )
                 (ids, features, entries), previous = model_inputs(config, device, dtype)
                 other = features.detach().clone().requires_grad_()
-                output = actual(ids, features, entries, prev_token_ids=previous)
+                output = actual(
+                    ids,
+                    features,
+                    entries,
+                    predecessor_ids=previous,
+                    output_correction_logits=True,
+                )
                 hidden = reference(
                     entries[0].position_ids,
                     noise_embedding=embedding(ids),
                     target_hidden=other,
                 )
                 states = hidden.reshape(2, 2, 4, 32)
-                previous_embeddings = embedding(previous).reshape_as(states)
+                legacy_previous = previous.reshape(2, 2, 4)
+                if not shifted:
+                    legacy_previous = torch.cat(
+                        (legacy_previous[..., 1:], legacy_previous[..., :1]), dim=-1
+                    )
+                previous_embeddings = embedding(legacy_previous).reshape_as(states)
                 correction = reference.compute_correction_logits(
                     hidden_states=states, prev_token_embeddings=previous_embeddings
                 )
@@ -109,8 +120,13 @@ class CanonicalDominoTest(unittest.TestCase):
                     (base[..., :start, :], base[..., start:, :] + correction), dim=-2
                 ).reshape(2, 8, 64)
                 torch.testing.assert_close(
-                    (output.hidden_states, output.logits, output.correction_logits),
-                    (hidden, logits, correction),
+                    (
+                        output.hidden_states,
+                        output.logits,
+                        output.base_logits,
+                        output.correction_logits,
+                    ),
+                    (hidden, logits, base.reshape_as(logits), correction),
                     rtol=tolerance,
                     atol=tolerance,
                 )
@@ -157,10 +173,14 @@ class CanonicalDominoTest(unittest.TestCase):
             config = model_config(shifted=shifted)
             actual = build_draft_model(config)
             args, previous = model_inputs(config)
-            output = actual(*args, prev_token_ids=previous)
+            output = actual(
+                *args, predecessor_ids=previous, output_correction_logits=True
+            )
             changed = previous.clone()
             changed[:, :4] = (changed[:, :4] + 1) % 64
-            other = actual(*args, prev_token_ids=changed)
+            other = actual(
+                *args, predecessor_ids=changed, output_correction_logits=True
+            )
             torch.testing.assert_close(
                 other.logits[:, 4:], output.logits[:, 4:], rtol=0, atol=0
             )
@@ -176,6 +196,37 @@ class CanonicalDominoTest(unittest.TestCase):
                 )
             )
 
+    def test_predecessors_do_not_leak_into_earlier_slots(self):
+        for shifted in (False, True):
+            model = build_draft_model(model_config(shifted=shifted, prefix=0))
+            args, previous = model_inputs(model.config.draft)
+            expected = model(*args, predecessor_ids=previous)
+            self.assertIsNone(expected.correction_logits)
+            for slot in range(4):
+                with self.subTest(shifted=shifted, slot=slot):
+                    changed = previous.clone()
+                    changed[:, slot] = (changed[:, slot] + 1) % 64
+                    output = model(*args, predecessor_ids=changed)
+                    torch.testing.assert_close(
+                        output.logits[:, :slot],
+                        expected.logits[:, :slot],
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(
+                        output.logits[:, 4:], expected.logits[:, 4:], rtol=0, atol=0
+                    )
+                    if slot == 0 and not shifted:
+                        torch.testing.assert_close(
+                            output.logits, expected.logits, rtol=0, atol=0
+                        )
+                    else:
+                        self.assertFalse(
+                            torch.equal(
+                                output.logits[:, slot:4], expected.logits[:, slot:4]
+                            )
+                        )
+
     def test_binding_checkpoint_and_hf_restore(self):
         config = model_config(bound=True)
         actual = build_draft_model(config)
@@ -185,8 +236,8 @@ class CanonicalDominoTest(unittest.TestCase):
         checkpointed = copy.deepcopy(actual)
         checkpointed.gradient_checkpointing_enable()
         args, previous = model_inputs(config)
-        output = actual(*args, prev_token_ids=previous)
-        expected = checkpointed(*args, prev_token_ids=previous)
+        output = actual(*args, predecessor_ids=previous, output_correction_logits=True)
+        expected = checkpointed(*args, predecessor_ids=previous)
         torch.testing.assert_close(output.logits, expected.logits, rtol=0, atol=0)
         output.logits.sum().backward()
         expected.logits.sum().backward()
@@ -207,7 +258,9 @@ class CanonicalDominoTest(unittest.TestCase):
             if module.weight.is_meta:
                 module.to_empty(device="cpu")
             module.load_target_weight(value)
-        result = restored(*args, prev_token_ids=previous)
+        result = restored(
+            *args, predecessor_ids=previous, output_correction_logits=True
+        )
         torch.testing.assert_close(result.logits, output.logits, rtol=0, atol=0)
         torch.testing.assert_close(
             result.correction_logits, output.correction_logits, rtol=0, atol=0
@@ -221,12 +274,12 @@ class CanonicalDominoTest(unittest.TestCase):
         hidden = actual(*args, output_logits=False)
         self.assertIsNone(hidden.logits)
         self.assertIsNone(hidden.correction_logits)
-        with self.assertRaisesRegex(ValueError, "requires prev_token_ids"):
+        with self.assertRaisesRegex(ValueError, "requires predecessor_ids"):
             actual(*args)
         with self.assertRaisesRegex(ValueError, "whole draft blocks"):
-            actual(args[0][:, :-1], args[1], args[2], prev_token_ids=previous)
+            actual(args[0][:, :-1], args[1], args[2], predecessor_ids=previous)
         with self.assertRaisesRegex(ValueError, "integer IDs"):
-            actual(*args, prev_token_ids=previous.float())
+            actual(*args, predecessor_ids=previous.float())
         meta = build_draft_model(config, device="meta", dtype=torch.bfloat16)
         self.assertTrue(
             all(p.is_meta and p.dtype == torch.bfloat16 for p in meta.parameters())

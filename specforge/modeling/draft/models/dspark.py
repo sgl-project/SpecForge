@@ -28,7 +28,7 @@ class DSparkOutput(ModelOutput):
 
 @register_draft_model
 class DSparkDraftModel(DraftPreTrainedModel):
-    """Consume whole draft-only blocks and already aligned predecessor tokens.
+    """Consume whole draft-only blocks and the token preceding each slot's target.
 
     Recurrent Markov state resets for every block. Confidence values are raw
     scores, matching the existing head; loss transforms and sampling belong to
@@ -85,7 +85,7 @@ class DSparkDraftModel(DraftPreTrainedModel):
         target_features: Tensor,
         layer_inputs: Sequence[LayerInputs],
         *,
-        prev_token_ids: Tensor | None = None,
+        predecessor_ids: Tensor | None = None,
         output_logits: bool = True,
     ) -> DSparkOutput:
         slots = self.config.draft.spec_config.protocol.num_model_slots
@@ -93,14 +93,14 @@ class DSparkDraftModel(DraftPreTrainedModel):
             raise ValueError("input_ids must be [batch, whole draft blocks]")
         if type(output_logits) is not bool:
             raise TypeError("output_logits must be boolean")
-        if output_logits and self.markov_head is not None and prev_token_ids is None:
-            raise ValueError("configured Markov head requires prev_token_ids")
-        if prev_token_ids is not None and (
-            prev_token_ids.shape != input_ids.shape
-            or prev_token_ids.dtype not in (torch.int32, torch.int64)
+        if output_logits and self.markov_head is not None and predecessor_ids is None:
+            raise ValueError("configured Markov head requires predecessor_ids")
+        if predecessor_ids is not None and (
+            predecessor_ids.shape != input_ids.shape
+            or predecessor_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError(
-                "prev_token_ids must be integer IDs aligned with input query positions"
+                "predecessor_ids must be integer IDs aligned with input query positions"
             )
         prepared = prepare_context_inputs(
             self.fusion,
@@ -116,14 +116,14 @@ class DSparkDraftModel(DraftPreTrainedModel):
             shape = (input_ids.shape[0], input_ids.shape[1] // slots, slots)
             logits = self.markov_head.apply_block_logits(
                 logits.reshape(*shape, logits.shape[-1]),
-                token_ids=prev_token_ids.reshape(shape),
+                token_ids=predecessor_ids.reshape(shape),
                 hidden_states=hidden.reshape(*shape, hidden.shape[-1]),
             ).reshape_as(logits)
         confidence = None
         if self.confidence_head is not None:
             features = hidden
             if self.config.draft.spec_config.confidence.with_markov:
-                previous = self.markov_head.get_prev_embeddings(prev_token_ids).to(
+                previous = self.markov_head.get_prev_embeddings(predecessor_ids).to(
                     hidden.dtype
                 )
                 features = torch.cat((hidden, previous), dim=-1)

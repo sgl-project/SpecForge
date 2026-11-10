@@ -22,16 +22,17 @@ from .tokens import build_token_modules
 class DominoOutput(ModelOutput):
     hidden_states: Tensor | None = None
     logits: Tensor | None = None
+    base_logits: Tensor | None = None
     correction_logits: Tensor | None = None
 
 
 @register_draft_model
 class DominoDraftModel(DraftPreTrainedModel):
-    """Consume whole blocks and teacher/committed tokens in block slot order.
+    """Consume whole blocks and the token preceding each slot's target.
 
     The configured label offset aligns the GRU prefix with decoder suffix states.
     GRU state resets for every block; sampling and loss construction belong to
-    callers. Correction logits retain [batch, blocks, suffix, vocab] dimensions.
+    callers. Optional correction logits have [batch, blocks, suffix, vocab] shape.
     output_logits=False skips both the vocabulary projection and GRU head.
     """
 
@@ -76,8 +77,9 @@ class DominoDraftModel(DraftPreTrainedModel):
         target_features: Tensor,
         layer_inputs: Sequence[LayerInputs],
         *,
-        prev_token_ids: Tensor | None = None,
+        predecessor_ids: Tensor | None = None,
         output_logits: bool = True,
+        output_correction_logits: bool = False,
     ) -> DominoOutput:
         spec = self.config.draft.spec_config
         slots = spec.protocol.num_model_slots
@@ -85,15 +87,17 @@ class DominoDraftModel(DraftPreTrainedModel):
             raise ValueError("input_ids must be [batch, whole draft blocks]")
         if type(output_logits) is not bool:
             raise TypeError("output_logits must be boolean")
-        if output_logits and prev_token_ids is None:
-            raise ValueError("Domino GRU head requires prev_token_ids")
-        if prev_token_ids is not None and (
-            prev_token_ids.shape != input_ids.shape
-            or prev_token_ids.dtype not in (torch.int32, torch.int64)
+        if output_logits and predecessor_ids is None:
+            raise ValueError("Domino GRU head requires predecessor_ids")
+        if predecessor_ids is not None and (
+            predecessor_ids.shape != input_ids.shape
+            or predecessor_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError(
-                "prev_token_ids must be integer IDs in input block slot order"
+                "predecessor_ids must be integer IDs in input block slot order"
             )
+        if type(output_correction_logits) is not bool:
+            raise TypeError("output_correction_logits must be boolean")
         prepared = prepare_context_inputs(
             self.fusion,
             target_features,
@@ -105,8 +109,9 @@ class DominoDraftModel(DraftPreTrainedModel):
             return DominoOutput(hidden_states=hidden)
         shape = (input_ids.shape[0], input_ids.shape[1] // slots, slots)
         states = hidden.reshape(*shape, hidden.shape[-1])
-        previous = self.embed_tokens(prev_token_ids).reshape_as(states)
-        prefix = previous if spec.block.shift_label else previous[..., :-1, :]
+        previous = self.embed_tokens(predecessor_ids).reshape_as(states)
+        # Unshifted slot zero is the committed anchor, not a GRU prediction.
+        prefix = previous if spec.block.shift_label else previous[..., 1:, :]
         correction = self.gru_head(states[..., spec.suffix_start :, :], prefix)
         base = self.lm_head(hidden)
         blocks = base.reshape(*shape, base.shape[-1])
@@ -118,5 +123,8 @@ class DominoDraftModel(DraftPreTrainedModel):
             dim=-2,
         ).reshape_as(base)
         return DominoOutput(
-            hidden_states=hidden, logits=logits, correction_logits=correction
+            hidden_states=hidden,
+            logits=logits,
+            base_logits=base,
+            correction_logits=correction if output_correction_logits else None,
         )

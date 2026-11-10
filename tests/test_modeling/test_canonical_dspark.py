@@ -97,7 +97,7 @@ class CanonicalDSparkTest(unittest.TestCase):
                 )
                 (ids, features, entries), previous = model_inputs(config, device, dtype)
                 other = features.detach().clone().requires_grad_()
-                output = actual(ids, features, entries, prev_token_ids=previous)
+                output = actual(ids, features, entries, predecessor_ids=previous)
                 hidden = reference(
                     entries[0].position_ids,
                     noise_embedding=embedding(ids),
@@ -160,10 +160,10 @@ class CanonicalDSparkTest(unittest.TestCase):
     def test_recurrence_resets_at_block_boundaries(self):
         actual = build_draft_model(model_config())
         args, previous = model_inputs(actual.config.draft)
-        output = actual(*args, prev_token_ids=previous)
+        output = actual(*args, predecessor_ids=previous)
         changed = previous.clone()
         changed[:, :4] = (changed[:, :4] + 1) % 64
-        other = actual(*args, prev_token_ids=changed)
+        other = actual(*args, predecessor_ids=changed)
         torch.testing.assert_close(
             other.logits[:, 4:], output.logits[:, 4:], rtol=0, atol=0
         )
@@ -184,8 +184,8 @@ class CanonicalDSparkTest(unittest.TestCase):
         checkpointed = copy.deepcopy(actual)
         checkpointed.gradient_checkpointing_enable()
         args, previous = model_inputs(config)
-        output = actual(*args, prev_token_ids=previous)
-        expected = checkpointed(*args, prev_token_ids=previous)
+        output = actual(*args, predecessor_ids=previous)
+        expected = checkpointed(*args, predecessor_ids=previous)
         torch.testing.assert_close(
             (output.logits, output.confidence_scores),
             (expected.logits, expected.confidence_scores),
@@ -211,7 +211,7 @@ class CanonicalDSparkTest(unittest.TestCase):
             if module.weight.is_meta:
                 module.to_empty(device="cpu")
             module.load_target_weight(value)
-        result = restored(*args, prev_token_ids=previous)
+        result = restored(*args, predecessor_ids=previous)
         torch.testing.assert_close(result.logits, output.logits, rtol=0, atol=0)
         torch.testing.assert_close(
             result.confidence_scores, output.confidence_scores, rtol=0, atol=0
@@ -233,12 +233,12 @@ class CanonicalDSparkTest(unittest.TestCase):
         hidden = headed(*args, output_logits=False)
         self.assertIsNone(hidden.logits)
         self.assertIsNone(hidden.confidence_scores)
-        with self.assertRaisesRegex(ValueError, "requires prev_token_ids"):
+        with self.assertRaisesRegex(ValueError, "requires predecessor_ids"):
             headed(*args)
         with self.assertRaisesRegex(ValueError, "whole draft blocks"):
             headed(args[0][:, :-1], args[1], args[2])
         with self.assertRaisesRegex(ValueError, "integer IDs"):
-            headed(*args, prev_token_ids=args[0].float())
+            headed(*args, predecessor_ids=args[0].float())
         meta = build_draft_model(model_config(), device="meta", dtype=torch.bfloat16)
         self.assertTrue(
             all(p.is_meta and p.dtype == torch.bfloat16 for p in meta.parameters())
