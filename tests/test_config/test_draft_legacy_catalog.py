@@ -18,19 +18,27 @@ class LegacyCatalogTest(unittest.TestCase):
         for path in paths:
             with self.subTest(path=path.name):
                 payload = json.loads(path.read_text())
+                options = (
+                    {"mask_token_id": 1}
+                    if payload["architectures"] == ["PEagleDraftModel"]
+                    else {}
+                )
                 # A structural oracle only; no real target checkpoint is loaded.
                 target = {
                     "hidden_size": payload["hidden_size"],
                     "vocab_size": payload["vocab_size"],
                     "num_hidden_layers": payload.get("num_target_layers", 128),
                 }
-                node = decode_legacy_config(payload, target_config=target)
+                node = decode_legacy_config(payload, **options, target_config=target)
                 restored = decode_config(
-                    json.loads(json.dumps(encode_config(node))), target_config=target
+                    json.loads(json.dumps(encode_config(node))),
+                    target_config=target,
                 )
                 self.assertEqual(restored, node)
                 inherited = decode_legacy_config(
-                    payload | {"draft_vocab_size": None}, target_config=target
+                    payload | {"draft_vocab_size": None},
+                    **options,
+                    target_config=target,
                 )
                 self.assertEqual(inherited.draft_vocab_size, payload["vocab_size"])
                 for name in (
@@ -50,6 +58,7 @@ class LegacyCatalogTest(unittest.TestCase):
                                 for key, value in payload.items()
                                 if key != name
                             },
+                            **options,
                             target_config=target,
                         )
 

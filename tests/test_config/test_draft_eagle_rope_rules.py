@@ -62,6 +62,37 @@ class EagleRoPERulesTest(unittest.TestCase):
         self.assertTrue(node.truncate)
         self.assertEqual(node.partial_rotary_factor, 1)
 
+    def test_copied_multimodal_fields_follow_effective_rope_type(self):
+        for params in (
+            dict(
+                rope_type="default",
+                rope_theta=1e7,
+                partial_rotary_factor=0.25,
+                mrope_section=[11, 11, 10],
+                mrope_interleaved=True,
+            ),
+            dict(
+                type="mrope",
+                rope_type="default",
+                rope_theta=1e6,
+                mrope_section=[16, 24, 24],
+            ),
+        ):
+            node = resolve_eagle_rope({"rope_parameters": params})
+            self.assertEqual(node.rope_type, "default")
+            self.assertEqual(node.rope_theta, params["rope_theta"])
+            self.assertEqual(node.partial_rotary_factor, 1)
+        for extra in ({"mrope_interleaved": True}, {"factor": 2}):
+            with self.assertRaisesRegex(ValueError, "does not support"):
+                resolve_eagle_rope(
+                    {
+                        "rope_scaling": dict(
+                            rope_type="mrope", mrope_section=[16, 24, 24]
+                        )
+                        | extra
+                    }
+                )
+
     def test_context_defaults_and_unsupported_dynamic(self):
         for params in (
             dict(rope_type="llama3", factor=8, low_freq_factor=1, high_freq_factor=4),
@@ -87,21 +118,16 @@ class EagleRoPERulesTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "unsupported.*dynamic"):
             resolve_eagle_rope({"rope_scaling": {"type": "dynamic", "factor": 2}})
-        node = resolve_eagle_rope(
-            {"rope_scaling": {"rope_type": "llama3", "factor": 8}}
-        )
-        self.assertEqual(node.rope_type, "default")
-        node = resolve_eagle_rope(
+        for params in (
+            {"rope_type": "llama3", "factor": 8},
             {
-                "rope_scaling": {
-                    "rope_type": "llama3",
-                    "low_freq_factor": 1,
-                    "high_freq_factor": 4,
-                    "original_max_position_embeddings": 4096,
-                }
-            }
-        )
-        self.assertEqual(node.factor, 1)
+                "rope_type": "llama3",
+                "low_freq_factor": 1,
+                "high_freq_factor": 4,
+            },
+        ):
+            with self.assertRaisesRegex(ValueError, "requires"):
+                resolve_eagle_rope({"rope_scaling": params})
 
     def test_invalid_executed_fields_and_alias_conflicts_fail(self):
         for settings in (
@@ -113,7 +139,7 @@ class EagleRoPERulesTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 resolve_eagle_rope({"rope_scaling": settings})
-        with self.assertRaisesRegex(ValueError, "conflicting"):
+        with self.assertRaisesRegex(ValueError, "unsupported"):
             resolve_eagle_rope(
                 {
                     "rope_scaling": {

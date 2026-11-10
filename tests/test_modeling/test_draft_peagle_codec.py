@@ -18,6 +18,12 @@ from tests.test_config.test_draft_legacy_peagle import peagle_payload, target_fo
 
 def reconstructed_payload(node):
     attention = node.attention_configs["default"]
+    if (attention.qk_norm, attention.attention_bias, attention.output_gate) != (
+        False,
+        False,
+        False,
+    ) or node.norm_config.weight_offset != 0:
+        raise AssertionError("legacy EAGLE cannot express this node")
     return dict(
         architectures=["PEagleDraftModel"],
         hidden_size=node.hidden_size,
@@ -52,6 +58,17 @@ def eager_attention(*, query, key, value, block_mask, enable_gqa, **kwargs):
 
 
 class PEagleCodecParityTest(unittest.TestCase):
+    def test_bundled_recipe_residual_matches_existing_model(self):
+        payload = peagle_payload()
+        node = decode_legacy_config(
+            payload, target_config=target_for_peagle(payload), mask_token_id=1
+        )
+        with torch.device("meta"):
+            old = AutoDraftModel.from_config(AutoDraftConfig.from_dict(payload))
+        self.assertEqual(
+            node.spec_config.norm_before_residual, old.norm_before_residual
+        )
+
     def test_shapes_outputs_gradients_and_saved_configs_match(self):
         for depth, normalized_residual in ((1, False), (3, False), (3, True)):
             with self.subTest(depth=depth, normalized_residual=normalized_residual):
@@ -70,13 +87,13 @@ class PEagleCodecParityTest(unittest.TestCase):
                     eos_token_id=None,
                     pad_token_id=0,
                     rope_scaling={"rope_type": "linear", "factor": 4},
-                    partial_rotary_factor=0.5,
-                    attention_bias=True,
-                    mlp_bias=True,
-                    attention_dropout=0.25,
+                    rms_norm_eps=1e-5,
+                    hidden_act="gelu_pytorch_tanh",
                 )
                 target = target_for_peagle(payload)
-                node = decode_legacy_config(payload, target_config=target)
+                node = decode_legacy_config(
+                    payload, mask_token_id=1, target_config=target
+                )
                 old = AutoDraftModel.from_config(AutoDraftConfig.from_dict(payload))
                 resolved = AutoDraftModel.from_config(
                     AutoDraftConfig.from_dict(reconstructed_payload(node))
@@ -94,7 +111,9 @@ class PEagleCodecParityTest(unittest.TestCase):
                     old.fc.in_features, node.spec_config.target_features.input_width
                 )
                 self.assertEqual(
-                    decode_legacy_config(old.config.to_dict(), target_config=target),
+                    decode_legacy_config(
+                        old.config.to_dict(), mask_token_id=1, target_config=target
+                    ),
                     node,
                 )
                 torch.testing.assert_close(
@@ -150,8 +169,8 @@ class PEagleCodecParityTest(unittest.TestCase):
 
     def test_capture_defaults_match_existing_provider(self):
         run = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layer_ids=None))
-        for depth in (4, 28, 36, 64):
-            for explicit in (None, [2, 1, 2]):
+        for depth in (8, 28, 36, 64):
+            for explicit in (None, [3, 1, 2]):
                 payload = peagle_payload()
                 if explicit is not None:
                     payload["eagle_config"] = {
@@ -161,9 +180,12 @@ class PEagleCodecParityTest(unittest.TestCase):
                 expected = resolve_eagle_capture_layers(
                     run, payload, SimpleNamespace(**target)
                 )
-                node = decode_legacy_config(payload, target_config=target)
+                node = decode_legacy_config(
+                    payload, mask_token_id=1, target_config=target
+                )
                 self.assertEqual(
-                    node.spec_config.target_features.target_layer_ids, tuple(expected)
+                    node.spec_config.target_features.target_layer_ids,
+                    tuple(sorted(expected)),
                 )
 
 

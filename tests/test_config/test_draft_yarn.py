@@ -42,6 +42,9 @@ class YaRNConfigTest(unittest.TestCase):
             rope.factor = 2
 
     def test_mscale_correction_and_explicit_attention_factor_are_distinct(self):
+        for mscale, mscale_all in ((0, 1), (1, 0), (0, 0)):
+            rope = resolve_rope(yarn_payload(mscale=mscale, mscale_all_dim=mscale_all))
+            self.assertAlmostEqual(rope.attention_factor, 1 + 0.1 * math.log(16))
         rope = resolve_rope(yarn_payload(mscale=0.707, mscale_all_dim=0.707))
         self.assertEqual(rope.attention_factor, 1)
         self.assertAlmostEqual(

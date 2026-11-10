@@ -14,6 +14,8 @@ from tests.test_config.test_draft_legacy_mtp import mtp_payload, target_for_mtp
 
 def model_from_node(node):
     attention = node.attention_configs["default"]
+    if not attention.qk_norm or node.norm_config.weight_offset != 1:
+        raise AssertionError("legacy MTP cannot express this node")
     payload = dict(
         architectures=["Qwen3_5MTPDraftModel"],
         hidden_size=node.hidden_size,
@@ -98,7 +100,11 @@ class MTPCodecParityTest(unittest.TestCase):
             {"mtp_config": {"share_lm_head": False}},
             {"attn_output_gate": False},
             {"attention_bias": True},
-            {"num_hidden_layers": 8},
+            {
+                "num_key_value_heads": None,
+                "rms_norm_eps": 1e-5,
+                "hidden_act": "gelu_pytorch_tanh",
+            },
             {"partial_rotary_factor": 1.0},
             {"attention_dropout": 0.2},
         ):

@@ -71,6 +71,11 @@ class ArchitectureSpecsTest(unittest.TestCase):
                 TargetFeatureSpec(
                     hidden_size=32, mask_token_id=value, target_layer_ids=(1,)
                 )
+        for value in (True, 0, -1, 32.0, "32", None):
+            with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
+                TargetFeatureSpec(
+                    hidden_size=value, mask_token_id=0, target_layer_ids=(1,)
+                )
 
     def test_architectures_compose_nodes_without_inheriting_each_other(self):
         second = dflash2()
