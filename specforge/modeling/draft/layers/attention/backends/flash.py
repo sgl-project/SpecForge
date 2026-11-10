@@ -98,7 +98,12 @@ class FlashAttentionBackend(AttentionBackend):
     def attend(
         self, query, key, value, *, mask, scale, dropout_p, training, return_lse
     ):
-        if query.device.type != "cuda" or query.dtype not in (
+        device_type = query.device.type
+        if query.dtype == torch.float32 and torch.is_autocast_enabled(device_type):
+            # weighted QK norm promotes Q/K to FP32 under autocast; cast like SDPA
+            dtype = torch.get_autocast_dtype(device_type)
+            query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+        if device_type != "cuda" or query.dtype not in (
             torch.float16,
             torch.bfloat16,
         ):
