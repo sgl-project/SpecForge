@@ -3,12 +3,14 @@
 import copy
 import unittest
 from dataclasses import replace
+from itertools import product
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
 from transformers import LlamaConfig
 
+from specforge.config.draft.rope import DynamicNTKRoPESpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.llama3_eagle import (
@@ -16,7 +18,10 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaRotaryEmbedding,
 )
 from specforge.modeling.draft.models import Eagle3DraftModel
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
+from tests.test_modeling.legacy_rope_reference import (
+    eager_legacy_reference,
+    legacy_fp32_rope,
+)
 from tests.test_modeling.test_draft_eagle_backbone import config_for
 from tests.test_modeling.test_draft_eagle_fusion import eager_reference
 from tests.test_modeling.test_draft_gqa import layout_for
@@ -84,7 +89,7 @@ def legacy_name(name):
 
 class CanonicalEagle3Test(unittest.TestCase):
     # Compare eager math on both sides, without compiler fusion differences.
-    @patch("torch._dynamo.config.disable", True)
+    @eager_legacy_reference()
     @legacy_fp32_rope()
     def _parity(self, device, dtype):
         # Canonical RoPE computes in FP32 before casting back to the model dtype.
@@ -132,11 +137,7 @@ class CanonicalEagle3Test(unittest.TestCase):
                     8, max_position_embeddings=128, base=10000, device=device
                 )
                 reference.load_state_dict(
-                    {
-                        legacy_name(n): v
-                        for n, v in actual.state_dict().items()
-                        if n != "vocabulary.ready"
-                    },
+                    {legacy_name(n): v for n, v in actual.state_dict().items()},
                     strict=True,
                 )
                 ids, features, entries = model_inputs(config, device, dtype)
@@ -220,6 +221,102 @@ class CanonicalEagle3Test(unittest.TestCase):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             self._parity("cuda", dtype)
 
+    def test_projected_prefix_matches_replay_and_gradients(self):
+        config = model_config(normalize=True)
+        variants = (
+            config,
+            replace(
+                config,
+                rope_parameters=DynamicNTKRoPESpec(
+                    interleaved=False,
+                    rope_theta=10000.0,
+                    partial_rotary_factor=1.0,
+                    factor=2.0,
+                    original_max_position_embeddings=4,
+                ),
+            ),
+        )
+        devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+        for config, device in product(variants, devices):
+            for checkpointing in (False, True):
+                with self.subTest(
+                    attention=type(config.attention_configs["full"]).__name__,
+                    rope=type(config.rope_parameters).__name__,
+                    device=device,
+                    checkpointing=checkpointing,
+                ):
+                    cached = build_draft_model(config, device=device)
+                    install_mapping(cached)
+                    replay = copy.deepcopy(cached)
+                    if checkpointing:
+                        cached.gradient_checkpointing_enable()
+                    ids, features, entries = model_inputs(config, device)
+                    other = features.detach().clone().requires_grad_()
+                    first = cached(ids, features, entries)
+                    reference = replay(ids, other, entries)
+                    positions = torch.arange(8, device=device).expand(2, -1)
+                    # Earlier queries cannot see the newly appended depth.
+                    visibility = (
+                        positions[:, None, None, :] <= positions[:, None, :, None]
+                    )
+                    layout = replace(
+                        entries[0].attention_layout,
+                        query_positions=positions,
+                        key_positions=positions,
+                        visibility=visibility,
+                    )
+                    full_inputs = [
+                        LayerInputs(attention_layout=layout, position_ids=positions)
+                    ]
+                    next_inputs = [
+                        LayerInputs(
+                            attention_layout=replace(
+                                layout,
+                                query_positions=positions[:, 4:],
+                                visibility=visibility[:, :, 4:],
+                            ),
+                            position_ids=positions[:, 4:],
+                        )
+                    ]
+                    second = cached(
+                        ids,
+                        None,
+                        next_inputs,
+                        recurrent_hidden=first.hidden_states,
+                        kv_prefix=first.kv,
+                    )
+                    expected = replay(
+                        torch.cat((ids, ids), dim=1),
+                        None,
+                        full_inputs,
+                        recurrent_hidden=torch.cat(
+                            (replay.fusion(other), reference.hidden_states), dim=1
+                        ),
+                    )
+                    torch.testing.assert_close(
+                        second.logits, expected.logits[:, 4:], rtol=1e-5, atol=1e-5
+                    )
+                    self.assertEqual(second.kv.key.shape[2], 4)
+                    self.assertTrue(second.kv.key.requires_grad)
+                    (
+                        first.logits.square().sum() + second.logits.square().sum()
+                    ).backward()
+                    (
+                        reference.logits.square().sum()
+                        + expected.logits[:, 4:].square().sum()
+                    ).backward()
+                    torch.testing.assert_close(
+                        features.grad, other.grad, rtol=1e-4, atol=1e-5
+                    )
+                    for name, parameter in cached.named_parameters():
+                        torch.testing.assert_close(
+                            parameter.grad,
+                            dict(replay.named_parameters())[name].grad,
+                            rtol=1e-4,
+                            atol=1e-5,
+                            msg=name,
+                        )
+
     def test_checkpointing_binding_and_hf_restore(self):
         config = model_config(normalize=True, bound=True, target_width=32)
         actual = build_draft_model(config)
@@ -293,7 +390,7 @@ class CanonicalEagle3Test(unittest.TestCase):
             replace(config, draft_vocab_size=64, tie_word_embeddings=True)
         )
         self.assertIs(full.embed_tokens.weight, full.lm_head.weight)
-        self.assertTrue(full.vocabulary.ready.item())
+        self.assertTrue(full.vocabulary.ready)
 
 
 if __name__ == "__main__":

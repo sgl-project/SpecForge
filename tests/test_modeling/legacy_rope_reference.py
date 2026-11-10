@@ -7,6 +7,7 @@ of the canonical `apply_rotary`.
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 
@@ -61,4 +62,12 @@ def legacy_fp32_rope():
             _fp32_query_key(llama3_eagle.apply_rotary_pos_emb),
         ),
     ):
+        yield
+
+
+@contextmanager
+def eager_legacy_reference():
+    """Discard compiled legacy helpers before comparing eager model math."""
+    torch._dynamo.reset()
+    with patch("torch._dynamo.config.disable", True):
         yield

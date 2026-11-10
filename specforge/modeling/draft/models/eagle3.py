@@ -1,14 +1,16 @@
 """EAGLE3 composition with explicit initial-feature and recurrent-state inputs."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 from transformers.utils import ModelOutput
 
 from ..hf_config import SpecForgeDraftConfig
 from ..layers import build_component
+from ..layers.attention.kv import AttentionKV
 from ..layers.inputs import LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .eagle_backbone import build_eagle_backbone
@@ -22,6 +24,7 @@ from .vocabulary import DraftVocabulary
 class Eagle3Output(ModelOutput):
     hidden_states: Tensor | None = None
     logits: Tensor | None = None
+    kv: AttentionKV | None = None
 
 
 @register_draft_model
@@ -30,7 +33,10 @@ class Eagle3DraftModel(DraftPreTrainedModel):
 
     hidden_states follows norm_output and can feed the next rollout. Logits are
     normalized exactly once and use draft-vocabulary order. Token alignment,
-    rollout scheduling, masks and positions are supplied by the caller.
+    rollout scheduling, masks and positions are supplied by the caller. kv_prefix
+    contains projected, rotated keys and values from previous depths; returned kv
+    contains only this depth and stays attached to autograd. Position inputs cover
+    only new tokens, while attention visibility covers prefix plus new tokens.
     """
 
     _no_split_modules = ["EagleDecoderStage"]
@@ -89,6 +95,7 @@ class Eagle3DraftModel(DraftPreTrainedModel):
         layer_inputs: Sequence[LayerInputs],
         *,
         recurrent_hidden: Tensor | None = None,
+        kv_prefix: AttentionKV | None = None,
         output_logits: bool = True,
     ) -> Eagle3Output:
         if input_ids.ndim != 2:
@@ -108,10 +115,29 @@ class Eagle3DraftModel(DraftPreTrainedModel):
             raise ValueError(
                 "features must align with input IDs and draft hidden width"
             )
-        hidden = self.backbone(
+        # EAGLE3 has one stage. The caller owns depth iteration and K/V lifetime.
+        state = self.backbone.begin(
             torch.cat((self.embed_tokens(input_ids), features), dim=-1), layer_inputs
         )
+        stage = self.backbone.layers[0]
+        options = dict(kv_prefix=kv_prefix, output_kv=True)
+        if (
+            self.backbone.gradient_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            hidden, kv = checkpoint(
+                stage,
+                state.hidden,
+                state.layer_inputs[0],
+                use_reentrant=False,
+                **options,
+            )
+        else:
+            hidden, kv = stage(state.hidden, state.layer_inputs[0], **options)
+        hidden = self.backbone.finalize(replace(state, hidden=hidden, next_layer=1))
         return Eagle3Output(
             hidden_states=hidden,
+            kv=kv,
             logits=self.compute_logits(hidden) if output_logits else None,
         )

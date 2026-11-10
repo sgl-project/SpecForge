@@ -42,6 +42,11 @@ class DraftPreTrainedModel(PreTrainedModel):
         }
         if invalid:
             raise ValueError(f"Invalid draft checkpoint: {invalid}")
+        # HF restores tensors directly, bypassing load_state_dict post-hooks.
+        for module in model.modules():
+            validate = getattr(module, "validate_draft_state", None)
+            if validate is not None:
+                validate()
         return (model, info) if output_loading_info else model
 
     def init_weights(self):

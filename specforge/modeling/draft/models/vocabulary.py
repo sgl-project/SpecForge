@@ -27,23 +27,55 @@ class DraftVocabulary(nn.Module):
         self.register_buffer(
             "d2t", torch.empty(draft_vocab_size, device=device, dtype=torch.long)
         )
-        self.register_buffer("ready", torch.empty((), device=device, dtype=torch.bool))
+        self._ready = False
+        self.register_load_state_dict_post_hook(self._after_load)
         self.reset_draft_parameters()
 
     def reset_draft_parameters(self):
         identity = self.vocab_size == self.draft_vocab_size
         init.constant_(self.t2d, identity)
         init.zeros_(self.d2t)
-        init.constant_(self.ready, identity)
+        self._ready = identity and not self.t2d.is_meta
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def _after_load(self, module, incompatible_keys):
+        self.validate_draft_state()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        self._ready = False
+        for name in ("t2d", "d2t"):
+            if prefix + name not in state_dict:
+                raise ValueError(f"missing vocabulary tensor: {prefix + name}")
+        self._validate_mapping(state_dict[prefix + "t2d"], state_dict[prefix + "d2t"])
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def validate_draft_state(self) -> None:
+        """Validate restored buffers once, before any token IDs are interpreted."""
+        self._ready = False
+        self._validate_mapping(self.t2d, self.d2t)
+        self._ready = True
 
     @torch.no_grad()
     def load_mapping(self, *, t2d: Tensor, d2t: Tensor) -> None:
         """Validate the entire mapping before copying into existing buffers."""
+        if self.t2d.is_meta or self.d2t.is_meta:
+            raise ValueError(
+                "materialize vocabulary tensors before installing a mapping"
+            )
+        self._validate_mapping(t2d, d2t)
+        self.t2d.copy_(t2d)
+        self.d2t.copy_(d2t)
+        self._ready = True
+
+    def _validate_mapping(self, t2d: Tensor, d2t: Tensor) -> None:
         if t2d.shape != self.t2d.shape or t2d.dtype != torch.bool:
             raise ValueError("t2d must be boolean [vocab_size]")
         if d2t.shape != self.d2t.shape or d2t.dtype != torch.long:
             raise ValueError("d2t must be int64 [draft_vocab_size]")
-        if any(t.is_meta for t in (t2d, d2t, self.t2d, self.d2t, self.ready)):
+        if any(t.is_meta for t in (t2d, d2t)):
             raise ValueError(
                 "materialize vocabulary tensors before installing a mapping"
             )
@@ -53,14 +85,12 @@ class DraftVocabulary(nn.Module):
         )
         if not torch.equal(selected, mapped):
             raise ValueError("t2d/d2t must describe the same ascending target IDs")
-        self.t2d.copy_(t2d)
-        self.d2t.copy_(d2t)
-        self.ready.fill_(True)
 
     def require_ready(self):
-        torch._assert_async(
-            self.ready, "Install or restore the draft vocabulary mapping before use"
-        )
+        if not self._ready:
+            raise RuntimeError(
+                "Install or restore the draft vocabulary mapping before use"
+            )
 
     def to_target(self, draft_ids: Tensor) -> Tensor:
         self.require_ready()

@@ -16,6 +16,7 @@ from .backends import (
     PreparedAttention,
     resolve_attention_backend,
 )
+from .kv import AttentionKV
 from .masks import AttentionLayout
 from .validation import validate_attention_inputs
 
@@ -136,12 +137,15 @@ class GQAAttention(nn.Module):
         attention: PreparedAttention,
         position_embeddings: tuple[Tensor, Tensor] | None,
         target_context: Tensor | None = None,
-    ) -> Tensor:
+        kv_prefix: AttentionKV | None = None,
+        output_kv: bool = False,
+    ) -> Tensor | tuple[Tensor, AttentionKV]:
         """Use an explicit attention layout and joint context-then-draft RoPE inputs.
 
         Context is already fused to input_size by the owning architecture. The
         layout's query positions describe hidden; key positions describe context
-        followed by hidden. No cache, algorithm settings, or family config enters
+        followed by hidden. An optional projected K/V prefix stays attached to autograd.
+        No mutable cache, algorithm settings, or family config enters
         this component. rotary_dim=0 requires position_embeddings=None. Supplied
         cosine/sine tables must be FP32; rotation casts back to the projected Q/K dtype.
         """
@@ -154,6 +158,7 @@ class GQAAttention(nn.Module):
             config=self.config,
             backend=self.backend,
             rotary_dim=self.rotary_dim,
+            kv_prefix=kv_prefix,
         )
         keys = context_length + length
         node = self.config
@@ -196,10 +201,13 @@ class GQAAttention(nn.Module):
             query, key = self._normalize(query, self.q_norm), self._normalize(
                 key, self.k_norm
             )
+        boolean("output_kv", output_kv)
+        current_kv = AttentionKV(key, value)
+        combined = current_kv.prepend(kv_prefix)
         result = attention.attend(
             query,
-            key,
-            value,
+            combined.key,
+            combined.value,
             scale=node.head_dim**-0.5,
             dropout_p=node.attention_dropout,
             training=self.training,
@@ -212,7 +220,8 @@ class GQAAttention(nn.Module):
             output = output * gate.sigmoid()
         output = self.o_proj(output)
         # Inactive queries must stay zero even when the output projection has bias.
-        return result.mask_output(output)
+        output = result.mask_output(output)
+        return (output, current_kv) if output_kv else output
 
 
 register_component_builder("attention", GQASpec, GQAAttention)

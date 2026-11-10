@@ -6,6 +6,7 @@ from torch import Tensor
 from specforge.config.draft.attention import AttentionSpec
 
 from .backends import AttentionBackend, PreparedAttention
+from .kv import AttentionKV
 
 
 def validate_hidden(
@@ -70,12 +71,19 @@ def validate_attention_inputs(
     config: AttentionSpec,
     backend: AttentionBackend,
     rotary_dim: int,
+    kv_prefix: AttentionKV | None = None,
 ) -> tuple[int, int, int]:
     batch, length, context_length = validate_hidden(hidden, target_context, input_size)
     if not isinstance(attention, PreparedAttention):
         raise TypeError("attention requires PreparedAttention")
     layout = attention.layout
-    keys = context_length + length
+    if kv_prefix is not None:
+        if not isinstance(kv_prefix, AttentionKV):
+            raise TypeError("kv_prefix must be AttentionKV")
+        if target_context is not None:
+            raise ValueError("kv_prefix cannot be combined with target_context")
+    prefix_length = 0 if kv_prefix is None else kv_prefix.key.shape[2]
+    keys = context_length + length + prefix_length
     if (
         attention.batch_size != batch
         or attention.num_heads != config.num_attention_heads
@@ -89,5 +97,5 @@ def validate_attention_inputs(
         raise ValueError(
             "prepared attention must match the layer and context-then-query tensors"
         )
-    validate_rotary(position_embeddings, hidden, keys, rotary_dim)
+    validate_rotary(position_embeddings, hidden, context_length + length, rotary_dim)
     return batch, length, context_length

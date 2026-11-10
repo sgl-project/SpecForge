@@ -1,5 +1,6 @@
 """P-EAGLE composition with learned auxiliary-feature replacement in forward."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -28,7 +29,8 @@ class PEagleOutput(ModelOutput):
 class PEagleDraftModel(DraftPreTrainedModel):
     """Replace selected raw auxiliary features, then project and run the backbone.
 
-    feature_mask=True selects the learned mask vector. Callers supply aligned
+    feature_mask=True replaces tokens and features with their configured masks.
+    Callers supply aligned
     tokens, feature-mask positions and visibility; sampling depth and scheduling
     remain outside the model. Returned hidden states are already normalized.
     """
@@ -63,6 +65,17 @@ class PEagleDraftModel(DraftPreTrainedModel):
             device=device,
         )
         self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # Match nn.Linear.reset_parameters without overwriting restored tensors.
+            init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+            if module.bias is not None:
+                bound = module.in_features**-0.5
+                init.uniform_(module.bias, -bound, bound)
+        else:
+            super()._init_weights(module)
 
     def reset_draft_parameters(self):
         # Legacy P-EAGLE starts this vector with standard-normal entries.
@@ -103,6 +116,9 @@ class PEagleDraftModel(DraftPreTrainedModel):
                 or feature_mask.dtype != torch.bool
             ):
                 raise ValueError("feature_mask must be boolean [batch, sequence]")
+            input_ids = input_ids.masked_fill(
+                feature_mask, self.config.draft.spec_config.mask_token_id
+            )
             target_features = torch.where(
                 feature_mask[..., None],
                 self.mask_hidden.to(target_features.dtype),

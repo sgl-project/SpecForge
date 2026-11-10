@@ -13,6 +13,10 @@ from specforge.modeling import build_draft_model
 from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
 from specforge.modeling.draft.models import PEagleDraftModel
 from specforge.modeling.draft.peagle import PEagleDraftModel as LegacyPEagleDraftModel
+from tests.test_modeling.legacy_rope_reference import (
+    eager_legacy_reference,
+    legacy_fp32_rope,
+)
 from tests.test_modeling.test_canonical_eagle3 import install_mapping, model_inputs
 from tests.test_modeling.test_draft_eagle_backbone import config_for
 from tests.test_modeling.test_draft_eagle_fusion import eager_reference
@@ -50,7 +54,16 @@ def legacy_name(name):
     return name
 
 
+def peagle_eager_reference(*, query, key, value, **kwargs):
+    # Legacy applies RoPE inline; cast after rotation, as canonical RoPE does.
+    return eager_reference(
+        query=query.to(value.dtype), key=key.to(value.dtype), value=value, **kwargs
+    )
+
+
 class CanonicalPEagleTest(unittest.TestCase):
+    @eager_legacy_reference()
+    @legacy_fp32_rope()
     def _parity(self, device, dtype):
         # Canonical RoPE computes in FP32 before casting back to the model dtype.
         tolerance = (
@@ -89,12 +102,15 @@ class CanonicalPEagleTest(unittest.TestCase):
                 reference.rotary_emb = LlamaRotaryEmbedding(
                     8, max_position_embeddings=128, base=10000, device=device
                 )
+                # Compute the legacy inline rotation in FP32 without changing
+                # projection weights or the attention/MLP arithmetic.
+                for layer in reference.layers:
+                    for projection in (layer.self_attn.q_proj, layer.self_attn.k_proj):
+                        projection.register_forward_hook(
+                            lambda module, args, output: output.float()
+                        )
                 reference.load_state_dict(
-                    {
-                        legacy_name(n): v
-                        for n, v in actual.state_dict().items()
-                        if n != "vocabulary.ready"
-                    },
+                    {legacy_name(n): v for n, v in actual.state_dict().items()},
                     strict=True,
                 )
                 ids, features, entries = model_inputs(config, device, dtype)
@@ -111,11 +127,13 @@ class CanonicalPEagleTest(unittest.TestCase):
                 )
                 with patch(
                     "specforge.modeling.draft.peagle.compile_friendly_flex_attention",
-                    eager_reference,
+                    peagle_eager_reference,
                 ):
                     hidden = reference(
                         selected,
-                        reference.embed_tokens(ids),
+                        reference.embed_tokens(
+                            ids.masked_fill(masked, config.spec_config.mask_token_id)
+                        ),
                         attention_mask=visibility,
                         position_ids=entries[0].position_ids,
                     )
@@ -143,6 +161,27 @@ class CanonicalPEagleTest(unittest.TestCase):
                         dict(reference.named_parameters())[legacy_name(name)].grad,
                         rtol=tolerance,
                         atol=tolerance,
+                    )
+
+    def test_linear_initialization_matches_pytorch_default(self):
+        model = build_draft_model(model_config())
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                reference = torch.nn.Linear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                )
+                torch.manual_seed(17)
+                reference.reset_parameters()
+                torch.manual_seed(17)
+                model._init_weights(module)
+                torch.testing.assert_close(
+                    module.weight, reference.weight, rtol=0, atol=0
+                )
+                if module.bias is not None:
+                    torch.testing.assert_close(
+                        module.bias, reference.bias, rtol=0, atol=0
                     )
 
     def test_cpu_legacy_composition(self):
@@ -228,7 +267,7 @@ class CanonicalPEagleTest(unittest.TestCase):
             replace(config, draft_vocab_size=64, tie_word_embeddings=True)
         )
         self.assertIs(full.embed_tokens.weight, full.lm_head.weight)
-        self.assertTrue(full.vocabulary.ready.item())
+        self.assertTrue(full.vocabulary.ready)
 
 
 if __name__ == "__main__":

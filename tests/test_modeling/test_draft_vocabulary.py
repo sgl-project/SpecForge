@@ -1,9 +1,11 @@
 """Vocabulary mappings are explicit tensors with safe installation and HF restore."""
 
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+from safetensors.torch import load_file, save_file
 
 from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 from specforge.modeling.draft.pretrained import DraftPreTrainedModel
@@ -83,11 +85,32 @@ class DraftVocabularyTest(unittest.TestCase):
             install(meta)
         meta.to_empty(device="cpu")
         meta.reset_draft_parameters()
-        self.assertFalse(meta.ready.item())
+        self.assertFalse(meta.ready)
         install(meta)
         meta.to(dtype=torch.bfloat16)
         self.assertEqual(meta.d2t.dtype, torch.int64)
         self.assertEqual(meta.t2d.dtype, torch.bool)
+
+    def test_restore_rejects_missing_or_inconsistent_mapping(self):
+        owner = DFlashDraftModel(model_config())
+        install(owner.vocabulary)
+        self.assertNotIn("ready", owner.vocabulary.state_dict())
+        for missing in (True, False):
+            with self.subTest(missing=missing), TemporaryDirectory() as path:
+                owner.save_pretrained(path)
+                filename = str(Path(path) / "model.safetensors")
+                state = load_file(filename)
+                if missing:
+                    del state["vocabulary.d2t"]
+                else:
+                    state["vocabulary.d2t"].zero_()
+                save_file(state, filename, metadata={"format": "pt"})
+                with self.assertRaises(ValueError):
+                    DFlashDraftModel.from_pretrained(path)
+                with self.assertRaises(ValueError):
+                    owner.load_state_dict(state)
+                self.assertFalse(owner.vocabulary.ready)
+                install(owner.vocabulary)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cpu_mapping_can_be_installed_on_cuda(self):
