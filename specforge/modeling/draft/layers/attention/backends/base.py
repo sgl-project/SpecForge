@@ -23,6 +23,13 @@ class AttentionResult:
 
 
 class AttentionBackend(ABC):
+    def validate(self, *, head_dim: int, value_head_dim: int, dropout_p: float) -> None:
+        """Check static execution limits before parameters are allocated.
+
+        dropout_p is the effective probability: zero for inference.
+        Device and tensor dtype checks remain in attend().
+        """
+
     @abstractmethod
     def prepare(
         self,

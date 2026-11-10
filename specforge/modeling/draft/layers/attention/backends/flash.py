@@ -34,6 +34,12 @@ class FlashMask:
 
 
 class FlashAttentionBackend(AttentionBackend):
+    def validate(self, *, head_dim, value_head_dim, dropout_p):
+        if head_dim > 256 or value_head_dim != head_dim:
+            raise ValueError(
+                "FlashAttention requires equal Q/K/V head dimensions no greater than 256"
+            )
+
     def prepare(self, layout, *, batch_size, num_heads, is_causal, sliding_window):
         padding = layout.visibility
         if not isinstance(padding, PaddingMask):
@@ -97,10 +103,11 @@ class FlashAttentionBackend(AttentionBackend):
             torch.bfloat16,
         ):
             raise ValueError("FlashAttention requires CUDA fp16/bf16 query/key/value")
-        if query.shape[-1] > 256 or value.shape[-1] != query.shape[-1]:
-            raise ValueError(
-                "FlashAttention requires equal Q/K/V head dimensions no greater than 256"
-            )
+        self.validate(
+            head_dim=query.shape[-1],
+            value_head_dim=value.shape[-1],
+            dropout_p=dropout_p if training else 0.0,
+        )
         from flash_attn import flash_attn_varlen_func
 
         def unpad(tensor, indices):

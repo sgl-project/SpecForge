@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor, nn
 
-from specforge.config.draft._validation import positive_int
+from specforge.config.draft._validation import boolean, positive_int
 from specforge.config.draft.attention import GQASpec, MHASpec
 from specforge.config.draft.norm import NormSpec
 from specforge.config.draft.rope import RopeSpec
@@ -30,6 +30,7 @@ class GQAAttention(nn.Module):
         norm: NormSpec,
         rope: RopeSpec,
         backend: str | AttentionBackend,
+        training: bool = True,
         device=None,
         dtype=None,
     ):
@@ -47,6 +48,7 @@ class GQAAttention(nn.Module):
         rotary_dim = rope.rotary_dim(config.head_dim)
         self.backend = resolve_attention_backend(backend)
         self.config = config
+        self.train(training)  # Validate the backend before allocating parameters.
         self.rotary_dim = rotary_dim
         self.rope = rope
         norm = config.qk_norm_config or norm
@@ -89,6 +91,16 @@ class GQAAttention(nn.Module):
         self.k_proj = nn.Linear(input_size, kv_width, **options)
         self.v_proj = nn.Linear(input_size, kv_width, **options)
         self.o_proj = nn.Linear(q_width, hidden_size, **options)
+        self.train(training)
+
+    def train(self, mode: bool = True):
+        boolean("training", mode)
+        self.backend.validate(
+            head_dim=self.config.head_dim,
+            value_head_dim=self.config.head_dim,
+            dropout_p=self.config.attention_dropout if mode else 0.0,
+        )
+        return super().train(mode)
 
     def _normalize(self, hidden: Tensor, norm: nn.Module) -> Tensor:
         if self.config.qk_norm_scope == "projection":
