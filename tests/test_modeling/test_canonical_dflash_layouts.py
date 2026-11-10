@@ -4,6 +4,7 @@ import copy
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from transformers import Qwen3Config
@@ -12,9 +13,10 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.dflash import DFlashDraftModel as LegacyDFlash
-from specforge.modeling.draft.dflash import _rope_config
+from specforge.modeling.draft.dflash import _rope_config, apply_rotary_pos_emb
 from specforge.modeling.draft.dflash2 import DFlash2DraftModel as LegacyDFlash2
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
+from specforge.modeling.draft.layers.attention import gqa
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from tests.test_modeling.test_canonical_dflash import legacy_name
@@ -82,7 +84,7 @@ def training_layout(anchors, keep, block):
 
 
 class CanonicalDFlashLayoutTest(unittest.TestCase):
-    def _parity(self, payload):
+    def _parity(self, payload, dtype=torch.float32):
         layer_count = payload.get("num_target_layers") or 64
         target = {
             "hidden_size": HIDDEN,
@@ -93,16 +95,18 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
         is_dflash2 = config.architecture == "DFlash2DraftModel"
         block = config.spec_config.block.block_size
         torch.manual_seed(0)
-        model = build_draft_model(config)
+        model = build_draft_model(config, dtype=dtype)
         with torch.no_grad():
             for parameter in model.parameters():
                 parameter.normal_(std=0.1)
-        embedding, head = torch.randn(VOCAB, HIDDEN), torch.randn(VOCAB, HIDDEN)
+        embedding, head = (torch.randn(VOCAB, HIDDEN, dtype=dtype) for _ in range(2))
         model.embed_tokens.load_target_weight(embedding)
         model.lm_head.load_target_weight(head)
         legacy_config = Qwen3Config.from_dict(payload)
         legacy_config._attn_implementation = "eager"
-        legacy = (LegacyDFlash2 if is_dflash2 else LegacyDFlash)(legacy_config)
+        legacy = (LegacyDFlash2 if is_dflash2 else LegacyDFlash)(legacy_config).to(
+            dtype=dtype
+        )
         # Same FP32 frequency rule as canonical RoPE.
         legacy.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(legacy_config, legacy.attention_mode)
@@ -120,6 +124,7 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
             2,
             CONTEXT,
             len(config.spec_config.target_features.target_layer_ids) * HIDDEN,
+            dtype=dtype,
         )
         entries = [
             LayerInputs(attention_layout=layout, position_ids=keys)
@@ -131,7 +136,7 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
             block_keep_mask=keep,
             S=CONTEXT,
             block_size=block,
-            device="cpu",
+            device=features.device,
             is_causal=getattr(legacy_config, "is_causal", None),
         )
         masks = {}
@@ -165,6 +170,47 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
 
     def test_mla_attention_matches_legacy_under_training_layouts(self):
         self._parity(mla(small_payload("qwen3.8-27b-dflash2.json")))
+
+    def _mha_bfloat16_matches_legacy(self):
+        # Preserve legacy rotation/layout as an independent reference; only
+        # promote its arithmetic to the canonical/SGLang FP32 precision rule.
+        tables = Qwen3RotaryEmbedding.forward
+
+        def fp32_tables(module, hidden, *args, **kwargs):
+            return tables(module, hidden.float(), *args, **kwargs)
+
+        def rotate(query, key, cos, sin, **kwargs):
+            q, k = apply_rotary_pos_emb(query.float(), key.float(), cos, sin, **kwargs)
+            return q.to(query.dtype), k.to(key.dtype)
+
+        with (
+            # Compare attention layout, not fused versus unfused convolution rounding.
+            patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}),
+            patch.object(Qwen3RotaryEmbedding, "forward", fp32_tables),
+            patch("specforge.modeling.draft.dflash.apply_rotary_pos_emb", rotate),
+        ):
+            for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
+                with self.subTest(recipe=name):
+                    payload = small_payload(name, num_key_value_heads=4)
+                    payload["dflash_config"]["attention_mode"] = "mha"
+                    self._parity(payload, dtype=torch.bfloat16)
+
+    def test_mha_rotary_preserves_legacy_layout(self):
+        key = torch.randn(2, 16, 4, 8, dtype=torch.bfloat16).transpose(1, 2)
+        cos, sin = torch.randn(2, 16, 8), torch.randn(2, 16, 8)
+        _, expected = apply_rotary_pos_emb(key.float(), key.float(), cos, sin)
+        expected = expected.to(key.dtype)
+        actual = gqa.apply_rotary(key, (cos, sin))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(actual.stride(), expected.stride())
+
+    def test_cpu_mha_bfloat16_matches_legacy(self):
+        self._mha_bfloat16_matches_legacy()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_mha_bfloat16_matches_legacy(self):
+        with torch.device("cuda"):
+            self._mha_bfloat16_matches_legacy()
 
     def test_explicit_causality_matches_legacy(self):
         for causal in (True, False):
