@@ -61,6 +61,19 @@ class _TargetWeight(nn.Module):
         self.weight.requires_grad_(False)
         self._bound = True
 
+    def _apply(self, fn, recurse=True):
+        weight = self.weight
+        dtype, storage = weight.dtype, weight.untyped_storage()
+        result = super()._apply(fn, recurse=recurse)
+        if self.weight.dtype != dtype or self.weight.untyped_storage() is not storage:
+            self._bound = False
+        return result
+
+    def bound_weight(self) -> Tensor:
+        """Checked access for scoring paths that do not call forward()."""
+        self._require_bound()
+        return self.weight
+
     def _transform_weight(self, value: Tensor) -> None:
         pass
 
@@ -92,8 +105,7 @@ class _TargetWeight(nn.Module):
 
 class BoundEmbedding(_TargetWeight):
     def forward(self, input_ids: Tensor) -> Tensor:
-        self._require_bound()
-        return F.embedding(input_ids, self.weight)
+        return F.embedding(input_ids, self.bound_weight())
 
 
 class BoundLMHead(_TargetWeight):
@@ -121,5 +133,4 @@ class BoundLMHead(_TargetWeight):
         self.logit_transform.transform_weight_(value)
 
     def forward(self, hidden: Tensor) -> Tensor:
-        self._require_bound()
-        return F.linear(hidden, self.weight)
+        return F.linear(hidden, self.bound_weight())

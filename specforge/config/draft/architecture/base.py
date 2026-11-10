@@ -14,6 +14,10 @@ class ArchitectureSpec(ABC):
     def protocol(self) -> BlockProtocol | None:
         """Return the fixed block protocol, or None for a step-based architecture."""
 
+    def attention_input_width(self, hidden_size: int, layer_index: int) -> int:
+        """Width consumed by attention at this layer, after architecture fusion."""
+        return hidden_size
+
     @abstractmethod
     def validate_target(self, target: Mapping) -> None:
         """Check this architecture's target-derived fields against the text config."""

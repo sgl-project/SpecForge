@@ -1,10 +1,12 @@
 """Structural injection nodes, runtime replacement, and HF initialization."""
 
+import math
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
 from specforge.modeling.draft.dspine import AdjacentInjection as LegacyInjection
@@ -45,7 +47,36 @@ class AdjacentInjectionTest(unittest.TestCase):
         self.assertIs(module.config, node)
         self.assertFalse(hasattr(module, "replacement_layers"))
         for layer in (0, 1):
-            expected = legacy(hidden, layer, ids, codes, replace)
+            # Independent reference: normalize, select predecessors, gate, then scale.
+            features = math.sqrt(module.rank) * F.normalize(
+                module.readouts[layer](hidden).float(), dim=-1
+            )
+            predecessors = torch.cat(
+                (
+                    math.sqrt(module.rank) * F.embedding(ids[..., :1], codes),
+                    features[..., 1:-1, :],
+                ),
+                -2,
+            )
+            if layer == 0:
+                predecessors = math.sqrt(module.rank) * F.embedding(
+                    ids[..., :-1], codes
+                )
+            gate = torch.sigmoid(
+                module.receiver_gate(features[..., 1:, :])
+                + module.predecessor_gate(predecessors)
+                + module.bias
+            )
+            delta = module.writes[layer](gate * module.message(predecessors))
+            scale = hidden[..., 1:, :].float().norm(dim=-1, keepdim=True) / math.sqrt(
+                hidden.shape[-1]
+            )
+            expected = torch.cat(
+                (hidden[..., :1, :], hidden[..., 1:, :] + scale * delta), -2
+            )
+            torch.testing.assert_close(
+                legacy(hidden, layer, ids, codes, replace), expected, rtol=0, atol=0
+            )
             actual = module(hidden, layer, ids, codes, replace if layer == 0 else None)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             torch.testing.assert_close(
@@ -79,6 +110,14 @@ class AdjacentInjectionTest(unittest.TestCase):
 
     def test_generic_hf_initialization_and_roundtrip(self):
         model = DFlashDraftModel(model_config())
+        for linear in (
+            model.injection.message,
+            model.injection.receiver_gate,
+            *model.injection.readouts,
+        ):
+            bound = linear.in_features**-0.5
+            self.assertLessEqual(linear.weight.abs().max().item(), bound)
+            self.assertGreater(linear.weight.std().item(), bound / 3)
         hidden = torch.randn(2, 2, 4, 16)
         ids = torch.randint(0, 32, (2, 2, 4))
         codes = torch.randn(32, 4)

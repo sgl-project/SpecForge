@@ -13,6 +13,7 @@ from torch import nn
 
 from specforge.config.draft.attention import GQASpec, MHASpec, MLASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
+from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransformSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import NormSpec, RMSNormSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
@@ -140,6 +141,8 @@ class ComponentBuilderTest(unittest.TestCase):
             ("norm", RMSNormSpec, {"hidden_size", "device", "dtype"}),
             ("mlp", DenseFFNSpec, {"hidden_size", "device", "dtype"}),
             ("residual", StandardResidualSpec, set()),
+            ("logits", NoLogitTransformSpec, set()),
+            ("logits", MuPLogitTransformSpec, set()),
             *(
                 (
                     "attention",

@@ -54,9 +54,15 @@ class AdjacentInjection(nn.Module):
             self.rank, config.message_size, bias=False, **options
         )
         self.bias = nn.Parameter(torch.empty(config.message_size, **options))
-        self.reset_draft_parameters()
+        self._zero_identity_paths()
 
     def reset_draft_parameters(self):
+        # Legacy builds this head after post_init, retaining nn.Linear defaults.
+        for linear in (self.message, self.receiver_gate, *self.readouts):
+            init.kaiming_uniform_(linear.weight, a=math.sqrt(5))
+        self._zero_identity_paths()
+
+    def _zero_identity_paths(self):
         # HF initialization helpers preserve tensors restored from a checkpoint.
         init.zeros_(self.bias)
         for write in self.writes:
