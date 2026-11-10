@@ -31,6 +31,15 @@ def build_eagle_backbone(
         raise ValueError("EAGLE assembly currently requires standard residuals")
     if backend != "eager":
         raise ValueError("EAGLE assembly currently supports only the eager backend")
+    convolved = [
+        name
+        for name in dict.fromkeys(config.layer_types)
+        if config.layer_configs[name].sublayer_conv is not None
+    ]
+    if convolved:
+        raise ValueError(
+            f"EAGLE assembly does not support sublayer_conv (layers {convolved})"
+        )
     for kind, nodes in (
         ("attention", config.attention_configs.values()),
         ("mlp", config.mlp_configs.values()),
