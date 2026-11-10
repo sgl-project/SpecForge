@@ -16,6 +16,9 @@ from specforge.config.draft.residual import StandardResidualSpec
 def gqa(**overrides):
     return GQASpec(
         **{
+            "qk_norm_position": "before_rope",
+            "qk_norm_scope": "head",
+            "qk_norm_config": None,
             "rope_parameters": None,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
@@ -36,7 +39,7 @@ class DraftNodesTest(unittest.TestCase):
         nodes = (
             gqa(),
             DenseFFNSpec(intermediate_size=256, hidden_act="silu"),
-            RMSNormSpec(eps=1e-6, weight_offset=0),
+            RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
             StandardResidualSpec(),
             GroupedCausalConvSpec(kernel_size=3, group_size=16),
             LayerSpec(attention="full", mlp="dense"),
@@ -106,12 +109,12 @@ class DraftNodesTest(unittest.TestCase):
                 gqa(attention_dropout=value)
         for value in (True, 0, -1, "1e-6", float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "eps"):
-                RMSNormSpec(eps=value, weight_offset=0)
+                RMSNormSpec(has_weight=True, eps=value, weight_offset=0)
         for value in (True, -1, 2, 0.0, "0", None):
             with self.assertRaisesRegex(ValueError, "weight_offset"):
-                RMSNormSpec(eps=1e-6, weight_offset=value)
-        ordinary = RMSNormSpec(eps=1e-6, weight_offset=0)
-        shifted = RMSNormSpec(eps=1e-6, weight_offset=1)
+                RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=value)
+        ordinary = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0)
+        shifted = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1)
         self.assertNotEqual(ordinary, shifted)
 
     def test_ffn_convolution_and_references(self):

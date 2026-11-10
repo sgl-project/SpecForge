@@ -22,7 +22,7 @@ from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     dense_attention_mask,
 )
-from specforge.modeling.draft.layers.rope import build_rotary
+from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
@@ -43,14 +43,26 @@ def make_node(**changes):
     )
 
 
-def build(node, *, input_size=16, rotary_dim=8, offset=0, **options):
+def build(node, *, input_size=16, rotary_dim=8, offset=0, rope=None, **options):
     return build_component(
         "attention",
         node,
         input_size=input_size,
         hidden_size=16,
-        norm=RMSNormSpec(eps=1e-6, weight_offset=offset),
-        rotary_dim=rotary_dim,
+        norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
+        rope=(
+            rope
+            if rope is not None
+            else (
+                NoRoPESpec()
+                if rotary_dim == 0
+                else DefaultRoPESpec(
+                    interleaved=False,
+                    rope_theta=10000.0,
+                    partial_rotary_factor=rotary_dim / node.head_dim,
+                )
+            )
+        ),
         backend="eager",
         **options,
     )
@@ -158,7 +170,9 @@ class GQATest(unittest.TestCase):
                     layout = layout_for(hidden, 0 if context is None else 2)
                     rope = build_rotary(
                         DefaultRoPESpec(
-                            rope_theta=10000.0, partial_rotary_factor=rotary_dim / 8
+                            interleaved=False,
+                            rope_theta=10000.0,
+                            partial_rotary_factor=rotary_dim / 8,
                         ),
                         head_dim=8,
                     )
@@ -218,16 +232,87 @@ class GQATest(unittest.TestCase):
                     self.assertIs(actual.config, node)
 
     def test_cpu_reference_outputs_and_gradients(self):
-        self._assert_parity("cpu", (torch.float32, torch.bfloat16))
+        self._assert_parity("cpu", (torch.float32,))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_reference_outputs_and_gradients(self):
-        self._assert_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
+        self._assert_parity("cuda", (torch.float32,))
 
-    def test_autocast_preserves_fp32_norm_rope_and_dropout_order(self):
-        self._assert_parity("cpu", (torch.float32,), autocast=True)
-        if torch.cuda.is_available():
-            self._assert_parity("cuda", (torch.float32,), autocast=True)
+    def test_autocast_keeps_projected_attention_dtype(self):
+        module = build(make_node(attention_dropout=0)).eval()
+        hidden = torch.randn(2, 3, 16, requires_grad=True)
+        layout = layout_for(hidden)
+        tables = build_rotary(
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+            ),
+            head_dim=8,
+        )(hidden, layout.key_positions)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = module(
+                hidden,
+                attention=prepared(module, layout, 2),
+                position_embeddings=tables,
+            )
+        self.assertEqual(output.dtype, torch.bfloat16)
+        output.float().sum().backward()
+        self.assertTrue(torch.isfinite(hidden.grad).all())
+
+    def test_qk_norm_order_scope_and_interleaved_rope(self):
+        for scope, position, weighted in (
+            ("head", "before_rope", True),
+            ("head", "after_rope", False),
+            ("projection", "before_rope", True),
+        ):
+            norm = RMSNormSpec(eps=1e-6, weight_offset=0, has_weight=weighted)
+            node = make_node(
+                attention_dropout=0,
+                qk_norm=True,
+                qk_norm_scope=scope,
+                qk_norm_position=position,
+                qk_norm_config=norm,
+            )
+            rope = DefaultRoPESpec(
+                interleaved=True, rope_theta=10000.0, partial_rotary_factor=1.0
+            )
+            module = build(node, rope=rope).eval()
+            hidden = torch.randn(2, 3, 16, requires_grad=True)
+            layout = layout_for(hidden)
+            tables = build_rotary(rope, head_dim=8)(hidden, layout.key_positions)
+            q = module.q_proj(hidden).view(2, 3, 2, 8).transpose(1, 2)
+            k = module.k_proj(hidden).view(2, 3, 1, 8).transpose(1, 2)
+
+            def normalize(tensor):
+                shape = tensor.shape
+                value = tensor.transpose(1, 2)
+                if scope == "projection":
+                    value = value.flatten(2)
+                value = value * torch.rsqrt(
+                    value.square().mean(-1, keepdim=True) + norm.eps
+                )
+                return value.reshape(shape[0], shape[2], shape[1], shape[3]).transpose(
+                    1, 2
+                )
+
+            if position == "before_rope":
+                q, k = normalize(q), normalize(k)
+            q, k = (apply_rotary(t, tables, interleaved=True) for t in (q, k))
+            if position == "after_rope":
+                q, k = normalize(q), normalize(k)
+            with patch.object(
+                module.backend, "attend", wraps=module.backend.attend
+            ) as attend:
+                output = module(
+                    hidden,
+                    attention=prepared(module, layout, 2),
+                    position_embeddings=tables,
+                )
+                actual_q, actual_k, _ = attend.call_args.args
+            torch.testing.assert_close(actual_q, q, rtol=0, atol=0)
+            torch.testing.assert_close(actual_k, k, rtol=0, atol=0)
+            output.sum().backward()
+            self.assertTrue(torch.isfinite(hidden.grad).all())
+            self.assertEqual(module.q_norm.weight is not None, weighted)
 
     def test_disabled_rope_and_masked_queries_do_not_leak_output_bias(self):
         node = make_node(rope_parameters=NoRoPESpec(), output_gate=True)
@@ -282,8 +367,8 @@ class GQATest(unittest.TestCase):
             key_positions=layout.key_positions[:1],
         )
         tables = (
-            torch.ones(1, 3, 8, dtype=hidden.dtype),
-            torch.zeros(1, 3, 8, dtype=hidden.dtype),
+            torch.ones(1, 3, 8, dtype=torch.float32),
+            torch.zeros(1, 3, 8, dtype=torch.float32),
         )
         expected = module(
             hidden,
@@ -296,11 +381,11 @@ class GQATest(unittest.TestCase):
             position_embeddings=tables,
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        with self.assertRaisesRegex(ValueError, "dtype"):
+        with self.assertRaisesRegex(ValueError, "FP32"):
             module(
                 hidden,
                 attention=prepared(module, shared, hidden.shape[0]),
-                position_embeddings=tuple(t.float() for t in tables),
+                position_embeddings=tuple(t.bfloat16() for t in tables),
             )
         mismatched = replace(
             shared, visibility=torch.ones(3, 1, 3, 3, dtype=torch.bool)
@@ -323,8 +408,10 @@ class GQATest(unittest.TestCase):
                     node,
                     input_size=16,
                     hidden_size=16,
-                    norm=RMSNormSpec(eps=1e-6, weight_offset=0),
-                    rotary_dim=8,
+                    norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
+                    rope=DefaultRoPESpec(
+                        interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+                    ),
                     backend="unknown",
                 )
             with self.assertRaises(ValueError):

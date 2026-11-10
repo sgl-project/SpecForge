@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .._validation import positive_int, positive_number
+from .._validation import boolean, positive_int, positive_number
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -19,8 +19,10 @@ class RopeSpec(ABC):
 class RotarySpec(RopeSpec):
     rope_theta: float
     partial_rotary_factor: float
+    interleaved: bool
 
     def __post_init__(self):
+        boolean("interleaved", self.interleaved)
         positive_number("rope_theta", self.rope_theta)
         positive_number("partial_rotary_factor", self.partial_rotary_factor)
         if self.partial_rotary_factor > 1:

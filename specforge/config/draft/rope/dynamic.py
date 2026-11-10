@@ -26,12 +26,11 @@ class DynamicNTKRoPESpec(RotarySpec):
             raise ValueError("dynamic NTK requires a rotary dimension greater than two")
         return dim
 
-    def scaled_theta(self, head_dim: int, seq_len: int) -> float:
+    def scaled_theta(self, head_dim: int) -> float:
+        """SGLang fixes the effective length at factor * original_max_positions."""
         dim = self.rotary_dim(head_dim)
-        positive_int("seq_len", seq_len)
-        if seq_len <= self.original_max_position_embeddings:
-            return self.rope_theta
-        stretch = self.factor * seq_len / self.original_max_position_embeddings - (
+        length = self.factor * self.original_max_position_embeddings
+        stretch = self.factor * length / self.original_max_position_embeddings - (
             self.factor - 1
         )
         return self.rope_theta * stretch ** (dim / (dim - 2))

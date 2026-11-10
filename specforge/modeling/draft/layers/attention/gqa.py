@@ -6,6 +6,7 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.attention import GQASpec, MHASpec
 from specforge.config.draft.norm import NormSpec
+from specforge.config.draft.rope import RopeSpec
 
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
@@ -16,6 +17,7 @@ from .backends import (
     resolve_attention_backend,
 )
 from .masks import AttentionLayout
+from .validation import validate_hidden, validate_rotary
 
 
 class GQAAttention(nn.Module):
@@ -26,7 +28,7 @@ class GQAAttention(nn.Module):
         input_size: int,
         hidden_size: int,
         norm: NormSpec,
-        rotary_dim: int,
+        rope: RopeSpec,
         backend: str | AttentionBackend,
         device=None,
         dtype=None,
@@ -38,33 +40,42 @@ class GQAAttention(nn.Module):
         positive_int("hidden_size", hidden_size)
         if not isinstance(norm, NormSpec):
             raise TypeError("norm must be a normalization node")
-        if (
-            type(rotary_dim) is not int
-            or rotary_dim < 0
-            or rotary_dim % 2
-            or rotary_dim > config.head_dim
-        ):
-            raise ValueError(
-                "rotary_dim must be zero or an even dimension within the head"
-            )
-        if (
-            config.rope_parameters is not None
-            and rotary_dim != config.rope_parameters.rotary_dim(config.head_dim)
-        ):
-            raise ValueError("rotary_dim must match the attention RoPE override")
+        if not isinstance(rope, RopeSpec):
+            raise TypeError("rope must be the resolved RopeSpec")
+        if config.rope_parameters is not None and rope != config.rope_parameters:
+            raise ValueError("rope must match the attention RoPE override")
+        rotary_dim = rope.rotary_dim(config.head_dim)
         self.backend = resolve_attention_backend(backend)
         self.config = config
         self.rotary_dim = rotary_dim
+        self.rope = rope
+        norm = config.qk_norm_config or norm
         self.q_norm = (
             build_component(
-                "norm", norm, hidden_size=config.head_dim, device=device, dtype=dtype
+                "norm",
+                norm,
+                hidden_size=(
+                    config.head_dim
+                    if config.qk_norm_scope == "head"
+                    else config.num_attention_heads * config.head_dim
+                ),
+                device=device,
+                dtype=dtype,
             )
             if config.qk_norm
             else nn.Identity()
         )
         self.k_norm = (
             build_component(
-                "norm", norm, hidden_size=config.head_dim, device=device, dtype=dtype
+                "norm",
+                norm,
+                hidden_size=(
+                    config.head_dim
+                    if config.qk_norm_scope == "head"
+                    else config.num_key_value_heads * config.head_dim
+                ),
+                device=device,
+                dtype=dtype,
             )
             if config.qk_norm
             else nn.Identity()
@@ -78,6 +89,16 @@ class GQAAttention(nn.Module):
         self.k_proj = nn.Linear(input_size, kv_width, **options)
         self.v_proj = nn.Linear(input_size, kv_width, **options)
         self.o_proj = nn.Linear(q_width, hidden_size, **options)
+
+    def _normalize(self, hidden: Tensor, norm: nn.Module) -> Tensor:
+        if self.config.qk_norm_scope == "projection":
+            shape = hidden.shape
+            return (
+                norm(hidden.transpose(1, 2).flatten(2))
+                .view(shape[0], shape[2], shape[1], shape[3])
+                .transpose(1, 2)
+            )
+        return norm(hidden.transpose(1, 2)).transpose(1, 2)
 
     def prepare(
         self,
@@ -110,22 +131,11 @@ class GQAAttention(nn.Module):
         layout's query positions describe hidden; key positions describe context
         followed by hidden. No cache, algorithm settings, or family config enters
         this component. rotary_dim=0 requires position_embeddings=None. Supplied
-        cosine/sine tables must have the hidden input's dtype, including under autocast.
+        cosine/sine tables must be FP32; rotation casts back to the projected Q/K dtype.
         """
-        if hidden.ndim != 3 or hidden.shape[-1] != self.q_proj.in_features:
-            raise ValueError("hidden must have shape [batch, query_length, input_size]")
-        batch, length = hidden.shape[:2]
-        if target_context is not None and (
-            target_context.ndim != 3
-            or target_context.shape[0] != batch
-            or target_context.shape[-1] != hidden.shape[-1]
-            or target_context.device != hidden.device
-            or target_context.dtype != hidden.dtype
-        ):
-            raise ValueError(
-                "target_context must match hidden batch, input width, dtype, and device"
-            )
-        context_length = 0 if target_context is None else target_context.shape[1]
+        batch, length, context_length = validate_hidden(
+            hidden, target_context, self.q_proj.in_features
+        )
         keys = context_length + length
         if not isinstance(attention, PreparedAttention):
             raise TypeError("GQAAttention requires PreparedAttention")
@@ -143,23 +153,7 @@ class GQAAttention(nn.Module):
             raise ValueError(
                 "prepared attention must match the layer and query/KV tensors"
             )
-        if self.rotary_dim:
-            if position_embeddings is None or len(position_embeddings) != 2:
-                raise ValueError("rotary attention requires a joint cosine/sine pair")
-            for value in position_embeddings:
-                if (
-                    value.ndim != 3
-                    or value.shape[0] not in (1, batch)
-                    or value.shape[1:] != (keys, self.rotary_dim)
-                    or value.device != hidden.device
-                    or value.dtype != hidden.dtype
-                    or not value.is_floating_point()
-                ):
-                    raise ValueError(
-                        "RoPE tensors must describe all context-then-query positions and match hidden dtype"
-                    )
-        elif position_embeddings is not None:
-            raise ValueError("disabled RoPE requires position_embeddings=None")
+        validate_rotary(position_embeddings, hidden, keys, self.rotary_dim)
         node = self.config
         query = self.q_proj(hidden).view(
             batch,
@@ -171,25 +165,35 @@ class GQAAttention(nn.Module):
         if node.output_gate:
             query, gate = query.chunk(2, dim=-1)
             gate = gate.reshape(batch, length, node.num_attention_heads * node.head_dim)
-        query = self.q_norm(query).transpose(1, 2)
+        query = query.transpose(1, 2)
         key, value = self.k_proj(hidden), self.v_proj(hidden)
         if target_context is not None:
             # Keep separate projections to preserve the existing context path's
             # GEMM shapes and accumulation order, including its input gradients.
             key = torch.cat((self.k_proj(target_context), key), dim=1)
             value = torch.cat((self.v_proj(target_context), value), dim=1)
-        key = self.k_norm(
-            key.view(batch, keys, node.num_key_value_heads, node.head_dim)
-        ).transpose(1, 2)
+        key = key.view(batch, keys, node.num_key_value_heads, node.head_dim).transpose(
+            1, 2
+        )
         value = value.view(
             batch, keys, node.num_key_value_heads, node.head_dim
         ).transpose(1, 2)
+        if node.qk_norm_position == "before_rope":
+            query, key = self._normalize(query, self.q_norm), self._normalize(
+                key, self.k_norm
+            )
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query = apply_rotary(
-                query, (cos[:, context_length:], sin[:, context_length:])
+                query,
+                (cos[:, context_length:], sin[:, context_length:]),
+                interleaved=self.rope.interleaved,
             )
-            key = apply_rotary(key, (cos, sin))
+            key = apply_rotary(key, (cos, sin), interleaved=self.rope.interleaved)
+        if node.qk_norm_position == "after_rope":
+            query, key = self._normalize(query, self.q_norm), self._normalize(
+                key, self.k_norm
+            )
         result = attention.attend(
             query,
             key,

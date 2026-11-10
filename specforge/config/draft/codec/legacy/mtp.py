@@ -85,7 +85,9 @@ def _rope(payload, target):
         )
         sources.append(value)
     theta = resolve_alias("rope_theta", *sources, payload, default=10000.0)
-    rope = DefaultRoPESpec(rope_theta=theta, partial_rotary_factor=fraction)
+    rope = DefaultRoPESpec(
+        interleaved=False, rope_theta=theta, partial_rotary_factor=fraction
+    )
     target_rope = target.get("rope_parameters") or {}
     if (
         target_rope.get("mrope_section") is not None
@@ -98,6 +100,7 @@ def _rope(payload, target):
     ):
         # Equal text positions make multi-axis RoPE identical to the MTP rotation.
         return MultiAxisRoPESpec(
+            interleaved=False,
             rope_theta=theta,
             partial_rotary_factor=fraction,
             mrope_section=tuple(target_rope["mrope_section"]),
@@ -142,6 +145,9 @@ def decode_mtp(payload, *, target_config):
         tie_word_embeddings=False,
         attention_configs={
             "default": GQASpec(
+                qk_norm_position="before_rope",
+                qk_norm_scope="head",
+                qk_norm_config=None,
                 rope_parameters=None,
                 num_attention_heads=heads,
                 num_key_value_heads=(
@@ -168,7 +174,9 @@ def decode_mtp(payload, *, target_config):
         layer_configs={"default": LayerSpec(attention="default", mlp="default")},
         # Qwen3_5MTPModel constructs one layer, independent of the HF depth field.
         layer_types=("default",),
-        norm_config=RMSNormSpec(eps=values["rms_norm_eps"], weight_offset=1),
+        norm_config=RMSNormSpec(
+            has_weight=True, eps=values["rms_norm_eps"], weight_offset=1
+        ),
         residual_config=StandardResidualSpec(),
         rope_parameters=_rope(payload, target),
         spec_config=MTPSpec(

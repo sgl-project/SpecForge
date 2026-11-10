@@ -24,6 +24,7 @@ def yarn_node(**overrides):
     return YaRNSpec(
         **(
             dict(
+                interleaved=False,
                 rope_theta=10000.0,
                 partial_rotary_factor=1.0,
                 factor=16.0,
@@ -72,7 +73,7 @@ class YaRNRotaryTest(unittest.TestCase):
                     hidden = torch.empty(2, 4, 128, device=device, dtype=dtype)
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
                         actual = module(hidden, positions)
-                    expected = tuple(value.to(dtype) for value in expected_fp32)
+                    expected = expected_fp32
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     query = torch.randn(
                         2, 2, 4, 128, device=device, dtype=dtype, requires_grad=True
@@ -80,8 +81,9 @@ class YaRNRotaryTest(unittest.TestCase):
                     query_copy = query.detach().clone().requires_grad_()
                     output = apply_rotary(query, actual)
                     reference, _ = apply_rotary_pos_emb(
-                        query_copy, query_copy, *expected
+                        query_copy.float(), query_copy.float(), *expected
                     )
+                    reference = reference.to(dtype)
                     torch.testing.assert_close(output, reference, rtol=0, atol=0)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
@@ -157,7 +159,7 @@ class YaRNRotaryTest(unittest.TestCase):
         positions = torch.tensor([[0, 8192, 65535]])
         expected = build_rotary(node, head_dim=128)(hidden.float(), positions)
         for left, right in zip(module(hidden, positions), expected):
-            torch.testing.assert_close(left, right.bfloat16(), rtol=0, atol=0)
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
         self.assertEqual(module.state_dict(), {})
         self.assertEqual(list(module.parameters()), [])
         with self.assertRaises(TypeError):

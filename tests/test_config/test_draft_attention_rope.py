@@ -21,7 +21,9 @@ class AttentionRoPETest(unittest.TestCase):
     def test_inherit_override_and_disable_are_distinct(self):
         base = draft_config()
         attention = base.attention_configs["full"]
-        scaled = LinearRoPESpec(rope_theta=1000, partial_rotary_factor=0.5, factor=4)
+        scaled = LinearRoPESpec(
+            interleaved=False, rope_theta=1000, partial_rotary_factor=0.5, factor=4
+        )
         node = dataclasses.replace(
             base,
             attention_configs={
@@ -61,7 +63,9 @@ class AttentionRoPETest(unittest.TestCase):
     def test_geometry_uses_effective_rope_per_attention(self):
         base = draft_config()
         attention = base.attention_configs["full"]
-        odd_dimension = DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=0.375)
+        odd_dimension = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000, partial_rotary_factor=0.375
+        )
         with self.assertRaisesRegex(
             ValueError, "attention_configs.full.*rotary dimension"
         ):
@@ -91,6 +95,7 @@ class AttentionRoPETest(unittest.TestCase):
             **MLA,
             "rope_parameters": {
                 "rope_type": "default",
+                "interleaved": False,
                 "rope_theta": 10000,
                 "partial_rotary_factor": 0.5,
             },
@@ -145,7 +150,9 @@ class AttentionRoPETest(unittest.TestCase):
             rope_type = "test_unregistered"
 
         base = draft_config()
-        rope = UnregisteredRoPE(rope_theta=10000, partial_rotary_factor=1.0)
+        rope = UnregisteredRoPE(
+            interleaved=False, rope_theta=10000, partial_rotary_factor=1.0
+        )
         with self.assertRaisesRegex(ValueError, "^rope_parameters: unknown rope type"):
             dataclasses.replace(base, rope_parameters=rope)
         attention = dataclasses.replace(
@@ -172,7 +179,9 @@ class AttentionRoPETest(unittest.TestCase):
 
         with patch.dict(registry._SCHEMAS):
             registry.register_component_schema("attention", NonRotaryAttention)
-            rope = LinearRoPESpec(rope_theta=1e4, partial_rotary_factor=1.0, factor=2.0)
+            rope = LinearRoPESpec(
+                interleaved=False, rope_theta=1e4, partial_rotary_factor=1.0, factor=2.0
+            )
             draft_config(
                 attention_configs={
                     "full": NonRotaryAttention(rope_parameters=None, num_heads=4)

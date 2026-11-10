@@ -54,7 +54,7 @@ def resolve_rope(payload: Mapping):
         )
         if values["rope_type"] == "yarn":
             values = expand_yarn(values, payload.get("max_position_embeddings", 32768))
-        return decode_component("rope", values)
+        return decode_component("rope", {**values, "interleaved": False})
 
     result = normalize(modern if modern is not None else (scaling or {}))
     if modern is not None and scaling is not None and result != normalize(scaling):

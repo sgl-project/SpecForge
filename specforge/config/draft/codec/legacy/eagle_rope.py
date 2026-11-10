@@ -107,7 +107,7 @@ def resolve_eagle_rope(payload: Mapping):
                 # it never multiplies full QK logits as it does in MLA.
                 mscale_all_dim=0.0,
             )
-        return decode_component("rope", result)
+        return decode_component("rope", {**result, "interleaved": False})
 
     result = normalize(modern if modern is not None else (scaling or {}))
     if modern is not None and scaling is not None and result != normalize(scaling):

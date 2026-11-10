@@ -7,10 +7,7 @@ from unittest.mock import patch
 
 import torch
 from transformers import LlamaConfig
-from transformers.modeling_rope_utils import (
-    _compute_linear_scaling_rope_parameters,
-    _compute_llama3_parameters,
-)
+from transformers.modeling_rope_utils import _compute_llama3_parameters
 
 from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.registry import (
@@ -43,8 +40,11 @@ from specforge.modeling.draft.llama3_eagle import (
 
 def scaled_nodes():
     return (
-        LinearRoPESpec(rope_theta=10000.0, partial_rotary_factor=1.0, factor=3.0),
+        LinearRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0, factor=3.0
+        ),
         Llama3RoPESpec(
+            interleaved=False,
             rope_theta=500000.0,
             partial_rotary_factor=1.0,
             factor=8.0,
@@ -71,6 +71,7 @@ class ScaledRotaryTest(unittest.TestCase):
             "rope",
             {
                 "rope_type": "test_registered_rotary",
+                "interleaved": False,
                 "rope_theta": 10000.0,
                 "partial_rotary_factor": 0.5,
             },
@@ -82,24 +83,24 @@ class ScaledRotaryTest(unittest.TestCase):
         self.assertIs(module.config, node)
         hidden, positions = torch.empty(1, 3, 8), torch.tensor([[0, 2, 7]])
         reference = DefaultRotaryEmbedding(
-            DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5),
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000.0, partial_rotary_factor=0.5
+            ),
             head_dim=8,
         )
         torch.testing.assert_close(
-            module(hidden, positions), reference(hidden, positions), rtol=0, atol=0
+            module(hidden, positions),
+            reference(hidden.float(), positions),
+            rtol=0,
+            atol=0,
         )
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_component_builder("rope", CustomRoPE, DefaultRotaryEmbedding)
 
     def _assert_hf_parity(self, device, dtypes):
         positions = torch.tensor([[0, 37, 8192, 65535], [9, 3, 11, 17]], device=device)
-        for original, reference in zip(
-            scaled_nodes(),
-            (
-                _compute_linear_scaling_rope_parameters,
-                _compute_llama3_parameters,
-            ),
-        ):
+        # Linear scaling follows SGLang/EAGLE position division, tested separately.
+        for original, reference in ((scaled_nodes()[1], _compute_llama3_parameters),):
             for partial in (1.0, 0.5):
                 node = replace(original, partial_rotary_factor=partial)
                 module = build_rotary(node, head_dim=128)
@@ -122,9 +123,7 @@ class ScaledRotaryTest(unittest.TestCase):
                         with torch.autocast(device_type=device, dtype=torch.bfloat16):
                             actual = module(hidden, positions)
                         for left, right in zip(actual, expected):
-                            torch.testing.assert_close(
-                                left, right.to(dtype), rtol=0, atol=0
-                            )
+                            torch.testing.assert_close(left, right, rtol=0, atol=0)
                 # A later short request must not inherit any long-request state.
                 short = module(hidden, positions[:, :1])
                 for left, right in zip(short, actual):
@@ -163,33 +162,27 @@ class ScaledRotaryTest(unittest.TestCase):
             for left, right in zip(actual, expected):
                 torch.testing.assert_close(left, right[0, 0][positions], rtol=0, atol=0)
 
-    def test_linear_eagle_position_scaling_roundoff_is_bounded(self):
-        # HF divides frequencies; legacy EAGLE divides positions. A non-power-of-
-        # two factor has FP32 roundoff, so this reference check is not bitwise.
-        for factor in (3.0, 4.0):
+    def test_linear_matches_eagle_position_scaling_at_long_positions(self):
+        for factor in (2.5, 3.0, 4.0):
             node = replace(scaled_nodes()[0], factor=factor)
-            module = build_rotary(node, head_dim=128)
             reference = LlamaLinearScalingRotaryEmbedding(
                 dim=128,
-                max_position_embeddings=64,
+                max_position_embeddings=65536,
                 base=node.rope_theta,
                 scaling_factor=factor,
             )
-            positions = torch.arange(65).unsqueeze(0)
-            actual = module(torch.empty(1, 65, 128), positions)
+            positions = torch.tensor([[0, 32768, 65535]])
+            actual = build_rotary(node, head_dim=128)(torch.empty(1, 3, 128), positions)
             for left, right in zip(
                 actual, (reference.cos_cached, reference.sin_cached)
             ):
-                torch.testing.assert_close(
-                    left,
-                    right[0, 0][positions],
-                    rtol=0,
-                    atol=0 if factor == 4.0 else 1e-5,
-                )
+                torch.testing.assert_close(left, right[0, 0][positions], rtol=0, atol=0)
 
     def test_builders_hold_nodes_and_disabled_rope_has_no_module(self):
         nodes = (
-            DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=1.0),
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+            ),
             *scaled_nodes(),
         )
         classes = (DefaultRotaryEmbedding, LinearRotaryEmbedding, Llama3RotaryEmbedding)

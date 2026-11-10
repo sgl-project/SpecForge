@@ -189,7 +189,7 @@ class LegacyDFlashTest(unittest.TestCase):
         attention = node.attention_configs["full_attention"]
         self.assertEqual(attention.type, "mla")
         self.assertEqual(attention.qk_head_dim, 24)
-        self.assertTrue(attention.rope_interleave)
+        self.assertTrue(node.rope_parameters.interleaved)
         self.assertFalse(hasattr(attention, "num_key_value_heads"))
         self.assertEqual(decode_config(encode_config(node)), node)
 

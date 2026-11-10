@@ -26,7 +26,9 @@ class RMSNormTest(unittest.TestCase):
                         input=input_dtype,
                         weight=weight_dtype,
                     ):
-                        node = RMSNormSpec(eps=1e-5, weight_offset=offset)
+                        node = RMSNormSpec(
+                            has_weight=True, eps=1e-5, weight_offset=offset
+                        )
                         before = hash(node)
                         actual = RMSNorm(
                             node, hidden_size=16, device=device, dtype=weight_dtype
@@ -76,7 +78,7 @@ class RMSNormTest(unittest.TestCase):
 
     def test_initialization_and_meta_materialization_use_the_node(self):
         for offset in (0, 1):
-            node = RMSNormSpec(eps=1e-6, weight_offset=offset)
+            node = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset)
             module = RMSNorm(node, hidden_size=8)
             torch.testing.assert_close(module.weight, torch.full((8,), 1.0 - offset))
             with torch.device("meta"):
@@ -91,7 +93,7 @@ class RMSNormTest(unittest.TestCase):
             torch.testing.assert_close(module.weight, torch.full((8,), 7.0))
 
     def test_invalid_inputs_fail_before_parameter_allocation(self):
-        node = RMSNormSpec(eps=1e-6, weight_offset=0)
+        node = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0)
         with patch("specforge.modeling.draft.layers.norm.rms.torch.empty") as allocate:
             for width in (0, -1, True, 1.5):
                 with self.assertRaises(ValueError):

@@ -84,7 +84,6 @@ class PEagleSpecTest(unittest.TestCase):
             is_causal=True,
             sliding_window=None,
             attention_dropout=0.0,
-            rope_interleave=True,
         )
         with self.assertRaisesRegex(ValueError, "variable_input_width"):
             peagle_config(attention_configs={"full": mla})

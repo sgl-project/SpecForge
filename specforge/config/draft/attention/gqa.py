@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from .._validation import boolean, finite_number, positive_int
+from ..norm import NormSpec
 from .base import AttentionSpec
 
 
@@ -26,9 +27,26 @@ class GQASpec(AttentionSpec):
     is_causal: bool
     sliding_window: int | None
     attention_dropout: float
+    qk_norm_position: str
+    qk_norm_scope: str
+    qk_norm_config: NormSpec | None
 
     def __post_init__(self):
         super().__post_init__()
+        if self.qk_norm_position not in ("before_rope", "after_rope"):
+            raise ValueError("qk_norm_position must be before_rope or after_rope")
+        if self.qk_norm_scope not in ("head", "projection"):
+            raise ValueError("qk_norm_scope must be head or projection")
+        if self.qk_norm_config is not None and not isinstance(
+            self.qk_norm_config, NormSpec
+        ):
+            raise ValueError("qk_norm_config must be a norm node or None")
+        if not self.qk_norm and (
+            self.qk_norm_config is not None
+            or self.qk_norm_position != "before_rope"
+            or self.qk_norm_scope != "head"
+        ):
+            raise ValueError("qk_norm settings require qk_norm=True")
         for name in ("num_attention_heads", "num_key_value_heads", "head_dim"):
             positive_int(name, getattr(self, name))
         if self.num_attention_heads % self.num_key_value_heads:

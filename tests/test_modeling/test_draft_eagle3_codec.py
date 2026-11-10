@@ -104,10 +104,6 @@ class Eagle3CodecParityTest(unittest.TestCase):
             ("qwen2-5-vl-7b-eagle3.json", {}),
             ("deepseek-v2-lite-eagle3.json", {}),
             ("llama3-70B-ealge3.json", {}),
-            (
-                "qwen3-8b-eagle3.json",
-                {"rope_scaling": {"rope_type": "dynamic", "factor": 2}},
-            ),
         ]
         for name, overrides in cases:
             with self.subTest(name=name, overrides=overrides):

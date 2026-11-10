@@ -1,4 +1,4 @@
-"""Linear scaling of rotary frequencies."""
+"""SGLang linear scaling: divide positions before computing phases."""
 
 import torch
 from torch import Tensor
@@ -15,8 +15,8 @@ class LinearRotaryEmbedding(RotaryEmbedding):
             raise TypeError("LinearRotaryEmbedding requires LinearRoPESpec")
         super().__init__(config, head_dim=head_dim)
 
-    def _frequencies(self, device: torch.device) -> Tensor:
-        return super()._frequencies(device) / self.config.factor
+    def _positions(self, position_ids: Tensor, device: torch.device) -> Tensor:
+        return super()._positions(position_ids, device) / self.config.factor
 
 
 register_component_builder("rope", LinearRoPESpec, LinearRotaryEmbedding)

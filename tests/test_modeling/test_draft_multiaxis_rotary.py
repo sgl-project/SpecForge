@@ -23,6 +23,7 @@ from tests.test_modeling.test_draft_rotary import RotaryLayer
 
 def multiaxis_node(partial=1.0, sections=(16, 24, 24)):
     return MultiAxisRoPESpec(
+        interleaved=False,
         mrope_interleaved=False,
         rope_theta=10000.0,
         partial_rotary_factor=partial,
@@ -52,7 +53,7 @@ class MultiAxisRotaryTest(unittest.TestCase):
                 with self.subTest(node=node, device=device, dtype=dtype):
                     module.to(device=device, dtype=dtype)
                     hidden = torch.empty(2, 4, 128, device=device, dtype=dtype)
-                    expected = reference(hidden, positions)
+                    expected = reference(hidden.float(), positions)
                     with torch.autocast(device_type=device, dtype=torch.bfloat16):
                         actual = module(hidden, positions)
                     for left, right in zip(actual, expected):
@@ -75,14 +76,14 @@ class MultiAxisRotaryTest(unittest.TestCase):
                     q_copy = q.detach().clone().requires_grad_()
                     k_copy = k.detach().clone().requires_grad_()
                     ref_q, ref_k = apply_multimodal_rotary_pos_emb(
-                        q_copy[..., :dim],
-                        k_copy[..., :dim],
+                        q_copy[..., :dim].float(),
+                        k_copy[..., :dim].float(),
                         *expected,
                         list(node.mrope_section),
                     )
                     reference_outputs = (
-                        torch.cat((ref_q, q_copy[..., dim:]), dim=-1),
-                        torch.cat((ref_k, k_copy[..., dim:]), dim=-1),
+                        torch.cat((ref_q, q_copy[..., dim:]), dim=-1).to(dtype),
+                        torch.cat((ref_k, k_copy[..., dim:]), dim=-1).to(dtype),
                     )
                     outputs = (apply_rotary(q, actual), apply_rotary(k, actual))
                     for left, right in zip(outputs, reference_outputs):
@@ -109,6 +110,7 @@ class MultiAxisRotaryTest(unittest.TestCase):
             module = build_rotary(node, head_dim=128)
             default = build_rotary(
                 DefaultRoPESpec(
+                    interleaved=False,
                     rope_theta=node.rope_theta,
                     partial_rotary_factor=node.partial_rotary_factor,
                 ),
@@ -124,7 +126,9 @@ class MultiAxisRotaryTest(unittest.TestCase):
 
     def test_mixed_backbone_layers_need_no_axis_specific_attention_interface(self):
         node = multiaxis_node(0.5, (1, 0, 1))
-        default = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=1.0)
+        default = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+        )
         rotary = [build_rotary(node, head_dim=8), build_rotary(default, head_dim=8)]
         backbone = DraftBackbone(
             [RotaryLayer(), RotaryLayer()],
@@ -160,7 +164,7 @@ class MultiAxisRotaryTest(unittest.TestCase):
         hidden = torch.empty(1, 2, 128, dtype=torch.bfloat16)
         expected = build_rotary(node, head_dim=128)(hidden.float(), positions)
         for left, right in zip(module(hidden, positions), expected):
-            torch.testing.assert_close(left, right.bfloat16(), rtol=0, atol=0)
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
         self.assertEqual(module.state_dict(), {})
 
     def test_invalid_sections_and_position_layouts_fail(self):

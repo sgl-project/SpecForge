@@ -30,7 +30,9 @@ class RotaryTest(unittest.TestCase):
     def _assert_parity(self, device, dtypes):
         positions = torch.tensor([[0, 7, 19, 64], [31, 9, 2, 53]], device=device)
         for partial in (1.0, 0.5):
-            node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=partial)
+            node = DefaultRoPESpec(
+                interleaved=False, rope_theta=10000.0, partial_rotary_factor=partial
+            )
             module = DefaultRotaryEmbedding(node, head_dim=16)
             reference = PartialRotaryEmbedding(
                 SimpleNamespace(
@@ -59,9 +61,9 @@ class RotaryTest(unittest.TestCase):
                     hidden = torch.randn(2, 4, 16, device=device, dtype=dtype)
                     actual = module(hidden, positions)
                     references = [
-                        reference(hidden, positions),
+                        reference(hidden.float(), positions),
                         tuple(
-                            cache[0, 0][positions].to(dtype)
+                            cache[0, 0][positions]
                             for cache in (
                                 eagle_reference.cos_cached,
                                 eagle_reference.sin_cached,
@@ -71,7 +73,7 @@ class RotaryTest(unittest.TestCase):
                     # Qwen3's default rotary implementation always rotates the full
                     # head; partial rotation is covered by the MTP reference above.
                     if partial == 1.0:
-                        references.append(hf_reference(hidden, positions))
+                        references.append(hf_reference(hidden.float(), positions))
                     for expected in references:
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     q = torch.randn(
@@ -82,7 +84,10 @@ class RotaryTest(unittest.TestCase):
                     )
                     q_copy = q.detach().clone().requires_grad_()
                     k_copy = k.detach().clone().requires_grad_()
-                    expected = apply_rotary_pos_emb(q, k, *actual)
+                    expected = tuple(
+                        t.to(dtype)
+                        for t in apply_rotary_pos_emb(q.float(), k.float(), *actual)
+                    )
                     outputs = (
                         apply_rotary(q_copy, actual),
                         apply_rotary(k_copy, actual),
@@ -106,7 +111,9 @@ class RotaryTest(unittest.TestCase):
         self._assert_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
 
     def test_precision_survives_module_cast_meta_and_autocast(self):
-        node = DefaultRoPESpec(rope_theta=10000000.0, partial_rotary_factor=0.5)
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000000.0, partial_rotary_factor=0.5
+        )
         devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
         for device in devices:
             with torch.device("meta"):
@@ -120,12 +127,14 @@ class RotaryTest(unittest.TestCase):
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 actual = module(hidden, positions)
             for left, right in zip(actual, expected):
-                torch.testing.assert_close(left, right.bfloat16(), rtol=0, atol=0)
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
             self.assertEqual(module.state_dict(), {})
             self.assertEqual(list(module.parameters()), [])
 
     def test_backbone_prepares_per_layer_positions_and_preserves_overrides(self):
-        node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5)
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=0.5
+        )
         rotary = DefaultRotaryEmbedding(node, head_dim=8)
         backbone = DraftBackbone(
             [RotaryLayer(), RotaryLayer()],
@@ -151,7 +160,9 @@ class RotaryTest(unittest.TestCase):
         self.assertIs(inputs[1].position_embeddings, supplied)
 
     def test_backbone_reuses_equivalent_rotary_only_within_forward(self):
-        node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5)
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=0.5
+        )
         rotary = [DefaultRotaryEmbedding(node, head_dim=8) for _ in range(2)]
         backbone = DraftBackbone(
             [RotaryLayer(), RotaryLayer()],
@@ -177,7 +188,9 @@ class RotaryTest(unittest.TestCase):
             self.assertEqual(second.call_count, 1)
 
     def test_invalid_dimensions_and_layouts_fail(self):
-        node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5)
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=0.5
+        )
         for head_dim in (0, True, 3, 6):
             with self.assertRaises(ValueError):
                 DefaultRotaryEmbedding(node, head_dim=head_dim)

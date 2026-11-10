@@ -29,7 +29,7 @@ class MultiAxisRotaryEmbedding(RotaryEmbedding):
                 "multi-axis position_ids must have shape [3, batch, sequence] or [batch, sequence]"
             )
         with torch.autocast(device_type=hidden.device.type, enabled=False):
-            frequencies = self._frequencies(hidden.device)
+            frequencies = self.frequencies(hidden.device)
             positions = position_ids.to(device=hidden.device, dtype=torch.float32)
             # Each section counts frequency pairs. Select one axis per section,
             # then duplicate the selected phases for the rotate-half convention.
@@ -43,7 +43,7 @@ class MultiAxisRotaryEmbedding(RotaryEmbedding):
                 dim=-1,
             )
             cos, sin = self._cos_sin(torch.cat((freqs, freqs), dim=-1))
-            return cos.to(hidden.dtype), sin.to(hidden.dtype)
+            return cos, sin
 
 
 register_component_builder("rope", MultiAxisRoPESpec, MultiAxisRotaryEmbedding)

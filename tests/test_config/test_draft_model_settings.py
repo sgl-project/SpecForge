@@ -55,6 +55,7 @@ class ModelSettingsTest(unittest.TestCase):
         register_component_schema("rope", CustomRoPESpec)
         register_component_schema("rope", CustomRoPESpec)
         payload = {
+            "interleaved": False,
             "rope_type": "test_custom_rope",
             "rope_theta": 10000.0,
             "partial_rotary_factor": 1.0,
@@ -84,6 +85,7 @@ class ModelSettingsTest(unittest.TestCase):
             (
                 "rope",
                 {
+                    "interleaved": False,
                     "rope_type": "default",
                     "rope_theta": 10000.0,
                     "partial_rotary_factor": 0.25,
@@ -92,6 +94,7 @@ class ModelSettingsTest(unittest.TestCase):
             (
                 "rope",
                 {
+                    "interleaved": False,
                     "rope_type": "linear",
                     "rope_theta": 10000.0,
                     "partial_rotary_factor": 1.0,
@@ -124,7 +127,9 @@ class ModelSettingsTest(unittest.TestCase):
                         )
 
     def test_rotary_geometry_is_derived_and_validated(self):
-        full = DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1.0)
+        full = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000, partial_rotary_factor=1.0
+        )
         partial = dataclasses.replace(full, partial_rotary_factor=0.25)
         self.assertEqual(full.rotary_dim(128), 128)
         self.assertEqual(partial.rotary_dim(128), 32)
@@ -142,13 +147,18 @@ class ModelSettingsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "multiplier"):
                     MuPLogitTransformSpec(multiplier=value)
                 with self.assertRaisesRegex(ValueError, "rope_theta"):
-                    DefaultRoPESpec(rope_theta=value, partial_rotary_factor=1.0)
+                    DefaultRoPESpec(
+                        interleaved=False, rope_theta=value, partial_rotary_factor=1.0
+                    )
                 with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
-                    DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=value)
+                    DefaultRoPESpec(
+                        interleaved=False, rope_theta=10000, partial_rotary_factor=value
+                    )
                 with self.assertRaisesRegex(ValueError, "factor"):
                     decode_component(
                         "rope",
                         {
+                            "interleaved": False,
                             "rope_type": "linear",
                             "rope_theta": 10000,
                             "partial_rotary_factor": 1.0,
@@ -156,7 +166,9 @@ class ModelSettingsTest(unittest.TestCase):
                         },
                     )
         with self.assertRaisesRegex(ValueError, "partial_rotary_factor"):
-            DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1.1)
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000, partial_rotary_factor=1.1
+            )
 
     def test_unknown_formats_fail_instead_of_defaulting(self):
         for kind in ("rope", "logits"):

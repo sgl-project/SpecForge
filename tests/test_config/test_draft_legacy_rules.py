@@ -31,7 +31,9 @@ class LegacyRulesTest(unittest.TestCase):
             resolve_alias("block_size", {})
 
     def test_old_and_new_rotary_spellings_resolve_identically(self):
-        expected = LinearRoPESpec(rope_theta=1000000, partial_rotary_factor=1, factor=2)
+        expected = LinearRoPESpec(
+            interleaved=False, rope_theta=1000000, partial_rotary_factor=1, factor=2
+        )
         old = {"rope_theta": 1000000, "rope_scaling": {"type": "linear", "factor": 2}}
         new = {
             "rope_parameters": {
@@ -45,7 +47,10 @@ class LegacyRulesTest(unittest.TestCase):
             self.assertEqual(resolve_rope(payload), expected)
         self.assertEqual(old, original)
         self.assertEqual(
-            resolve_rope({}), DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1)
+            resolve_rope({}),
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000, partial_rotary_factor=1
+            ),
         )
         self.assertEqual(
             resolve_rope({"partial_rotary_factor": 0.5}).partial_rotary_factor, 0.5

@@ -47,7 +47,7 @@ class ComponentBuilderTest(unittest.TestCase):
         register_component_schema("norm", TestNormSpec)
 
     def test_builtins_keep_nodes_and_support_composition(self):
-        norm_node = RMSNormSpec(eps=1e-6, weight_offset=1)
+        norm_node = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1)
         mlp_node = DenseFFNSpec(intermediate_size=24, hidden_act="silu")
         residual_node = StandardResidualSpec()
         norm = build_component("norm", norm_node, hidden_size=16)

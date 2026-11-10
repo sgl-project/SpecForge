@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from .._validation import finite_number
+from .._validation import boolean, finite_number
 from .base import NormSpec
 
 
@@ -13,8 +13,12 @@ class RMSNormSpec(NormSpec):
 
     eps: float
     weight_offset: int
+    has_weight: bool
 
     def __post_init__(self):
+        boolean("has_weight", self.has_weight)
+        if not self.has_weight and self.weight_offset != 0:
+            raise ValueError("weight_offset requires has_weight=True")
         finite_number("eps", self.eps)
         if self.eps <= 0:
             raise ValueError("eps must be positive")
