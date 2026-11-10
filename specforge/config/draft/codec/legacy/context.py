@@ -177,7 +177,8 @@ def read_context(payload, method, target_config):
         raise ValueError("target_layer_ids must be an array")
     features = TargetFeatureSpec(
         hidden_size=target_config["hidden_size"],
-        mask_token_id=method.get("mask_token_id"), target_layer_ids=tuple(feature_ids)
+        mask_token_id=method.get("mask_token_id"),
+        target_layer_ids=tuple(feature_ids),
     )
     fields = dict(
         hidden_size=values["hidden_size"],
