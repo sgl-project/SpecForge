@@ -4,6 +4,7 @@ import copy
 import unittest
 from dataclasses import replace
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 from torch import nn
