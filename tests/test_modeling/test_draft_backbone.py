@@ -169,6 +169,11 @@ class BackboneTest(unittest.TestCase):
 
     def test_residual_expansion_and_reduction_surround_the_layers(self):
         class TwoStreams(ResidualStreams):
+            def build_connection(
+                self, *, hidden_size, layer_index, sublayer, device=None, dtype=None
+            ):
+                raise NotImplementedError("this fixture tests only stream boundaries")
+
             def expand(self, hidden):
                 return torch.stack((hidden, hidden * 2), dim=-2)
 

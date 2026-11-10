@@ -65,6 +65,14 @@ class ComponentCodecTest(unittest.TestCase):
         self.enterContext(patch.dict(registry._SCHEMAS))
         self.enterContext(patch.dict(registry._VALIDATORS))
 
+    def test_dense_activation_is_validated_during_decode(self):
+        for activation in ("gelu_new", "prelu", "unknown"):
+            with self.subTest(activation=activation):
+                with self.assertRaisesRegex(ValueError, "hidden_act"):
+                    decode_component(
+                        "mlp", COMPONENTS["mlp"] | {"hidden_act": activation}
+                    )
+
     def test_nested_component_must_match_its_annotated_type(self):
         @dataclass(frozen=True, kw_only=True)
         class NarrowFFN(FFNSpec):

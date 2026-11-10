@@ -1,4 +1,9 @@
-from .base import ResidualStreams
-from .standard import StandardResidual
+from .base import ResidualConnection, ResidualStreams
+from .standard import StandardResidual, StandardResidualConnection
 
-__all__ = ["ResidualStreams", "StandardResidual"]
+__all__ = [
+    "ResidualConnection",
+    "ResidualStreams",
+    "StandardResidual",
+    "StandardResidualConnection",
+]
