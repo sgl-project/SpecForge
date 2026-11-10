@@ -338,7 +338,9 @@ class LoadingTest(unittest.TestCase):
                     invalid = dict(old.state_dict())
                     invalid["t2d"] = ~invalid["t2d"]
                     torch.save(invalid, path / "pytorch_model.bin")
-                    with self.assertRaisesRegex(ValueError, "same ascending target IDs"):
+                    with self.assertRaisesRegex(
+                        ValueError, "same ascending target IDs"
+                    ):
                         load_draft(path, target=target)
                     state = {
                         k: v
