@@ -18,6 +18,15 @@ def validate_target_context(config: DraftConfig) -> None:
         raise ValueError(
             "spec_config.target_features.mask_token_id must be below vocab_size"
         )
+    # bound tables are the target's own, at the target's width
+    if (
+        config.target_bindings
+        and config.spec_config.target_features.hidden_size != config.hidden_size
+    ):
+        raise ValueError(
+            "target_bindings require spec_config.target_features.hidden_size "
+            "== hidden_size"
+        )
     for name, attention in config.attention_configs.items():
         if "target_context_kv" not in attention.capabilities():
             raise ValueError(
