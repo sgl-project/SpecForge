@@ -14,6 +14,9 @@ from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_domino_spec import domino_spec
 from tests.test_config.test_draft_dspark_spec import dspark_spec
 from tests.test_config.test_draft_dspine_spec import dspine_config
+from tests.test_config.test_draft_eagle3_spec import eagle_config
+from tests.test_config.test_draft_mtp_spec import mtp_config
+from tests.test_config.test_draft_peagle_spec import peagle_config
 
 FIXTURES = Path(__file__).parent / "fixtures" / "canonical"
 
@@ -39,6 +42,9 @@ def dflash2_config():
 
 
 EXPECTED = {
+    "MTPDraftModel": mtp_config,
+    "PEagleDraftModel": peagle_config,
+    "Eagle3DraftModel": eagle_config,
     "DominoDraftModel": lambda: draft_config(
         architecture="DominoDraftModel", spec_config=domino_spec()
     ),

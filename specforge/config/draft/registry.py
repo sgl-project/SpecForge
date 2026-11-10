@@ -13,9 +13,15 @@ from .architecture import (
     DominoSpec,
     DSparkSpec,
     DSpineSpec,
+    Eagle3Spec,
+    MTPSpec,
+    PEagleSpec,
 )
 from .architecture.constraints import validate_dflash2, validate_target_context
 from .architecture.dspine import validate_dspine
+from .architecture.eagle3 import validate_eagle3
+from .architecture.mtp import validate_mtp
+from .architecture.peagle import validate_peagle
 from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .conv.constraints import validate_grouped_causal
@@ -26,8 +32,10 @@ from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
 from .rope import (
     DefaultRoPESpec,
+    DynamicNTKRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
+    MultiAxisRoPESpec,
     NoRoPESpec,
     RopeSpec,
     YaRNSpec,
@@ -223,6 +231,8 @@ for _kind, _schema in (
     ("rope", DefaultRoPESpec),
     ("rope", LinearRoPESpec),
     ("rope", NoRoPESpec),
+    ("rope", DynamicNTKRoPESpec),
+    ("rope", MultiAxisRoPESpec),
     ("rope", Llama3RoPESpec),
     ("rope", YaRNSpec),
     ("logits", NoLogitTransformSpec),
@@ -239,3 +249,6 @@ register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
 register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
 register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
 register_spec("DominoDraftModel", DominoSpec, validate_target_context)
+register_spec("Eagle3DraftModel", Eagle3Spec, validate_eagle3)
+register_spec("PEagleDraftModel", PEagleSpec, validate_peagle)
+register_spec("MTPDraftModel", MTPSpec, validate_mtp)
