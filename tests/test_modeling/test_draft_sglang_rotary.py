@@ -18,7 +18,7 @@ from tests.test_modeling.test_draft_yarn_rotary import yarn_node
 
 @unittest.skipUnless(
     torch.cuda.is_available() and importlib.util.find_spec("sglang"),
-    "SGLang CUDA runtime is required for serving-reference tests"
+    "SGLang CUDA runtime is required for serving-reference tests",
 )
 class SGLangRotaryTest(unittest.TestCase):
     def setUp(self):

@@ -28,6 +28,7 @@ def eager_attention(
     dropout_p: float,
     training: bool,
     return_lse: bool = False,
+    empty_rows: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Return [batch, query_heads, query_length, value_dim].
 
@@ -35,7 +36,8 @@ def eager_attention(
     The caller supplies the complete visibility policy as a boolean mask:
     True means visible. Masks must be rank four and broadcast to [batch, heads, Q, K].
     Fully blocked rows return zero with zero gradients. No causal/window policy
-    is inferred, and additive float biases are not supported.
+    is inferred, and additive float biases are not supported. Prepared callers may
+    supply empty_rows = ~attention_mask.any(-1, keepdim=True) to reuse the reduction.
     """
     positive_number("scale", scale)
     finite_number("dropout_p", dropout_p)
@@ -79,7 +81,16 @@ def eager_attention(
     groups = heads // kv_heads
     scores = torch.matmul(query, _repeat_kv(key, groups).transpose(-1, -2)) * scale
     scores = scores.masked_fill(~attention_mask, -torch.inf)
-    empty_rows = ~attention_mask.any(dim=-1, keepdim=True)
+    if empty_rows is None:
+        empty_rows = ~attention_mask.any(dim=-1, keepdim=True)
+    elif (
+        empty_rows.shape != (*attention_mask.shape[:-1], 1)
+        or empty_rows.dtype != torch.bool
+        or empty_rows.device != query.device
+    ):
+        raise ValueError(
+            "empty_rows must be boolean with shape [B, H, Q, 1] matching the mask"
+        )
     # Avoid NaN softmax/gradients for fully blocked rows. Unmasked numerical
     # overflow remains visible rather than being treated as an empty row.
     scores = scores.masked_fill(empty_rows, 0)

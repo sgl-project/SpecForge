@@ -22,7 +22,7 @@ def layout_for(device):
     return AttentionLayout(
         query_positions=positions,
         key_positions=positions,
-        visibility=lambda b, h, q, k: (q > 0) & (k % 2 == 0),
+        visibility=lambda b, h, q, k: (q > 0) & (k % 2 == 0) & ((h % 2 == 0) | (q > 1)),
         active_queries=active,
     )
 
@@ -103,6 +103,31 @@ class TestAttentionBackends(unittest.TestCase):
 
     def test_flex(self):
         check_backend("flex")
+
+    def test_eager_reuses_empty_rows(self):
+        with AttentionPreparation() as scope:
+            attention = scope.prepare(
+                resolve_attention_backend("eager"),
+                layout_for("cpu"),
+                batch_size=1,
+                num_heads=4,
+                is_causal=True,
+                sliding_window=None,
+            )
+        q, k, v = [torch.randn(1, h, 7, 16, requires_grad=True) for h in (4, 2, 2)]
+        with patch.object(
+            torch.Tensor,
+            "any",
+            side_effect=AssertionError("mask reduced during execution"),
+        ):
+            for _ in range(2):
+                result = attention.attend(
+                    q, k, v, scale=0.25, dropout_p=0, training=True
+                )
+                self.assertEqual(result.output[:, 1::2, 1].count_nonzero().item(), 0)
+                result.output.sum().backward()
+        for tensor in (q, k, v):
+            self.assertTrue(torch.isfinite(tensor.grad).all())
 
     def test_preparation(self):
         check_preparation()

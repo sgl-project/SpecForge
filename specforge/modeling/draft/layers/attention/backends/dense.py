@@ -1,11 +1,19 @@
 """Dense mask preparation shared by eager and SDPA execution."""
 
+from dataclasses import dataclass
+
 from torch import Tensor
 from torch.nn import functional as F
 
 from ..masks import dense_attention_mask
 from .base import AttentionBackend
 from .eager import eager_attention
+
+
+@dataclass(frozen=True)
+class DenseMask:
+    visibility: Tensor
+    empty_rows: Tensor
 
 
 class DenseAttentionBackend(AttentionBackend):
@@ -17,18 +25,30 @@ class DenseAttentionBackend(AttentionBackend):
             is_causal=is_causal,
             sliding_window=sliding_window,
         )
-        return mask, mask.any(dim=-1).any(dim=1).expand(batch_size, -1)
+        visible_rows = mask.any(dim=-1, keepdim=True)
+        active = visible_rows.squeeze(-1).any(dim=1).expand(batch_size, -1)
+        return DenseMask(mask, ~visible_rows), active
 
 
 class EagerAttentionBackend(DenseAttentionBackend):
     def attend(
-        self, query, key, value, *, mask: Tensor, scale, dropout_p, training, return_lse
+        self,
+        query,
+        key,
+        value,
+        *,
+        mask: DenseMask,
+        scale,
+        dropout_p,
+        training,
+        return_lse,
     ):
         result = eager_attention(
             query,
             key,
             value,
-            attention_mask=mask,
+            attention_mask=mask.visibility,
+            empty_rows=mask.empty_rows,
             scale=scale,
             dropout_p=dropout_p,
             training=training,
@@ -39,7 +59,16 @@ class EagerAttentionBackend(DenseAttentionBackend):
 
 class SDPAAttentionBackend(DenseAttentionBackend):
     def attend(
-        self, query, key, value, *, mask: Tensor, scale, dropout_p, training, return_lse
+        self,
+        query,
+        key,
+        value,
+        *,
+        mask: DenseMask,
+        scale,
+        dropout_p,
+        training,
+        return_lse,
     ):
         if return_lse:
             raise NotImplementedError(
@@ -49,7 +78,7 @@ class SDPAAttentionBackend(DenseAttentionBackend):
             query,
             key,
             value,
-            attn_mask=mask,
+            attn_mask=mask.visibility,
             scale=scale,
             dropout_p=dropout_p if training else 0.0,
             enable_gqa=query.shape[1] != key.shape[1],
