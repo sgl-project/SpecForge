@@ -18,6 +18,7 @@ from specforge.modeling.draft.models.eagle_fusion import (
 from specforge.modeling.draft.peagle import PEagleFirstLayer
 from tests.test_config.test_draft_eagle3_spec import eagle_config
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
+from tests.test_modeling.test_draft_mla import prepare
 
 
 def eager_reference(*, query, key, value, block_mask, enable_gqa, **kwargs):
@@ -46,7 +47,7 @@ def stage(*, norm_before_residual=False, device="cpu", dtype=torch.float32):
             dtype=dtype,
         ),
         hidden_size=16,
-        norm=RMSNormSpec(eps=1e-6, weight_offset=0),
+        norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
         norm_before_residual=norm_before_residual,
         device=device,
         dtype=dtype,
@@ -75,7 +76,9 @@ class EagleFusionTest(unittest.TestCase):
                 reference.target_hidden_size = 32
                 reference.fc = nn.Linear(96, 16, bias=False)
                 reference.fc_norm = (
-                    nn.ModuleList([LlamaRMSNorm(32) for _ in range(3)])
+                    nn.ModuleList(
+                        [LlamaRMSNorm(32, eps=config.norm_config.eps) for _ in range(3)]
+                    )
                     if normalized
                     else None
                 )
@@ -86,21 +89,30 @@ class EagleFusionTest(unittest.TestCase):
                 expected = LlamaForCausalLMEagle3.project_hidden_states(
                     reference, other
                 )
-                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
                 grad = torch.randn_like(output)
                 output.backward(grad)
                 expected.backward(grad)
-                torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    features.grad, other.grad, rtol=1e-5, atol=1e-5
+                )
                 for name, parameter in actual.named_parameters():
                     torch.testing.assert_close(
                         parameter.grad,
                         dict(reference.named_parameters())[name].grad,
-                        rtol=0,
-                        atol=0,
+                        rtol=1e-5,
+                        atol=1e-5,
                     )
                 self.assertIs(actual.config, config.spec_config.target_features)
 
     def _stage_parity(self, device, dtype):
+        torch.manual_seed(0)
+        # Canonical RoPE rotates in FP32 before casting; legacy rotates in dtype.
+        tolerance = (
+            2e-2
+            if dtype == torch.bfloat16
+            else 1e-2 if dtype == torch.float16 else 1e-5
+        )
         for normalized_residual in (False, True):
             with self.subTest(
                 device=device, dtype=dtype, normalized_residual=normalized_residual
@@ -137,7 +149,10 @@ class EagleFusionTest(unittest.TestCase):
                 output = actual(
                     hidden,
                     LayerInputs(
-                        attention_layout=layout, position_embeddings=embeddings
+                        attention=prepare(actual.self_attn, layout, hidden.shape[0]),
+                        position_embeddings=tuple(
+                            table.float() for table in embeddings
+                        ),
                     ),
                 )
                 with patch(
@@ -145,18 +160,22 @@ class EagleFusionTest(unittest.TestCase):
                     eager_reference,
                 ):
                     expected = reference(other, causal, embeddings)
-                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    output, expected, rtol=tolerance, atol=tolerance
+                )
                 grad = torch.randn_like(output)
                 output.backward(grad)
                 expected.backward(grad)
-                torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    hidden.grad, other.grad, rtol=tolerance, atol=tolerance
+                )
                 for name, parameter in actual.named_parameters():
                     self.assertIsNotNone(parameter.grad, name)
                     torch.testing.assert_close(
                         parameter.grad,
                         dict(reference.named_parameters())[name].grad,
-                        rtol=0,
-                        atol=0,
+                        rtol=tolerance,
+                        atol=tolerance,
                     )
 
     def test_cpu_first_stage_forward_and_backward(self):

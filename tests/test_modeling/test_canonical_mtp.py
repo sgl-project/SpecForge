@@ -55,7 +55,7 @@ class CanonicalMTPTest(unittest.TestCase):
         base = mtp_config(target_bindings=(), target_logit_transform=None)
         config = replace(
             base,
-            norm_config=RMSNormSpec(eps=1e-6, weight_offset=1),
+            norm_config=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1),
             attention_configs={
                 "full": replace(base.attention_configs["full"], output_gate=True)
             },

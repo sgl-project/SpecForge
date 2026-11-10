@@ -1,11 +1,38 @@
 """Assemble ordinary decoder stacks without taking over algorithm execution."""
 
+from dataclasses import replace
+
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.residual import StandardResidualSpec
 
 from ..backbone import DraftBackbone
 from ..layers import DecoderLayer, build_component, component_builder
+from ..layers.attention.backends import AttentionPreparationScope
 from ..layers.rope import build_rotary
+
+
+class DecoderBackbone(DraftBackbone):
+    """Prepare attention once per forward for the assembled decoder stages."""
+
+    def begin(self, hidden, layer_inputs):
+        if len(layer_inputs) != self.num_layers:
+            raise ValueError("layer_inputs must contain one entry per layer")
+        with AttentionPreparationScope() as scope:
+            prepared = [
+                (
+                    replace(
+                        inputs,
+                        attention=layer.self_attn.prepare(
+                            inputs.attention_layout, scope, batch_size=hidden.shape[0]
+                        ),
+                        attention_layout=None,
+                    )
+                    if inputs.attention_layout is not None
+                    else inputs
+                )
+                for layer, inputs in zip(self.layers, layer_inputs)
+            ]
+        return super().begin(hidden, prepared)
 
 
 def build_decoder_backbone(
@@ -83,7 +110,7 @@ def build_decoder_backbone(
                 **options,
             )
         )
-    return DraftBackbone(
+    return DecoderBackbone(
         layers,
         final_norm=build_component("norm", config.norm_config, **options),
         rotary=rotary,
