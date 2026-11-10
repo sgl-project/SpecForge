@@ -11,6 +11,11 @@ class AttentionSpec(ABC):
     """Base for attention schemas with different projection/state semantics."""
 
     def capabilities(self) -> frozenset[str]:
+        """Declare execution contracts checked before model construction.
+
+        projected_kv accepts kv_prefix and output_kv; when requested it returns
+        the hidden update and this call's projected K/V, retaining gradients.
+        """
         return frozenset()
 
     # None explicitly inherits model-level RoPE; NoRoPESpec disables rotation.

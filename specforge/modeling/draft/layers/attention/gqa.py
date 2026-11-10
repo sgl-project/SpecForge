@@ -202,12 +202,16 @@ class GQAAttention(nn.Module):
                 key, self.k_norm
             )
         boolean("output_kv", output_kv)
-        current_kv = AttentionKV(key, value)
-        combined = current_kv.prepend(kv_prefix)
+        current_kv = (
+            AttentionKV(key, value) if output_kv or kv_prefix is not None else None
+        )
+        if kv_prefix is not None:
+            combined = current_kv.prepend(kv_prefix)
+            key, value = combined.key, combined.value
         result = attention.attend(
             query,
-            combined.key,
-            combined.value,
+            key,
+            value,
             scale=node.head_dim**-0.5,
             dropout_p=node.attention_dropout,
             training=self.training,

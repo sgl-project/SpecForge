@@ -68,7 +68,9 @@ class PEagleDraftModel(DraftPreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if getattr(module, "reset_draft_parameters", None) is not None:
+            super()._init_weights(module)
+        elif isinstance(module, nn.Linear):
             # Match nn.Linear.reset_parameters without overwriting restored tensors.
             init.kaiming_uniform_(module.weight, a=math.sqrt(5))
             if module.bias is not None:

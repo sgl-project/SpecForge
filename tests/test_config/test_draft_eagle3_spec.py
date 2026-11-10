@@ -3,6 +3,7 @@
 import dataclasses
 import json
 import unittest
+from unittest.mock import patch
 
 from specforge.config.draft.architecture import Eagle3Spec
 from specforge.config.draft.architecture.eagle_fusion import AuxiliaryFeatureSpec
@@ -90,6 +91,13 @@ class Eagle3SpecTest(unittest.TestCase):
         for index in (-1, True, 1):
             with self.assertRaises(ValueError):
                 eagle_config().spec_config.attention_input_width(32, index)
+
+    def test_attention_must_support_projected_kv(self):
+        attention = eagle_config().attention_configs["full"]
+        flags = attention.capabilities() - {"projected_kv"}
+        with patch.object(type(attention), "capabilities", return_value=flags):
+            with self.assertRaisesRegex(ValueError, "projected_kv"):
+                eagle_config()
 
     def test_auxiliary_fusion_accepts_any_nonempty_ordered_selection(self):
         for layers in ((1,), (1, 3), (0, 1, 3, 4)):

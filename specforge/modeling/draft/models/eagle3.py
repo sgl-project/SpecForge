@@ -1,11 +1,10 @@
 """EAGLE3 composition with explicit initial-feature and recurrent-state inputs."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 from transformers.utils import ModelOutput
 
 from ..hf_config import SpecForgeDraftConfig
@@ -119,25 +118,10 @@ class Eagle3DraftModel(DraftPreTrainedModel):
         state = self.backbone.begin(
             torch.cat((self.embed_tokens(input_ids), features), dim=-1), layer_inputs
         )
-        stage = self.backbone.layers[0]
-        options = dict(kv_prefix=kv_prefix, output_kv=True)
-        if (
-            self.backbone.gradient_checkpointing
-            and self.training
-            and torch.is_grad_enabled()
-        ):
-            hidden, kv = checkpoint(
-                stage,
-                state.hidden,
-                state.layer_inputs[0],
-                use_reentrant=False,
-                **options,
-            )
-        else:
-            hidden, kv = stage(state.hidden, state.layer_inputs[0], **options)
-        hidden = self.backbone.finalize(replace(state, hidden=hidden, next_layer=1))
+        state = self.backbone.run_next_layer(state, kv_prefix=kv_prefix, output_kv=True)
+        hidden = self.backbone.finalize(state)
         return Eagle3Output(
             hidden_states=hidden,
-            kv=kv,
+            kv=state.layer_output.kv,
             logits=self.compute_logits(hidden) if output_logits else None,
         )

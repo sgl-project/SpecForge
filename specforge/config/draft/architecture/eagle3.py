@@ -44,3 +44,6 @@ def validate_eagle3(config) -> None:
     if config.num_hidden_layers != 1:
         raise ValueError("EAGLE3 requires exactly one decoder layer")
     validate_auxiliary_fusion(config)
+    layer = config.layer_configs[config.layer_types[0]]
+    if "projected_kv" not in config.attention_configs[layer.attention].capabilities():
+        raise ValueError("EAGLE3 requires projected_kv attention support")

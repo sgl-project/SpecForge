@@ -184,6 +184,16 @@ class CanonicalPEagleTest(unittest.TestCase):
                         module.bias, reference.bias, rtol=0, atol=0
                     )
 
+    def test_custom_linear_initialization_takes_precedence(self):
+        class CustomLinear(torch.nn.Linear):
+            def reset_draft_parameters(self):
+                torch.nn.init.constant_(self.weight, 0.25)
+
+        model = build_draft_model(model_config())
+        module = CustomLinear(4, 4, bias=False)
+        model._init_weights(module)
+        torch.testing.assert_close(module.weight, torch.full_like(module.weight, 0.25))
+
     def test_cpu_legacy_composition(self):
         for dtype in (torch.float32, torch.bfloat16):
             self._parity("cpu", dtype)
@@ -243,7 +253,11 @@ class CanonicalPEagleTest(unittest.TestCase):
         config = model_config()
         actual = build_draft_model(config)
         args = model_inputs(config)
-        output = actual(*args, output_logits=False)
+        with patch(
+            "specforge.modeling.draft.layers.attention.gqa.AttentionKV",
+            side_effect=AssertionError("ordinary attention needs no K/V wrapper"),
+        ):
+            output = actual(*args, output_logits=False)
         unmasked = actual(
             *args,
             feature_mask=torch.zeros_like(args[0], dtype=torch.bool),

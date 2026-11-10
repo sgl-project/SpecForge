@@ -34,3 +34,10 @@ class LayerInputs:
         if self.attention_layout is not None:
             if not isinstance(self.attention_layout, AttentionLayout):
                 raise TypeError("attention_layout must be AttentionLayout")
+
+
+@dataclass(frozen=True, eq=False)
+class LayerOutput:
+    """A layer's hidden result; specialized stages may add typed tensor fields."""
+
+    hidden: Tensor

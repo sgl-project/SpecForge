@@ -1,5 +1,7 @@
 """EAGLE input computation owned by models, not the shared decoder loop."""
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor, nn
 
@@ -10,7 +12,7 @@ from specforge.config.draft.norm import NormSpec
 from ..layers import build_component, component_builder
 from ..layers.attention.backends import PreparedAttention
 from ..layers.attention.kv import AttentionKV
-from ..layers.inputs import LayerInputs
+from ..layers.inputs import LayerInputs, LayerOutput
 
 
 class AuxiliaryFeatureProjection(nn.Module):
@@ -72,6 +74,11 @@ class AuxiliaryFeatureProjection(nn.Module):
         return self.fc(features)
 
 
+@dataclass(frozen=True, eq=False)
+class EagleStageOutput(LayerOutput):
+    kv: AttentionKV
+
+
 class EagleDecoderStage(nn.Module):
     """First-layer fusion: [token embedding, projected features] -> H.
 
@@ -112,7 +119,7 @@ class EagleDecoderStage(nn.Module):
         *,
         kv_prefix: AttentionKV | None = None,
         output_kv: bool = False,
-    ) -> Tensor | tuple[Tensor, AttentionKV]:
+    ) -> Tensor | EagleStageOutput:
         if hidden.ndim != 3 or hidden.shape[-1] != 2 * self.hidden_size:
             raise ValueError(
                 "EAGLE first stage requires [batch, sequence, 2 * hidden_size]"
@@ -151,4 +158,4 @@ class EagleDecoderStage(nn.Module):
         if update.shape != hidden.shape:
             raise ValueError("mlp output must preserve the residual shape")
         hidden = hidden + update
-        return (hidden, current_kv) if output_kv else hidden
+        return EagleStageOutput(hidden, current_kv) if output_kv else hidden
