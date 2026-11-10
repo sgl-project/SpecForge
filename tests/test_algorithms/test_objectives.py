@@ -1,6 +1,7 @@
 """Default objective coverage and independently checked token alignment."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -160,6 +161,51 @@ class ObjectiveTest(unittest.TestCase):
             captured[0][:, :6].flatten(0, 1), labels.flatten()
         )
         torch.testing.assert_close(result.loss, reference)
+
+    def test_domino_reuses_base_logits_and_aligned_predecessors(self):
+        for shifted in (False, True):
+            config = domino_config(shifted=shifted)
+            model = build_draft_model(config)
+            batch = training_batch(config)
+            blocks = prepare_blocks(
+                config, batch, num_anchors=2, label_offset=int(shifted)
+            )
+            captured = []
+            model.register_forward_hook(
+                lambda module, args, output: captured.append(output)
+            )
+            runtime = build_objective_model(model, options={"num_anchors": 2})
+            with (
+                patch(
+                    "specforge.algorithms.objectives.domino.prepare_blocks",
+                    return_value=blocks,
+                ),
+                patch.object(model, "forward", wraps=model.forward) as forward,
+                patch.object(
+                    model.lm_head, "forward", wraps=model.lm_head.forward
+                ) as projection,
+            ):
+                result = runtime(batch, step=1, total_steps=10)
+                result.loss.backward()
+                self.assertEqual(projection.call_count, 1)
+                torch.testing.assert_close(
+                    forward.call_args.kwargs["predecessor_ids"],
+                    blocks.predecessors.flatten(1),
+                )
+            output = captured[0]
+            labels = blocks.labels.flatten()
+            weights = blocks.weights.flatten()
+
+            def ce(logits):
+                return torch.nn.functional.cross_entropy(
+                    logits.flatten(0, 1), labels, reduction="none"
+                )
+
+            expected = (
+                (0.8 * ce(output.base_logits) + 0.2 * ce(output.logits)) * weights
+            ).sum() / weights.sum()
+            torch.testing.assert_close(result.loss, expected)
+            self.assertIsNone(output.correction_logits)
 
     def test_reject_incompatible_or_unknown_options(self):
         model = build_draft_model(dflash2_config())

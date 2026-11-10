@@ -14,7 +14,7 @@ from .registry import register_objective
     "domino",
     architectures=("DominoDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    outputs=("logits", "hidden_states", "correction_logits"),
+    outputs=("logits", "base_logits"),
     trains=COMMON_MODULES + ("gru_head",),
 )
 @dataclass
@@ -47,18 +47,15 @@ class DominoObjective:
             blocks.input_ids,
             batch["hidden_states"],
             blocks.layer_inputs,
-            prev_token_ids=(
-                blocks.predecessors if spec.block.shift_label else blocks.labels
-            ).flatten(1),
+            predecessor_ids=blocks.predecessors.flatten(1),
         )
         labels = blocks.labels.flatten(1)
-        base = model.lm_head(output.hidden_states)
         if self.lambda_base_start and not total_steps:
             raise ValueError("Domino base-loss schedule requires total_steps")
         warmup = max(1, (total_steps or 1) * self.lambda_base_decay_ratio)
         weight = self.lambda_base_start * max(0, 1 - step / warmup)
         loss = (
-            weight * ce_l1_loss(base, labels).cross_entropy
+            weight * ce_l1_loss(output.base_logits, labels).cross_entropy
             + (1 - weight) * ce_l1_loss(output.logits, labels).cross_entropy
         )
         return reduce_loss(

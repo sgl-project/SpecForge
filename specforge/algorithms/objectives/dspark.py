@@ -51,7 +51,7 @@ class DSparkObjective:
             blocks.input_ids,
             batch["hidden_states"],
             blocks.layer_inputs,
-            prev_token_ids=blocks.predecessors.flatten(1),
+            predecessor_ids=blocks.predecessors.flatten(1),
         )
         labels = blocks.labels.flatten(1)
         teacher = runtime.teacher_logits(batch, blocks.label_positions.flatten(1) - 1)
