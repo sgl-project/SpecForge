@@ -2,10 +2,12 @@
 
 import copy
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+from safetensors.torch import load_file, save_file
 from torch.utils.checkpoint import checkpoint
 
 from specforge.config.draft.conv import GroupedCausalConvSpec
@@ -174,6 +176,28 @@ class GroupedCausalConvTest(unittest.TestCase):
         )
         torch.testing.assert_close(
             run_pair(restored.conv, hidden), expected, rtol=0, atol=0
+        )
+
+    def test_hf_missing_projection_restores_identity(self):
+        model = DFlashDraftModel(model_config())
+        with TemporaryDirectory() as directory:
+            model.save_pretrained(directory)
+            weights_path = Path(directory) / "model.safetensors"
+            weights = load_file(weights_path)
+            del weights["conv.kernel_projection.weight"]
+            save_file(weights, weights_path)
+            restored = DFlashDraftModel.from_pretrained(directory)
+        torch.testing.assert_close(
+            restored.conv.base_kernel, model.conv.base_kernel, rtol=0, atol=0
+        )
+        self.assertEqual(
+            restored.conv.kernel_projection.weight.count_nonzero().item(), 0
+        )
+        hidden = torch.randn(1, 8, 16)
+        prepared, coefficients = restored.conv.prepare(hidden)
+        torch.testing.assert_close(prepared, hidden, rtol=0, atol=0)
+        torch.testing.assert_close(
+            restored.conv.finish(hidden, coefficients), hidden, rtol=0, atol=0
         )
 
     def test_invalid_dimensions_fail_before_allocation(self):

@@ -5,6 +5,7 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.norm import NormSpec
 
+from .attention.backends import PreparedAttention
 from .inputs import LayerInputs
 from .registry import build_component
 
@@ -66,10 +67,8 @@ class DecoderLayer(nn.Module):
             )
         if not isinstance(inputs, LayerInputs):
             raise TypeError("DecoderLayer requires LayerInputs")
-        if inputs.attention_layout is None or inputs.attention_mask is not None:
-            raise ValueError(
-                "DecoderLayer requires attention_layout, not a prepared attention_mask"
-            )
+        if not isinstance(inputs.attention, PreparedAttention):
+            raise ValueError("DecoderLayer requires prepared attention")
         # Position IDs are consumed by the backbone. Direct callers must supply
         # any required RoPE embeddings, so layers never recompute frequencies.
         update = self.input_layernorm(hidden)
@@ -77,7 +76,7 @@ class DecoderLayer(nn.Module):
             update, coefficients = self.attention_conv.prepare(update)
         update = self.self_attn(
             update,
-            layout=inputs.attention_layout,
+            attention=inputs.attention,
             position_embeddings=inputs.position_embeddings,
             target_context=inputs.target_context,
         )

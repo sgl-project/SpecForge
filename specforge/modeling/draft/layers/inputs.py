@@ -13,10 +13,10 @@ from .attention.masks import AttentionLayout
 class LayerInputs:
     """Runtime context, visibility, and positions without algorithm settings.
 
-    New components consume attention_layout and apply their node's constraints.
-    Existing adapters may instead use a prepared tensor/BlockMask. Supplying both
-    is ambiguous and rejected. RoPE can be supplied directly or prepared by the
-    backbone from position_ids. Tensor contents must not be mutated while their
+    Decoder components consume attention prepared before the layer loop.
+    Existing adapters may instead use a layout or tensor/BlockMask.
+    Supply only one attention representation. RoPE can be supplied directly or
+    prepared by the backbone from position_ids. Tensor contents must not be mutated while their
     autograd graph is live; mutable serving KV caches are not part of this API.
     """
 
@@ -28,6 +28,13 @@ class LayerInputs:
     attention_layout: AttentionLayout | None = None
 
     def __post_init__(self):
+        if self.attention is not None:
+            if not isinstance(self.attention, PreparedAttention):
+                raise TypeError("attention must be PreparedAttention")
+            if self.attention_layout is not None or self.attention_mask is not None:
+                raise ValueError(
+                    "provide prepared attention or a legacy layout/mask, not both"
+                )
         if self.attention_layout is not None:
             if not isinstance(self.attention_layout, AttentionLayout):
                 raise TypeError("attention_layout must be AttentionLayout")

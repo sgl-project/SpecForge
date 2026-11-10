@@ -28,7 +28,7 @@ class RotaryLayer(nn.Module):
 
 
 class RotaryTest(unittest.TestCase):
-    def test_interleaved_rotation_matches_mla_with_partial_tail_and_gradients(self):
+    def test_mla_rotation_uses_fp32_with_partial_tail_and_gradients(self):
         cases = [("cpu", torch.float32), ("cpu", torch.bfloat16)]
         if torch.cuda.is_available():
             cases.extend(
@@ -43,14 +43,17 @@ class RotaryTest(unittest.TestCase):
                     )
                     other = hidden.detach().clone().requires_grad_()
                     phase = torch.randn(
-                        2, 5, width // 2, device=device, dtype=dtype
+                        2, 5, width // 2, device=device, dtype=torch.float32
                     ).repeat(1, 1, 2)
                     cos, sin = phase.cos(), phase.sin()
                     expected = torch.cat(
                         (
                             apply_mla_rope(
-                                hidden[..., :width], cos, sin, interleaved=interleaved
-                            ),
+                                hidden[..., :width].float(),
+                                cos,
+                                sin,
+                                interleaved=interleaved,
+                            ).to(dtype),
                             hidden[..., width:],
                         ),
                         dim=-1,

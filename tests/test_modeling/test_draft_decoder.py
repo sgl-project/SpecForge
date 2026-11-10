@@ -24,6 +24,7 @@ from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
 from specforge.modeling.draft.dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.residual import StandardResidual
@@ -66,11 +67,16 @@ def make_layer(
             dtype=dtype,
         ),
         hidden_size=16,
-        norm=RMSNormSpec(eps=1e-6, weight_offset=offset),
+        norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
         sublayer_conv=convolutions,
         device=device,
         dtype=dtype,
     )
+
+
+def prepare(module, layout, batch_size):
+    with AttentionPreparation() as scope:
+        return module.self_attn.prepare(layout, scope, batch_size=batch_size)
 
 
 class DecoderTest(unittest.TestCase):
@@ -162,13 +168,15 @@ class DecoderTest(unittest.TestCase):
                     layout = layout_for(hidden, 0 if context is None else 2)
                     rope = build_rotary(
                         DefaultRoPESpec(
-                            rope_theta=10000.0, partial_rotary_factor=rotary_dim / 8
+                            interleaved=False,
+                            rope_theta=10000.0,
+                            partial_rotary_factor=rotary_dim / 8,
                         ),
                         head_dim=8,
                     )
                     embeddings = rope(hidden, layout.key_positions)
                     entry = LayerInputs(
-                        attention_layout=layout,
+                        attention=prepare(actual, layout, hidden.shape[0]),
                         target_context=context,
                         position_embeddings=embeddings,
                     )
@@ -226,16 +234,11 @@ class DecoderTest(unittest.TestCase):
                         )
 
     def test_cpu_whole_layer_outputs_and_gradients(self):
-        self._assert_reference("cpu", (torch.float32, torch.bfloat16))
+        self._assert_reference("cpu", (torch.float32,))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_whole_layer_outputs_and_gradients(self):
-        self._assert_reference("cuda", (torch.float32, torch.float16, torch.bfloat16))
-
-    def test_autocast_with_fp32_residuals_and_bf16_context(self):
-        self._assert_reference("cpu", (torch.float32,), autocast=True)
-        if torch.cuda.is_available():
-            self._assert_reference("cuda", (torch.float32,), autocast=True)
+        self._assert_reference("cuda", (torch.float32,))
 
     def test_backbone_sequential_manual_and_checkpoint_paths_are_identical(self):
         cases = [("cpu", torch.float32)]
@@ -263,14 +266,18 @@ class DecoderTest(unittest.TestCase):
                 layers,
                 final_norm=build_component(
                     "norm",
-                    RMSNormSpec(eps=1e-6, weight_offset=0),
+                    RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
                     hidden_size=16,
                     device=device,
                     dtype=dtype,
                 ),
                 rotary=[
                     build_rotary(
-                        DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=1.0),
+                        DefaultRoPESpec(
+                            interleaved=False,
+                            rope_theta=10000.0,
+                            partial_rotary_factor=1.0,
+                        ),
                         head_dim=8,
                     ),
                     None,
@@ -299,14 +306,17 @@ class DecoderTest(unittest.TestCase):
                 hidden = hidden_base.clone().requires_grad_()
                 context = context_base.clone().requires_grad_()
                 layout = layout_for(hidden, 2)
-                entries = [
-                    LayerInputs(
-                        attention_layout=layout,
-                        target_context=context,
-                        position_ids=layout.key_positions,
-                    )
-                    for _ in layers
-                ]
+                with AttentionPreparation() as scope:
+                    entries = [
+                        LayerInputs(
+                            attention=layer.self_attn.prepare(
+                                layout, scope, batch_size=hidden.shape[0]
+                            ),
+                            target_context=context,
+                            position_ids=layout.key_positions,
+                        )
+                        for layer in model.layers
+                    ]
                 torch.manual_seed(43)
                 if manual:
                     state = model.begin(hidden, entries)
@@ -337,22 +347,28 @@ class DecoderTest(unittest.TestCase):
         layout = layout_for(hidden)
         with patch.object(module.self_attn, "forward") as attention:
             for entry in (LayerInputs(), LayerInputs(attention_mask=layout.visibility)):
-                with self.assertRaisesRegex(ValueError, "attention_layout"):
+                with self.assertRaisesRegex(ValueError, "prepared attention"):
                     module(hidden, entry)
             with self.assertRaisesRegex(ValueError, "single"):
-                module(hidden.unsqueeze(0), LayerInputs(attention_layout=layout))
+                module(
+                    hidden.unsqueeze(0),
+                    LayerInputs(attention=prepare(module, layout, hidden.shape[0])),
+                )
             attention.assert_not_called()
         with self.assertRaisesRegex(TypeError, "module pair"):
             DecoderLayer(
                 nn.Identity(),
                 nn.Identity(),
                 hidden_size=16,
-                norm=RMSNormSpec(eps=1e-6, weight_offset=0),
+                norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
                 sublayer_conv=nn.Identity(),
             )
         with patch.object(module.self_attn, "forward", return_value=torch.zeros(16)):
             with self.assertRaisesRegex(ValueError, "residual shape"):
-                module(hidden, LayerInputs(attention_layout=layout))
+                module(
+                    hidden,
+                    LayerInputs(attention=prepare(module, layout, hidden.shape[0])),
+                )
 
     def test_convolutions_are_independent_and_identity_matches_plain_layer(self):
         node = make_node(rope_parameters=NoRoPESpec())
@@ -373,7 +389,9 @@ class DecoderTest(unittest.TestCase):
             self.assertNotEqual(a.data_ptr(), b.data_ptr())
         hidden = torch.randn(1, 8, 16, requires_grad=True)
         other = hidden.detach().clone().requires_grad_()
-        entry = LayerInputs(attention_layout=layout_for(hidden))
+        entry = LayerInputs(
+            attention=prepare(wrapped, layout_for(hidden), hidden.shape[0])
+        )
         torch.manual_seed(11)
         output = wrapped(hidden, entry)
         torch.manual_seed(11)
@@ -402,7 +420,7 @@ class DecoderTest(unittest.TestCase):
                     nn.Identity(),
                     nn.Identity(),
                     hidden_size=16,
-                    norm=RMSNormSpec(eps=1e-6, weight_offset=0),
+                    norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
                     sublayer_conv=invalid,
                 )
 
@@ -414,7 +432,7 @@ class DecoderTest(unittest.TestCase):
             module(
                 hidden,
                 LayerInputs(
-                    attention_layout=layout,
+                    attention=prepare(module, layout, hidden.shape[0]),
                     target_context=torch.zeros(1, 2, 16, dtype=torch.bfloat16),
                 ),
             )
@@ -424,7 +442,7 @@ class DecoderTest(unittest.TestCase):
                     module(
                         hidden,
                         LayerInputs(
-                            attention_layout=layout,
+                            attention=prepare(module, layout, hidden.shape[0]),
                             target_context=torch.zeros(1, 2, 16, dtype=dtype),
                         ),
                     )

@@ -6,13 +6,18 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.norm import NormSpec
-from specforge.config.draft.rope import RopeSpec, YaRNSpec
+from specforge.config.draft.rope import RopeSpec
 
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
-from .backends import eager_attention
-from .inputs import validate_attention_inputs
-from .masks import AttentionLayout, dense_attention_mask
+from .backends import (
+    AttentionBackend,
+    AttentionPreparation,
+    PreparedAttention,
+    resolve_attention_backend,
+)
+from .masks import AttentionLayout
+from .validation import validate_attention_inputs
 
 
 class MLAAttention(nn.Module):
@@ -31,7 +36,7 @@ class MLAAttention(nn.Module):
         hidden_size: int,
         norm: NormSpec,
         rope: RopeSpec,
-        backend: str,
+        backend: str | AttentionBackend,
         device=None,
         dtype=None,
     ):
@@ -44,14 +49,12 @@ class MLAAttention(nn.Module):
             raise TypeError("norm and rope must be configuration nodes")
         if config.rope_parameters is not None and rope != config.rope_parameters:
             raise ValueError("rope must match the attention RoPE override")
-        rotary_dim = rope.rotary_dim(config.qk_rope_head_dim)
-        if backend != "eager":
-            raise ValueError("MLAAttention currently supports only the eager backend")
+        rotary_dim = rope.rotary_dim(config.rotary_input_dim)
+        self.backend = resolve_attention_backend(backend)
+        self.rope = rope
         self.config = config
         self.rotary_dim = rotary_dim
-        self.scaling = config.qk_head_dim**-0.5
-        if isinstance(rope, YaRNSpec):
-            self.scaling *= rope.mla_qk_scale_multiplier
+        self.scaling = config.qk_head_dim**-0.5 * rope.mla_qk_scale_multiplier
         options = dict(device=device, dtype=dtype)
         if config.q_lora_rank is None:
             self.q_proj = nn.Linear(
@@ -108,25 +111,42 @@ class MLAAttention(nn.Module):
         k_nope, value = kv.split((node.qk_nope_head_dim, node.v_head_dim), dim=-1)
         return k_nope, k_rope, value
 
+    def prepare(
+        self,
+        layout: AttentionLayout,
+        preparation: AttentionPreparation,
+        *,
+        batch_size: int,
+    ) -> PreparedAttention:
+        """Prepare outside the layer loop; equivalent layers share the same result."""
+        return preparation.prepare(
+            self.backend,
+            layout,
+            batch_size=batch_size,
+            num_heads=self.config.num_attention_heads,
+            is_causal=self.config.is_causal,
+            sliding_window=self.config.sliding_window,
+        )
+
     def forward(
         self,
         hidden: Tensor,
         *,
-        layout: AttentionLayout,
+        attention: PreparedAttention,
         position_embeddings: tuple[Tensor, Tensor] | None,
         target_context: Tensor | None = None,
     ) -> Tensor:
         node = self.config
-        context_length = validate_attention_inputs(
+        batch, length, context_length = validate_attention_inputs(
             hidden,
-            layout,
+            attention,
             position_embeddings,
             target_context,
             input_size=self.kv_a_proj_with_mqa.in_features,
-            num_heads=node.num_attention_heads,
+            config=node,
+            backend=self.backend,
             rotary_dim=self.rotary_dim,
         )
-        batch, length = hidden.shape[:2]
         query = (
             self.q_proj(hidden)
             if node.q_lora_rank is None
@@ -150,9 +170,9 @@ class MLAAttention(nn.Module):
             q_rope = apply_rotary(
                 q_rope,
                 (cos[:, context_length:], sin[:, context_length:]),
-                interleaved=node.rope_interleave,
+                interleaved=self.rope.interleaved,
             )
-            k_rope = apply_rotary(k_rope, (cos, sin), interleaved=node.rope_interleave)
+            k_rope = apply_rotary(k_rope, (cos, sin), interleaved=self.rope.interleaved)
         query = torch.cat((q_nope.transpose(1, 2), q_rope), dim=-1)
         key = torch.cat(
             (
@@ -161,24 +181,20 @@ class MLAAttention(nn.Module):
             ),
             dim=-1,
         )
-        mask = dense_attention_mask(
-            layout, is_causal=node.is_causal, sliding_window=node.sliding_window
-        )
-        output = eager_attention(
+        result = attention.attend(
             query,
             key,
-            value.transpose(1, 2).to(query.dtype),
-            attention_mask=mask,
+            value.transpose(1, 2),
             scale=self.scaling,
             dropout_p=node.attention_dropout,
             training=self.training,
         )
         output = self.o_proj(
-            output.transpose(1, 2).reshape(
+            result.output.transpose(1, 2).reshape(
                 batch, length, node.num_attention_heads * node.v_head_dim
             )
         )
-        return output.masked_fill(~mask.any(dim=-1).any(dim=1).unsqueeze(-1), 0)
+        return result.mask_output(output)
 
 
 register_component_builder("attention", MLASpec, MLAAttention)

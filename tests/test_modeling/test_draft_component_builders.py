@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from specforge.config.draft.attention import GQASpec, MHASpec, MLASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import NormSpec, RMSNormSpec
@@ -113,6 +114,22 @@ class ComponentBuilderTest(unittest.TestCase):
             ("norm", RMSNormSpec, {"hidden_size", "device", "dtype"}),
             ("mlp", DenseFFNSpec, {"hidden_size", "device", "dtype"}),
             ("residual", StandardResidualSpec, set()),
+            *(
+                (
+                    "attention",
+                    node,
+                    {
+                        "input_size",
+                        "hidden_size",
+                        "norm",
+                        "rope",
+                        "backend",
+                        "device",
+                        "dtype",
+                    },
+                )
+                for node in (GQASpec, MHASpec, MLASpec)
+            ),
             (
                 "conv",
                 GroupedCausalConvSpec,
@@ -122,7 +139,7 @@ class ComponentBuilderTest(unittest.TestCase):
             constructor = component_builder(kind, node_type.type)
             parameters = inspect.signature(constructor).parameters
             self.assertEqual(set(parameters), {"config"} | extras)
-            self.assertIs(parameters["config"].annotation, node_type)
+            self.assertTrue(issubclass(node_type, parameters["config"].annotation))
             for name in extras:
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
         root = Path(layers.__file__).parent
