@@ -9,7 +9,21 @@ from .llama3 import Llama3RotaryEmbedding
 from .multiaxis import MultiAxisRotaryEmbedding
 from .yarn import YaRNRotaryEmbedding
 
+# Exact types whose tables depend only on (node, head_dim, positions); a
+# subclass may add state, so it is not listed by inheritance.
+NODE_DETERMINED_ROTARY_TYPES = frozenset(
+    {
+        DefaultRotaryEmbedding,
+        DynamicNTKRotaryEmbedding,
+        LinearRotaryEmbedding,
+        Llama3RotaryEmbedding,
+        MultiAxisRotaryEmbedding,
+        YaRNRotaryEmbedding,
+    }
+)
+
 __all__ = [
+    "NODE_DETERMINED_ROTARY_TYPES",
     "DefaultRotaryEmbedding",
     "DynamicNTKRotaryEmbedding",
     "LinearRotaryEmbedding",
