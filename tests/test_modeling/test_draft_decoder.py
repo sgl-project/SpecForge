@@ -24,7 +24,7 @@ from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
 from specforge.modeling.draft.dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
-from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.residual import StandardResidual
@@ -75,7 +75,7 @@ def make_layer(
 
 
 def prepare(module, layout, batch_size):
-    with AttentionPreparation() as scope:
+    with AttentionPreparationScope() as scope:
         return module.self_attn.prepare(layout, scope, batch_size=batch_size)
 
 
@@ -306,7 +306,7 @@ class DecoderTest(unittest.TestCase):
                 hidden = hidden_base.clone().requires_grad_()
                 context = context_base.clone().requires_grad_()
                 layout = layout_for(hidden, 2)
-                with AttentionPreparation() as scope:
+                with AttentionPreparationScope() as scope:
                     entries = [
                         LayerInputs(
                             attention=layer.self_attn.prepare(
@@ -346,7 +346,7 @@ class DecoderTest(unittest.TestCase):
         hidden = torch.randn(1, 3, 16)
         layout = layout_for(hidden)
         with patch.object(module.self_attn, "forward") as attention:
-            for entry in (LayerInputs(), LayerInputs(attention_mask=layout.visibility)):
+            for entry in (LayerInputs(), LayerInputs(attention_layout=layout)):
                 with self.assertRaisesRegex(ValueError, "prepared attention"):
                     module(hidden, entry)
             with self.assertRaisesRegex(ValueError, "single"):

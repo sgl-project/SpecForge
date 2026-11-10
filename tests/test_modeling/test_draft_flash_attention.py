@@ -6,7 +6,7 @@ from dataclasses import replace
 import torch
 
 from specforge.modeling.draft.layers.attention.backends import (
-    AttentionPreparation,
+    AttentionPreparationScope,
     PaddingMask,
     resolve_attention_backend,
 )
@@ -36,9 +36,9 @@ def make_layout(device):
 
 class FlashAttentionTest(unittest.TestCase):
     def test_preparation_and_rejected_layouts(self):
-        backend = resolve_attention_backend("flash_attention_2")
+        backend = resolve_attention_backend("fa")
         layout = make_layout("cpu")
-        with AttentionPreparation() as scope:
+        with AttentionPreparationScope() as scope:
 
             def prepare(value):
                 return scope.prepare(
@@ -96,9 +96,9 @@ class FlashAttentionTest(unittest.TestCase):
                         )
                     ]
                     results = []
-                    for backend in ("eager", "flash_attention_2"):
+                    for backend in ("eager", "fa"):
                         q, k, v = [t.clone().requires_grad_() for t in values]
-                        with AttentionPreparation() as scope:
+                        with AttentionPreparationScope() as scope:
                             prepared = scope.prepare(
                                 resolve_attention_backend(backend),
                                 layout,
@@ -116,7 +116,7 @@ class FlashAttentionTest(unittest.TestCase):
                             training=True,
                             return_lse=True,
                         )
-                        if backend == "flash_attention_2":
+                        if backend == "fa":
                             evaluation = prepared.attend(
                                 q, k, v, scale=32**-0.5, dropout_p=0.5, training=False
                             )

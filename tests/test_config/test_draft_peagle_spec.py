@@ -20,6 +20,7 @@ def peagle_config(**overrides):
                 target_bindings=(),
                 layer_types=("full_dense",) * 4,
                 spec_config=PEagleSpec(
+                    mask_token_id=1,
                     target_features=base.spec_config.target_features,
                     norm_before_residual=False,
                     pad_token_id=None,
@@ -54,6 +55,7 @@ class PEagleSpecTest(unittest.TestCase):
 
     def test_features_can_have_a_different_width_when_embeddings_are_unbound(self):
         spec = PEagleSpec(
+            mask_token_id=1,
             target_features=AuxiliaryFeatureSpec(
                 target_layer_ids=(1, 2, 3), hidden_size=48
             ),

@@ -1,6 +1,8 @@
 """Multi-axis section selection is internal to rotary preparation."""
 
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -103,6 +105,50 @@ class MultiAxisRotaryTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_eagle_outputs_and_gradients(self):
         self._assert_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
+
+    def test_interleaved_axes_match_transformers_and_text_positions(self):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import (
+            Qwen3_5TextRotaryEmbedding,
+        )
+
+        node = replace(multiaxis_node(0.25, (11, 11, 10)), mrope_interleaved=True)
+        module = build_rotary(node, head_dim=256)
+        positions = torch.arange(9).reshape(3, 1, 3)
+        hidden = torch.empty(1, 3, 256)
+        frequencies = module.frequencies(hidden.device)
+        phases = positions.float().unsqueeze(-1) * frequencies
+        expected = Qwen3_5TextRotaryEmbedding.recomposition_frequencies(
+            SimpleNamespace(mrope_section=node.mrope_section), phases
+        )
+        torch.testing.assert_close(
+            module(hidden, positions), (expected.cos(), expected.sin()), rtol=0, atol=0
+        )
+        default = build_rotary(
+            DefaultRoPESpec(
+                interleaved=False,
+                rope_theta=node.rope_theta,
+                partial_rotary_factor=0.25,
+            ),
+            head_dim=256,
+        )
+        torch.testing.assert_close(
+            module(hidden, positions[0]), default(hidden, positions[0]), rtol=0, atol=0
+        )
+
+    def test_meta_forward(self):
+        for node in (
+            multiaxis_node(),
+            replace(multiaxis_node(), mrope_interleaved=True),
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+            ),
+        ):
+            module = build_rotary(node, head_dim=128)
+            positions = torch.empty(2, 4, dtype=torch.long, device="meta")
+            for table in module(torch.empty(2, 4, 128, device="meta"), positions):
+                self.assertTrue(table.is_meta)
+                self.assertEqual(table.shape, (2, 4, 128))
+                self.assertEqual(table.dtype, torch.float32)
 
     def test_text_positions_reduce_to_default_full_and_partial_rotary(self):
         positions = torch.tensor([[0, 17, 65535], [3, 4, 7]])

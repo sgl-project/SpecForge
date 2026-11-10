@@ -225,6 +225,34 @@ class RotaryTest(unittest.TestCase):
             backbone.begin(hidden, [inputs[0], LayerInputs(position_ids=positions + 1)])
             self.assertEqual(second.call_count, 1)
 
+    def test_backbone_memo_compiles_with_fresh_positions(self):
+        from torch._dynamo.testing import CompileCounter
+
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+        )
+        backbone = DraftBackbone(
+            [RotaryLayer(), RotaryLayer()],
+            final_norm=nn.Identity(),
+            rotary=[DefaultRotaryEmbedding(node, head_dim=8) for _ in range(2)],
+            residual=StandardResidual(StandardResidualSpec()),
+        )
+
+        def forward(hidden, positions):
+            return backbone(hidden, [LayerInputs(position_ids=positions)] * 2)
+
+        torch._dynamo.reset()
+        counter = CompileCounter()
+        compiled = torch.compile(forward, backend=counter, fullgraph=True)
+        for i in range(6):
+            hidden, positions = torch.randn(1, 3, 8), (torch.arange(3) + i)[None]
+            torch.testing.assert_close(
+                compiled(hidden, positions), forward(hidden, positions)
+            )
+        self.assertLessEqual(
+            counter.frame_count, 2
+        )  # Cold and populated frequency cache.
+
     def test_invalid_dimensions_and_layouts_fail(self):
         node = DefaultRoPESpec(
             interleaved=False, rope_theta=10000.0, partial_rotary_factor=0.5

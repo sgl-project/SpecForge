@@ -23,7 +23,12 @@ _DECODERS = {
 
 
 def decode_legacy_config(
-    payload: Mapping, *, target_config: Mapping, capture_layers=None
+    payload: Mapping,
+    *,
+    target_config: Mapping,
+    capture_layers=None,
+    mask_token_id=None,
+    norm_before_residual=None,
 ):
     if not isinstance(payload, Mapping):
         raise ValueError("legacy draft must be a configuration object")
@@ -49,7 +54,19 @@ def decode_legacy_config(
         raise ValueError(
             f"unsupported legacy architectures; expected one of {sorted(_DECODERS)}"
         )
-    if architecture in {"LlamaForCausalLMEagle3", "PEagleDraftModel"}:
+    if architecture == "PEagleDraftModel":
+        return decode_peagle(
+            payload,
+            target_config=target_config,
+            capture_layers=capture_layers,
+            mask_token_id=mask_token_id,
+            norm_before_residual=norm_before_residual,
+        )
+    if mask_token_id is not None or norm_before_residual is not None:
+        raise ValueError(
+            "recorded mask/residual settings are only supported for legacy P-EAGLE"
+        )
+    if architecture == "LlamaForCausalLMEagle3":
         return _DECODERS[architecture](
             payload, target_config=target_config, capture_layers=capture_layers
         )

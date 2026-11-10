@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 from ..._validation import finite_number, positive_number
 from ..components import decode_component
+from .auxiliary import _DEFAULTS
 from .context import _check_fields
 from .rules import resolve_alias
 
@@ -39,8 +40,14 @@ def resolve_eagle_rope(payload: Mapping):
 
     def normalize(source):
         values = dict(source)
-        alias = {"rope_type": values.pop("type")} if "type" in values else {}
-        kind = resolve_alias("rope_type", values, alias, default="default")
+        legacy_type = values.pop("type", None)
+        # Match the old model: rope_type takes precedence over the HF alias.
+        kind = values.get("rope_type", legacy_type)
+        if kind is None:
+            kind = "default"
+        if kind != "mrope":
+            values.pop("mrope_section", None)
+            values.pop("mrope_interleaved", None)
         if type(kind) is not str or kind not in _PARAMETERS:
             raise ValueError(f"unsupported EAGLE rope_type {kind!r}")
         _check_fields(
@@ -58,29 +65,25 @@ def resolve_eagle_rope(payload: Mapping):
             # LlamaConfig fills this before constructing the historical model.
             values.setdefault(
                 "original_max_position_embeddings",
-                payload.get("max_position_embeddings", 2048),
+                payload.get(
+                    "max_position_embeddings", _DEFAULTS["max_position_embeddings"]
+                ),
             )
         if kind == "linear":
             result["factor"] = values.get("factor")
         elif kind == "mrope":
+            if values.get("mrope_interleaved", False) or "factor" in values:
+                raise ValueError(
+                    "legacy EAGLE mrope does not support interleaving or factor"
+                )
             result["mrope_section"] = values.get("mrope_section")
             # Historical EAGLE always used contiguous sections.
             result["mrope_interleaved"] = False
         elif kind == "llama3":
-            frequency_fields = (
-                "low_freq_factor",
-                "high_freq_factor",
-                "original_max_position_embeddings",
-            )
-            if any(values.get(name) is None for name in frequency_fields):
-                # LlamaRotaryEmbedding applies this scaling only when all
-                # frequency parameters are present.
-                result["rope_type"] = "default"
-            else:
-                result.update({name: values[name] for name in frequency_fields})
-                result["factor"] = (
-                    1.0 if values.get("factor") is None else values["factor"]
-                )
+            for name in _PARAMETERS["llama3"]:
+                if values.get(name) is None:
+                    raise ValueError(f"legacy llama3 RoPE requires {name}")
+                result[name] = values[name]
         elif kind == "yarn":
             factor = values.get("factor")
             positive_number("factor", factor)

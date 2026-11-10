@@ -13,6 +13,12 @@ from specforge.config.draft.rope import DefaultRoPESpec, LinearRoPESpec
 
 
 class LegacyRulesTest(unittest.TestCase):
+    def test_legacy_rope_rejects_interleaved_instead_of_overwriting_it(self):
+        for field in ("rope_parameters", "rope_scaling"):
+            for value in (True, False):
+                with self.assertRaisesRegex(ValueError, "interleaved"):
+                    resolve_rope({field: {"interleaved": value}})
+
     def test_aliases_reject_conflicts_instead_of_choosing_a_winner(self):
         self.assertEqual(
             resolve_alias("block_size", {"block_size": 8}, {"block_size": 8}), 8
@@ -52,11 +58,28 @@ class LegacyRulesTest(unittest.TestCase):
                 interleaved=False, rope_theta=10000, partial_rotary_factor=1
             ),
         )
-        self.assertEqual(
-            resolve_rope({"partial_rotary_factor": 0.5}).partial_rotary_factor, 0.5
-        )
         with self.assertRaisesRegex(ValueError, "missing fields"):
             decode_component("rope", {"rope_type": "default"})
+
+    def test_partial_rotation_requires_explicit_legacy_scaling(self):
+        for source in (
+            {"partial_rotary_factor": 0.5},
+            {"rope_parameters": {"rope_type": "default", "partial_rotary_factor": 0.5}},
+            {"rope_scaling": {"type": "default", "partial_rotary_factor": 0.5}},
+        ):
+            with self.assertRaisesRegex(ValueError, "legacy default RoPE"):
+                resolve_rope(source)
+        for kind in ("linear", "yarn"):
+            rope = resolve_rope(
+                {
+                    "rope_scaling": {
+                        "rope_type": kind,
+                        "factor": 2,
+                        "partial_rotary_factor": 0.5,
+                    }
+                }
+            )
+            self.assertEqual(rope.partial_rotary_factor, 0.5)
 
     def test_rotary_conflicts_and_unsupported_settings_fail(self):
         for payload in (
@@ -103,6 +126,8 @@ class LegacyRulesTest(unittest.TestCase):
         self.assertEqual(payload, original)
 
     def test_qwen3_layout_defaults_are_expanded(self):
+        layers, _ = resolve_attention_layout({"use_sliding_window": True}, 30)
+        self.assertEqual(layers, ("full_attention",) * 28 + ("sliding_attention",) * 2)
         layers, settings = resolve_attention_layout({}, 2)
         self.assertEqual(layers, ("full_attention", "full_attention"))
         self.assertEqual(settings, {"full_attention": (False, None)})

@@ -66,6 +66,13 @@ class TargetSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
             parse_draft(payload, target_config=TARGET)
 
+    def test_bound_tables_require_the_target_width_to_equal_the_draft_width(self):
+        payload = encode_config(draft_config())
+        payload["spec_config"]["target_features"]["hidden_size"] = 64
+        for reader in (parse_draft, decode_config):
+            with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
+                reader(payload, target_config=None)
+
     def test_registration_requires_an_explicit_target_validator(self):
         @dataclass(frozen=True)
         class MissingTargetCheck(ArchitectureSpec):
@@ -160,7 +167,7 @@ class TargetSettingsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     decode_config(payload, target_config={**TARGET, name: value})
         for name in ("hidden_size", "vocab_size"):
-            with self.assertRaisesRegex(ValueError, name):
+            with self.assertRaisesRegex(ValueError, f"bound target {name}"):
                 decode_config(payload, target_config={**TARGET, name: 128})
         with self.assertRaisesRegex(ValueError, "target_layer_ids"):
             decode_config(payload, target_config={**TARGET, "num_hidden_layers": 3})

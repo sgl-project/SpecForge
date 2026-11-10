@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor, nn
 
-from specforge.config.draft._validation import positive_int
+from specforge.config.draft._validation import boolean, positive_int
 from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.norm import NormSpec
 from specforge.config.draft.rope import RopeSpec
@@ -12,7 +12,7 @@ from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
 from .backends import (
     AttentionBackend,
-    AttentionPreparation,
+    AttentionPreparationScope,
     PreparedAttention,
     resolve_attention_backend,
 )
@@ -37,6 +37,7 @@ class MLAAttention(nn.Module):
         norm: NormSpec,
         rope: RopeSpec,
         backend: str | AttentionBackend,
+        training: bool = True,
         device=None,
         dtype=None,
     ):
@@ -53,6 +54,7 @@ class MLAAttention(nn.Module):
         self.backend = resolve_attention_backend(backend)
         self.rope = rope
         self.config = config
+        self.train(training)  # Validate the backend before allocating parameters.
         self.rotary_dim = rotary_dim
         self.scaling = config.qk_head_dim**-0.5 * rope.mla_qk_scale_multiplier
         options = dict(device=device, dtype=dtype)
@@ -98,6 +100,17 @@ class MLAAttention(nn.Module):
             **options,
         )
 
+        self.train(training)
+
+    def train(self, mode: bool = True):
+        boolean("training", mode)
+        self.backend.validate(
+            head_dim=self.config.qk_head_dim,
+            value_head_dim=self.config.v_head_dim,
+            dropout_p=self.config.attention_dropout if mode else 0.0,
+        )
+        return super().train(mode)
+
     def _project_kv(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         node = self.config
         latent, k_rope = self.kv_a_proj_with_mqa(hidden).split(
@@ -114,7 +127,7 @@ class MLAAttention(nn.Module):
     def prepare(
         self,
         layout: AttentionLayout,
-        preparation: AttentionPreparation,
+        preparation: AttentionPreparationScope,
         *,
         batch_size: int,
     ) -> PreparedAttention:

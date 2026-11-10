@@ -32,6 +32,24 @@ class SGLangRotaryTest(unittest.TestCase):
             )
         )
 
+    def test_interleaved_multiaxis_matches_serving(self):
+        from dataclasses import replace
+
+        from sglang.srt.layers.rotary_embedding.mrope import apply_interleaved_rope
+
+        from tests.test_modeling.test_draft_multiaxis_rotary import multiaxis_node
+
+        node = replace(multiaxis_node(0.25, (11, 11, 10)), mrope_interleaved=True)
+        module = build_rotary(node, head_dim=256)
+        positions = torch.arange(9, device="cuda").reshape(3, 1, 3)
+        hidden = torch.empty(1, 3, 256, device="cuda")
+        phases = positions.float().unsqueeze(-1) * module.frequencies(hidden.device)
+        phases = apply_interleaved_rope(phases, node.mrope_section)
+        phases = torch.cat((phases, phases), -1)
+        torch.testing.assert_close(
+            module(hidden, positions), (phases.cos(), phases.sin()), rtol=0, atol=0
+        )
+
     def test_tables_and_rotation_match_serving_reference(self):
         from sglang.srt.layers.rotary_embedding.base import (
             LinearScalingRotaryEmbedding,

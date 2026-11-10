@@ -64,7 +64,7 @@ class DraftBackbone(nn.Module):
         if len(layer_inputs) != self.num_layers:
             raise ValueError("layer_inputs must contain one entry per layer")
         prepared = []
-        rotary_tables = {}
+        rotary_tables = []
         hidden = self.residual.expand(hidden)
         for inputs, rotary in zip(layer_inputs, self.rotary):
             if not isinstance(inputs, LayerInputs):
@@ -74,15 +74,19 @@ class DraftBackbone(nn.Module):
                     raise ValueError("rotary preparation requires position_ids")
                 # Built-in rotary modules are determined by their frozen node.
                 # Unknown modules share only when the module itself is shared.
-                rule = (
-                    (type(rotary), rotary.config, rotary.head_dim)
-                    if isinstance(rotary, RotaryEmbedding)
-                    else id(rotary)
-                )
-                key = (rule, id(inputs.position_ids))
-                if key not in rotary_tables:
-                    rotary_tables[key] = rotary(hidden, inputs.position_ids)
-                inputs = replace(inputs, position_embeddings=rotary_tables[key])
+                for cached, positions, tables in rotary_tables:
+                    same_rule = cached is rotary or (
+                        isinstance(rotary, RotaryEmbedding)
+                        and type(cached) is type(rotary)
+                        and cached.config == rotary.config
+                        and cached.head_dim == rotary.head_dim
+                    )
+                    if same_rule and positions is inputs.position_ids:
+                        break
+                else:
+                    tables = rotary(hidden, inputs.position_ids)
+                    rotary_tables.append((rotary, inputs.position_ids, tables))
+                inputs = replace(inputs, position_embeddings=tables)
             prepared.append(inputs)
         return BackboneState(hidden, tuple(prepared), 0, self._state_owner)
 

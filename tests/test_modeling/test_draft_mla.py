@@ -16,7 +16,7 @@ from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec, YaRNSpec
 from specforge.modeling.draft.dflash import Qwen3DFlashMLAAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, MLAAttention, build_component
-from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.rope import build_rotary
@@ -58,11 +58,26 @@ def build(node, rope, *, backend="eager", **options):
 
 
 def prepare(module, layout, batch_size):
-    with AttentionPreparation() as scope:
+    with AttentionPreparationScope() as scope:
         return module.prepare(layout, scope, batch_size=batch_size)
 
 
 class MLATest(unittest.TestCase):
+    def test_backend_limits_fail_before_allocation(self):
+        for backend, message in (
+            ("flex_attention", "dropout"),
+            ("fa", "head dimensions"),
+        ):
+            with patch("torch.nn.Linear") as allocate:
+                with self.assertRaisesRegex(ValueError, message):
+                    build(mla_node(), NoRoPESpec(), backend=backend)
+                allocate.assert_not_called()
+        module = build(
+            mla_node(), NoRoPESpec(), backend="flex_attention", training=False
+        )
+        with self.assertRaisesRegex(ValueError, "dropout"):
+            module.train()
+
     def _parity(self, device, dtypes, autocast=False):
         for rank, interleaved, rope_kind in (
             (None, False, "default"),
@@ -295,7 +310,7 @@ class MLATest(unittest.TestCase):
             qk_nope_head_dim=16, qk_rope_head_dim=16, v_head_dim=16, attention_dropout=0
         )
         eager = build(node, NoRoPESpec(), device="cuda")
-        flex = build(node, NoRoPESpec(), backend="flex", device="cuda")
+        flex = build(node, NoRoPESpec(), backend="flex_attention", device="cuda")
         flex.load_state_dict(eager.state_dict())
         hidden = torch.randn(1, 4, 16, device="cuda")
         layout = replace(
@@ -321,7 +336,7 @@ class MLATest(unittest.TestCase):
         gqa = build_gqa(make_node(sliding_window=3))
         mla = build(mla_node(), NoRoPESpec())
         layout = layout_for(torch.randn(1, 4, 16))
-        with AttentionPreparation() as scope:
+        with AttentionPreparationScope() as scope:
             self.assertIs(
                 gqa.prepare(layout, scope, batch_size=1),
                 mla.prepare(layout, scope, batch_size=1),
