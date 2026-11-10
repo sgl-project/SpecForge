@@ -328,6 +328,7 @@ class SpecCaptureSink:
         self._control_listener: Optional[socket.socket] = None
         self._lock = threading.Lock()
         self._uncertain_publications = []
+        self._uncertain_lock = threading.Lock()
         self._closed = False
         self.require_hard_pin = False
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
@@ -475,8 +476,16 @@ class SpecCaptureSink:
         future.add_done_callback(report_failure)
         return future
 
+    def _uncertain_snapshot(self):
+        with self._uncertain_lock:
+            return tuple(self._uncertain_publications)
+
+    def _retain_uncertain(self, item):
+        with self._uncertain_lock:
+            self._uncertain_publications.append(item)
+
     def _discard_keys(self, keys: List[str]) -> None:
-        if any(set(keys).intersection(item["keys"]) for item in self._uncertain_publications):
+        if any(set(keys).intersection(item["keys"]) for item in self._uncertain_snapshot()):
             raise CaptureWriterUncertain("cannot remove objects before native writer drain")
         if self._nvlink is not None:
             self._nvlink.free(keys)
@@ -527,7 +536,20 @@ class SpecCaptureSink:
                 diagnostic = {"p0_v1_sink_batch_id": sequence,
                               "p0_v1_sink_batch_samples": len(samples),
                               "p0_v1_sink_enqueue_ns": time.monotonic_ns()}
-        future = self._executor.submit(self._put_ready_samples, list(samples), ready_event, diagnostic)
+        owned = list(samples)
+        # submit() may enqueue and then fail while starting a worker. Keep a
+        # separate immutable owner: the accepted worker clears its own list.
+        retained = tuple(owned)
+        keys = tuple(sample_object_key(spec, str(name))
+                     for spec, _, _ in retained
+                     for name in [*(spec.get("features") or {}).values(),
+                                  *(item["name"] for item in spec.get("passthrough") or [])])
+        try:
+            future = self._executor.submit(self._put_ready_samples, owned, ready_event, diagnostic)
+        except BaseException as exc:
+            self._retain_uncertain({"samples": retained, "keys": keys,
+                                    "registered": (), "acceptance_unknown": True})
+            raise CaptureWriterUncertain("capture enqueue acceptance unknown: " + str(exc)) from None
         # Scalar-only metadata: never retain another tensor/owner reference.
         # The worker finishes writing it before the Future becomes done.
         if diagnostic is not None:
@@ -560,7 +582,7 @@ class SpecCaptureSink:
     def close(self) -> None:
         self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=False)
-        if self._uncertain_publications:
+        if self._uncertain_snapshot():
             raise RuntimeError("capture sink retains native writes whose drain is unproven")
         if self._control_listener is not None and self._nvlink is None:
             self._control_listener.close()
@@ -577,7 +599,7 @@ class SpecCaptureSink:
         """
         if not samples:
             return []
-        if self._uncertain_publications:
+        if self._uncertain_snapshot():
             raise CaptureWriterUncertain("capture native writer is quarantined")
 
         store = None if nvlink_enabled() else self._connect()
@@ -748,7 +770,7 @@ class SpecCaptureSink:
             if (getattr(exc, "capture_writer_drained", True) is False
                     or (submitted and not isinstance(exc, _DrainedWriteFailure))):
                 quarantined = True
-                self._uncertain_publications.append({"tensors": tensors, "keys": keys,
+                self._retain_uncertain({"tensors": tensors, "keys": keys,
                     "registered": tuple(registered), "bytes": sum(sizes)})
                 raise CaptureWriterUncertain(str(exc)) from None
             self._remove_many_quiet(keys)
