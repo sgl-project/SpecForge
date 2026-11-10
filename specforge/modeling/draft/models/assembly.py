@@ -50,9 +50,9 @@ def build_decoder_backbone(
         raise ValueError("decoder assembly currently requires standard residuals")
     if backend != "eager":
         raise ValueError("decoder assembly currently supports only the eager backend")
-    input_width = getattr(config.spec_config, "attention_input_width", None)
-    if input_width is not None and any(
-        input_width(config.hidden_size, index) != config.hidden_size
+    if any(
+        config.spec_config.attention_input_width(config.hidden_size, index)
+        != config.hidden_size
         for index in range(config.num_hidden_layers)
     ):
         raise ValueError(
@@ -79,6 +79,8 @@ def build_decoder_backbone(
         )
         for node, rope in zip(attentions, ropes)
     ]
+    protocol = config.spec_config.protocol
+    block_size = None if protocol is None else protocol.num_model_slots
     options = dict(hidden_size=config.hidden_size, device=device, dtype=dtype)
     layers = []
     for layer, attention, rope in zip(definitions, attentions, ropes):
@@ -88,7 +90,7 @@ def build_decoder_backbone(
                 build_component(
                     "conv",
                     config.conv_configs[layer.sublayer_conv],
-                    block_size=config.spec_config.protocol.num_model_slots,
+                    block_size=block_size,
                     **options,
                 )
                 for _ in range(2)

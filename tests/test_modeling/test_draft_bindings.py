@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import dataclass
+from tempfile import TemporaryDirectory
 from typing import ClassVar
 from unittest.mock import patch
 
@@ -15,11 +16,22 @@ from specforge.config.draft.logits import (
     NoLogitTransformSpec,
     TargetLogitSpec,
 )
-from specforge.config.draft.registry import register_component_schema
+from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.modeling.draft.bindings import BoundEmbedding, BoundLMHead
 from specforge.modeling.draft.layers.logits import TargetLogitTransform
-from specforge.modeling.draft.layers.registry import register_component_builder
-from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
+from specforge.modeling.draft.layers.registry import (
+    _BUILDERS,
+    register_component_builder,
+)
+from specforge.modeling.draft.pretrained import DraftPreTrainedModel
+from tests.test_modeling.test_draft_pretrained import model_config
+
+
+class DFlashDraftModel(DraftPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.tokens = owner()
+        self.post_init()
 
 
 def owner():
@@ -42,6 +54,8 @@ class RowNormalizedHead(TargetLogitTransform):
 
 class BindingTest(unittest.TestCase):
     def test_registered_transform_preserves_full_and_weight_based_scoring(self):
+        self.enterContext(patch.dict(_SCHEMAS))
+        self.enterContext(patch.dict(_BUILDERS))
         register_component_schema("logits", RowNormalizedSpec)
         config = decode_component("logits", {"type": RowNormalizedSpec.type})
         with self.assertRaisesRegex(ValueError, "no modeling builder"):
@@ -55,7 +69,7 @@ class BindingTest(unittest.TestCase):
             head.load_target_weight(source)
             torch.testing.assert_close(head(hidden), F.linear(hidden, expected))
             torch.testing.assert_close(
-                F.embedding(torch.tensor([0, 3]), head.weight), expected[[0, 3]]
+                F.embedding(torch.tensor([0, 3]), head.bound_weight()), expected[[0, 3]]
             )
         self.assertIs(head.logit_transform.config, config)
         self.assertEqual(head.state_dict(), {})
@@ -168,6 +182,45 @@ class BindingTest(unittest.TestCase):
         torch.testing.assert_close(
             head.weight, torch.ones_like(head.weight), rtol=0, atol=0
         )
+
+    def test_restore_materializes_bound_modules_without_binding(self):
+        model = DFlashDraftModel(model_config())
+        with TemporaryDirectory() as directory:
+            model.save_pretrained(directory)
+            restored = DFlashDraftModel.from_pretrained(directory)
+        restored.to("cpu")
+        torch.testing.assert_close(
+            restored.tokens.proj.weight, model.tokens.proj.weight
+        )
+        for module in (restored.tokens.embed_tokens, restored.tokens.lm_head):
+            self.assertFalse(module.weight.is_meta)
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                module.bound_weight()
+            module.load_target_weight(torch.ones(16, 8))
+            torch.testing.assert_close(module.bound_weight(), torch.ones(16, 8))
+
+    def test_dtype_and_storage_changes_require_rebinding(self):
+        source = torch.full((4, 2), 0.9)
+        head = BoundLMHead(
+            MuPLogitTransformSpec(multiplier=3), vocab_size=4, hidden_size=2
+        )
+        head.load_target_weight(source)
+        head.float()  # A no-op preserves the binding.
+        self.assertIs(head.bound_weight(), head.weight)
+        for move in (
+            lambda: head.bfloat16(),
+            lambda: head.to_empty(device="cpu"),
+            lambda: head.to("meta").to_empty(device="cpu"),
+        ):
+            move()
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                head.bound_weight()
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                head(torch.ones(1, 2, dtype=head.weight.dtype))
+            head.load_target_weight(source)
+            torch.testing.assert_close(
+                head.bound_weight(), source.to(head.weight.dtype) / 3, rtol=0, atol=0
+            )
 
     def test_invalid_binding_does_not_change_installed_weight(self):
         embedding = BoundEmbedding(16, 8)

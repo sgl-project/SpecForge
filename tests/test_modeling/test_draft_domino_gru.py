@@ -55,8 +55,31 @@ class DominoGRUTest(unittest.TestCase):
                         embeddings = torch.randn_like(hidden, requires_grad=True)
                         other_hidden = hidden.detach().clone().requires_grad_()
                         other_embeddings = embeddings.detach().clone().requires_grad_()
-                        expected = legacy.compute_correction_logits(
-                            prev_token_embeddings=embeddings, hidden_states=hidden
+                        # Independent alignment reference from the original Domino path.
+                        prefix_tokens = embeddings if shifted else embeddings[:, :, :-1]
+                        states = legacy.prefix_gru(
+                            prefix_tokens.reshape(-1, prefix_tokens.shape[-2], 4)
+                        )[0]
+                        states = states.reshape(2, 2, prefix_tokens.shape[-2], 3)
+                        start = (
+                            legacy.suffix_start if shifted else legacy.suffix_start - 1
+                        )
+                        expected = legacy.embed_proj(
+                            torch.cat(
+                                (
+                                    hidden[:, :, legacy.suffix_start :],
+                                    states[:, :, start:],
+                                ),
+                                -1,
+                            )
+                        )
+                        torch.testing.assert_close(
+                            legacy.compute_correction_logits(
+                                prev_token_embeddings=embeddings, hidden_states=hidden
+                            ),
+                            expected,
+                            rtol=0,
+                            atol=0,
                         )
                         actual = head(
                             other_hidden[:, :, legacy.suffix_start :],

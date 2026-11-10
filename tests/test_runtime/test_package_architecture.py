@@ -274,7 +274,6 @@ DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/core/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
-    "specforge/modeling/__init__.py",
     "specforge/modeling/target/__init__.py",
 )
 

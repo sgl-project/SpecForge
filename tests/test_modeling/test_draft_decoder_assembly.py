@@ -2,21 +2,28 @@
 
 import copy
 import unittest
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import ClassVar
 from unittest.mock import patch
 
 import torch
 
 from specforge.config.draft.architecture import DFlash2Spec
-from specforge.config.draft.conv import GroupedCausalConvSpec
+from specforge.config.draft.conv import ConvSpec, GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.layers import GQAAttention, MLAAttention
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from specforge.modeling.draft.layers.registry import _BUILDERS
+from specforge.modeling.draft.layers.registry import (
+    _BUILDERS,
+    register_component_builder,
+)
 from specforge.modeling.draft.models.assembly import build_decoder_backbone
+from specforge.modeling.draft.models.eagle_backbone import build_eagle_backbone
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_eagle3_spec import eagle_config
+from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_config.test_draft_peagle_spec import peagle_config
 from tests.test_modeling.test_draft_gqa import layout_for
 from tests.test_modeling.test_draft_mla import mla_node
@@ -191,6 +198,47 @@ class DecoderAssemblyTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "no modeling builder"):
                     build_decoder_backbone(config, backend="eager")
                 allocate.assert_not_called()
+
+    def test_protocol_less_conv_is_explicit_and_eagle_rejects_it(self):
+        @dataclass(frozen=True, kw_only=True)
+        class SlotlessConvSpec(ConvSpec):
+            type: ClassVar[str] = "test_slotless"
+
+        class SlotlessConv(torch.nn.Module):
+            def __init__(self, config, *, block_size, **kwargs):
+                super().__init__()
+                self.config = config
+                if block_size is not None:
+                    raise ValueError("expected no block protocol")
+
+            def prepare(self, hidden):
+                return hidden, None
+
+            def finish(self, hidden, coefficients):
+                return hidden
+
+        with patch.dict(_SCHEMAS), patch.dict(_BUILDERS):
+            register_component_schema("conv", SlotlessConvSpec)
+            register_component_builder("conv", SlotlessConvSpec, SlotlessConv)
+            for base in (mtp_config(), eagle_config(), peagle_config()):
+                config = replace(
+                    base,
+                    conv_configs={"slotless": SlotlessConvSpec()},
+                    layer_configs={
+                        name: replace(layer, sublayer_conv="slotless")
+                        for name, layer in base.layer_configs.items()
+                    },
+                )
+                if config.architecture == "MTPDraftModel":
+                    model = build_decoder_backbone(config, backend="eager")
+                    self.assertIsInstance(model.layers[0].attention_conv, SlotlessConv)
+                else:
+                    with patch("torch.nn.Linear") as allocate:
+                        with self.assertRaisesRegex(
+                            ValueError, "does not support sublayer_conv"
+                        ):
+                            build_eagle_backbone(config, backend="eager")
+                        allocate.assert_not_called()
 
     def test_nonstandard_fusion_and_unsupported_backend_fail_early(self):
         with patch("torch.nn.Linear") as allocate:
