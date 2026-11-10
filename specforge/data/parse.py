@@ -646,7 +646,9 @@ class MuseParser(ThinkingParser):
     - ``to=<tool name>`` tool-call arguments, closed by ``<|eom|>`` or ``<|eot|>``
     - ``to=user`` final answer, closed by ``<|eot|>``
 
-    Each of those interiors is supervised, and so is its closing token. The
+    Each of those interiors is supervised, and so is its closing token. A
+    final span cut off by the generation length cap has no closing token; it
+    is supervised up to the end of the text, and no closer is added. The
     ``<|start|>assistant to=…<|message|>`` prefix is not. System, user, and
     tool-result turns stay unsupervised.
 
@@ -673,9 +675,7 @@ class MuseParser(ThinkingParser):
 
     def set_assistant_pattern(self, chat_template: ChatTemplate):
         del chat_template
-        self.assistant_pattern = (
-            r"<\|start\|>assistant to=.*?<\|message\|>([\s\S]*?(?:<\|eom\|>|<\|eot\|>))"
-        )
+        self.assistant_pattern = r"<\|start\|>assistant to=.*?<\|message\|>([\s\S]*?(?:<\|eom\|>|<\|eot\|>|$))"
 
     def _select_matches(self, matches, conversation, train_only_last_turn):
         if not train_only_last_turn or not matches:
