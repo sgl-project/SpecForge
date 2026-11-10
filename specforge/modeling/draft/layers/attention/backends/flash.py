@@ -20,6 +20,12 @@ def _unpad_metadata(valid):
     return indices, cumulative, int(lengths.max().item())
 
 
+def _reject_lse_gradient(grad):
+    raise NotImplementedError(
+        "FlashAttention does not backpropagate through LSE; use eager or Flex"
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class FlashMask:
     query_indices: Tensor
@@ -143,4 +149,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             lse = lse.view(heads, batch, length).transpose(0, 1)
             lse = lse.masked_fill(~mask.active_queries[:, None, :], -torch.inf)
+            if lse.requires_grad:
+                # flash_attn's varlen backward silently drops the LSE gradient
+                lse.register_hook(_reject_lse_gradient)
         return padded.view(batch, length, heads, width).transpose(1, 2), lse

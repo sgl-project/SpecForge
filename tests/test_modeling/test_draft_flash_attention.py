@@ -110,6 +110,19 @@ class FlashAttentionTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(tensor.grad).all())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_loss_through_lse_fails_loudly(self):
+        """flash_attn drops the LSE gradient, so a loss through LSE must not train."""
+        torch.manual_seed(6)
+        prepared = prepare_causal_flash(make_layout("cuda"))
+        values = make_inputs(prepared.layout, torch.bfloat16)
+        result = prepared.attend(
+            *values, scale=32**-0.5, dropout_p=0, training=True, return_lse=True
+        )
+        result.output.float().sum().backward(retain_graph=True)
+        with self.assertRaisesRegex(NotImplementedError, "LSE"):
+            torch.where(result.lse.isfinite(), result.lse, 0).sum().backward()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_output_lse_and_gradients(self):
         # Import failures on a CUDA test runner must not silently skip the backend.
         import flash_attn
