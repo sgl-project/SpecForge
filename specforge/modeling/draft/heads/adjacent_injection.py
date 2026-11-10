@@ -69,6 +69,9 @@ class AdjacentInjection(nn.Module):
             init.zeros_(write.weight)
         init.zeros_(self.predecessor_gate.weight)
 
+    def code(self, token_ids: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        return math.sqrt(self.rank) * F.embedding(token_ids, codes)
+
     def feature(self, hidden: torch.Tensor, layer: int) -> torch.Tensor:
         projected = self.readouts[layer](hidden)
         return (math.sqrt(self.rank) * F.normalize(projected.float(), dim=-1)).to(
@@ -105,10 +108,10 @@ class AdjacentInjection(nn.Module):
         replace: torch.Tensor | None = None,
     ) -> torch.Tensor:
         features = self.feature(hidden, layer)
-        anchor = math.sqrt(self.rank) * F.embedding(token_ids[..., :1], codes)
+        anchor = self.code(token_ids[..., :1], codes)
         predecessors = torch.cat((anchor, features[..., 1:-1, :]), dim=-2)
         if replace is not None:
-            correct = math.sqrt(self.rank) * F.embedding(token_ids[..., :-1], codes)
+            correct = self.code(token_ids[..., :-1], codes)
             predecessors = torch.where(replace[..., None, None], correct, predecessors)
         successors = self.write(
             hidden[..., 1:, :], features[..., 1:, :], predecessors, layer

@@ -1,10 +1,18 @@
 """Assemble owned or target-bound token modules without changing their names."""
 
-from torch import nn
+import torch.nn.functional as F
+from torch import Tensor, nn
 
 from specforge.config.draft import DraftConfig
 
 from ..bindings import BoundEmbedding, BoundLMHead
+
+
+class LMHead(nn.Linear):
+    """Owned vocabulary projection with the same candidate API as BoundLMHead."""
+
+    def candidate_weights(self, token_ids: Tensor) -> Tensor:
+        return F.embedding(token_ids, self.weight)
 
 
 def build_token_modules(config: DraftConfig, *, device=None, dtype=None):
@@ -23,8 +31,6 @@ def build_token_modules(config: DraftConfig, *, device=None, dtype=None):
             **options,
         )
         if "lm_head" in config.target_bindings
-        else nn.Linear(
-            config.hidden_size, config.draft_vocab_size, bias=False, **options
-        )
+        else LMHead(config.hidden_size, config.draft_vocab_size, bias=False, **options)
     )
     return embedding, head

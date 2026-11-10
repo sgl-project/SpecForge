@@ -30,6 +30,20 @@ class DraftPreTrainedModel(PreTrainedModel):
             raise ValueError("model class name must match draft.architecture")
         super().__init__(config)
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Restore complete draft artifacts; partial weights use explicit loading APIs."""
+        output_loading_info = kwargs.pop("output_loading_info", False)
+        model, info = super().from_pretrained(*args, output_loading_info=True, **kwargs)
+        invalid = {
+            key: info[key]
+            for key in ("missing_keys", "unexpected_keys", "mismatched_keys")
+            if info.get(key)
+        }
+        if invalid:
+            raise ValueError(f"Invalid draft checkpoint: {invalid}")
+        return (model, info) if output_loading_info else model
+
     def init_weights(self):
         on_meta = [
             tensor.is_meta for tensor in chain(self.parameters(), self.buffers())

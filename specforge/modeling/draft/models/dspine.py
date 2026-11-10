@@ -1,16 +1,13 @@
 """DSpine owns the decoder/injection loop and preserves intermediate states."""
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from transformers import initialization as init
 from transformers.utils import ModelOutput
 
-from ..bindings import BoundLMHead
 from ..heads.adjacent_injection import AdjacentInjection
 from ..heads.transfer_space import initialize_transfer_space
 from ..hf_config import SpecForgeDraftConfig
@@ -95,6 +92,8 @@ class DSpineDraftModel(DraftPreTrainedModel):
     def initialize_transfer_space(
         self, head_weight: Tensor, chunk_size: int = 4096
     ) -> None:
+        if self.transfer_ready.item():
+            raise RuntimeError("DSpine transfer space is already initialized")
         initialize_transfer_space(
             head_weight,
             self.transfer_codes,
@@ -180,48 +179,7 @@ class DSpineDraftModel(DraftPreTrainedModel):
             raise ValueError("predecessor_ids must align with hidden states")
         layer = self.backbone.num_layers - 1
         receiver = self.injection.feature(hidden, layer)
-        predecessor = math.sqrt(self.injection.rank) * F.embedding(
-            predecessor_ids, self.transfer_codes
-        )
+        predecessor = self.injection.code(predecessor_ids, self.transfer_codes)
         return self.backbone.final_norm(
             self.injection.write(hidden, receiver, predecessor, layer)
         )
-
-    def transition_scores(
-        self, pre_injection: Tensor, candidate_ids: Tensor, anchor_ids: Tensor
-    ) -> Tensor:
-        """Score adjacent pairs from supplied pre-injection successor states.
-
-        Inputs are [..., positions, H], [..., positions, K], and [...] anchors.
-        Output is FP32 [..., positions, predecessor K, successor K]. At the
-        first position all predecessor rows use the anchor. Candidate creation
-        and path selection belong to the caller. Gradients remain attached.
-        """
-        if (
-            pre_injection.ndim < 2
-            or pre_injection.shape[-1] != self.config.draft.hidden_size
-            or candidate_ids.ndim != pre_injection.ndim
-            or candidate_ids.shape[:-1] != pre_injection.shape[:-1]
-            or candidate_ids.shape[-1] < 1
-            or candidate_ids.shape[-2] < 1
-            or anchor_ids.shape != candidate_ids.shape[:-2]
-        ):
-            raise ValueError("candidates and anchors must align with successor states")
-        if any(
-            ids.dtype not in (torch.int32, torch.int64)
-            for ids in (candidate_ids, anchor_ids)
-        ):
-            raise TypeError("candidate and anchor IDs must be integers")
-        count = candidate_ids.shape[-1]
-        anchor = anchor_ids[..., None, None].expand(*anchor_ids.shape, 1, count)
-        predecessors = torch.cat((anchor, candidate_ids[..., :-1, :]), dim=-2)
-        hidden = pre_injection.unsqueeze(-2).expand(
-            *pre_injection.shape[:-1], count, pre_injection.shape[-1]
-        )
-        refined = self.refine(hidden, predecessors)
-        weights = (
-            self.lm_head.candidate_weights(candidate_ids)
-            if isinstance(self.lm_head, BoundLMHead)
-            else F.embedding(candidate_ids, self.lm_head.weight)
-        )
-        return torch.einsum("...ikh,...ijh->...ikj", refined, weights).float()

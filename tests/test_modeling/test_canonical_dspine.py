@@ -3,9 +3,11 @@
 import copy
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+from safetensors.torch import load_file, save_file
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.block import AnchoredBlockSpec
@@ -247,6 +249,46 @@ class CanonicalDSpineTest(unittest.TestCase):
         )
         torch.testing.assert_close(result.logits, output.logits, rtol=0, atol=0)
         self.assertNotIn("lm_head.weight", model.state_dict())
+
+    def test_owned_and_bound_heads_expose_candidate_weights(self):
+        ids = torch.tensor([[1, 7, 9]])
+        for bound in (False, True):
+            model = initialized_model(bound=bound)
+            weights = model.lm_head.candidate_weights(ids)
+            torch.testing.assert_close(
+                weights, model.lm_head.weight[ids], rtol=0, atol=0
+            )
+            self.assertEqual(weights.requires_grad, not bound)
+
+    def test_transfer_space_cannot_overwrite_trained_state(self):
+        model = initialized_model()
+        before = copy.deepcopy(model.state_dict())
+        with self.assertRaisesRegex(RuntimeError, "already initialized"):
+            model.initialize_transfer_space(torch.randn(64, 32))
+        torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
+
+    def test_hf_restore_rejects_incomplete_or_unexpected_state(self):
+        model = initialized_model(bound=True)
+        with TemporaryDirectory() as path:
+            model.save_pretrained(path)
+            weights = Path(path) / "model.safetensors"
+            original = load_file(weights)
+            for key in ("transfer_codes", "injection.readouts.0.weight", "unexpected"):
+                with self.subTest(key=key):
+                    state = dict(original)
+                    if key == "unexpected":
+                        state[key] = torch.zeros(1)
+                    else:
+                        del state[key]
+                    save_file(state, weights)
+                    with self.assertRaisesRegex(ValueError, key):
+                        DSpineDraftModel.from_pretrained(path)
+            save_file(original, weights)
+            restored, info = DSpineDraftModel.from_pretrained(
+                path, output_loading_info=True
+            )
+            self.assertFalse(info["missing_keys"])
+            self.assertTrue(restored.transfer_ready.item())
 
     def test_uninitialized_hidden_only_meta_and_invalid_inputs(self):
         config = model_config()
