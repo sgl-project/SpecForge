@@ -102,7 +102,8 @@ class CanonicalDSpineTest(unittest.TestCase):
                 reference = LegacyDSpineDraftModel(legacy).to(
                     device=device, dtype=dtype
                 )
-                reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
+                with torch.device(device):
+                    reference.rotary_emb = Qwen3RotaryEmbedding(legacy)
                 reference.load_state_dict(
                     {
                         legacy_name(n) or n: v
