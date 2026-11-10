@@ -7,24 +7,9 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from .layers.attention.backends import PreparedAttention
+from .layers.inputs import LayerInputs
 from .layers.residual import ResidualStreams
 from .layers.rope import NODE_DETERMINED_ROTARY_TYPES
-
-
-@dataclass(frozen=True, eq=False, kw_only=True)
-class LayerInputs:
-    """Prepared runtime inputs, without algorithm settings or mutable KV caches.
-
-    Attention is prepared once by the model and reused across equivalent layers.
-    RoPE can be supplied directly or computed from this layer's position_ids.
-    Tensor contents must not be mutated while their autograd graph is live.
-    """
-
-    attention: PreparedAttention | None = None
-    target_context: Tensor | None = None
-    position_ids: Tensor | None = None
-    position_embeddings: tuple[Tensor, Tensor] | None = None
 
 
 @dataclass(frozen=True, eq=False)

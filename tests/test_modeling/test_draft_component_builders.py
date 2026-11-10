@@ -5,12 +5,13 @@ import inspect
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, get_type_hints
 from unittest.mock import patch
 
 import torch
 from torch import nn
 
+from specforge.config.draft.attention import GQASpec, MHASpec, MLASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import NormSpec, RMSNormSpec
@@ -45,6 +46,26 @@ class ComponentBuilderTest(unittest.TestCase):
         self.enterContext(patch.dict(_SCHEMAS))
         self.enterContext(patch.dict(_BUILDERS))
         register_component_schema("norm", TestNormSpec)
+
+    def test_builtin_schemas_have_matching_builders(self):
+        schemas = {
+            key: schema
+            for key, schema in _SCHEMAS.items()
+            if schema.__module__.startswith("specforge.config.draft.")
+        }
+        exceptions = {
+            ("rope", "none"),  # build_rotary returns None; there is no module.
+            ("logits", "none"),  # Builders arrive with target bindings in #1141.
+            ("logits", "mup"),
+        }
+        self.assertLessEqual(exceptions, schemas.keys())
+        self.assertLessEqual(_BUILDERS.keys(), _SCHEMAS.keys())
+        self.assertEqual(schemas.keys() - exceptions, _BUILDERS.keys() & schemas.keys())
+        for key in schemas.keys() - exceptions:
+            with self.subTest(component=key):
+                builder = component_builder(*key)
+                annotation = get_type_hints(builder.__init__)["config"]
+                self.assertTrue(issubclass(schemas[key], annotation))
 
     def test_builtins_keep_nodes_and_support_composition(self):
         norm_node = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1)
@@ -104,8 +125,8 @@ class ComponentBuilderTest(unittest.TestCase):
         with patch("torch.nn.Parameter") as allocate:
             with self.assertRaisesRegex(ValueError, "no modeling builder"):
                 build_component(
-                    "conv",
-                    GroupedCausalConvSpec(kernel_size=3, group_size=8),
+                    "norm",
+                    TestNormSpec(),
                     hidden_size=32,
                 )
             with self.assertRaises(ValueError):
@@ -139,11 +160,33 @@ class ComponentBuilderTest(unittest.TestCase):
             ("norm", RMSNormSpec, {"hidden_size", "device", "dtype"}),
             ("mlp", DenseFFNSpec, {"hidden_size", "device", "dtype"}),
             ("residual", StandardResidualSpec, set()),
+            *(
+                (
+                    "attention",
+                    node,
+                    {
+                        "input_size",
+                        "hidden_size",
+                        "norm",
+                        "rope",
+                        "backend",
+                        "training",
+                        "device",
+                        "dtype",
+                    },
+                )
+                for node in (GQASpec, MHASpec, MLASpec)
+            ),
+            (
+                "conv",
+                GroupedCausalConvSpec,
+                {"hidden_size", "block_size", "device", "dtype"},
+            ),
         ):
             constructor = component_builder(kind, node_type.type)
             parameters = inspect.signature(constructor).parameters
             self.assertEqual(set(parameters), {"config"} | extras)
-            self.assertIs(parameters["config"].annotation, node_type)
+            self.assertTrue(issubclass(node_type, parameters["config"].annotation))
             for name in extras:
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
         root = Path(layers.__file__).parent

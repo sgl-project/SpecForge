@@ -12,6 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone, LayerInputs
+from specforge.modeling.draft.dflash import apply_mla_rope
 from specforge.modeling.draft.layers.residual import StandardResidual
 from specforge.modeling.draft.layers.rope import DefaultRotaryEmbedding, apply_rotary
 from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
@@ -27,6 +28,43 @@ class RotaryLayer(nn.Module):
 
 
 class RotaryTest(unittest.TestCase):
+    def test_mla_rotation_uses_fp32_with_partial_tail_and_gradients(self):
+        cases = [("cpu", torch.float32), ("cpu", torch.bfloat16)]
+        if torch.cuda.is_available():
+            cases.extend(
+                ("cuda", dtype)
+                for dtype in (torch.float32, torch.float16, torch.bfloat16)
+            )
+        for device, dtype in cases:
+            for width in (4, 8):
+                for interleaved in (False, True):
+                    hidden = torch.randn(
+                        2, 3, 5, 8, device=device, dtype=dtype, requires_grad=True
+                    )
+                    other = hidden.detach().clone().requires_grad_()
+                    phase = torch.randn(
+                        2, 5, width // 2, device=device, dtype=torch.float32
+                    ).repeat(1, 1, 2)
+                    cos, sin = phase.cos(), phase.sin()
+                    expected = torch.cat(
+                        (
+                            apply_mla_rope(
+                                hidden[..., :width].float(),
+                                cos,
+                                sin,
+                                interleaved=interleaved,
+                            ).to(dtype),
+                            hidden[..., width:],
+                        ),
+                        dim=-1,
+                    )
+                    actual = apply_rotary(other, (cos, sin), interleaved=interleaved)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    upstream = torch.randn_like(actual)
+                    actual.backward(upstream)
+                    expected.backward(upstream)
+                    torch.testing.assert_close(other.grad, hidden.grad, rtol=0, atol=0)
+
     def _assert_parity(self, device, dtypes):
         positions = torch.tensor([[0, 7, 19, 64], [31, 9, 2, 53]], device=device)
         for partial in (1.0, 0.5):
