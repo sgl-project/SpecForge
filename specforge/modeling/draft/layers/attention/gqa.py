@@ -88,7 +88,8 @@ class GQAAttention(nn.Module):
         Context is already fused to input_size by the owning architecture. The
         layout's query positions describe hidden; key positions describe context
         followed by hidden. No cache, algorithm settings, or family config enters
-        this component. rotary_dim=0 requires position_embeddings=None.
+        this component. rotary_dim=0 requires position_embeddings=None. Supplied
+        cosine/sine tables must have the hidden input's dtype, including under autocast.
         """
         if hidden.ndim != 3 or hidden.shape[-1] != self.q_proj.in_features:
             raise ValueError("hidden must have shape [batch, query_length, input_size]")
@@ -108,7 +109,14 @@ class GQAAttention(nn.Module):
         if not isinstance(layout, AttentionLayout):
             raise TypeError("GQAAttention requires AttentionLayout")
         if (
-            layout.query_positions.shape[0] not in (1, batch)
+            any(
+                value.shape[0] not in (1, batch)
+                for value in (
+                    layout.query_positions,
+                    layout.key_positions,
+                    layout.visibility,
+                )
+            )
             or layout.query_positions.shape[1] != length
             or layout.key_positions.shape[1] != keys
             or layout.query_positions.device != hidden.device
@@ -126,10 +134,11 @@ class GQAAttention(nn.Module):
                     or value.shape[0] not in (1, batch)
                     or value.shape[1:] != (keys, self.rotary_dim)
                     or value.device != hidden.device
+                    or value.dtype != hidden.dtype
                     or not value.is_floating_point()
                 ):
                     raise ValueError(
-                        "RoPE tensors must describe all context-then-query positions"
+                        "RoPE tensors must describe all context-then-query positions and match hidden dtype"
                     )
         elif position_embeddings is not None:
             raise ValueError("disabled RoPE requires position_embeddings=None")

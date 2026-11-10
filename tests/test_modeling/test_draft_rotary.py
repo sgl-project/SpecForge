@@ -46,8 +46,7 @@ class RotaryTest(unittest.TestCase):
                         "partial_rotary_factor": partial,
                     },
                 ),
-                device=device,
-            )
+            ).to(device)
             eagle_reference = LlamaRotaryEmbedding(
                 dim=node.rotary_dim(16),
                 max_position_embeddings=64,
@@ -162,6 +161,12 @@ class RotaryTest(unittest.TestCase):
                 torch.zeros(1, 3, 8), torch.arange(3)
             )
         hidden = torch.zeros(1, 2, 3, 8)
+        for batch, length in ((1, 1), (2, 3)):
+            with self.assertRaisesRegex(ValueError, "batch.*sequence"):
+                apply_rotary(
+                    hidden,
+                    (torch.ones(batch, length, 8), torch.zeros(batch, length, 8)),
+                )
         for width in (0, 3, 10):
             with self.assertRaises(ValueError):
                 apply_rotary(

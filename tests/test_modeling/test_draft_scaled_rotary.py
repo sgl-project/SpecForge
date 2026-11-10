@@ -3,6 +3,7 @@
 import unittest
 from dataclasses import dataclass, replace
 from typing import ClassVar
+from unittest.mock import patch
 
 import torch
 from transformers import LlamaConfig
@@ -12,14 +13,21 @@ from transformers.modeling_rope_utils import (
 )
 
 from specforge.config.draft.codec.components import decode_component, encode_component
-from specforge.config.draft.registry import register_component_schema
+from specforge.config.draft.registry import (
+    _SCHEMAS,
+    _VALIDATORS,
+    register_component_schema,
+)
 from specforge.config.draft.rope import (
     DefaultRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
     NoRoPESpec,
 )
-from specforge.modeling.draft.layers.registry import register_component_builder
+from specforge.modeling.draft.layers.registry import (
+    _BUILDERS,
+    register_component_builder,
+)
 from specforge.modeling.draft.layers.rope import (
     DefaultRotaryEmbedding,
     LinearRotaryEmbedding,
@@ -53,6 +61,10 @@ class CustomRoPE(DefaultRoPESpec):
 
 
 class ScaledRotaryTest(unittest.TestCase):
+    def setUp(self):
+        for registry in (_SCHEMAS, _VALIDATORS, _BUILDERS):
+            self.enterContext(patch.dict(registry))
+
     def test_registered_schema_and_builder_extend_rotary(self):
         register_component_schema("rope", CustomRoPE)
         node = decode_component(

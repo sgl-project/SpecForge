@@ -258,6 +258,34 @@ class GQATest(unittest.TestCase):
             )
             torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
+    def test_shared_positions_and_external_rope_dtype(self):
+        module = build(make_node(), dtype=torch.bfloat16).eval()
+        hidden = torch.randn(2, 3, 16, dtype=torch.bfloat16)
+        layout = layout_for(hidden)
+        shared = replace(
+            layout,
+            query_positions=layout.query_positions[:1],
+            key_positions=layout.key_positions[:1],
+        )
+        tables = (
+            torch.ones(1, 3, 8, dtype=hidden.dtype),
+            torch.zeros(1, 3, 8, dtype=hidden.dtype),
+        )
+        expected = module(hidden, layout=layout, position_embeddings=tables)
+        actual = module(hidden, layout=shared, position_embeddings=tables)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            module(
+                hidden,
+                layout=shared,
+                position_embeddings=tuple(t.float() for t in tables),
+            )
+        mismatched = replace(
+            shared, visibility=torch.ones(3, 1, 3, 3, dtype=torch.bool)
+        )
+        with self.assertRaisesRegex(ValueError, "layout"):
+            module(hidden, layout=mismatched, position_embeddings=tables)
+
     def test_invalid_construction_and_runtime_inputs_fail_early(self):
         node = make_node()
         with patch("torch.nn.Linear") as allocate:

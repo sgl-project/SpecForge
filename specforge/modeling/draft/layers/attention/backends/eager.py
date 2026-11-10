@@ -23,7 +23,7 @@ def eager_attention(
     key: Tensor,
     value: Tensor,
     *,
-    attention_mask: Tensor | None,
+    attention_mask: Tensor,
     scale: float,
     dropout_p: float,
     training: bool,
@@ -31,11 +31,10 @@ def eager_attention(
     """Return [batch, query_heads, query_length, value_dim].
 
     Inputs use [batch, heads, sequence, dim]; grouped KV heads are supported.
-    The caller supplies the complete visibility policy: None means all visible,
-    boolean True means visible, and floating masks are additive biases (-inf
-    blocks a key). Masks must be rank four and broadcast to [batch, heads, Q, K].
-    Fully blocked rows return zero with zero gradients; finite negative biases
-    are not interpreted as hard masks. No causal/window policy is inferred.
+    The caller supplies the complete visibility policy as a boolean mask:
+    True means visible. Masks must be rank four and broadcast to [batch, heads, Q, K].
+    Fully blocked rows return zero with zero gradients. No causal/window policy
+    is inferred, and additive float biases are not supported.
     """
     positive_number("scale", scale)
     finite_number("dropout_p", dropout_p)
@@ -65,37 +64,25 @@ def eager_attention(
         for tensor in (query, key, value)
     ):
         raise ValueError("query/key/value must share a floating dtype and device")
-    if attention_mask is not None:
-        if not isinstance(attention_mask, Tensor):
-            raise TypeError("eager attention requires a tensor mask or None")
-        target = (batch, heads, queries, keys)
-        if attention_mask.ndim != 4 or any(
-            size not in (1, expected)
-            for size, expected in zip(attention_mask.shape, target)
-        ):
-            raise ValueError("attention_mask must broadcast to [batch, heads, Q, K]")
-        if attention_mask.device != query.device or not (
-            attention_mask.dtype == torch.bool or attention_mask.is_floating_point()
-        ):
-            raise ValueError(
-                "attention_mask must be boolean or floating on the query device"
-            )
+    if not isinstance(attention_mask, Tensor):
+        raise TypeError("eager attention requires a boolean tensor mask")
+    target = (batch, heads, queries, keys)
+    if attention_mask.ndim != 4 or any(
+        size not in (1, expected)
+        for size, expected in zip(attention_mask.shape, target)
+    ):
+        raise ValueError("attention_mask must broadcast to [batch, heads, Q, K]")
+    if attention_mask.device != query.device or attention_mask.dtype != torch.bool:
+        raise ValueError("attention_mask must be boolean on the query device")
 
     groups = heads // kv_heads
     scores = torch.matmul(query, _repeat_kv(key, groups).transpose(-1, -2)) * scale
-    empty_rows = None
-    if attention_mask is not None:
-        if attention_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attention_mask, -torch.inf)
-            empty_rows = ~attention_mask.any(dim=-1, keepdim=True)
-        else:
-            scores = scores + attention_mask
-            empty_rows = torch.isneginf(attention_mask).all(dim=-1, keepdim=True)
-        # Prevent NaN softmax/gradients on rows with no visible keys. Only the
-        # mask determines empty rows; numerical overflow must not be hidden.
-        scores = scores.masked_fill(empty_rows, 0)
+    scores = scores.masked_fill(~attention_mask, -torch.inf)
+    empty_rows = ~attention_mask.any(dim=-1, keepdim=True)
+    # Avoid NaN softmax/gradients for fully blocked rows. Unmasked numerical
+    # overflow remains visible rather than being treated as an empty row.
+    scores = scores.masked_fill(empty_rows, 0)
     weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    if empty_rows is not None:
-        weights = weights.masked_fill(empty_rows, 0)
+    weights = weights.masked_fill(empty_rows, 0)
     weights = F.dropout(weights, p=dropout_p, training=training)
     return torch.matmul(weights, _repeat_kv(value, groups))

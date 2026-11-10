@@ -79,6 +79,22 @@ class AttentionMaskTest(unittest.TestCase):
         self.assertTrue(actual[1, 0, 0, 1])
         self.assertFalse(actual[0, 0, 0, 1])
 
+    def test_shared_positions_broadcast_with_per_example_visibility(self):
+        positions = torch.arange(3).unsqueeze(0)
+        visibility = torch.ones(2, 1, 3, 3, dtype=torch.bool)
+        visibility[1, :, :, 0] = False
+        for q, k in (
+            (positions, positions),
+            (positions.expand(2, -1), positions),
+            (positions, positions.expand(2, -1)),
+        ):
+            layout = AttentionLayout(
+                query_positions=q, key_positions=k, visibility=visibility
+            )
+            actual = dense_attention_mask(layout, is_causal=True, sliding_window=None)
+            expected = visibility & torch.ones(3, 3, dtype=torch.bool).tril()
+            torch.testing.assert_close(actual, expected)
+
     def test_invalid_layouts_and_ambiguous_flags_are_rejected(self):
         values = dict(
             query_positions=torch.zeros(1, 2, dtype=torch.long),
@@ -87,7 +103,10 @@ class AttentionMaskTest(unittest.TestCase):
         )
         for override in (
             {"query_positions": torch.zeros(1, 2)},
-            {"key_positions": torch.zeros(2, 3, dtype=torch.long)},
+            {
+                "query_positions": torch.zeros(2, 2, dtype=torch.long),
+                "key_positions": torch.zeros(3, 3, dtype=torch.long),
+            },
             {"visibility": torch.ones(1, 1, 2, 3)},
             {"visibility": torch.ones(1, 1, 1, 3, dtype=torch.bool)},
             {"visibility": torch.ones(1, 1, 2, 3, dtype=torch.bool, device="meta")},

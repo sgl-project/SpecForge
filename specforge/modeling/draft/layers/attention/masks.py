@@ -30,19 +30,21 @@ class AttentionLayout:
             p.ndim != 2 or p.dtype not in (torch.int32, torch.int64) for p in (q, k)
         ):
             raise ValueError("logical positions must be rank-two integer tensors")
-        if q.shape[0] != k.shape[0] or q.device != k.device:
-            raise ValueError("query/key positions must share a batch size and device")
+        if q.device != k.device:
+            raise ValueError("query/key positions must share a device")
         if (
             allowed.ndim != 4
             or allowed.dtype != torch.bool
             or allowed.device != q.device
-            or allowed.shape[0] not in (1, q.shape[0])
             or allowed.shape[1] < 1
             or allowed.shape[2:] != (q.shape[1], k.shape[1])
         ):
             raise ValueError(
                 "visibility must be boolean [batch, heads, Q, K] on the positions device"
             )
+        batches = {value.shape[0] for value in (q, k, allowed)} - {1}
+        if len(batches) > 1:
+            raise ValueError("positions and visibility must have broadcastable batches")
 
 
 def dense_attention_mask(
