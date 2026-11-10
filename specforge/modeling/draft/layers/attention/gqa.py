@@ -12,7 +12,7 @@ from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
 from .backends import (
     AttentionBackend,
-    AttentionPreparation,
+    AttentionPreparationScope,
     PreparedAttention,
     resolve_attention_backend,
 )
@@ -103,7 +103,7 @@ class GQAAttention(nn.Module):
     def prepare(
         self,
         layout: AttentionLayout,
-        preparation: AttentionPreparation,
+        preparation: AttentionPreparationScope,
         *,
         batch_size: int,
     ) -> PreparedAttention:

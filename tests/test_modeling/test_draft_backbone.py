@@ -22,8 +22,6 @@ class TestLayer(nn.Module):
         self.seen_inputs.append(inputs)
         if inputs.target_context is not None:
             hidden = hidden + inputs.target_context
-        if inputs.attention_mask is not None:
-            hidden = hidden * inputs.attention_mask
         if inputs.position_embeddings is not None:
             cos, sin = inputs.position_embeddings
             hidden = hidden + cos + sin
@@ -56,10 +54,9 @@ def make_inputs():
     return [
         LayerInputs(
             target_context=torch.randn(1, 3, 4),
-            attention_mask=torch.full((1, 3, 1), factor),
             position_ids=positions + index,
         )
-        for index, factor in enumerate((0.5, 0.75))
+        for index in range(2)
     ]
 
 
@@ -81,7 +78,6 @@ class BackboneTest(unittest.TestCase):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         for layer, entry in zip(backbone.layers, inputs):
             self.assertIs(layer.seen_inputs[-1].target_context, entry.target_context)
-            self.assertIs(layer.seen_inputs[-1].attention_mask, entry.attention_mask)
             self.assertIsNone(entry.position_embeddings)
 
     def test_model_owned_injection_keeps_intermediate_gradients(self):

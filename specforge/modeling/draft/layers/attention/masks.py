@@ -80,6 +80,16 @@ class AttentionLayout:
             batches.add(allowed.shape[0])
         elif not callable(self.visibility) or self.active_queries is None:
             raise ValueError("callable visibility requires explicit active_queries")
+        if isinstance(self.visibility, PaddingMask):
+            for valid, positions in (
+                (self.visibility.query_valid, q),
+                (self.visibility.key_valid, k),
+            ):
+                if valid.shape[1] != positions.shape[1] or valid.device != q.device:
+                    raise ValueError(
+                        "padding masks must match layout lengths and device"
+                    )
+                batches.add(valid.shape[0])
         if self.active_queries is not None:
             active = self.active_queries
             if (
@@ -103,10 +113,20 @@ class AttentionLayout:
             tensors.append(self.visibility)
             if self.visibility.shape[1] not in (1, num_heads):
                 raise ValueError("visibility heads must broadcast to attention heads")
+        if isinstance(self.visibility, PaddingMask):
+            tensors.extend((self.visibility.query_valid, self.visibility.key_valid))
         if self.active_queries is not None:
             tensors.append(self.active_queries)
         if any(t.shape[0] not in (1, batch_size) for t in tensors):
             raise ValueError("layout batch must broadcast to hidden batch")
+
+    def mask_heads(self, num_heads: int) -> int | None:
+        """Share metadata across heads only when visibility guarantees it."""
+        if isinstance(self.visibility, PaddingMask):
+            return None
+        if isinstance(self.visibility, Tensor):
+            return None if self.visibility.shape[1] == 1 else num_heads
+        return num_heads
 
     def mask_mod(self, *, is_causal: bool, sliding_window: int | None) -> MaskMod:
         boolean("is_causal", is_causal)
@@ -137,7 +157,9 @@ class AttentionLayout:
                 if is_causal:
                     allowed = allowed & (qp >= kp)
                 if sliding_window is not None:
-                    allowed = allowed & ((qp - kp).abs() < sliding_window)
+                    allowed = allowed & (
+                        (kp > qp - sliding_window) & (kp < qp + sliding_window)
+                    )
             return valid & allowed
 
         return mask
@@ -163,7 +185,9 @@ def dense_attention_mask(
         if is_causal:
             allowed = allowed & (q >= k).unsqueeze(1)
         if sliding_window is not None:
-            allowed = allowed & ((q - k).abs() < sliding_window).unsqueeze(1)
+            allowed = allowed & (
+                (k > q - sliding_window) & (k < q + sliding_window)
+            ).unsqueeze(1)
         if layout.active_queries is not None:
             allowed = allowed & layout.active_queries[:, None, :, None]
         return allowed
@@ -175,7 +199,7 @@ def dense_attention_mask(
     return create_mask(
         layout.mask_mod(is_causal=is_causal, sliding_window=sliding_window),
         batch_size,
-        num_heads,
+        layout.mask_heads(num_heads),
         layout.query_positions.shape[1],
         layout.key_positions.shape[1],
         device=layout.query_positions.device,

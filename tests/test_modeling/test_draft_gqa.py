@@ -17,7 +17,7 @@ from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import GQAAttention, build_component
-from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     dense_attention_mask,
@@ -81,7 +81,7 @@ def layout_for(hidden, context_length=0):
 
 
 def prepared(module, layout, batch_size):
-    with AttentionPreparation() as preparation:
+    with AttentionPreparationScope() as preparation:
         return module.prepare(layout, preparation, batch_size=batch_size)
 
 

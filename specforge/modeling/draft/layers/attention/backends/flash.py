@@ -20,7 +20,7 @@ def _unpad_metadata(valid):
     return indices, cumulative, int(lengths.max().item())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FlashMask:
     query_indices: Tensor
     key_indices: Tensor
@@ -40,21 +40,9 @@ class FlashAttentionBackend(AttentionBackend):
             raise ValueError(
                 "FlashAttention requires PaddingMask visibility; use Flex for arbitrary masks"
             )
-        masks = []
-        for valid, positions in (
-            (padding.query_valid, layout.query_positions),
-            (padding.key_valid, layout.key_positions),
-        ):
-            if (
-                valid.device != positions.device
-                or valid.shape[0] not in (1, batch_size)
-                or valid.shape[1] != positions.shape[1]
-            ):
-                raise ValueError(
-                    "padding masks must match layout dimensions and device"
-                )
-            masks.append(valid.expand(batch_size, -1))
-        qvalid, kvalid = masks
+        layout.validate_dimensions(batch_size, num_heads)
+        qvalid = padding.query_valid.expand(batch_size, -1)
+        kvalid = padding.key_valid.expand(batch_size, -1)
         if layout.active_queries is not None:
             qvalid = qvalid & layout.active_queries
         qi, cq, mq = _unpad_metadata(qvalid)

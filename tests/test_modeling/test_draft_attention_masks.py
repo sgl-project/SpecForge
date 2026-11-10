@@ -8,6 +8,7 @@ import torch
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
+    PaddingMask,
     dense_attention_mask,
 )
 
@@ -94,6 +95,36 @@ class AttentionMaskTest(unittest.TestCase):
             actual = dense_attention_mask(layout, is_causal=True, sliding_window=None)
             expected = visibility & torch.ones(3, 3, dtype=torch.bool).tril()
             torch.testing.assert_close(actual, expected)
+
+    def test_padding_layout_validation_and_head_sharing(self):
+        positions = torch.arange(3)[None]
+        valid = torch.ones(1, 3, dtype=torch.bool)
+
+        def layout(query, key):
+            return AttentionLayout(
+                query_positions=positions,
+                key_positions=positions,
+                visibility=PaddingMask(query, key),
+                active_queries=valid,
+            )
+
+        for query, key in (
+            (valid[:, :2], valid),
+            (valid, torch.ones(1, 4, dtype=torch.bool)),
+            (valid.to("meta"), valid.to("meta")),
+        ):
+            with self.assertRaisesRegex(ValueError, "lengths and device"):
+                layout(query, key)
+        with self.assertRaisesRegex(ValueError, "batch"):
+            layout(valid, valid.expand(2, -1)).validate_dimensions(4, 8)
+        mask = dense_attention_mask(
+            layout(valid, valid),
+            batch_size=4,
+            num_heads=8,
+            is_causal=False,
+            sliding_window=None,
+        )
+        self.assertEqual(mask.shape, (4, 1, 3, 3))
 
     def test_invalid_layouts_and_ambiguous_flags_are_rejected(self):
         values = dict(
