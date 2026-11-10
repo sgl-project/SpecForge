@@ -60,6 +60,7 @@ def build_eagle_backbone(
         for node, rope in zip(attentions, ropes)
     ]
     options = dict(hidden_size=config.hidden_size, device=device, dtype=dtype)
+    residual = build_component("residual", config.residual_config)
     layers = []
     for index, (definition, attention, rope) in enumerate(
         zip(definitions, attentions, ropes)
@@ -86,7 +87,17 @@ def build_eagle_backbone(
                 **options,
             )
             if index == 0
-            else DecoderLayer(*parts, norm=config.norm_config, **options)
+            else DecoderLayer(
+                *parts,
+                norm=config.norm_config,
+                attention_connection=residual.build_connection(
+                    layer_index=index, sublayer="attention", **options
+                ),
+                mlp_connection=residual.build_connection(
+                    layer_index=index, sublayer="mlp", **options
+                ),
+                **options,
+            )
         )
     normalize_output = type(spec) is PEagleSpec or spec.norm_output
     return DecoderBackbone(
@@ -97,5 +108,5 @@ def build_eagle_backbone(
             if normalize_output
             else nn.Identity()
         ),
-        residual=build_component("residual", config.residual_config),
+        residual=residual,
     )

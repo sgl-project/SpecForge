@@ -27,7 +27,11 @@ from specforge.modeling.draft.layers import DecoderLayer, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from specforge.modeling.draft.layers.residual import StandardResidual
+from specforge.modeling.draft.layers.residual import (
+    ResidualConnection,
+    StandardResidual,
+    StandardResidualConnection,
+)
 from specforge.modeling.draft.layers.rope import build_rotary
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
 
@@ -66,6 +70,8 @@ def make_layer(
             device=device,
             dtype=dtype,
         ),
+        attention_connection=StandardResidualConnection(StandardResidualSpec()),
+        mlp_connection=StandardResidualConnection(StandardResidualSpec()),
         hidden_size=16,
         norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
         sublayer_conv=convolutions,
@@ -77,6 +83,19 @@ def make_layer(
 def prepare(module, layout, batch_size):
     with AttentionPreparationScope() as scope:
         return module.self_attn.prepare(layout, scope, batch_size=batch_size)
+
+
+class TwoStreamConnection(ResidualConnection):
+    """A test connection that reads one stream and writes into both."""
+
+    def __init__(self, read_index):
+        super().__init__()
+        self.read_index = read_index
+        self.gain = nn.Parameter(torch.tensor([0.3, 0.7]))
+
+    def forward(self, hidden, sublayer):
+        update = sublayer(hidden[..., self.read_index, :])
+        return hidden + self.gain[:, None] * update.unsqueeze(-2)
 
 
 class DecoderTest(unittest.TestCase):
@@ -341,6 +360,58 @@ class DecoderTest(unittest.TestCase):
                     all(entry.position_embeddings is None for entry in entries)
                 )
 
+    def test_connections_own_stream_reads_writes_and_checkpoint_gradients(self):
+        from torch.utils.checkpoint import checkpoint
+
+        module = make_layer(
+            make_node(rope_parameters=NoRoPESpec(), attention_dropout=0), rotary_dim=0
+        )
+        module.attention_connection = TwoStreamConnection(0)
+        module.mlp_connection = TwoStreamConnection(1)
+        reference = copy.deepcopy(module)
+        hidden = torch.randn(1, 3, 2, 16, requires_grad=True)
+        other = hidden.detach().clone().requires_grad_()
+        stream = hidden[..., 0, :]
+        entry = LayerInputs(attention=prepare(module, layout_for(stream), 1))
+        actual = checkpoint(module, hidden, entry, use_reentrant=False)
+        update = reference.self_attn(
+            reference.input_layernorm(other[..., 0, :]),
+            attention=prepare(reference, layout_for(other[..., 0, :]), 1),
+            position_embeddings=None,
+        )
+        expected = other + reference.attention_connection.gain[
+            :, None
+        ] * update.unsqueeze(-2)
+        update = reference.mlp(reference.post_attention_layernorm(expected[..., 1, :]))
+        expected = expected + reference.mlp_connection.gain[:, None] * update.unsqueeze(
+            -2
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+        for name, parameter in module.named_parameters():
+            self.assertIsNotNone(parameter.grad, name)
+            torch.testing.assert_close(
+                parameter.grad,
+                dict(reference.named_parameters())[name].grad,
+                rtol=0,
+                atol=0,
+            )
+        for connections, error in (
+            ((nn.Identity(), module.mlp_connection), TypeError),
+            ((module.attention_connection, module.attention_connection), ValueError),
+        ):
+            with self.assertRaises(error):
+                DecoderLayer(
+                    module.self_attn,
+                    module.mlp,
+                    hidden_size=16,
+                    norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
+                    attention_connection=connections[0],
+                    mlp_connection=connections[1],
+                )
+
     def test_invalid_layout_streams_and_convolution_contract_fail(self):
         module = make_layer(make_node())
         hidden = torch.randn(1, 3, 16)
@@ -359,12 +430,14 @@ class DecoderTest(unittest.TestCase):
             DecoderLayer(
                 nn.Identity(),
                 nn.Identity(),
+                attention_connection=StandardResidualConnection(StandardResidualSpec()),
+                mlp_connection=StandardResidualConnection(StandardResidualSpec()),
                 hidden_size=16,
                 norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
                 sublayer_conv=nn.Identity(),
             )
         with patch.object(module.self_attn, "forward", return_value=torch.zeros(16)):
-            with self.assertRaisesRegex(ValueError, "residual shape"):
+            with self.assertRaisesRegex(ValueError, "input shape"):
                 module(
                     hidden,
                     LayerInputs(attention=prepare(module, layout, hidden.shape[0])),
@@ -419,6 +492,10 @@ class DecoderTest(unittest.TestCase):
                 DecoderLayer(
                     nn.Identity(),
                     nn.Identity(),
+                    attention_connection=StandardResidualConnection(
+                        StandardResidualSpec()
+                    ),
+                    mlp_connection=StandardResidualConnection(StandardResidualSpec()),
                     hidden_size=16,
                     norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
                     sublayer_conv=invalid,

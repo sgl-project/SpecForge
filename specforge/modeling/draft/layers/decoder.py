@@ -1,4 +1,4 @@
-"""Compose pre-norm attention/FFN sublayers with single-stream residuals."""
+"""Compose pre-norm sublayers through independently owned residual connections."""
 
 from torch import Tensor, nn
 
@@ -8,17 +8,16 @@ from specforge.config.draft.norm import NormSpec
 from .attention.backends import PreparedAttention
 from .inputs import LayerInputs
 from .registry import build_component
+from .residual import ResidualConnection
 
 
 class DecoderLayer(nn.Module):
-    """Standard residual wiring shared by model-owned and sequential execution.
+    """The caller supplies attention, FFN and one residual connection per sublayer.
 
-    The model supplies constructed attention/FFN components. Input fusion,
-    inter-layer injection, multiple residual streams, and file loading are not
-    implemented here. ``sublayer_conv`` is an optional (attention, mlp) pair of
-    independently constructed modules, each exposing prepare/finish. A single
-    LayerSpec convolution reference supplies their shared configuration, not
-    shared parameters. The layer neither builds nor clones these modules.
+    Connections own stream layout and mixing. Their callable includes normalization
+    and optional convolution, and consumes one [batch, sequence, hidden_size] stream.
+    ``sublayer_conv`` contains independently constructed attention/FFN modules with
+    prepare/finish methods; the decoder neither builds nor clones them.
     """
 
     def __init__(
@@ -28,6 +27,8 @@ class DecoderLayer(nn.Module):
         *,
         hidden_size: int,
         norm: NormSpec,
+        attention_connection: ResidualConnection,
+        mlp_connection: ResidualConnection,
         sublayer_conv: tuple[nn.Module, nn.Module] | None = None,
         device=None,
         dtype=None,
@@ -36,6 +37,17 @@ class DecoderLayer(nn.Module):
         positive_int("hidden_size", hidden_size)
         if not isinstance(attention, nn.Module) or not isinstance(mlp, nn.Module):
             raise TypeError("attention and mlp must be constructed modules")
+        if not all(
+            isinstance(connection, ResidualConnection)
+            for connection in (attention_connection, mlp_connection)
+        ):
+            raise TypeError("sublayer connections must be ResidualConnection modules")
+        if attention_connection is mlp_connection:
+            raise ValueError(
+                "attention and mlp require independent residual connections"
+            )
+        self.attention_connection = attention_connection
+        self.mlp_connection = mlp_connection
         if sublayer_conv is not None:
             if not isinstance(sublayer_conv, tuple) or len(sublayer_conv) != 2:
                 raise TypeError("sublayer_conv must be an (attention, mlp) module pair")
@@ -61,16 +73,24 @@ class DecoderLayer(nn.Module):
         )
 
     def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
-        if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
-            raise ValueError(
-                "DecoderLayer requires a single [batch, sequence, hidden_size] stream"
-            )
         if not isinstance(inputs, LayerInputs):
             raise TypeError("DecoderLayer requires LayerInputs")
         if not isinstance(inputs.attention, PreparedAttention):
             raise ValueError("DecoderLayer requires prepared attention")
-        # Position IDs are consumed by the backbone. Direct callers must supply
-        # any required RoPE embeddings, so layers never recompute frequencies.
+        hidden = self.attention_connection(
+            hidden, lambda stream: self._attention_update(stream, inputs)
+        )
+        return self.mlp_connection(hidden, self._mlp_update)
+
+    def _check_stream(self, hidden: Tensor) -> None:
+        if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
+            raise ValueError(
+                "Decoder sublayers require a single [batch, sequence, hidden_size] stream"
+            )
+
+    def _attention_update(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
+        self._check_stream(hidden)
+        # Position IDs are consumed by the backbone, not individual layers.
         update = self.input_layernorm(hidden)
         if self.attention_conv is not None:
             update, coefficients = self.attention_conv.prepare(update)
@@ -82,15 +102,14 @@ class DecoderLayer(nn.Module):
         )
         if self.attention_conv is not None:
             update = self.attention_conv.finish(update, coefficients)
-        if update.shape != hidden.shape:
-            raise ValueError("attention output must preserve the residual shape")
-        hidden = hidden + update
+        return update
+
+    def _mlp_update(self, hidden: Tensor) -> Tensor:
+        self._check_stream(hidden)
         update = self.post_attention_layernorm(hidden)
         if self.mlp_conv is not None:
             update, coefficients = self.mlp_conv.prepare(update)
         update = self.mlp(update)
         if self.mlp_conv is not None:
             update = self.mlp_conv.finish(update, coefficients)
-        if update.shape != hidden.shape:
-            raise ValueError("mlp output must preserve the residual shape")
-        return hidden + update
+        return update
