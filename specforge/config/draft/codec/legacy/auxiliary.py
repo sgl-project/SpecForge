@@ -117,6 +117,9 @@ def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=No
         tie_word_embeddings=False,
         attention_configs={
             "default": GQASpec(
+                qk_norm_position="before_rope",
+                qk_norm_scope="head",
+                qk_norm_config=None,
                 rope_parameters=None,
                 num_attention_heads=heads,
                 num_key_value_heads=(
@@ -146,7 +149,9 @@ def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=No
         conv_configs={},
         layer_configs={"default": LayerSpec(attention="default", mlp="default")},
         layer_types=("default",) * depth,
-        norm_config=RMSNormSpec(eps=values["rms_norm_eps"], weight_offset=0),
+        norm_config=RMSNormSpec(
+            has_weight=True, eps=values["rms_norm_eps"], weight_offset=0
+        ),
         residual_config=StandardResidualSpec(),
         target_bindings=(),
         target_logit_transform=None,

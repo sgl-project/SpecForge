@@ -14,6 +14,9 @@ from specforge.config.draft.validate import validate_layers
 
 def definitions():
     attention = GQASpec(
+        qk_norm_position="before_rope",
+        qk_norm_scope="head",
+        qk_norm_config=None,
         rope_parameters=None,
         num_attention_heads=8,
         num_key_value_heads=2,

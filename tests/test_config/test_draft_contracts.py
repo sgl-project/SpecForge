@@ -154,7 +154,9 @@ class ContractsTest(unittest.TestCase):
             pass
 
         with self.assertRaisesRegex(ValueError, "norm_config must use its registered"):
-            draft_config(norm_config=ShadowNorm(eps=1e-6, weight_offset=0))
+            draft_config(
+                norm_config=ShadowNorm(has_weight=True, eps=1e-6, weight_offset=0)
+            )
         with self.assertRaisesRegex(ValueError, "target_logit_transform must use"):
             draft_config(target_logit_transform=ShadowLogits())
 
@@ -166,7 +168,12 @@ class ContractsTest(unittest.TestCase):
 
         with patch.dict(registry._SCHEMAS):
             register_component_schema("rope", BandRoPE)
-            rope = BandRoPE(rope_theta=10000, partial_rotary_factor=1.0, bands=[1.0])
+            rope = BandRoPE(
+                interleaved=False,
+                rope_theta=10000,
+                partial_rotary_factor=1.0,
+                bands=[1.0],
+            )
             with self.assertRaisesRegex(ValueError, "immutable and hashable"):
                 draft_config(rope_parameters=rope)
 

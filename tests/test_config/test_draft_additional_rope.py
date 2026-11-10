@@ -13,6 +13,7 @@ from tests.test_config.draft_fixtures import draft_config
 class AdditionalRoPETest(unittest.TestCase):
     def test_multiaxis_sections_round_trip_as_arrays(self):
         source = {
+            "interleaved": False,
             "rope_type": "mrope",
             "rope_theta": 10000,
             "partial_rotary_factor": 1,
@@ -33,12 +34,14 @@ class AdditionalRoPETest(unittest.TestCase):
         for section in ((1, 2), (0, 0, 0), (-1, 2, 3), (True, 1, 2), (1.5, 1, 2)):
             with self.assertRaisesRegex(ValueError, "mrope_section"):
                 MultiAxisRoPESpec(
+                    interleaved=False,
                     mrope_interleaved=False,
                     rope_theta=10000,
                     partial_rotary_factor=1,
                     mrope_section=section,
                 )
         rope = MultiAxisRoPESpec(
+            interleaved=False,
             mrope_interleaved=False,
             rope_theta=10000,
             partial_rotary_factor=1,
@@ -52,13 +55,13 @@ class AdditionalRoPETest(unittest.TestCase):
 
     def test_dynamic_threshold_and_partial_geometry(self):
         rope = DynamicNTKRoPESpec(
+            interleaved=False,
             rope_theta=10000,
             partial_rotary_factor=1,
             factor=2,
             original_max_position_embeddings=128,
         )
-        self.assertEqual(rope.scaled_theta(8, 128), 10000)
-        self.assertAlmostEqual(rope.scaled_theta(8, 256), 10000 * 3 ** (8 / 6))
+        self.assertAlmostEqual(rope.scaled_theta(8), 10000 * 3 ** (8 / 6))
         node = draft_config(rope_parameters=rope)
         self.assertEqual(decode_config(encode_config(node)), node)
         with self.assertRaisesRegex(ValueError, "greater than two"):
@@ -74,12 +77,14 @@ class AdditionalRoPETest(unittest.TestCase):
     def test_new_rope_fields_are_required_and_unknown_settings_fail(self):
         nodes = [
             MultiAxisRoPESpec(
+                interleaved=False,
                 mrope_interleaved=False,
                 rope_theta=10000,
                 partial_rotary_factor=1,
                 mrope_section=(1, 1, 2),
             ),
             DynamicNTKRoPESpec(
+                interleaved=False,
                 rope_theta=10000,
                 partial_rotary_factor=1,
                 factor=2,

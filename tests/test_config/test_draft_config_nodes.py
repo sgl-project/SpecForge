@@ -129,7 +129,7 @@ class DraftConfigNodesTest(unittest.TestCase):
         ):
             draft_config(
                 rope_parameters=DefaultRoPESpec(
-                    rope_theta=10000, partial_rotary_factor=0.375
+                    interleaved=False, rope_theta=10000, partial_rotary_factor=0.375
                 )
             )
 

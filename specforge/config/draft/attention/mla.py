@@ -25,7 +25,6 @@ class MLASpec(AttentionSpec):
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     v_head_dim: int
-    rope_interleave: bool
     attention_bias: bool
     is_causal: bool
     sliding_window: int | None
@@ -46,7 +45,7 @@ class MLASpec(AttentionSpec):
             raise ValueError("qk_nope_head_dim must be a nonnegative integer")
         if self.qk_rope_head_dim % 2:
             raise ValueError("qk_rope_head_dim must be even")
-        for name in ("rope_interleave", "attention_bias", "is_causal"):
+        for name in ("attention_bias", "is_causal"):
             boolean(name, getattr(self, name))
         if self.sliding_window is not None:
             positive_int("sliding_window", self.sliding_window)

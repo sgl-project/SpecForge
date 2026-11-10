@@ -16,15 +16,16 @@ from tests.test_modeling.test_dspine import forward_inputs, initialized_model
 class LegacyLayerAdapter(nn.Module):
     """Test-only signature adapter; production models are not switched yet."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, mask):
         super().__init__()
         self.layer = layer
+        self.mask = mask
 
     def forward(self, hidden, inputs):
         return self.layer(
             hidden_states=hidden,
             target_hidden=inputs.target_context,
-            attention_mask=inputs.attention_mask,
+            attention_mask=self.mask,
             position_ids=inputs.position_ids,
             position_embeddings=inputs.position_embeddings,
         )
@@ -32,7 +33,7 @@ class LegacyLayerAdapter(nn.Module):
 
 def model_owned_forward(model, inputs, checkpointing):
     backbone = DraftBackbone(
-        [LegacyLayerAdapter(layer) for layer in model.layers],
+        [LegacyLayerAdapter(layer, inputs["attention_mask"]) for layer in model.layers],
         final_norm=model.norm,
         rotary=[model.rotary_emb] * len(model.layers),
         residual=StandardResidual(StandardResidualSpec()),
@@ -42,7 +43,6 @@ def model_owned_forward(model, inputs, checkpointing):
     layer_inputs = [
         LayerInputs(
             target_context=context,
-            attention_mask=inputs["attention_mask"],
             position_ids=inputs["position_ids"],
         )
     ] * backbone.num_layers

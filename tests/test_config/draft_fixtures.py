@@ -27,6 +27,9 @@ def draft_config(**overrides):
             "tie_word_embeddings": False,
             "attention_configs": {
                 "full": GQASpec(
+                    qk_norm_position="before_rope",
+                    qk_norm_scope="head",
+                    qk_norm_config=None,
                     rope_parameters=None,
                     num_attention_heads=4,
                     num_key_value_heads=2,
@@ -45,10 +48,10 @@ def draft_config(**overrides):
             "conv_configs": {},
             "layer_configs": {"full_dense": LayerSpec(attention="full", mlp="dense")},
             "layer_types": ("full_dense", "full_dense"),
-            "norm_config": RMSNormSpec(eps=1e-6, weight_offset=0),
+            "norm_config": RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
             "residual_config": StandardResidualSpec(),
             "rope_parameters": DefaultRoPESpec(
-                rope_theta=10000, partial_rotary_factor=1.0
+                interleaved=False, rope_theta=10000, partial_rotary_factor=1.0
             ),
             "spec_config": DFlashSpec(
                 block=AnchoredBlockSpec(block_size=8),

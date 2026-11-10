@@ -23,7 +23,10 @@
       "output_gate": false,
       "is_causal": true,
       "sliding_window": null,
-      "attention_dropout": 0.0
+      "attention_dropout": 0.0,
+      "qk_norm_position": "before_rope",
+      "qk_norm_scope": "head",
+      "qk_norm_config": null
     }
   },
   "mlp_configs": {
@@ -48,7 +51,8 @@
   "norm_config": {
     "type": "rms",
     "eps": 1e-06,
-    "weight_offset": 0
+    "weight_offset": 0,
+    "has_weight": true
   },
   "residual_config": {
     "type": "standard"
@@ -56,7 +60,8 @@
   "rope_parameters": {
     "rope_type": "default",
     "rope_theta": 10000,
-    "partial_rotary_factor": 1.0
+    "partial_rotary_factor": 1.0,
+    "interleaved": false
   },
   "spec_config": {
     "target_features": {

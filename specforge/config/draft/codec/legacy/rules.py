@@ -36,6 +36,8 @@ def resolve_rope(payload: Mapping):
 
     def normalize(source):
         values = dict(source)
+        if "interleaved" in values:
+            raise ValueError("legacy Qwen3 RoPE does not support interleaved")
         alias = {"rope_type": values.pop("type")} if "type" in values else {}
         values["rope_type"] = resolve_alias(
             "rope_type", values, alias, default="default"
@@ -59,7 +61,7 @@ def resolve_rope(payload: Mapping):
             )
         if values["rope_type"] == "yarn":
             values = expand_yarn(values, payload.get("max_position_embeddings", 32768))
-        return decode_component("rope", values)
+        return decode_component("rope", {**values, "interleaved": False})
 
     result = normalize(modern if modern is not None else (scaling or {}))
     if modern is not None and scaling is not None and result != normalize(scaling):

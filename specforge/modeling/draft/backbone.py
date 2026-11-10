@@ -5,23 +5,24 @@ from dataclasses import dataclass, field, replace
 
 import torch
 from torch import Tensor, nn
-from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
+from .layers.attention.backends import PreparedAttention
 from .layers.residual import ResidualStreams
+from .layers.rope import NODE_DETERMINED_ROTARY_TYPES
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class LayerInputs:
     """Prepared runtime inputs, without algorithm settings or mutable KV caches.
 
-    Masks may be additive/boolean tensors or prebuilt FlexAttention block masks.
+    Attention is prepared once by the model and reused across equivalent layers.
     RoPE can be supplied directly or computed from this layer's position_ids.
     Tensor contents must not be mutated while their autograd graph is live.
     """
 
+    attention: PreparedAttention | None = None
     target_context: Tensor | None = None
-    attention_mask: Tensor | BlockMask | None = None
     position_ids: Tensor | None = None
     position_embeddings: tuple[Tensor, Tensor] | None = None
 
@@ -78,6 +79,7 @@ class DraftBackbone(nn.Module):
         if len(layer_inputs) != self.num_layers:
             raise ValueError("layer_inputs must contain one entry per layer")
         prepared = []
+        rotary_tables = []
         hidden = self.residual.expand(hidden)
         for inputs, rotary in zip(layer_inputs, self.rotary):
             if not isinstance(inputs, LayerInputs):
@@ -85,9 +87,21 @@ class DraftBackbone(nn.Module):
             if rotary is not None and inputs.position_embeddings is None:
                 if inputs.position_ids is None:
                     raise ValueError("rotary preparation requires position_ids")
-                inputs = replace(
-                    inputs, position_embeddings=rotary(hidden, inputs.position_ids)
-                )
+                # Built-in rotary modules are determined by their frozen node.
+                # Any other module shares only when the module itself is shared.
+                for cached, positions, tables in rotary_tables:
+                    same_rule = cached is rotary or (
+                        type(rotary) in NODE_DETERMINED_ROTARY_TYPES
+                        and type(cached) is type(rotary)
+                        and cached.config == rotary.config
+                        and cached.head_dim == rotary.head_dim
+                    )
+                    if same_rule and positions is inputs.position_ids:
+                        break
+                else:
+                    tables = rotary(hidden, inputs.position_ids)
+                    rotary_tables.append((rotary, inputs.position_ids, tables))
+                inputs = replace(inputs, position_embeddings=tables)
             prepared.append(inputs)
         return BackboneState(hidden, tuple(prepared), 0, self._state_owner)
 

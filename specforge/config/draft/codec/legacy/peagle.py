@@ -44,7 +44,9 @@ def _rope(payload):
     # PEagleDraftModel reads theta but constructs unscaled, full-dimensional
     # LlamaRotaryEmbedding. Scaling fields were accepted but never executed.
     theta = resolve_alias("rope_theta", *sources, payload, default=10000.0)
-    return DefaultRoPESpec(rope_theta=theta, partial_rotary_factor=1.0)
+    return DefaultRoPESpec(
+        interleaved=False, rope_theta=theta, partial_rotary_factor=1.0
+    )
 
 
 def decode_peagle(

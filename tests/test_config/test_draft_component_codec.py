@@ -24,6 +24,9 @@ from specforge.config.draft.rope import DefaultRoPESpec, RopeSpec
 
 COMPONENTS = {
     "attention": {
+        "qk_norm_position": "before_rope",
+        "qk_norm_scope": "head",
+        "qk_norm_config": None,
         "type": "gqa",
         "rope_parameters": None,
         "num_attention_heads": 8,
@@ -38,7 +41,7 @@ COMPONENTS = {
     },
     "mlp": {"type": "dense", "intermediate_size": 64, "hidden_act": "silu"},
     "conv": {"type": "grouped_causal", "kernel_size": 3, "group_size": 8},
-    "norm": {"type": "rms", "eps": 1e-6, "weight_offset": 1},
+    "norm": {"has_weight": True, "type": "rms", "eps": 1e-6, "weight_offset": 1},
     "residual": {"type": "standard"},
     "rope": {"rope_type": "none"},
     "logits": {"type": "mup", "multiplier": 8.0},
@@ -284,7 +287,10 @@ class ComponentCodecTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, r"norm/rms\.eps: expected a number, got str '1e-6'"
         ):
-            decode_component("norm", {"type": "rms", "eps": "1e-6", "weight_offset": 0})
+            decode_component(
+                "norm",
+                {"has_weight": True, "type": "rms", "eps": "1e-6", "weight_offset": 0},
+            )
         with self.assertRaisesRegex(
             ValueError, r"attention/gqa\.head_dim: expected int, got str '128'"
         ):
@@ -328,7 +334,7 @@ class ComponentCodecTest(unittest.TestCase):
                 """
 import sys
 from specforge.config.draft.codec.components import decode_component
-decode_component('norm', {'type': 'rms', 'eps': 1e-6, 'weight_offset': 0})
+decode_component('norm', {'type': 'rms', 'has_weight': True, 'eps': 1e-6, 'weight_offset': 0})
 for name in ('torch', 'transformers', 'pydantic', 'specforge.modeling',
              'specforge.algorithms', 'specforge.runtime', 'specforge.config.schema'):
     assert name not in sys.modules, name

@@ -19,18 +19,25 @@ class RMSNorm(nn.Module):
             raise TypeError("RMSNorm requires RMSNormSpec")
         positive_int("hidden_size", hidden_size)
         self.config = config
-        self.weight = nn.Parameter(torch.empty(hidden_size, device=device, dtype=dtype))
+        self.weight = (
+            nn.Parameter(torch.empty(hidden_size, device=device, dtype=dtype))
+            if config.has_weight
+            else None
+        )
         self.reset_draft_parameters()
 
     def reset_draft_parameters(self):
         # HF restoration can mark a loaded tensor before initializing missing ones.
-        init.constant_(self.weight, 1 - self.config.weight_offset)
+        if self.weight is not None:
+            init.constant_(self.weight, 1 - self.config.weight_offset)
 
     def forward(self, hidden: Tensor) -> Tensor:
         input_dtype = hidden.dtype
         hidden = hidden.to(torch.float32)
         variance = hidden.pow(2).mean(-1, keepdim=True)
         hidden = hidden * torch.rsqrt(variance + self.config.eps)
+        if self.weight is None:
+            return hidden.to(input_dtype)
         if self.config.weight_offset == 0:
             # Ordinary RMSNorm casts the normalized activations before scaling.
             return self.weight * hidden.to(input_dtype)

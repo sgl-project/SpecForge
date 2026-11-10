@@ -15,6 +15,7 @@ from .components import decode_component, decode_layer, encode_component, encode
 from .nodes import decode_node, encode_node
 from .target import resolve_target_logits, validate_target
 
+# Canonical v1 is provisional until the format cutover (design step 6).
 SCHEMA_VERSION = 1
 MODEL_TYPE = "specforge_draft"
 _GROUPS = {

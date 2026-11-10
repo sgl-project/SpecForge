@@ -82,7 +82,6 @@ class CanonicalCodecTest(unittest.TestCase):
                     qk_nope_head_dim=8,
                     qk_rope_head_dim=8,
                     v_head_dim=8,
-                    rope_interleave=True,
                     attention_bias=False,
                     is_causal=False,
                     sliding_window=None,

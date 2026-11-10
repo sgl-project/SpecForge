@@ -16,7 +16,6 @@ MLA = {
     "qk_nope_head_dim": 16,
     "qk_rope_head_dim": 8,
     "v_head_dim": 16,
-    "rope_interleave": True,
     "attention_bias": False,
     "is_causal": False,
     "sliding_window": None,
@@ -28,7 +27,16 @@ class MLASpecTest(unittest.TestCase):
     def test_projection_variants_round_trip(self):
         for rank in (None, 16):
             for interleaved in (False, True):
-                payload = {**MLA, "q_lora_rank": rank, "rope_interleave": interleaved}
+                payload = {
+                    **MLA,
+                    "q_lora_rank": rank,
+                    "rope_parameters": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                        "interleaved": interleaved,
+                    },
+                }
                 with self.subTest(rank=rank, interleaved=interleaved):
                     node = decode_component("attention", payload)
                     self.assertIsInstance(node, MLASpec)
@@ -42,7 +50,7 @@ class MLASpecTest(unittest.TestCase):
                     self.assertEqual(node, restored)
                     self.assertEqual(hash(node), hash(restored))
                     with self.assertRaises(dataclasses.FrozenInstanceError):
-                        node.rope_interleave = not interleaved
+                        node.rope_parameters.interleaved = not interleaved
 
     def test_rotary_and_nonrotary_dimensions(self):
         node = decode_component("attention", {**MLA, "qk_nope_head_dim": 0})
@@ -67,7 +75,7 @@ class MLASpecTest(unittest.TestCase):
                         decode_component("attention", {**MLA, name: value})
 
     def test_visibility_and_dropout_validation(self):
-        for name in ("rope_interleave", "attention_bias", "is_causal"):
+        for name in ("attention_bias", "is_causal"):
             for value in (None, 0, "false"):
                 with self.assertRaisesRegex(ValueError, name):
                     decode_component("attention", {**MLA, name: value})

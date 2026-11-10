@@ -1,5 +1,7 @@
 """Shared field decoding for legacy target-context drafts; no algorithm dispatch."""
 
+from dataclasses import replace
+
 from ..._validation import positive_int
 from ...architecture.features import TargetFeatureSpec
 from ...attention import GQASpec, MHASpec, MLASpec
@@ -135,13 +137,15 @@ def _attention(mode, values, causal, window):
             **common,
             **{name: values[name] for name in required},
             q_lora_rank=values.get("q_lora_rank"),
-            rope_interleave=values.get("rope_interleave", True),
         )
     if _MLA_FIELDS & values.keys():
         raise ValueError("MLA projection fields require attention_mode='mla'")
     schema = MHASpec if mode == "mha" else GQASpec
     kv_heads = values["num_key_value_heads"]
     return schema(
+        qk_norm_position="before_rope",
+        qk_norm_scope="head",
+        qk_norm_config=None,
         **common,
         num_key_value_heads=(
             values["num_attention_heads"] if kv_heads is None else kv_heads
@@ -162,6 +166,8 @@ def read_context(payload, method, target_config):
     depth = values["num_hidden_layers"]
     layers, settings = resolve_attention_layout(values, depth)
     rope = resolve_rope(values)
+    if mode == "mla":
+        rope = replace(rope, interleaved=values.get("rope_interleave", True))
     # Both embeddings and the head were already supplied by the target in the
     # existing training path. Resolving logits also requires an explicit target.
     logits = resolve_target_logits(target_config)
@@ -222,7 +228,9 @@ def read_context(payload, method, target_config):
             for name in settings
         },
         layer_types=layers,
-        norm_config=RMSNormSpec(eps=values["rms_norm_eps"], weight_offset=0),
+        norm_config=RMSNormSpec(
+            has_weight=True, eps=values["rms_norm_eps"], weight_offset=0
+        ),
         residual_config=StandardResidualSpec(),
         rope_parameters=rope,
         target_bindings=("embed_tokens", "lm_head"),

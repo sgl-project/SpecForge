@@ -13,6 +13,12 @@ from specforge.config.draft.rope import DefaultRoPESpec, LinearRoPESpec
 
 
 class LegacyRulesTest(unittest.TestCase):
+    def test_legacy_rope_rejects_interleaved_instead_of_overwriting_it(self):
+        for field in ("rope_parameters", "rope_scaling"):
+            for value in (True, False):
+                with self.assertRaisesRegex(ValueError, "interleaved"):
+                    resolve_rope({field: {"interleaved": value}})
+
     def test_aliases_reject_conflicts_instead_of_choosing_a_winner(self):
         self.assertEqual(
             resolve_alias("block_size", {"block_size": 8}, {"block_size": 8}), 8
@@ -31,7 +37,9 @@ class LegacyRulesTest(unittest.TestCase):
             resolve_alias("block_size", {})
 
     def test_old_and_new_rotary_spellings_resolve_identically(self):
-        expected = LinearRoPESpec(rope_theta=1000000, partial_rotary_factor=1, factor=2)
+        expected = LinearRoPESpec(
+            interleaved=False, rope_theta=1000000, partial_rotary_factor=1, factor=2
+        )
         old = {"rope_theta": 1000000, "rope_scaling": {"type": "linear", "factor": 2}}
         new = {
             "rope_parameters": {
@@ -45,7 +53,10 @@ class LegacyRulesTest(unittest.TestCase):
             self.assertEqual(resolve_rope(payload), expected)
         self.assertEqual(old, original)
         self.assertEqual(
-            resolve_rope({}), DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=1)
+            resolve_rope({}),
+            DefaultRoPESpec(
+                interleaved=False, rope_theta=10000, partial_rotary_factor=1
+            ),
         )
         with self.assertRaisesRegex(ValueError, "missing fields"):
             decode_component("rope", {"rope_type": "default"})
