@@ -178,7 +178,7 @@ class PrefixFeatureCache:
             raise CaptureContractError("lease does not cover the requested prefix")
         if namespace is not None and namespace != rec.namespace:
             raise CaptureContractError("lease namespace differs from plan")
-        if tokens is not None:
+        if tokens is not None and not end and self.skip_unused_cache_work:
             _token_tuple(tokens)
         if tokens is not None and (end or not self.skip_unused_cache_work):
             expected = self.block_keys(rec.namespace, tokens)
