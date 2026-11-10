@@ -40,6 +40,18 @@ def inputs_for(config, device="cpu", dtype=torch.float32):
     return ids, features, entries
 
 
+def count_layer_calls(model):
+    """Per-layer forward counts; a checkpointed layer runs again in backward."""
+    calls = [0] * model.backbone.num_layers
+    for index, layer in enumerate(model.backbone.layers):
+
+        def count(module, args, index=index):
+            calls[index] += 1
+
+        layer.register_forward_pre_hook(count)
+    return calls
+
+
 def legacy_name(name):
     for prefix, replacement in (
         ("backbone.layers.", "layers."),
@@ -188,6 +200,7 @@ class CanonicalDFlashTest(unittest.TestCase):
         self.assertIs(model.embed_tokens.weight, model.lm_head.weight)
         checkpointed = copy.deepcopy(model)
         checkpointed.gradient_checkpointing_enable()
+        calls = count_layer_calls(checkpointed)
         ids, features, entries = inputs_for(config)
         other = features.detach().clone().requires_grad_()
         output, expected = model(ids, features, entries), checkpointed(
@@ -197,6 +210,7 @@ class CanonicalDFlashTest(unittest.TestCase):
         upstream = torch.randn_like(output.logits)
         output.logits.backward(upstream)
         expected.logits.backward(upstream)
+        self.assertEqual(calls, [2] * checkpointed.backbone.num_layers)
         torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
         for name, parameter in model.named_parameters():
             torch.testing.assert_close(

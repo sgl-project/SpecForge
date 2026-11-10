@@ -12,6 +12,7 @@ from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.codec.components import decode_component
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
+from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec, YaRNSpec
 from specforge.modeling.draft.dflash import Qwen3DFlashMLAAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
@@ -19,6 +20,7 @@ from specforge.modeling.draft.layers import DecoderLayer, MLAAttention, build_co
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from specforge.modeling.draft.layers.residual import StandardResidualConnection
 from specforge.modeling.draft.layers.rope import build_rotary
 from tests.test_modeling.test_draft_gqa import layout_for
 
@@ -255,6 +257,8 @@ class MLATest(unittest.TestCase):
             eager = DecoderLayer(
                 build(node, rope, device=device, dtype=dtype),
                 torch.nn.Linear(16, 16, device=device, dtype=dtype),
+                attention_connection=StandardResidualConnection(StandardResidualSpec()),
+                mlp_connection=StandardResidualConnection(StandardResidualSpec()),
                 hidden_size=16,
                 norm=norm,
                 device=device,
@@ -263,6 +267,8 @@ class MLATest(unittest.TestCase):
             sdpa = DecoderLayer(
                 build(node, rope, backend="sdpa", device=device, dtype=dtype),
                 torch.nn.Linear(16, 16, device=device, dtype=dtype),
+                attention_connection=StandardResidualConnection(StandardResidualSpec()),
+                mlp_connection=StandardResidualConnection(StandardResidualSpec()),
                 hidden_size=16,
                 norm=norm,
                 device=device,

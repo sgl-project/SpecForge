@@ -21,7 +21,7 @@ from specforge.modeling.draft.models import DFlash2DraftModel, DFlashDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.legacy_fixtures import legacy_dflash_config
 from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
+from tests.test_modeling.test_canonical_dflash import count_layer_calls, legacy_name
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -63,6 +63,14 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
     predecessors = torch.randint(64, (2, 8), device=device)
     return (ids, features, entries), dict(
         candidate_ids=candidates, predecessor_ids=predecessors
+    )
+
+
+def score(model, output, options):
+    return model.candidate_selector.score_candidates(
+        **options,
+        unary_logits=output.logits.gather(-1, options["candidate_ids"]),
+        hidden_states=output.hidden_states,
     )
 
 
@@ -112,7 +120,8 @@ class CanonicalDFlash2Test(unittest.TestCase):
         )
         (ids, features, entries), options = model_inputs(config, device, dtype)
         other = features.detach().clone().requires_grad_()
-        output = actual(ids, features, entries, **options)
+        output = actual(ids, features, entries)
+        actual_scores = score(actual, output, options)
         with patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}):
             hidden = reference(
                 entries[0].position_ids,
@@ -126,14 +135,14 @@ class CanonicalDFlash2Test(unittest.TestCase):
             hidden_states=hidden,
         )
         torch.testing.assert_close(
-            (output.hidden_states, output.logits, output.candidate_scores),
+            (output.hidden_states, output.logits, actual_scores),
             (hidden, logits, scores),
             rtol=tolerance,
             atol=tolerance,
         )
         self.assertEqual(output.logits.dtype, torch.float32)
         upstream = torch.randn_like(scores)
-        output.candidate_scores.backward(upstream)
+        actual_scores.backward(upstream)
         scores.backward(upstream)
         torch.testing.assert_close(
             features.grad, other.grad, rtol=tolerance, atol=tolerance
@@ -177,15 +186,15 @@ class CanonicalDFlash2Test(unittest.TestCase):
             getattr(actual, name).load_target_weight(weight)
         other = copy.deepcopy(actual)
         other.gradient_checkpointing_enable()
+        calls = count_layer_calls(other)
         args, options = model_inputs(config)
-        output = actual(*args, **options)
-        expected = other(*args, **options)
-        torch.testing.assert_close(
-            output.candidate_scores, expected.candidate_scores, rtol=0, atol=0
-        )
-        grad = torch.randn_like(output.candidate_scores)
-        output.candidate_scores.backward(grad)
-        expected.candidate_scores.backward(grad)
+        output = score(actual, actual(*args), options)
+        expected = score(other, other(*args), options)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        grad = torch.randn_like(output)
+        output.backward(grad)
+        expected.backward(grad)
+        self.assertEqual(calls, [2] * other.backbone.num_layers)
         for name, parameter in actual.named_parameters():
             self.assertEqual(parameter.grad is not None, parameter.requires_grad, name)
             if parameter.requires_grad:
@@ -204,10 +213,7 @@ class CanonicalDFlash2Test(unittest.TestCase):
                 module.to_empty(device="cpu")
             module.load_target_weight(weight)
         torch.testing.assert_close(
-            restored(*args, **options).candidate_scores,
-            output.candidate_scores,
-            rtol=0,
-            atol=0,
+            score(restored, restored(*args), options), output, rtol=0, atol=0
         )
         self.assertNotIn("lm_head.weight", actual.state_dict())
         self.assertTrue(all(e.target_context is None for e in args[2]))
@@ -248,23 +254,41 @@ class CanonicalDFlash2Test(unittest.TestCase):
             atol=0,
         )
 
-    def test_candidate_contract_and_hidden_only_output(self):
+    def test_materialized_meta_models_initialize_all_parameters(self):
+        for config in (
+            draft_config(target_bindings=(), target_logit_transform=None),
+            dflash2_config(),
+        ):
+            with self.subTest(architecture=config.architecture):
+                model = build_draft_model(config, device="meta")
+                model.to_empty(device="cpu")
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        parameter.fill_(float("nan"))
+                model.init_weights()
+                for name, parameter in model.named_parameters():
+                    self.assertTrue(parameter.isfinite().all(), name)
+
+    def test_convolution_is_optional(self):
+        base = dflash2_config()
+        config = replace(
+            base,
+            conv_configs={},
+            layer_configs={"full_dense": LayerSpec(attention="full", mlp="dense")},
+        )
+        model = build_draft_model(config)
+        args, _ = model_inputs(config)
+        output = model(*args)
+        self.assertTrue(output.logits.isfinite().all())
+        self.assertIsNone(model.backbone.layers[0].attention_conv)
+        self.assertIsNone(model.backbone.layers[0].mlp_conv)
+
+    def test_hidden_only_output(self):
         actual = build_draft_model(dflash2_config())
-        args, options = model_inputs(actual.config.draft)
+        args, _ = model_inputs(actual.config.draft)
         hidden_only = actual(*args, output_logits=False)
         self.assertIsNone(hidden_only.logits)
-        self.assertIsNone(hidden_only.candidate_scores)
-        for invalid in (
-            {"candidate_ids": options["candidate_ids"]},
-            {**options, "output_logits": False},
-            {**options, "predecessor_ids": options["predecessor_ids"][:, :-1]},
-        ):
-            with self.assertRaises(ValueError):
-                actual(*args, **invalid)
-        with self.assertRaises(TypeError):
-            actual(
-                *args, **(options | {"candidate_ids": options["candidate_ids"].float()})
-            )
+        self.assertEqual(hidden_only.hidden_states.shape, (2, 8, 32))
 
 
 if __name__ == "__main__":

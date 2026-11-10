@@ -250,7 +250,8 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        # Attention interfaces already return [batch, query, head, dim].
+        # transformers attention interfaces already return [b, s, heads, d];
+        # another transpose here would mix heads and positions.
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
         if self.attn_output_gate:

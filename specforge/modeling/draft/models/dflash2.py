@@ -1,4 +1,4 @@
-"""DFlash2 composition with sublayer convolutions and explicit candidate scoring."""
+"""DFlash2 composition with sublayer convolutions and a candidate selector."""
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -22,20 +22,17 @@ from .tokens import build_token_modules
 class DFlash2Output(ModelOutput):
     hidden_states: Tensor | None = None
     logits: Tensor | None = None
-    candidate_scores: Tensor | None = None
 
 
 @register_draft_model
 class DFlash2DraftModel(DraftPreTrainedModel):
-    """Own DFlash2's composition without inheriting another algorithm model.
+    """DFlash plus sublayer convolutions and a low-rank candidate selector.
 
-    Optional candidate/predecessor IDs align with the input query positions.
-    Forward scores those candidates without detaching hidden states or logits.
-    Candidate construction, prediction-position masks, loss weights and sampling
-    remain caller policy; the selector is also available for lattice scoring.
+    `logits` are the transformed unary logits. Callers pick candidates from them
+    and score those through `candidate_selector`; sampling and losses stay theirs.
     """
 
-    _no_split_modules = ["DecoderLayer", "CandidateSelector"]
+    _no_split_modules = ["DecoderLayer"]
 
     def __init__(
         self, config: SpecForgeDraftConfig, *, backend="eager", device=None, dtype=None
@@ -88,32 +85,12 @@ class DFlash2DraftModel(DraftPreTrainedModel):
         target_features: Tensor,
         layer_inputs: Sequence[LayerInputs],
         *,
-        candidate_ids: Tensor | None = None,
-        predecessor_ids: Tensor | None = None,
         output_logits: bool = True,
     ) -> DFlash2Output:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must be [batch, draft_sequence]")
         if type(output_logits) is not bool:
             raise TypeError("output_logits must be boolean")
-        if (candidate_ids is None) != (predecessor_ids is None):
-            raise ValueError(
-                "candidate_ids and predecessor_ids must be supplied together"
-            )
-        if candidate_ids is not None:
-            if not output_logits:
-                raise ValueError("candidate scoring requires output_logits")
-            if (
-                candidate_ids.ndim != 3
-                or candidate_ids.shape[:2] != input_ids.shape
-                or candidate_ids.shape[-1] == 0
-                or predecessor_ids.shape != input_ids.shape
-            ):
-                raise ValueError(
-                    "candidate and predecessor IDs must align with input query positions"
-                )
-            if candidate_ids.dtype != torch.long or predecessor_ids.dtype != torch.long:
-                raise TypeError("candidate and predecessor IDs must be int64")
         prepared = prepare_context_inputs(
             self.fusion,
             target_features,
@@ -124,14 +101,4 @@ class DFlash2DraftModel(DraftPreTrainedModel):
         logits = (
             self.transform_unary_logits(self.lm_head(hidden)) if output_logits else None
         )
-        scores = None
-        if candidate_ids is not None:
-            scores = self.candidate_selector.score_candidates(
-                candidate_ids=candidate_ids,
-                unary_logits=logits.gather(-1, candidate_ids),
-                hidden_states=hidden,
-                predecessor_ids=predecessor_ids,
-            )
-        return DFlash2Output(
-            hidden_states=hidden, logits=logits, candidate_scores=scores
-        )
+        return DFlash2Output(hidden_states=hidden, logits=logits)
