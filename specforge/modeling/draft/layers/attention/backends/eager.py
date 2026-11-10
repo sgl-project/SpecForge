@@ -27,7 +27,8 @@ def eager_attention(
     scale: float,
     dropout_p: float,
     training: bool,
-) -> Tensor:
+    return_lse: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
     """Return [batch, query_heads, query_length, value_dim].
 
     Inputs use [batch, heads, sequence, dim]; grouped KV heads are supported.
@@ -85,4 +86,12 @@ def eager_attention(
     weights = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
     weights = weights.masked_fill(empty_rows, 0)
     weights = F.dropout(weights, p=dropout_p, training=training)
-    return torch.matmul(weights, _repeat_kv(value, groups))
+    output = torch.matmul(weights, _repeat_kv(value, groups))
+    if return_lse:
+        lse = (
+            scores.float()
+            .logsumexp(dim=-1)
+            .masked_fill(empty_rows.squeeze(-1), -torch.inf)
+        )
+        return output, lse
+    return output

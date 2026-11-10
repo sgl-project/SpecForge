@@ -9,8 +9,13 @@ from specforge.config.draft.norm import NormSpec
 
 from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
-from .backends import eager_attention
-from .masks import AttentionLayout, dense_attention_mask
+from .backends import (
+    AttentionBackend,
+    AttentionPreparation,
+    PreparedAttention,
+    resolve_attention_backend,
+)
+from .masks import AttentionLayout
 
 
 class GQAAttention(nn.Module):
@@ -22,7 +27,7 @@ class GQAAttention(nn.Module):
         hidden_size: int,
         norm: NormSpec,
         rotary_dim: int,
-        backend: str,
+        backend: str | AttentionBackend,
         device=None,
         dtype=None,
     ):
@@ -47,8 +52,7 @@ class GQAAttention(nn.Module):
             and rotary_dim != config.rope_parameters.rotary_dim(config.head_dim)
         ):
             raise ValueError("rotary_dim must match the attention RoPE override")
-        if backend != "eager":
-            raise ValueError("GQAAttention currently supports only the eager backend")
+        self.backend = resolve_attention_backend(backend)
         self.config = config
         self.rotary_dim = rotary_dim
         self.q_norm = (
@@ -75,11 +79,28 @@ class GQAAttention(nn.Module):
         self.v_proj = nn.Linear(input_size, kv_width, **options)
         self.o_proj = nn.Linear(q_width, hidden_size, **options)
 
+    def prepare(
+        self,
+        layout: AttentionLayout,
+        preparation: AttentionPreparation,
+        *,
+        batch_size: int,
+    ) -> PreparedAttention:
+        """Prepare outside the layer loop; equivalent layers share the same result."""
+        return preparation.prepare(
+            self.backend,
+            layout,
+            batch_size=batch_size,
+            num_heads=self.config.num_attention_heads,
+            is_causal=self.config.is_causal,
+            sliding_window=self.config.sliding_window,
+        )
+
     def forward(
         self,
         hidden: Tensor,
         *,
-        layout: AttentionLayout,
+        attention: PreparedAttention,
         position_embeddings: tuple[Tensor, Tensor] | None,
         target_context: Tensor | None = None,
     ) -> Tensor:
@@ -106,24 +127,21 @@ class GQAAttention(nn.Module):
             )
         context_length = 0 if target_context is None else target_context.shape[1]
         keys = context_length + length
-        if not isinstance(layout, AttentionLayout):
-            raise TypeError("GQAAttention requires AttentionLayout")
+        if not isinstance(attention, PreparedAttention):
+            raise TypeError("GQAAttention requires PreparedAttention")
+        layout = attention.layout
         if (
-            any(
-                value.shape[0] not in (1, batch)
-                for value in (
-                    layout.query_positions,
-                    layout.key_positions,
-                    layout.visibility,
-                )
-            )
+            attention.batch_size != batch
+            or attention.num_heads != self.config.num_attention_heads
+            or attention.backend is not self.backend
+            or attention.is_causal != self.config.is_causal
+            or attention.sliding_window != self.config.sliding_window
             or layout.query_positions.shape[1] != length
             or layout.key_positions.shape[1] != keys
             or layout.query_positions.device != hidden.device
-            or layout.visibility.shape[1] not in (1, self.config.num_attention_heads)
         ):
             raise ValueError(
-                "layout must describe the query and context-then-query KV tensors"
+                "prepared attention must match the layer and query/KV tensors"
             )
         if self.rotary_dim:
             if position_embeddings is None or len(position_embeddings) != 2:
@@ -143,9 +161,6 @@ class GQAAttention(nn.Module):
         elif position_embeddings is not None:
             raise ValueError("disabled RoPE requires position_embeddings=None")
         node = self.config
-        mask = dense_attention_mask(
-            layout, is_causal=node.is_causal, sliding_window=node.sliding_window
-        )
         query = self.q_proj(hidden).view(
             batch,
             length,
@@ -175,18 +190,15 @@ class GQAAttention(nn.Module):
                 query, (cos[:, context_length:], sin[:, context_length:])
             )
             key = apply_rotary(key, (cos, sin))
-        # FP32 norms/RoPE can promote Q/K under autocast. Preserve their precision
-        # through softmax/dropout; the matmuls still follow the autocast policy.
-        value = value.to(query.dtype)
-        output = eager_attention(
+        result = attention.attend(
             query,
             key,
             value,
-            attention_mask=mask,
             scale=node.head_dim**-0.5,
             dropout_p=node.attention_dropout,
             training=self.training,
         )
+        output = result.output
         output = output.transpose(1, 2).reshape(
             batch, length, node.num_attention_heads * node.head_dim
         )
@@ -194,7 +206,7 @@ class GQAAttention(nn.Module):
             output = output * gate.sigmoid()
         output = self.o_proj(output)
         # Inactive queries must stay zero even when the output projection has bias.
-        return output.masked_fill(~mask.any(dim=-1).any(dim=1).unsqueeze(-1), 0)
+        return result.mask_output(output)
 
 
 register_component_builder("attention", GQASpec, GQAAttention)

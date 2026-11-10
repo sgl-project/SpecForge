@@ -17,6 +17,7 @@ from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import GQAAttention, build_component
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     dense_attention_mask,
@@ -65,6 +66,11 @@ def layout_for(hidden, context_length=0):
             b, 1, q, keys.shape[1], device=hidden.device, dtype=torch.bool
         ),
     )
+
+
+def prepared(module, layout, batch_size):
+    with AttentionPreparation() as preparation:
+        return module.prepare(layout, preparation, batch_size=batch_size)
 
 
 class GQATest(unittest.TestCase):
@@ -173,7 +179,7 @@ class GQATest(unittest.TestCase):
                     ):
                         output = actual(
                             hidden,
-                            layout=layout,
+                            attention=prepared(actual, layout, hidden.shape[0]),
                             position_embeddings=embeddings,
                             target_context=context,
                         )
@@ -231,7 +237,11 @@ class GQATest(unittest.TestCase):
         layout.visibility.zero_()
         with torch.no_grad():
             module.o_proj.bias.fill_(7)
-        output = module(hidden, layout=layout, position_embeddings=None)
+        output = module(
+            hidden,
+            attention=prepared(module, layout, hidden.shape[0]),
+            position_embeddings=None,
+        )
         torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
         output.sum().backward()
         for parameter in (*module.parameters(), hidden):
@@ -240,7 +250,11 @@ class GQATest(unittest.TestCase):
             )
         empty = torch.empty(2, 0, 16)
         self.assertEqual(
-            module(empty, layout=layout_for(empty), position_embeddings=None).shape,
+            module(
+                empty,
+                attention=prepared(module, layout_for(empty), empty.shape[0]),
+                position_embeddings=None,
+            ).shape,
             (2, 0, 16),
         )
 
@@ -271,20 +285,32 @@ class GQATest(unittest.TestCase):
             torch.ones(1, 3, 8, dtype=hidden.dtype),
             torch.zeros(1, 3, 8, dtype=hidden.dtype),
         )
-        expected = module(hidden, layout=layout, position_embeddings=tables)
-        actual = module(hidden, layout=shared, position_embeddings=tables)
+        expected = module(
+            hidden,
+            attention=prepared(module, layout, hidden.shape[0]),
+            position_embeddings=tables,
+        )
+        actual = module(
+            hidden,
+            attention=prepared(module, shared, hidden.shape[0]),
+            position_embeddings=tables,
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         with self.assertRaisesRegex(ValueError, "dtype"):
             module(
                 hidden,
-                layout=shared,
+                attention=prepared(module, shared, hidden.shape[0]),
                 position_embeddings=tuple(t.float() for t in tables),
             )
         mismatched = replace(
             shared, visibility=torch.ones(3, 1, 3, 3, dtype=torch.bool)
         )
         with self.assertRaisesRegex(ValueError, "layout"):
-            module(hidden, layout=mismatched, position_embeddings=tables)
+            module(
+                hidden,
+                attention=prepared(module, mismatched, hidden.shape[0]),
+                position_embeddings=tables,
+            )
 
     def test_invalid_construction_and_runtime_inputs_fail_early(self):
         node = make_node()
@@ -299,7 +325,7 @@ class GQATest(unittest.TestCase):
                     hidden_size=16,
                     norm=RMSNormSpec(eps=1e-6, weight_offset=0),
                     rotary_dim=8,
-                    backend="flex",
+                    backend="unknown",
                 )
             with self.assertRaises(ValueError):
                 build(replace(node, rope_parameters=NoRoPESpec()))
@@ -309,17 +335,21 @@ class GQATest(unittest.TestCase):
         layout = layout_for(hidden)
         with patch.object(module.q_proj, "forward") as project:
             with self.assertRaises(ValueError):
-                module(hidden, layout=layout, position_embeddings=None)
+                module(
+                    hidden,
+                    attention=prepared(module, layout, hidden.shape[0]),
+                    position_embeddings=None,
+                )
             with self.assertRaises(ValueError):
                 module(
                     hidden,
-                    layout=layout,
+                    attention=prepared(module, layout, hidden.shape[0]),
                     position_embeddings=(torch.ones(2, 4, 8), torch.zeros(2, 4, 8)),
                 )
             with self.assertRaises(ValueError):
                 module(
                     hidden,
-                    layout=layout,
+                    attention=prepared(module, layout, hidden.shape[0]),
                     position_embeddings=None,
                     target_context=torch.zeros(2, 1, 32),
                 )

@@ -8,18 +8,22 @@ from torch import Tensor, nn
 from torch.nn.attention.flex_attention import BlockMask
 from torch.utils.checkpoint import checkpoint
 
+from .layers.attention.backends import PreparedAttention
 from .layers.residual import ResidualStreams
+from .layers.rope.base import RotaryEmbedding
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
 class LayerInputs:
     """Prepared runtime inputs, without algorithm settings or mutable KV caches.
 
-    Masks may be additive/boolean tensors or prebuilt FlexAttention block masks.
+    Attention is prepared once by the model and reused across equivalent layers.
+    The legacy attention_mask field accepts tensor or FlexAttention masks.
     RoPE can be supplied directly or computed from this layer's position_ids.
     Tensor contents must not be mutated while their autograd graph is live.
     """
 
+    attention: PreparedAttention | None = None
     target_context: Tensor | None = None
     attention_mask: Tensor | BlockMask | None = None
     position_ids: Tensor | None = None
@@ -78,6 +82,7 @@ class DraftBackbone(nn.Module):
         if len(layer_inputs) != self.num_layers:
             raise ValueError("layer_inputs must contain one entry per layer")
         prepared = []
+        rotary_tables = {}
         hidden = self.residual.expand(hidden)
         for inputs, rotary in zip(layer_inputs, self.rotary):
             if not isinstance(inputs, LayerInputs):
@@ -85,9 +90,17 @@ class DraftBackbone(nn.Module):
             if rotary is not None and inputs.position_embeddings is None:
                 if inputs.position_ids is None:
                     raise ValueError("rotary preparation requires position_ids")
-                inputs = replace(
-                    inputs, position_embeddings=rotary(hidden, inputs.position_ids)
+                # Built-in rotary modules are determined by their frozen node.
+                # Unknown modules share only when the module itself is shared.
+                rule = (
+                    (type(rotary), rotary.config, rotary.head_dim)
+                    if isinstance(rotary, RotaryEmbedding)
+                    else id(rotary)
                 )
+                key = (rule, id(inputs.position_ids))
+                if key not in rotary_tables:
+                    rotary_tables[key] = rotary(hidden, inputs.position_ids)
+                inputs = replace(inputs, position_embeddings=rotary_tables[key])
             prepared.append(inputs)
         return BackboneState(hidden, tuple(prepared), 0, self._state_owner)
 

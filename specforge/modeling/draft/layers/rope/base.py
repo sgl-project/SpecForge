@@ -16,6 +16,7 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, config: RotarySpec, *, head_dim: int):
         super().__init__()
         self.config = config
+        self.head_dim = head_dim
         self.rotary_dim = config.rotary_dim(head_dim)
 
     def _frequencies(self, device: torch.device) -> Tensor:

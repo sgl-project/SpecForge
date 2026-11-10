@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -148,6 +149,32 @@ class RotaryTest(unittest.TestCase):
         torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
         self.assertIsNone(inputs[0].position_embeddings)
         self.assertIs(inputs[1].position_embeddings, supplied)
+
+    def test_backbone_reuses_equivalent_rotary_only_within_forward(self):
+        node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5)
+        rotary = [DefaultRotaryEmbedding(node, head_dim=8) for _ in range(2)]
+        backbone = DraftBackbone(
+            [RotaryLayer(), RotaryLayer()],
+            final_norm=nn.Identity(),
+            rotary=rotary,
+            residual=StandardResidual(StandardResidualSpec()),
+        )
+        hidden, positions = torch.randn(1, 3, 8), torch.arange(3)[None]
+        inputs = [LayerInputs(position_ids=positions)] * 2
+        with (
+            patch.object(rotary[0], "forward", wraps=rotary[0].forward) as first,
+            patch.object(rotary[1], "forward", wraps=rotary[1].forward) as second,
+        ):
+            state = backbone.begin(hidden, inputs)
+            self.assertIs(
+                state.layer_inputs[0].position_embeddings,
+                state.layer_inputs[1].position_embeddings,
+            )
+            self.assertEqual((first.call_count, second.call_count), (1, 0))
+            backbone.begin(hidden, inputs)
+            self.assertEqual(first.call_count, 2)
+            backbone.begin(hidden, [inputs[0], LayerInputs(position_ids=positions + 1)])
+            self.assertEqual(second.call_count, 1)
 
     def test_invalid_dimensions_and_layouts_fail(self):
         node = DefaultRoPESpec(rope_theta=10000.0, partial_rotary_factor=0.5)
