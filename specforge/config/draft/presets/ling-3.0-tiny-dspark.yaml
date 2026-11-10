@@ -17,6 +17,9 @@ attention_configs:
     num_key_value_heads: 12
     head_dim: 128
     qk_norm: true
+    qk_norm_position: before_rope
+    qk_norm_scope: head
+    qk_norm_config: null
     attention_bias: false
     output_gate: false
     is_causal: false
@@ -42,12 +45,14 @@ layer_types:
 num_hidden_layers: 5
 norm_config:
   type: rms
+  has_weight: true
   eps: 1.0e-06
   weight_offset: 0
 residual_config:
   type: standard
 rope_parameters:
   rope_type: default
+  interleaved: false
   rope_theta: 6000000.0
   partial_rotary_factor: 1.0
 spec_config:
