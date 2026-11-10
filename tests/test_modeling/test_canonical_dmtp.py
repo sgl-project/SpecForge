@@ -10,6 +10,7 @@ from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.block import ExternalFirstBlockSpec
+from specforge.config.draft.codec import decode_config, encode_config
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.dflash import DFlashDraftModel as LegacyDFlashDraftModel
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
@@ -91,7 +92,8 @@ class CanonicalDMTPTest(unittest.TestCase):
                     dflash_config={"target_layer_ids": [1, 3], "mask_token_id": 63},
                 )
                 decoder = LegacyDFlashDraftModel(legacy).to(device=device, dtype=dtype)
-                decoder.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
+                with torch.device(device):
+                    decoder.rotary_emb = Qwen3RotaryEmbedding(legacy)
                 decoder.load_state_dict(
                     {
                         legacy_name(n): v
@@ -183,6 +185,51 @@ class CanonicalDMTPTest(unittest.TestCase):
     def test_cuda_reference_composition(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             self._parity("cuda", dtype)
+
+    def test_inactive_nan_features_do_not_affect_gradients(self):
+        for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
+            with self.subTest(device=device):
+                config = model_config()
+                actual = build_draft_model(config, device=device)
+                reference = copy.deepcopy(actual)
+                args, mtp, keep = model_inputs(config, device)
+                padded = mtp.detach().masked_fill(~keep[..., None], float("nan"))
+                padded.requires_grad_()
+                output = actual(*args, mtp_features=padded, block_keep_mask=keep)
+                expected = reference(*args, mtp_features=mtp, block_keep_mask=keep)
+                torch.testing.assert_close(output.logits, expected.logits)
+                output.logits.sum().backward()
+                expected.logits.sum().backward()
+                self.assertTrue(torch.isfinite(padded.grad).all())
+                self.assertEqual(torch.count_nonzero(padded.grad[~keep]).item(), 0)
+                for name, parameter in actual.named_parameters():
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+                    torch.testing.assert_close(
+                        parameter.grad, dict(reference.named_parameters())[name].grad
+                    )
+
+    def test_target_width_can_differ_from_draft_width(self):
+        base = model_config()
+        config = replace(
+            base,
+            spec_config=replace(
+                base.spec_config,
+                target_features=replace(
+                    base.spec_config.target_features, hidden_size=48
+                ),
+            ),
+        )
+        target = {"hidden_size": 48, "vocab_size": 64, "num_hidden_layers": 8}
+        config = decode_config(encode_config(config), target_config=target)
+        model = build_draft_model(config)
+        (ids, _, entries), mtp, keep = model_inputs(config)
+        context = torch.randn(2, 5, config.spec_config.target_features.input_width())
+        output = model(ids, context, entries, mtp_features=mtp, block_keep_mask=keep)
+        self.assertEqual(output.hidden_states.shape, (2, 8, 32))
+        with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
+            decode_config(
+                encode_config(config), target_config=target | {"hidden_size": 32}
+            )
 
     def test_only_first_slots_are_fused_and_blocks_are_independent(self):
         config = model_config()

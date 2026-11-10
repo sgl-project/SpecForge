@@ -83,6 +83,11 @@ class DMTPDraftModel(DraftPreTrainedModel):
             block_keep_mask.shape != shape or block_keep_mask.dtype != torch.bool
         ):
             raise ValueError("block_keep_mask must be boolean [batch, blocks]")
+        if mtp_features.ndim != 3 or mtp_features.shape[:2] != shape:
+            raise ValueError("mtp_features must be [batch, blocks, feature_size]")
+        if block_keep_mask is not None:
+            # Mask before fusion so padded NaNs cannot contaminate parameter gradients.
+            mtp_features = mtp_features.masked_fill(~block_keep_mask[..., None], 0)
         embeddings = self.embed_tokens(input_ids).reshape(
             *shape, slots, self.config.draft.hidden_size
         )
