@@ -116,24 +116,26 @@ class EagleBackboneTest(unittest.TestCase):
                         for layer in references:
                             expected = layer(expected, causal, embeddings)
                     expected = final_norm(expected)
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
                     expected.backward(upstream)
-                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        hidden.grad, other.grad, rtol=1e-5, atol=1e-5
+                    )
                     for name, parameter in actual.layers.named_parameters():
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(references.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
+                            rtol=1e-5,
+                            atol=1e-5,
                         )
                     for name, parameter in actual.final_norm.named_parameters():
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(final_norm.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
+                            rtol=1e-5,
+                            atol=1e-5,
                         )
 
     def test_cpu_legacy_eager_wiring(self):

@@ -28,7 +28,7 @@ class MTPInputFusion(nn.Module):
         super().__init__()
         if type(config) is not MTPSpec:
             raise TypeError("MTP input fusion requires MTPSpec")
-        width = config.fusion_input_width(hidden_size)
+        width = hidden_size + config.target_features.hidden_size
         self.config = config
         self.hidden_size = hidden_size
         self.pre_fc_norm_embedding = build_component(

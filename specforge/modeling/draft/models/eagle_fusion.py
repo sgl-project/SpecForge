@@ -8,6 +8,7 @@ from specforge.config.draft.architecture.eagle_fusion import AuxiliaryFeatureSpe
 from specforge.config.draft.norm import NormSpec
 
 from ..layers import build_component, component_builder
+from ..layers.attention.backends import PreparedAttention
 from ..layers.inputs import LayerInputs
 
 
@@ -110,8 +111,8 @@ class EagleDecoderStage(nn.Module):
             )
         if not isinstance(inputs, LayerInputs):
             raise TypeError("EAGLE first stage requires LayerInputs")
-        if inputs.attention_layout is None or inputs.attention_mask is not None:
-            raise ValueError("EAGLE first stage requires attention_layout")
+        if not isinstance(inputs.attention, PreparedAttention):
+            raise ValueError("EAGLE first stage requires prepared attention")
         if inputs.target_context is not None:
             raise ValueError(
                 "EAGLE fuses features into queries, not a target KV context"
@@ -124,7 +125,7 @@ class EagleDecoderStage(nn.Module):
             residual = features
         update = self.self_attn(
             torch.cat((embeds, features), dim=-1),
-            layout=inputs.attention_layout,
+            attention=inputs.attention,
             position_embeddings=inputs.position_embeddings,
         )
         if update.shape != residual.shape:

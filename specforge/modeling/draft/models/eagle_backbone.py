@@ -9,6 +9,7 @@ from specforge.config.draft.residual import StandardResidualSpec
 from ..backbone import DraftBackbone
 from ..layers import DecoderLayer, build_component, component_builder
 from ..layers.rope import build_rotary
+from .assembly import DecoderBackbone
 from .eagle_fusion import EagleDecoderStage
 
 
@@ -79,7 +80,7 @@ def build_eagle_backbone(
             else DecoderLayer(*parts, norm=config.norm_config, **options)
         )
     normalize_output = type(spec) is PEagleSpec or spec.norm_output
-    return DraftBackbone(
+    return DecoderBackbone(
         layers,
         rotary=rotary,
         final_norm=(
