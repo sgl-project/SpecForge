@@ -12,6 +12,11 @@ from .layers.residual import ResidualStreams
 from .layers.rope.base import RotaryEmbedding
 
 
+def _call_layer(layer, hidden, inputs, layer_kwargs):
+    """Keep layer keyword arguments separate from checkpoint control options."""
+    return layer(hidden, inputs, **layer_kwargs)
+
+
 @dataclass(frozen=True, eq=False)
 class BackboneState:
     hidden: Tensor
@@ -105,13 +110,18 @@ class DraftBackbone(nn.Module):
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             # Non-reentrant checkpointing retains gradients for nested context/RoPE
             # tensors, and works when inputs are frozen but layer weights are not.
-            # Pass the selected module directly: recomputation must not close over
-            # an advancing layer index. Normal module hooks still run.
+            # Pass the module and its kwargs as positional inputs, so checkpoint
+            # cannot consume a layer argument such as debug or use_reentrant.
             result = checkpoint(
-                layer, state.hidden, inputs, use_reentrant=False, **layer_kwargs
+                _call_layer,
+                layer,
+                state.hidden,
+                inputs,
+                layer_kwargs,
+                use_reentrant=False,
             )
         else:
-            result = layer(state.hidden, inputs, **layer_kwargs)
+            result = _call_layer(layer, state.hidden, inputs, layer_kwargs)
         output = result if isinstance(result, LayerOutput) else None
         return replace(
             state,

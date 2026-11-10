@@ -87,9 +87,9 @@ class BackboneTest(unittest.TestCase):
             feature: torch.Tensor
 
         class Layer(TestLayer):
-            def forward(self, hidden, inputs, *, scale=2):
+            def forward(self, hidden, inputs, *, debug=False):
                 hidden = super().forward(hidden, inputs)
-                return Output(hidden, hidden * scale)
+                return Output(hidden, hidden * (2 if debug else 1))
 
         backbone = make_backbone()
         backbone.layers = nn.ModuleList([Layer(), Layer()])
@@ -101,7 +101,7 @@ class BackboneTest(unittest.TestCase):
             backbone.gradient_checkpointing = checkpointing
             state = backbone.begin(hidden, inputs)
             for _ in backbone.layers:
-                state = backbone.run_next_layer(state, scale=2)
+                state = backbone.run_next_layer(state, debug=True)
             torch.testing.assert_close(
                 backbone.finalize(state), expected, rtol=0, atol=0
             )
