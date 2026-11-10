@@ -31,7 +31,11 @@ class LegacyPEagleTest(unittest.TestCase):
         payload = peagle_payload()
         payload.pop("norm_before_residual", None)
         target = target_for_peagle(payload)
-        for mask in (None, -1, True, payload["vocab_size"]):
+        with self.assertRaisesRegex(
+            ValueError, "peagle_mask_token_id.*resume contract"
+        ):
+            decode_legacy_config(payload, target_config=target)
+        for mask in (-1, True, payload["vocab_size"]):
             with (
                 self.subTest(mask=mask),
                 self.assertRaisesRegex(ValueError, "mask_token_id"),

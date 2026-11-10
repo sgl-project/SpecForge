@@ -27,6 +27,8 @@ class AuxiliaryFeatureSpec:
         positive_int("target_config.num_hidden_layers", count)
         if any(layer >= count for layer in self.target_layer_ids):
             raise ValueError("target_layer_ids exceed target num_hidden_layers")
+        if count - 1 in self.target_layer_ids:
+            raise ValueError("target_layer_ids cannot include the final target layer")
         width = target.get("hidden_size")
         positive_int("target_config.hidden_size", width)
         if self.hidden_size != width:

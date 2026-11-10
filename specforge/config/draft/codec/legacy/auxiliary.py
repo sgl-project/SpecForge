@@ -59,6 +59,7 @@ def _capture_layers(layers):
 
 def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=None):
     validate_dimensions(payload)
+    depth = payload["num_hidden_layers"] if num_layers is None else num_layers
     reject_ignored_settings(
         payload,
         attention_bias=False,
@@ -66,11 +67,10 @@ def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=No
         mlp_bias=False,
         use_sliding_window=False,
         partial_rotary_factor=1,
-        layer_types=["full_attention"] * payload["num_hidden_layers"],
+        layer_types=["full_attention"] * depth,
     )
     target = _text_config(target_config)
     values = {**_DEFAULTS, **payload}
-    depth = values["num_hidden_layers"] if num_layers is None else num_layers
     heads = values["num_attention_heads"]
     positive_int("num_hidden_layers", depth)
     tp = values.get("pretraining_tp", 1)
@@ -89,12 +89,16 @@ def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=No
     )
     if "use_aux_hidden_state" in method:
         boolean("use_aux_hidden_state", method["use_aux_hidden_state"])
+        reject_ignored_settings(method, use_aux_hidden_state=True)
     layers = method.get("eagle_aux_hidden_state_layer_ids")
     layers = _capture_layers(layers) if layers is not None else None
     if capture_layers is not None:
         recorded = _capture_layers(capture_layers)
         if layers is not None and layers != recorded:
-            raise ValueError("recorded capture_layers conflict with eagle_config")
+            raise ValueError(
+                "recorded capture_layers conflict with eagle_config; remove the stale "
+                "eagle_config or supply the draft config used by the training run"
+            )
         layers = recorded
     if layers is None:
         count = target.get("num_hidden_layers")

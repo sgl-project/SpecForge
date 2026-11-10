@@ -64,6 +64,7 @@ class Eagle3SpecTest(unittest.TestCase):
         for field, value, message in (
             ("hidden_size", 64, "target_features.hidden_size"),
             ("num_hidden_layers", 4, "target_layer_ids"),
+            ("num_hidden_layers", 5, "final target layer"),
         ):
             with self.assertRaisesRegex(ValueError, message):
                 decode_config(payload, target_config=target | {field: value})

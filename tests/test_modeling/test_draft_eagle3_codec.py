@@ -161,7 +161,6 @@ class Eagle3CodecParityTest(unittest.TestCase):
     def test_outputs_and_gradients_match_for_normalization_and_rotary_variants(self):
         cases = [
             ("qwen3-8b-eagle3.json", {}),
-            ("qwen3-8b-eagle3.json", {"num_hidden_layers": 8}),
             ("qwen3-30B-A3B-eagle3.1.json", {}),
             ("qwen2-5-vl-7b-eagle3.json", {}),
             ("deepseek-v2-lite-eagle3.json", {}),

@@ -6,6 +6,7 @@ from ..target import validate_target
 from .auxiliary import _FIELDS, read_auxiliary
 from .context import _check_fields
 from .eagle_rope import resolve_eagle_rope
+from .rules import reject_ignored_settings
 
 
 def decode_eagle3(payload, *, target_config, capture_layers=None):
@@ -15,7 +16,7 @@ def decode_eagle3(payload, *, target_config, capture_layers=None):
         | {"fc_norm", "norm_output", "target_model_type", "decoder_sparse_step"},
         "legacy EAGLE3",
     )
-    # The old model creates one midlayer regardless of the HF depth field.
+    reject_ignored_settings(payload, num_hidden_layers=1)
     fields, features = read_auxiliary(
         payload, target_config, num_layers=1, capture_layers=capture_layers
     )

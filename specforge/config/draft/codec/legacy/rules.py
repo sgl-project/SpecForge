@@ -143,5 +143,10 @@ def reject_ignored_settings(payload, **fixed):
     """Reject structural values that the historical model would silently ignore."""
     for name, expected in fixed.items():
         value = payload.get(name)
+        if name == "layer_types" and isinstance(value, (list, tuple)):
+            value = list(value)
         if value is not None and value != expected:
-            raise ValueError(f"legacy {name} must be {expected!r}")
+            raise ValueError(
+                f"legacy {name} must be {expected!r}; "
+                "the historical model ignored other values"
+            )

@@ -56,6 +56,11 @@ def decode_peagle(
     norm_before_residual=None,
 ):
     _check_fields(payload, _FIELDS | {"norm_before_residual"}, "legacy P-EAGLE")
+    if mask_token_id is None:
+        raise ValueError(
+            "legacy P-EAGLE requires mask_token_id from peagle_mask_token_id "
+            "in the checkpoint resume contract"
+        )
     fields, features = read_auxiliary(
         payload, target_config, capture_layers=capture_layers
     )

@@ -64,6 +64,8 @@ class LegacyMTPTest(unittest.TestCase):
         self.assertEqual(node.rope_parameters.mrope_section, (11, 11, 10))
         self.assertTrue(node.rope_parameters.mrope_interleaved)
         self.assertEqual(decode_config(encode_config(node), target_config=target), node)
+        target["rope_parameters"]["rope_theta"] = 5000
+        self.assertEqual(decode_legacy_config(payload, target_config=target), expected)
 
     def test_bundled_recipe_round_trip_and_binding_choices(self):
         for method in (None, {}, {"share_lm_head": True}, {"share_lm_head": False}):
