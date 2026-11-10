@@ -82,8 +82,11 @@ def build_decoder_backbone(
     protocol = config.spec_config.protocol
     block_size = None if protocol is None else protocol.num_model_slots
     options = dict(hidden_size=config.hidden_size, device=device, dtype=dtype)
+    residual = build_component("residual", config.residual_config)
     layers = []
-    for layer, attention, rope in zip(definitions, attentions, ropes):
+    for index, (layer, attention, rope) in enumerate(
+        zip(definitions, attentions, ropes)
+    ):
         conv = None
         if layer.sublayer_conv is not None:
             conv = tuple(
@@ -108,6 +111,12 @@ def build_decoder_backbone(
                 ),
                 build_component("mlp", config.mlp_configs[layer.mlp], **options),
                 norm=config.norm_config,
+                attention_connection=residual.build_connection(
+                    layer_index=index, sublayer="attention", **options
+                ),
+                mlp_connection=residual.build_connection(
+                    layer_index=index, sublayer="mlp", **options
+                ),
                 sublayer_conv=conv,
                 **options,
             )
@@ -116,5 +125,5 @@ def build_decoder_backbone(
         layers,
         final_norm=build_component("norm", config.norm_config, **options),
         rotary=rotary,
-        residual=build_component("residual", config.residual_config),
+        residual=residual,
     )
