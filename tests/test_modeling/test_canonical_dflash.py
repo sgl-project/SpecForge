@@ -16,6 +16,7 @@ from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DFlashDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.legacy_fixtures import legacy_dflash_config
+from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -51,6 +52,7 @@ def legacy_name(name):
 
 
 class CanonicalDFlashTest(unittest.TestCase):
+    @legacy_fp32_rope()
     def _legacy_parity(self, device, dtype):
         # Canonical RoPE computes in FP32 before casting back to the model dtype.
         tolerance = (

@@ -20,6 +20,7 @@ from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DFlash2DraftModel, DFlashDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.legacy_fixtures import legacy_dflash_config
+from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 from tests.test_modeling.test_draft_gqa import layout_for
 
@@ -66,6 +67,7 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
 
 
 class CanonicalDFlash2Test(unittest.TestCase):
+    @legacy_fp32_rope()
     def _parity(self, device, dtype):
         # Canonical RoPE computes in FP32 before casting back to the model dtype.
         tolerance = (
