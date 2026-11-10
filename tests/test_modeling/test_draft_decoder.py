@@ -44,6 +44,7 @@ def make_layer(
     device="cpu",
     dtype=torch.float32,
     convolution=False,
+    connections=None,
 ):
     conv_node = GroupedCausalConvSpec(kernel_size=3, group_size=4)
     convolutions = (
@@ -70,8 +71,16 @@ def make_layer(
             device=device,
             dtype=dtype,
         ),
-        attention_connection=StandardResidualConnection(StandardResidualSpec()),
-        mlp_connection=StandardResidualConnection(StandardResidualSpec()),
+        attention_connection=(
+            connections[0]
+            if connections
+            else StandardResidualConnection(StandardResidualSpec())
+        ),
+        mlp_connection=(
+            connections[1]
+            if connections
+            else StandardResidualConnection(StandardResidualSpec())
+        ),
         hidden_size=16,
         norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
         sublayer_conv=convolutions,
@@ -412,6 +421,24 @@ class DecoderTest(unittest.TestCase):
                     mlp_connection=connections[1],
                 )
 
+    def test_misshaped_updates_fail_under_a_multi_stream_connection(self):
+        """A connection that broadcasts must not hide a wrongly shaped update."""
+        module = make_layer(
+            make_node(rope_parameters=NoRoPESpec(), attention_dropout=0),
+            rotary_dim=0,
+            connections=(TwoStreamConnection(0), TwoStreamConnection(1)),
+        )
+        hidden = torch.randn(2, 3, 2, 16)
+        entry = LayerInputs(attention=prepare(module, layout_for(hidden[..., 0, :]), 2))
+        for target, bad in (
+            ("self_attn", torch.zeros(16)),
+            ("self_attn", torch.zeros(2, 1, 16)),
+            ("mlp", torch.zeros(2, 1, 16)),
+        ):
+            with patch.object(getattr(module, target), "forward", return_value=bad):
+                with self.assertRaisesRegex(ValueError, "preserve the stream shape"):
+                    module(hidden, entry)
+
     def test_invalid_layout_streams_and_convolution_contract_fail(self):
         module = make_layer(make_node())
         hidden = torch.randn(1, 3, 16)
@@ -437,7 +464,7 @@ class DecoderTest(unittest.TestCase):
                 sublayer_conv=nn.Identity(),
             )
         with patch.object(module.self_attn, "forward", return_value=torch.zeros(16)):
-            with self.assertRaisesRegex(ValueError, "input shape"):
+            with self.assertRaisesRegex(ValueError, "stream shape"):
                 module(
                     hidden,
                     LayerInputs(attention=prepare(module, layout, hidden.shape[0])),
