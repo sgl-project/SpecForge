@@ -4,6 +4,7 @@ import copy
 import unittest
 from dataclasses import replace
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 from transformers import Qwen3Config
@@ -12,6 +13,7 @@ from specforge.config.draft.architecture.features import FinalHiddenFeatureSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from specforge.modeling.draft.layers.rope import apply_rotary
 from specforge.modeling.draft.models import MTPDraftModel
 from specforge.modeling.draft.mtp.qwen3_5 import PartialRotaryEmbedding, Qwen3_5MTPModel
 from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -52,6 +54,7 @@ def legacy_key(name):
 
 class CanonicalMTPTest(unittest.TestCase):
     def _parity(self, device, dtype):
+        torch.manual_seed(0)
         base = mtp_config(target_bindings=(), target_logit_transform=None)
         config = replace(
             base,
@@ -92,7 +95,23 @@ class CanonicalMTPTest(unittest.TestCase):
         ids, features, entries = model_inputs(config, device, dtype)
         other = features.detach().clone().requires_grad_()
         output = actual(ids, features, entries)
-        hidden = reference(embedding(ids), other, position_ids=entries[0].position_ids)
+        # Compare composition with the same FP32 RoPE arithmetic on both sides.
+        rotary_forward = reference.rotary_emb.forward
+
+        def rotate(query, key, cos, sin, **kwargs):
+            return apply_rotary(query, (cos, sin)), apply_rotary(key, (cos, sin))
+
+        with (
+            patch.object(
+                reference.rotary_emb,
+                "forward",
+                lambda x, positions: rotary_forward(x.float(), positions),
+            ),
+            patch("specforge.modeling.draft.mtp.qwen3_5.apply_rotary_pos_emb", rotate),
+        ):
+            hidden = reference(
+                embedding(ids), other, position_ids=entries[0].position_ids
+            )
         expected = reference.lm_head(hidden)
         torch.testing.assert_close(output.hidden_states, hidden, rtol=0, atol=0)
         torch.testing.assert_close(output.logits, expected, rtol=0, atol=0)
