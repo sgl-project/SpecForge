@@ -67,9 +67,35 @@ class LegacyDFlashTest(unittest.TestCase):
                     node.spec_config.target_features.target_layer_ids,
                     tuple(payload["dflash_config"]["target_layer_ids"]),
                 )
+                for attention in node.attention_configs.values():
+                    self.assertTrue(attention.qk_norm)
+                    self.assertFalse(attention.output_gate)
+                self.assertEqual(node.norm_config.weight_offset, 0)
                 self.assertEqual(payload, before)
                 self.assertNotIn("auto_map", saved)
                 self.assertNotIn("dflash_config", saved)
+
+    def test_target_context_mirror_and_missing_target_depth(self):
+        payload = legacy_payload()
+        target = target_for(payload)
+        expected = decode_legacy_config(payload, target_config=target)
+        mirrored = payload | {"initial_context_length": 4096}
+        self.assertEqual(
+            decode_legacy_config(
+                mirrored, target_config=target | {"initial_context_length": 4096}
+            ),
+            expected,
+        )
+        for invalid in (target, target | {"initial_context_length": 2048}):
+            with self.assertRaisesRegex(ValueError, "initial_context_length"):
+                decode_legacy_config(mirrored, target_config=invalid)
+        target.pop("num_hidden_layers")
+        for source in (
+            payload,
+            {k: v for k, v in payload.items() if k != "num_target_layers"},
+        ):
+            with self.assertRaisesRegex(ValueError, "target_config.num_hidden_layers"):
+                decode_legacy_config(source, target_config=target)
 
     def test_alias_conflicts_are_rejected(self):
         payload = legacy_payload()
@@ -208,6 +234,15 @@ class LegacyDFlashTest(unittest.TestCase):
         self.assertEqual(node.spec_config.selector_top_k, 16)
         self.assertEqual(node.spec_config.output_multiplier, 1)
         self.assertIsNone(node.spec_config.final_logit_softcapping)
+        payload["dflash_config"].update(
+            output_multiplier=2.5, final_logit_softcapping=30
+        )
+        spec = decode_legacy_config(
+            payload, target_config=target_for(payload)
+        ).spec_config
+        self.assertEqual(
+            (spec.output_multiplier, spec.final_logit_softcapping), (2.5, 30)
+        )
 
     def test_unknown_or_wrong_architecture_fields_do_not_disappear(self):
         for field in (
@@ -225,6 +260,16 @@ class LegacyDFlashTest(unittest.TestCase):
             payload["dflash_config"][field] = 1
             with self.assertRaisesRegex(ValueError, field):
                 decode_legacy_config(payload, target_config=target_for(payload))
+        for payload in (
+            legacy_payload(),
+            json.loads((CONFIGS / "qwen3.8-27b-dflash2.json").read_text()),
+        ):
+            payload["dflash_config"]["projector_type"] = "unknown"
+            with self.assertRaisesRegex(ValueError, "projector_type"):
+                decode_legacy_config(payload, target_config=target_for(payload))
+        payload = legacy_payload() | {"kv_lora_rank": 16}
+        with self.assertRaisesRegex(ValueError, "MLA projection fields"):
+            decode_legacy_config(payload, target_config=target_for(payload))
         for architectures in (None, [], ["UnknownDraftModel"], [["DFlashDraftModel"]]):
             payload = legacy_payload() | {"architectures": architectures}
             with self.assertRaisesRegex(ValueError, "architectures"):
@@ -233,14 +278,25 @@ class LegacyDFlashTest(unittest.TestCase):
     def test_legacy_codec_imports_no_compute_or_hf_packages(self):
         code = """
 import sys
-from tests.test_config.test_draft_legacy_dflash import legacy_payload, target_for
+class RejectComputeImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'torch', 'transformers', 'pydantic'}:
+            raise AssertionError(f'forbidden import: {fullname}')
+sys.meta_path.insert(0, RejectComputeImports())
+import json
+from tests.test_config.test_draft_legacy_dflash import CONFIGS, target_for
+from tests.test_config.test_draft_legacy_dspine import dspine_payload
 from specforge.config.draft.codec import decode_legacy_config
-payload = legacy_payload()
+for pattern in ('*dflash*.json', '*dspark*.json', '*domino*.json'):
+    for path in CONFIGS.glob(pattern):
+        payload = json.loads(path.read_text())
+        decode_legacy_config(payload, target_config=target_for(payload))
+payload = dspine_payload()
 decode_legacy_config(payload, target_config=target_for(payload))
 assert not any(name in sys.modules for name in ('torch', 'transformers', 'pydantic'))
 """
         result = subprocess.run(
-            [sys.executable, "-S", "-c", code], capture_output=True, text=True
+            [sys.executable, "-c", code], capture_output=True, text=True
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 

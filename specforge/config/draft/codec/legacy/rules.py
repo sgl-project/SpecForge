@@ -52,6 +52,11 @@ def resolve_rope(payload: Mapping):
         values["partial_rotary_factor"] = resolve_alias(
             "partial_rotary_factor", values, payload, default=1.0
         )
+        if kind == "default" and values["partial_rotary_factor"] != 1:
+            raise ValueError(
+                "legacy default RoPE requires partial_rotary_factor=1; "
+                "use an explicit canonical configuration for partial rotation"
+            )
         if values["rope_type"] == "yarn":
             values = expand_yarn(values, payload.get("max_position_embeddings", 32768))
         return decode_component("rope", values)

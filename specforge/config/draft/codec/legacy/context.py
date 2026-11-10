@@ -91,6 +91,7 @@ _TOP_FIELDS = (
         "rope_scaling",
         "rope_parameters",
         "partial_rotary_factor",
+        "initial_context_length",
     }
 )
 _COMMON_FIELDS = {
@@ -164,6 +165,16 @@ def read_context(payload, method, target_config):
     # Both embeddings and the head were already supplied by the target in the
     # existing training path. Resolving logits also requires an explicit target.
     logits = resolve_target_logits(target_config)
+    if "initial_context_length" in payload and (
+        "initial_context_length" not in target_config
+        or payload["initial_context_length"] != target_config["initial_context_length"]
+    ):
+        raise ValueError(
+            "initial_context_length must match target_config.initial_context_length"
+        )
+    positive_int(
+        "target_config.num_hidden_layers", target_config.get("num_hidden_layers")
+    )
     target_depth = resolve_alias(
         "num_target_layers",
         payload,

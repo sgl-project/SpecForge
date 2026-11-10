@@ -14,10 +14,12 @@ from specforge.config.draft.rope import DefaultRoPESpec
 
 
 def draft_config(**overrides):
+    # binds the target's tables, so the target width follows hidden_size
+    hidden_size = overrides.get("hidden_size", 32)
     return DraftConfig(
         **{
             "architecture": "DFlashDraftModel",
-            "hidden_size": 32,
+            "hidden_size": hidden_size,
             "vocab_size": 64,
             "draft_vocab_size": 64,
             "max_position_embeddings": 256,
@@ -51,7 +53,7 @@ def draft_config(**overrides):
             "spec_config": DFlashSpec(
                 block=AnchoredBlockSpec(block_size=8),
                 target_features=TargetFeatureSpec(
-                    hidden_size=32, mask_token_id=63, target_layer_ids=(1, 3)
+                    hidden_size=hidden_size, mask_token_id=63, target_layer_ids=(1, 3)
                 ),
             ),
             "target_bindings": ("embed_tokens", "lm_head"),
