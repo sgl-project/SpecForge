@@ -111,6 +111,7 @@ class ContractsTest(unittest.TestCase):
 
             def capabilities(self) -> frozenset[str]:
                 return frozenset({"target_context_kv"})
+
             num_heads: int
 
             @property

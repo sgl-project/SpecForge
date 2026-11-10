@@ -9,8 +9,8 @@ from unittest.mock import patch
 from specforge.config.draft import registry
 from specforge.config.draft.architecture import DSpineSpec
 from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
-from specforge.config.draft.codec import decode_config, encode_config
 from specforge.config.draft.attention import AttentionSpec
+from specforge.config.draft.codec import decode_config, encode_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.residual import ResidualSpec
 from tests.test_config.draft_fixtures import draft_config

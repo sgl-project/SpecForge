@@ -34,7 +34,9 @@ class TargetFeatureSpec:
         width = target.get("hidden_size")
         positive_int("target_config.hidden_size", width)
         if self.hidden_size != width:
-            raise ValueError("target_features.hidden_size must match target hidden_size")
+            raise ValueError(
+                "target_features.hidden_size must match target hidden_size"
+            )
         count = target.get("num_hidden_layers")
         positive_int("target_config.num_hidden_layers", count)
         if any(layer >= count for layer in self.target_layer_ids):
