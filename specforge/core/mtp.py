@@ -77,6 +77,7 @@ class OnlineMTPModel(nn.Module):
         shift_hidden: torch.Tensor,
         input_ids: torch.Tensor,
         loss_mask: torch.Tensor,
+        supervised_rows: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply lm_head + cross-entropy in bounded chunks over positions.
 
@@ -84,12 +85,20 @@ class OnlineMTPModel(nn.Module):
         position-wise, so this equals shifting the logits), and each chunk's
         logits are freed (or recomputed under checkpointing) before the next
         chunk runs.
+
+        Only positions with a nonzero shifted loss mask go through lm_head +
+        CE. ``supervised_rows`` are their flat indices; without them they are
+        found here, which syncs a GPU with the host.
         """
         shift_labels, shift_mask = self._shift_for_next_token(input_ids, loss_mask)
         batch, positions, hidden_size = shift_hidden.shape
-        flat_hidden = shift_hidden.reshape(batch * positions, hidden_size)
-        flat_labels = shift_labels.reshape(-1)
-        flat_mask = shift_mask.reshape(-1)
+        if supervised_rows is None:
+            supervised_rows = shift_mask.reshape(-1).nonzero(as_tuple=True)[0]
+        flat_hidden = shift_hidden.reshape(-1, hidden_size).index_select(
+            0, supervised_rows
+        )
+        flat_labels = shift_labels.reshape(-1).index_select(0, supervised_rows)
+        flat_mask = shift_mask.reshape(-1).index_select(0, supervised_rows)
         rows = flat_hidden.shape[0]
         chunk_size = self.objective_chunk_size if self.objective_chunk_size else rows
         lm_head = self.draft_model.mtp.lm_head
@@ -105,7 +114,9 @@ class OnlineMTPModel(nn.Module):
         loss_num = None
         denom = None
         corrects_chunks = []
-        for start in range(0, rows, chunk_size):
+        # An unsupervised batch still runs one (empty) chunk, so the loss stays
+        # connected to the draft and backward produces zero gradients.
+        for start in range(0, max(rows, 1), max(chunk_size, 1)):
             end = min(start + chunk_size, rows)
             chunk_args = (
                 flat_hidden[start:end],
@@ -128,8 +139,10 @@ class OnlineMTPModel(nn.Module):
             corrects_chunks.append(chunk_corrects)
 
         loss = loss_num / denom.clamp_min(1)
-        corrects = torch.cat(corrects_chunks).view(batch, positions)
-        return loss, corrects, shift_mask.float()
+        supervised_corrects = torch.cat(corrects_chunks)
+        corrects = supervised_corrects.new_zeros(batch * positions)
+        corrects.index_copy_(0, supervised_rows, supervised_corrects)
+        return loss, corrects.view(batch, positions), shift_mask.float()
 
     def forward(
         self,
@@ -138,6 +151,7 @@ class OnlineMTPModel(nn.Module):
         loss_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        supervised_rows: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Args:
@@ -146,6 +160,9 @@ class OnlineMTPModel(nn.Module):
             loss_mask: [batch, seq_len].
             attention_mask: optional padding mask, [batch, seq_len].
             position_ids: optional position ids, [batch, seq_len].
+            supervised_rows: optional flat indices of the supervised positions
+                (see ``_chunked_objective``), found on the host so the forward
+                does not sync.
 
         Returns:
             loss: scalar weighted loss.
@@ -197,7 +214,7 @@ class OnlineMTPModel(nn.Module):
 
         # The synthetic pad position has no label; drop it before the objective.
         loss, corrects, denoms = self._chunked_objective(
-            draft_hidden[:, :-1], input_ids, loss_mask
+            draft_hidden[:, :-1], input_ids, loss_mask, supervised_rows
         )
 
         # Single-layer MTP: wrap in length-1 lists for E1 evaluator compatibility.

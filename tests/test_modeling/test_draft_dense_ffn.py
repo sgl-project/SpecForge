@@ -9,8 +9,8 @@ import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 from specforge.config.draft.mlp import DenseFFNSpec
+from specforge.config.draft.mlp.dense import SUPPORTED_ACTIVATIONS
 from specforge.modeling.draft.layers.mlp import DenseFFN
-from specforge.modeling.draft.layers.mlp.dense import SUPPORTED_ACTIVATIONS
 from specforge.modeling.draft.llama3_eagle import LlamaMLP
 from tests.test_config.test_draft_legacy_dflash import CONFIGS
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
@@ -95,10 +95,7 @@ class DenseFFNTest(unittest.TestCase):
             self.assertEqual(torch.count_nonzero(parameter).item(), 0)
 
     def test_unsupported_settings_fail_before_projections_are_allocated(self):
-        node = DenseFFNSpec(intermediate_size=24, hidden_act="prelu")
         with patch("specforge.modeling.draft.layers.mlp.dense.nn.Linear") as allocate:
-            with self.assertRaisesRegex(ValueError, "hidden_act"):
-                DenseFFN(node, hidden_size=16)
             for width in (0, True, 1.5):
                 with self.assertRaises(ValueError):
                     DenseFFN(

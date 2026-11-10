@@ -8,12 +8,6 @@ from specforge.config.draft.mlp import DenseFFNSpec
 
 from ..registry import register_component_builder
 
-# Parameter-free activation primitives with numerical parity coverage. Expanding
-# this set requires a reference test; it does not add another config default.
-SUPPORTED_ACTIVATIONS = frozenset(
-    {"silu", "swish", "gelu", "gelu_pytorch_tanh", "relu"}
-)
-
 
 class DenseFFN(nn.Module):
     def __init__(
@@ -23,11 +17,6 @@ class DenseFFN(nn.Module):
         if type(config) is not DenseFFNSpec:
             raise TypeError("DenseFFN requires DenseFFNSpec")
         positive_int("hidden_size", hidden_size)
-        if config.hidden_act not in SUPPORTED_ACTIVATIONS:
-            raise ValueError(
-                f"unsupported dense hidden_act {config.hidden_act!r}; "
-                f"supported: {sorted(SUPPORTED_ACTIVATIONS)}"
-            )
         self.config = config
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_proj = nn.Linear(

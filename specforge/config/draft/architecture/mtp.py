@@ -3,7 +3,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .._validation import positive_int
 from .base import ArchitectureSpec
 from .features import FinalHiddenFeatureSpec
 
@@ -37,10 +36,6 @@ class MTPSpec(ArchitectureSpec):
     @property
     def prediction_token_offset(self) -> int:
         return 1
-
-    def fusion_input_width(self, hidden_size: int) -> int:
-        positive_int("hidden_size", hidden_size)
-        return hidden_size + self.target_features.hidden_size
 
 
 def validate_mtp(config) -> None:

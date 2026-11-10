@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from specforge.config.draft.attention import GQASpec, MHASpec, MLASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import NormSpec, RMSNormSpec
@@ -61,6 +62,32 @@ class ComponentBuilderTest(unittest.TestCase):
         output.square().sum().backward()
         for parameter in (*norm.parameters(), *mlp.parameters(), hidden):
             self.assertIsNotNone(parameter.grad)
+
+    def test_standard_residual_connections_are_independent_and_preserve_gradients(self):
+        residual = build_component("residual", StandardResidualSpec())
+        attention = residual.build_connection(
+            hidden_size=4, layer_index=0, sublayer="attention"
+        )
+        ffn = residual.build_connection(hidden_size=4, layer_index=0, sublayer="mlp")
+        self.assertIsNot(attention, ffn)
+        self.assertIs(attention.config, residual.config)
+        self.assertIs(ffn.config, residual.config)
+        self.assertEqual(list(residual.children()), [])
+        self.assertEqual(attention.state_dict(), {})
+        hidden = torch.randn(2, 3, 4, requires_grad=True)
+        sublayer = nn.Linear(4, 4)
+        expected = hidden + sublayer(hidden)
+        actual = attention(hidden, sublayer)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "input shape"):
+            attention(hidden, lambda x: x[:, :1])
+        tensors = (hidden, *sublayer.parameters())
+        torch.testing.assert_close(
+            torch.autograd.grad(actual.sum(), tensors),
+            torch.autograd.grad(expected.sum(), tensors),
+            rtol=0,
+            atol=0,
+        )
 
     def test_external_schema_and_builder_can_register_without_shared_edits(self):
         register_component_builder("norm", TestNormSpec, TestNorm)
@@ -113,6 +140,22 @@ class ComponentBuilderTest(unittest.TestCase):
             ("norm", RMSNormSpec, {"hidden_size", "device", "dtype"}),
             ("mlp", DenseFFNSpec, {"hidden_size", "device", "dtype"}),
             ("residual", StandardResidualSpec, set()),
+            *(
+                (
+                    "attention",
+                    node,
+                    {
+                        "input_size",
+                        "hidden_size",
+                        "norm",
+                        "rope",
+                        "backend",
+                        "device",
+                        "dtype",
+                    },
+                )
+                for node in (GQASpec, MHASpec, MLASpec)
+            ),
             (
                 "conv",
                 GroupedCausalConvSpec,
@@ -122,7 +165,7 @@ class ComponentBuilderTest(unittest.TestCase):
             constructor = component_builder(kind, node_type.type)
             parameters = inspect.signature(constructor).parameters
             self.assertEqual(set(parameters), {"config"} | extras)
-            self.assertIs(parameters["config"].annotation, node_type)
+            self.assertTrue(issubclass(node_type, parameters["config"].annotation))
             for name in extras:
                 self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
         root = Path(layers.__file__).parent

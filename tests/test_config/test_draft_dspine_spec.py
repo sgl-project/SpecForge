@@ -87,7 +87,9 @@ class DSpineSpecTest(unittest.TestCase):
                 base.spec_config,
                 injection=AdjacentInjectionSpec(transfer_rank=rank, message_size=4),
                 target_features=dataclasses.replace(
-                    base.spec_config.target_features, mask_token_id=0
+                    base.spec_config.target_features,
+                    hidden_size=hidden,
+                    mask_token_id=0,
                 ),
             )
             with self.assertRaisesRegex(ValueError, "transfer_rank"):

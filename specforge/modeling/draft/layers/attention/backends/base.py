@@ -11,7 +11,7 @@ from specforge.config.draft._validation import boolean, positive_int
 from ..masks import AttentionLayout
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class AttentionResult:
     output: Tensor
     active_queries: Tensor
@@ -23,6 +23,13 @@ class AttentionResult:
 
 
 class AttentionBackend(ABC):
+    def validate(self, *, head_dim: int, value_head_dim: int, dropout_p: float) -> None:
+        """Check static execution limits before parameters are allocated.
+
+        dropout_p is the effective probability: zero for inference.
+        Device and tensor dtype checks remain in attend().
+        """
+
     @abstractmethod
     def prepare(
         self,
@@ -112,8 +119,8 @@ class PreparedAttention:
         return AttentionResult(output, active, lse if return_lse else None)
 
 
-class AttentionPreparation:
-    """Use a fresh `with AttentionPreparation()` before each model forward.
+class AttentionPreparationScope:
+    """Use a fresh `with AttentionPreparationScope()` before each model forward.
 
     Layout tensors/callables are keyed by identity; equal node causal/window
     semantics share a prepared object. Closing the scope drops the cache, while
@@ -126,7 +133,7 @@ class AttentionPreparation:
     def __enter__(self):
         if self._cache is not None:
             raise RuntimeError("attention preparation is already active")
-        self._cache = {}
+        self._cache = []
         return self
 
     def __exit__(self, *exc):
@@ -150,33 +157,35 @@ class AttentionPreparation:
         if sliding_window is not None:
             positive_int("sliding_window", sliding_window)
         layout.validate_dimensions(batch_size, num_heads)
-        key = (
+        for entry in self._cache:
+            if (
+                entry.backend is backend
+                and entry.layout.query_positions is layout.query_positions
+                and entry.layout.key_positions is layout.key_positions
+                and entry.layout.visibility is layout.visibility
+                and entry.layout.active_queries is layout.active_queries
+                and entry.batch_size == batch_size
+                and entry.num_heads == num_heads
+                and entry.is_causal == is_causal
+                and entry.sliding_window == sliding_window
+            ):
+                return entry
+        mask, active = backend.prepare(
+            layout,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            is_causal=is_causal,
+            sliding_window=sliding_window,
+        )
+        prepared = PreparedAttention(
+            layout,
             backend,
-            id(layout.query_positions),
-            id(layout.key_positions),
-            id(layout.visibility),
-            id(layout.active_queries),
+            mask,
+            active,
             batch_size,
             num_heads,
             is_causal,
             sliding_window,
         )
-        if key not in self._cache:
-            mask, active = backend.prepare(
-                layout,
-                batch_size=batch_size,
-                num_heads=num_heads,
-                is_causal=is_causal,
-                sliding_window=sliding_window,
-            )
-            self._cache[key] = PreparedAttention(
-                layout,
-                backend,
-                mask,
-                active,
-                batch_size,
-                num_heads,
-                is_causal,
-                sliding_window,
-            )
-        return self._cache[key]
+        self._cache.append(prepared)
+        return prepared

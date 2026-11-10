@@ -17,11 +17,14 @@ class PEagleSpec(ArchitectureSpec):
     target_features: AuxiliaryFeatureSpec
     norm_before_residual: bool
     pad_token_id: int | None
+    mask_token_id: int
 
     def __post_init__(self):
         if type(self.target_features) is not AuxiliaryFeatureSpec:
             raise ValueError("target_features must be an AuxiliaryFeatureSpec")
         boolean("norm_before_residual", self.norm_before_residual)
+        if type(self.mask_token_id) is not int or self.mask_token_id < 0:
+            raise ValueError("mask_token_id must be a nonnegative integer")
         if self.pad_token_id is not None and (
             type(self.pad_token_id) is not int or self.pad_token_id < 0
         ):
@@ -45,6 +48,8 @@ class PEagleSpec(ArchitectureSpec):
 
 def validate_peagle(config) -> None:
     validate_auxiliary_fusion(config)
+    if config.spec_config.mask_token_id >= config.vocab_size:
+        raise ValueError("mask_token_id must be smaller than vocab_size")
     pad = config.spec_config.pad_token_id
     if pad is not None and pad >= config.vocab_size:
         raise ValueError("pad_token_id must be smaller than vocab_size")

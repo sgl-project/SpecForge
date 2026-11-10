@@ -10,7 +10,7 @@ from .base import AttentionBackend
 from .eager import eager_attention
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class DenseMask:
     visibility: Tensor
     empty_rows: Tensor

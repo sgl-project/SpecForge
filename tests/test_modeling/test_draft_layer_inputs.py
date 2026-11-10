@@ -10,6 +10,10 @@ from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone
 from specforge.modeling.draft.backbone import LayerInputs as BackboneLayerInputs
+from specforge.modeling.draft.layers.attention.backends import (
+    AttentionPreparationScope,
+    resolve_attention_backend,
+)
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.residual import StandardResidual
@@ -68,13 +72,19 @@ class LayerInputsTest(unittest.TestCase):
 
     def test_layout_cannot_silently_override_a_prepared_mask(self):
         layout = make_layout()
+        with AttentionPreparationScope() as scope:
+            attention = scope.prepare(
+                resolve_attention_backend("eager"),
+                layout,
+                batch_size=1,
+                num_heads=1,
+                is_causal=True,
+                sliding_window=None,
+            )
         with self.assertRaisesRegex(ValueError, "not both"):
-            LayerInputs(attention_layout=layout, attention_mask=layout.visibility)
+            LayerInputs(attention_layout=layout, attention=attention)
         with self.assertRaises(TypeError):
             LayerInputs(attention_layout=layout.visibility)
-        legacy = LayerInputs(attention_mask=layout.visibility)
-        self.assertIs(legacy.attention_mask, layout.visibility)
-        self.assertIsNone(legacy.attention_layout)
 
 
 if __name__ == "__main__":

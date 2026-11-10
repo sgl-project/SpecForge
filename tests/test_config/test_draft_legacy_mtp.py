@@ -64,6 +64,8 @@ class LegacyMTPTest(unittest.TestCase):
         self.assertEqual(node.rope_parameters.mrope_section, (11, 11, 10))
         self.assertTrue(node.rope_parameters.mrope_interleaved)
         self.assertEqual(decode_config(encode_config(node), target_config=target), node)
+        target["rope_parameters"]["rope_theta"] = 5000
+        self.assertEqual(decode_legacy_config(payload, target_config=target), expected)
 
     def test_bundled_recipe_round_trip_and_binding_choices(self):
         for method in (None, {}, {"share_lm_head": True}, {"share_lm_head": False}):
@@ -94,13 +96,8 @@ class LegacyMTPTest(unittest.TestCase):
         target = target_for_mtp(payload)
         expected = decode_legacy_config(payload, target_config=target)
         changes = {
-            "num_hidden_layers": 8,
-            "layer_types": ["sliding_attention"] * 8,
-            "use_sliding_window": True,
             "sliding_window": 128,
-            "is_causal": False,
             "draft_vocab_size": 64,
-            "mlp_bias": True,
         }
         self.assertEqual(
             decode_legacy_config(payload | changes, target_config=target), expected

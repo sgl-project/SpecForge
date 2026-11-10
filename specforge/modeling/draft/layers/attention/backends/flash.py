@@ -20,7 +20,7 @@ def _unpad_metadata(valid):
     return indices, cumulative, int(lengths.max().item())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class FlashMask:
     query_indices: Tensor
     key_indices: Tensor
@@ -34,27 +34,21 @@ class FlashMask:
 
 
 class FlashAttentionBackend(AttentionBackend):
+    def validate(self, *, head_dim, value_head_dim, dropout_p):
+        if head_dim > 256 or value_head_dim != head_dim:
+            raise ValueError(
+                "FlashAttention requires equal Q/K/V head dimensions no greater than 256"
+            )
+
     def prepare(self, layout, *, batch_size, num_heads, is_causal, sliding_window):
         padding = layout.visibility
         if not isinstance(padding, PaddingMask):
             raise ValueError(
                 "FlashAttention requires PaddingMask visibility; use Flex for arbitrary masks"
             )
-        masks = []
-        for valid, positions in (
-            (padding.query_valid, layout.query_positions),
-            (padding.key_valid, layout.key_positions),
-        ):
-            if (
-                valid.device != positions.device
-                or valid.shape[0] not in (1, batch_size)
-                or valid.shape[1] != positions.shape[1]
-            ):
-                raise ValueError(
-                    "padding masks must match layout dimensions and device"
-                )
-            masks.append(valid.expand(batch_size, -1))
-        qvalid, kvalid = masks
+        layout.validate_dimensions(batch_size, num_heads)
+        qvalid = padding.query_valid.expand(batch_size, -1)
+        kvalid = padding.key_valid.expand(batch_size, -1)
         if layout.active_queries is not None:
             qvalid = qvalid & layout.active_queries
         qi, cq, mq = _unpad_metadata(qvalid)
@@ -109,10 +103,11 @@ class FlashAttentionBackend(AttentionBackend):
             torch.bfloat16,
         ):
             raise ValueError("FlashAttention requires CUDA fp16/bf16 query/key/value")
-        if query.shape[-1] > 256 or value.shape[-1] != query.shape[-1]:
-            raise ValueError(
-                "FlashAttention requires equal Q/K/V head dimensions no greater than 256"
-            )
+        self.validate(
+            head_dim=query.shape[-1],
+            value_head_dim=value.shape[-1],
+            dropout_p=dropout_p if training else 0.0,
+        )
         from flash_attn import flash_attn_varlen_func
 
         def unpad(tensor, indices):

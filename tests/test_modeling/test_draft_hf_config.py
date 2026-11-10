@@ -3,17 +3,68 @@
 import copy
 import json
 import unittest
+from dataclasses import fields
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
 from transformers import PreTrainedConfig
 
 from specforge.config.draft.codec import encode_config
-from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
+from specforge.modeling.draft.hf_config import _METADATA, SpecForgeDraftConfig
 from tests.test_config.draft_fixtures import draft_config
 
 
 class DraftHFConfigTest(unittest.TestCase):
+    def test_equality_includes_structure_and_metadata(self):
+        config = SpecForgeDraftConfig(draft_config())
+        self.assertEqual(config, copy.deepcopy(config))
+        self.assertNotEqual(config, SpecForgeDraftConfig(draft_config(hidden_size=64)))
+        self.assertNotEqual(
+            config, SpecForgeDraftConfig(draft_config(), dtype="bfloat16")
+        )
+        with self.assertRaises(TypeError):
+            hash(config)
+
+    def test_config_only_loaders_and_dtype_overrides(self):
+        config = SpecForgeDraftConfig(draft_config(), dtype="bfloat16")
+        with TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            restored = SpecForgeDraftConfig.from_json_file(
+                Path(directory) / "config.json"
+            )
+            self.assertEqual(restored, config)
+            for kwargs, dtype in (
+                ({"torch_dtype": "float32"}, torch.float32),
+                ({"dtype": "float32"}, torch.float32),
+                ({"dtype": "auto"}, torch.bfloat16),
+                ({"torch_dtype": "auto"}, torch.bfloat16),
+            ):
+                with self.subTest(kwargs=kwargs):
+                    loaded = SpecForgeDraftConfig.from_pretrained(directory, **kwargs)
+                    self.assertEqual(loaded.dtype, dtype)
+
+    def test_runtime_metadata_and_minimal_serialization(self):
+        self.assertLessEqual(
+            {f.name for f in fields(PreTrainedConfig)} - {"architectures"}, _METADATA
+        )
+        config = SpecForgeDraftConfig(draft_config(), use_cache=False)
+        config.use_cache = False  # HF Trainer writes this at startup.
+        self.assertFalse(config.use_cache)
+        with self.assertRaisesRegex(ValueError, "no KV cache"):
+            config.use_cache = True
+        with self.assertRaisesRegex(ValueError, "no KV cache"):
+            SpecForgeDraftConfig(draft_config(), use_cache=True)
+        with self.assertRaisesRegex(ValueError, "attn_implementation"):
+            SpecForgeDraftConfig.from_dict(config.to_dict(), attn_implementation="sdpa")
+        self.assertEqual(
+            set(config.to_dict()) - set(encode_config(config.draft)),
+            {"transformers_version"},
+        )
+        self.assertEqual(
+            SpecForgeDraftConfig.from_dict(config.to_dict()).to_dict(), config.to_dict()
+        )
+
     def test_one_structural_source_and_read_only_hf_views(self):
         draft = draft_config()
         config = SpecForgeDraftConfig(draft)
@@ -69,12 +120,10 @@ class DraftHFConfigTest(unittest.TestCase):
         config, unused = SpecForgeDraftConfig.from_dict(
             payload,
             return_unused_kwargs=True,
-            attn_implementation="eager",
             dtype="float32",
             device_map="cpu",
             _from_auto=True,
         )
-        self.assertEqual(config._attn_implementation, "eager")
         self.assertEqual(config.dtype, torch.float32)
         self.assertEqual(unused, {"device_map": "cpu"})
         self.assertEqual(payload, before)
