@@ -83,12 +83,6 @@ class PEagleDraftModel(DraftPreTrainedModel):
         # Legacy P-EAGLE starts this vector with standard-normal entries.
         init.normal_(self.mask_hidden, mean=0, std=1)
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     def compute_logits(self, hidden: Tensor) -> Tensor:
         """Project the already normalized hidden states returned by forward."""
         self.vocabulary.require_ready()

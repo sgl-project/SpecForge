@@ -65,12 +65,6 @@ class DominoDraftModel(DraftPreTrainedModel):
         )
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     def forward(
         self,
         input_ids: Tensor,

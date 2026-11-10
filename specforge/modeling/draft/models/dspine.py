@@ -82,12 +82,6 @@ class DSpineDraftModel(DraftPreTrainedModel):
         init.zeros_(self.transfer_codes)
         init.zeros_(self.transfer_ready)
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     @torch.no_grad()
     def initialize_transfer_space(self, *, chunk_size: int = 4096) -> None:
         if self.transfer_ready.item():

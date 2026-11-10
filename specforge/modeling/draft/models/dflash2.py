@@ -64,12 +64,6 @@ class DFlash2DraftModel(DraftPreTrainedModel):
         )
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     def unary_logits_transform_is_identity(self) -> bool:
         """Losses skip the FP32 logit copy when the transform only upcasts."""
         spec = self.config.draft.spec_config

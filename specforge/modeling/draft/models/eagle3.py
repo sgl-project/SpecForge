@@ -77,12 +77,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
         )
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     def compute_logits(self, hidden: Tensor) -> Tensor:
         self.vocabulary.require_ready()
         return self.lm_head(self.logit_norm(hidden))
