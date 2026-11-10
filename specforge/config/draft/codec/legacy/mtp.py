@@ -21,7 +21,7 @@ from .context import (
     _check_fields,
     validate_dimensions,
 )
-from .rules import resolve_alias
+from .rules import reject_ignored_settings, resolve_alias
 
 _FIELDS = (
     set(_DEFAULTS)
@@ -109,6 +109,14 @@ def _rope(payload, target):
 def decode_mtp(payload, *, target_config):
     _check_fields(payload, _FIELDS, "legacy MTP")
     validate_dimensions(payload)
+    reject_ignored_settings(
+        payload,
+        mlp_bias=False,
+        is_causal=True,
+        num_hidden_layers=1,
+        use_sliding_window=False,
+        layer_types=["full_attention"],
+    )
     target = _text_config(target_config)
     values = {**_DEFAULTS, **payload}
     # AutoDraftConfig validates this field, but the MTP head always uses vocab_size.

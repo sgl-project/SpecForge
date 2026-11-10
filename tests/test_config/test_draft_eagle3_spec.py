@@ -90,8 +90,18 @@ class Eagle3SpecTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 eagle_config().spec_config.attention_input_width(32, index)
 
+    def test_auxiliary_fusion_accepts_any_nonempty_ordered_selection(self):
+        for layers in ((1,), (1, 3), (0, 1, 3, 4)):
+            features = AuxiliaryFeatureSpec(target_layer_ids=layers, hidden_size=32)
+            self.assertEqual(features.input_width, 32 * len(layers))
+            spec = dataclasses.replace(
+                eagle_config().spec_config, target_features=features
+            )
+            node = eagle_config(spec_config=spec)
+            self.assertEqual(decode_config(encode_config(node)), node)
+
     def test_feature_nodes_and_boolean_settings_are_strict(self):
-        for layers in ([], (1, 2), (1, 2, 3, 4), (1, True, 3), (1, -1, 3)):
+        for layers in ([], (), (2, 1), (1, 1), (1, True, 3), (1, -1, 3)):
             with self.assertRaisesRegex(ValueError, "target_layer_ids"):
                 AuxiliaryFeatureSpec(target_layer_ids=layers, hidden_size=32)
         for width in (0, True, 1.5):

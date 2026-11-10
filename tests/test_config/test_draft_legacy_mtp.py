@@ -94,13 +94,8 @@ class LegacyMTPTest(unittest.TestCase):
         target = target_for_mtp(payload)
         expected = decode_legacy_config(payload, target_config=target)
         changes = {
-            "num_hidden_layers": 8,
-            "layer_types": ["sliding_attention"] * 8,
-            "use_sliding_window": True,
             "sliding_window": 128,
-            "is_causal": False,
             "draft_vocab_size": 64,
-            "mlp_bias": True,
         }
         self.assertEqual(
             decode_legacy_config(payload | changes, target_config=target), expected

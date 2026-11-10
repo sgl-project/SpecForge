@@ -71,7 +71,8 @@
       "hidden_size": 32
     },
     "norm_before_residual": false,
-    "pad_token_id": null
+    "pad_token_id": null,
+    "mask_token_id": 1
   },
   "target_bindings": []
 }

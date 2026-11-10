@@ -25,6 +25,35 @@ def target_for_eagle(payload):
 
 
 class LegacyEagle3Test(unittest.TestCase):
+    def test_unsupported_structural_settings_are_rejected(self):
+        from tests.test_config.test_draft_legacy_mtp import mtp_payload
+        from tests.test_config.test_draft_legacy_peagle import peagle_payload
+
+        for payload in (eagle_payload(), peagle_payload(), mtp_payload()):
+            architecture = payload["architectures"][0]
+            settings = dict(
+                mlp_bias=True,
+                use_sliding_window=True,
+                layer_types=["sliding_attention"],
+            )
+            if architecture == "Qwen3_5MTPDraftModel":
+                settings.update(num_hidden_layers=2, is_causal=False)
+            else:
+                settings.update(
+                    attention_bias=True,
+                    attention_dropout=0.2,
+                    partial_rotary_factor=0.5,
+                )
+            options = {"mask_token_id": 1} if architecture == "PEagleDraftModel" else {}
+            for field, value in settings.items():
+                with self.subTest(architecture=architecture, field=field):
+                    with self.assertRaisesRegex(ValueError, field):
+                        decode_legacy_config(
+                            payload | {field: value},
+                            target_config=target_for_eagle(payload),
+                            **options,
+                        )
+
     def test_every_bundled_eagle_recipe_round_trips(self):
         count = 0
         for path in CONFIGS.glob("*.json"):
@@ -63,10 +92,7 @@ class LegacyEagle3Test(unittest.TestCase):
             "model_type": "qwen3",
             "target_model_type": "gemma3_text",
             "decoder_sparse_step": 2,
-            "attention_bias": True,
-            "attention_dropout": 0.2,
             "sliding_window": 128,
-            "layer_types": ["sliding_attention"] * 8,
         }
         self.assertEqual(
             decode_legacy_config(changed, target_config=target_for_eagle(payload)),
@@ -77,13 +103,13 @@ class LegacyEagle3Test(unittest.TestCase):
         payload = eagle_payload() | {
             "eagle_config": {
                 "use_aux_hidden_state": False,
-                "eagle_aux_hidden_state_layer_ids": [3, 1, 3],
+                "eagle_aux_hidden_state_layer_ids": [3, 1, 2],
             },
             "fc_norm": True,
             "norm_output": True,
         }
         node = decode_legacy_config(payload, target_config=target_for_eagle(payload))
-        self.assertEqual(node.spec_config.target_features.target_layer_ids, (3, 1, 3))
+        self.assertEqual(node.spec_config.target_features.target_layer_ids, (1, 2, 3))
         self.assertTrue(node.spec_config.normalize_features)
         self.assertTrue(node.spec_config.norm_output)
         self.assertEqual(

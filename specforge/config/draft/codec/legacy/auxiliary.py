@@ -11,6 +11,7 @@ from ...norm import RMSNormSpec
 from ...residual import StandardResidualSpec
 from ..target import _text_config
 from .context import _HF_METADATA, _REQUIRED_FIELDS, _check_fields, validate_dimensions
+from .rules import reject_ignored_settings
 
 _DEFAULTS = {
     "hidden_act": "silu",
@@ -46,8 +47,27 @@ _FIELDS = (
 )
 
 
+def _capture_layers(layers):
+    if not isinstance(layers, (list, tuple)) or len(layers) != 3:
+        raise ValueError("legacy target_layer_ids must contain exactly three layers")
+    if any(type(layer) is not int or layer < 0 for layer in layers):
+        raise ValueError("target_layer_ids must contain nonnegative integers")
+    if len(set(layers)) != len(layers):
+        raise ValueError("target_layer_ids must be distinct")
+    return tuple(sorted(layers))
+
+
 def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=None):
     validate_dimensions(payload)
+    reject_ignored_settings(
+        payload,
+        attention_bias=False,
+        attention_dropout=0,
+        mlp_bias=False,
+        use_sliding_window=False,
+        partial_rotary_factor=1,
+        layer_types=["full_attention"] * payload["num_hidden_layers"],
+    )
     target = _text_config(target_config)
     values = {**_DEFAULTS, **payload}
     depth = values["num_hidden_layers"] if num_layers is None else num_layers
@@ -70,22 +90,16 @@ def read_auxiliary(payload, target_config, *, num_layers=None, capture_layers=No
     if "use_aux_hidden_state" in method:
         boolean("use_aux_hidden_state", method["use_aux_hidden_state"])
     layers = method.get("eagle_aux_hidden_state_layer_ids")
-    for name, value in (
-        ("eagle_aux_hidden_state_layer_ids", layers),
-        ("capture_layers", capture_layers),
-    ):
-        if value is not None and not isinstance(value, (list, tuple)):
-            raise ValueError(f"{name} must be an array")
+    layers = _capture_layers(layers) if layers is not None else None
     if capture_layers is not None:
-        if layers is not None and tuple(layers) != tuple(capture_layers):
+        recorded = _capture_layers(capture_layers)
+        if layers is not None and layers != recorded:
             raise ValueError("recorded capture_layers conflict with eagle_config")
-        layers = capture_layers
+        layers = recorded
     if layers is None:
         count = target.get("num_hidden_layers")
         positive_int("target_config.num_hidden_layers", count)
-        layers = (1, count // 2 - 1, count - 4)
-    if not isinstance(layers, (list, tuple)):
-        raise ValueError("eagle_aux_hidden_state_layer_ids must be an array")
+        layers = _capture_layers((1, count // 2 - 1, count - 4))
     fields = dict(
         hidden_size=values["hidden_size"],
         vocab_size=values["vocab_size"],

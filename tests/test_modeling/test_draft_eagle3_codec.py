@@ -30,6 +30,12 @@ def legacy_config(payload):
 
 def model_from_node(node):
     attention = node.attention_configs["default"]
+    if (attention.qk_norm, attention.attention_bias, attention.output_gate) != (
+        False,
+        False,
+        False,
+    ) or node.norm_config.weight_offset != 0:
+        raise AssertionError("legacy EAGLE cannot express this node")
     payload = dict(
         architectures=["LlamaForCausalLMEagle3"],
         hidden_size=node.hidden_size,
@@ -66,6 +72,62 @@ def model_from_node(node):
 
 
 class Eagle3CodecParityTest(unittest.TestCase):
+    def test_defaults_and_explicit_values_match_hf_configuration(self):
+        for architecture in (
+            "LlamaForCausalLMEagle3",
+            "PEagleDraftModel",
+            "Qwen3_5MTPDraftModel",
+        ):
+            for overrides in (
+                {},
+                dict(
+                    rms_norm_eps=1e-5,
+                    hidden_act="gelu_pytorch_tanh",
+                    initializer_range=0.03,
+                    num_key_value_heads=None,
+                ),
+            ):
+                with self.subTest(architecture=architecture, overrides=overrides):
+                    payload = (
+                        dict(
+                            architectures=[architecture],
+                            hidden_size=256,
+                            vocab_size=64,
+                            num_hidden_layers=1,
+                            num_attention_heads=32,
+                            intermediate_size=64,
+                        )
+                        | overrides
+                    )
+                    options = (
+                        {"mask_token_id": 1}
+                        if architecture == "PEagleDraftModel"
+                        else {}
+                    )
+                    node = decode_legacy_config(
+                        payload, target_config=target_for_eagle(payload), **options
+                    )
+                    hf = AutoDraftConfig.from_dict(payload)
+                    attention = node.attention_configs["default"]
+                    self.assertEqual(attention.head_dim, hf.head_dim)
+                    self.assertEqual(attention.attention_dropout, hf.attention_dropout)
+                    self.assertEqual(node.norm_config.eps, hf.rms_norm_eps)
+                    self.assertEqual(
+                        node.mlp_configs["default"].hidden_act, hf.hidden_act
+                    )
+                    self.assertEqual(node.initializer_range, hf.initializer_range)
+                    self.assertEqual(
+                        node.max_position_embeddings, hf.max_position_embeddings
+                    )
+                    self.assertEqual(
+                        node.attention_configs["default"].num_key_value_heads,
+                        hf.num_key_value_heads,
+                    )
+                    self.assertEqual(
+                        node.rope_parameters.rope_theta,
+                        hf.rope_parameters["rope_theta"],
+                    )
+
     def test_all_recipes_preserve_parameter_names_shapes_and_saved_settings(self):
         count = 0
         for path in CONFIGS.glob("*.json"):
@@ -106,7 +168,7 @@ class Eagle3CodecParityTest(unittest.TestCase):
             ("llama3-70B-ealge3.json", {}),
             (
                 "qwen3-8b-eagle3.json",
-                {"rope_scaling": {"rope_type": "dynamic", "factor": 2}},
+                {"rms_norm_eps": 1e-5, "hidden_act": "gelu_pytorch_tanh"},
             ),
         ]
         for name, overrides in cases:

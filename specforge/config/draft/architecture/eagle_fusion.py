@@ -12,10 +12,14 @@ class AuxiliaryFeatureSpec:
     hidden_size: int
 
     def __post_init__(self):
-        if type(self.target_layer_ids) is not tuple or len(self.target_layer_ids) != 3:
-            raise ValueError("target_layer_ids must be a tuple of exactly three layers")
+        if type(self.target_layer_ids) is not tuple or not self.target_layer_ids:
+            raise ValueError("target_layer_ids must be a nonempty tuple")
         if any(type(layer) is not int or layer < 0 for layer in self.target_layer_ids):
             raise ValueError("target_layer_ids must contain nonnegative integers")
+        if any(
+            a >= b for a, b in zip(self.target_layer_ids, self.target_layer_ids[1:])
+        ):
+            raise ValueError("target_layer_ids must be strictly increasing")
         positive_int("target_features.hidden_size", self.hidden_size)
 
     def validate_target(self, target: Mapping) -> None:
