@@ -41,6 +41,7 @@ class Llama3RoPEConfigTest(unittest.TestCase):
         old_scaling["type"] = old_scaling.pop("rope_type")
         self.assertEqual(resolve_rope(payload), expected)
         payload["rope_parameters"] = encode_component("rope", expected)
+        payload["rope_parameters"].pop("interleaved")  # Canonical-only field.
         self.assertEqual(resolve_rope(payload), expected)
         payload["rope_parameters"]["factor"] = 16
         with self.assertRaisesRegex(ValueError, "conflicting"):

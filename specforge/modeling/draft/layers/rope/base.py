@@ -1,5 +1,7 @@
 """Shared FP32 phase computation for static rotary frequency rules."""
 
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor, nn
 
@@ -50,7 +52,11 @@ class RotaryEmbedding(nn.Module):
         """Return [batch, sequence, rotary_dim] cosine/sine for explicit positions."""
         if position_ids.ndim != 2:
             raise ValueError("position_ids must have shape [batch, sequence]")
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
+        with (
+            nullcontext()
+            if hidden.is_meta
+            else torch.autocast(device_type=hidden.device.type, enabled=False)
+        ):
             inv_freq = self.frequencies(hidden.device)
             positions = self._positions(position_ids, hidden.device)
             freqs = positions.unsqueeze(-1) * inv_freq

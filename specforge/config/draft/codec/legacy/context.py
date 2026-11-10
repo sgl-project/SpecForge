@@ -1,6 +1,6 @@
-from dataclasses import replace
-
 """Shared field decoding for legacy target-context drafts; no algorithm dispatch."""
+
+from dataclasses import replace
 
 from ..._validation import positive_int
 from ...architecture.features import TargetFeatureSpec

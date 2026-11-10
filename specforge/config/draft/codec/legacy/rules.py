@@ -36,6 +36,8 @@ def resolve_rope(payload: Mapping):
 
     def normalize(source):
         values = dict(source)
+        if "interleaved" in values:
+            raise ValueError("legacy Qwen3 RoPE does not support interleaved")
         alias = {"rope_type": values.pop("type")} if "type" in values else {}
         values["rope_type"] = resolve_alias(
             "rope_type", values, alias, default="default"

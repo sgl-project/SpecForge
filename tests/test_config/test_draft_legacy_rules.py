@@ -13,6 +13,12 @@ from specforge.config.draft.rope import DefaultRoPESpec, LinearRoPESpec
 
 
 class LegacyRulesTest(unittest.TestCase):
+    def test_legacy_rope_rejects_interleaved_instead_of_overwriting_it(self):
+        for field in ("rope_parameters", "rope_scaling"):
+            for value in (True, False):
+                with self.assertRaisesRegex(ValueError, "interleaved"):
+                    resolve_rope({field: {"interleaved": value}})
+
     def test_aliases_reject_conflicts_instead_of_choosing_a_winner(self):
         self.assertEqual(
             resolve_alias("block_size", {"block_size": 8}, {"block_size": 8}), 8
