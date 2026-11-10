@@ -10,6 +10,7 @@ from .architecture import (
     ArchitectureSpec,
     DFlash2Spec,
     DFlashSpec,
+    DominoSpec,
     DSparkSpec,
     DSpineSpec,
 )
@@ -23,7 +24,14 @@ from .logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
 from .mlp import DenseFFNSpec, FFNSpec
 from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
-from .rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec, RopeSpec
+from .rope import (
+    DefaultRoPESpec,
+    LinearRoPESpec,
+    Llama3RoPESpec,
+    NoRoPESpec,
+    RopeSpec,
+    YaRNSpec,
+)
 
 if TYPE_CHECKING:
     from .model import DraftConfig
@@ -215,6 +223,8 @@ for _kind, _schema in (
     ("rope", DefaultRoPESpec),
     ("rope", LinearRoPESpec),
     ("rope", NoRoPESpec),
+    ("rope", Llama3RoPESpec),
+    ("rope", YaRNSpec),
     ("logits", NoLogitTransformSpec),
     ("logits", MuPLogitTransformSpec),
 ):
@@ -228,3 +238,4 @@ register_spec("DFlashDraftModel", DFlashSpec, validate_target_context)
 register_spec("DFlash2DraftModel", DFlash2Spec, validate_dflash2)
 register_spec("DSparkDraftModel", DSparkSpec, validate_target_context)
 register_spec("DSpineDraftModel", DSpineSpec, validate_dspine)
+register_spec("DominoDraftModel", DominoSpec, validate_target_context)

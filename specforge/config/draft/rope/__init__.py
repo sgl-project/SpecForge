@@ -3,6 +3,15 @@
 from .base import RopeSpec
 from .default import DefaultRoPESpec
 from .linear import LinearRoPESpec
+from .llama3 import Llama3RoPESpec
 from .none import NoRoPESpec
+from .yarn import YaRNSpec
 
-__all__ = ["RopeSpec", "DefaultRoPESpec", "LinearRoPESpec", "NoRoPESpec"]
+__all__ = [
+    "RopeSpec",
+    "DefaultRoPESpec",
+    "LinearRoPESpec",
+    "Llama3RoPESpec",
+    "NoRoPESpec",
+    "YaRNSpec",
+]
