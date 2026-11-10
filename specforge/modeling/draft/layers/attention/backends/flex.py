@@ -14,6 +14,16 @@ _compiled_block_mask = torch.compile(create_block_mask)
 
 
 class FlexAttentionBackend(AttentionBackend):
+    def __init__(self, *, kernel_backend="TRITON"):
+        if kernel_backend not in {"TRITON", "FLASH"}:
+            raise ValueError("Flex kernel_backend must be TRITON or FLASH")
+        # AUTO can select flex-decoding, which rejects sparse short-query batches.
+        self.kernel_backend = kernel_backend
+
+    def validate(self, *, head_dim, value_head_dim, dropout_p):
+        if dropout_p:
+            raise ValueError("FlexAttention does not support attention dropout")
+
     def prepare(self, layout, *, batch_size, num_heads, is_causal, sliding_window):
         qlen, klen = layout.query_positions.shape[1], layout.key_positions.shape[1]
         if not qlen or not klen:
@@ -26,18 +36,22 @@ class FlexAttentionBackend(AttentionBackend):
         mask = prepare(
             layout.mask_mod(is_causal=is_causal, sliding_window=sliding_window),
             batch_size,
-            num_heads,
+            layout.mask_heads(num_heads),
             qlen,
             klen,
             device=layout.query_positions.device,
+            BLOCK_SIZE=(256, 128) if self.kernel_backend == "FLASH" else 128,
         )
         return mask, layout.active_queries.expand(batch_size, -1)
 
     def attend(
         self, query, key, value, *, mask, scale, dropout_p, training, return_lse
     ):
-        if training and dropout_p:
-            raise ValueError("FlexAttention does not support attention dropout")
+        self.validate(
+            head_dim=query.shape[-1],
+            value_head_dim=value.shape[-1],
+            dropout_p=dropout_p if training else 0.0,
+        )
         compute = (
             flex_attention if torch.compiler.is_compiling() else _compiled_attention
         )
@@ -49,5 +63,6 @@ class FlexAttentionBackend(AttentionBackend):
             scale=scale,
             enable_gqa=query.shape[1] != key.shape[1],
             return_aux=AuxRequest(lse=True),
+            kernel_options={"BACKEND": self.kernel_backend},
         )
         return output, aux.lse

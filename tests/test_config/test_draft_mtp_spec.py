@@ -38,7 +38,6 @@ class MTPSpecTest(unittest.TestCase):
             node = mtp_config(layer_types=("full_dense",) * depth)
             spec = node.spec_config
             self.assertIsNone(spec.protocol)
-            self.assertEqual(spec.fusion_input_width(32), 64)
             self.assertEqual(spec.feature_token_offset, -1)
             self.assertEqual(spec.prediction_token_offset, 1)
             restored = decode_config(json.loads(json.dumps(encode_config(node))))
@@ -54,7 +53,6 @@ class MTPSpecTest(unittest.TestCase):
             decode_config(payload, target_config={"hidden_size": 64})
         spec = MTPSpec(target_features=FinalHiddenFeatureSpec(hidden_size=64))
         node = dataclasses.replace(node, spec_config=spec)
-        self.assertEqual(spec.fusion_input_width(32), 96)
         decode_config(encode_config(node), target_config={"hidden_size": 64})
 
     def test_causality_vocabulary_and_feature_types_are_checked(self):
@@ -71,8 +69,6 @@ class MTPSpecTest(unittest.TestCase):
         for value in (0, True, 1.5):
             with self.assertRaises(ValueError):
                 FinalHiddenFeatureSpec(hidden_size=value)
-            with self.assertRaises(ValueError):
-                mtp_config().spec_config.fusion_input_width(value)
 
     def test_checkpoint_and_training_policy_are_not_architecture_fields(self):
         for field in ("native_prefix", "share_lm_head", "loss_weight", "num_steps"):

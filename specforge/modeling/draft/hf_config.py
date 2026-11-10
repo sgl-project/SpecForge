@@ -1,6 +1,7 @@
 """Transformers metadata around the single immutable draft configuration."""
 
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import fields
 
@@ -33,7 +34,6 @@ _METADATA = frozenset(
         "_name_or_path",
         "name_or_path",
         "_commit_hash",
-        "attn_implementation",
         "experts_implementation",
     }
 )
@@ -63,12 +63,29 @@ class SpecForgeDraftConfig(PreTrainedConfig):
         unknown = metadata.keys() - _METADATA
         if unknown:
             raise ValueError(f"unknown HF metadata: {sorted(unknown)}")
+        self.use_cache = metadata.pop("use_cache", False)
         object.__setattr__(self, "_draft", draft)
         super().__init__(
             architectures=[draft.architecture],
             tie_word_embeddings=draft.tie_word_embeddings,
             **copy.deepcopy(metadata),
         )
+
+    def __eq__(self, other):
+        if type(self) is not type(other):
+            return NotImplemented
+        return self.to_dict() == other.to_dict()
+
+    __hash__ = None
+
+    @property
+    def use_cache(self) -> bool:
+        return False
+
+    @use_cache.setter
+    def use_cache(self, value):
+        if value:
+            raise ValueError("draft models have no KV cache; use_cache must be False")
 
     @property
     def draft(self) -> DraftConfig:
@@ -109,8 +126,16 @@ class SpecForgeDraftConfig(PreTrainedConfig):
         super().__setattr__(name, value)
 
     def to_dict(self):
+        defaults = PreTrainedConfig().to_dict()
         metadata = {
-            key: value for key, value in super().to_dict().items() if key in _METADATA
+            key: value
+            for key, value in super().to_dict().items()
+            if key in _METADATA
+            and key != "_name_or_path"
+            and (
+                key in {"transformers_version", "auto_map"}
+                or value != defaults.get(key)
+            )
         }
         return {**metadata, **encode_config(self.draft)}
 
@@ -118,6 +143,11 @@ class SpecForgeDraftConfig(PreTrainedConfig):
         # Canonical structural fields are required, even if they resemble HF
         # defaults. There is deliberately no empty/default DraftConfig.
         return self.to_dict()
+
+    @classmethod
+    def from_json_file(cls, json_file):
+        with open(json_file, encoding="utf-8") as stream:
+            return cls.from_dict(json.load(stream))
 
     @classmethod
     def from_dict(cls, config_dict: Mapping, **kwargs):
@@ -131,10 +161,14 @@ class SpecForgeDraftConfig(PreTrainedConfig):
         forbidden = kwargs.keys() & _STRUCTURE
         if forbidden:
             raise ValueError(f"cannot override draft structure: {sorted(forbidden)}")
+        # A caller's dtype (including the legacy spelling) wins over saved metadata.
+        legacy_dtype = kwargs.pop("torch_dtype", None)
+        dtype = kwargs.pop("dtype", legacy_dtype)
+        if dtype is not None and dtype != "auto":
+            metadata.pop("torch_dtype", None)
+            metadata["dtype"] = dtype
         for key in list(kwargs):
             if key in _METADATA:
-                if key in {"dtype", "torch_dtype"} and kwargs[key] == "auto":
-                    continue
                 metadata[key] = kwargs.pop(key)
         if kwargs and not return_unused:
             raise ValueError(f"unknown configuration overrides: {sorted(kwargs)}")

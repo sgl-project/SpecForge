@@ -1,9 +1,12 @@
 """Family-independent HF base; legacy base.py remains during migration."""
 
+from itertools import chain
+
 import torch
 from torch import nn
 from transformers import PreTrainedModel
 from transformers import initialization as init
+from transformers.modeling_utils import get_torch_context_manager_or_global_device
 
 from .backbone import DraftBackbone
 from .hf_config import SpecForgeDraftConfig
@@ -23,11 +26,28 @@ class DraftPreTrainedModel(PreTrainedModel):
             raise ValueError("model class name must match draft.architecture")
         super().__init__(config)
 
+    def init_weights(self):
+        on_meta = [
+            tensor.is_meta for tensor in chain(self.parameters(), self.buffers())
+        ]
+        if (
+            on_meta and all(on_meta)
+        ) or get_torch_context_manager_or_global_device() == torch.device("meta"):
+            self.tie_weights(recompute_mapping=False)
+            return
+        if any(on_meta):
+            raise ValueError("draft is partly on meta; materialize every tensor first")
+        super().init_weights()
+
+    def _initialize_weights(self, module, is_custom_code=False):
+        # HF's custom-code shortcut skips resets that initialize child tensors.
+        super()._initialize_weights(module, False)
+
     @torch.no_grad()
     def _init_weights(self, module):
         """Own basic initialization without HF family defaults or name matching.
 
-        Components with special parameters implement reset_draft_parameters().
+        Components with special parameters or buffers implement reset_draft_parameters().
         They must respect HF's initialized-tensor flags when restoring partial
         weights, for example by using transformers.initialization primitives.
         HF's module flags prevent repeated post_init from overwriting weights.
@@ -49,7 +69,12 @@ class DraftPreTrainedModel(PreTrainedModel):
                 init.ones_(module.weight)
             if module.bias is not None:
                 init.zeros_(module.bias)
-        elif any(True for _ in module.parameters(recurse=False)):
+        elif any(
+            True
+            for _ in chain(
+                module.parameters(recurse=False), module.buffers(recurse=False)
+            )
+        ):
             raise TypeError(
                 f"{type(module).__name__} must define reset_draft_parameters"
             )

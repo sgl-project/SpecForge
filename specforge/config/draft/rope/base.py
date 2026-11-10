@@ -10,6 +10,11 @@ from .._validation import boolean, positive_int, positive_number
 class RopeSpec(ABC):
     """Base for explicit rotary-position settings, including disabled RoPE."""
 
+    @property
+    def mla_qk_scale_multiplier(self) -> float:
+        """Scale MLA scores when required by the rotary rule."""
+        return 1.0
+
     @abstractmethod
     def rotary_dim(self, head_dim: int) -> int:
         """Validate and derive the number of dimensions to rotate."""
