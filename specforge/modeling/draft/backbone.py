@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .layers.attention.backends import PreparedAttention
 from .layers.residual import ResidualStreams
-from .layers.rope.base import RotaryEmbedding
+from .layers.rope import NODE_DETERMINED_ROTARY_TYPES
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
@@ -88,10 +88,10 @@ class DraftBackbone(nn.Module):
                 if inputs.position_ids is None:
                     raise ValueError("rotary preparation requires position_ids")
                 # Built-in rotary modules are determined by their frozen node.
-                # Unknown modules share only when the module itself is shared.
+                # Any other module shares only when the module itself is shared.
                 for cached, positions, tables in rotary_tables:
                     same_rule = cached is rotary or (
-                        isinstance(rotary, RotaryEmbedding)
+                        type(rotary) in NODE_DETERMINED_ROTARY_TYPES
                         and type(cached) is type(rotary)
                         and cached.config == rotary.config
                         and cached.head_dim == rotary.head_dim

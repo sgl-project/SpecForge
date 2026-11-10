@@ -187,6 +187,34 @@ class RotaryTest(unittest.TestCase):
             backbone.begin(hidden, [inputs[0], LayerInputs(position_ids=positions + 1)])
             self.assertEqual(second.call_count, 1)
 
+    def test_backbone_keeps_tables_of_custom_rotary_subclasses_per_module(self):
+        """A subclass may hold state beyond its node, so equal nodes must not share."""
+
+        class OffsetRotary(DefaultRotaryEmbedding):
+            def __init__(self, config, *, head_dim, offset):
+                super().__init__(config, head_dim=head_dim)
+                self.offset = offset
+
+            def _positions(self, position_ids, device):
+                return super()._positions(position_ids, device) + self.offset
+
+        node = DefaultRoPESpec(
+            interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+        )
+        rotary = [OffsetRotary(node, head_dim=8, offset=offset) for offset in (0, 5)]
+        backbone = DraftBackbone(
+            [RotaryLayer(), RotaryLayer()],
+            final_norm=nn.Identity(),
+            rotary=rotary,
+            residual=StandardResidual(StandardResidualSpec()),
+        )
+        hidden, positions = torch.randn(1, 3, 8), torch.arange(3)[None]
+        state = backbone.begin(hidden, [LayerInputs(position_ids=positions)] * 2)
+        for inputs, module in zip(state.layer_inputs, rotary):
+            torch.testing.assert_close(
+                inputs.position_embeddings, module(hidden, positions), rtol=0, atol=0
+            )
+
     def test_backbone_memo_compiles_with_fresh_positions(self):
         from torch._dynamo.testing import CompileCounter
 
