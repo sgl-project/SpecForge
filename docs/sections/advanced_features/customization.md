@@ -275,10 +275,11 @@ cutover, incompatible changes require a schema migration.
 
 Canonical RoPE computes frequencies, phases, and cosine/sine tables in FP32.
 Rotation also computes in FP32 and casts once to the Q/K dtype. This follows
-SGLang's base rotary embedding, which keeps an FP32 cosine/sine cache on CUDA,
-and intentionally changes BF16 numerics relative to legacy frequency/table
-rounding. SGLang's multi-axis rotary embedding casts its cache to the activation
-dtype before rotating, so multi-axis drafts differ from serving by that
+SGLang's base rotary embedding, which keeps an FP32 cosine/sine cache on CUDA
+for head sizes 64, 128, 256 and 512, and intentionally changes BF16 numerics
+relative to legacy frequency/table rounding. For other head sizes, and for
+SGLang's multi-axis rotary embedding, SGLang casts the cache to the activation
+dtype before rotating, so such drafts differ from serving by at least that
 rounding. Linear scaling divides positions; dynamic NTK
 uses a fixed `factor * original_max_position_embeddings`, independent of previous
 calls. Legacy EAGLE dynamic configurations remain unsupported. Continued training
