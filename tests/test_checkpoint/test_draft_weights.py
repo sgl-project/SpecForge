@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -94,6 +95,19 @@ class DraftWeightsTest(unittest.TestCase):
                     self.assertIs(restored.embed_tokens.weight, restored.lm_head.weight)
                 if bound:
                     self.assertFalse(restored.lm_head.weight.requires_grad)
+                    for name, ref in bindings.items():
+                        torch.testing.assert_close(
+                            restored.get_submodule(name).weight,
+                            ref.read(),
+                            rtol=0,
+                            atol=0,
+                        )
+                    for invalid in (
+                        {},
+                        bindings | {"unknown": next(iter(bindings.values()))},
+                    ):
+                        with self.assertRaisesRegex(ValueError, "target bindings"):
+                            make_weight_plan(restored, store.refs(), bindings=invalid)
                 with self.assertRaises(FileExistsError):
                     save_draft(original, path)
 
@@ -139,6 +153,36 @@ class DraftWeightsTest(unittest.TestCase):
             before = model.state_dict()[key].clone()
             apply_weight_plan(model, plan)
             torch.testing.assert_close(model.state_dict()[key], before, rtol=0, atol=0)
+
+    def test_shape_ties_revalidation_and_meta_fail_before_reading(self):
+        config = draft_config(target_bindings=(), target_logit_transform=None)
+        model = build_draft_model(config)
+        with TemporaryDirectory() as tmp:
+            save_draft(model, Path(tmp) / "draft")
+            store = TensorStore(Path(tmp) / "draft")
+            refs = store.refs()
+            plan = make_weight_plan(model, refs)
+            key = "embed_tokens.weight"
+            info = store.metadata[key]
+            before = {name: value.clone() for name, value in model.state_dict().items()}
+            with patch.object(
+                TensorStore, "read", side_effect=AssertionError("preflight read")
+            ):
+                store.metadata[key] = replace(info, shape=(1,))
+                with self.assertRaisesRegex(ValueError, "shape mismatch"):
+                    make_weight_plan(model, refs)
+                with self.assertRaisesRegex(ValueError, "shape mismatch"):
+                    apply_weight_plan(model, plan)
+                store.metadata[key] = info
+                tied = build_draft_model(replace(config, tie_word_embeddings=True))
+                with self.assertRaisesRegex(ValueError, "conflicting assignments"):
+                    make_weight_plan(tied, refs)
+                meta = build_draft_model(config, device="meta")
+                with self.assertRaisesRegex(ValueError, "materialize"):
+                    apply_weight_plan(meta, plan)
+                with self.assertRaisesRegex(ValueError, "gathered"):
+                    save_draft(meta, Path(tmp) / "meta")
+            torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
 
     def test_legacy_tensor_payload_index_validation_and_format_guard(self):
         with TemporaryDirectory() as tmp:

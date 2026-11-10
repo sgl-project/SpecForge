@@ -5,9 +5,6 @@ import os
 import tempfile
 from pathlib import Path
 
-from huggingface_hub import split_torch_state_dict_into_shards
-from safetensors.torch import save_file
-
 
 def read_artifact_metadata(config):
     """Validate directory-format metadata without treating it as model structure."""
@@ -45,37 +42,15 @@ def save_draft(model, path, *, max_shard_size="5GB"):
         not destination.is_dir() or any(destination.iterdir())
     ):
         raise FileExistsError(f"checkpoint directory is not empty: {destination}")
-    state, seen = {}, set()
-    for key, value in model.state_dict(keep_vars=True).items():
+    state = model.state_dict()
+    for key, value in state.items():
         if value.is_meta or hasattr(value, "to_local"):
             raise ValueError(f"{key}: save requires materialized, gathered tensors")
-        if id(value) not in seen:
-            state[key] = value.detach().cpu().contiguous()
-            seen.add(id(value))
-    shards = split_torch_state_dict_into_shards(state, max_shard_size=max_shard_size)
     with tempfile.TemporaryDirectory(prefix=".draft-", dir=destination.parent) as tmp:
         staging = Path(tmp) / "artifact"
-        staging.mkdir()
-        for filename, keys in shards.filename_to_tensors.items():
-            # Clone to avoid shared storage aliases in safetensors.
-            save_file(
-                {k: state[k].clone() for k in keys},
-                staging / filename,
-                metadata={"format": "pt"},
-            )
-        if shards.is_sharded:
-            (staging / "model.safetensors.index.json").write_text(
-                json.dumps(
-                    {
-                        "metadata": shards.metadata,
-                        "weight_map": shards.tensor_to_filename,
-                    },
-                    indent=2,
-                )
-                + "\n"
-            )
-        config = model.config.to_dict() | {
-            "specforge_artifact": {"format": "specforge", "version": 1}
-        }
-        (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        model.save_pretrained(staging, state_dict=state, max_shard_size=max_shard_size)
+        config_path = staging / "config.json"
+        config = json.loads(config_path.read_text())
+        config["specforge_artifact"] = {"format": "specforge", "version": 1}
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
         os.replace(staging, destination)

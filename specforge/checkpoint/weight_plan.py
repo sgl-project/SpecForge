@@ -33,6 +33,20 @@ def _validate_dtype(name, source, destination, strict):
             )
 
 
+def _validate_unquantized(name, ref):
+    dtype = ref.info.dtype
+    scales = {ref.key + "_scale", ref.key + "_scale_inv"}
+    if (
+        isinstance(dtype, str)
+        or str(dtype).startswith(("torch.float8", "torch.float4"))
+        or scales.intersection(ref.store.metadata)
+    ):
+        raise ValueError(
+            f"{name} <- {ref.key}: unsupported quantized/scaled weight ({dtype}); "
+            "provide unquantized weights"
+        )
+
+
 def make_weight_plan(
     model, weights, *, bindings=None, allow_new=(), strict_copies=(), unused=()
 ):
@@ -44,6 +58,9 @@ def make_weight_plan(
     """
     state = model.state_dict(keep_vars=True)
     weights, bindings = dict(weights), dict(bindings or {})
+    # Check selected sources before reporting their scale tensors as unexpected.
+    for name, ref in (*weights.items(), *bindings.items()):
+        _validate_unquantized(name, ref)
     allowed, strict = set(allow_new), set(strict_copies)
     if (weights.keys() | allowed) - state.keys():
         raise ValueError(

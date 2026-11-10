@@ -1,17 +1,18 @@
 """Checkpoint metadata and selective tensor reads, without model construction."""
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
+from .layout import read_weight_map_file, resolve_weight_layout
+
 
 @dataclass(frozen=True)
 class TensorInfo:
     shape: tuple[int, ...]
-    dtype: torch.dtype
+    dtype: torch.dtype | str
 
 
 @dataclass(frozen=True)
@@ -53,31 +54,16 @@ class TensorStore:
         if root.is_file():
             layout, root = root, root.parent
         else:
-            layouts = [
-                root / name
-                for name in (
-                    "model.safetensors.index.json",
-                    "model.safetensors",
-                    "pytorch_model.bin.index.json",
-                    "pytorch_model.bin",
-                    "training_state.pt",
-                )
-                if (root / name).is_file()
-            ]
-            if not layouts:
+            _, filename = resolve_weight_layout(str(root), allow_missing=True)
+            layout = Path(filename) if filename else root / "training_state.pt"
+            if not layout.is_file():
                 raise FileNotFoundError(f"no checkpoint weights in {root}")
-            layout = layouts[0]
         self.root = root.resolve()
         self.metadata, self.files = {}, {}
+        self._loaded = {}
         weight_map = None
         if layout.name.endswith(".index.json"):
-            weight_map = json.loads(layout.read_text()).get("weight_map")
-            if not isinstance(weight_map, dict) or not weight_map:
-                raise ValueError(f"{layout}: invalid weight_map")
-            if not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in weight_map.items()
-            ):
-                raise ValueError(f"{layout}: invalid weight_map entries")
+            weight_map = read_weight_map_file(str(layout))
             filenames = sorted(set(weight_map.values()))
         else:
             filenames = [layout.name]
@@ -124,7 +110,9 @@ class TensorStore:
                     if region is None
                     else handle.get_slice(key)[region]
                 )
-        value = _torch_state(file)[key]
+        if file not in self._loaded:
+            self._loaded[file] = _torch_state(file)
+        value = self._loaded[file][key]
         return value if region is None else value[region]
 
 
@@ -141,8 +129,5 @@ def _safe_dtype(name):
         "U8": torch.uint8,
         "BOOL": torch.bool,
     }
-    if name not in names:
-        raise ValueError(
-            f"unsupported checkpoint dtype {name}; provide unquantized weights"
-        )
-    return names[name]
+    # Preserve unknown/quantized metadata; only selected weights must be loadable.
+    return names.get(name, name)
