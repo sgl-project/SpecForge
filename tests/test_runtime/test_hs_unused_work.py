@@ -127,6 +127,28 @@ class UnusedCacheWorkTests(unittest.TestCase):
             else:
                 self.assertFalse(any(key.startswith("p0_") for key in timings))
 
+    def test_diagnostic_sampling_bounds_controller_event_work(self):
+        with mock.patch.dict("os.environ", {"SPECFORGE_HS_DIAGNOSTICS": "1",
+                "SPECFORGE_HS_DIAGNOSTICS_EVERY": "2", "SPECFORGE_HS_DIAGNOSTICS_MAX": "2"}):
+            cache = self.cache(0)
+            controller = CaptureController(cache, schema(), 512, 512, 512)
+        sampled = []
+        for index in range(6):
+            execution = ExecutionIdentity("server", str(index), str(index), 0)
+            tokens = tuple(range(8))
+            lease = cache.lookup_and_pin("ns", tokens, 8)
+            reservation = controller.try_reserve_output(execution, 8, 0, 0)
+            plan = controller.freeze_plan(execution, "ns", tokens, 8, 0, lease, reservation)
+            sample = controller.submit(plan, CapturedSpan(execution, 0, 8,
+                {"aux": torch.zeros(8, 2)}, None)).result(5)
+            sampled.append("p0_v1_materialize_done_ns" in sample.timings)
+            sample.release()
+            controller.poll_completed()
+            controller.poll_drained()
+        controller.shutdown()
+        self.assertEqual(sampled, [True, False, True, False, False, False])
+        self.assertEqual(controller.stats()["pending_executions"], 0)
+
     def test_rollback_flag_preserves_legacy_hash_and_adoption_work(self):
         cache = self.cache(0, enabled=False)
         with mock.patch.object(cache, "block_keys", wraps=cache.block_keys) as keys:

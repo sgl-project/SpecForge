@@ -83,6 +83,9 @@ class CaptureController:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
+        self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
+        self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
+        self._diagnostic_sequence = 0
         self._limits = {
             "pinned": checked_int(pinned_budget_bytes, "pinned_budget_bytes"),
             "output": checked_int(output_budget_bytes, "output_budget_bytes"),
@@ -376,7 +379,10 @@ class CaptureController:
             future.set_running_or_notify_cancel()
             job = _Job(plan, features, span.ready_event, is_cuda, state, future)
             if self._diagnostics:
-                job.diagnostics["p0_v1_materialize_submitted_ns"] = monotonic_ns()
+                sequence = self._diagnostic_sequence
+                self._diagnostic_sequence += 1
+                if sequence % self._diagnostic_every == 0 and sequence // self._diagnostic_every < self._diagnostic_limit:
+                    job.diagnostics["p0_v1_materialize_submitted_ns"] = monotonic_ns()
             try:
                 self._executor.submit(self._run_job, job)
             except BaseException:
@@ -395,9 +401,9 @@ class CaptureController:
         if not job.is_cuda:
             if job.ready_event is not None:
                 try:
-                    ready_started = monotonic_ns() if self._diagnostics else 0
+                    ready_started = monotonic_ns() if job.diagnostics else 0
                     job.ready_event.synchronize()
-                    if self._diagnostics:
+                    if job.diagnostics:
                         job.diagnostics["p0_v1_producer_ready_wait_ms"] = (monotonic_ns() - ready_started) / 1e6
                 except BaseException as exc:
                     raise _UnsafeDrain(exc, [job.ready_event]) from exc
@@ -420,27 +426,27 @@ class CaptureController:
                     raise CaptureContractError("pinned arena quarantined after unproven DMA drain")
                 stream = torch.cuda.Stream(device=device)
                 with torch.cuda.stream(stream):
-                    if self._diagnostics:
+                    if job.diagnostics:
                         waiting = torch.cuda.Event(enable_timing=True)
                         ready = torch.cuda.Event(enable_timing=True)
                         copy_start = torch.cuda.Event(enable_timing=True)
                         waiting.record(stream)
                     stream.wait_event(job.ready_event)
-                    if self._diagnostics:
+                    if job.diagnostics:
                         ready.record(stream)
                         alloc_started = monotonic_ns()
                     staging = self._staging_views(job.plan.N - job.plan.L, job.plan.reservation)
-                    if self._diagnostics:
+                    if job.diagnostics:
                         job.diagnostics["p0_v1_staging_alloc_ms"] = (monotonic_ns() - alloc_started) / 1e6
                         copy_start.record(stream)
                     for name, source in job.features.items():
                         target = staging[name]
                         target.copy_(source, non_blocking=True)
                         source.record_stream(stream)
-                    copied = torch.cuda.Event(enable_timing=True) if self._diagnostics else torch.cuda.Event()
+                    copied = torch.cuda.Event(enable_timing=True) if job.diagnostics else torch.cuda.Event()
                     copied.record(stream)
                 copied.synchronize()
-                if self._diagnostics:
+                if job.diagnostics:
                     # Read events only after the existing real copy drain. No
                     # timing-only synchronization is introduced on the hot path.
                     job.diagnostics["p0_v1_producer_ready_wait_ms"] = waiting.elapsed_time(ready)
@@ -484,7 +490,7 @@ class CaptureController:
         completion = None
         unsafe = False
         try:
-            if self._diagnostics:
+            if job.diagnostics:
                 started_ns = monotonic_ns()
                 job.diagnostics["p0_v1_materialize_started_ns"] = started_ns
                 job.diagnostics["p0_v1_d2h_queue_ms"] = (started_ns - job.diagnostics["p0_v1_materialize_submitted_ns"]) / 1e6
@@ -497,12 +503,12 @@ class CaptureController:
             if self._cancelled(job):
                 raise CaptureCancelledError(job.state.reason or "execution released")
             with torch.no_grad():
-                if self._diagnostics:
+                if job.diagnostics:
                     alloc_started = monotonic_ns()
                     faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 for spec in self.schema.features:
                     output[spec.name] = torch.empty((job.plan.N, spec.width), dtype=DTYPES[spec.dtype], device="cpu")
-                if self._diagnostics:
+                if job.diagnostics:
                     prefix_started = monotonic_ns()
                     job.diagnostics["p0_v1_output_alloc_ms"] = (prefix_started - alloc_started) / 1e6
                     job.diagnostics["p0_v1_output_alloc_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
@@ -511,7 +517,7 @@ class CaptureController:
                     self.cache.copy_prefix_into(job.plan.lease, job.plan.L, output)
                 finally:
                     self.cache.release_lease(job.plan.lease)
-                if self._diagnostics:
+                if job.diagnostics:
                     suffix_started = monotonic_ns()
                     job.diagnostics["p0_v1_prefix_copy_ms"] = (suffix_started - prefix_started) / 1e6
                     job.diagnostics["p0_v1_prefix_copy_bytes"] = job.plan.L * self.schema.row_bytes
@@ -519,7 +525,7 @@ class CaptureController:
                     faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 for name in output:
                     output[name][job.plan.L:job.plan.N].copy_(staging[name])
-                if self._diagnostics:
+                if job.diagnostics:
                     job.diagnostics["p0_v1_suffix_copy_ms"] = (monotonic_ns() - suffix_started) / 1e6
                     job.diagnostics["p0_v1_suffix_copy_bytes"] = (job.plan.N - job.plan.L) * self.schema.row_bytes
                     job.diagnostics["p0_v1_suffix_copy_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
@@ -532,7 +538,7 @@ class CaptureController:
             assembled_at = perf_counter()
             cache_keys = self._prepare_cache_adoption(job)
             filled_at = perf_counter()
-            if self._diagnostics:
+            if job.diagnostics:
                 job.diagnostics["p0_v1_key_prepare_ms"] = (filled_at - assembled_at) * 1000.0
                 # Assembly and key preparation are complete. Sample/completion
                 # bookkeeping and future delivery follow on this same worker.
