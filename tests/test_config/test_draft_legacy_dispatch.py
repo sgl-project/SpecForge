@@ -9,6 +9,9 @@ from tempfile import TemporaryDirectory
 from scripts.gates.normalize_dflash_export import normalize_export
 from specforge.config.draft.codec import decode_legacy_config
 from tests.test_config.test_draft_legacy_dflash import target_for
+from tests.test_config.test_draft_legacy_domino import domino_payload
+from tests.test_config.test_draft_legacy_dspark import dspark_payload
+from tests.test_config.test_draft_legacy_dspine import dspine_payload
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/legacy_projectors"
 
@@ -52,6 +55,18 @@ class LegacyDispatchTest(unittest.TestCase):
             decode_legacy_config(normalized, target_config=target_for(payload)),
             expected,
         )
+
+    def test_unknown_fields_are_rejected_in_each_family(self):
+        for build in (dspark_payload, domino_payload, dspine_payload):
+            for field in (None, "dflash_config", "dspine_config"):
+                payload = build()
+                if field is not None and field not in payload:
+                    continue
+                values = payload if field is None else payload[field]
+                values["typo"] = 1
+                with self.subTest(family=payload["architectures"], field=field):
+                    with self.assertRaisesRegex(ValueError, "unknown fields.*typo"):
+                        decode_legacy_config(payload, target_config=target_for(payload))
 
     def test_unknown_architectures_use_the_same_rejection(self):
         for architecture in ("Qwen3DSparkModel", "UnknownDraftModel"):
