@@ -63,6 +63,7 @@ class _Publication:
     cleanup: Future | None = None
     failed: BaseException | None = None
     publish_started: float = 0.0
+    diagnostic: dict | None = None
 
 
 class HSCompletion:
@@ -90,6 +91,14 @@ class HSCompletion:
             result = self.job.output.result()
         except Exception as exc:
             result = {"sample_id": self.job.spec["sample_id"], "error": str(exc)}
+        if self.job.diagnostic is not None:
+            now = time.monotonic_ns()
+            self.job.diagnostic["p0_v1_response_callback_ns"] = now
+            observed = self.job.diagnostic.get("p0_v1_owner_observed_ns")
+            if observed is not None:
+                elapsed = (now - observed) / 1e6
+                self.job.diagnostic["p0_v1_owner_to_response_callback_ms"] = elapsed
+                result.setdefault("timings", {})["p0_v1_owner_to_response_callback_ms"] = elapsed
         self.runtime.capture.results[self.job.execution.request_id] = result
         self._resolved = True
 
@@ -157,6 +166,12 @@ class HSCaptureRuntime:
         self.candidates: dict[str, _Candidate] = {}
         self.jobs: dict[ExecutionIdentity, _Publication] = {}
         self.history = deque(maxlen=256)
+        self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
+        self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
+        self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
+        self._diagnostic_sequence = 0
+        self._diagnostic_batch = 0
+        self.diagnostics = deque(maxlen=self._diagnostic_limit)
         self._transferred_tokens = []
         self._closed = False
         self.fatal_capture_error = None
@@ -590,6 +605,16 @@ class HSCaptureRuntime:
         from specforge_sglang_capture.capture import request_spec
         job = _Publication(plan.execution, candidate.entry, copy.deepcopy(request_spec(req)),
                            plan, future, output)
+        if self._diagnostics:
+            sequence = self._diagnostic_sequence
+            self._diagnostic_sequence += 1
+            if sequence % self._diagnostic_every == 0 and sequence // self._diagnostic_every < self._diagnostic_limit:
+                job.diagnostic = {"p0_v1_event": "publication", "server_epoch": self.epoch,
+                    "request_id": plan.execution.request_id, "attempt_id": plan.execution.attempt_id,
+                    "execution_epoch": plan.execution.execution_epoch, "rank": self.tp_rank,
+                    "store_id": job.spec["store_id"], "sample_id": job.spec["sample_id"],
+                    "request_digest": job.entry.request_digest, "N": plan.N, "L": plan.L,
+                    "suffix_tokens": plan.N - plan.L, "p0_v1_snapshot_ns": time.monotonic_ns()}
         self.jobs[plan.execution] = job
         candidate.entry.deliveries += 1
         return job
@@ -597,7 +622,15 @@ class HSCaptureRuntime:
     def consume(self, jobs, batch):
         self._assert_owner()
         reqs = {req.rid: req for req in batch.reqs}
+        if self._diagnostics:
+            self._diagnostic_batch += 1
         for job in jobs:
+            if job.diagnostic is not None:
+                # One ID per native consume batch; do not sum shared batch work
+                # once per sample. This timestamp is NOT a CUDA forward timer.
+                job.diagnostic.update(p0_v1_consume_batch_id=self._diagnostic_batch,
+                    p0_v1_consume_batch_samples=len(jobs),
+                    p0_v1_consume_ns=time.monotonic_ns())
             req = reqs.get(job.execution.request_id)
             if req is None or not self._current(job):
                 self._cancel_job(job, "capture request disappeared before consume")
@@ -701,6 +734,7 @@ class HSCaptureRuntime:
         if ready:
             samples = [(job.spec, job.sample.features["aux"],
                         job.sample.features["last_hidden"]) for job in ready]
+            enqueue_ns = time.monotonic_ns() if self._diagnostics else 0
             try:
                 future = self.capture.sink.submit_samples(samples)
             except Exception as exc:
@@ -710,12 +744,18 @@ class HSCaptureRuntime:
             for index, job in enumerate(ready):
                 job.sink, job.sink_index, job.sink_count = future, index, len(ready)
                 job.publish_started = time.perf_counter()
+                if job.diagnostic is not None:
+                    job.diagnostic["p0_v1_runtime_sink_enqueue_ns"] = enqueue_ns
+                    done_ns = job.sample.timings.get("p0_v1_materialize_done_ns")
+                    if done_ns is not None:
+                        job.diagnostic["p0_v1_materialize_to_enqueue_ms"] = (enqueue_ns - done_ns) / 1e6
                 job.entry.state = "PUBLISHING"
             samples = None  # The sink now owns and clears its argument list.
         ready.clear()
         for job in tuple(self.jobs.values()):
             if job.sink is None or not job.sink.done() or job.cleanup is not None:
                 continue
+            observed_ns = time.monotonic_ns() if job.diagnostic is not None else 0
             try:
                 results = job.sink.result()
                 if len(results) != job.sink_count:
@@ -733,6 +773,18 @@ class HSCaptureRuntime:
                     raise CaptureContractError("capture transfer precedes all execution drains")
                 timings = dict(job.sample.timings)
                 timings["publication_queue_ms"] = (time.perf_counter() - job.publish_started) * 1000
+                if job.diagnostic is not None:
+                    observed = observed_ns
+                    sink_timing = dict(getattr(job.sink, "p0_v1_timings", {}))
+                    job.diagnostic.update(timings)
+                    job.diagnostic.update(sink_timing)
+                    job.diagnostic["p0_v1_owner_observed_ns"] = observed
+                    if "p0_v1_sink_done_ns" in sink_timing:
+                        job.diagnostic["p0_v1_sink_done_to_owner_ms"] = (observed - sink_timing["p0_v1_sink_done_ns"]) / 1e6
+                        job.diagnostic["p0_v1_sink_queue_ms"] = (sink_timing["p0_v1_sink_start_ns"] - sink_timing["p0_v1_sink_enqueue_ns"]) / 1e6
+                    timings.update({key: value for key, value in job.diagnostic.items()
+                                    if key.startswith("p0_v1_")})
+                    self.diagnostics.append(job.diagnostic)
                 entry.last_plan["timings"] = timings
                 # Sink has cleared its source refs. Transfer allocation ownership
                 # to cache (or retire it), then issue the physical-key certificate.
@@ -861,6 +913,10 @@ class HSCaptureRuntime:
                         "pending_deliveries": len(self.jobs),
                         "active_readers": sum(len(x.readers) for x in self.registry.active.values()),
                         "plans": list(self.history),
+                        **({"p0_v1_diagnostics": list(self.diagnostics),
+                            "p0_v1_diagnostic_seen": self._diagnostic_sequence,
+                            "p0_v1_diagnostic_every": self._diagnostic_every,
+                            "p0_v1_diagnostic_limit": self._diagnostic_limit} if self._diagnostics else {}),
                         "cache": self.cache.stats() if self.cache else {},
                         "controller": self.controller.stats() if self.controller else {}}
             return self._local_phase("control.stats", stats)

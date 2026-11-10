@@ -330,6 +330,11 @@ class SpecCaptureSink:
         self._uncertain_publications = []
         self._closed = False
         self.require_hard_pin = False
+        self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
+        self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
+        self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
+        self._diagnostic_sequence = 0
+        self._diagnostic_local = threading.local()
         # One writer is enough: Mooncake stripes a batched transfer itself.
         # The thread only decouples that transfer from the scheduler.
         self._executor = ThreadPoolExecutor(
@@ -513,9 +518,26 @@ class SpecCaptureSink:
             raise RuntimeError("capture sink is closed")
         # Own a separate list: the caller may still be assigning completions
         # while this worker finishes and drops its last source references.
-        return self._executor.submit(self._put_ready_samples, list(samples), ready_event)
+        diagnostic = None
+        if self._diagnostics:
+            with self._lock:
+                sequence = self._diagnostic_sequence
+                self._diagnostic_sequence += 1
+            if sequence % self._diagnostic_every == 0 and sequence // self._diagnostic_every < self._diagnostic_limit:
+                diagnostic = {"p0_v1_sink_batch_id": sequence,
+                              "p0_v1_sink_batch_samples": len(samples),
+                              "p0_v1_sink_enqueue_ns": time.monotonic_ns()}
+        future = self._executor.submit(self._put_ready_samples, list(samples), ready_event, diagnostic)
+        # Scalar-only metadata: never retain another tensor/owner reference.
+        # The worker finishes writing it before the Future becomes done.
+        if diagnostic is not None:
+            future.p0_v1_timings = diagnostic
+        return future
 
-    def _put_ready_samples(self, samples, ready_event):
+    def _put_ready_samples(self, samples, ready_event, diagnostic=None):
+        if diagnostic is not None:
+            self._diagnostic_local.current = diagnostic
+            diagnostic["p0_v1_sink_start_ns"] = time.monotonic_ns()
         error = None
         try:
             if ready_event is not None:
@@ -528,6 +550,9 @@ class SpecCaptureSink:
             error = scalar_error(exc)
         finally:
             samples.clear()
+            if diagnostic is not None:
+                diagnostic["p0_v1_sink_done_ns"] = time.monotonic_ns()
+                self._diagnostic_local.current = None
         if error is not None:
             raise error
         return result
@@ -653,9 +678,14 @@ class SpecCaptureSink:
             )
         self._remove_many_quiet(replace_keys)
         registered: List[int] = []
+        registered_bytes = 0
         seen_storage = set()
         submitted = quarantined = False
         register_started = time.perf_counter()
+        diagnostic = getattr(self._diagnostic_local, "current", None)
+        if diagnostic is not None:
+            diagnostic.update(p0_v1_sink_objects=len(keys), p0_v1_sink_bytes=sum(sizes),
+                              p0_v1_sink_staging_ms=materialize_ms)
         try:
             for tensor, nbytes in zip(tensors, sizes):
                 storage = tensor.untyped_storage()
@@ -672,6 +702,8 @@ class SpecCaptureSink:
                 else:
                     if rc is None or int(rc) == 0:
                         registered.append(ptr)
+                        if diagnostic is not None:
+                            registered_bytes += storage.nbytes()
                     elif tensor.is_cuda:
                         raise RuntimeError(
                             f"GPU capture buffer registration failed ({rc}); "
@@ -679,6 +711,9 @@ class SpecCaptureSink:
                             "PyTorch expandable_segments for this server"
                         )
             register_ms = (time.perf_counter() - register_started) * 1000.0
+            if diagnostic is not None:
+                diagnostic["p0_v1_sink_register_ms"] = register_ms
+                diagnostic["p0_v1_sink_registered_bytes"] = registered_bytes
             put_started = time.perf_counter()
             batch_put = getattr(store, "batch_put_from", None)
             submitted = True
@@ -695,6 +730,8 @@ class SpecCaptureSink:
                     self._put_config,
                 )
             put_ms = (time.perf_counter() - put_started) * 1000.0
+            if diagnostic is not None:
+                diagnostic["p0_v1_sink_put_ms"] = put_ms
             if statuses is None:
                 statuses = [0] * len(keys)
             if len(statuses) != len(keys):
@@ -717,12 +754,16 @@ class SpecCaptureSink:
             self._remove_many_quiet(keys)
             raise
         finally:
+            unregister_started = time.monotonic_ns() if diagnostic is not None else 0
             if not quarantined:
                 for ptr in registered:
                     try:
                         store.unregister_buffer(ptr)
                     except Exception:
                         pass
+            if diagnostic is not None:
+                diagnostic["p0_v1_sink_unregister_ms"] = (time.monotonic_ns() - unregister_started) / 1e6
+                diagnostic["p0_v1_sink_quarantined"] = quarantined
 
         if timing_enabled:
             logger.info(
