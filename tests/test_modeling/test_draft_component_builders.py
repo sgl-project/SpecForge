@@ -5,7 +5,7 @@ import inspect
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, get_type_hints
 from unittest.mock import patch
 
 import torch
@@ -46,6 +46,26 @@ class ComponentBuilderTest(unittest.TestCase):
         self.enterContext(patch.dict(_SCHEMAS))
         self.enterContext(patch.dict(_BUILDERS))
         register_component_schema("norm", TestNormSpec)
+
+    def test_builtin_schemas_have_matching_builders(self):
+        schemas = {
+            key: schema
+            for key, schema in _SCHEMAS.items()
+            if schema.__module__.startswith("specforge.config.draft.")
+        }
+        exceptions = {
+            ("rope", "none"),  # build_rotary returns None; there is no module.
+            ("logits", "none"),  # Builders arrive with target bindings in #1141.
+            ("logits", "mup"),
+        }
+        self.assertLessEqual(exceptions, schemas.keys())
+        self.assertLessEqual(_BUILDERS.keys(), _SCHEMAS.keys())
+        self.assertEqual(schemas.keys() - exceptions, _BUILDERS.keys() & schemas.keys())
+        for key in schemas.keys() - exceptions:
+            with self.subTest(component=key):
+                builder = component_builder(*key)
+                annotation = get_type_hints(builder.__init__)["config"]
+                self.assertTrue(issubclass(schemas[key], annotation))
 
     def test_builtins_keep_nodes_and_support_composition(self):
         norm_node = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1)
