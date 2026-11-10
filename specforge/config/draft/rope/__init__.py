@@ -1,6 +1,6 @@
 """Typed rotary-position configuration, with no tensor or HF dependency."""
 
-from .base import RopeSpec
+from .base import RopeSpec, RotarySpec, attention_rotary_dim
 from .default import DefaultRoPESpec
 from .dynamic import DynamicNTKRoPESpec
 from .linear import LinearRoPESpec
@@ -11,6 +11,8 @@ from .yarn import YaRNSpec
 
 __all__ = [
     "RopeSpec",
+    "RotarySpec",
+    "attention_rotary_dim",
     "DefaultRoPESpec",
     "DynamicNTKRoPESpec",
     "LinearRoPESpec",
