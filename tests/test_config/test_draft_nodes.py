@@ -16,6 +16,7 @@ from specforge.config.draft.residual import StandardResidualSpec
 def gqa(**overrides):
     return GQASpec(
         **{
+            "rope_parameters": None,
             "num_attention_heads": 8,
             "num_key_value_heads": 2,
             "head_dim": 16,
@@ -136,18 +137,21 @@ class DraftNodesTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "type"):
             LayerSpec(attention="full", mlp="dense", type="decoder")
 
-    def test_import_does_not_load_run_schema_or_compute_packages(self):
+    def test_no_draft_module_loads_run_schema_or_compute_packages(self):
         result = subprocess.run(
             [
                 sys.executable,
                 "-c",
                 """
 import importlib
+import pkgutil
 import sys
-for name in ('attention', 'mlp', 'norm', 'residual', 'conv', 'layer'):
-    importlib.import_module('specforge.config.draft.' + name)
+import specforge.config.draft as draft
+for module in pkgutil.walk_packages(draft.__path__, draft.__name__ + '.'):
+    importlib.import_module(module.name)
 for name in ('torch', 'transformers', 'pydantic', 'specforge.runtime',
-             'specforge.config.schema', 'specforge.modeling'):
+             'specforge.config.schema', 'specforge.modeling',
+             'specforge.algorithms'):
     assert name not in sys.modules, name
 """,
             ],

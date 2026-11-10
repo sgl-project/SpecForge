@@ -14,6 +14,7 @@ from specforge.config.draft.validate import validate_layers
 
 def definitions():
     attention = GQASpec(
+        rope_parameters=None,
         num_attention_heads=8,
         num_key_value_heads=2,
         head_dim=16,
@@ -135,6 +136,33 @@ class LayerDefinitionsTest(unittest.TestCase):
             table[next(iter(table))] = {}
             with self.assertRaises(ValueError):
                 validate_layers(**config)
+
+    def test_unregistered_subclasses_cannot_reuse_a_type_name(self):
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class PatchedGQA(GQASpec):
+            pass
+
+        config = definitions()
+        full = config["attention_configs"]["full"]
+        config["attention_configs"]["full"] = PatchedGQA(**dataclasses.asdict(full))
+        with self.assertRaisesRegex(
+            ValueError, "attention_configs.full: expected GQASpec"
+        ):
+            validate_layers(**config)
+
+    def test_an_unused_layer_is_reported_before_the_components_it_strands(self):
+        config = definitions()
+        attention = config["attention_configs"]
+        attention["orphan_attention"] = attention["full"]
+        config["layer_configs"]["orphan"] = LayerSpec(
+            attention="orphan_attention", mlp="dense"
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^layer_configs: unused definitions \['orphan'\]; "
+            r"attention_configs: unused definitions \['orphan_attention'\]$",
+        ):
+            validate_layers(**config)
 
 
 if __name__ == "__main__":

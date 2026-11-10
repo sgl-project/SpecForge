@@ -11,6 +11,12 @@ from .base import AttentionSpec
 class GQASpec(AttentionSpec):
     type: ClassVar[str] = "gqa"
 
+    def capabilities(self) -> frozenset[str]:
+        flags = {"target_context_kv"}
+        if self.is_causal:
+            flags.add("causal")
+        return frozenset(flags)
+
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
@@ -22,6 +28,7 @@ class GQASpec(AttentionSpec):
     attention_dropout: float
 
     def __post_init__(self):
+        super().__post_init__()
         for name in ("num_attention_heads", "num_key_value_heads", "head_dim"):
             positive_int(name, getattr(self, name))
         if self.num_attention_heads % self.num_key_value_heads:
@@ -39,6 +46,10 @@ class GQASpec(AttentionSpec):
     @property
     def num_key_value_groups(self) -> int:
         return self.num_attention_heads // self.num_key_value_heads
+
+    @property
+    def rotary_input_dim(self) -> int:
+        return self.head_dim
 
 
 @dataclass(frozen=True, kw_only=True)

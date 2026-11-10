@@ -4,8 +4,13 @@ from collections.abc import Mapping
 from dataclasses import MISSING, fields
 
 
+def serialized_fields(schema_or_node) -> tuple:
+    """Fields written and read by the codecs; `init=False` fields are derived."""
+    return tuple(field for field in fields(schema_or_node) if field.init)
+
+
 def _construct(schema: type, values: Mapping, path: str):
-    expected = {field.name: field for field in fields(schema) if field.init}
+    expected = {field.name: field for field in serialized_fields(schema)}
     unknown = values.keys() - expected.keys()
     if unknown:
         raise ValueError(f"{path}: unknown fields {sorted(unknown, key=str)}")

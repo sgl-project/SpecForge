@@ -1,6 +1,7 @@
 """Type dispatch stays in configuration; layers only hold name references."""
 
 import copy
+import dataclasses
 import json
 import subprocess
 import sys
@@ -19,11 +20,12 @@ from specforge.config.draft.codec.components import (
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import FFNSpec
 from specforge.config.draft.registry import component_schema, register_component_schema
-from specforge.config.draft.rope import RopeSpec
+from specforge.config.draft.rope import DefaultRoPESpec, RopeSpec
 
 COMPONENTS = {
     "attention": {
         "type": "gqa",
+        "rope_parameters": None,
         "num_attention_heads": 8,
         "num_key_value_heads": 2,
         "head_dim": 16,
@@ -56,6 +58,21 @@ class NestedFFN(FFNSpec):
 
 
 class ComponentCodecTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(registry._SCHEMAS))
+        self.enterContext(patch.dict(registry._VALIDATORS))
+
+    def test_nested_component_must_match_its_annotated_type(self):
+        @dataclass(frozen=True, kw_only=True)
+        class NarrowFFN(FFNSpec):
+            type: ClassVar[str] = "test_narrow_ffn"
+            rope: DefaultRoPESpec
+
+        register_component_schema("mlp", NarrowFFN)
+        payload = {"type": "test_narrow_ffn", "rope": {"rope_type": "none"}}
+        with self.assertRaisesRegex(ValueError, "rope: expected DefaultRoPESpec"):
+            decode_component("mlp", payload)
+
     def test_nested_nodes_and_components_use_the_same_codec(self):
         register_component_schema("mlp", NestedFFN)
         payload = {
@@ -210,6 +227,37 @@ class ComponentCodecTest(unittest.TestCase):
             with self.subTest(schema=schema), self.assertRaisesRegex(TypeError, error):
                 register_component_schema("mlp", schema)
 
+    def test_registration_rejects_nodes_that_would_not_read_back_as_values(self):
+        @dataclass(frozen=True, kw_only=True, eq=False)
+        class IdentityEqual(FFNSpec):
+            type: ClassVar[str] = "test_identity_equal"
+            width: int
+
+        @dataclass(frozen=True, kw_only=True)
+        class Router:
+            top_k: int = 2
+
+        @dataclass(frozen=True, kw_only=True)
+        class NestedDefault(FFNSpec):
+            type: ClassVar[str] = "test_nested_default"
+            router: Router
+
+        @dataclass(frozen=True, kw_only=True)
+        class Unresolvable(FFNSpec):
+            type: ClassVar[str] = "test_unresolvable"
+            router: "MissingRouter"
+
+        for schema, error in (
+            (IdentityEqual, "compare by value"),
+            (NestedDefault, r"mlp\.router\.top_k: structural fields must have no"),
+            (Unresolvable, "unresolvable annotation"),
+        ):
+            with (
+                self.subTest(schema=schema.__name__),
+                self.assertRaisesRegex(TypeError, error),
+            ):
+                register_component_schema("mlp", schema)
+
     def test_decoding_rejects_mutable_extension_values(self):
         @dataclass(frozen=True, kw_only=True)
         class MutableValue(FFNSpec):
@@ -218,8 +266,51 @@ class ComponentCodecTest(unittest.TestCase):
 
         with patch.dict(registry._SCHEMAS):
             register_component_schema("mlp", MutableValue)
-            with self.assertRaisesRegex(ValueError, "widths"):
+            with self.assertRaisesRegex(
+                ValueError, "widths: unsupported field annotation"
+            ):
                 decode_component("mlp", {"type": "test_mutable_value", "widths": [32]})
+
+    def test_number_errors_name_the_value_received(self):
+        # PyYAML (YAML 1.1) loads `eps: 1e-6` as a string
+        with self.assertRaisesRegex(
+            ValueError, r"norm/rms\.eps: expected a number, got str '1e-6'"
+        ):
+            decode_component("norm", {"type": "rms", "eps": "1e-6", "weight_offset": 0})
+        with self.assertRaisesRegex(
+            ValueError, r"attention/gqa\.head_dim: expected int, got str '128'"
+        ):
+            decode_component(
+                "attention", {**COMPONENTS["attention"], "head_dim": "128"}
+            )
+
+    def test_derived_fields_are_not_serialized(self):
+        @dataclass(frozen=True, kw_only=True)
+        class Window:
+            size: int
+            half: int = dataclasses.field(init=False)
+
+            def __post_init__(self):
+                object.__setattr__(self, "half", self.size // 2)
+
+        @dataclass(frozen=True, kw_only=True)
+        class DerivedFFN(FFNSpec):
+            type: ClassVar[str] = "test_derived_ffn"
+            window: Window
+            width: int
+            doubled: int = dataclasses.field(init=False)
+
+            def __post_init__(self):
+                object.__setattr__(self, "doubled", 2 * self.width)
+
+        payload = {"type": "test_derived_ffn", "window": {"size": 4}, "width": 3}
+        with patch.dict(registry._SCHEMAS):
+            register_component_schema("mlp", DerivedFFN)
+            node = decode_component("mlp", payload)
+            self.assertEqual((node.doubled, node.window.half), (6, 2))
+            saved = json.loads(json.dumps(encode_component("mlp", node)))
+            self.assertEqual(saved, payload)
+            self.assertEqual(decode_component("mlp", saved), node)
 
     def test_registry_and_codec_import_without_model_dependencies(self):
         result = subprocess.run(

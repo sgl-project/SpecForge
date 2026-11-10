@@ -6,7 +6,9 @@ import subprocess
 import sys
 import unittest
 from typing import ClassVar
+from unittest.mock import patch
 
+from specforge.config.draft import registry
 from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.config.draft.registry import component_schema, register_component_schema
@@ -25,6 +27,10 @@ class CustomLogitSpec(MuPLogitTransformSpec):
 
 
 class ModelSettingsTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(registry._SCHEMAS))
+        self.enterContext(patch.dict(registry._VALIDATORS))
+
     def test_registered_logit_settings_round_trip(self):
         register_component_schema("logits", CustomLogitSpec)
         payload = {"type": "test_custom_logits", "multiplier": 3.0}

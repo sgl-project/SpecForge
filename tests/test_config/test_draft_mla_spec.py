@@ -9,6 +9,7 @@ from specforge.config.draft.codec.components import decode_component, encode_com
 
 MLA = {
     "type": "mla",
+    "rope_parameters": None,
     "num_attention_heads": 8,
     "q_lora_rank": None,
     "kv_lora_rank": 32,
@@ -83,6 +84,12 @@ class MLASpecTest(unittest.TestCase):
                 )
                 self.assertIs(node.is_causal, causal)
                 self.assertEqual(node.sliding_window, window)
+
+    def test_is_causal_is_declared_as_the_causal_capability(self):
+        for causal in (False, True):
+            node = decode_component("attention", {**MLA, "is_causal": causal})
+            self.assertIn("target_context_kv", node.capabilities())
+            self.assertIs("causal" in node.capabilities(), causal)
 
     def test_no_implicit_projection_or_rotation_defaults(self):
         for field in MLA:

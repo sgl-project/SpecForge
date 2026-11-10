@@ -13,6 +13,12 @@ class MLASpec(AttentionSpec):
 
     type: ClassVar[str] = "mla"
 
+    def capabilities(self) -> frozenset[str]:
+        flags = {"target_context_kv"}
+        if self.is_causal:
+            flags.add("causal")
+        return frozenset(flags)
+
     num_attention_heads: int
     q_lora_rank: int | None
     kv_lora_rank: int
@@ -26,6 +32,7 @@ class MLASpec(AttentionSpec):
     attention_dropout: float
 
     def __post_init__(self):
+        super().__post_init__()
         for name in (
             "num_attention_heads",
             "kv_lora_rank",
@@ -50,3 +57,7 @@ class MLASpec(AttentionSpec):
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def rotary_input_dim(self) -> int:
+        return self.qk_rope_head_dim

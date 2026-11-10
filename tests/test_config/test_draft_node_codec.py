@@ -42,6 +42,18 @@ class NodeCodecTest(unittest.TestCase):
                     "settings",
                 )
 
+    def test_mutable_nested_nodes_are_rejected(self):
+        @dataclass
+        class MutableRouter:
+            top_k: int
+
+        @dataclass(frozen=True)
+        class Settings:
+            router: MutableRouter
+
+        with self.assertRaisesRegex(ValueError, r"settings\.router: unhashable"):
+            decode_node(Settings, {"router": {"top_k": 2}}, "settings")
+
 
 if __name__ == "__main__":
     unittest.main()
