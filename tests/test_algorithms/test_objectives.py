@@ -142,6 +142,8 @@ class ObjectiveTest(unittest.TestCase):
 
         visible = dense_attention_mask(
             blocks.layer_inputs[0].attention_layout,
+            batch_size=blocks.input_ids.shape[0],
+            num_heads=1,
             is_causal=False,
             sliding_window=None,
         )[0, 0]
