@@ -39,15 +39,15 @@ class DraftPreTrainedModel(PreTrainedModel):
             raise ValueError("draft is partly on meta; materialize every tensor first")
         super().init_weights()
 
-    def _initialize_weights(self, module, is_remote_code=False):
-        # Our resets respect tensor flags and may also initialize child tensors.
-        super()._initialize_weights(module, is_remote_code=False)
+    def _initialize_weights(self, module, is_custom_code=False):
+        # HF's custom-code shortcut skips resets that initialize child tensors.
+        super()._initialize_weights(module, False)
 
     @torch.no_grad()
     def _init_weights(self, module):
         """Own basic initialization without HF family defaults or name matching.
 
-        Components with special parameters implement reset_draft_parameters().
+        Components with special parameters or buffers implement reset_draft_parameters().
         They must respect HF's initialized-tensor flags when restoring partial
         weights, for example by using transformers.initialization primitives.
         HF's module flags prevent repeated post_init from overwriting weights.
@@ -69,8 +69,11 @@ class DraftPreTrainedModel(PreTrainedModel):
                 init.ones_(module.weight)
             if module.bias is not None:
                 init.zeros_(module.bias)
-        elif module._non_persistent_buffers_set or any(
-            True for _ in module.parameters(recurse=False)
+        elif any(
+            True
+            for _ in chain(
+                module.parameters(recurse=False), module.buffers(recurse=False)
+            )
         ):
             raise TypeError(
                 f"{type(module).__name__} must define reset_draft_parameters"

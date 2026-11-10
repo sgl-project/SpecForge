@@ -64,9 +64,13 @@ class ComponentBuilderTest(unittest.TestCase):
 
     def test_standard_residual_connections_are_independent_and_preserve_gradients(self):
         residual = build_component("residual", StandardResidualSpec())
-        attention = residual.build_connection(hidden_size=4)
-        ffn = residual.build_connection(hidden_size=4)
+        attention = residual.build_connection(
+            hidden_size=4, layer_index=0, sublayer="attention"
+        )
+        ffn = residual.build_connection(hidden_size=4, layer_index=0, sublayer="mlp")
         self.assertIsNot(attention, ffn)
+        self.assertIs(attention.config, residual.config)
+        self.assertIs(ffn.config, residual.config)
         self.assertEqual(list(residual.children()), [])
         self.assertEqual(attention.state_dict(), {})
         hidden = torch.randn(2, 3, 4, requires_grad=True)
@@ -74,6 +78,8 @@ class ComponentBuilderTest(unittest.TestCase):
         expected = hidden + sublayer(hidden)
         actual = attention(hidden, sublayer)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "input shape"):
+            attention(hidden, lambda x: x[:, :1])
         tensors = (hidden, *sublayer.parameters())
         torch.testing.assert_close(
             torch.autograd.grad(actual.sum(), tensors),

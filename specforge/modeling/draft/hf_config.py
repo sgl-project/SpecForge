@@ -131,6 +131,7 @@ class SpecForgeDraftConfig(PreTrainedConfig):
             key: value
             for key, value in super().to_dict().items()
             if key in _METADATA
+            and key != "_name_or_path"
             and (
                 key in {"transformers_version", "auto_map"}
                 or value != defaults.get(key)
