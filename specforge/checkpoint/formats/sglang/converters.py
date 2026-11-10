@@ -37,6 +37,7 @@ def common(config, *, eagle=False, native=False):
     require(
         type(config.norm_config) is RMSNormSpec, f"norm kind {config.norm_config.type}"
     )
+    require(config.norm_config.has_weight, "weightless RMSNorm is unsupported")
     require(
         not config.tie_word_embeddings, "tied draft token tables are not representable"
     )
@@ -122,6 +123,15 @@ def common(config, *, eagle=False, native=False):
     )
     if isinstance(a, GQASpec):
         require(a.qk_norm == (not eagle), "qk_norm differs from serving implementation")
+        if a.qk_norm:
+            require(
+                a.qk_norm_position == "before_rope" and a.qk_norm_scope == "head",
+                "QK normalization must be per-head and before RoPE",
+            )
+            require(
+                (a.qk_norm_config or config.norm_config) == config.norm_config,
+                "QK normalization must use the model's weighted RMSNorm settings",
+            )
         require(native or not a.output_gate, "attention output_gate is unsupported")
         require(
             not eagle or (a.is_causal and not windows and not a.attention_bias),

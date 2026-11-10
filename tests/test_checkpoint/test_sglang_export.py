@@ -147,6 +147,30 @@ class SGLangExportTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "no serving implementation"):
                     convert_config(config)
 
+    def test_qk_norm_serving_boundary(self):
+        for config in serving_configs():
+            for changes in (
+                {"qk_norm_position": "after_rope"},
+                {"qk_norm_scope": "projection"},
+                {"qk_norm_config": replace(config.norm_config, has_weight=False)},
+            ):
+                attentions = {
+                    name: replace(node, qk_norm=True, **changes)
+                    for name, node in config.attention_configs.items()
+                }
+                with (
+                    self.subTest(architecture=config.architecture, changes=changes),
+                    self.assertRaisesRegex(ValueError, "qk_norm|QK normalization"),
+                ):
+                    convert_config(replace(config, attention_configs=attentions))
+            with self.assertRaisesRegex(ValueError, "weightless"):
+                convert_config(
+                    replace(
+                        config,
+                        norm_config=replace(config.norm_config, has_weight=False),
+                    )
+                )
+
     def test_native_merge_rewrites_stale_shards_and_preserves_target(self):
         config = replace(
             mtp_config(),
