@@ -82,6 +82,7 @@ class UnusedCacheWorkTests(unittest.TestCase):
         sample = controller.submit(plan, span).result(5)
         self.assertTrue(torch.equal(sample.features["aux"], features["aux"]))
         self.assertEqual(controller.stats()["output_bytes"], n * schema().row_bytes)
+        self.last_timings = dict(sample.timings)
         sample.release()
         sample.release()
         controller.poll_completed()
@@ -110,6 +111,21 @@ class UnusedCacheWorkTests(unittest.TestCase):
         with self.assertRaises(CaptureContractError):
             cache._validate_plan_lease(lease, 4, "ns", (99,) + tuple(range(1, 8)))
         cache.release_lease(lease)
+
+    def test_diagnostics_are_opt_in_and_describe_cpu_copy_without_changing_output(self):
+        for enabled in (False, True):
+            with mock.patch.dict("os.environ", {"SPECFORGE_HS_DIAGNOSTICS": str(int(enabled))}):
+                self.capture(self.cache(0))
+            timings = self.last_timings
+            if enabled:
+                self.assertLessEqual(timings["p0_v1_materialize_submitted_ns"], timings["p0_v1_materialize_started_ns"])
+                self.assertLessEqual(timings["p0_v1_materialize_started_ns"], timings["p0_v1_materialize_done_ns"])
+                self.assertEqual(timings["p0_v1_d2h_bytes"], 0)
+                self.assertEqual(timings["p0_v1_prefix_copy_bytes"], 0)
+                self.assertEqual(timings["p0_v1_suffix_copy_bytes"], 8 * schema().row_bytes)
+                self.assertGreaterEqual(timings["p0_v1_suffix_copy_ms"], 0)
+            else:
+                self.assertFalse(any(key.startswith("p0_") for key in timings))
 
     def test_rollback_flag_preserves_legacy_hash_and_adoption_work(self):
         cache = self.cache(0, enabled=False)

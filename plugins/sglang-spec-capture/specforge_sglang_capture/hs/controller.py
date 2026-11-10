@@ -6,11 +6,13 @@ Workers never touch a Req, execute a collective, or release sink-owned output.
 
 from __future__ import annotations
 
+import os
+import resource
 import threading
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from time import perf_counter
+from time import monotonic_ns, perf_counter
 from dataclasses import dataclass, field
 
 import torch
@@ -60,6 +62,7 @@ class _Job:
     is_cuda: bool
     state: _Execution
     future: Future
+    diagnostics: dict[str, int | float] = field(default_factory=dict)
 
 
 class _UnsafeDrain(RuntimeError):
@@ -79,6 +82,7 @@ class CaptureController:
         if not isinstance(cache, PrefixFeatureCache) or schema != cache.schema:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
+        self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._limits = {
             "pinned": checked_int(pinned_budget_bytes, "pinned_budget_bytes"),
             "output": checked_int(output_budget_bytes, "output_budget_bytes"),
@@ -371,6 +375,8 @@ class CaptureController:
             # Future.cancel() cannot cancel the cleanup worker and strand storage.
             future.set_running_or_notify_cancel()
             job = _Job(plan, features, span.ready_event, is_cuda, state, future)
+            if self._diagnostics:
+                job.diagnostics["p0_v1_materialize_submitted_ns"] = monotonic_ns()
             try:
                 self._executor.submit(self._run_job, job)
             except BaseException:
@@ -389,7 +395,10 @@ class CaptureController:
         if not job.is_cuda:
             if job.ready_event is not None:
                 try:
+                    ready_started = monotonic_ns() if self._diagnostics else 0
                     job.ready_event.synchronize()
+                    if self._diagnostics:
+                        job.diagnostics["p0_v1_producer_ready_wait_ms"] = (monotonic_ns() - ready_started) / 1e6
                 except BaseException as exc:
                     raise _UnsafeDrain(exc, [job.ready_event]) from exc
             return {} if self._cancelled(job) else dict(job.features)
@@ -411,15 +420,31 @@ class CaptureController:
                     raise CaptureContractError("pinned arena quarantined after unproven DMA drain")
                 stream = torch.cuda.Stream(device=device)
                 with torch.cuda.stream(stream):
+                    if self._diagnostics:
+                        waiting = torch.cuda.Event(enable_timing=True)
+                        ready = torch.cuda.Event(enable_timing=True)
+                        copy_start = torch.cuda.Event(enable_timing=True)
+                        waiting.record(stream)
                     stream.wait_event(job.ready_event)
+                    if self._diagnostics:
+                        ready.record(stream)
+                        alloc_started = monotonic_ns()
                     staging = self._staging_views(job.plan.N - job.plan.L, job.plan.reservation)
+                    if self._diagnostics:
+                        job.diagnostics["p0_v1_staging_alloc_ms"] = (monotonic_ns() - alloc_started) / 1e6
+                        copy_start.record(stream)
                     for name, source in job.features.items():
                         target = staging[name]
                         target.copy_(source, non_blocking=True)
                         source.record_stream(stream)
-                    copied = torch.cuda.Event()
+                    copied = torch.cuda.Event(enable_timing=True) if self._diagnostics else torch.cuda.Event()
                     copied.record(stream)
                 copied.synchronize()
+                if self._diagnostics:
+                    # Read events only after the existing real copy drain. No
+                    # timing-only synchronization is introduced on the hot path.
+                    job.diagnostics["p0_v1_producer_ready_wait_ms"] = waiting.elapsed_time(ready)
+                    job.diagnostics["p0_v1_d2h_copy_ms"] = copy_start.elapsed_time(copied)
                 return staging
         except BaseException as exc:
             drain_errors = []
@@ -459,6 +484,11 @@ class CaptureController:
         completion = None
         unsafe = False
         try:
+            if self._diagnostics:
+                started_ns = monotonic_ns()
+                job.diagnostics["p0_v1_materialize_started_ns"] = started_ns
+                job.diagnostics["p0_v1_d2h_queue_ms"] = (started_ns - job.diagnostics["p0_v1_materialize_submitted_ns"]) / 1e6
+                job.diagnostics["p0_v1_d2h_bytes"] = (job.plan.N - job.plan.L) * self.schema.row_bytes if job.is_cuda else 0
             copy_started = perf_counter()
             staging = self._copy_suffix(job)
             copied_at = perf_counter()
@@ -467,14 +497,32 @@ class CaptureController:
             if self._cancelled(job):
                 raise CaptureCancelledError(job.state.reason or "execution released")
             with torch.no_grad():
+                if self._diagnostics:
+                    alloc_started = monotonic_ns()
+                    faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 for spec in self.schema.features:
                     output[spec.name] = torch.empty((job.plan.N, spec.width), dtype=DTYPES[spec.dtype], device="cpu")
+                if self._diagnostics:
+                    prefix_started = monotonic_ns()
+                    job.diagnostics["p0_v1_output_alloc_ms"] = (prefix_started - alloc_started) / 1e6
+                    job.diagnostics["p0_v1_output_alloc_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
+                    faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 try:
                     self.cache.copy_prefix_into(job.plan.lease, job.plan.L, output)
                 finally:
                     self.cache.release_lease(job.plan.lease)
+                if self._diagnostics:
+                    suffix_started = monotonic_ns()
+                    job.diagnostics["p0_v1_prefix_copy_ms"] = (suffix_started - prefix_started) / 1e6
+                    job.diagnostics["p0_v1_prefix_copy_bytes"] = job.plan.L * self.schema.row_bytes
+                    job.diagnostics["p0_v1_prefix_copy_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
+                    faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 for name in output:
                     output[name][job.plan.L:job.plan.N].copy_(staging[name])
+                if self._diagnostics:
+                    job.diagnostics["p0_v1_suffix_copy_ms"] = (monotonic_ns() - suffix_started) / 1e6
+                    job.diagnostics["p0_v1_suffix_copy_bytes"] = (job.plan.N - job.plan.L) * self.schema.row_bytes
+                    job.diagnostics["p0_v1_suffix_copy_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
             staging.clear()
             with self._lock:
                 self._release_transient_locked(self._reservation(job.plan.reservation))
@@ -484,8 +532,14 @@ class CaptureController:
             assembled_at = perf_counter()
             cache_keys = self._prepare_cache_adoption(job)
             filled_at = perf_counter()
+            if self._diagnostics:
+                job.diagnostics["p0_v1_key_prepare_ms"] = (filled_at - assembled_at) * 1000.0
+                # Assembly and key preparation are complete. Sample/completion
+                # bookkeeping and future delivery follow on this same worker.
+                job.diagnostics["p0_v1_materialize_done_ns"] = monotonic_ns()
             sample = MaterializedSample(job.plan.execution, output, job.plan.N,
                         lambda: self._sample_released(job.plan.reservation), timings={
+                            **job.diagnostics,
                             "d2h_wait_ms": (copied_at - copy_started) * 1000.0,
                             "assembly_ms": (assembled_at - copied_at) * 1000.0,
                             "cache_fill_ms": (filled_at - assembled_at) * 1000.0,
