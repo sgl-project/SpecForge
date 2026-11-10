@@ -157,8 +157,10 @@ class AttentionLayout:
                 if is_causal:
                     allowed = allowed & (qp >= kp)
                 if sliding_window is not None:
+                    # compare distances, not shifted positions: q +/- window can overflow
+                    distance = qp - kp
                     allowed = allowed & (
-                        (kp > qp - sliding_window) & (kp < qp + sliding_window)
+                        (distance < sliding_window) & (distance > -sliding_window)
                     )
             return valid & allowed
 
@@ -185,8 +187,9 @@ def dense_attention_mask(
         if is_causal:
             allowed = allowed & (q >= k).unsqueeze(1)
         if sliding_window is not None:
+            distance = q - k
             allowed = allowed & (
-                (k > q - sliding_window) & (k < q + sliding_window)
+                (distance < sliding_window) & (distance > -sliding_window)
             ).unsqueeze(1)
         if layout.active_queries is not None:
             allowed = allowed & layout.active_queries[:, None, :, None]
