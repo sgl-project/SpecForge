@@ -461,6 +461,32 @@ class TestMooncakeFeatureStore(unittest.TestCase):
             fs.get(ref)
         self.assertEqual(fs.health()["resident_samples"], 0)
 
+    def test_failed_put_rolls_back_partial_keys(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        prior = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        original_put = fake.put_from
+        calls = 0
+
+        def fail_second(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return -1
+            return original_put(*args)
+
+        fake.fail_remove = True  # the immediate rollback cannot remove the key
+        with mock.patch.object(fake, "put_from", side_effect=fail_second):
+            with self.assertRaises(RuntimeError):
+                fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        self.assertEqual(fs.health()["release_pending"], 1)
+        fake.fail_remove = False
+        self.assertEqual(fs.gc()["release_pending"], 0)
+        # Only the prior generation is left, and it is still readable.
+        self.assertTrue(all("/g1/" in key for key in fake._d))
+        self.assertEqual(len(fake._d), len(prior.feature_keys))
+        self.assertIn("hidden_state", fs.get(prior)[0])
+
     def test_stale_generation_rejected_after_reput(self):
         fs = _store()
         ref1 = fs.put(_tensors(), sample_id="s0", metadata=_meta())

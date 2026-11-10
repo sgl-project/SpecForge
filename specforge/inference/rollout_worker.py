@@ -224,8 +224,7 @@ class RolloutWorker:
                     sample_id=sample_id,
                     metadata=self._put_metadata(task),
                 )
-            except Exception as exc:  # partial write -> abort, report
-                self.feature_store.abort(sample_id, reason=f"put_failed:{exc}")
+            except Exception as exc:  # partial write -> put() owns cleanup, report
                 self.controller.fail_prompt_tasks(
                     self.worker_id,
                     [task.task_id],
