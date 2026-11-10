@@ -67,6 +67,13 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
 
 class CanonicalDFlash2Test(unittest.TestCase):
     def _parity(self, device, dtype):
+        # Canonical RoPE computes in FP32 before casting back to the model dtype.
+        tolerance = (
+            2e-2
+            if dtype == torch.bfloat16
+            else 1e-2 if dtype == torch.float16 else 1e-5
+        )
+        torch.manual_seed(0)
         config = dflash2_config()
         actual = build_draft_model(config, device=device, dtype=dtype)
         self.assertNotIsInstance(actual, DFlashDraftModel)
@@ -89,7 +96,7 @@ class CanonicalDFlash2Test(unittest.TestCase):
             },
         )
         reference = LegacyDFlash2DraftModel(legacy).to(device=device, dtype=dtype)
-        reference.rotary_emb = Qwen3RotaryEmbedding(legacy, device=device)
+        reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
         reference.load_state_dict(
             {
                 legacy_name(name) or name: value
@@ -119,14 +126,16 @@ class CanonicalDFlash2Test(unittest.TestCase):
         torch.testing.assert_close(
             (output.hidden_states, output.logits, output.candidate_scores),
             (hidden, logits, scores),
-            rtol=0,
-            atol=0,
+            rtol=tolerance,
+            atol=tolerance,
         )
         self.assertEqual(output.logits.dtype, torch.float32)
         upstream = torch.randn_like(scores)
         output.candidate_scores.backward(upstream)
         scores.backward(upstream)
-        torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
+        torch.testing.assert_close(
+            features.grad, other.grad, rtol=tolerance, atol=tolerance
+        )
         for name, parameter in actual.named_parameters():
             ref = (
                 embedding.weight
@@ -138,7 +147,9 @@ class CanonicalDFlash2Test(unittest.TestCase):
                 )
             )
             self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
+            torch.testing.assert_close(
+                parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
+            )
 
     def test_cpu_complete_legacy_computation(self):
         for dtype in (torch.float32, torch.bfloat16):

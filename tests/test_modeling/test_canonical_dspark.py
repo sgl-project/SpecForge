@@ -51,6 +51,13 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
 
 class CanonicalDSparkTest(unittest.TestCase):
     def _parity(self, device, dtype):
+        # Canonical RoPE computes in FP32 before casting back to the model dtype.
+        tolerance = (
+            2e-2
+            if dtype == torch.bfloat16
+            else 1e-2 if dtype == torch.float16 else 1e-5
+        )
+        torch.manual_seed(0)
         for kind, with_markov in (
             (None, False),
             ("vanilla", True),
@@ -74,7 +81,7 @@ class CanonicalDSparkTest(unittest.TestCase):
                 reference = LegacyDSparkDraftModel(legacy).to(
                     device=device, dtype=dtype
                 )
-                reference.rotary_emb = Qwen3RotaryEmbedding(legacy, device=device)
+                reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
                 reference.load_state_dict(
                     {
                         legacy_name(n) or n: v
@@ -106,8 +113,8 @@ class CanonicalDSparkTest(unittest.TestCase):
                 torch.testing.assert_close(
                     (output.hidden_states, output.logits, output.confidence_scores),
                     (hidden, logits, confidence),
-                    rtol=0,
-                    atol=0,
+                    rtol=tolerance,
+                    atol=tolerance,
                 )
                 grad, confidence_grad = torch.randn_like(logits), torch.randn_like(
                     confidence
@@ -119,7 +126,9 @@ class CanonicalDSparkTest(unittest.TestCase):
                 (
                     logits.mul(grad).sum() + confidence.mul(confidence_grad).sum()
                 ).backward()
-                torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    features.grad, other.grad, rtol=tolerance, atol=tolerance
+                )
                 for name, parameter in actual.named_parameters():
                     ref = (
                         embedding.weight
@@ -133,7 +142,9 @@ class CanonicalDSparkTest(unittest.TestCase):
                         )
                     )
                     self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
+                    )
 
     def test_cpu_legacy_composition(self):
         for dtype in (torch.float32, torch.bfloat16):

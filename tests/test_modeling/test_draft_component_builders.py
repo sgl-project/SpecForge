@@ -150,6 +150,7 @@ class ComponentBuilderTest(unittest.TestCase):
                         "norm",
                         "rope",
                         "backend",
+                        "training",
                         "device",
                         "dtype",
                     },
