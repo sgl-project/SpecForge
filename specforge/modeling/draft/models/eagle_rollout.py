@@ -7,13 +7,11 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from specforge.modeling.draft.layers.attention.backends import (
-    attention_backend,
-    execute_attention,
+    AttentionBackend,
+    AttentionPreparationScope,
+    resolve_attention_backend,
 )
-from specforge.modeling.draft.layers.attention.masks import (
-    AttentionLayout,
-    prepare_attention_mask,
-)
+from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.rope import apply_rotary
 
 
@@ -111,7 +109,7 @@ class EagleRollout:
 class EagleCachedStep:
     """Immutable inputs for one recurrent stage, including its previous cache."""
 
-    backend: str
+    backend: str | AttentionBackend
     padding: torch.Tensor
     positions: torch.Tensor
     keys: tuple
@@ -194,24 +192,24 @@ class EagleCachedStep:
                 active_queries=torch.arange(length, device=padding.device)[None]
                 < valid_length[:, None],
             )
-            mask = prepare_attention_mask(
-                layout,
-                is_causal=node.is_causal,
-                sliding_window=node.sliding_window,
-                backend=self.backend,
-                batch_size=batch,
-                num_heads=node.num_attention_heads,
-            )
-            output, active = execute_attention(
-                attention_backend(self.backend),
+            with AttentionPreparationScope() as scope:
+                prepared = scope.prepare(
+                    resolve_attention_backend(self.backend),
+                    layout,
+                    batch_size=batch,
+                    num_heads=node.num_attention_heads,
+                    is_causal=node.is_causal,
+                    sliding_window=node.sliding_window,
+                )
+            result = prepared.attend(
                 query,
                 torch.cat(all_keys, 2),
                 torch.cat(all_values, 2),
-                attention_mask=mask,
                 scale=node.head_dim**-0.5,
                 dropout_p=node.attention_dropout,
                 training=stage.training,
             )
+            output, active = result.output, result.active_queries
         output = attention.project_output(output, gate, active)
         residual = (
             stage.hidden_norm(features) if stage.norm_before_residual else features
