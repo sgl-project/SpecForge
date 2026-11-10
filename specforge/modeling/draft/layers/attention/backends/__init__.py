@@ -3,7 +3,7 @@
 from ..masks import PaddingMask
 from .base import (
     AttentionBackend,
-    AttentionPreparation,
+    AttentionPreparationScope,
     AttentionResult,
     PreparedAttention,
 )
@@ -15,14 +15,16 @@ from .flex import FlexAttentionBackend
 _BACKENDS = {
     "eager": EagerAttentionBackend(),
     "sdpa": SDPAAttentionBackend(),
-    "flex": FlexAttentionBackend(),
-    "flash_attention_2": FlashAttentionBackend(),
+    "flex_attention": FlexAttentionBackend(),
+    "fa": FlashAttentionBackend(),
 }
 
 
 def resolve_attention_backend(backend: str | AttentionBackend) -> AttentionBackend:
     if isinstance(backend, AttentionBackend):
         return backend
+    if backend == "usp":
+        raise NotImplementedError("USP is not implemented for canonical attention")
     if not isinstance(backend, str) or backend not in _BACKENDS:
         raise ValueError(f"unsupported attention backend {backend!r}")
     return _BACKENDS[backend]
@@ -30,7 +32,7 @@ def resolve_attention_backend(backend: str | AttentionBackend) -> AttentionBacke
 
 __all__ = [
     "AttentionBackend",
-    "AttentionPreparation",
+    "AttentionPreparationScope",
     "AttentionResult",
     "PreparedAttention",
     "EagerAttentionBackend",

@@ -49,18 +49,38 @@ def _rope(payload):
     )
 
 
-def decode_peagle(payload, *, target_config, capture_layers=None):
+def decode_peagle(
+    payload,
+    *,
+    target_config,
+    mask_token_id,
+    capture_layers=None,
+    norm_before_residual=None,
+):
     _check_fields(payload, _FIELDS | {"norm_before_residual"}, "legacy P-EAGLE")
+    if mask_token_id is None:
+        raise ValueError(
+            "legacy P-EAGLE requires mask_token_id from peagle_mask_token_id "
+            "in the checkpoint resume contract"
+        )
     fields, features = read_auxiliary(
         payload, target_config, capture_layers=capture_layers
     )
-    norm_before = payload.get("norm_before_residual")
+    recorded = (
+        {}
+        if norm_before_residual is None
+        else {"norm_before_residual": norm_before_residual}
+    )
+    norm_before = resolve_alias(
+        "norm_before_residual", payload, recorded, default=False, ignore_none=True
+    )
     config = DraftConfig(
         architecture="PEagleDraftModel",
         rope_parameters=_rope(payload),
         spec_config=PEagleSpec(
             target_features=features,
-            norm_before_residual=False if norm_before is None else norm_before,
+            norm_before_residual=norm_before,
+            mask_token_id=mask_token_id,
             pad_token_id=payload.get("pad_token_id"),
         ),
         **fields,

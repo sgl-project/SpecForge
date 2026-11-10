@@ -26,10 +26,32 @@ class OffsetNorm(nn.Module):
         init.zeros_(self.weight)
 
 
+class BufferScale(nn.Module):
+    def __init__(self, *, persistent=False):
+        super().__init__()
+        self.register_buffer("scale", torch.empty(4), persistent=persistent)
+
+    def reset_draft_parameters(self):
+        init.constant_(self.scale, 2)
+
+
+class ZeroProjection(nn.Module):
+    def __init__(self, width, own_parameter=False):
+        super().__init__()
+        if own_parameter:
+            self.gate = nn.Parameter(torch.empty(1))
+        self.proj = nn.Linear(width, width, bias=False)
+
+    def reset_draft_parameters(self):
+        if hasattr(self, "gate"):
+            init.ones_(self.gate)
+        init.zeros_(self.proj.weight)
+
+
 class DFlashDraftModel(DraftPreTrainedModel):
     """Small test model; the production DFlash implementation is unchanged."""
 
-    def __init__(self, config):
+    def __init__(self, config, device=None):
         super().__init__(config)
         draft = config.draft
         self.embed_tokens = nn.Embedding(
@@ -43,10 +65,16 @@ class DFlashDraftModel(DraftPreTrainedModel):
             rotary=[TestRotary(0.5) for _ in draft.layer_types],
             residual=StandardResidual(draft.residual_config),
         )
+        self.scale = BufferScale()
+        self.saved_scale = BufferScale(persistent=True)
+        self.zero_projection = ZeroProjection(draft.hidden_size)
+        self.gated_projection = ZeroProjection(draft.hidden_size, own_parameter=True)
+        if device is not None:
+            self.to(device)
         self.post_init()
 
     def forward(self, hidden, layer_inputs):
-        return self.backbone(hidden, layer_inputs)
+        return self.backbone(hidden, layer_inputs) * self.scale.scale.mean()
 
 
 def model_config(**changes):
@@ -67,6 +95,56 @@ def model_inputs(model):
 
 
 class DraftPreTrainedTest(unittest.TestCase):
+    def test_buffer_only_modules_require_reset(self):
+        model = DFlashDraftModel(model_config())
+        for persistent in (False, True):
+            module = nn.Module()
+            module.register_buffer("inv_freq", torch.empty(4), persistent=persistent)
+            with (
+                self.subTest(persistent=persistent),
+                self.assertRaisesRegex(TypeError, "reset_draft_parameters"),
+            ):
+                model._init_weights(module)
+
+    def test_parent_resets_run_on_fresh_and_partial_load(self):
+        model = DFlashDraftModel(model_config())
+        for parent in (model.zero_projection, model.gated_projection):
+            torch.testing.assert_close(
+                parent.proj.weight, torch.zeros_like(parent.proj.weight)
+            )
+        with torch.no_grad():
+            model.gated_projection.gate.fill_(7)
+        state = {
+            key: value
+            for key, value in model.state_dict().items()
+            if not key.endswith("projection.proj.weight") and key != "saved_scale.scale"
+        }
+        with TemporaryDirectory() as directory:
+            model.save_pretrained(directory, state_dict=state)
+            restored = DFlashDraftModel.from_pretrained(directory)
+        torch.testing.assert_close(
+            restored.gated_projection.gate, model.gated_projection.gate
+        )
+        torch.testing.assert_close(restored.saved_scale.scale, torch.full((4,), 2.0))
+        for parent in (restored.zero_projection, restored.gated_projection):
+            torch.testing.assert_close(
+                parent.proj.weight, torch.zeros_like(parent.proj.weight)
+            )
+
+    def test_explicit_meta_build_initializes_after_materialization(self):
+        model = DFlashDraftModel(model_config(initializer_range=0), device="meta")
+        self.assertFalse(getattr(model, "_is_hf_initialized", False))
+        model.to_empty(device="cpu")
+        model.init_weights()
+        torch.testing.assert_close(
+            model.embed_tokens.weight, torch.zeros_like(model.embed_tokens.weight)
+        )
+        torch.testing.assert_close(model.scale.scale, torch.full((4,), 2.0))
+        torch.testing.assert_close(model.saved_scale.scale, torch.full((4,), 2.0))
+        model.zero_projection.to("meta")
+        with self.assertRaisesRegex(ValueError, "partly on meta"):
+            model.init_weights()
+
     def test_generic_base_uses_golden_initialization_and_is_not_a_serving_backend(self):
         config = model_config(initializer_range=0)
         before = hash(config.draft)
@@ -144,6 +222,11 @@ class DraftPreTrainedTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             restored = DFlashDraftModel.from_pretrained(directory).eval()
+        torch.testing.assert_close(
+            restored.scale.scale, model.scale.scale, rtol=0, atol=0
+        )
+        self.assertEqual(restored.config, config)
+        self.assertNotIn("_name_or_path", restored.config.to_dict())
         self.assertEqual(restored.config.draft, config.draft)
         self.assertEqual(restored.config.auto_map, config.auto_map)
         torch.testing.assert_close(

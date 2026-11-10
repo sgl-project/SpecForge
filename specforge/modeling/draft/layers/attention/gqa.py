@@ -3,7 +3,7 @@
 import torch
 from torch import Tensor, nn
 
-from specforge.config.draft._validation import positive_int
+from specforge.config.draft._validation import boolean, positive_int
 from specforge.config.draft.attention import GQASpec, MHASpec
 from specforge.config.draft.norm import NormSpec
 from specforge.config.draft.rope import RopeSpec
@@ -12,12 +12,12 @@ from ..registry import build_component, register_component_builder
 from ..rope import apply_rotary
 from .backends import (
     AttentionBackend,
-    AttentionPreparation,
+    AttentionPreparationScope,
     PreparedAttention,
     resolve_attention_backend,
 )
 from .masks import AttentionLayout
-from .validation import validate_hidden, validate_rotary
+from .validation import validate_attention_inputs
 
 
 class GQAAttention(nn.Module):
@@ -30,6 +30,7 @@ class GQAAttention(nn.Module):
         norm: NormSpec,
         rope: RopeSpec,
         backend: str | AttentionBackend,
+        training: bool = True,
         device=None,
         dtype=None,
     ):
@@ -44,9 +45,10 @@ class GQAAttention(nn.Module):
             raise TypeError("rope must be the resolved RopeSpec")
         if config.rope_parameters is not None and rope != config.rope_parameters:
             raise ValueError("rope must match the attention RoPE override")
-        rotary_dim = rope.rotary_dim(config.head_dim)
+        rotary_dim = rope.rotary_dim(config.rotary_input_dim)
         self.backend = resolve_attention_backend(backend)
         self.config = config
+        self.train(training)  # Validate the backend before allocating parameters.
         self.rotary_dim = rotary_dim
         self.rope = rope
         norm = config.qk_norm_config or norm
@@ -89,6 +91,16 @@ class GQAAttention(nn.Module):
         self.k_proj = nn.Linear(input_size, kv_width, **options)
         self.v_proj = nn.Linear(input_size, kv_width, **options)
         self.o_proj = nn.Linear(q_width, hidden_size, **options)
+        self.train(training)
+
+    def train(self, mode: bool = True):
+        boolean("training", mode)
+        self.backend.validate(
+            head_dim=self.config.head_dim,
+            value_head_dim=self.config.head_dim,
+            dropout_p=self.config.attention_dropout if mode else 0.0,
+        )
+        return super().train(mode)
 
     def _normalize(self, hidden: Tensor, norm: nn.Module) -> Tensor:
         if self.config.qk_norm_scope == "projection":
@@ -103,7 +115,7 @@ class GQAAttention(nn.Module):
     def prepare(
         self,
         layout: AttentionLayout,
-        preparation: AttentionPreparation,
+        preparation: AttentionPreparationScope,
         *,
         batch_size: int,
     ) -> PreparedAttention:
@@ -133,27 +145,17 @@ class GQAAttention(nn.Module):
         this component. rotary_dim=0 requires position_embeddings=None. Supplied
         cosine/sine tables must be FP32; rotation casts back to the projected Q/K dtype.
         """
-        batch, length, context_length = validate_hidden(
-            hidden, target_context, self.q_proj.in_features
+        batch, length, context_length = validate_attention_inputs(
+            hidden,
+            attention,
+            position_embeddings,
+            target_context,
+            input_size=self.q_proj.in_features,
+            config=self.config,
+            backend=self.backend,
+            rotary_dim=self.rotary_dim,
         )
         keys = context_length + length
-        if not isinstance(attention, PreparedAttention):
-            raise TypeError("GQAAttention requires PreparedAttention")
-        layout = attention.layout
-        if (
-            attention.batch_size != batch
-            or attention.num_heads != self.config.num_attention_heads
-            or attention.backend is not self.backend
-            or attention.is_causal != self.config.is_causal
-            or attention.sliding_window != self.config.sliding_window
-            or layout.query_positions.shape[1] != length
-            or layout.key_positions.shape[1] != keys
-            or layout.query_positions.device != hidden.device
-        ):
-            raise ValueError(
-                "prepared attention must match the layer and query/KV tensors"
-            )
-        validate_rotary(position_embeddings, hidden, keys, self.rotary_dim)
         node = self.config
         query = self.q_proj(hidden).view(
             batch,

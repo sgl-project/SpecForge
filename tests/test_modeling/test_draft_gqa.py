@@ -17,7 +17,7 @@ from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.dflash import Qwen3DFlashAttention
 from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import GQAAttention, build_component
-from specforge.modeling.draft.layers.attention.backends import AttentionPreparation
+from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     dense_attention_mask,
@@ -63,7 +63,7 @@ def build(node, *, input_size=16, rotary_dim=8, offset=0, rope=None, **options):
                 )
             )
         ),
-        backend="eager",
+        backend=options.pop("backend", "eager"),
         **options,
     )
 
@@ -81,11 +81,30 @@ def layout_for(hidden, context_length=0):
 
 
 def prepared(module, layout, batch_size):
-    with AttentionPreparation() as preparation:
+    with AttentionPreparationScope() as preparation:
         return module.prepare(layout, preparation, batch_size=batch_size)
 
 
 class GQATest(unittest.TestCase):
+    def test_backend_limits_fail_before_allocation(self):
+        for backend, node, message in (
+            ("flex_attention", make_node(attention_dropout=0.1), "dropout"),
+            ("fa", make_node(head_dim=264), "head dimensions"),
+        ):
+            with (
+                patch("torch.nn.Linear") as allocate,
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                build(node, backend=backend, rotary_dim=0)
+            allocate.assert_not_called()
+        build(make_node(head_dim=256), backend="fa", rotary_dim=0)
+        build(make_node(attention_dropout=0), backend="flex_attention")
+        module = build(make_node(), backend="flex_attention", training=False)
+        self.assertTrue(all(not child.training for child in module.modules()))
+        with self.assertRaisesRegex(ValueError, "dropout"):
+            module.train()
+        self.assertFalse(module.training)
+
     def _assert_parity(self, device, dtypes, autocast=False):
         for kind in ("qwen3", "gated", "wide", "context", "mha"):
             gated, wide = kind == "gated", kind == "wide"

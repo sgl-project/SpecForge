@@ -1,5 +1,7 @@
 """Select temporal/height/width rotary sections before attention sees them."""
 
+from contextlib import nullcontext
+
 import torch
 from torch import Tensor
 
@@ -28,20 +30,31 @@ class MultiAxisRotaryEmbedding(RotaryEmbedding):
             raise ValueError(
                 "multi-axis position_ids must have shape [3, batch, sequence] or [batch, sequence]"
             )
-        with torch.autocast(device_type=hidden.device.type, enabled=False):
+        with (
+            nullcontext()
+            if hidden.is_meta
+            else torch.autocast(device_type=hidden.device.type, enabled=False)
+        ):
             frequencies = self.frequencies(hidden.device)
             positions = position_ids.to(device=hidden.device, dtype=torch.float32)
-            # Each section counts frequency pairs. Select one axis per section,
-            # then duplicate the selected phases for the rotate-half convention.
-            freqs = torch.cat(
-                [
-                    positions[axis].unsqueeze(-1) * section
-                    for axis, section in enumerate(
-                        frequencies.split(self.config.mrope_section)
-                    )
-                ],
-                dim=-1,
-            )
+            if self.config.mrope_interleaved:
+                # SGLang's interleaved layout defaults to T, with H/W at 1::3/2::3.
+                axes = torch.zeros(
+                    frequencies.numel(), dtype=torch.long, device=hidden.device
+                )
+                for axis in (1, 2):
+                    axes[axis : 3 * self.config.mrope_section[axis] : 3] = axis
+                freqs = positions[axes].permute(1, 2, 0) * frequencies
+            else:
+                freqs = torch.cat(
+                    [
+                        positions[axis].unsqueeze(-1) * section
+                        for axis, section in enumerate(
+                            frequencies.split(self.config.mrope_section)
+                        )
+                    ],
+                    dim=-1,
+                )
             cos, sin = self._cos_sin(torch.cat((freqs, freqs), dim=-1))
             return cos, sin
 

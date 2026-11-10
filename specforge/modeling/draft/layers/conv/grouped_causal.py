@@ -11,6 +11,11 @@ from specforge.config.draft.conv import GroupedCausalConvSpec
 from ..registry import register_component_builder
 
 
+class _KernelProjection(nn.Linear):
+    def reset_draft_parameters(self):
+        init.zeros_(self.weight)
+
+
 class GroupedCausalConv(nn.Module):
     """An input/output convolution pair with kernels derived from the input.
 
@@ -50,7 +55,7 @@ class GroupedCausalConv(nn.Module):
         self.base_kernel = nn.Parameter(
             torch.empty(2, config.kernel_size, hidden_size, device=device, dtype=dtype)
         )
-        self.kernel_projection = nn.Linear(
+        self.kernel_projection = _KernelProjection(
             hidden_size,
             2 * config.kernel_size * self.num_groups,
             bias=False,
@@ -65,7 +70,7 @@ class GroupedCausalConv(nn.Module):
         if not getattr(self.base_kernel, "_is_hf_initialized", False):
             init.zeros_(self.base_kernel)
             init.ones_(self.base_kernel[:, 0])
-        init.zeros_(self.kernel_projection.weight)
+        self.kernel_projection.reset_draft_parameters()
 
     def _validate_hidden(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
