@@ -67,8 +67,8 @@ class AttentionMaskTest(unittest.TestCase):
             both.tolist(), [[[[False, True, True, False], [True, False, False, True]]]]
         )
 
-    def test_window_at_the_position_dtype_limit_keeps_every_key(self):
-        """A window as wide as the position dtype must not overflow into an empty mask."""
+    def test_windows_at_or_beyond_the_position_dtype_limit_keep_every_key(self):
+        """A window at or past the position dtype's limit must not overflow or wrap."""
         valid = torch.ones(1, 4, dtype=torch.bool)
         for dtype in (torch.int32, torch.int64):
             positions = torch.arange(4, dtype=dtype)[None]
@@ -82,18 +82,21 @@ class AttentionMaskTest(unittest.TestCase):
                     visibility=visibility,
                     active_queries=active,
                 )
-                with self.subTest(dtype=dtype, mask_mod=active is not None):
-                    masks = [
-                        dense_attention_mask(
-                            layout,
-                            is_causal=True,
-                            sliding_window=window,
-                            batch_size=1,
-                            num_heads=1,
-                        )
-                        for window in (torch.iinfo(dtype).max, None)
-                    ]
-                    self.assertTrue(torch.equal(*masks))
+                for window in (torch.iinfo(dtype).max, torch.iinfo(dtype).max + 1):
+                    with self.subTest(
+                        dtype=dtype, mask_mod=active is not None, window=window
+                    ):
+                        masks = [
+                            dense_attention_mask(
+                                layout,
+                                is_causal=True,
+                                sliding_window=value,
+                                batch_size=1,
+                                num_heads=1,
+                            )
+                            for value in (window, None)
+                        ]
+                        self.assertTrue(torch.equal(*masks))
 
     def test_head_specific_visibility_and_batch_broadcast_are_preserved(self):
         positions = torch.tensor([[0, 1], [2, 1]])

@@ -53,6 +53,7 @@ class FlashAttentionBackend(AttentionBackend):
                 "FlashAttention requires PaddingMask visibility; use Flex for arbitrary masks"
             )
         layout.validate_dimensions(batch_size, num_heads)
+        sliding_window = layout._resolve_window(sliding_window)
         qvalid = padding.query_valid.expand(batch_size, -1)
         kvalid = padding.key_valid.expand(batch_size, -1)
         if layout.active_queries is not None:

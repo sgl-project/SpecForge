@@ -86,6 +86,23 @@ class FlashAttentionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "consecutive"):
                 prepare(replace(layout, query_positions=positions))
 
+    def test_window_wider_than_positions_does_not_bind(self):
+        layout = make_layout("cpu")
+        with AttentionPreparationScope() as scope:
+            wide, unbounded = [
+                scope.prepare(
+                    resolve_attention_backend("fa"),
+                    layout,
+                    batch_size=2,
+                    num_heads=4,
+                    is_causal=True,
+                    sliding_window=window,
+                )
+                for window in (torch.iinfo(torch.int64).max + 1, None)
+            ]
+        self.assertEqual(wide.mask.window, unbounded.mask.window)
+        self.assertTrue(torch.equal(wide.active_queries, unbounded.active_queries))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_autocast_casts_promoted_inputs(self):
         """Weighted QK norm hands FP32 inputs to FA2 under autocast; cast, don't reject."""

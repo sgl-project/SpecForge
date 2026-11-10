@@ -128,10 +128,20 @@ class AttentionLayout:
             return None if self.visibility.shape[1] == 1 else num_heads
         return num_heads
 
+    def _resolve_window(self, sliding_window: int | None) -> int | None:
+        """Drop a window wider than any distance these positions can express."""
+        if sliding_window is None:
+            return None
+        positive_int("sliding_window", sliding_window)
+        dtype = torch.promote_types(
+            self.query_positions.dtype, self.key_positions.dtype
+        )
+        # a Python int beyond the dtype would wrap in tensor comparisons
+        return None if sliding_window > torch.iinfo(dtype).max else sliding_window
+
     def mask_mod(self, *, is_causal: bool, sliding_window: int | None) -> MaskMod:
         boolean("is_causal", is_causal)
-        if sliding_window is not None:
-            positive_int("sliding_window", sliding_window)
+        sliding_window = self._resolve_window(sliding_window)
         qpos, kpos, visibility, active = (
             self.query_positions,
             self.key_positions,
@@ -180,8 +190,7 @@ def dense_attention_mask(
         raise TypeError("dense attention requires AttentionLayout")
     if isinstance(layout.visibility, Tensor):
         boolean("is_causal", is_causal)
-        if sliding_window is not None:
-            positive_int("sliding_window", sliding_window)
+        sliding_window = layout._resolve_window(sliding_window)
         allowed = layout.visibility
         q, k = layout.query_positions.unsqueeze(-1), layout.key_positions.unsqueeze(-2)
         if is_causal:
