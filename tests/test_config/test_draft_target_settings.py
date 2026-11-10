@@ -167,7 +167,7 @@ class TargetSettingsTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     decode_config(payload, target_config={**TARGET, name: value})
         for name in ("hidden_size", "vocab_size"):
-            with self.assertRaisesRegex(ValueError, name):
+            with self.assertRaisesRegex(ValueError, f"bound target {name}"):
                 decode_config(payload, target_config={**TARGET, name: 128})
         with self.assertRaisesRegex(ValueError, "target_layer_ids"):
             decode_config(payload, target_config={**TARGET, "num_hidden_layers": 3})
