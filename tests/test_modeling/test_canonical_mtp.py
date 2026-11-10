@@ -1,4 +1,4 @@
-"""Canonical MTP matches the existing native computation using own components."""
+"""Canonical MTP matches transformers' Qwen3.5 decoder layer around its own fusion."""
 
 import copy
 import unittest
@@ -7,16 +7,23 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen3Config
+from torch import nn
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5RMSNorm,
+    Qwen3_5TextRotaryEmbedding,
+    apply_rotary_pos_emb,
+)
 
 from specforge.config.draft.architecture.features import FinalHiddenFeatureSpec
 from specforge.config.draft.norm import RMSNormSpec
+from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from specforge.modeling.draft.layers.rope import apply_rotary
 from specforge.modeling.draft.models import MTPDraftModel
-from specforge.modeling.draft.mtp.qwen3_5 import PartialRotaryEmbedding, Qwen3_5MTPModel
 from tests.test_config.test_draft_mtp_spec import mtp_config
+from tests.test_modeling.test_canonical_dflash import count_layer_calls
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -41,15 +48,73 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
     )
 
 
-def legacy_key(name):
-    for prefix, replacement in (
-        ("fusion.", ""),
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-    ):
-        if name.startswith(prefix):
-            return replacement + name[len(prefix) :]
-    return name
+def reference_model(config):
+    """The same parameter names, computed by transformers' Qwen3.5 modules."""
+    attention = config.attention_configs["full"]
+    hf_config = Qwen3_5TextConfig(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.mlp_configs["dense"].intermediate_size,
+        num_attention_heads=attention.num_attention_heads,
+        num_key_value_heads=attention.num_key_value_heads,
+        head_dim=attention.head_dim,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        rms_norm_eps=config.norm_config.eps,
+        attention_bias=False,
+        attention_dropout=0.0,
+        vocab_size=config.vocab_size,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": config.rope_parameters.rope_theta,
+            "partial_rotary_factor": config.rope_parameters.partial_rotary_factor,
+        },
+    )
+    hf_config._attn_implementation = "eager"
+    width = config.hidden_size
+    reference = nn.Module()
+    reference.embed_tokens = nn.Embedding(config.vocab_size, width)
+    reference.fusion = nn.Module()
+    reference.fusion.pre_fc_norm_embedding = Qwen3_5RMSNorm(
+        width, eps=hf_config.rms_norm_eps
+    )
+    reference.fusion.pre_fc_norm_hidden = Qwen3_5RMSNorm(
+        width, eps=hf_config.rms_norm_eps
+    )
+    reference.fusion.fc = nn.Linear(2 * width, width, bias=False)
+    reference.backbone = nn.Module()
+    reference.backbone.layers = nn.ModuleList(
+        [Qwen3_5DecoderLayer(hf_config, layer_idx=0)]
+    )
+    reference.backbone.final_norm = Qwen3_5RMSNorm(width, eps=hf_config.rms_norm_eps)
+    reference.lm_head = nn.Linear(width, config.vocab_size, bias=False)
+    reference.rotary = Qwen3_5TextRotaryEmbedding(hf_config)
+    return reference
+
+
+def reference_forward(reference, ids, features, positions):
+    embeddings = reference.embed_tokens(ids)
+    fusion = reference.fusion
+    hidden = fusion.fc(
+        torch.cat(
+            (
+                fusion.pre_fc_norm_embedding(embeddings),
+                fusion.pre_fc_norm_hidden(features),
+            ),
+            dim=-1,
+        )
+    )
+    length = ids.shape[1]
+    causal = torch.full(
+        (length, length), float("-inf"), dtype=hidden.dtype, device=hidden.device
+    ).triu(1)
+    # Match the canonical/SGLang FP32 rotation; retain HF as the independent oracle.
+    rotary = reference.rotary.float()(hidden.float(), positions)
+    for layer in reference.backbone.layers:
+        hidden = layer(
+            hidden, position_embeddings=rotary, attention_mask=causal[None, None]
+        )
+    hidden = reference.backbone.final_norm(hidden)
+    return hidden, reference.lm_head(hidden)
 
 
 class CanonicalMTPTest(unittest.TestCase):
@@ -62,71 +127,45 @@ class CanonicalMTPTest(unittest.TestCase):
             attention_configs={
                 "full": replace(base.attention_configs["full"], output_gate=True)
             },
-            rope_parameters=replace(base.rope_parameters, partial_rotary_factor=0.5),
+            rope_parameters=DefaultRoPESpec(
+                interleaved=False, rope_theta=10_000_000, partial_rotary_factor=0.5
+            ),
         )
         actual = build_draft_model(config, device=device, dtype=dtype)
-        legacy = Qwen3Config(
-            hidden_size=32,
-            intermediate_size=64,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            num_hidden_layers=1,
-            vocab_size=64,
-            rms_norm_eps=1e-6,
-            attn_output_gate=True,
-            attention_dropout=0,
-            partial_rotary_factor=0.5,
-            rope_theta=10000,
+        with torch.no_grad():
+            for parameter in actual.parameters():
+                parameter.normal_(std=0.2)
+        reference = reference_model(config).to(device=device, dtype=dtype)
+        reference.rotary = Qwen3_5TextRotaryEmbedding(reference.rotary.config).to(
+            device
         )
-        legacy._attn_implementation = "eager"
-        reference = Qwen3_5MTPModel(legacy).to(device=device, dtype=dtype)
-        # Use the same FP32-derived frequencies as canonical RoPE after casts.
-        reference.rotary_emb = PartialRotaryEmbedding(legacy, 8).to(device)
-        reference.load_state_dict(
-            {
-                legacy_key(name): value
-                for name, value in actual.state_dict().items()
-                if name != "embed_tokens.weight"
-            },
-            strict=True,
-        )
-        embedding = copy.deepcopy(actual.embed_tokens)
+        reference.load_state_dict(actual.state_dict(), strict=True)
         ids, features, entries = model_inputs(config, device, dtype)
         other = features.detach().clone().requires_grad_()
         output = actual(ids, features, entries)
-        # Compare composition with the same FP32 RoPE arithmetic on both sides.
-        rotary_forward = reference.rotary_emb.forward
 
         def rotate(query, key, cos, sin, **kwargs):
-            return apply_rotary(query, (cos, sin)), apply_rotary(key, (cos, sin))
+            q, k = apply_rotary_pos_emb(query.float(), key.float(), cos, sin, **kwargs)
+            return q.to(query.dtype), k.to(key.dtype)
 
-        with (
-            patch.object(
-                reference.rotary_emb,
-                "forward",
-                lambda x, positions: rotary_forward(x.float(), positions),
-            ),
-            patch("specforge.modeling.draft.mtp.qwen3_5.apply_rotary_pos_emb", rotate),
+        with patch(
+            "transformers.models.qwen3_5.modeling_qwen3_5.apply_rotary_pos_emb", rotate
         ):
-            hidden = reference(
-                embedding(ids), other, position_ids=entries[0].position_ids
+            hidden, expected = reference_forward(
+                reference, ids, other, entries[0].position_ids
             )
-        expected = reference.lm_head(hidden)
         torch.testing.assert_close(output.hidden_states, hidden, rtol=0, atol=0)
         torch.testing.assert_close(output.logits, expected, rtol=0, atol=0)
         upstream = torch.randn_like(expected)
         output.logits.backward(upstream)
         expected.backward(upstream)
         torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
+        references = dict(reference.named_parameters())
         for name, parameter in actual.named_parameters():
-            ref = (
-                embedding.weight
-                if name == "embed_tokens.weight"
-                else dict(reference.named_parameters())[legacy_key(name)]
-            )
             self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
+            torch.testing.assert_close(
+                parameter.grad, references[name].grad, rtol=0, atol=0
+            )
 
     def test_cpu_native_computation(self):
         for dtype in (torch.float32, torch.bfloat16):
@@ -154,6 +193,7 @@ class CanonicalMTPTest(unittest.TestCase):
         self.assertIs(actual.embed_tokens.weight, actual.lm_head.weight)
         checkpointed = copy.deepcopy(actual)
         checkpointed.gradient_checkpointing_enable()
+        calls = count_layer_calls(checkpointed)
         ids, features, entries = model_inputs(config)
         other = features.detach().clone().requires_grad_()
         output, expected = actual(ids, features, entries), checkpointed(
@@ -163,6 +203,7 @@ class CanonicalMTPTest(unittest.TestCase):
         grad = torch.randn_like(output.logits)
         output.logits.backward(grad)
         expected.logits.backward(grad)
+        self.assertEqual(calls, [2] * checkpointed.backbone.num_layers)
         for name, parameter in actual.named_parameters():
             self.assertIsNotNone(parameter.grad, name)
             torch.testing.assert_close(
