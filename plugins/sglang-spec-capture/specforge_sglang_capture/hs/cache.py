@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 import threading
 import uuid
@@ -68,6 +69,9 @@ class PrefixFeatureCache:
         self.schema = schema
         self.chunk_tokens = checked_int(chunk_tokens, "chunk_tokens", 1)
         self.capacity_bytes = checked_int(capacity_bytes, "capacity_bytes")
+        # Freeze this policy for the lifetime of a cache/controller pair. Setting
+        # the flag to 0 retains the old work for paired diagnostics and rollback.
+        self.skip_unused_cache_work = os.environ.get("SPECFORGE_HS_SKIP_UNUSED_CACHE_WORK", "1") != "0"
         self._chunk_bytes = self.chunk_tokens * self.schema.row_bytes
         self._lock = threading.RLock()
         self._entries: dict[ContentBlockKey, _Entry] = {}
@@ -139,7 +143,13 @@ class PrefixFeatureCache:
     def lookup_and_pin(self, namespace: str, tokens: tuple[int, ...], limit: int) -> PrefixLease:
         _token_tuple(tokens)
         checked_int(limit, "coverage limit")
-        keys = self.block_keys(namespace, tokens[: min(len(tokens), limit)])
+        if self.skip_unused_cache_work and self.capacity_bytes == 0:
+            # A disabled cache cannot have content. Still validate the external
+            # namespace/tokens and issue a real, identity-checked empty lease.
+            self._root_digest(namespace)
+            keys = ()
+        else:
+            keys = self.block_keys(namespace, tokens[: min(len(tokens), limit)])
         with self._lock:
             entries = []
             for key in keys:
@@ -169,6 +179,8 @@ class PrefixFeatureCache:
         if namespace is not None and namespace != rec.namespace:
             raise CaptureContractError("lease namespace differs from plan")
         if tokens is not None:
+            _token_tuple(tokens)
+        if tokens is not None and (end or not self.skip_unused_cache_work):
             expected = self.block_keys(rec.namespace, tokens)
             needed = (end + self.chunk_tokens - 1) // self.chunk_tokens
             if tuple(e.key for e in rec.entries[:needed]) != expected[:needed]:

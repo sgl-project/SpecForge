@@ -116,6 +116,7 @@ class CaptureController:
             "admission_declined_fragmentation_attempts",
         ), 0)
         self._adoption_calls = 0
+        self._adoption_unused_skips = 0
         self._adoption_total_ms = self._adoption_max_ms = 0.0
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="spec-feature-capture")
 
@@ -316,8 +317,11 @@ class CaptureController:
                 # after this ownership transfer. Keep the output charge until
                 # the cache has charged every retained backing allocation.
                 if owned and not state.cancelled and not rec.release_requested and not self._closed:
-                    self._adoption_calls += 1
-                    self.cache._adopt_released_sample(state.cache_keys, owned)
+                    if state.cache_keys or not self.cache.skip_unused_cache_work:
+                        self._adoption_calls += 1
+                        self.cache._adopt_released_sample(state.cache_keys, owned)
+                    else:
+                        self._adoption_unused_skips += 1
             except Exception:
                 self._fill_failures += 1
             finally:
@@ -439,6 +443,9 @@ class CaptureController:
     def _prepare_cache_adoption(self, job: _Job) -> tuple:
         # Hash/construct keys on the assembly worker, never in the sink release
         # callback (which may run on the scheduler thread).
+        if self.cache.skip_unused_cache_work and (
+                self.cache.capacity_bytes == 0 or job.plan.N < self.cache.chunk_tokens):
+            return ()
         try:
             return self.cache.block_keys(job.plan.namespace, job.plan.tokens)
         except Exception:
@@ -581,6 +588,7 @@ class CaptureController:
                           fill_failures=self._fill_failures,
                           capture_workers=self._max_workers,
                           cache_adoption_calls=self._adoption_calls,
+                          cache_adoption_unused_skips=self._adoption_unused_skips,
                           cache_adoption_total_ms=self._adoption_total_ms,
                           cache_adoption_max_ms=self._adoption_max_ms,
                           pinned_free_bytes=sum(size for _, size in self._pinned_free),
