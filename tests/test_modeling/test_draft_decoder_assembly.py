@@ -35,7 +35,9 @@ def mixed_config(*, convolution=False, latent_rope=None):
                 attention_dropout=0,
             ),
         },
-        rope_parameters=DefaultRoPESpec(rope_theta=10000, partial_rotary_factor=0.5),
+        rope_parameters=DefaultRoPESpec(
+            interleaved=False, rope_theta=10000, partial_rotary_factor=0.5
+        ),
         conv_configs=(
             {"grouped": GroupedCausalConvSpec(kernel_size=3, group_size=4)}
             if convolution
@@ -108,7 +110,12 @@ class DecoderAssemblyTest(unittest.TestCase):
 
     def _assert_checkpoint_parity(self, device):
         for convolution, latent_rope in (
-            (False, DefaultRoPESpec(rope_theta=50000, partial_rotary_factor=1)),
+            (
+                False,
+                DefaultRoPESpec(
+                    interleaved=False, rope_theta=50000, partial_rotary_factor=1
+                ),
+            ),
             (True, None),
         ):
             with self.subTest(device=device, convolution=convolution):

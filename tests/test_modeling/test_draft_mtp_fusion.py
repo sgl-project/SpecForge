@@ -33,7 +33,7 @@ class MTPFusionTest(unittest.TestCase):
                 actual = MTPInputFusion(
                     spec,
                     hidden_size=32,
-                    norm=RMSNormSpec(eps=1e-6, weight_offset=offset),
+                    norm=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
                     device=device,
                     dtype=dtype,
                 )
