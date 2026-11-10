@@ -10,6 +10,7 @@ from specforge.config.draft import registry
 from specforge.config.draft.architecture import DSpineSpec
 from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
 from specforge.config.draft.codec import decode_config, encode_config
+from specforge.config.draft.attention import AttentionSpec
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.residual import ResidualSpec
 from tests.test_config.draft_fixtures import draft_config
@@ -32,6 +33,25 @@ def dspine_config():
 
 
 class DSpineSpecTest(unittest.TestCase):
+    def test_causal_capability_does_not_require_an_is_causal_field(self):
+        @dataclasses.dataclass(frozen=True, kw_only=True)
+        class CausalAttention(AttentionSpec):
+            type: ClassVar[str] = "test_always_causal"
+
+            def capabilities(self) -> frozenset[str]:
+                return frozenset({"causal", "target_context_kv"})
+
+            @property
+            def rotary_input_dim(self):
+                return None
+
+        with patch.dict(registry._SCHEMAS):
+            registry.register_component_schema("attention", CausalAttention)
+            dataclasses.replace(
+                dspine_config(),
+                attention_configs={"full": CausalAttention(rope_parameters=None)},
+            )
+
     def test_injection_structure_round_trips_without_schedules(self):
         node = dspine_config()
         payload = encode_config(node)
@@ -122,7 +142,7 @@ class DSpineSpecTest(unittest.TestCase):
             type: ClassVar[str] = "test_mutable_residual"
             capabilities: ClassVar[set[str]] = {"single_stream"}
 
-        with self.assertRaisesRegex(TypeError, "frozenset"):
+        with self.assertRaisesRegex(TypeError, "capabilities must be a method"):
             registry.register_component_schema("residual", MutableCapabilities)
 
     def test_training_and_candidate_selection_are_not_model_structure(self):

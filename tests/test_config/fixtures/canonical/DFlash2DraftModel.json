@@ -70,6 +70,7 @@
       "block_size": 8
     },
     "target_features": {
+      "hidden_size": 32,
       "mask_token_id": 63,
       "target_layer_ids": [
         1,

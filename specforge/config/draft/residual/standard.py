@@ -9,4 +9,6 @@ from .base import ResidualSpec
 @dataclass(frozen=True, kw_only=True)
 class StandardResidualSpec(ResidualSpec):
     type: ClassVar[str] = "standard"
-    capabilities: ClassVar[frozenset[str]] = frozenset({"single_stream"})
+
+    def capabilities(self) -> frozenset[str]:
+        return frozenset({"single_stream"})

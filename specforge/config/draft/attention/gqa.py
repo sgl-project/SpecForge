@@ -10,7 +10,12 @@ from .base import AttentionSpec
 @dataclass(frozen=True, kw_only=True)
 class GQASpec(AttentionSpec):
     type: ClassVar[str] = "gqa"
-    capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
+
+    def capabilities(self) -> frozenset[str]:
+        flags = {"target_context_kv"}
+        if self.is_causal:
+            flags.add("causal")
+        return frozenset(flags)
 
     num_attention_heads: int
     num_key_value_heads: int

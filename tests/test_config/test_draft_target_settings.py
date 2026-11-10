@@ -54,6 +54,18 @@ class TargetSettingsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "target_layer_ids"):
                 decode_config(encode_config(invalid), target_config=TARGET)
 
+    def test_target_width_is_independent_of_unbound_draft_width(self):
+        config = draft_config(target_bindings=(), target_logit_transform=None)
+        payload = encode_config(config)
+        payload["spec_config"]["target_features"]["hidden_size"] = 64
+        target = {**TARGET, "hidden_size": 64}
+        node = parse_draft(payload, target_config=target)
+        self.assertEqual(node.hidden_size, 32)
+        self.assertEqual(node.spec_config.target_features.input_width(), 128)
+        self.assertEqual(decode_config(encode_config(node)), node)
+        with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
+            parse_draft(payload, target_config=TARGET)
+
     def test_registration_requires_an_explicit_target_validator(self):
         @dataclass(frozen=True)
         class MissingTargetCheck(ArchitectureSpec):
@@ -88,7 +100,7 @@ class TargetSettingsTest(unittest.TestCase):
 
     def test_yaml_requires_feature_layers_and_mask_token(self):
         for source in (encode_config(draft_config()), shorthand()):
-            for field in ("target_layer_ids", "mask_token_id"):
+            for field in ("hidden_size", "target_layer_ids", "mask_token_id"):
                 payload = copy.deepcopy(source)
                 del payload["spec_config"]["target_features"][field]
                 for target in (TARGET, None):

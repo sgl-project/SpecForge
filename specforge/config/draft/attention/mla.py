@@ -12,7 +12,12 @@ class MLASpec(AttentionSpec):
     """Latent projections and rotary subspace; no GQA head/cache assumptions."""
 
     type: ClassVar[str] = "mla"
-    capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
+
+    def capabilities(self) -> frozenset[str]:
+        flags = {"target_context_kv"}
+        if self.is_causal:
+            flags.add("causal")
+        return frozenset(flags)
 
     num_attention_heads: int
     q_lora_rank: int | None

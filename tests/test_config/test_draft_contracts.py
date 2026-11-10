@@ -108,7 +108,9 @@ class ContractsTest(unittest.TestCase):
         @dataclasses.dataclass(frozen=True, kw_only=True)
         class ContextAttention(AttentionSpec):
             type: ClassVar[str] = "test_context_attention"
-            capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
+
+            def capabilities(self) -> frozenset[str]:
+                return frozenset({"target_context_kv"})
             num_heads: int
 
             @property

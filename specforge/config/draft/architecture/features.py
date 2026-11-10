@@ -11,10 +11,12 @@ from .block import AnchoredBlockSpec
 class TargetFeatureSpec:
     """Tap k is decoder layer k's output before the final norm, read as layer k+1's input."""
 
+    hidden_size: int
     mask_token_id: int
     target_layer_ids: tuple[int, ...]
 
     def __post_init__(self):
+        positive_int("target_features.hidden_size", self.hidden_size)
         if type(self.mask_token_id) is not int or self.mask_token_id < 0:
             raise ValueError("mask_token_id must be a nonnegative integer")
         if type(self.target_layer_ids) is not tuple or not self.target_layer_ids:
@@ -29,6 +31,10 @@ class TargetFeatureSpec:
             )
 
     def validate_target(self, target: Mapping) -> None:
+        width = target.get("hidden_size")
+        positive_int("target_config.hidden_size", width)
+        if self.hidden_size != width:
+            raise ValueError("target_features.hidden_size must match target hidden_size")
         count = target.get("num_hidden_layers")
         positive_int("target_config.num_hidden_layers", count)
         if any(layer >= count for layer in self.target_layer_ids):
@@ -37,9 +43,8 @@ class TargetFeatureSpec:
             # no layer L reads it: SGLang drops the tap, HF returns the normed state
             raise ValueError("target_layer_ids cannot include the final target layer")
 
-    def input_width(self, target_hidden_size: int) -> int:
-        positive_int("target_hidden_size", target_hidden_size)
-        return len(self.target_layer_ids) * target_hidden_size
+    def input_width(self) -> int:
+        return len(self.target_layer_ids) * self.hidden_size
 
 
 def validate_anchored_inputs(block, target_features) -> None:

@@ -168,7 +168,9 @@ class DraftConfigNodesTest(unittest.TestCase):
         @dataclasses.dataclass(frozen=True, kw_only=True)
         class WithoutContext(GQASpec):
             type: ClassVar[str] = "test_without_context"
-            capabilities: ClassVar[frozenset[str]] = frozenset()
+
+            def capabilities(self) -> frozenset[str]:
+                return frozenset()
 
         with patch.dict(registry._SCHEMAS):
             register_component_schema("attention", WithoutContext)
@@ -205,7 +207,7 @@ class DraftConfigNodesTest(unittest.TestCase):
             type: ClassVar[str] = "test_mutable_capabilities"
             capabilities: ClassVar[set[str]] = {"target_context_kv"}
 
-        with self.assertRaisesRegex(TypeError, "capabilities must be a frozenset"):
+        with self.assertRaisesRegex(TypeError, "capabilities must be a method"):
             register_component_schema("attention", MutableCapabilities)
 
     def test_model_config_import_is_dependency_free(self):

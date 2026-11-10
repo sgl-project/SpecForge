@@ -19,7 +19,7 @@ def validate_target_context(config: DraftConfig) -> None:
             "spec_config.target_features.mask_token_id must be below vocab_size"
         )
     for name, attention in config.attention_configs.items():
-        if "target_context_kv" not in attention.capabilities:
+        if "target_context_kv" not in attention.capabilities():
             raise ValueError(
                 f"attention_configs.{name}: architecture requires target_context_kv"
             )
@@ -34,7 +34,7 @@ def validate_dflash2(config: DraftConfig) -> None:
             raise ValueError(f"layer_configs.{name}: DFlash2 requires sublayer_conv")
         if (
             "block_sublayer_pair"
-            not in config.conv_configs[layer.sublayer_conv].capabilities
+            not in config.conv_configs[layer.sublayer_conv].capabilities()
         ):
             raise ValueError(
                 f"layer_configs.{name}: convolution must support block_sublayer_pair"

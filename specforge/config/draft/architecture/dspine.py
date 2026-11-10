@@ -52,11 +52,11 @@ def validate_dspine(config: DraftConfig) -> None:
         raise ValueError(
             "injection.transfer_rank must not exceed min(hidden_size, vocab_size - 1)"
         )
-    if "single_stream" not in config.residual_config.capabilities:
+    if "single_stream" not in config.residual_config.capabilities():
         raise ValueError("DSpine adjacent injection requires single_stream residuals")
     for name, attention in config.attention_configs.items():
         # A component without an explicit causal contract cannot feed injection.
-        if getattr(attention, "is_causal", None) is not True:
+        if "causal" not in attention.capabilities():
             raise ValueError(
                 f"attention_configs.{name}: DSpine requires causal attention"
             )

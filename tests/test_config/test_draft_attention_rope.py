@@ -160,7 +160,9 @@ class AttentionRoPETest(unittest.TestCase):
         @dataclasses.dataclass(frozen=True, kw_only=True)
         class NonRotaryAttention(AttentionSpec):
             type: ClassVar[str] = "test_non_rotary_attention"
-            capabilities: ClassVar[frozenset[str]] = frozenset({"target_context_kv"})
+
+            def capabilities(self) -> frozenset[str]:
+                return frozenset({"target_context_kv"})
             num_heads: int
 
             @property

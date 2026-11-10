@@ -88,10 +88,8 @@ def _validate_schema(schema: type, label: str) -> None:
             )
     _check_value_schema(schema, label, set())
     if issubclass(schema, (AttentionSpec, ConvSpec, ResidualSpec)):
-        if type(schema.capabilities) is not frozenset or any(
-            type(name) is not str or not name for name in schema.capabilities
-        ):
-            raise TypeError(f"{label} capabilities must be a frozenset of names")
+        if not callable(schema.capabilities):
+            raise TypeError(f"{label} capabilities must be a method")
 
 
 def component_type_field(kind: str) -> str:

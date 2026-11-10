@@ -51,7 +51,7 @@ def draft_config(**overrides):
             "spec_config": DFlashSpec(
                 block=AnchoredBlockSpec(block_size=8),
                 target_features=TargetFeatureSpec(
-                    mask_token_id=63, target_layer_ids=(1, 3)
+                    hidden_size=32, mask_token_id=63, target_layer_ids=(1, 3)
                 ),
             ),
             "target_bindings": ("embed_tokens", "lm_head"),

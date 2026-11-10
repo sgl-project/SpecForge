@@ -2,7 +2,6 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar
 
 from ..rope import RopeSpec
 
@@ -11,7 +10,8 @@ from ..rope import RopeSpec
 class AttentionSpec(ABC):
     """Base for attention schemas with different projection/state semantics."""
 
-    capabilities: ClassVar[frozenset[str]] = frozenset()
+    def capabilities(self) -> frozenset[str]:
+        return frozenset()
 
     # None explicitly inherits model-level RoPE; NoRoPESpec disables rotation.
     rope_parameters: RopeSpec | None

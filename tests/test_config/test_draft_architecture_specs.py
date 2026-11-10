@@ -17,7 +17,7 @@ def dflash2(**overrides):
         **dict(
             block=AnchoredBlockSpec(block_size=16),
             target_features=TargetFeatureSpec(
-                mask_token_id=31, target_layer_ids=(1, 4, 7)
+                hidden_size=32, mask_token_id=31, target_layer_ids=(1, 4, 7)
             ),
             selector_rank=8,
             selector_top_k=4,
@@ -56,15 +56,21 @@ class ArchitectureSpecsTest(unittest.TestCase):
                 schema(block_size=1)
 
     def test_target_feature_order_and_width(self):
-        node = TargetFeatureSpec(mask_token_id=0, target_layer_ids=(1, 4, 7))
+        node = TargetFeatureSpec(
+            hidden_size=32, mask_token_id=0, target_layer_ids=(1, 4, 7)
+        )
         self.assertEqual(node.target_layer_ids, (1, 4, 7))
-        self.assertEqual(node.input_width(96), 288)
+        self.assertEqual(node.input_width(), 96)
         for value in ([], (), (True,), (-1,), ("1",), [1, 2], (7, 1, 7)):
             with self.assertRaisesRegex(ValueError, "target_layer_ids"):
-                TargetFeatureSpec(mask_token_id=0, target_layer_ids=value)
+                TargetFeatureSpec(
+                    hidden_size=32, mask_token_id=0, target_layer_ids=value
+                )
         for value in (True, -1, 0.0, "0", None):
             with self.assertRaisesRegex(ValueError, "mask_token_id"):
-                TargetFeatureSpec(mask_token_id=value, target_layer_ids=(1,))
+                TargetFeatureSpec(
+                    hidden_size=32, mask_token_id=value, target_layer_ids=(1,)
+                )
 
     def test_architectures_compose_nodes_without_inheriting_each_other(self):
         second = dflash2()
@@ -83,7 +89,9 @@ class ArchitectureSpecsTest(unittest.TestCase):
         # Reconstruct typed children, rather than letting dictionaries into a frozen node.
         fields.update(
             block=AnchoredBlockSpec(block_size=16),
-            target_features=TargetFeatureSpec(mask_token_id=31, target_layer_ids=(1,)),
+            target_features=TargetFeatureSpec(
+                hidden_size=32, mask_token_id=31, target_layer_ids=(1,)
+            ),
         )
         for name in ("conv_kernel_size", "ce_weight", "replacement_probability"):
             with self.assertRaisesRegex(TypeError, name):
@@ -102,7 +110,7 @@ class ArchitectureSpecsTest(unittest.TestCase):
                 DFlashSpec(
                     block=block,
                     target_features=TargetFeatureSpec(
-                        mask_token_id=0, target_layer_ids=(1,)
+                        hidden_size=32, mask_token_id=0, target_layer_ids=(1,)
                     ),
                 )
         with self.assertRaisesRegex(ValueError, "TargetFeatureSpec"):
