@@ -34,6 +34,29 @@ def make_layout(device):
     )
 
 
+def prepare_causal_flash(layout):
+    with AttentionPreparationScope() as scope:
+        return scope.prepare(
+            resolve_attention_backend("fa"),
+            layout,
+            batch_size=2,
+            num_heads=4,
+            is_causal=True,
+            sliding_window=None,
+        )
+
+
+def make_inputs(layout, dtype):
+    return [
+        torch.randn(2, heads, length, 32, device="cuda", dtype=dtype).requires_grad_()
+        for heads, length in (
+            (4, layout.query_positions.shape[1]),
+            (2, layout.key_positions.shape[1]),
+            (2, layout.key_positions.shape[1]),
+        )
+    ]
+
+
 class FlashAttentionTest(unittest.TestCase):
     def test_preparation_and_rejected_layouts(self):
         backend = resolve_attention_backend("fa")
@@ -62,6 +85,59 @@ class FlashAttentionTest(unittest.TestCase):
             positions[0, 2] += 1
             with self.assertRaisesRegex(ValueError, "consecutive"):
                 prepare(replace(layout, query_positions=positions))
+
+    def test_window_wider_than_positions_does_not_bind(self):
+        layout = make_layout("cpu")
+        with AttentionPreparationScope() as scope:
+            wide, unbounded = [
+                scope.prepare(
+                    resolve_attention_backend("fa"),
+                    layout,
+                    batch_size=2,
+                    num_heads=4,
+                    is_causal=True,
+                    sliding_window=window,
+                )
+                for window in (torch.iinfo(torch.int64).max + 1, None)
+            ]
+        self.assertEqual(wide.mask.window, unbounded.mask.window)
+        self.assertTrue(torch.equal(wide.active_queries, unbounded.active_queries))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_autocast_casts_promoted_inputs(self):
+        """Weighted QK norm hands FP32 inputs to FA2 under autocast; cast, don't reject."""
+        torch.manual_seed(5)
+        prepared = prepare_causal_flash(make_layout("cuda"))
+        values = make_inputs(prepared.layout, torch.float32)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            promoted = prepared.attend(
+                *values, scale=32**-0.5, dropout_p=0, training=True
+            )
+        explicit = prepared.attend(
+            *(t.detach().bfloat16() for t in values),
+            scale=32**-0.5,
+            dropout_p=0,
+            training=True,
+        )
+        self.assertEqual(promoted.output.dtype, torch.bfloat16)
+        torch.testing.assert_close(promoted.output, explicit.output, rtol=0, atol=0)
+        promoted.output.float().sum().backward()
+        for tensor in values:
+            self.assertEqual(tensor.grad.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(tensor.grad).all())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_loss_through_lse_fails_loudly(self):
+        """flash_attn drops the LSE gradient, so a loss through LSE must not train."""
+        torch.manual_seed(6)
+        prepared = prepare_causal_flash(make_layout("cuda"))
+        values = make_inputs(prepared.layout, torch.bfloat16)
+        result = prepared.attend(
+            *values, scale=32**-0.5, dropout_p=0, training=True, return_lse=True
+        )
+        result.output.float().sum().backward(retain_graph=True)
+        with self.assertRaisesRegex(NotImplementedError, "LSE"):
+            torch.where(result.lse.isfinite(), result.lse, 0).sum().backward()
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_output_lse_and_gradients(self):

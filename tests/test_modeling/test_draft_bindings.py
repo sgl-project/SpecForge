@@ -222,6 +222,21 @@ class BindingTest(unittest.TestCase):
                 head.bound_weight(), source.to(head.weight.dtype) / 3, rtol=0, atol=0
             )
 
+    def test_binding_rejects_its_own_storage_without_folding_again(self):
+        head = BoundLMHead(
+            MuPLogitTransformSpec(multiplier=3), vocab_size=4, hidden_size=2
+        )
+        head.load_target_weight(torch.ones(4, 2))
+        before = head.bound_weight().clone()
+        for source in (
+            head.weight,
+            head.weight.detach(),
+            head.weight.view_as(head.weight),
+        ):
+            with self.assertRaisesRegex(ValueError, "share storage"):
+                head.load_target_weight(source)
+            torch.testing.assert_close(head.bound_weight(), before, rtol=0, atol=0)
+
     def test_invalid_binding_does_not_change_installed_weight(self):
         embedding = BoundEmbedding(16, 8)
         with self.assertRaisesRegex(RuntimeError, "not bound"):

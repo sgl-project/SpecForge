@@ -29,8 +29,6 @@ def build_eagle_backbone(
         raise ValueError("EAGLE assembly requires Eagle3Spec or PEagleSpec")
     if type(config.residual_config) is not StandardResidualSpec:
         raise ValueError("EAGLE assembly currently requires standard residuals")
-    if backend != "eager":
-        raise ValueError("EAGLE assembly currently supports only the eager backend")
     convolved = [
         name
         for name in dict.fromkeys(config.layer_types)

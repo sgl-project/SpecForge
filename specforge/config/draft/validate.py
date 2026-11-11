@@ -17,6 +17,7 @@ from .registry import (
     component_type,
     validate_component,
 )
+from .rope import attention_rotary_dim
 
 if TYPE_CHECKING:
     from .model import DraftConfig
@@ -68,8 +69,9 @@ def validate(config: DraftConfig) -> None:
                 )
         else:
             try:
-                attention.effective_rope(config.rope_parameters).rotary_dim(
-                    attention.rotary_input_dim
+                attention_rotary_dim(
+                    attention.effective_rope(config.rope_parameters),
+                    attention.rotary_input_dim,
                 )
             except ValueError as exc:
                 raise ValueError(f"attention_configs.{name}: {exc}") from exc
