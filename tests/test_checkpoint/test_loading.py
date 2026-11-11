@@ -85,6 +85,45 @@ class LoadingTest(unittest.TestCase):
                     atol=0,
                 )
 
+    def test_legacy_dflash_records_must_match_supplied_config(self):
+        """A config-less DFlash run imported with a stale JSON must not load silently."""
+        payload = dflash2_payload()
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "source"
+            target.mkdir()
+            (target / "config.json").write_text(
+                json.dumps(
+                    {
+                        "hidden_size": payload["hidden_size"],
+                        "vocab_size": payload["vocab_size"],
+                        "num_hidden_layers": payload["num_target_layers"],
+                    }
+                )
+            )
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
+            spec = read_draft(source, target=target).config.spec_config
+            matching = {
+                "dflash_target_layer_ids": spec.target_features.target_layer_ids,
+                "dflash_mask_token_id": spec.target_features.mask_token_id,
+                "dflash_block_size": spec.block.block_size,
+            }
+            torch.save(matching, source / "training_state.pt")
+            read_draft(source, target=target)
+            for key, value in (
+                ("dflash_mask_token_id", spec.target_features.mask_token_id + 1),
+                ("dflash_block_size", spec.block.block_size + 1),
+                (
+                    "dflash_target_layer_ids",
+                    spec.target_features.target_layer_ids[::-1],
+                ),
+            ):
+                with self.subTest(key=key):
+                    torch.save(matching | {key: value}, source / "training_state.pt")
+                    with self.assertRaisesRegex(ValueError, key):
+                        read_draft(source, target=target)
+
     def test_legacy_capture_layers_come_from_training_provenance(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
         payload = json.loads((fixture / "config.json").read_text())

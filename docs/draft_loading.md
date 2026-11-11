@@ -73,7 +73,8 @@ fused parameters must supply its layout rather than relying on family guesses.
 Legacy draft imports use the existing configuration codec and format-owned
 weight renames. They require the target configuration. A `training_state.pt`
 without `config.json` additionally needs `legacy_config` (a dictionary or JSON
-file); only `draft_state_dict` is used, via PyTorch's restricted unpickler.
+file); tensors come only from `draft_state_dict`, via PyTorch's restricted
+unpickler, and recorded settings are checked as described below.
 Continuing a reduced-vocabulary EAGLE checkpoint requires its saved `t2d` and
 `d2t` mapping. A weights-only warm start can explicitly allow a new `vocabulary`;
 the caller must install its mapping before using logits.
@@ -86,7 +87,9 @@ Plans validate global metadata; Shard/Replicate DTensor destinations read only
 their local slices. Partial placements are rejected. CLI/training orchestration
 and export conversion will adopt these APIs in subsequent integration steps.
 
-Legacy imports check recorded capture, mask, residual and binding settings.
+Legacy imports check recorded capture, mask, residual and binding settings,
+including the DFlash-family `*_target_layer_ids`, `*_mask_token_id` and
+`*_block_size` records.
 A saved copy of a target-bound table must match the supplied target; importing
 must not silently replace trained weights. Hub imports also fetch
 `training_state.pt` for these structural records, without restoring training state.

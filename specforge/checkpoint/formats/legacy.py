@@ -8,6 +8,15 @@ from specforge.config.draft.codec import decode_legacy_config
 
 logger = logging.getLogger(__name__)
 
+# main's DataFlow strategies record context-draft semantics under these prefixes.
+_CONTEXT_RECORD_PREFIXES = {
+    "DFlashDraftModel": "dflash",
+    "DFlash2DraftModel": "dflash",
+    "DSparkDraftModel": "dspark",
+    "DominoDraftModel": "domino",
+    "DSpineDraftModel": "dspine",
+}
+
 ARCHITECTURES = {
     "DFlashDraftModel",
     "DFlash2DraftModel",
@@ -73,6 +82,23 @@ def read_legacy(payload, store, target_config, *, check_target=True):
             type(recorded) is not bool or recorded != expected
         ):
             raise ValueError(f"recorded {name} conflicts with legacy configuration")
+    prefix = _CONTEXT_RECORD_PREFIXES.get(architecture)
+    if prefix is not None:
+        spec = config.spec_config
+        decoded = {
+            "target_layer_ids": tuple(spec.target_features.target_layer_ids),
+            "mask_token_id": spec.target_features.mask_token_id,
+            "block_size": spec.block.block_size,
+        }
+        for field, value in decoded.items():
+            recorded = state.get(f"{prefix}_{field}")
+            if field == "target_layer_ids" and recorded is not None:
+                recorded = tuple(recorded)
+            if recorded is not None and recorded != value:
+                raise ValueError(
+                    f"recorded {prefix}_{field}={recorded!r} conflicts with legacy "
+                    f"configuration ({value!r}); supply the run's draft config"
+                )
     if architecture == "DFlashDraftModel":
         architecture = config.architecture
     weights = {}
