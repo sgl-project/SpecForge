@@ -6,15 +6,14 @@ from pathlib import Path
 import torch
 
 from specforge.checkpoint import make_weight_plan
-from specforge.checkpoint.tensors import TensorInfo
+from specforge.checkpoint.tensors import TensorInfo, TensorRef
 from specforge.loading import read_draft
 from specforge.modeling import build_draft_model
 
 
 @dataclass(frozen=True)
 class _BindingMetadata:
-    key: str
-    info: TensorInfo
+    metadata: dict[str, TensorInfo]
 
 
 def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=None):
@@ -48,13 +47,15 @@ def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=Non
     # Meta construction validates every tensor name and shape. Bound modules
     # are intentionally absent from an artifact; no target tensor is read here.
     preview = build_draft_model(checkpoint.config, device="meta")
-    bindings = {
-        name: _BindingMetadata(
-            name,
-            TensorInfo(tuple(preview.get_submodule(name).weight.shape), torch.float32),
-        )
-        for name in checkpoint.config.target_bindings
-    }
+    binding_store = _BindingMetadata(
+        {
+            name: TensorInfo(
+                tuple(preview.get_submodule(name).weight.shape), torch.float32
+            )
+            for name in checkpoint.config.target_bindings
+        }
+    )
+    bindings = {name: TensorRef(binding_store, name) for name in binding_store.metadata}
     plan = make_weight_plan(preview, checkpoint.weights, bindings=bindings)
     state, seen = {}, set()
     for name, ref in plan.weights:
