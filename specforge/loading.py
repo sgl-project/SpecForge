@@ -140,8 +140,10 @@ def load_draft(
     model = build_draft_model(
         checkpoint.config, device=device, dtype=dtype, backend=backend
     )
+    # dtype is the caller's; the artifact format and auto_map describe the source dir
+    skipped = {"dtype", "torch_dtype", "specforge_artifact", "auto_map"}
     for key, value in checkpoint.hf_metadata.items():
-        if key not in {"dtype", "torch_dtype"}:
+        if key not in skipped:
             setattr(model.config, key, value)
     apply_weight_plan(model, plan)
     _validate_vocabulary(model, plan)

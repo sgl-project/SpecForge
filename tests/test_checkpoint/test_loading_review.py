@@ -207,6 +207,22 @@ class LoadingReviewTest(unittest.TestCase):
             with self.assertRaises(UnpicklingError):
                 read_draft(source, target=target)
 
+    def test_source_directory_metadata_does_not_follow_the_model(self):
+        """Re-saving a loaded export must not carry its auto_map without its code."""
+        with TemporaryDirectory() as tmp:
+            source, target, out = (Path(tmp) / n for n in ("export", "target", "out"))
+            write_target(target)
+            save_draft(build_draft_model(draft_config()), source)
+            payload = json.loads((source / "config.json").read_text())
+            artifact = payload["specforge_artifact"]
+            payload["auto_map"] = {"AutoModel": "modeling_draft.DFlashDraftModel"}
+            payload["specforge_artifact"] = artifact | {"stale": True}
+            (source / "config.json").write_text(json.dumps(payload))
+            save_draft(load_draft(source, target=target), out)
+            saved = json.loads((out / "config.json").read_text())
+            self.assertNotIn("auto_map", saved)
+            self.assertEqual(saved["specforge_artifact"], artifact)
+
     def test_legacy_contract_and_saved_bound_table_are_checked(self):
         payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
         with TemporaryDirectory() as tmp:
