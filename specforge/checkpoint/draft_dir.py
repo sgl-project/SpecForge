@@ -44,12 +44,17 @@ def save_draft(model, path, *, max_shard_size="5GB"):
     _require_unwrapped(model)
     state = model.state_dict()
     # an FSDP1 root above the draft leaves shard views; wrappers rename keys
-    expected = build_draft_model(model.config.draft, device="meta").state_dict()
-    if {k: v.shape for k, v in state.items()} != {
-        k: v.shape for k, v in expected.items()
-    }:
+    meta = build_draft_model(model.config.draft, device="meta")
+    shapes = {key: tuple(value.shape) for key, value in state.items()}
+    expected = {key: tuple(value.shape) for key, value in meta.state_dict().items()}
+    if shapes != expected:
+        differing = sorted(shapes.keys() ^ expected.keys()) or sorted(
+            f"{key}: {shapes[key]} != {expected[key]}"
+            for key in shapes
+            if shapes[key] != expected[key]
+        )
         raise TypeError(
-            "draft tensors do not match its configuration; "
+            f"draft tensors do not match its configuration ({differing[:3]}); "
             "save an unwrapped, gathered copy"
         )
     for key, value in state.items():
