@@ -42,6 +42,8 @@ class DSpineObjective:
     replacement_end_ratio: float = 1 / 3
     candidate_mass_threshold: float = 1e-4
 
+    default_weighting_options = ("loss_decay_gamma",)
+
     @property
     def default_loss(self):
         return TokenLoss(

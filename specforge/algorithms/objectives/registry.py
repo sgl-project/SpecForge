@@ -58,6 +58,18 @@ def build_objective_model(
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
     token_loss = TokenLoss(**(loss or {}))
+    _reject_shadowed_options(
+        options,
+        weighting is not None,
+        getattr(objective, "default_weighting_options", ()),
+        "weighting",
+    )
+    _reject_shadowed_options(
+        options,
+        token_loss.kind != "default",
+        getattr(objective, "default_loss_options", ()),
+        "loss",
+    )
     if weighting is None:
         gamma = getattr(objective, "loss_decay_gamma", None)
         weighting = getattr(objective, "default_weighting", None)
@@ -114,6 +126,16 @@ def build_objective_model(
         token_loss=token_loss,
         weighting=position_weighting,
     )
+
+
+def _reject_shadowed_options(options, replaced, names, selection):
+    given = {key for key, value in (options or {}).items() if value is not None}
+    shadowed = sorted(given & set(names)) if replaced else []
+    if shadowed:
+        raise ValueError(
+            f"{shadowed} only configure the default {selection}; "
+            f"set them in the explicit {selection} instead"
+        )
 
 
 def protocol_registrations():

@@ -30,6 +30,7 @@ class DFlashObjective:
     loss_decay_gamma: float | None = None
 
     default_loss = TokenLoss(kind="ce")
+    default_weighting_options = ("loss_decay_gamma",)
 
     def __post_init__(self):
         check_options(

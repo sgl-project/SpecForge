@@ -37,6 +37,7 @@ class DFlash2Objective:
     selector_stop_gradient: bool = False
 
     default_loss = TokenLoss(kind="ce")
+    default_weighting_options = ("loss_decay_gamma",)
 
     def __post_init__(self):
         check_options(

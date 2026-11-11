@@ -408,3 +408,25 @@ class ObjectiveContractTest(unittest.TestCase):
                     predictions, TokenLoss(), weighting
                 ).ratios["acc"]
                 self.assertEqual((correct.item(), total.item()), (2.0, 3.0))
+
+    def test_explicit_selection_rejects_options_it_would_ignore(self):
+        build_runtime("DSpineDraftModel", weighting={"kind": "uniform"})
+        build_runtime("DSparkDraftModel", loss={"kind": "kl"})
+        build_runtime(
+            "DSpineDraftModel", options={"ce_weight": 0.2}, loss={"kind": "kl"}
+        )
+        build_runtime(
+            "DFlashDraftModel",
+            options={"loss_decay_gamma": None},
+            weighting={"kind": "uniform"},
+        )
+        uniform, kl = {"weighting": {"kind": "uniform"}}, {"loss": {"kind": "kl"}}
+        for architecture, options, selection in (
+            ("DFlashDraftModel", {"loss_decay_gamma": 7.0}, uniform),
+            ("DSpineDraftModel", {"loss_decay_gamma": 7.0}, uniform),
+            ("Eagle3DraftModel", {"depth_decay": 0.1}, uniform),
+            ("DSparkDraftModel", {"ce_loss_alpha": 0.1}, kl),
+        ):
+            with self.subTest(architecture=architecture, options=options):
+                with self.assertRaisesRegex(ValueError, next(iter(options))):
+                    build_runtime(architecture, options=options, **selection)

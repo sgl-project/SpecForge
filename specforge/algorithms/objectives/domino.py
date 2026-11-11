@@ -31,6 +31,7 @@ class DominoObjective:
     lambda_base_decay_ratio: float = 0.5
 
     default_loss = TokenLoss(kind="ce")
+    default_weighting_options = ("loss_decay_gamma",)
 
     def __post_init__(self):
         check_options(

@@ -34,6 +34,9 @@ class DSparkObjective:
     l1_loss_alpha: float = 0.9
     confidence_loss_alpha: float = 1.0
 
+    default_weighting_options = ("loss_decay_gamma",)
+    default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
+
     @property
     def default_loss(self):
         return TokenLoss(

@@ -30,6 +30,7 @@ class Eagle3Objective:
     depth_decay: float = 0.8
 
     default_loss = TokenLoss(kind="soft_ce")
+    default_weighting_options = ("depth_decay",)
 
     def __post_init__(self):
         check_options(
