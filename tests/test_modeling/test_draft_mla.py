@@ -22,6 +22,7 @@ from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.residual import StandardResidualConnection
 from specforge.modeling.draft.layers.rope import build_rotary
+from tests.test_config.draft_fixtures import UnpairedRoPESpec
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -447,6 +448,8 @@ class MLATest(unittest.TestCase):
                     ),
                     rope,
                 )
+            with self.assertRaisesRegex(ValueError, "not a RotarySpec"):
+                build(node, UnpairedRoPESpec())
             allocate.assert_not_called()
         module = build(node, rope, device="meta")
         self.assertTrue(all(parameter.is_meta for parameter in module.parameters()))

@@ -20,6 +20,12 @@ def _unpad_metadata(valid):
     return indices, cumulative, int(lengths.max().item())
 
 
+def _reject_lse_gradient(grad):
+    raise NotImplementedError(
+        "FlashAttention does not backpropagate through LSE; use eager or Flex"
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class FlashMask:
     query_indices: Tensor
@@ -47,6 +53,7 @@ class FlashAttentionBackend(AttentionBackend):
                 "FlashAttention requires PaddingMask visibility; use Flex for arbitrary masks"
             )
         layout.validate_dimensions(batch_size, num_heads)
+        sliding_window = layout._resolve_window(sliding_window)
         qvalid = padding.query_valid.expand(batch_size, -1)
         kvalid = padding.key_valid.expand(batch_size, -1)
         if layout.active_queries is not None:
@@ -98,7 +105,16 @@ class FlashAttentionBackend(AttentionBackend):
     def attend(
         self, query, key, value, *, mask, scale, dropout_p, training, return_lse
     ):
-        if query.device.type != "cuda" or query.dtype not in (
+        is_cuda = query.device.type == "cuda"
+        if (
+            is_cuda
+            and query.dtype == torch.float32
+            and torch.is_autocast_enabled("cuda")
+        ):
+            # weighted QK norm promotes Q/K to FP32 under autocast; cast like SDPA
+            dtype = torch.get_autocast_dtype("cuda")
+            query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+        if not is_cuda or query.dtype not in (
             torch.float16,
             torch.bfloat16,
         ):
@@ -138,4 +154,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             lse = lse.view(heads, batch, length).transpose(0, 1)
             lse = lse.masked_fill(~mask.active_queries[:, None, :], -torch.inf)
+            if lse.requires_grad:
+                # flash_attn's varlen backward silently drops the LSE gradient
+                lse.register_hook(_reject_lse_gradient)
         return padded.view(batch, length, heads, width).transpose(1, 2), lse

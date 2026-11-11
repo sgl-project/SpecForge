@@ -125,8 +125,6 @@ class DraftPreTrainedTest(unittest.TestCase):
             torch.testing.assert_close(
                 parent.proj.weight, torch.zeros_like(parent.proj.weight)
             )
-        with torch.no_grad():
-            model.gated_projection.gate.fill_(7)
         state = {
             key: value
             for key, value in model.state_dict().items()

@@ -180,6 +180,58 @@ class DecoderAssemblyTest(unittest.TestCase):
     def test_cuda_mixed_stack_outputs_and_checkpoint_gradients(self):
         self._assert_checkpoint_parity("cuda")
 
+    def test_sdpa_matches_eager_for_decoder_and_eagle_assembly(self):
+        for config, build in (
+            (mixed_config(), build_decoder_backbone),
+            (mixed_config(convolution=True), build_decoder_backbone),
+            (peagle_config(), build_eagle_backbone),
+        ):
+            with self.subTest(architecture=config.architecture):
+                eager = build(config, backend="eager")
+                sdpa = build(config, backend="sdpa")
+                sdpa.load_state_dict(eager.state_dict())
+                width = config.spec_config.attention_input_width(config.hidden_size, 0)
+                hidden = torch.randn(2, 8, width)
+                layout = layout_for(hidden)
+                entries = [
+                    LayerInputs(
+                        attention_layout=layout, position_ids=layout.key_positions
+                    )
+                    for _ in config.layer_types
+                ]
+                expected = eager(hidden, entries)
+                actual = sdpa(hidden, entries)
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(
+                    torch.autograd.grad(actual.sum(), tuple(sdpa.parameters())),
+                    torch.autograd.grad(expected.sum(), tuple(eager.parameters())),
+                    rtol=1e-4,
+                    atol=1e-5,
+                )
+
+    def test_each_layer_prepares_its_own_layout(self):
+        config = mixed_config()
+        model = build_decoder_backbone(config, backend="eager")
+        hidden = torch.randn(2, 4, 32)
+        layout = layout_for(hidden)
+        entries = [
+            LayerInputs(
+                attention_layout=replace(
+                    layout,
+                    visibility=layout.visibility
+                    & (layout.key_positions[:, None, None, :] <= index),
+                ),
+                position_ids=layout.key_positions,
+            )
+            for index in range(config.num_hidden_layers)
+        ]
+        state = model.begin(hidden, entries)
+        for original, prepared in zip(entries, state.layer_inputs):
+            self.assertIs(prepared.attention.layout, original.attention_layout)
+        torch.testing.assert_close(
+            model(hidden, entries), model(hidden, state.layer_inputs), rtol=0, atol=0
+        )
+
     def test_missing_builders_fail_before_allocating_weights(self):
         config = mixed_config(convolution=True)
         for key in (
@@ -245,7 +297,7 @@ class DecoderAssemblyTest(unittest.TestCase):
             for config in (eagle_config(), peagle_config()):
                 with self.assertRaisesRegex(ValueError, "input fusion"):
                     build_decoder_backbone(config, backend="eager")
-            with self.assertRaisesRegex(ValueError, "eager"):
+            with self.assertRaisesRegex(ValueError, "unsupported attention backend"):
                 build_decoder_backbone(draft_config(), backend="flex")
             with self.assertRaisesRegex(TypeError, "DraftConfig"):
                 build_decoder_backbone({}, backend="eager")

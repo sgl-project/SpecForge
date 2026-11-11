@@ -88,6 +88,13 @@ class DecoderLayer(nn.Module):
                 "Decoder sublayers require a single [batch, sequence, hidden_size] stream"
             )
 
+    @staticmethod
+    def _check_update(update: Tensor, stream: Tensor, sublayer: str) -> Tensor:
+        # a multi-stream connection would broadcast a mis-shaped update silently
+        if not isinstance(update, Tensor) or update.shape != stream.shape:
+            raise ValueError(f"{sublayer} output must preserve the stream shape")
+        return update
+
     def _attention_update(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
         self._check_stream(hidden)
         # Position IDs are consumed by the backbone, not individual layers.
@@ -102,7 +109,7 @@ class DecoderLayer(nn.Module):
         )
         if self.attention_conv is not None:
             update = self.attention_conv.finish(update, coefficients)
-        return update
+        return self._check_update(update, hidden, "attention")
 
     def _mlp_update(self, hidden: Tensor) -> Tensor:
         self._check_stream(hidden)
@@ -112,4 +119,4 @@ class DecoderLayer(nn.Module):
         update = self.mlp(update)
         if self.mlp_conv is not None:
             update = self.mlp_conv.finish(update, coefficients)
-        return update
+        return self._check_update(update, hidden, "mlp")

@@ -103,14 +103,12 @@ class CanonicalDSpineTest(unittest.TestCase):
                 reference = LegacyDSpineDraftModel(legacy).to(
                     device=device, dtype=dtype
                 )
+                # Rebuild FP32 inv_freq on the test device to match canonical RoPE;
+                # legacy .to(bfloat16) rounds it, changing the parity reference.
                 with torch.device(device):
                     reference.rotary_emb = Qwen3RotaryEmbedding(legacy)
                 reference.load_state_dict(
-                    {
-                        legacy_name(n) or n: v
-                        for n, v in actual.state_dict().items()
-                        if n not in ("embed_tokens.weight", "lm_head.weight")
-                    },
+                    {legacy_name(n) or n: v for n, v in actual.state_dict().items()},
                     strict=True,
                 )
                 embedding, head = actual.embed_tokens, actual.lm_head
@@ -276,16 +274,21 @@ class CanonicalDSpineTest(unittest.TestCase):
             model.save_pretrained(path)
             weights = Path(path) / "model.safetensors"
             original = load_file(weights)
-            for key in ("transfer_codes", "injection.readouts.0.weight", "unexpected"):
+            for key in (
+                "transfer_codes",
+                "injection.readouts.0.weight",
+                "extra.tensor",
+            ):
                 with self.subTest(key=key):
                     state = dict(original)
-                    if key == "unexpected":
+                    if key == "extra.tensor":
                         state[key] = torch.zeros(1)
                     else:
                         del state[key]
                     save_file(state, weights)
-                    with self.assertRaisesRegex(ValueError, key):
+                    with self.assertRaises(ValueError) as error:
                         DSpineDraftModel.from_pretrained(path)
+                    self.assertIn(key, str(error.exception))
             save_file(original, weights)
             restored, info = DSpineDraftModel.from_pretrained(
                 path, output_loading_info=True
