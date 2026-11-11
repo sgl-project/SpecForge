@@ -1,8 +1,12 @@
 """Weight names for supported historical draft checkpoints, not native targets."""
 
+import logging
+
 import torch
 
 from specforge.config.draft.codec import decode_legacy_config
+
+logger = logging.getLogger(__name__)
 
 ARCHITECTURES = {
     "DFlashDraftModel",
@@ -19,6 +23,11 @@ ARCHITECTURES = {
 def _recorded_settings(directory):
     path = directory / "training_state.pt"
     if not path.is_file():
+        return {}, {}
+    unsafe = set(torch.serialization.get_unsafe_globals_in_checkpoint(path))
+    if unsafe and unsafe <= {"argparse.Namespace"}:
+        # pre-DataFlow scripts pickled argparse args beside HF weights; no records
+        logger.warning("Ignoring %s: pre-DataFlow training state", path)
         return {}, {}
     # Inspect structural provenance, never restore optimizer or trainer state.
     state = torch.load(path, map_location="meta", weights_only=True, mmap=True)

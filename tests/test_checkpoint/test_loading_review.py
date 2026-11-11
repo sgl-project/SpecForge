@@ -182,6 +182,30 @@ class LoadingReviewTest(unittest.TestCase):
                 "embed.weight",
             )
 
+    def test_pre_dataflow_training_state_beside_hf_weights_is_ignored(self):
+        """Old epoch dirs pickled argparse args next to save_pretrained weights."""
+        from argparse import Namespace
+        from datetime import datetime
+        from pickle import UnpicklingError
+
+        payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "source"
+            weights = write_target(target)
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file(
+                {"mtp.lm_head.weight": weights["lm_head.weight"]},
+                source / "model.safetensors",
+            )
+            torch.save({"args": Namespace(lr=1e-4)}, source / "training_state.pt")
+            with self.assertLogs("specforge.checkpoint.formats.legacy", "WARNING"):
+                read_draft(source, target=target)
+            # any other non-allowlisted object still fails loudly
+            torch.save({"saved_at": datetime(2026, 1, 1)}, source / "training_state.pt")
+            with self.assertRaises(UnpicklingError):
+                read_draft(source, target=target)
+
     def test_legacy_contract_and_saved_bound_table_are_checked(self):
         payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
         with TemporaryDirectory() as tmp:
