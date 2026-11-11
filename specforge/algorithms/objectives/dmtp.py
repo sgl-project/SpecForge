@@ -14,7 +14,13 @@ from .registry import register_protocol
     "dmtp",
     architectures=("DMTPDraftModel",),
     inputs=("input_ids", "hidden_states", "mtp_hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES + ("mtp_fusion",),
 )
 @dataclass

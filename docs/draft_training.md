@@ -27,10 +27,12 @@ result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
 `loss.kind` accepts `default`, `ce` (explicit labels), `soft_ce`, `kl`, `reverse_kl`,
-`js`, `tv`, `nla`, `lk` and `ce_l1`. Distillation needs aligned teacher logits or final states
+`js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
 plus a frozen head. `default` preserves each algorithm's base loss. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
-Weighting accepts `uniform`, `exponential` (gamma) or `geometric` (factor).
+Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
+`dpace`, `dpace-cumulative-confidence-only` or `dpace-continuation-value-only`
+(alpha, default 0.5).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
 factor. EAGLE/P-EAGLE apply weighting to rollout depth. DFlash2 selector warmup
@@ -80,6 +82,28 @@ single-token units. Projection does not rerun the backbone, and Domino computes
 base and corrected logits together. This boundary supports later chunked projection
 and fused-loss executors; this PR still uses the eager executor. Chunked DSpine
 training must reuse the optimizer-window alignment multiplier across chunks.
-D-PACE and the full legacy LK option set are not exposed by this API. Training
-configuration and resume serialization must carry loss and weighting selections
-when the canonical training entry adopts them.
+D-PACE groups predictions by stable `chain_ids` and ordered `positions`, including
+chains spanning EAGLE depth sets. `sequence_ids` balance valid anchors within each
+sequence. Credit weights are detached; the denominator counts valid sequences,
+not credit mass. This applies to explicit D-PACE selection, including protocols
+whose default loss uses a microbatch mean. The eager executor materializes complete
+chains before weighting; future chunked executors must preserve this normalization.
+
+Legacy LK modes use `lk_alpha`, `lk_tv` and `lk_lambda`. Their `options.target` is
+`labels` by default (one-hot acceptance), or `teacher` for distribution overlap.
+`kl_scale` and `kl_decay` default to 1.0; lambda uses detached mean acceptance over
+supervised positions. Teacher LK preserves the target probability mass outside a
+reduced draft vocabulary, and uses soft cross-entropy for its legacy KL term.
+The existing `lk` remains the per-token KL/TV hybrid, with configurable `eta`.
+
+```python
+runtime = build_objective_model(
+    draft,
+    loss={"kind": "lk_lambda", "options": {"kl_scale": 1.0, "kl_decay": 1.0}},
+    weighting={"kind": "dpace", "alpha": 0.5},
+)
+```
+
+For legacy EAGLE LK semantics, select `options.target="teacher"` and retain the
+default geometric weighting. Training configuration and resume serialization must
+carry these selections when the canonical training entry adopts them.

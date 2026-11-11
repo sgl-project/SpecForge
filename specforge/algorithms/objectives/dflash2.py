@@ -16,7 +16,13 @@ from .registry import register_protocol
     "dflash2",
     architectures=("DFlash2DraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES + ("candidate_selector",),
 )
 @dataclass

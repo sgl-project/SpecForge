@@ -17,7 +17,13 @@ from .registry import register_protocol
     "dspark",
     architectures=("DSparkDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES + ("markov_head", "confidence_head"),
 )
 @dataclass

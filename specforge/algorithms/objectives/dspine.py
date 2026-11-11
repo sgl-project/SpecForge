@@ -19,7 +19,13 @@ from .registry import register_protocol
     "dspine",
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=("backbone", "fusion", "injection"),
 )
 @dataclass

@@ -101,6 +101,8 @@ class ObjectiveModel(nn.Module):
         labels=None,
         positions=None,
         unit_size=1,
+        chain_ids=None,
+        sequence_ids=None,
         projection_inputs=None,
         auxiliary_inputs=None,
         **options,
@@ -125,10 +127,21 @@ class ObjectiveModel(nn.Module):
             )
         if positions is None:
             positions = torch.arange(unit_size, device=hidden.device)
+        hidden = hidden.reshape(-1, unit_size, hidden.shape[-1])
+        if chain_ids is None:
+            chain_ids = torch.arange(hidden.shape[0], device=hidden.device)[:, None]
+        if sequence_ids is None:
+            sequence_ids = torch.arange(mask.shape[0], device=hidden.device).reshape(
+                -1, *([1] * (mask.ndim - 1))
+            )
         return Predictions(
-            hidden=hidden.reshape(-1, unit_size, hidden.shape[-1]),
+            hidden=hidden,
             projector=self.draft_model.project,
             mask=mask.reshape(-1, unit_size),
+            chain_ids=torch.broadcast_to(chain_ids, hidden.shape[:2]),
+            sequence_ids=torch.broadcast_to(sequence_ids, mask.shape).reshape(
+                -1, unit_size
+            ),
             labels=None if labels is None else labels.reshape(-1, unit_size),
             positions=torch.broadcast_to(positions, mask.shape).reshape(-1, unit_size),
             teacher=teacher,

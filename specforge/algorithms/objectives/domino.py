@@ -14,7 +14,13 @@ from .registry import register_protocol
     "domino",
     architectures=("DominoDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES + ("gru_head",),
 )
 @dataclass

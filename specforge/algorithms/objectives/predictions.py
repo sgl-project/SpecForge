@@ -47,6 +47,8 @@ class Predictions:
     projector: Callable
     mask: Tensor
     positions: Tensor
+    chain_ids: Tensor | None = None
+    sequence_ids: Tensor | None = None
     labels: Tensor | None = None
     teacher: Teacher | None = None
     projection_inputs: dict[str, Tensor] = field(default_factory=dict)
@@ -73,6 +75,11 @@ class Predictions:
             )
         if self.labels is not None and self.labels.shape != shape:
             raise ValueError("prediction labels must align with hidden states")
+        for value in (self.chain_ids, self.sequence_ids):
+            if value is not None and (
+                value.shape != shape or value.dtype != torch.long
+            ):
+                raise ValueError("chain and sequence IDs must be aligned int64 tensors")
         aligned = [*self.projection_inputs.values(), *self.auxiliary_inputs.values()]
         if self.teacher is not None:
             aligned.append(self.teacher.values)
@@ -82,6 +89,8 @@ class Predictions:
     @property
     def capabilities(self):
         flags = {"logits", "chain_positions"}
+        if self.chain_ids is not None and self.sequence_ids is not None:
+            flags.add("acceptance_chain")
         if self.labels is not None or self.vocab_mask is not None:
             flags.add("labels")
         if self.teacher is not None:
@@ -97,6 +106,10 @@ class Predictions:
             hidden=self.hidden[units],
             mask=self.mask[units],
             positions=self.positions[units],
+            chain_ids=None if self.chain_ids is None else self.chain_ids[units],
+            sequence_ids=(
+                None if self.sequence_ids is None else self.sequence_ids[units]
+            ),
             labels=None if self.labels is None else self.labels[units],
             teacher=None if self.teacher is None else self.teacher.select(units),
             projection_inputs={

@@ -15,7 +15,13 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
     "dflash",
     architectures=("DFlashDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES,
 )
 @dataclass

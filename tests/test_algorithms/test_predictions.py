@@ -103,12 +103,12 @@ class PredictionsTest(unittest.TestCase):
     def test_capability_mismatch_fails_before_freezing(self):
         with patch.dict(_LOSSES):
 
-            @register_loss("unsupported", requires=("logits", "acceptance_chain"))
+            @register_loss("unsupported", requires=("logits", "unsupported_capability"))
             def unsupported(logits, labels, teacher):
                 raise AssertionError("incompatible loss was executed")
 
             model = build_draft_model(configurations()[0])
-            with self.assertRaisesRegex(ValueError, "acceptance_chain"):
+            with self.assertRaisesRegex(ValueError, "unsupported_capability"):
                 build_objective_model(
                     model, loss={"kind": "unsupported"}, frozen=("backbone",)
                 )

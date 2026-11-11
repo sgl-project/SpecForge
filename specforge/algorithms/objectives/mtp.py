@@ -15,7 +15,13 @@ from .registry import register_protocol
     "mtp",
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=COMMON_MODULES,
 )
 @dataclass
@@ -61,5 +67,8 @@ class MTPObjective:
             labels=labels,
             mask=weights,
             positions=positions - positions[:, :1],
+            chain_ids=torch.arange(ids.shape[0], device=ids.device)[:, None]
+            .expand_as(positions)
+            .reshape(-1, 1),
         )
         return PredictionBatch((predictions,))

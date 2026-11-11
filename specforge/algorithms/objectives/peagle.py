@@ -20,7 +20,13 @@ from .registry import register_protocol
     "peagle",
     architectures=("PEagleDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    provides=("logits", "labels", "teacher_logits", "chain_positions"),
+    provides=(
+        "logits",
+        "labels",
+        "teacher_logits",
+        "chain_positions",
+        "acceptance_chain",
+    ),
     trains=("backbone", "fusion", "embed_tokens", "lm_head", "mask_hidden"),
 )
 @dataclass
@@ -85,6 +91,7 @@ class PEagleObjective:
             original + 1,
             mask=gather(supervised, original),
             positions=depths[None],
+            chain_ids=anchors.reshape(-1, 1),
             vocab_mask=model.vocabulary.t2d,
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
