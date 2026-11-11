@@ -53,7 +53,7 @@ class DominoObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            label_offset=int(spec.block.shift_label),
+            label_offset=spec.block.label_offset,
         )
         output = model(
             blocks.input_ids,
