@@ -11,6 +11,7 @@ from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.registry import _SPECS
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_dmtp_spec import dmtp_config
 from tests.test_config.test_draft_domino_spec import domino_spec
 from tests.test_config.test_draft_dspark_spec import dspark_spec
 from tests.test_config.test_draft_dspine_spec import dspine_config
@@ -42,6 +43,7 @@ def dflash2_config():
 
 
 EXPECTED = {
+    "DMTPDraftModel": dmtp_config,
     "MTPDraftModel": mtp_config,
     "PEagleDraftModel": peagle_config,
     "Eagle3DraftModel": eagle_config,

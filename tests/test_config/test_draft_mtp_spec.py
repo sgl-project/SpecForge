@@ -48,12 +48,14 @@ class MTPSpecTest(unittest.TestCase):
         node = mtp_config(target_bindings=(), target_logit_transform=None)
         payload = encode_config(node)
         # A final output is not an indexed intermediate decoder feature.
-        decode_config(payload, target_config={"hidden_size": 32})
+        decode_config(payload, target_config={"hidden_size": 32, "vocab_size": 64})
         with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
-            decode_config(payload, target_config={"hidden_size": 64})
+            decode_config(payload, target_config={"hidden_size": 64, "vocab_size": 64})
         spec = MTPSpec(target_features=FinalHiddenFeatureSpec(hidden_size=64))
         node = dataclasses.replace(node, spec_config=spec)
-        decode_config(encode_config(node), target_config={"hidden_size": 64})
+        decode_config(
+            encode_config(node), target_config={"hidden_size": 64, "vocab_size": 64}
+        )
 
     def test_causality_vocabulary_and_feature_types_are_checked(self):
         with self.assertRaisesRegex(ValueError, "causal"):
