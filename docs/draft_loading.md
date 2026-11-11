@@ -48,7 +48,8 @@ model = initialize_draft(
 Omitting `mapping` selects matching canonical names, excluding `allow_new`.
 Every owned tensor must be assigned or explicitly new; unused source tensors
 are reported. A warm-start source supplies weights only and is not checked
-against the new target configuration. Mapping keys are draft
+against the new target configuration; a legacy source's stored copies of
+target-bound tables count as source tensors. Mapping keys are draft
 prefixes and values are source prefixes. A `*` matches one path segment.
 
 Target copies are declared separately:

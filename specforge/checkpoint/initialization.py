@@ -161,16 +161,20 @@ def make_initialization_plan(
         ):
             raise ValueError(f"allow_new selects no draft tensor: {pattern}")
     if weights_from is not None:
+        # a legacy source's stored bound tables are ordinary source tensors here
+        source = dict(weights_from.weights) | {
+            f"{name}.weight": ref for name, ref in weights_from.bound_copies.items()
+        }
         if mapping is None:
             weights = {
                 name: ref
-                for name, ref in weights_from.weights.items()
+                for name, ref in source.items()
                 if name in state and name not in allowed
             }
             used = weights.keys()
         else:
-            weights, used = _expand(weights_from.weights, mapping)
-        unused = weights_from.weights.keys() - used
+            weights, used = _expand(source, mapping)
+        unused = source.keys() - used
     copies = {}
     if from_target is not None:
         if target_store is None:

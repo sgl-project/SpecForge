@@ -11,7 +11,11 @@ import torch
 from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.initialization import _TARGET_KEYS, resolve_bindings
+from specforge.checkpoint.initialization import (
+    _TARGET_KEYS,
+    make_initialization_plan,
+    resolve_bindings,
+)
 from specforge.checkpoint.resolve import target_configuration
 from specforge.checkpoint.tensors import TensorStore
 from specforge.loading import initialize_draft, load_draft, read_draft
@@ -154,6 +158,33 @@ class LoadingReviewTest(unittest.TestCase):
                         "extra": "lm_head",
                     },
                 )
+
+    def test_warm_start_uses_or_reports_stored_bound_tables(self):
+        """A stored bound table fills an owned module, else is reported unused."""
+        owned = draft_config(target_bindings=(), target_logit_transform=None)
+        with TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            save_draft(build_draft_model(owned), source)
+            write_target(target)
+            checkpoint = read_draft(source)
+            weights = dict(checkpoint.weights)
+            legacy = replace(
+                checkpoint,
+                weights=weights,
+                bound_copies={"lm_head": weights.pop("lm_head.weight")},
+            )
+            plan = make_initialization_plan(
+                build_draft_model(owned, device="meta"), weights_from=legacy
+            )
+            self.assertIn("lm_head.weight", dict(plan.weights))
+            with self.assertLogs("specforge.checkpoint.initialization", "WARNING"):
+                plan = make_initialization_plan(
+                    build_draft_model(draft_config(), device="meta"),
+                    weights_from=legacy,
+                    target_store=TensorStore(target),
+                    target_config=target_configuration(target),
+                )
+            self.assertIn("lm_head.weight", plan.unused)
 
     def test_fp8_unselected_weights_bind_but_selected_weights_fail(self):
         with TemporaryDirectory() as tmp:
