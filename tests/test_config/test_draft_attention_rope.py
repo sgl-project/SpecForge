@@ -13,7 +13,7 @@ from specforge.config.draft.codec import decode_config, encode_config, parse_dra
 from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.rope import DefaultRoPESpec, LinearRoPESpec, NoRoPESpec
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.draft_fixtures import UnpairedRoPESpec, draft_config
 from tests.test_config.test_draft_mla_spec import MLA
 
 
@@ -162,6 +162,15 @@ class AttentionRoPETest(unittest.TestCase):
             ValueError, "full.rope_parameters: unknown rope type"
         ):
             dataclasses.replace(base, attention_configs={"full": attention})
+
+    def test_rotating_rope_must_declare_its_pairing(self):
+        """A rule without `interleaved` fails validation, not the first forward."""
+        with patch.dict(registry._SCHEMAS):
+            registry.register_component_schema("rope", UnpairedRoPESpec)
+            with self.assertRaisesRegex(
+                ValueError, "^attention_configs.full: UnpairedRoPESpec rotates"
+            ):
+                draft_config(rope_parameters=UnpairedRoPESpec())
 
     def test_rope_override_on_a_non_rotary_kind_is_refused(self):
         @dataclasses.dataclass(frozen=True, kw_only=True)

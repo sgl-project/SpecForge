@@ -41,3 +41,14 @@ class RotarySpec(RopeSpec):
                 "partial_rotary_factor must produce a positive even rotary dimension"
             )
         return dim
+
+
+def attention_rotary_dim(rope: RopeSpec, head_dim: int) -> int:
+    """Rotary width attention applies; rotating needs the pairing `RotarySpec` declares."""
+    dim = rope.rotary_dim(head_dim)
+    if dim and not isinstance(rope, RotarySpec):
+        raise ValueError(
+            f"{type(rope).__name__} rotates {dim} dimensions but is not a "
+            "RotarySpec, so it declares no `interleaved` pairing"
+        )
+    return dim

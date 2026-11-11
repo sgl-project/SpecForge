@@ -23,7 +23,7 @@ from specforge.modeling.draft.layers.attention.masks import (
     dense_attention_mask,
 )
 from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.draft_fixtures import UnpairedRoPESpec, draft_config
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
 
@@ -435,6 +435,8 @@ class GQATest(unittest.TestCase):
                 )
             with self.assertRaises(ValueError):
                 build(replace(node, rope_parameters=NoRoPESpec()))
+            with self.assertRaisesRegex(ValueError, "not a RotarySpec"):
+                build(node, rope=UnpairedRoPESpec())
             allocate.assert_not_called()
         module = build(node)
         hidden = torch.randn(2, 3, 16)

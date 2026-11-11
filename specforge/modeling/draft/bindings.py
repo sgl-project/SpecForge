@@ -17,6 +17,8 @@ class _TargetWeight(nn.Module):
     The checkpoint loader owns target key resolution and supplies a materialized
     tensor. Constructing or restoring draft state alone never makes this module
     usable. Target tensors must be installed after meta materialization.
+    FSDP trainers must ignore these modules: their parameters are deliberately
+    absent from state_dict, including full-state-dict saves.
     """
 
     def __init__(self, vocab_size: int, hidden_size: int, *, device=None, dtype=None):
@@ -53,11 +55,13 @@ class _TargetWeight(nn.Module):
             raise ValueError("target weight shape must match the bound module")
         if source.is_meta or self.weight.is_meta:
             raise ValueError("materialize target and draft weights before binding")
-        value = source.detach().to(
-            device=self.weight.device, dtype=self.weight.dtype, copy=True
-        )
-        self._transform_weight(value)
-        self.weight.copy_(value)
+        if source.untyped_storage() is self.weight.untyped_storage():
+            raise ValueError(
+                "target source must not share storage with the bound weight"
+            )
+        self._bound = False
+        self.weight.copy_(source.detach())
+        self._transform_weight(self.weight)
         self.weight.requires_grad_(False)
         self._bound = True
 
