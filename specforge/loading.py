@@ -56,7 +56,7 @@ def _dtype(requested, checkpoint):
     types = {
         ref.info.dtype
         for ref in checkpoint.weights.values()
-        if ref.info.dtype.is_floating_point
+        if isinstance(ref.info.dtype, torch.dtype) and ref.info.dtype.is_floating_point
     }
     if len(types) != 1:
         raise ValueError(

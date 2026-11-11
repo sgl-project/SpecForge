@@ -68,15 +68,7 @@ def read_legacy(payload, store, target_config):
         for prefix, replacement in (
             ("layers.", "backbone.layers."),
             ("midlayer.", "backbone.layers.0."),
-            (
-                "norm.",
-                (
-                    "logit_norm."
-                    if architecture == "LlamaForCausalLMEagle3"
-                    and not config.spec_config.norm_output
-                    else "backbone.final_norm."
-                ),
-            ),
+            ("norm.", "backbone.final_norm."),
             ("fc.", "fusion.fc."),
             ("hidden_norm.", "fusion.hidden_norm."),
             ("pre_fc_norm_embedding.", "fusion.pre_fc_norm_embedding."),
