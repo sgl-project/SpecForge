@@ -10,6 +10,7 @@ from transformers import LlamaConfig
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling.draft.layers import build_component
+from specforge.modeling.draft.layers.attention.backends.eager import eager_attention
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models.eagle_fusion import (
     AuxiliaryFeatureProjection,
@@ -22,13 +23,18 @@ from tests.test_modeling.test_draft_mla import prepare
 
 
 def eager_reference(*, query, key, value, block_mask, enable_gqa, **kwargs):
-    # Replace only the legacy flex kernel with explicit eager math. This oracle
-    # tests fusion and residual wiring; attention components have separate oracles.
-    groups = query.shape[1] // key.shape[1]
-    key, value = key.repeat_interleave(groups, 1), value.repeat_interleave(groups, 1)
-    scores = (query @ key.transpose(-1, -2)) * query.shape[-1] ** -0.5
-    scores = scores.masked_fill(~block_mask, -torch.inf)
-    return scores.softmax(-1, dtype=torch.float32).to(query.dtype) @ value
+    # Swap only the legacy flex kernel for the canonical eager kernel: BLAS may round
+    # a stride-0 GQA repeat differently from repeat_interleave. This oracle tests
+    # fusion and residual wiring; attention components have separate oracles.
+    return eager_attention(
+        query,
+        key,
+        value,
+        attention_mask=block_mask,
+        scale=query.shape[-1] ** -0.5,
+        dropout_p=0.0,
+        training=False,
+    )
 
 
 def stage(*, norm_before_residual=False, device="cpu", dtype=torch.float32):
