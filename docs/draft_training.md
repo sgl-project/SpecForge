@@ -10,8 +10,9 @@ explicitly frozen parameters and target bindings are excluded.
 
 The default objectives cover EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino,
 DSpine, MTP and DMTP. They reuse explicit-label CE/L1 loss primitives and functional
-sampling/mask construction. EAGLE3 replays its recurrent tree with explicit dense
-visibility; it does not add algorithm hooks or mutable KV caches to the backbone.
+sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiable
+KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
+KV caches to the backbone.
 This is an eager reference path, including dense vocabulary projections; fused
 losses, sparse attention and sequence parallel execution are not implemented here.
 The legacy training path retains the optimized kernels. MTP/DMTP CE is evaluated
