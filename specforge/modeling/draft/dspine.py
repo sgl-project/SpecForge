@@ -13,6 +13,7 @@ from specforge.config.draft.architecture.dspine import AdjacentInjectionSpec
 
 from .dflash import DFlashDraftModel
 from .heads.adjacent_injection import AdjacentInjection as _AdjacentInjection
+from .heads.transfer_space import initialize_transfer_space
 from .registry import register_draft
 
 
@@ -152,35 +153,12 @@ class DSpineDraftModel(DFlashDraftModel):
             raise ValueError(
                 "DSpine transfer space requires the target head's full vocabulary and hidden width"
             )
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
-        width = head_weight.shape[1]
-        covariance = torch.zeros(
-            width, width, device=head_weight.device, dtype=torch.float32
+        initialize_transfer_space(
+            head_weight,
+            self.transfer_codes,
+            self.injection.readouts,
+            chunk_size=chunk_size,
         )
-        total = covariance.new_zeros(width)
-        for rows in head_weight.split(chunk_size):
-            normalized = F.normalize(rows.float(), dim=-1)
-            total.add_(normalized.sum(dim=0))
-            covariance.add_(normalized.T @ normalized)
-        mean = total / head_weight.shape[0]
-        covariance.sub_(head_weight.shape[0] * torch.outer(mean, mean))
-        values, directions = torch.linalg.eigh(covariance)
-        values = values[-self.dspine_config.transfer_rank :]
-        directions = directions[:, -self.dspine_config.transfer_rank :]
-        if not torch.isfinite(values).all() or (values <= 0).any():
-            raise ValueError(
-                "Target head has insufficient positive principal directions for transfer_rank"
-            )
-        for start in range(0, head_weight.shape[0], chunk_size):
-            rows = head_weight[start : start + chunk_size]
-            codes = F.normalize(
-                (F.normalize(rows.float(), dim=-1) - mean) @ directions / values.sqrt(),
-                dim=-1,
-            )
-            self.transfer_codes[start : start + len(rows)].copy_(codes)
-        for readout in self.injection.readouts:
-            readout.weight.copy_(directions.T)
         self.transfer_ready.fill_(True)
 
     def forward(

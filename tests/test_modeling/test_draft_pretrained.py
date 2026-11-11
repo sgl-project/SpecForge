@@ -106,14 +106,12 @@ class DraftPreTrainedTest(unittest.TestCase):
             ):
                 model._init_weights(module)
 
-    def test_parent_resets_run_on_fresh_and_partial_load(self):
+    def test_parent_resets_run_on_fresh_build_and_partial_artifacts_fail(self):
         model = DFlashDraftModel(model_config())
         for parent in (model.zero_projection, model.gated_projection):
             torch.testing.assert_close(
                 parent.proj.weight, torch.zeros_like(parent.proj.weight)
             )
-        with torch.no_grad():
-            model.gated_projection.gate.fill_(7)
         state = {
             key: value
             for key, value in model.state_dict().items()
@@ -121,15 +119,8 @@ class DraftPreTrainedTest(unittest.TestCase):
         }
         with TemporaryDirectory() as directory:
             model.save_pretrained(directory, state_dict=state)
-            restored = DFlashDraftModel.from_pretrained(directory)
-        torch.testing.assert_close(
-            restored.gated_projection.gate, model.gated_projection.gate
-        )
-        torch.testing.assert_close(restored.saved_scale.scale, torch.full((4,), 2.0))
-        for parent in (restored.zero_projection, restored.gated_projection):
-            torch.testing.assert_close(
-                parent.proj.weight, torch.zeros_like(parent.proj.weight)
-            )
+            with self.assertRaisesRegex(ValueError, "missing_keys"):
+                DFlashDraftModel.from_pretrained(directory)
 
     def test_explicit_meta_build_initializes_after_materialization(self):
         model = DFlashDraftModel(model_config(initializer_range=0), device="meta")

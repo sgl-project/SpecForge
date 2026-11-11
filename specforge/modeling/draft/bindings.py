@@ -138,3 +138,7 @@ class BoundLMHead(_TargetWeight):
 
     def forward(self, hidden: Tensor) -> Tensor:
         return F.linear(hidden, self.bound_weight())
+
+    def candidate_weights(self, token_ids: Tensor) -> Tensor:
+        """Gather installed, transformed rows for candidate-only logit scoring."""
+        return F.embedding(token_ids, self.bound_weight())
