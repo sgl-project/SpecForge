@@ -22,6 +22,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from specforge.modeling.draft.models.specialized.base import NativeDraftAdapter
+
 
 class MTPDraftModel(nn.Module):
     """Contract shared by all MTP draft architectures."""
@@ -44,6 +46,7 @@ class MTPDraftModel(nn.Module):
         "lm_head.weight",
     ]
 
+    checkpoint_adapter: type[NativeDraftAdapter]
     embed_tokens: nn.Embedding
     mtp: nn.Module
 
@@ -99,41 +102,23 @@ class MTPDraftModel(nn.Module):
             self.mtp.lm_head.requires_grad_(False)
 
     def native_state_dict(self) -> dict[str, torch.Tensor]:
-        """Return the draft weights in the native ``mtp.*`` serving layout."""
-        return {
-            key: value
-            for key, value in self.state_dict().items()
-            if key.startswith(self.NATIVE_KEY_PREFIX)
-        }
+        """Return weights using the concrete architecture's native layout."""
+        return self.checkpoint_adapter.native_state_dict(self.state_dict())
 
     def required_native_state_keys(self) -> set[str]:
-        """Return native keys that must exist for safe target initialization.
-
-        A shared lm_head is deliberately reconstructed from the target model,
-        and native Qwen3.5 checkpoints do not need to duplicate it under the
-        MTP prefix. Every other native draft tensor must be present; accepting a
-        partial prefix match would leave part of the trainable head randomized.
-        """
-        required = set(self.native_state_dict())
-        mtp_config = getattr(self.config, "mtp_config", None) or {}
-        if mtp_config.get("share_lm_head", True):
-            required.discard(f"{self.NATIVE_KEY_PREFIX}lm_head.weight")
-        return required
+        return self.checkpoint_adapter.required_keys(
+            self.state_dict(),
+            share_lm_head=(getattr(self.config, "mtp_config", None) or {}).get(
+                "share_lm_head", True
+            ),
+        )
 
     def allowed_extra_native_state_keys(self) -> set[str]:
-        """Native keys a merged checkpoint may carry that the draft never owns.
-
-        ``export/mtp.merge_mtp_into_base`` backfills shared embeddings into the
-        native namespace so serving can instantiate ``mtp.embed_tokens`` (and a
-        separate ``mtp.lm_head`` for untied targets).  Re-finetuning a merged
-        checkpoint must tolerate those keys instead of rejecting the
-        checkpoint as incompatible.
-        """
-        extra = {f"{self.NATIVE_KEY_PREFIX}embed_tokens.weight"}
-        mtp_config = getattr(self.config, "mtp_config", None) or {}
-        if mtp_config.get("share_lm_head", True):
-            extra.add(f"{self.NATIVE_KEY_PREFIX}lm_head.weight")
-        return extra
+        return self.checkpoint_adapter.allowed_extra_keys(
+            share_lm_head=(getattr(self.config, "mtp_config", None) or {}).get(
+                "share_lm_head", True
+            )
+        )
 
 
 __all__ = ["MTPDraftModel"]
