@@ -94,6 +94,7 @@ def read_checkpoint(
     *,
     target_config=None,
     legacy_config=None,
+    legacy_settings=None,
     adapter=None,
     cache_dir=None,
     check_target=True,
@@ -131,13 +132,19 @@ def read_checkpoint(
     bound_copies = {}
     if matches[0] == "legacy":
         config, weights, metadata = read_legacy(
-            payload, store, target_config, check_target=check_target
+            payload,
+            store,
+            target_config,
+            check_target=check_target,
+            settings=legacy_settings,
         )
         for name in config.target_bindings:
             key = name + ".weight"
             if key in weights:
                 bound_copies[name] = weights.pop(key)
     else:
+        if legacy_settings:
+            raise ValueError("legacy_settings apply only to legacy checkpoints")
         config, weights, metadata = _ADAPTERS[matches[0]][1](
             payload, store, target_config if check_target else None
         )

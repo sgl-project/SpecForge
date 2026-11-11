@@ -197,3 +197,23 @@ CE once per window and passes the alignment coefficient into the objective.
 Objective evaluation performs no collectives; the objective itself never reduces
 its alignment statistics across ranks. Transfer-space initialization and
 restoration remain owned by the public model loader.
+
+Legacy checkpoints keep their original full-resume path (`model.draft_*` plus
+`training.resume_from`). Importing one through `initialization.checkpoint` or
+`weights_from` reads weights and effective settings only; it does not translate
+optimizer shards, scheduler state or RNG. For legacy imports, explicit
+`model.mask_token_id`, `model.aux_hidden_state_layer_ids` and
+`training.norm_before_residual` must agree with recorded settings. Canonical YAML
+keeps these settings in its architecture nodes.
+
+For scratch training, `model.load_target_embedding: true` copies the target table
+into an owned embedding through `from_target`, with shape/dtype validation.
+Explicit target mappings take precedence; checkpoint and warm-start embeddings
+are preserved. Target-bound tables always follow their bindings. Teacher heads
+and draft bindings use the same target key resolver and cached source tensors;
+a compatible bound head is shared directly.
+
+Canonical training uses PyTorch kernels by default. `model.use_liger_kernel: true`
+selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain their
+PyTorch implementation. This option does not change parameter names or canonical
+configuration and is recorded in the training resume contract.

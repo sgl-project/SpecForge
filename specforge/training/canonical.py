@@ -13,6 +13,18 @@ def enabled(cfg):
     )
 
 
+def _legacy_settings(cfg):
+    return {
+        name: value
+        for name, value in {
+            "mask_token_id": cfg.model.mask_token_id,
+            "norm_before_residual": cfg.training.norm_before_residual,
+            "capture_layers": cfg.model.aux_hidden_state_layer_ids,
+        }.items()
+        if value is not None
+    }
+
+
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
@@ -39,12 +51,27 @@ def resolve_config(cfg, *, target_config=None):
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
             legacy_config=initialization.legacy_config if initialization else None,
+            legacy_settings=_legacy_settings(cfg),
         ).config
         if supplied is not None and supplied != loaded:
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
+        if cfg.training.resume_from:
+            from specforge.checkpoint.resolve import read_json
+
+            if (
+                read_json(Path(source) / "config.json").get("model_type")
+                != "specforge_draft"
+            ):
+                raise ValueError(
+                    "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+                )
         return loaded
+    if _legacy_settings(cfg) and not (initialization and initialization.weights_from):
+        raise ValueError(
+            "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
+        )
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -142,7 +169,6 @@ def resolve_run(cfg, registry, *, target_config=None):
         "num_depths",
         "down_sample_ratio",
         "down_sample_ratio_min",
-        "norm_before_residual",
     }
     from specforge.config.schema import TrainingConfig
 
@@ -241,6 +267,7 @@ def resolve_run(cfg, registry, *, target_config=None):
         attention_backends=frozenset({"eager"}),
         required_batch_size=1 if default == "peagle" else None,
         supports_vocab_mapping=vocab,
+        supports_liger_kernel=True,
     )
     spec = AlgorithmSpec(
         name=family,
@@ -283,11 +310,13 @@ def build_bundle(cfg, algorithm):
         StepRuntimeConfig,
     )
     from specforge.algorithms.objectives import build_objective_model, resolve_objective
+    from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import resolve_target_logits
+    from specforge.config.schema import ModelConfig
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
-    from specforge.modeling.target.target_head import TargetHead
+    from specforge.modeling.draft.layers.kernels import configure_kernels
     from specforge.modeling.target.target_utils import (
         load_target_config,
         target_hidden_size,
@@ -310,8 +339,20 @@ def build_bundle(cfg, algorithm):
         from specforge.training.checkpoint import CheckpointManager
 
         source = CheckpointManager.resolve_resume_dir(cfg.training.resume_from)
+    target_weights = TargetWeights(
+        cfg.model.target_model_path,
+        cache_dir=cfg.model.cache_dir,
+        keys={
+            name: getattr(cfg.model, field)
+            for name, field in (
+                ("embed_tokens", "embedding_key"),
+                ("lm_head", "lm_head_key"),
+            )
+            if getattr(cfg.model, field) != ModelConfig.model_fields[field].default
+        },
+    )
     common = dict(
-        target=cfg.model.target_model_path,
+        target=target_weights,
         draft=draft,
         device=device,
         dtype=dtype,
@@ -324,35 +365,47 @@ def build_bundle(cfg, algorithm):
             **common,
             adapter=init.adapter if init else None,
             legacy_config=init.legacy_config if init else None,
+            legacy_settings=_legacy_settings(cfg),
         ).train()
     else:
         weights = init.weights_from if init else None
+        from_target = dict(init.from_target or {}) if init else {}
+        if (
+            weights is None
+            and cfg.model.load_target_embedding
+            and "embed_tokens" not in draft.target_bindings
+            and not any(
+                k in from_target for k in ("", "embed_tokens", "embed_tokens.weight")
+            )
+        ):
+            from_target["embed_tokens.weight"] = target_weights.resolve(
+                "embed_tokens"
+            ).key
         model = initialize_draft(
             **common,
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
-            from_target=init.from_target if init else None,
+            from_target=from_target or None,
             legacy_config=init.legacy_config if init else None,
+            legacy_settings=_legacy_settings(cfg),
         )
     teacher = None
     if resolved.requires_teacher:
-        loaded = TargetHead.from_pretrained(
-            cfg.model.target_model_path,
-            lm_head_key=cfg.model.lm_head_key,
-            embedding_key=cfg.model.embedding_key,
-            dtype=dtype,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-        teacher = BoundLMHead(
-            resolve_target_logits(target.to_dict()),
-            vocab_size=target_vocab_size(target),
-            hidden_size=target_hidden_size(target),
-            device=device,
-            dtype=dtype,
-        )
-        teacher.load_target_weight(loaded.fc.weight)
+        transform = resolve_target_logits(target.to_dict())
+        if isinstance(model.lm_head, BoundLMHead) and model.lm_head.config == transform:
+            teacher = model.lm_head
+        else:
+            teacher = BoundLMHead(
+                transform,
+                vocab_size=target_vocab_size(target),
+                hidden_size=target_hidden_size(target),
+                device=device,
+                dtype=dtype,
+            )
+            teacher.load_target_weight(target_weights.resolve("lm_head").read())
+    use_liger = cfg.model.use_liger_kernel is True
+    configure_kernels(model, use_liger=use_liger)
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -384,6 +437,7 @@ def build_bundle(cfg, algorithm):
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
+        "canonical_use_liger_kernel": use_liger,
         "canonical_frozen": tuple(cfg.training.frozen),
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),

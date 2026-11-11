@@ -6,25 +6,6 @@ from collections.abc import Mapping
 from .weight_plan import make_weight_plan
 
 logger = logging.getLogger(__name__)
-_TARGET_KEYS = {
-    "embed_tokens": (
-        "language_model.model.embed_tokens.weight",
-        "embed.weight",
-        "model.llm.embed.weight",
-        "model.word_embeddings.weight",
-        "model.language_model.embed_tokens.weight",
-        "model.embed_tokens.weight",
-        "embed_tokens.weight",
-    ),
-    "lm_head": (
-        "language_model.lm_head.weight",
-        "head.weight",
-        "model.llm.unembed.weight",
-        "model.language_model.lm_head.weight",
-        "model.lm_head.weight",
-        "lm_head.weight",
-    ),
-}
 
 
 def resolve_bindings(config, store, target_config):
@@ -34,19 +15,12 @@ def resolve_bindings(config, store, target_config):
         raise ValueError(
             "target checkpoint and configuration are required for target_bindings"
         )
-    refs, bindings = store.refs(), {}
-    for module in config.target_bindings:
-        candidates = [key for key in _TARGET_KEYS[module] if key in refs]
-        if (
-            module == "lm_head"
-            and not candidates
-            and target_config.get("tie_word_embeddings") is True
-        ):
-            candidates = [key for key in _TARGET_KEYS["embed_tokens"] if key in refs]
-        if len(candidates) != 1:
-            raise ValueError(f"{module}: expected one target key, found {candidates}")
-        bindings[module] = refs[candidates[0]]
-    return bindings
+    from .target import resolve_target_tensor
+
+    return {
+        name: resolve_target_tensor(store, target_config, name)
+        for name in config.target_bindings
+    }
 
 
 def _match(name, prefix):
@@ -197,7 +171,8 @@ def make_initialization_plan(
         )
     weights.update(copies)
     if weights_from is None:
-        allowed = state.keys() - weights.keys()
+        copied = {id(state[name]) for name in weights if name in state}
+        allowed = {name for name, value in state.items() if id(value) not in copied}
     if unused:
         logger.warning("Unused source draft tensors: %s", sorted(unused))
     return make_weight_plan(

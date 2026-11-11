@@ -12,6 +12,7 @@ from specforge.checkpoint.resolve import (
     resolve_directory,
     target_configuration,
 )
+from specforge.checkpoint.target import TargetWeights
 from specforge.checkpoint.tensors import TensorStore
 from specforge.checkpoint.weight_plan import _validate_unquantized
 from specforge.config.draft import DraftConfig
@@ -21,6 +22,8 @@ from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 
 
 def _target_config(source, cache_dir):
+    if isinstance(source, TargetWeights):
+        return source.config
     if source is None:
         return None
     return target_configuration(
@@ -31,7 +34,11 @@ def _target_config(source, cache_dir):
 def _target_store(source, config, from_target, cache_dir):
     if source is None or not (config.target_bindings or from_target):
         return None
-    return TensorStore(resolve_directory(source, cache_dir=cache_dir))
+    return (
+        source
+        if isinstance(source, TargetWeights)
+        else TensorStore(resolve_directory(source, cache_dir=cache_dir))
+    )
 
 
 def _check_bound_copies(checkpoint, preview, plan):
@@ -49,7 +56,13 @@ def _check_bound_copies(checkpoint, preview, plan):
 
 
 def read_draft(
-    source, *, target=None, legacy_config=None, adapter=None, cache_dir=None
+    source,
+    *,
+    target=None,
+    legacy_config=None,
+    legacy_settings=None,
+    adapter=None,
+    cache_dir=None,
 ):
     """Read structure and tensor references without constructing/loading a model.
 
@@ -61,6 +74,7 @@ def read_draft(
         source,
         target_config=target_config,
         legacy_config=legacy_config,
+        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -101,6 +115,7 @@ def load_draft(
     target=None,
     draft=None,
     legacy_config=None,
+    legacy_settings=None,
     adapter=None,
     device="cpu",
     dtype=None,
@@ -118,6 +133,7 @@ def load_draft(
         source,
         target_config=target_config,
         legacy_config=legacy_config,
+        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -162,6 +178,7 @@ def initialize_draft(
     backend="eager",
     cache_dir=None,
     legacy_config=None,
+    legacy_settings=None,
 ):
     """Construct scratch/new-structure weights, optionally copying explicit sources.
 
@@ -181,6 +198,7 @@ def initialize_draft(
             check_target=False,
             target_config=target_config,
             legacy_config=legacy_config,
+            legacy_settings=legacy_settings,
             cache_dir=cache_dir,
         )
     )

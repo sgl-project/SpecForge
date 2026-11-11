@@ -61,6 +61,137 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_target_tables_are_reused_and_owned_embedding_is_initialized(self):
+        from safetensors.torch import load_file
+
+        from specforge.checkpoint.tensors import TensorStore
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            original = TensorStore.read
+            reads = []
+
+            def read(store, key, region=None):
+                reads.append(key)
+                return original(store, key, region)
+
+            resolved = resolve_run(
+                run_config(
+                    target,
+                    draft_config(),
+                    training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                )
+            )
+            with patch.object(TensorStore, "read", read):
+                bundle = build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm
+                )
+            self.assertIs(bundle.target_head, bundle.draft_model.lm_head)
+            self.assertEqual(reads.count("lm_head.weight"), 1)
+            draft = peagle_config(target_width=32)
+            resolved = resolve_run(run_config(target, draft))
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            expected = load_file(target / "model.safetensors")[
+                "model.embed_tokens.weight"
+            ]
+            torch.testing.assert_close(
+                bundle.draft_model.embed_tokens.weight.cpu(), expected, rtol=0, atol=0
+            )
+
+    def test_target_aliases_survive_config_roundtrip(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            save_file(
+                {"embed_tokens.weight": torch.randn(64, 32)},
+                target / "model.safetensors",
+            )
+            payload = json.loads((target / "config.json").read_text())
+            payload["tie_word_embeddings"] = True
+            (target / "config.json").write_text(json.dumps(payload))
+            cfg = Config.model_validate(run_config(target, draft_config()).model_dump())
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            torch.testing.assert_close(
+                bundle.draft_model.embed_tokens.weight,
+                bundle.draft_model.lm_head.weight,
+            )
+
+    def test_legacy_import_settings_and_full_resume_boundary(self):
+        import shutil
+
+        from specforge.training.canonical import enabled
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            fixture = Path(shutil.copytree(fixture, Path(temp) / "legacy"))
+            torch.save({}, fixture / "training_state.pt")
+            raw = dict(
+                model={"target_model_path": str(target), "mask_token_id": 63},
+                initialization={"checkpoint": str(fixture)},
+                data={"hidden_states_path": str(target.parent / "features")},
+                training={"attention_backend": "eager"},
+            )
+            resolved = resolve_run(Config.model_validate(raw))
+            self.assertEqual(resolved.config.draft["spec_config"]["mask_token_id"], 63)
+            raw.pop("initialization")
+            raw["resume"] = str(fixture)
+            with self.assertRaisesRegex(ValueError, "legacy full resume"):
+                resolve_run(Config.model_validate(raw))
+            raw.pop("resume")
+            raw["training"] = {
+                "resume_from": str(fixture),
+                "attention_backend": "eager",
+            }
+            raw["model"]["draft_model_config"] = str(fixture)
+            self.assertFalse(enabled(Config.model_validate(raw)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Liger requires CUDA")
+    def test_liger_training_kernels_preserve_forward_and_gradients(self):
+        import copy
+
+        from specforge.config.draft.mlp import DenseFFNSpec
+        from specforge.config.draft.norm import RMSNormSpec
+        from specforge.modeling.draft.layers.kernels import configure_kernels
+        from specforge.modeling.draft.layers.mlp.dense import DenseFFN
+        from specforge.modeling.draft.layers.norm.rms import RMSNorm
+
+        for dtype in (torch.float32, torch.bfloat16):
+            for offset in (0, 1):
+                reference = torch.nn.Sequential(
+                    RMSNorm(
+                        RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=offset),
+                        hidden_size=32,
+                    ),
+                    DenseFFN(
+                        DenseFFNSpec(hidden_act="silu", intermediate_size=64),
+                        hidden_size=32,
+                    ),
+                ).to(device="cuda", dtype=dtype)
+                fused = copy.deepcopy(reference)
+                configure_kernels(fused, use_liger=True)
+                x = torch.randn(
+                    2, 8, 32, device="cuda", dtype=dtype, requires_grad=True
+                )
+                y = x.detach().clone().requires_grad_()
+                expected, actual = reference(x), fused(y)
+                expected.float().square().mean().backward()
+                actual.float().square().mean().backward()
+                tolerance = 1e-5 if dtype == torch.float32 else 1e-2
+                torch.testing.assert_close(
+                    actual, expected, rtol=tolerance, atol=tolerance
+                )
+                torch.testing.assert_close(
+                    x.grad, y.grad, rtol=tolerance, atol=tolerance
+                )
+                for p, q in zip(reference.parameters(), fused.parameters()):
+                    torch.testing.assert_close(
+                        p.grad, q.grad, rtol=tolerance, atol=tolerance
+                    )
+                self.assertEqual(
+                    reference.state_dict().keys(), fused.state_dict().keys()
+                )
+
     def test_training_parses_with_target_before_building_the_model(self):
         from unittest.mock import patch
 
@@ -71,7 +202,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             config = json.loads((target / "config.json").read_text())
             config["logits_mup_width_multiplier"] = 8
             (target / "config.json").write_text(json.dumps(config))
-            cfg = run_config(target, draft_config())
+            cfg = run_config(
+                target,
+                draft_config(),
+                training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+            )
             del cfg.draft["target_logit_transform"]
             resolved = resolve_run(cfg, target_config=training_target_config(cfg))
             self.assertEqual(
@@ -80,6 +215,12 @@ class CanonicalTrainingTest(unittest.TestCase):
             )
             bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
             self.assertEqual(bundle.draft_config.target_logit_transform.multiplier, 8)
+            from safetensors.torch import load_file
+
+            expected = load_file(target / "model.safetensors")["lm_head.weight"] / 8
+            torch.testing.assert_close(
+                bundle.target_head.weight.cpu(), expected, rtol=0, atol=0
+            )
             resolved.config.draft["spec_config"]["target_features"][
                 "target_layer_ids"
             ] = [99]
@@ -243,6 +384,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     "weighting": {"kind": "dpace", "alpha": 0.3},
                 },
             )
+            cfg.model.use_liger_kernel = tied
             first = build_application_run(cfg)
             first.run()
             checkpoint = root / "output" / "specforge-run-step1"

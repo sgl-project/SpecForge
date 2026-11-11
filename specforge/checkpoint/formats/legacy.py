@@ -29,7 +29,10 @@ def _recorded_settings(directory):
     return state, provenance
 
 
-def read_legacy(payload, store, target_config, *, check_target=True):
+def read_legacy(payload, store, target_config, *, check_target=True, settings=None):
+    explicit = settings or {}
+    if explicit.keys() - {"mask_token_id", "norm_before_residual", "capture_layers"}:
+        raise ValueError("unknown legacy settings")
     if target_config is None:
         raise ValueError(
             "legacy import requires target configuration to resolve saved semantics"
@@ -44,6 +47,13 @@ def read_legacy(payload, store, target_config, *, check_target=True):
             mask_token_id=state.get("peagle_mask_token_id"),
             norm_before_residual=state.get("peagle_norm_before_residual"),
         )
+    for name, value in explicit.items():
+        recorded = settings.get(name)
+        if name == "capture_layers" and recorded is not None:
+            recorded, value = tuple(recorded), tuple(value)
+        if recorded is not None and recorded != value:
+            raise ValueError(f"explicit {name} conflicts with recorded legacy setting")
+        settings[name] = value
     config = decode_legacy_config(
         payload, target_config=target_config, check_target=check_target, **settings
     )

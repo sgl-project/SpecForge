@@ -18,6 +18,7 @@ class DenseFFN(nn.Module):
             raise TypeError("DenseFFN requires DenseFFNSpec")
         positive_int("hidden_size", hidden_size)
         self.config = config
+        self.liger_swiglu = None
         self.act_fn = ACT2FN[config.hidden_act]
         self.gate_proj = nn.Linear(
             hidden_size,
@@ -42,9 +43,13 @@ class DenseFFN(nn.Module):
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
-        return self.down_proj(
-            self.act_fn(self.gate_proj(hidden)) * self.up_proj(hidden)
+        gate, up = self.gate_proj(hidden), self.up_proj(hidden)
+        activated = (
+            self.liger_swiglu(gate, up)
+            if self.liger_swiglu is not None
+            else self.act_fn(gate) * up
         )
+        return self.down_proj(activated)
 
 
 register_component_builder("mlp", DenseFFNSpec, DenseFFN)
