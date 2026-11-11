@@ -10,6 +10,7 @@ from torch import nn
 from specforge.algorithms.objectives import build_objective_model
 from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
 from specforge.algorithms.objectives.dflash2 import DFlash2Objective
+from specforge.algorithms.objectives.dspark import DSparkObjective
 from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
@@ -430,3 +431,23 @@ class ObjectiveContractTest(unittest.TestCase):
             with self.subTest(architecture=architecture, options=options):
                 with self.assertRaisesRegex(ValueError, next(iter(options))):
                     build_runtime(architecture, options=options, **selection)
+
+    def test_dspark_zero_confidence_weight_freezes_the_head(self):
+        _, runtime = build_runtime(
+            "DSparkDraftModel", options={"confidence_loss_alpha": 0.0}
+        )
+        head = runtime.draft_model.confidence_head
+        self.assertFalse(any(p.requires_grad for p in head.parameters()))
+        self.assertEqual(runtime.frozen_parameters, ("confidence_head",))
+        config = dspark_config(confidence=False)
+        model = build_draft_model(config)
+        for name in config.target_bindings:
+            model.get_submodule(name).load_target_weight(
+                torch.randn(config.vocab_size, config.hidden_size)
+            )
+        runtime = build_objective_model(model, options={"confidence_loss_alpha": 0.0})
+        self.assertEqual(runtime.frozen_parameters, ())
+        misspelled = property(lambda objective: ("confidence_haed",))
+        with patch.object(DSparkObjective, "frozen_parameters", misspelled):
+            with self.assertRaisesRegex(ValueError, "confidence_haed"):
+                build_runtime("DSparkDraftModel")

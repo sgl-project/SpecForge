@@ -38,6 +38,10 @@ class DSparkObjective:
     default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
 
     @property
+    def frozen_parameters(self):
+        return ("confidence_head",) if self.confidence_loss_alpha == 0 else ()
+
+    @property
     def default_loss(self):
         return TokenLoss(
             kind="ce_l1",

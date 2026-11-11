@@ -89,19 +89,30 @@ def build_objective_model(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
-    frozen = tuple(frozen) + getattr(objective, "frozen_parameters", ())
-    to_freeze = []
-    for prefix in frozen:
+    requested = tuple(frozen)
+    # a protocol may freeze an optional head this draft disables (set to None)
+    declared = getattr(objective, "frozen_parameters", ())
+    frozen, to_freeze = [], []
+    for prefix in requested + tuple(declared):
         try:
             try:
                 module = draft_model.get_submodule(prefix)
             except AttributeError:
                 module = draft_model.get_parameter(prefix)
         except AttributeError as error:
+            if (
+                prefix in declared
+                and prefix not in requested
+                and hasattr(draft_model, prefix)
+                and getattr(draft_model, prefix) is None
+            ):
+                continue
             raise ValueError(
                 f"unknown frozen parameter or module: {prefix!r}"
             ) from error
+        frozen.append(prefix)
         to_freeze.append(module)
+    frozen = tuple(frozen)
     uncovered = [
         key
         for key, parameter in draft_model.named_parameters()
@@ -125,6 +136,7 @@ def build_objective_model(
         name=name,
         token_loss=token_loss,
         weighting=position_weighting,
+        frozen_parameters=frozen,
     )
 
 

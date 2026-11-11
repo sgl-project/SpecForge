@@ -59,6 +59,7 @@ class ObjectiveModel(nn.Module):
         name=None,
         token_loss=None,
         weighting=None,
+        frozen_parameters=(),
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -68,6 +69,7 @@ class ObjectiveModel(nn.Module):
         self.target_head = target_head
         self.token_loss = token_loss
         self.weighting = weighting
+        self.frozen_parameters = tuple(frozen_parameters)
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
