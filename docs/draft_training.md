@@ -27,7 +27,9 @@ runtime = build_objective_model(
 result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
-`loss.kind` accepts `default`, `ce` (explicit labels), `soft_ce`, `kl`, `reverse_kl`,
+`loss.kind` accepts `default`, `ce` (the protocol's labels: data tokens for block and
+MTP protocols, the teacher's top-1 within the draft vocabulary for EAGLE3/P-EAGLE),
+`soft_ce`, `kl`, `reverse_kl`,
 `js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
 plus a frozen head. `default` preserves each algorithm's base loss. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
