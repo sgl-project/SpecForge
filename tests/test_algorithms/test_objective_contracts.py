@@ -502,3 +502,12 @@ class ObjectiveContractTest(unittest.TestCase):
         )
         result = runtime(batch, step=0, total_steps=None)
         self.assertEqual(result.denominator.item(), 2)
+
+    def test_runtime_keeps_the_resolved_default_loss(self):
+        _, dspark = build_runtime("DSparkDraftModel", options={"ce_loss_alpha": 0.3})
+        self.assertEqual(
+            dspark.token_loss,
+            TokenLoss(kind="ce_l1", options={"ce_weight": 0.3, "l1_weight": 0.9}),
+        )
+        _, eagle = build_runtime("Eagle3DraftModel")
+        self.assertEqual(eagle.token_loss, TokenLoss(kind="soft_ce"))

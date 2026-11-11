@@ -134,7 +134,7 @@ def build_objective_model(
         target_head,
         registration=entry,
         name=name,
-        token_loss=token_loss,
+        token_loss=selected_loss,
         weighting=position_weighting,
         frozen_parameters=frozen,
     )
