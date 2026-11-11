@@ -16,11 +16,20 @@ ALGORITHM = builtin_algorithm_registry().resolve("dspark")
 @unittest.skipUnless(CUDA, "DSpark offline launcher requires CUDA")
 class TestDSparkOfflineLaunch(unittest.TestCase):
     def test_dspark_trains_from_precomputed_target_features(self):
+        self._check_backend("fsdp")
+
+    def test_fsdp2_trains_through_the_same_launcher(self):
+        self._check_backend("fsdp2")
+
+    def _check_backend(self, training_backend):
         from tests.test_runtime import _fixtures as fx
 
         fx.build_single_rank_distributed(port="29580")
 
+        from torch.distributed.fsdp import FSDPModule
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        expected_wrapper = FSDPModule if training_backend == "fsdp2" else FSDP
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
@@ -47,6 +56,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
             algorithm=ALGORITHM,
             hidden_states_path=feature_dir,
             draft_model=model,
+            training_backend=training_backend,
             target_head=None,
             optimizer_factory=lambda module: BF16Optimizer(
                 module,
@@ -67,7 +77,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
         strategy = trainer.core.strategy
         self.assertIsInstance(strategy, DSparkTrainStrategy)
         module = strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(module, expected_wrapper)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 

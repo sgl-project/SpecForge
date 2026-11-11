@@ -403,6 +403,8 @@ class TestExportCheckpointPrecision(unittest.TestCase):
 
 @unittest.skipUnless(CUDA, "export round-trip requires CUDA")
 class TestExporters(unittest.TestCase):
+    training_backend = "fsdp"
+
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(0)
@@ -414,7 +416,7 @@ class TestExporters(unittest.TestCase):
         from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.backend import ParallelConfig, create_training_backend
         from specforge.training.controller import TrainerController, TrainerCore
         from specforge.training.strategies.base import Eagle3TrainStrategy
 
@@ -448,13 +450,17 @@ class TestExporters(unittest.TestCase):
             )
         )
 
-        opt = BF16Optimizer(
-            dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
+        backend = create_training_backend(
+            cls.training_backend,
+            ParallelConfig.from_distributed(),
+            optimizer_factory=lambda draft: BF16Optimizer(
+                draft, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
+            ),
         )
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
-        backend.prepare_model(model, wrap=False)
-        backend.set_optimizer(opt)
-        strategy = Eagle3TrainStrategy(model, target_head=head)
+        wrapped = backend.prepare_model(
+            model, wrap=cls.training_backend == "fsdp2", optimizer_target=dm
+        )
+        strategy = Eagle3TrainStrategy(wrapped, target_head=head)
         ctrl = TrainerController(
             TrainerCore(strategy, backend),
             run_id="exp",
@@ -561,6 +567,10 @@ class TestExporters(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _serving_state({"fc.weight": torch.zeros(1)}, {})
+
+
+class TestFSDP2Exporters(TestExporters):
+    training_backend = "fsdp2"
 
 
 if __name__ == "__main__":
