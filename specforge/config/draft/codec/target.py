@@ -78,7 +78,9 @@ def validate_target(config: DraftConfig, target: Mapping) -> None:
         target_vocab_size = target.get("vocab_size")
         positive_int("target_config.vocab_size", target_vocab_size)
         if config.vocab_size < target_vocab_size:
-            raise ValueError("draft vocab_size must cover target vocab_size")
+            raise ValueError(
+                "Draft input embedding size (vocab_size) must be at least target vocab_size"
+            )
     if "lm_head" in config.target_bindings:
         if config.target_logit_transform != resolve_target_logits(target):
             raise ValueError("target_logit_transform does not match target_config")

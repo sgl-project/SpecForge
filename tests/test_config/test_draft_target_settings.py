@@ -187,7 +187,9 @@ class TargetSettingsTest(unittest.TestCase):
                             ),
                             config,
                         )
-                    with self.assertRaisesRegex(ValueError, "cover target vocab_size"):
+                    with self.assertRaisesRegex(
+                        ValueError, "Draft input embedding size"
+                    ):
                         reader(payload, target_config={**TARGET, "vocab_size": 80})
                     for size in (None, True, 0):
                         with self.assertRaisesRegex(
