@@ -98,12 +98,7 @@ class DSpineObjective:
             output.logits, blocks.labels, teacher_logits=teacher, top_k=self.top_k
         )
         refined = model.refine(output.pre_injection, blocks.predecessors)
-        head = model.lm_head
-        weights = (
-            head.candidate_weights(terms.topk_ids)
-            if hasattr(head, "candidate_weights")
-            else F.embedding(terms.topk_ids, head.weight)
-        )
+        weights = model.lm_head.candidate_weights(terms.topk_ids)
         scores = torch.einsum("...h,...kh->...k", refined, weights).float()
         covered = terms.topk_ids == blocks.labels[..., None]
         refinement = ce_l1_loss(

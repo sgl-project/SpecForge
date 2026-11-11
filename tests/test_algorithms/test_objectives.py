@@ -75,17 +75,19 @@ class ObjectiveTest(unittest.TestCase):
                             < config.draft_vocab_size,
                             d2t=torch.zeros_like(selected),
                         )
-                    if hasattr(model, "initialize_transfer_space"):
-                        model.initialize_transfer_space(
+                    for name in config.target_bindings:
+                        model.get_submodule(name).load_target_weight(
                             torch.randn(
                                 config.vocab_size, config.hidden_size, device=device
                             )
                         )
+                    if hasattr(model, "initialize_transfer_space"):
+                        model.initialize_transfer_space()
                     options = {"num_anchors": 2} if config.spec_config.protocol else {}
                     if config.architecture == "Eagle3DraftModel":
                         options["ttt_length"] = 2
                     if config.architecture == "PEagleDraftModel":
-                        options.update(mask_token_id=0, num_depths=2)
+                        options.update(num_depths=2)
                     runtime = build_objective_model(
                         model,
                         options=options,

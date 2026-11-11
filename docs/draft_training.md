@@ -23,7 +23,7 @@ Auxiliary features are `hidden_states`; final normalized target states are
 DMTP additionally requires `mtp_hidden_states` from a frozen MTP provider: state at
 anchor A fuses with token A+1, and the objective supervises A+2 onward. Objectives
 never run the target or frozen MTP themselves. P-EAGLE additionally needs an
-explicit `mask_token_id` training option and currently requires batch size one.
+`PEagleSpec.mask_token_id` configuration and currently requires batch size one.
 
 `ObjectiveResult` exposes an additive numerator, denominator and metric ratios.
 The trainer must pool these across microbatches and data-parallel ranks. DSpine's
