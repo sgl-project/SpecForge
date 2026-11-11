@@ -5,6 +5,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import torch.distributed as dist
+
 
 def read_artifact_metadata(config):
     """Validate directory-format metadata without treating it as model structure."""
@@ -36,6 +38,8 @@ def save_draft(model, path, *, max_shard_size="5GB"):
 
     if not isinstance(model.config, SpecForgeDraftConfig):
         raise TypeError("save_draft requires a canonical draft model")
+    if dist.is_initialized() and dist.get_rank() != 0:
+        raise ValueError("save_draft must be called on global rank 0")
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and (

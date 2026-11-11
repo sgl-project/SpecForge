@@ -1,6 +1,6 @@
 """Checkpoint metadata and selective tensor reads, without model construction."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -13,6 +13,8 @@ from .layout import read_weight_map_file, resolve_weight_layout
 class TensorInfo:
     shape: tuple[int, ...]
     dtype: torch.dtype | str
+    scales: tuple[str, ...] = ()
+    is_meta: bool = False
 
 
 @dataclass(frozen=True)
@@ -28,11 +30,9 @@ class TensorRef:
         return self.store.read(self.key, region)
 
 
-def _torch_state(path, *, metadata=False):
+def _torch_state(path):
     # mmap avoids materializing unrelated tensors in legacy .bin/training files.
-    state = torch.load(
-        path, map_location="meta" if metadata else "cpu", weights_only=True, mmap=True
-    )
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     if isinstance(state, dict) and "draft_state_dict" in state:
         state = state["draft_state_dict"]
     if not isinstance(state, dict) or not all(
@@ -54,8 +54,8 @@ class TensorStore:
         if root.is_file():
             layout, root = root, root.parent
         else:
-            _, filename = resolve_weight_layout(str(root), allow_missing=True)
-            layout = Path(filename) if filename else root / "training_state.pt"
+            _, filename = resolve_weight_layout(str(root))
+            layout = Path(filename)
             if not layout.is_file():
                 raise FileNotFoundError(f"no checkpoint weights in {root}")
         self.root = root.resolve()
@@ -83,9 +83,10 @@ class TensorStore:
                         for key in handle.keys()
                     }
             else:
+                self._loaded[file] = _torch_state(file)
                 metadata = {
-                    k: TensorInfo(tuple(v.shape), v.dtype)
-                    for k, v in _torch_state(file, metadata=True).items()
+                    k: TensorInfo(tuple(v.shape), v.dtype, is_meta=v.is_meta)
+                    for k, v in self._loaded[file].items()
                 }
             for key, info in metadata.items():
                 if key in self.metadata:
@@ -97,6 +98,15 @@ class TensorStore:
             raise ValueError(
                 f"index references missing tensors: {sorted(weight_map.keys() - self.metadata.keys())}"
             )
+
+        for key, info in self.metadata.items():
+            scales = tuple(
+                key + suffix
+                for suffix in ("_scale", "_scale_inv")
+                if key + suffix in self.metadata
+            )
+            if scales:
+                self.metadata[key] = replace(info, scales=scales)
 
     def refs(self):
         return {key: TensorRef(self, key) for key in self.metadata}
@@ -127,6 +137,9 @@ def _safe_dtype(name):
         "I16": torch.int16,
         "I8": torch.int8,
         "U8": torch.uint8,
+        "U16": torch.uint16,
+        "U32": torch.uint32,
+        "U64": torch.uint64,
         "BOOL": torch.bool,
     }
     # Preserve unknown/quantized metadata; only selected weights must be loadable.

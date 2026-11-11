@@ -44,3 +44,5 @@ jobs:
           tests.test_modeling.test_draft_peagle_codec
           tests.test_modeling.test_draft_mtp_codec
           tests.test_modeling.test_draft_eagle_rope_codec -v
+      - name: Test checkpoint loading and publication on CPU
+        run: python -m unittest discover -s tests/test_checkpoint -t . -v

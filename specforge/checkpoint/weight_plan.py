@@ -33,16 +33,25 @@ def _validate_dtype(name, source, destination, strict):
             )
 
 
+_QUANTIZED_DTYPES = {
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+    torch.float8_e5m2fnuz,
+    torch.float8_e8m0fnu,
+    torch.float4_e2m1fn_x2,
+}
+
+
 def _validate_unquantized(name, ref):
-    dtype = ref.info.dtype
-    scales = {ref.key + "_scale", ref.key + "_scale_inv"}
-    if (
-        isinstance(dtype, str)
-        or str(dtype).startswith(("torch.float8", "torch.float4"))
-        or scales.intersection(ref.store.metadata)
-    ):
+    info = ref.info
+    if info.is_meta:
         raise ValueError(
-            f"{name} <- {ref.key}: unsupported quantized/scaled weight ({dtype}); "
+            f"{name} <- {ref.key}: source tensor has no materialized storage"
+        )
+    if isinstance(info.dtype, str) or info.dtype in _QUANTIZED_DTYPES or info.scales:
+        raise ValueError(
+            f"{name} <- {ref.key}: unsupported quantized/scaled weight ({info.dtype}); "
             "provide unquantized weights"
         )
 
@@ -117,12 +126,15 @@ def make_weight_plan(
 
 
 def _local_tensor(tensor):
-    from torch.distributed.tensor import DTensor, Partial
+    from torch.distributed.tensor import DTensor, Replicate, Shard
 
     if not isinstance(tensor, DTensor):
         return tensor, None
-    if any(isinstance(p, Partial) for p in tensor.placements):
-        raise ValueError("loading into Partial DTensor placements is not supported")
+    for placement in tensor.placements:
+        if type(placement) not in (Shard, Replicate):
+            raise ValueError(
+                f"loading into {type(placement).__name__} DTensor placements is not supported"
+            )
     from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
     shape, offset = compute_local_shape_and_global_offset(
@@ -179,4 +191,8 @@ def apply_weight_plan(model, plan):
                 stride=module.weight.stride(),
             )
         module.load_target_weight(value)
+    for module in model.modules():
+        validate = getattr(module, "validate_draft_state", None)
+        if validate is not None:
+            validate()
     return model

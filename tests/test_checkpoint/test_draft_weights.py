@@ -24,7 +24,8 @@ from tests.test_config.draft_fixtures import draft_config
 def _sharded_load(rank, directory):
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
-    from torch.distributed.tensor import Shard, distribute_tensor
+    from torch.distributed.tensor import DTensor, Partial, Shard, distribute_tensor
+    from torch.distributed.tensor.placement_types import _StridedShard
 
     dist.init_process_group(
         "gloo",
@@ -49,6 +50,25 @@ def _sharded_load(rank, directory):
         torch.testing.assert_close(
             model.embed_tokens.weight.to_local(), expected, rtol=0, atol=0
         )
+        for placement in (Partial(), _StridedShard(0, split_factor=2)):
+            model.embed_tokens.weight = torch.nn.Parameter(
+                DTensor.from_local(
+                    torch.empty(32, 32),
+                    mesh,
+                    [placement],
+                    shape=(64, 32),
+                    stride=(32, 1),
+                    run_check=False,
+                ),
+                requires_grad=False,
+            )
+            with patch.object(
+                TensorStore, "read", side_effect=AssertionError("preflight read")
+            ):
+                with unittest.TestCase().assertRaisesRegex(
+                    ValueError, type(placement).__name__
+                ):
+                    apply_weight_plan(model, plan)
     finally:
         dist.destroy_process_group()
 
@@ -208,3 +228,48 @@ class DraftWeightsTest(unittest.TestCase):
             for metadata in (None, [], {}, {"format": "specforge", "version": 2}):
                 with self.subTest(metadata=metadata), self.assertRaises(ValueError):
                     read_artifact_metadata({"specforge_artifact": metadata})
+
+    def test_vocabulary_is_finalized_after_direct_copies(self):
+        from tests.test_modeling.test_canonical_eagle3 import (
+            install_mapping,
+            model_config,
+        )
+
+        model = build_draft_model(model_config())
+        install_mapping(model)
+        with TemporaryDirectory() as tmp:
+            save_draft(model, Path(tmp) / "draft")
+            refs = TensorStore(Path(tmp) / "draft").refs()
+            restored = build_draft_model(model_config())
+            apply_weight_plan(restored, make_weight_plan(restored, refs))
+            ids = torch.arange(model.config.draft.draft_vocab_size)
+            torch.testing.assert_close(
+                restored.vocabulary.to_target(ids), model.vocabulary.to_target(ids)
+            )
+            # Invalid mappings must not become usable merely because copying succeeded.
+            weights = {name: ref.read() for name, ref in refs.items()}
+            weights["vocabulary.d2t"].zero_()
+            save_file(weights, Path(tmp) / "bad.safetensors")
+            bad = TensorStore(Path(tmp) / "bad.safetensors").refs()
+            with self.assertRaisesRegex(ValueError, "ascending target IDs"):
+                apply_weight_plan(restored, make_weight_plan(restored, bad))
+            self.assertFalse(restored.vocabulary.ready)
+
+    def test_failed_publish_leaves_no_artifact_and_nonzero_rank_is_rejected(self):
+        model = build_draft_model(draft_config())
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "draft"
+            with patch(
+                "specforge.checkpoint.draft_dir.os.replace",
+                side_effect=RuntimeError("write failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "write failed"):
+                    save_draft(model, destination)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            with (
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch("torch.distributed.get_rank", return_value=1),
+            ):
+                with self.assertRaisesRegex(ValueError, "global rank 0"):
+                    save_draft(model, destination)
+            self.assertFalse(destination.exists())
