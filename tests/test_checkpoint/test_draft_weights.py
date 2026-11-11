@@ -73,6 +73,34 @@ def _sharded_load(rank, directory):
         dist.destroy_process_group()
 
 
+def _fsdp1_refusal(rank, directory):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + directory + "/rendezvous",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        wrapped = FullyShardedDataParallel(
+            build_draft_model(
+                draft_config(target_bindings=(), target_logit_transform=None)
+            ),
+            use_orig_params=True,
+            device_id=torch.device("cpu"),
+        )
+        for call in (
+            lambda: make_weight_plan(wrapped, {}),
+            lambda: save_draft(wrapped, Path(directory) / f"draft-{rank}"),
+        ):
+            with unittest.TestCase().assertRaisesRegex(TypeError, "FSDP1"):
+                call()
+    finally:
+        dist.destroy_process_group()
+
+
 class DraftWeightsTest(unittest.TestCase):
     def test_sharded_round_trip_ties_bindings_and_slices(self):
         for tied, bound in ((False, False), (True, False), (False, True)):
@@ -143,6 +171,13 @@ class DraftWeightsTest(unittest.TestCase):
                 Path(tmp) / "target.safetensors",
             )
             torch.multiprocessing.spawn(_sharded_load, args=(tmp,), nprocs=2, join=True)
+
+    def test_fsdp1_wrapped_draft_is_refused_on_every_rank(self):
+        """Its state_dict is a collective of temporary views: saves hang, loads vanish."""
+        with TemporaryDirectory() as tmp:
+            torch.multiprocessing.spawn(
+                _fsdp1_refusal, args=(tmp,), nprocs=2, join=True
+            )
 
     def test_preflight_rejects_without_reading_or_mutating(self):
         model = build_draft_model(
