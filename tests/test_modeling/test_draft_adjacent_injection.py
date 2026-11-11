@@ -93,6 +93,9 @@ class AdjacentInjectionTest(unittest.TestCase):
         node = AdjacentInjectionSpec(transfer_rank=4, message_size=8)
         module = AdjacentInjection(node, hidden_size=16, num_layers=2, device="meta")
         module.to_empty(device="cpu")
+        with torch.no_grad():
+            for parameter in module.parameters():
+                parameter.fill_(7)
         module.reset_draft_parameters()
         special = [
             module.bias,

@@ -14,7 +14,7 @@ from specforge.config.draft.rope import NoRoPESpec
 from specforge.modeling.draft.layers import DecoderLayer, MLAAttention
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.registry import _BUILDERS
-from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm
+from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm, LlamaRotaryEmbedding
 from specforge.modeling.draft.models.eagle_backbone import build_eagle_backbone
 from specforge.modeling.draft.models.eagle_fusion import (
     AuxiliaryFeatureProjection,
@@ -52,6 +52,11 @@ def config_for(kind, option):
 
 
 class EagleBackboneTest(unittest.TestCase):
+    def setUp(self):
+        # Compare eager FP32 assembly math, independently of legacy compile caches.
+        torch._dynamo.reset()
+        self.enterContext(patch("torch._dynamo.config.disable", True))
+
     def _parity(self, device):
         for kind in ("eagle3", "peagle"):
             for option in (False, True):
@@ -102,7 +107,15 @@ class EagleBackboneTest(unittest.TestCase):
                         )
                         for _ in config.layer_types
                     ]
-                    embeddings = actual.rotary[0](hidden, layout.key_positions)
+                    rotary = LlamaRotaryEmbedding(
+                        reference_config.head_dim,
+                        base=config.rope_parameters.rope_theta,
+                        device=device,
+                    )
+                    embeddings = tuple(
+                        table[0, 0][layout.key_positions]
+                        for table in rotary(hidden, seq_len=hidden.shape[1])
+                    )
                     causal = (
                         layout.key_positions[:, None, None, :]
                         <= layout.query_positions[:, None, :, None]
@@ -116,26 +129,24 @@ class EagleBackboneTest(unittest.TestCase):
                         for layer in references:
                             expected = layer(expected, causal, embeddings)
                     expected = final_norm(expected)
-                    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
                     expected.backward(upstream)
-                    torch.testing.assert_close(
-                        hidden.grad, other.grad, rtol=1e-5, atol=1e-5
-                    )
+                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
                     for name, parameter in actual.layers.named_parameters():
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(references.named_parameters())[name].grad,
-                            rtol=1e-5,
-                            atol=1e-5,
+                            rtol=0,
+                            atol=0,
                         )
                     for name, parameter in actual.final_norm.named_parameters():
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(final_norm.named_parameters())[name].grad,
-                            rtol=1e-5,
-                            atol=1e-5,
+                            rtol=0,
+                            atol=0,
                         )
 
     def test_cpu_legacy_eager_wiring(self):
@@ -220,7 +231,7 @@ class EagleBackboneTest(unittest.TestCase):
         with patch("torch.nn.Linear") as allocate:
             with self.assertRaisesRegex(ValueError, "Eagle3Spec or PEagleSpec"):
                 build_eagle_backbone(draft_config(), backend="eager")
-            with self.assertRaisesRegex(ValueError, "eager"):
+            with self.assertRaisesRegex(ValueError, "unsupported attention backend"):
                 build_eagle_backbone(eagle_config(), backend="flex")
             with patch.dict(_BUILDERS):
                 _BUILDERS.pop(("norm", "rms"))

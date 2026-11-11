@@ -180,6 +180,9 @@ class GroupedCausalConvTest(unittest.TestCase):
 
     def test_hf_missing_projection_restores_identity(self):
         model = DFlashDraftModel(model_config())
+        with torch.no_grad():
+            # non-identity base: a re-initialized kernel would not match
+            model.conv.base_kernel.normal_(std=0.1)
         with TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             weights_path = Path(directory) / "model.safetensors"
@@ -193,11 +196,12 @@ class GroupedCausalConvTest(unittest.TestCase):
         self.assertEqual(
             restored.conv.kernel_projection.weight.count_nonzero().item(), 0
         )
+        reference = make_conv()
+        with torch.no_grad():
+            reference.base_kernel.copy_(model.conv.base_kernel)
         hidden = torch.randn(1, 8, 16)
-        prepared, coefficients = restored.conv.prepare(hidden)
-        torch.testing.assert_close(prepared, hidden, rtol=0, atol=0)
         torch.testing.assert_close(
-            restored.conv.finish(hidden, coefficients), hidden, rtol=0, atol=0
+            run_pair(restored.conv, hidden), run_pair(reference, hidden), rtol=0, atol=0
         )
 
     def test_invalid_dimensions_fail_before_allocation(self):

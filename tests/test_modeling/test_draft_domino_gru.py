@@ -159,6 +159,16 @@ class DominoGRUTest(unittest.TestCase):
             restored.head(hidden, prefix), expected, rtol=0, atol=0
         )
 
+    def test_mismatched_batch_dimensions_are_rejected_before_gru(self):
+        head = DominoGRUHead(
+            GRUHeadSpec(hidden_size=3, projection_size=2), hidden_size=4, vocab_size=7
+        )
+        # Equal flattened batch sizes would otherwise hide the incompatible layout.
+        with patch.object(head.prefix_gru, "forward") as run:
+            with self.assertRaisesRegex(ValueError, "batch/hidden dimensions"):
+                head(torch.randn(2, 3, 2, 4), torch.randn(3, 2, 5, 4))
+            run.assert_not_called()
+
     def test_invalid_constructor_inputs_fail_before_allocation(self):
         with patch("torch.nn.Linear") as allocate:
             with self.assertRaises(TypeError):

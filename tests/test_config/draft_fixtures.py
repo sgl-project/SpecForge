@@ -1,5 +1,8 @@
 """Small effective draft configurations shared by configuration tests."""
 
+from dataclasses import dataclass
+from typing import ClassVar
+
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.architecture import DFlashSpec
 from specforge.config.draft.architecture.block import AnchoredBlockSpec
@@ -10,7 +13,17 @@ from specforge.config.draft.logits import NoLogitTransformSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
-from specforge.config.draft.rope import DefaultRoPESpec
+from specforge.config.draft.rope import DefaultRoPESpec, RopeSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnpairedRoPESpec(RopeSpec):
+    """Rotates every dimension but is not a `RotarySpec`, so it has no `interleaved`."""
+
+    rope_type: ClassVar[str] = "test_unpaired"
+
+    def rotary_dim(self, head_dim: int) -> int:
+        return head_dim
 
 
 def draft_config(**overrides):
