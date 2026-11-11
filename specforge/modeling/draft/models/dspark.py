@@ -105,6 +105,15 @@ class DSparkDraftModel(DraftPreTrainedModel):
         slots = self.config.draft.spec_config.protocol.num_model_slots
         if hidden.ndim != 3 or hidden.shape[1] % slots:
             raise ValueError("DSpark projection requires whole blocks")
+        if self.markov_head is not None and (
+            predecessor_ids is None
+            or predecessor_ids.shape != hidden.shape[:2]
+            or predecessor_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "configured Markov head requires integer predecessor_ids "
+                "aligned with hidden states"
+            )
         logits = self.lm_head(hidden)
         if self.markov_head is not None:
             shape = (hidden.shape[0], hidden.shape[1] // slots, slots)

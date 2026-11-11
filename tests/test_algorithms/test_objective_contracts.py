@@ -456,3 +456,12 @@ class ObjectiveContractTest(unittest.TestCase):
         with patch.object(DSparkObjective, "frozen_parameters", misspelled):
             with self.assertRaisesRegex(ValueError, "confidence_haed"):
                 build_runtime("DSparkDraftModel")
+
+    def test_dspark_projection_requires_integer_predecessors(self):
+        config = dspark_config()
+        model = build_draft_model(config)
+        slots = config.spec_config.protocol.num_model_slots
+        hidden = torch.zeros(1, slots, config.hidden_size)
+        for predecessors in (None, torch.zeros(1, slots)):
+            with self.assertRaisesRegex(ValueError, "predecessor_ids"):
+                model.project(hidden, predecessor_ids=predecessors)
