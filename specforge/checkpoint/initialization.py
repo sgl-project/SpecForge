@@ -197,7 +197,9 @@ def make_initialization_plan(
         )
     weights.update(copies)
     if weights_from is None:
-        allowed = state.keys() - weights.keys()
+        # by identity: the tied alias of a copied tensor is not new
+        assigned = {id(state[name]) for name in weights if name in state}
+        allowed = {name for name in state if id(state[name]) not in assigned}
     if unused:
         logger.warning("Unused source draft tensors: %s", sorted(unused))
     return make_weight_plan(

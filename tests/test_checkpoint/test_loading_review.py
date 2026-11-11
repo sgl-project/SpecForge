@@ -129,6 +129,32 @@ class LoadingReviewTest(unittest.TestCase):
                     )
                 store.assert_not_called()
 
+    def test_target_copy_into_one_name_of_a_tied_pair(self):
+        """Copying the embedding of a tied, owned table also fills its lm_head alias."""
+        config = draft_config(
+            target_bindings=(), target_logit_transform=None, tie_word_embeddings=True
+        )
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            tensors = write_target(target)
+            model = initialize_draft(
+                config,
+                target=target,
+                from_target={"embed_tokens": "model.embed_tokens"},
+            )
+            embed = tensors["model.embed_tokens.weight"]
+            torch.testing.assert_close(model.lm_head.weight, embed, rtol=0, atol=0)
+            # a copied name the draft lacks is still a plan error, not a KeyError
+            with self.assertRaisesRegex(ValueError, "unexpected draft tensors"):
+                initialize_draft(
+                    config,
+                    target=target,
+                    from_target={
+                        "embed_tokens": "model.embed_tokens",
+                        "extra": "lm_head",
+                    },
+                )
+
     def test_fp8_unselected_weights_bind_but_selected_weights_fail(self):
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / "target"
