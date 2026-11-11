@@ -111,7 +111,6 @@ def load_draft(
 
     Constructs on meta for preflight, then constructs the real model once and
     copies into its initialized tensors. Missing weights are never randomized.
-    Target-bound weights must be supplied before the returned model can run.
     """
     target_config = _target_config(target, cache_dir)
     checkpoint = read_checkpoint(

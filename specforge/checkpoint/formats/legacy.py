@@ -140,6 +140,4 @@ def read_legacy(payload, store, target_config, *, check_target=True):
         if name in weights:
             raise ValueError(f"legacy tensors collide at {name}")
         weights[name] = ref
-    # A weights-only warm start may explicitly allow a new vocabulary mapping.
-    # Continuation still rejects missing buffers through ordinary plan validation.
     return config, weights, {}
