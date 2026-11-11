@@ -29,7 +29,8 @@ class DFlash2DraftModel(DraftPreTrainedModel):
     """DFlash plus sublayer convolutions and a low-rank candidate selector.
 
     `logits` are the transformed unary logits. Callers pick candidates from them
-    and score those through `candidate_selector`; sampling and losses stay theirs.
+    and score those through `candidate_selector` inside the same FSDP-wrapped
+    forward; sampling and losses stay theirs.
     """
 
     _no_split_modules = ["DecoderLayer"]
@@ -69,9 +70,14 @@ class DFlash2DraftModel(DraftPreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
+    def unary_logits_transform_is_identity(self) -> bool:
+        """Losses skip the FP32 logit copy when the transform only upcasts."""
+        spec = self.config.draft.spec_config
+        return spec.output_multiplier == 1 and spec.final_logit_softcapping is None
+
     def transform_unary_logits(self, logits: Tensor) -> Tensor:
         spec = self.config.draft.spec_config
-        if spec.output_multiplier == 1 and spec.final_logit_softcapping is None:
+        if self.unary_logits_transform_is_identity():
             return logits.float()
         logits = logits.float() * spec.output_multiplier
         if spec.final_logit_softcapping is not None:

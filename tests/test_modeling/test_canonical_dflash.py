@@ -66,12 +66,6 @@ def legacy_name(name):
 class CanonicalDFlashTest(unittest.TestCase):
     @legacy_fp32_rope()
     def _legacy_parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
         torch.manual_seed(0)
         config = draft_config(target_bindings=(), target_logit_transform=None)
         actual = build_draft_model(config, device=device, dtype=dtype)
@@ -106,17 +100,13 @@ class CanonicalDFlashTest(unittest.TestCase):
         )
         expected = head(expected_hidden)
         torch.testing.assert_close(
-            output.hidden_states, expected_hidden, rtol=tolerance, atol=tolerance
+            output.hidden_states, expected_hidden, rtol=0, atol=0
         )
-        torch.testing.assert_close(
-            output.logits, expected, rtol=tolerance, atol=tolerance
-        )
+        torch.testing.assert_close(output.logits, expected, rtol=0, atol=0)
         upstream = torch.randn_like(expected)
         output.logits.backward(upstream)
         expected.backward(upstream)
-        torch.testing.assert_close(
-            features.grad, other_features.grad, rtol=tolerance, atol=tolerance
-        )
+        torch.testing.assert_close(features.grad, other_features.grad, rtol=0, atol=0)
         for name, parameter in actual.named_parameters():
             if legacy_name(name) is not None:
                 ref = dict(reference.named_parameters())[legacy_name(name)]
@@ -125,9 +115,7 @@ class CanonicalDFlashTest(unittest.TestCase):
                     embeddings.weight if name == "embed_tokens.weight" else head.weight
                 )
             self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(
-                parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-            )
+            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
 
     def test_cpu_complete_legacy_forward_and_backward(self):
         for dtype in (torch.float32, torch.bfloat16):

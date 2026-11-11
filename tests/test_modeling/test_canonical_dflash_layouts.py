@@ -19,6 +19,7 @@ from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
 from specforge.modeling.draft.layers.attention import gqa
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
@@ -84,6 +85,9 @@ def training_layout(anchors, keep, block):
 
 
 class CanonicalDFlashLayoutTest(unittest.TestCase):
+    # Compare attention layout, not fused versus unfused convolution rounding.
+    @patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"})
+    @legacy_fp32_rope()
     def _parity(self, payload, dtype=torch.float32):
         layer_count = payload.get("num_target_layers") or 64
         target = {
@@ -165,35 +169,22 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
             "qwen3.8-27b-dflash2.json",
             "qwen3-8b-dflash.json",  # full bidirectional
         ):
-            with self.subTest(recipe=name):
-                self._parity(small_payload(name))
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(recipe=name, dtype=dtype):
+                    self._parity(small_payload(name), dtype=dtype)
 
     def test_mla_attention_matches_legacy_under_training_layouts(self):
-        self._parity(mla(small_payload("qwen3.8-27b-dflash2.json")))
+        payload = mla(small_payload("qwen3.8-27b-dflash2.json"))
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._parity(copy.deepcopy(payload), dtype=dtype)
 
     def _mha_bfloat16_matches_legacy(self):
-        # Preserve legacy rotation/layout as an independent reference; only
-        # promote its arithmetic to the canonical/SGLang FP32 precision rule.
-        tables = Qwen3RotaryEmbedding.forward
-
-        def fp32_tables(module, hidden, *args, **kwargs):
-            return tables(module, hidden.float(), *args, **kwargs)
-
-        def rotate(query, key, cos, sin, **kwargs):
-            q, k = apply_rotary_pos_emb(query.float(), key.float(), cos, sin, **kwargs)
-            return q.to(query.dtype), k.to(key.dtype)
-
-        with (
-            # Compare attention layout, not fused versus unfused convolution rounding.
-            patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}),
-            patch.object(Qwen3RotaryEmbedding, "forward", fp32_tables),
-            patch("specforge.modeling.draft.dflash.apply_rotary_pos_emb", rotate),
-        ):
-            for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
-                with self.subTest(recipe=name):
-                    payload = small_payload(name, num_key_value_heads=4)
-                    payload["dflash_config"]["attention_mode"] = "mha"
-                    self._parity(payload, dtype=torch.bfloat16)
+        for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
+            with self.subTest(recipe=name):
+                payload = small_payload(name, num_key_value_heads=4)
+                payload["dflash_config"]["attention_mode"] = "mha"
+                self._parity(payload, dtype=torch.bfloat16)
 
     def test_mha_rotary_preserves_legacy_layout(self):
         key = torch.randn(2, 16, 4, 8, dtype=torch.bfloat16).transpose(1, 2)
