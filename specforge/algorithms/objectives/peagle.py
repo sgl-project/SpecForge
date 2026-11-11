@@ -24,7 +24,6 @@ from .registry import register_objective
 )
 @dataclass
 class PEagleObjective:
-    mask_token_id: int
     num_depths: int = 8
     down_sample_ratio: float = 0.8
     down_sample_ratio_min: float = 0.2
@@ -32,7 +31,6 @@ class PEagleObjective:
     def __post_init__(self):
         check_options(
             counts={"num_depths": self.num_depths},
-            zero_counts={"mask_token_id": self.mask_token_id},
             probabilities={
                 "down_sample_ratio": self.down_sample_ratio,
                 "down_sample_ratio_min": self.down_sample_ratio_min,
@@ -58,9 +56,7 @@ class PEagleObjective:
         )
         original = (anchors + depths)[None]
         feature_mask = (depths > 0)[None]
-        sampled = shifted[:, anchors + depths].masked_fill(
-            feature_mask, self.mask_token_id
-        )
+        sampled = shifted[:, anchors + depths]
         index = torch.arange(anchors.numel(), device=ids.device)
         mask_mod = create_peagle_mask_mod(anchors, depths, lengths, ids.shape[1])
         visible = mask_mod(0, 0, index[:, None], index[None])[None]

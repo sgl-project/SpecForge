@@ -21,7 +21,7 @@ def teacher_distribution(model, logits):
     architectures=("Eagle3DraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     outputs=("logits", "hidden_states"),
-    trains=("backbone", "fusion", "embed_tokens", "lm_head", "logit_norm"),
+    trains=("backbone", "fusion", "embed_tokens", "lm_head"),
 )
 @dataclass
 class Eagle3Objective:
