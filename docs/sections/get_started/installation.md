@@ -32,7 +32,7 @@ using the command above for capture workloads. SpecForge pins Torch `2.14.1`
 and Transformers `5.19.0`, but does not install SGLang automatically.
 Normal installer caches are reused. Online
 training and offline feature preparation use the capture plugin; see the
-[plugin guide](../../../plugins/sglang-spec-capture/README.md) for server setup.
+[plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md) for server setup.
 Offline training from existing features does not require a capture server.
 
 - **Install from PyPI**
@@ -52,6 +52,14 @@ pip install specforge
 PyPI installation also requires the explicit SGLang installation above when
 using a capture server. Install SGLang and the capture plugin in the server's
 environment; an existing compatible server can be used separately.
+
+## Remote development container
+
+For VS Code development on a remote Linux NVIDIA host, follow the
+[Dev Container walkthrough](https://github.com/sgl-project/SpecForge/blob/main/.devcontainer/README.md).
+It covers Remote SSH, host UID/GID configuration, the isolated Python 3.11
+environment, and a first Llama EAGLE3 training run with external SGLang and
+Mooncake capture services.
 
 ## Accelerator-specific environments
 
