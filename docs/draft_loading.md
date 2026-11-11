@@ -90,3 +90,7 @@ Legacy imports check recorded capture, mask, residual and binding settings.
 A saved copy of a target-bound table must match the supplied target; importing
 must not silently replace trained weights. Hub imports also fetch
 `training_state.pt` for these structural records, without restoring training state.
+
+`initialize_draft` initializes a fresh DSpine transfer space after binding the
+target head. Warm starts preserve a loaded transfer space; partial transfer-state
+loads are rejected rather than overwriting trained readouts.

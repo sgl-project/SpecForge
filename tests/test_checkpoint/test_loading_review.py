@@ -22,6 +22,38 @@ from tests.test_config.test_draft_legacy_mtp import mtp_payload
 
 
 class LoadingReviewTest(unittest.TestCase):
+    def test_dspine_initializes_fresh_transfer_space_and_preserves_loaded_state(self):
+        from tests.test_modeling.test_canonical_dspine import model_config
+
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "draft"
+            write_target(target)
+            model = initialize_draft(model_config(), target=target)
+            self.assertTrue(model.transfer_ready.item())
+            with torch.no_grad():
+                model.injection.readouts[0].weight.add_(1)
+            save_draft(model, source)
+            for restored in (
+                load_draft(source, target=target),
+                initialize_draft(model_config(), target=target, weights_from=source),
+            ):
+                torch.testing.assert_close(
+                    restored.state_dict(), model.state_dict(), rtol=0, atol=0
+                )
+            for missing in ("transfer_ready", "transfer_codes", "injection.readouts"):
+                with (
+                    self.subTest(missing=missing),
+                    self.assertRaisesRegex(
+                        ValueError, "incomplete DSpine transfer space"
+                    ),
+                ):
+                    initialize_draft(
+                        model_config(),
+                        target=target,
+                        weights_from=source,
+                        allow_new=[missing],
+                    )
+
     def test_warm_start_selects_only_needed_weights(self):
         config = draft_config(target_bindings=(), target_logit_transform=None)
         with TemporaryDirectory() as tmp:
