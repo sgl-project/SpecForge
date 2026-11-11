@@ -523,3 +523,10 @@ class ObjectiveContractTest(unittest.TestCase):
         )
         _, mtp = build_runtime("MTPDraftModel")
         self.assertEqual(mtp.weighting, PositionWeighting())
+
+    def test_dspark_returns_a_per_microbatch_mean(self):
+        """Microbatches are averaged as means, like main, not pooled by token."""
+        config, runtime = build_runtime("DSparkDraftModel")
+        result = runtime(training_batch(config), step=0, total_steps=1)
+        self.assertEqual(result.denominator.item(), 1)
+        torch.testing.assert_close(result.loss, result.numerator)

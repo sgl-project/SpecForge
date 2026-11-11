@@ -317,3 +317,30 @@ class AcceptanceLossTest(unittest.TestCase):
                 [(weights, _)] = chain_weights([prediction], [projected], weighting)
                 self.assertGreater(weights[0].item(), 0)
                 self.assertEqual(weights[1:].tolist(), [0.0, 0.0])
+
+    def test_dpace_orders_each_chain_by_position(self):
+        torch.manual_seed(13)
+        prediction = Predictions(
+            hidden=torch.randn(3, 3, 5),
+            projector=lambda x: {"logits": x},
+            mask=torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]]),
+            positions=torch.arange(3).expand(3, 3),
+            labels=torch.arange(9).reshape(3, 3) % 5,
+            chain_ids=torch.arange(3)[:, None].expand(3, 3),
+            sequence_ids=torch.tensor([0, 0, 1])[:, None].expand(3, 3),
+        )
+        fields = ("hidden", "labels", "mask", "positions", "chain_ids", "sequence_ids")
+        depths = [
+            replace(
+                prediction, **{n: getattr(prediction, n)[:, d : d + 1] for n in fields}
+            )
+            for d in range(3)
+        ]
+        weighting = PositionWeighting(kind="dpace", alpha=0.3)
+        results = [
+            execute_batch(
+                PredictionBatch(sets), TokenLoss(kind="ce"), weighting, training=False
+            )
+            for sets in (depths, depths[::-1])
+        ]
+        torch.testing.assert_close(results[1].loss, results[0].loss)
