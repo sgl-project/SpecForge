@@ -26,7 +26,36 @@ from tests.test_config.test_draft_legacy_dspine import dspine_payload
 from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
 from tests.test_config.test_draft_legacy_peagle import peagle_payload
+from tests.test_modeling import test_canonical_dflash as _dflash
+from tests.test_modeling import test_canonical_domino as _domino
+from tests.test_modeling import test_canonical_eagle3 as _eagle3
+from tests.test_modeling import test_canonical_peagle as _peagle
 from tests.test_modeling.test_canonical_dflash import inputs_for
+
+
+def _mtp_legacy_name(name):
+    # the MTP forward-parity map, inlined: its test module is retired later in the stack
+    for prefix, legacy in (
+        ("fusion.", ""),
+        ("backbone.layers.", "layers."),
+        ("backbone.final_norm.", "norm."),
+    ):
+        if name.startswith(prefix):
+            return legacy + name[len(prefix) :]
+    return name
+
+
+# canonical -> legacy names, as the forward-parity tests prove them
+_LEGACY_NAMES = {
+    "legacy_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dflash2_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dspark_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dspine_payload": lambda name: _dflash.legacy_name(name) or name,
+    "domino_payload": _domino.reference_name,
+    "eagle_payload": _eagle3.legacy_name,
+    "peagle_payload": _peagle.legacy_name,
+    "mtp_payload": _mtp_legacy_name,
+}
 
 
 def dflash2_payload():
@@ -398,11 +427,18 @@ class LoadingTest(unittest.TestCase):
                 self.assertEqual(
                     restored.config.draft, read_draft(path, target=target).config
                 )
-                # Every persisted destination is backed by the actual old model.
                 artifact = read_draft(path, target=target)
-                for key, ref in artifact.weights.items():
+                # by value, through the maps the forward-parity tests prove
+                old_state = old.state_dict()
+                to_legacy = _LEGACY_NAMES[factory.__name__]
+                for key, value in restored.state_dict().items():
+                    if key == "vocabulary.ready":
+                        continue
+                    legacy = to_legacy(key)
+                    if legacy not in old_state:
+                        legacy = "mtp." + legacy
                     torch.testing.assert_close(
-                        restored.state_dict()[key], ref.read(), rtol=0, atol=0
+                        value, old_state[legacy], rtol=0, atol=0, msg=key
                     )
                 if factory is eagle_payload:
                     self.assertTrue(restored.vocabulary.ready)
