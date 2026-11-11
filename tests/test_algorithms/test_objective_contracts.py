@@ -112,10 +112,15 @@ class ObjectiveContractTest(unittest.TestCase):
             captured = objective.call_args.args[1]
             self.assertEqual(captured["hidden_states"].dtype, torch.bfloat16)
             self.assertEqual(captured["target_last_hidden_states"].dtype, torch.float32)
-            self.assertEqual(
-                runtime.teacher_logits(captured, torch.tensor([[1]])).dtype,
-                torch.float32,
-            )
+            teacher = runtime.predictions(
+                torch.zeros(1, 1, 32, dtype=torch.bfloat16),
+                captured,
+                torch.tensor([[1]]),
+                mask=torch.ones(1, 1),
+                labels=torch.zeros(1, 1, dtype=torch.long),
+            ).teacher
+            self.assertEqual(teacher.values.dtype, torch.float32)
+            self.assertEqual(teacher.logits().dtype, torch.float32)
 
     def test_dspark_stops_at_unsupervised_gap(self):
         config = dspark_config()

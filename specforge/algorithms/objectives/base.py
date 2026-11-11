@@ -18,17 +18,6 @@ class ObjectiveResult:
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
-def reduce_loss(per_token, weights, *, logits=None, labels=None, ratios=None):
-    denominator = weights.sum().detach()
-    metrics = dict(ratios or {})
-    if logits is not None:
-        metrics["acc"] = (
-            ((logits.argmax(-1) == labels) * weights).sum().detach(),
-            denominator,
-        )
-    return ObjectiveResult((per_token * weights).sum(), denominator, metrics)
-
-
 def microbatch_mean(result, *, global_denominator=False):
     """Preserve mean-of-microbatch losses; DDP averages rank gradients."""
     import torch.distributed as dist
@@ -79,19 +68,6 @@ class ObjectiveModel(nn.Module):
         if self.target_head is not None:
             self.target_head.eval()
         return self
-
-    def teacher_logits(self, batch, positions):
-        from .inputs import gather
-
-        with torch.no_grad():
-            if "target_logits" in batch:
-                return gather(batch["target_logits"], positions).detach()
-            if self.target_head is None:
-                raise ValueError(
-                    "this objective requires frozen target logits or a target head"
-                )
-            hidden = batch["target_last_hidden_states"]
-            return self.target_head(gather(hidden, positions).detach())
 
     def predictions(
         self,
