@@ -92,8 +92,9 @@ chains before weighting; future chunked executors must preserve this normalizati
 
 Legacy LK modes use `lk_alpha`, `lk_tv` and `lk_lambda`. Their `options.target` is
 `labels` by default (one-hot acceptance), or `teacher` for distribution overlap.
-`kl_scale` and `kl_decay` default to 1.0; lambda uses detached mean acceptance over
-supervised positions. Teacher LK preserves the target probability mass outside a
+`lk_lambda` also takes `kl_scale` and `kl_decay` (default 1.0) and uses detached mean
+acceptance over supervised positions; the other modes reject them. Unknown loss
+options fail when the loss is built. Teacher LK preserves the target probability mass outside a
 reduced draft vocabulary, and uses soft cross-entropy for its legacy KL term.
 The existing `lk` remains the per-token KL/TV hybrid, with configurable `eta`.
 

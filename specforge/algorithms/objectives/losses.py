@@ -1,5 +1,6 @@
 """Token losses and position weights, independent of algorithm execution."""
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -68,6 +69,7 @@ def _distillation(compute):
     def loss(logits, labels, teacher, **options):
         return compute(logits, teacher, **options)
 
+    loss._options_from = compute
     return loss
 
 
@@ -131,6 +133,24 @@ for _mode in ("alpha", "tv", "lambda"):
     register_loss(f"lk_{_mode}", contextual=True)(_lk(_mode))
 
 
+def _accepted_options(compute):
+    """Keyword options a loss accepts, or None when its signature cannot tell."""
+    try:
+        parameters = inspect.signature(
+            getattr(compute, "_options_from", compute), follow_wrapped=False
+        ).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    if any(p.kind is p.VAR_KEYWORD for p in parameters):
+        return None
+    return {
+        p.name
+        for p in parameters
+        if p.kind is p.KEYWORD_ONLY
+        or (p.default is not p.empty and p.name != "teacher")
+    }
+
+
 @dataclass(frozen=True)
 class TokenLoss:
     """Select a common loss without replacing algorithm execution or auxiliary loss."""
@@ -141,9 +161,19 @@ class TokenLoss:
     def __post_init__(self):
         if self.kind != "default" and self.kind not in _LOSSES:
             raise ValueError(f"unknown token loss: {self.kind!r}")
+        if self.kind == "default" and self.options:
+            raise ValueError("loss options require an explicit loss kind")
+        if self.options and not self.registration.contextual:
+            accepted = _accepted_options(self.registration.compute)
+            unknown = set() if accepted is None else self.options.keys() - accepted
+            if unknown:
+                raise ValueError(f"unknown {self.kind} options: {sorted(unknown)}")
 
         if self.kind in ("lk_alpha", "lk_tv", "lk_lambda"):
-            unknown = self.options.keys() - {"target", "kl_scale", "kl_decay"}
+            accepted = {"target"} | (
+                {"kl_scale", "kl_decay"} if self.kind == "lk_lambda" else set()
+            )
+            unknown = self.options.keys() - accepted
             if unknown:
                 raise ValueError(f"unknown LK options: {sorted(unknown)}")
             if self.options.get("target", "labels") not in ("labels", "teacher"):

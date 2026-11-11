@@ -1,15 +1,18 @@
 """Acceptance losses preserve legacy reduction and complete-chain weighting."""
 
+import functools
 import unittest
 from dataclasses import replace
 
 import torch
 
+from specforge.algorithms.objectives import losses
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.losses import (
     LossContext,
     PositionWeighting,
     TokenLoss,
+    register_loss,
 )
 from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
 from specforge.core.lk_loss import compute_lk_loss
@@ -31,7 +34,12 @@ class AcceptanceLossTest(unittest.TestCase):
                     torch.manual_seed(7)
                     runtime, legacy, names = block_pair("dflash")
                     runtime.token_loss = TokenLoss(
-                        kind=f"lk_{mode}", options={"kl_scale": 0.7, "kl_decay": 1.3}
+                        kind=f"lk_{mode}",
+                        options=(
+                            {"kl_scale": 0.7, "kl_decay": 1.3}
+                            if mode == "lambda"
+                            else {}
+                        ),
                     )
                     runtime.weighting = PositionWeighting(kind=weighting)
                     legacy.lk_loss_type, legacy.kl_scale, legacy.kl_decay = (
@@ -69,7 +77,8 @@ class AcceptanceLossTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 loss = TokenLoss(
                     kind=f"lk_{mode}",
-                    options={"target": "teacher", "kl_scale": 0.7, "kl_decay": 1.3},
+                    options={"target": "teacher"}
+                    | ({"kl_scale": 0.7, "kl_decay": 1.3} if mode == "lambda" else {}),
                 )
                 actual = (
                     loss(
@@ -218,3 +227,46 @@ class AcceptanceLossTest(unittest.TestCase):
             logits, teacher.argmax(-1), teacher=teacher
         )
         self.assertTrue(torch.isfinite(result).all())
+
+    def test_loss_options_are_checked_when_the_loss_is_built(self):
+        TokenLoss(kind="lk", options={"eta": 2.0})
+        TokenLoss(kind="ce_l1", options={"ce_weight": 0.2, "l1_weight": 0.8})
+        TokenLoss(kind="lk_lambda", options={"kl_scale": 0.5, "kl_decay": 2.0})
+        for kind, options in (
+            ("ce_l1", {"ce_wieght": 0.2}),
+            ("kl", {"eta": 2.0}),
+            ("default", {"ce_weight": 0.2}),
+            ("lk_tv", {"kl_scale": 0.5}),
+            ("lk_alpha", {"kl_decay": 2.0}),
+        ):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                TokenLoss(kind=kind, options=options)
+
+    def test_registered_losses_keep_their_own_options(self):
+        def temperature_ce(logits, labels, teacher=None, **options):
+            return logits.new_zeros(labels.shape) + options["temperature"]
+
+        def scaled(compute):
+            @functools.wraps(compute)
+            def loss(logits, labels, teacher=None, *, scale=1.0):
+                return scale * compute(logits, labels, teacher, temperature=1.0)
+
+            return loss
+
+        register_loss("test_temperature_ce")(temperature_ce)
+        register_loss("test_scaled_ce")(scaled(temperature_ce))
+        try:
+            labels = torch.zeros(1, 2, dtype=torch.long)
+            for kind, options, expected in (
+                ("test_temperature_ce", {"temperature": 2.0}, 2.0),
+                ("test_scaled_ce", {"scale": 3.0}, 3.0),
+            ):
+                with self.subTest(kind=kind):
+                    loss = TokenLoss(kind=kind, options=options)
+                    values = loss(torch.zeros(1, 2, 3), labels)
+                    self.assertTrue(bool((values == expected).all()))
+            with self.assertRaises(ValueError):
+                TokenLoss(kind="test_scaled_ce", options={"scael": 3.0})
+        finally:
+            losses._LOSSES.pop("test_temperature_ce")
+            losses._LOSSES.pop("test_scaled_ce")
