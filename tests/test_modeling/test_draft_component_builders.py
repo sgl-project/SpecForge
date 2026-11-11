@@ -33,10 +33,12 @@ class TestNormSpec(NormSpec):
 
 
 class TestNorm(nn.Module):
-    def __init__(self, config: TestNormSpec, *, hidden_size: int):
+    def __init__(
+        self, config: TestNormSpec, *, hidden_size: int, device=None, dtype=None
+    ):
         super().__init__()
         self.config = config
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
 
     def forward(self, hidden):
         return hidden * self.weight
@@ -120,6 +122,17 @@ class ComponentBuilderTest(unittest.TestCase):
                 "norm", TestNormSpec, lambda config: nn.Identity()
             )
 
+    def test_invalid_builder_signatures_fail_at_registration(self):
+        for builder in (
+            lambda: nn.Identity(),
+            lambda config: nn.Identity(),
+            lambda config, hidden_size, /, **kwargs: nn.Identity(),
+            lambda config, *, required_extra, **kwargs: nn.Identity(),
+        ):
+            with self.assertRaisesRegex(TypeError, "builder signature"):
+                register_component_builder("norm", TestNormSpec, builder)
+        self.assertNotIn(("norm", TestNormSpec.type), _BUILDERS)
+
     def test_unknown_or_unimplemented_kinds_fail_before_allocation(self):
         with patch("torch.nn.Parameter") as allocate:
             with self.assertRaisesRegex(ValueError, "no modeling builder"):
@@ -146,8 +159,8 @@ class ComponentBuilderTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             build_component("norm", Impostor(), hidden_size=4)
         for builder, error in (
-            (lambda config: object(), TypeError),
-            (lambda config: nn.Identity(), ValueError),
+            (lambda config, **kwargs: object(), TypeError),
+            (lambda config, **kwargs: nn.Identity(), ValueError),
         ):
             with patch.dict(_BUILDERS):
                 register_component_builder("norm", TestNormSpec, builder)

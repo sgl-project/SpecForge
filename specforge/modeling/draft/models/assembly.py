@@ -48,8 +48,6 @@ def build_decoder_backbone(
         raise TypeError("decoder assembly requires a resolved DraftConfig")
     if type(config.residual_config) is not StandardResidualSpec:
         raise ValueError("decoder assembly currently requires standard residuals")
-    if backend != "eager":
-        raise ValueError("decoder assembly currently supports only the eager backend")
     if any(
         config.spec_config.attention_input_width(config.hidden_size, index)
         != config.hidden_size

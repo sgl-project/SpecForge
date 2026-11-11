@@ -55,6 +55,10 @@ def stage(*, norm_before_residual=False, device="cpu", dtype=torch.float32):
 
 
 class EagleFusionTest(unittest.TestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+        self.enterContext(patch("torch._dynamo.config.disable", True))
+
     def test_auxiliary_projection_normalizes_chunks_before_projection(self):
         config = eagle_config()
         for normalized in (False, True):
@@ -89,29 +93,26 @@ class EagleFusionTest(unittest.TestCase):
                 expected = LlamaForCausalLMEagle3.project_hidden_states(
                     reference, other
                 )
-                torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 grad = torch.randn_like(output)
                 output.backward(grad)
                 expected.backward(grad)
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=1e-5, atol=1e-5
-                )
+                torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
                 for name, parameter in actual.named_parameters():
                     torch.testing.assert_close(
                         parameter.grad,
                         dict(reference.named_parameters())[name].grad,
-                        rtol=1e-5,
-                        atol=1e-5,
+                        rtol=0,
+                        atol=0,
                     )
                 self.assertIs(actual.config, config.spec_config.target_features)
 
     def _stage_parity(self, device, dtype):
         torch.manual_seed(0)
         # Canonical RoPE rotates in FP32 before casting; legacy rotates in dtype.
+        # Low-precision rotation rounds differently; FP32 eager math is exact.
         tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
+            2e-2 if dtype == torch.bfloat16 else 1e-2 if dtype == torch.float16 else 0
         )
         for normalized_residual in (False, True):
             with self.subTest(
@@ -191,13 +192,22 @@ class EagleFusionTest(unittest.TestCase):
         actual = stage()
         hidden = torch.randn(2, 4, 32)
         layout = layout_for(hidden)
+        prepared = prepare(actual.self_attn, layout, 2)
         with patch.object(actual.self_attn, "forward") as attention:
-            for value, inputs in (
-                (hidden[..., :16], LayerInputs(attention_layout=layout)),
-                (hidden, LayerInputs()),
-                (hidden, LayerInputs(attention_layout=layout, target_context=hidden)),
+            for value, inputs, message in (
+                (
+                    hidden[..., :16],
+                    LayerInputs(attention=prepared),
+                    r"2 \* hidden_size",
+                ),
+                (hidden, LayerInputs(), "requires prepared attention"),
+                (
+                    hidden,
+                    LayerInputs(attention=prepared, target_context=hidden),
+                    "not a target KV context",
+                ),
             ):
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, message):
                     actual(value, inputs)
             attention.assert_not_called()
         config = eagle_config()
