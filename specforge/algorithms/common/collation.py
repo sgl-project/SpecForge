@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence, Union
+
+PadTo = Union[int, Sequence[int]]
 
 
 def concatenate_features(features):
@@ -21,17 +23,38 @@ def concatenate_features(features):
     }
 
 
+def resolve_static_length(longest: int, pad_to) -> int:
+    """Length a batch is padded to under ``training.static_shapes``.
+
+    ``pad_to`` is one fixed length, or an ascending sequence of bucket lengths
+    (``training.static_shape_buckets``): the smallest bucket that fits the
+    longest sample wins. A sample longer than the (largest) length raises.
+    """
+    if pad_to is None:
+        return int(longest)
+    buckets = [int(pad_to)] if isinstance(pad_to, int) else sorted(int(b) for b in pad_to)
+    for bucket in buckets:
+        if longest <= bucket:
+            return bucket
+    raise ValueError(
+        f"sample length {longest} exceeds the static batch length {buckets[-1]}"
+    )
+
+
 def pad_and_concatenate_features(
     features,
     *,
     sequence_axes: Mapping[str, int],
     required_keys: Sequence[str],
     optional_keys: Sequence[str] = (),
+    pad_to: Optional[PadTo] = None,
 ):
     """Zero-pad configured tensor axes to the longest input sequence.
 
     ``optional_keys`` are collated when every sample carries them and omitted
-    when none does; a batch that mixes both raises.
+    when none does; a batch that mixes both raises.  With ``pad_to`` every
+    batch is padded to that fixed length instead (``training.static_shapes``),
+    and a longer sample raises.
     """
 
     if not features:
@@ -56,6 +79,7 @@ def pad_and_concatenate_features(
                 "omitted from every sample"
             )
     max_length = max(int(feature["input_ids"].shape[-1]) for feature in features)
+    max_length = resolve_static_length(max_length, pad_to)
 
     import torch
 
@@ -83,4 +107,4 @@ def pad_and_concatenate_features(
     return batch
 
 
-__all__ = ["concatenate_features", "pad_and_concatenate_features"]
+__all__ = ["concatenate_features", "pad_and_concatenate_features", "resolve_static_length"]
