@@ -124,6 +124,30 @@ class LoadingTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, key):
                         read_draft(source, target=target)
 
+    def test_legacy_peagle_residual_order_comes_from_resume_contract(self):
+        """main's YAML may override norm_before_residual; the JSON can omit it."""
+        payload = peagle_payload() | dict(
+            hidden_size=32, vocab_size=64, draft_vocab_size=64
+        )
+        payload.pop("norm_before_residual", None)
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "source"
+            write_target(target)
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
+            for recorded in (True, False):
+                with self.subTest(recorded=recorded):
+                    torch.save(
+                        {
+                            "peagle_mask_token_id": 63,
+                            "peagle_norm_before_residual": recorded,
+                        },
+                        source / "training_state.pt",
+                    )
+                    spec = read_draft(source, target=target).config.spec_config
+                    self.assertIs(spec.norm_before_residual, recorded)
+
     def test_legacy_capture_layers_come_from_training_provenance(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
         payload = json.loads((fixture / "config.json").read_text())
