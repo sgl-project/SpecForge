@@ -279,3 +279,9 @@ class AcceptanceLossTest(unittest.TestCase):
         context = LossContext(mask, None, torch.tensor(4.0))
         tv = TokenLoss(kind="lk_tv")(logits, labels, context=context)
         torch.testing.assert_close(tv, (1 - acceptance) * 2)
+
+    def test_geometric_zero_factor_keeps_the_anchor_slot_finite(self):
+        weights = PositionWeighting(kind="geometric", factor=0.0)(
+            torch.tensor([0.0, 1.0, 1.0]), torch.tensor([-1, 0, 1])
+        )
+        self.assertTrue(torch.isfinite(weights).all())

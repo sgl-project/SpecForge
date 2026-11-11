@@ -258,5 +258,5 @@ class PositionWeighting:
         if self.kind == "uniform":
             return weights
         if self.kind == "geometric":
-            return weights * self.factor**positions
+            return weights * self.factor ** positions.clamp_min(0)
         return weights * torch.exp(-positions.float().clamp_min(0) / self.gamma)
