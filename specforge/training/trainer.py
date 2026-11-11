@@ -31,7 +31,7 @@ from specforge.algorithms.common.providers import (
     checkpoint_key_fingerprint,
 )
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import ParallelConfig, create_training_backend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
@@ -87,6 +87,8 @@ class Trainer:
         model,
         target_head,
         optimizer_factory,
+        training_backend: str = "fsdp",
+        fsdp_sharding: Optional[str] = None,
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -426,11 +428,14 @@ class Trainer:
             del state, saved_weights
 
         parallel = ParallelConfig.from_distributed(
+            sharding_strategy=fsdp_sharding,
             tp_size=tp_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend = create_training_backend(
+            training_backend, parallel, optimizer_factory=optimizer_factory
+        )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
