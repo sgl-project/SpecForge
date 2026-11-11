@@ -465,3 +465,21 @@ class ObjectiveContractTest(unittest.TestCase):
         for predecessors in (None, torch.zeros(1, slots)):
             with self.assertRaisesRegex(ValueError, "predecessor_ids"):
                 model.project(hidden, predecessor_ids=predecessors)
+
+    def test_peagle_accepts_two_dimensional_document_lengths(self):
+        config = peagle_config()
+        losses = []
+        for lengths in (torch.tensor([3, 3]), torch.tensor([[3, 3]])):
+            torch.manual_seed(0)
+            model = build_draft_model(config)
+            install_mapping(model)
+            batch = {k: v[:, :6] for k, v in training_batch(config).items()}
+            batch.update(
+                loss_mask=torch.ones(1, 6),
+                attention_mask=torch.ones(1, 6),
+                lengths=lengths,
+                target_logits=torch.randn(1, 6, config.vocab_size),
+            )
+            runtime = build_objective_model(model, options={"num_depths": 1})
+            losses.append(runtime(batch, step=0, total_steps=None).loss)
+        torch.testing.assert_close(losses[0], losses[1])

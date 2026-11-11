@@ -59,7 +59,7 @@ class PEagleObjective:
         supervised = torch.cat((valid[:, 1:], torch.zeros_like(valid[:, :1])), 1)
         lengths = batch.get("lengths", ids.new_tensor([ids.shape[1]]))
         # A shifted label must stay in the same packed document.
-        ends = lengths.to(device=ids.device).cumsum(0)
+        ends = lengths.reshape(-1).to(device=ids.device).cumsum(0)
         supervised &= ~torch.isin(
             torch.arange(1, ids.shape[1] + 1, device=ids.device), ends
         )[None]
