@@ -1,31 +1,10 @@
 """Computational builders, separate from configuration schema registration."""
 
 from collections.abc import Callable
-from inspect import signature
 
 from torch import nn
 
 from specforge.config.draft.registry import component_schema, component_type
-
-# Runtime keywords supplied by each component's callers; **kwargs is allowed.
-_BUILDER_KWARGS = {
-    "norm": ("hidden_size", "device", "dtype"),
-    "mlp": ("hidden_size", "device", "dtype"),
-    "residual": (),
-    "conv": ("hidden_size", "block_size", "device", "dtype"),
-    "rope": ("head_dim",),
-    "logits": (),
-    "attention": (
-        "input_size",
-        "hidden_size",
-        "norm",
-        "rope",
-        "backend",
-        "training",
-        "device",
-        "dtype",
-    ),
-}
 
 _BUILDERS: dict[tuple[str, str], Callable[..., nn.Module]] = {}
 
@@ -45,12 +24,6 @@ def register_component_builder(
     existing = _BUILDERS.get(key)
     if existing is not None and existing is not builder:
         raise ValueError(f"component builder {kind}/{name} is already registered")
-    try:
-        signature(builder).bind(object(), **dict.fromkeys(_BUILDER_KWARGS[kind]))
-    except (TypeError, ValueError) as error:
-        raise TypeError(
-            f"{kind}/{name}: incompatible builder signature: {error}"
-        ) from error
     _BUILDERS[key] = builder
 
 
