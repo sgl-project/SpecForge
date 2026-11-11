@@ -1,16 +1,29 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
+import logging
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 
 
 def enabled(cfg):
-    return (
+    if (
         cfg.draft is not None
         or cfg.initialization is not None
         or cfg.resume is not None
-    )
+    ):
+        return True
+    if cfg.resume_path:
+        from specforge.checkpoint.resolve import read_json
+        from specforge.training.checkpoint import CheckpointManager
+
+        try:
+            directory = CheckpointManager.resolve_resume_dir(cfg.resume_path)
+        except FileNotFoundError:
+            return False  # Legacy launch planning need not have a local checkpoint.
+        path = Path(directory) / "config.json"
+        return path.is_file() and read_json(path).get("model_type") == "specforge_draft"
+    return False
 
 
 def _legacy_settings(cfg):
@@ -38,10 +51,10 @@ def resolve_config(cfg, *, target_config=None):
     )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
-    if cfg.training.resume_from:
+    if cfg.resume_path:
         from specforge.training.checkpoint import CheckpointManager
 
-        source = CheckpointManager.resolve_resume_dir(cfg.training.resume_from)
+        source = CheckpointManager.resolve_resume_dir(cfg.resume_path)
     if source:
         from specforge.loading import read_draft
 
@@ -57,7 +70,7 @@ def resolve_config(cfg, *, target_config=None):
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
-        if cfg.training.resume_from:
+        if cfg.resume_path:
             from specforge.checkpoint.resolve import read_json
 
             if (
@@ -86,11 +99,18 @@ def capture_layers(cfg, draft, target_config):
             draft,
             target_config=target_text_config(target_config).to_dict(),
         )
+    from specforge.config.draft.architecture.features import FinalHiddenFeatureSpec
+
     features = draft.spec_config.target_features
-    if hasattr(features, "target_layer_ids"):
-        return list(features.target_layer_ids)
-    target = getattr(target_config, "text_config", target_config)
-    return [target.num_hidden_layers - 1]
+    if isinstance(features, FinalHiddenFeatureSpec):
+        target = target_text_config(target_config)
+        if target.num_hidden_layers < 2:
+            raise ValueError(
+                "final-hidden capture requires a target with at least two layers"
+            )
+        # DFLASH capture requires an auxiliary tap; MTP discards this feature.
+        return [0]
+    return list(features.target_layer_ids)
 
 
 def minimum_loss_tokens(cfg, draft):
@@ -110,6 +130,31 @@ def _objective_settings(cfg):
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
     )
+
+
+def _validate_imported_objective(cfg, resolved):
+    init = cfg.initialization
+    if init is None or init.checkpoint is None:
+        return
+    from specforge.checkpoint.resolve import read_json, resolve_directory
+    from specforge.config.draft.codec.legacy.dspine import (
+        extract_dspine_training_settings,
+    )
+
+    source = resolve_directory(
+        init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
+    )
+    directory = source.parent if source.is_file() else source
+    payload = read_json(init.legacy_config or directory / "config.json")
+    if payload.get("model_type") == "specforge_draft" or payload.get(
+        "architectures"
+    ) != ["DSpineDraftModel"]:
+        return
+    for name, saved in extract_dspine_training_settings(payload).items():
+        if getattr(resolved.objective, name) != saved:
+            raise ValueError(
+                f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
+            )
 
 
 def resolve_run(cfg, registry, *, target_config=None):
@@ -141,6 +186,10 @@ def resolve_run(cfg, registry, *, target_config=None):
 
     from . import canonical_data
 
+    if cfg.model.draft_model_config or cfg.model.draft_checkpoint_path:
+        raise ValueError(
+            "canonical checkpoint cannot mix with legacy model.draft_* sources"
+        )
     draft = resolve_config(cfg, target_config=target_config)
     default = default_objective(draft.architecture)
     family = "dflash" if default in ("dflash2", "dmtp") else default
@@ -148,7 +197,14 @@ def resolve_run(cfg, registry, *, target_config=None):
         raise ValueError("training.strategy conflicts with the draft architecture")
     # New objectives have their own options. Never silently consume legacy
     # algorithm switches with a different meaning on the canonical path.
-    legacy_options = {
+    optimization_options = {
+        "objective_chunk_blocks",
+        "objective_checkpointing",
+        "fused_logits_loss",
+        "mtp_objective_chunk_size",
+        "trim_loss_positions",
+    }
+    legacy_options = optimization_options | {
         "loss_type",
         "lk_loss_type",
         "dpace_alpha",
@@ -176,14 +232,40 @@ def resolve_run(cfg, registry, *, target_config=None):
     present = {
         name
         for name in legacy_options
-        if getattr(cfg.training, name, None) != getattr(defaults, name, None)
+        if getattr(cfg.training, name) != getattr(defaults, name)
     }
     if present:
         raise ValueError(
             f"canonical training uses training.loss, training.weighting and "
             f"training.objective_options, not {sorted(present)}"
         )
+    ignored = cfg.training.model_fields_set & optimization_options
+    if ignored:
+        logging.getLogger(__name__).warning(
+            "Canonical objectives do not use legacy optimization options %s; "
+            "their default values do not enable chunking, checkpointing or fused loss",
+            sorted(ignored),
+        )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+    _validate_imported_objective(cfg, resolved)
+    from specforge.config.schema import ModelConfig
+
+    init = cfg.initialization
+    scratch = not cfg.resume_path and not (
+        init and (init.checkpoint or init.weights_from)
+    )
+    used_keys = {
+        "lm_head_key": "lm_head" in draft.target_bindings or resolved.requires_teacher,
+        "embedding_key": "embed_tokens" in draft.target_bindings
+        or resolved.requires_teacher
+        or (scratch and cfg.model.load_target_embedding),
+    }
+    for field, used in used_keys.items():
+        if (
+            not used
+            and getattr(cfg.model, field) != ModelConfig.model_fields[field].default
+        ):
+            raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
     if (
         cfg.training.tp_size,
@@ -263,6 +345,8 @@ def resolve_run(cfg, registry, *, target_config=None):
             replace(contracts[0], mode=FeatureMode.STREAMING, storage=None)
         )
     vocab = default in ("eagle3", "peagle")
+    if cfg.model.vocab_mapping_path and not vocab:
+        raise ValueError("model.vocab_mapping_path requires a draft vocabulary")
     capabilities = AlgorithmCapabilities(
         attention_backends=frozenset({"eager"}),
         required_batch_size=1 if default == "peagle" else None,
@@ -335,10 +419,10 @@ def build_bundle(cfg, algorithm):
     dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
     init = cfg.initialization
     source = init.checkpoint if init else None
-    if cfg.training.resume_from:
+    if cfg.resume_path:
         from specforge.training.checkpoint import CheckpointManager
 
-        source = CheckpointManager.resolve_resume_dir(cfg.training.resume_from)
+        source = CheckpointManager.resolve_resume_dir(cfg.resume_path)
     target_weights = TargetWeights(
         cfg.model.target_model_path,
         cache_dir=cfg.model.cache_dir,
@@ -392,7 +476,7 @@ def build_bundle(cfg, algorithm):
         )
     teacher = None
     if resolved.requires_teacher:
-        transform = resolve_target_logits(target.to_dict())
+        transform = resolve_target_logits(target_weights.config)
         if isinstance(model.lm_head, BoundLMHead) and model.lm_head.config == transform:
             teacher = model.lm_head
         else:

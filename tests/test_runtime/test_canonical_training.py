@@ -489,7 +489,8 @@ class CanonicalTrainingTest(unittest.TestCase):
                         if p.requires_grad
                     )
                 )
-        model.eval()
+        strategy.trainable_module().eval()
+        self.assertFalse(runtime.training)
         with patch("specforge.training.strategies.canonical.dist.all_reduce") as reduce:
             evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
             self.assertIsNone(evaluated.replay_loss)

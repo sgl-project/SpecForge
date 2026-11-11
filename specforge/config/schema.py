@@ -1227,13 +1227,16 @@ class Config(StrictConfigModel):
         raw["training"] = training
         return raw
 
+    @property
+    def resume_path(self) -> Optional[str]:
+        return self.resume or self.training.resume_from
+
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
         if self.resume:
             if self.training.resume_from and self.training.resume_from != self.resume:
                 raise ValueError("resume and training.resume_from disagree")
-            self.training.resume_from = self.resume
         canonical = (
             self.draft is not None
             or self.initialization is not None
@@ -1244,17 +1247,17 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "draft/initialization/resume cannot mix with legacy model.draft_* sources"
                 )
-            if self.initialization is not None and self.training.resume_from:
+            if self.initialization is not None and self.resume_path:
                 raise ValueError("initialization and resume are mutually exclusive")
             if self.draft is None and not (
                 self.resume
-                or self.training.resume_from
+                or self.resume_path
                 or (self.initialization and self.initialization.checkpoint)
             ):
                 raise ValueError(
                     "scratch/weights_from/from_target requires draft structure"
                 )
-        elif (
+        elif not self.resume_path and (
             self.training.objective
             or self.training.objective_options
             or self.training.frozen
@@ -1314,7 +1317,7 @@ class Config(StrictConfigModel):
 
         if (
             self.model.draft_checkpoint_path is not None
-            and self.training.resume_from is not None
+            and self.resume_path is not None
         ):
             raise ValueError(
                 "model.draft_checkpoint_path (weights-only warm start) and "
@@ -1411,7 +1414,7 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "managed_local requires the persisted training role to be auto"
                 )
-            if self.training.resume_from is not None:
+            if self.resume_path is not None:
                 raise ValueError("managed_local does not support resume")
             mooncake = managed_local.mooncake
             if mooncake.protocol == "nvlink":
@@ -1488,7 +1491,7 @@ class Config(StrictConfigModel):
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
                 )
-        if self.training.role == "producer" and self.training.resume_from is not None:
+        if self.training.role == "producer" and self.resume_path is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":
             if mode != "offline":

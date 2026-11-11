@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from .base import DraftTrainStrategy, StepContext, StepOutput
 
@@ -16,7 +17,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.required_features = set(required_features)
         seen = set()
         self._duplicate_parameters = set()
-        for key, value in model.draft_model.named_parameters(remove_duplicate=False):
+        inner = model.module if isinstance(model, DistributedDataParallel) else model
+        for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
             seen.add(id(value))
@@ -24,7 +26,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self._alignment_ce = None
 
     def trainable_module(self):
-        return self.model.draft_model
+        return self.model
 
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
@@ -48,9 +50,25 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             total_steps=ctx.total_steps,
             alignment_ce=alignment_ce,
         )
+        positions = sorted(
+            int(name.split("_")[1])
+            for name in result.ratios
+            if name.startswith("position_") and name.endswith("_accuracy")
+        )
+        counts = [
+            result.ratios[f"position_{position}_accuracy"] for position in positions
+        ]
+        metrics = (
+            {
+                "acc_corrects": [n for n, _ in counts],
+                "acc_denoms": [d for _, d in counts],
+            }
+            if counts
+            else {}
+        )
         return StepOutput(
             loss=result.loss,
-            metrics={},
+            metrics=metrics,
             ratio_metrics=result.ratios,
             loss_terms=(result.numerator, result.denominator),
         )

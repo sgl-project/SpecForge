@@ -217,3 +217,13 @@ Canonical training uses PyTorch kernels by default. `model.use_liger_kernel: tru
 selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain their
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
+
+Canonical objectives do not consume legacy `objective_chunk_blocks`,
+`objective_checkpointing`, `fused_logits_loss`, `mtp_objective_chunk_size` or
+`trim_loss_positions`. Non-default values fail validation; explicitly supplied
+legacy defaults produce a warning and do not enable those optimizations.
+
+`resume` and `training.resume_from` are alternative inputs for one resolved resume
+path. Neither is copied into the other. A canonical checkpoint supplied through
+`training.resume_from` also selects the canonical training route. Legacy DSpine
+imports must explicitly match saved training settings in `training.objective_options`.
