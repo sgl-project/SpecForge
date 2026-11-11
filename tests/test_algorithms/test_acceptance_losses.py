@@ -270,3 +270,12 @@ class AcceptanceLossTest(unittest.TestCase):
         finally:
             losses._LOSSES.pop("test_temperature_ce")
             losses._LOSSES.pop("test_scaled_ce")
+
+    def test_label_acceptance_is_normalized_by_supervised_positions(self):
+        logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.0, 0.0]]])
+        labels = torch.tensor([[0, 1, 0, 0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        acceptance = logits.softmax(-1).gather(-1, labels[..., None]).squeeze(-1)
+        context = LossContext(mask, None, torch.tensor(4.0))
+        tv = TokenLoss(kind="lk_tv")(logits, labels, context=context)
+        torch.testing.assert_close(tv, (1 - acceptance) * 2)

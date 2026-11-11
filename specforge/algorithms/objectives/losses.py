@@ -111,7 +111,7 @@ def _lk(mode):
         scale = 1
         mask = context.mask.float()
         count = mask.sum()
-        if target == "teacher" and context.denominator is not None:
+        if context.denominator is not None:
             scale = context.denominator / count.where(count > 0, 1)
         if mode == "alpha":
             return (
