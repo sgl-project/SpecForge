@@ -483,3 +483,22 @@ class ObjectiveContractTest(unittest.TestCase):
             runtime = build_objective_model(model, options={"num_depths": 1})
             losses.append(runtime(batch, step=0, total_steps=None).loss)
         torch.testing.assert_close(losses[0], losses[1])
+
+    def test_peagle_dpace_balances_each_packed_document(self):
+        config = peagle_config()
+        model = build_draft_model(config)
+        install_mapping(model)
+        batch = {k: v[:, :6] for k, v in training_batch(config).items()}
+        teacher = torch.zeros(1, 6, config.vocab_size)
+        teacher[..., 2] = 10
+        batch.update(
+            loss_mask=torch.ones(1, 6),
+            attention_mask=torch.ones(1, 6),
+            lengths=torch.tensor([3, 3]),
+            target_logits=teacher,
+        )
+        runtime = build_objective_model(
+            model, options={"num_depths": 1}, weighting={"kind": "dpace"}
+        )
+        result = runtime(batch, step=0, total_steps=None)
+        self.assertEqual(result.denominator.item(), 2)

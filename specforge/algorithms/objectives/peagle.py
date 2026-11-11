@@ -92,6 +92,7 @@ class PEagleObjective:
             mask=gather(supervised, original),
             positions=depths[None],
             chain_ids=anchors.reshape(-1, 1),
+            sequence_ids=torch.searchsorted(ends, anchors, right=True)[None],
             vocab_mask=model.vocabulary.t2d,
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
