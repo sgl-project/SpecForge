@@ -369,3 +369,18 @@ class ObjectiveContractTest(unittest.TestCase):
             uniform(batch, step=0, total_steps=1).loss,
             default(batch, step=0, total_steps=1).loss,
         )
+
+    def test_eagle_legacy_denominator_is_fp32_under_a_bf16_draft(self):
+        config, runtime = build_runtime("Eagle3DraftModel", dtype=torch.bfloat16)
+        batch = training_batch(config)
+        del batch["mtp_hidden_states"]
+        length = 257  # not representable in bf16
+        batch["input_ids"] = torch.arange(length)[None] % config.vocab_size
+        for key in ("loss_mask", "attention_mask"):
+            batch[key] = torch.ones(1, length, dtype=torch.long)
+        for key in ("hidden_states", "target_last_hidden_states"):
+            batch[key] = torch.randn(1, length, batch[key].shape[-1])
+        batch["hidden_states"] = batch["hidden_states"].to(torch.bfloat16)
+        predictions = next(runtime.objective.rollout(runtime, batch))
+        self.assertEqual(predictions.denominator.dtype, torch.float32)
+        self.assertEqual(predictions.denominator.item(), length)

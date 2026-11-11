@@ -104,7 +104,7 @@ class Eagle3Objective:
                 draft_to_target=model.vocabulary.d2t,
                 requires=frozenset({"teacher_logits"}),
                 default_loss=self.default_loss,
-                denominator=hidden.new_tensor(ids.numel()),
+                denominator=torch.tensor(float(ids.numel()), device=ids.device),
                 accuracy_name=f"position_{depth}_accuracy",
                 report_accuracy=depth == 0,
             )
