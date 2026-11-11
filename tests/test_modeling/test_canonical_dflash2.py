@@ -77,12 +77,6 @@ def score(model, output, options):
 class CanonicalDFlash2Test(unittest.TestCase):
     @legacy_fp32_rope()
     def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
         torch.manual_seed(0)
         config = dflash2_config()
         actual = build_draft_model(config, device=device, dtype=dtype)
@@ -137,16 +131,14 @@ class CanonicalDFlash2Test(unittest.TestCase):
         torch.testing.assert_close(
             (output.hidden_states, output.logits, actual_scores),
             (hidden, logits, scores),
-            rtol=tolerance,
-            atol=tolerance,
+            rtol=0,
+            atol=0,
         )
         self.assertEqual(output.logits.dtype, torch.float32)
         upstream = torch.randn_like(scores)
         actual_scores.backward(upstream)
         scores.backward(upstream)
-        torch.testing.assert_close(
-            features.grad, other.grad, rtol=tolerance, atol=tolerance
-        )
+        torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
         for name, parameter in actual.named_parameters():
             ref = (
                 embedding.weight
@@ -158,9 +150,7 @@ class CanonicalDFlash2Test(unittest.TestCase):
                 )
             )
             self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(
-                parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-            )
+            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
 
     def test_cpu_complete_legacy_computation(self):
         for dtype in (torch.float32, torch.bfloat16):
@@ -246,6 +236,8 @@ class CanonicalDFlash2Test(unittest.TestCase):
             ),
         )
         identity_model = build_draft_model(identity)
+        self.assertTrue(identity_model.unary_logits_transform_is_identity())
+        self.assertFalse(actual.unary_logits_transform_is_identity())
         logits = torch.randn(2, 3, 64, dtype=torch.bfloat16)
         torch.testing.assert_close(
             identity_model.transform_unary_logits(logits),
