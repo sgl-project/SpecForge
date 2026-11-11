@@ -83,7 +83,9 @@ Native drafts inside target checkpoints use an explicit preset and
 `from_target`, rather than an import adapter. SGLang artifacts are rejected.
 
 For distributed construction, use the same `make_initialization_plan` or
-`make_weight_plan` on each rank, then `apply_weight_plan` after materialization.
+`make_weight_plan` on each rank, then `apply_weight_plan` after materialization;
+a scratch or warm-start model then needs `finalize_initialization` as in
+`initialize_draft`.
 Plans validate global metadata; Shard/Replicate DTensor destinations read only
 their local slices. Partial placements are rejected. CLI/training orchestration
 and export conversion will adopt these APIs in subsequent integration steps.
