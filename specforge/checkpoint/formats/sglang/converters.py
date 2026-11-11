@@ -386,7 +386,6 @@ def serving_weights(config, state):
         for prefix, replacement in (
             ("backbone.layers.", "layers."),
             ("backbone.final_norm.", "norm."),
-            ("logit_norm.", "norm."),
             ("fusion.", ""),
             ("gru_head.", ""),
             ("vocabulary.", ""),

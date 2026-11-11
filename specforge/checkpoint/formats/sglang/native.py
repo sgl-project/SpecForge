@@ -12,6 +12,7 @@ from safetensors.torch import save_file
 from specforge.checkpoint.initialization import resolve_bindings
 from specforge.checkpoint.resolve import resolve_directory
 from specforge.checkpoint.tensors import TensorStore
+from specforge.checkpoint.weight_plan import _validate_unquantized
 
 from . import artifact_metadata
 from .converters import require
@@ -66,7 +67,10 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         "native export requires safetensors target shards",
     )
     weights = {"mtp." + key: value for key, value in state.items()}
-    for name, ref in resolve_bindings(config, store, text).items():
+    bindings = resolve_bindings(config, store, text)
+    for name, ref in bindings.items():
+        _validate_unquantized(name, ref)
+    for name, ref in bindings.items():
         weights[f"mtp.{name}.weight"] = ref.read()
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
