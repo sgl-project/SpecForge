@@ -835,6 +835,145 @@ class TestDFlashLosses(unittest.TestCase):
                 loss_mask=self.loss_mask,
             )
 
+    def _learnable_dspark_model(self, head=None):
+        torch.manual_seed(99)
+        return _make_dspark_model(
+            self.logits,
+            self.anchors,
+            self.keep_mask,
+            draft_model=_LearnableDSparkDraft(4).double(),
+            lm_head=head or nn.Linear(4, self.logits.shape[-1], bias=False).double(),
+            dspark_ce_loss_alpha=0.1,
+            dspark_l1_loss_alpha=0.9,
+            dspark_confidence_head_alpha=1.0,
+        )
+
+    def test_dspark_exports_loss_terms_without_a_micro_step_collective(self):
+        model = self._learnable_dspark_model()
+        target_hidden = torch.randn_like(self.hidden_states)
+        with (
+            patch("torch.distributed.is_available", return_value=True),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as all_reduce,
+        ):
+            loss, _accuracy, metrics = model(
+                input_ids=self.input_ids,
+                hidden_states=self.hidden_states,
+                loss_mask=self.loss_mask,
+                target_last_hidden_states=target_hidden,
+            )
+        all_reduce.assert_not_called()
+        numerator, denominator = metrics["loss_terms"]
+        _targets, eval_mask = _dspark_targets_and_mask(
+            self.input_ids,
+            self.loss_mask,
+            self.anchors,
+            self.keep_mask,
+            self.logits.shape[2],
+        )
+        torch.testing.assert_close(
+            denominator, eval_mask.sum().to(denominator.dtype), rtol=0, atol=0
+        )
+        self.assertFalse(denominator.requires_grad)
+        self.assertTrue(numerator.requires_grad)
+        # The returned loss is the rank-local mean, independent of world size.
+        torch.testing.assert_close(loss, numerator / denominator)
+
+    def test_dspark_micro_step_without_supervised_tokens_is_finite(self):
+        model = self._learnable_dspark_model()
+        loss, _accuracy, metrics = model(
+            input_ids=self.input_ids,
+            hidden_states=self.hidden_states,
+            loss_mask=torch.zeros_like(self.loss_mask),
+            target_last_hidden_states=torch.randn_like(self.hidden_states),
+        )
+        numerator, denominator = metrics["loss_terms"]
+        self.assertEqual(denominator.item(), 0.0)
+        self.assertEqual(numerator.item(), 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        numerator.backward()
+        self.assertTrue(torch.isfinite(model.draft_model.signal.grad).all())
+
+    def test_dspark_trainer_normalizes_by_the_optimizer_window_token_count(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.backend import TrainingBackend
+        from specforge.training.controller import TrainerCore
+        from specforge.training.strategies.base import DSparkTrainStrategy
+
+        class _Backend(TrainingBackend):
+            def __init__(self, model):
+                self.model = model
+
+            def prepare_model(self, model):
+                return model
+
+            def backward(self, loss, *, is_boundary=True):
+                loss.backward()
+
+            def scale_gradients(self, factor):
+                for parameter in self.model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(factor)
+
+            def step(self):
+                return None
+
+            def state_dict(self):
+                return {}
+
+            def load_state_dict(self, state):
+                pass
+
+        head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
+        trained = self._learnable_dspark_model(head=copy.deepcopy(head))
+        reference = self._learnable_dspark_model(head=copy.deepcopy(head))
+        reference.load_state_dict(trained.state_dict())
+
+        sparse_mask = self.loss_mask.clone()
+        sparse_mask[0, 2:] = 0.0
+        windows = []
+        for loss_mask in (self.loss_mask, sparse_mask):
+            windows.append(
+                {
+                    "input_ids": self.input_ids,
+                    "hidden_states": self.hidden_states,
+                    "loss_mask": loss_mask,
+                    "target_last_hidden_states": torch.randn_like(self.hidden_states),
+                }
+            )
+
+        core = TrainerCore(
+            DSparkTrainStrategy(trained), _Backend(trained), accumulation_steps=2
+        )
+        for index, tensors in enumerate(windows):
+            result = core.train_step(
+                TrainBatch(
+                    sample_ids=[f"s{index}"],
+                    strategy="dspark",
+                    tensors=tensors,
+                    metadata={},
+                )
+            )
+        self.assertTrue(result.optimizer_stepped)
+
+        numerators, denominators = [], []
+        for tensors in windows:
+            _loss, _accuracy, metrics = reference(**tensors)
+            numerator, denominator = metrics["loss_terms"]
+            numerators.append(numerator)
+            denominators.append(denominator)
+        # The micro-steps carry different token counts, so this differs from
+        # averaging the per-micro-step means.
+        self.assertNotEqual(denominators[0].item(), denominators[1].item())
+        (sum(numerators) / sum(denominators)).backward()
+        torch.testing.assert_close(
+            trained.draft_model.signal.grad,
+            reference.draft_model.signal.grad,
+            rtol=1e-6,
+            atol=1e-9,
+        )
+
     def test_dspark_chunking_matches_full_loss_and_gradient(self):
         torch.manual_seed(99)
         head = nn.Linear(4, self.logits.shape[-1], bias=False).double()
