@@ -22,6 +22,7 @@ from .registry import (
     protocol_registrations,
     register_objective,
     register_protocol,
+    resolve_objective,
 )
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "register_objective",
     "register_loss",
     "register_protocol",
+    "resolve_objective",
     "protocol_registrations",
     "default_protocol",
     "Predictions",

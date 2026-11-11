@@ -76,6 +76,15 @@ def build_step(wrapped_model, *, target_head=None, **options):
     return CanonicalTrainStrategy(wrapped_model, **options)
 
 
+def _objective_settings(cfg):
+    return dict(
+        name=cfg.training.objective,
+        options=cfg.training.objective_options,
+        loss=cfg.training.loss,
+        weighting=cfg.training.weighting,
+    )
+
+
 def resolve_run(cfg, registry, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
     from specforge.algorithms.common.defaults import (
@@ -100,10 +109,7 @@ def resolve_run(cfg, registry, *, target_config=None):
         FeatureMode,
         OfflineStorageContract,
     )
-    from specforge.algorithms.objectives import (
-        default_objective,
-        objective_registrations,
-    )
+    from specforge.algorithms.objectives import default_objective, resolve_objective
     from specforge.config.draft.codec import encode_config
 
     from . import canonical_data
@@ -148,15 +154,11 @@ def resolve_run(cfg, registry, *, target_config=None):
     }
     if present:
         raise ValueError(
-            f"canonical training uses training.objective_options, not {sorted(present)}"
+            f"canonical training uses training.loss, training.weighting and "
+            f"training.objective_options, not {sorted(present)}"
         )
-    objective = cfg.training.objective or default
-    entry = objective_registrations().get(objective)
-    if entry is None or draft.architecture not in entry.architectures:
-        raise ValueError(
-            f"objective {objective!r} is incompatible with {draft.architecture}"
-        )
-    entry.factory(**cfg.training.objective_options)
+    resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+    objective, entry = resolved.name, resolved.registration
     if (
         cfg.training.tp_size,
         cfg.training.sp_ulysses_size,
@@ -280,7 +282,7 @@ def build_bundle(cfg, algorithm):
         MODEL_PROVENANCE_CONTRACT_KEY,
         StepRuntimeConfig,
     )
-    from specforge.algorithms.objectives import build_objective_model
+    from specforge.algorithms.objectives import build_objective_model, resolve_objective
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import resolve_target_logits
     from specforge.loading import initialize_draft, load_draft
@@ -300,6 +302,7 @@ def build_bundle(cfg, algorithm):
         trust_remote_code=cfg.model.trust_remote_code,
     )
     draft = resolve_config(cfg, target_config=target_text_config(target).to_dict())
+    resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
     init = cfg.initialization
     source = init.checkpoint if init else None
@@ -333,7 +336,7 @@ def build_bundle(cfg, algorithm):
             legacy_config=init.legacy_config if init else None,
         )
     teacher = None
-    if cfg.training.objective in ("eagle3", "peagle", "dspark", "dspine"):
+    if resolved.requires_teacher:
         loaded = TargetHead.from_pretrained(
             cfg.model.target_model_path,
             lm_head_key=cfg.model.lm_head_key,
@@ -350,10 +353,6 @@ def build_bundle(cfg, algorithm):
             dtype=dtype,
         )
         teacher.load_target_weight(loaded.fc.weight)
-    if hasattr(model, "initialize_transfer_space") and not bool(model.transfer_ready):
-        if source:
-            raise ValueError("DSpine checkpoint has no initialized transfer space")
-        model.initialize_transfer_space()
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -370,8 +369,7 @@ def build_bundle(cfg, algorithm):
         model.vocabulary.load_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
     runtime = build_objective_model(
         model,
-        name=cfg.training.objective,
-        options=cfg.training.objective_options,
+        **_objective_settings(cfg),
         frozen=cfg.training.frozen,
         target_head=teacher,
     )
@@ -387,6 +385,8 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_frozen": tuple(cfg.training.frozen),
+        "canonical_loss": asdict(runtime.token_loss),
+        "canonical_weighting": asdict(runtime.weighting),
     }
     from specforge.training.provenance import model_resume_provenance
 

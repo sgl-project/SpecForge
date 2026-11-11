@@ -59,7 +59,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         ctx = ctx or StepContext()
         if (
             self.objective != "dspine"
-            or ctx.accumulation_steps == 1
+            or not self.trainable_module().training
             or not torch.is_grad_enabled()
         ):
             return self._forward(batch, ctx)
@@ -69,7 +69,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         cpu_rng = torch.get_rng_state()
         device_rng = [device_module.get_rng_state(index) for index in devices]
         with torch.no_grad():
-            output = self._forward(batch, ctx)
+            output = self._forward(
+                batch, ctx, alignment_ce=torch.zeros((), device=device)
+            )
         replay_batch = replace(
             batch,
             tensors={key: value.detach().cpu() for key, value in batch.tensors.items()},
@@ -81,7 +83,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
                 totals = torch.stack((numerator, denominator))
                 if dist.is_initialized():
                     dist.all_reduce(totals)
-                self._alignment_ce = (totals[0] / totals[1].clamp_min(1)).detach()
+                denominator = totals[1].where(totals[1] > 0, 1)
+                self._alignment_ce = (totals[0] / denominator).detach()
                 self._alignment_window = window_ratios
             with torch.random.fork_rng(devices=devices, device_type=device.type):
                 torch.set_rng_state(cpu_rng)

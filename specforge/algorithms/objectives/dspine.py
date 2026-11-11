@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
@@ -17,6 +16,7 @@ from .registry import register_protocol
 
 @register_protocol(
     "dspine",
+    requires=("teacher_logits",),
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     provides=(
@@ -156,8 +156,6 @@ class DSpineObjective:
             coefficient = alignment_ce
             if coefficient is None:
                 totals = torch.stack((ce_num.detach(), denominator))
-                if model.training and dist.is_initialized():
-                    dist.all_reduce(totals)
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
             return AuxiliaryLoss(
                 refined_loss + beta * coefficient.detach() * alignment,

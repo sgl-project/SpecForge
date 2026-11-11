@@ -15,6 +15,7 @@ from .registry import register_protocol
 
 @register_protocol(
     "dspark",
+    requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     provides=(

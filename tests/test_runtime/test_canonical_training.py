@@ -4,6 +4,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
@@ -114,6 +115,77 @@ class CanonicalTrainingTest(unittest.TestCase):
                         bundle.model.objective_name,
                     )
 
+    def test_loss_selection_drives_capture_head_and_resume_contract(self):
+        from specforge.algorithms.objectives import resolve_objective
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for kind in ("ce", "kl", "lk_lambda"):
+                with self.subTest(loss=kind):
+                    loss = {"kind": kind}
+                    if kind == "lk_lambda":
+                        loss["options"] = {"target": "teacher", "kl_scale": 0.7}
+                    cfg = run_config(
+                        target,
+                        draft_config(),
+                        training={
+                            "attention_backend": "eager",
+                            "loss": loss,
+                            "weighting": {"kind": "dpace", "alpha": 0.3},
+                        },
+                    )
+                    resolved = resolve_run(cfg)
+                    bundle = build_model_bundle(
+                        resolved.config, algorithm=resolved.algorithm
+                    )
+                    needs_teacher = kind != "ce"
+                    layout = resolved.algorithm.providers.offline_for(
+                        "text"
+                    ).capture_layout
+                    self.assertEqual(
+                        layout.last_hidden_feature is not None, needs_teacher
+                    )
+                    self.assertEqual(bundle.target_head is not None, needs_teacher)
+                    self.assertEqual(
+                        "target_last_hidden_states" in bundle.model.registration.inputs,
+                        needs_teacher,
+                    )
+                    contract = bundle.strategy_kwargs.resume_contract
+                    self.assertEqual(contract["canonical_loss"]["kind"], kind)
+                    self.assertEqual(contract["canonical_weighting"]["alpha"], 0.3)
+                    if bundle.target_head is not None:
+                        self.assertFalse(
+                            any(
+                                p.requires_grad for p in bundle.target_head.parameters()
+                            )
+                        )
+            # MTP consumes final states but CE needs no teacher projection; EAGLE
+            # still needs a teacher for vocabulary mapping when selecting CE.
+            self.assertFalse(resolve_objective("MTPDraftModel").requires_teacher)
+            self.assertTrue(
+                resolve_objective(
+                    "Eagle3DraftModel", loss={"kind": "ce"}
+                ).requires_teacher
+            )
+            for changes in (
+                {"loss": {"kind": "unknown"}},
+                {"weighting": {"kind": "dpace", "alpha": 2}},
+            ):
+                cfg = run_config(
+                    target,
+                    draft_config(),
+                    training={"attention_backend": "eager", **changes},
+                )
+                with patch("specforge.loading.initialize_draft") as initialize:
+                    with self.assertRaises(ValueError):
+                        resolve_run(cfg)
+                    initialize.assert_not_called()
+            raw = run_config(target, draft_config()).model_dump()
+            raw["draft"] = None
+            raw["training"]["loss"] = {"kind": "kl"}
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                Config.model_validate(raw)
+
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_existing_trainer_saves_loadable_model_and_resumes(self):
         for tied in (False, True):
@@ -148,7 +220,12 @@ class CanonicalTrainingTest(unittest.TestCase):
                 torch.save(
                     {
                         key: batch[key][0].detach()
-                        for key in ("input_ids", "loss_mask", "hidden_states")
+                        for key in (
+                            "input_ids",
+                            "loss_mask",
+                            "hidden_states",
+                            "target_last_hidden_states",
+                        )
                     },
                     features / f"{index}.ckpt",
                 )
@@ -162,6 +239,8 @@ class CanonicalTrainingTest(unittest.TestCase):
                     "save_interval": 1,
                     "log_interval": 1,
                     "objective_options": {"num_anchors": 2},
+                    "loss": {"kind": "kl"},
+                    "weighting": {"kind": "dpace", "alpha": 0.3},
                 },
             )
             first = build_application_run(cfg)
@@ -182,6 +261,8 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
+            self.assertEqual(state["canonical_loss"]["kind"], "kl")
+            self.assertEqual(state["canonical_weighting"]["alpha"], 0.3)
             if tied:
                 self.assertNotIn("lm_head.weight", state["draft_state_dict"])
                 self.assertIs(model.embed_tokens.weight, model.lm_head.weight)
@@ -191,6 +272,15 @@ class CanonicalTrainingTest(unittest.TestCase):
                     for name, tensor in state["draft_state_dict"].items()
                 )
             )
+            for key, changed in (
+                ("loss", {"kind": "tv"}),
+                ("weighting", {"kind": "uniform"}),
+            ):
+                with self.subTest(changed=key):
+                    incompatible = Config.model_validate(raw)
+                    setattr(incompatible.training, key, changed)
+                    with self.assertRaisesRegex(ValueError, f"canonical_{key}"):
+                        build_application_run(incompatible)
             raw["draft"] = encode_config(
                 draft_config(hidden_size=32, layer_types=("full_dense",))
             )
@@ -214,17 +304,54 @@ class CanonicalTrainingTest(unittest.TestCase):
             required_features=runtime.registration.inputs,
         )
         batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
-        output = strategy.forward_loss(
-            batch, StepContext(global_step=1, total_steps=10, accumulation_steps=2)
-        )
-        state = torch.get_rng_state().clone()
-        replayed = output.replay_loss(output.ratio_metrics)
-        torch.testing.assert_close(state, torch.get_rng_state())
-        torch.testing.assert_close(output.loss, replayed.loss)
-        replayed.loss.backward()
-        self.assertTrue(
-            all(p.grad is not None for p in model.parameters() if p.requires_grad)
-        )
+        for accumulation in (1, 2):
+            with self.subTest(accumulation=accumulation):
+                initial_rng = torch.get_rng_state().clone()
+                ctx = StepContext(
+                    global_step=1, total_steps=10, accumulation_steps=accumulation
+                )
+                with (
+                    patch(
+                        "specforge.training.strategies.canonical.dist.is_initialized",
+                        return_value=True,
+                    ),
+                    patch(
+                        "specforge.training.strategies.canonical.dist.all_reduce"
+                    ) as reduce,
+                ):
+                    output = strategy.forward_loss(batch, ctx)
+                    reduce.assert_not_called()
+                    state = torch.get_rng_state().clone()
+                    # A fractional denominator must remain exact.
+                    window = {
+                        "dspine/backbone_ce": (torch.tensor(0.1), torch.tensor(0.2))
+                    }
+                    replayed = output.replay_loss(window)
+                    output.replay_loss(window)
+                    reduce.assert_called_once()
+                torch.testing.assert_close(state, torch.get_rng_state())
+                with torch.random.fork_rng():
+                    torch.set_rng_state(initial_rng)
+                    expected = runtime(
+                        batch.tensors,
+                        step=1,
+                        total_steps=10,
+                        alignment_ce=torch.tensor(0.5),
+                    )
+                torch.testing.assert_close(replayed.loss, expected.loss)
+                replayed.loss.backward()
+                self.assertTrue(
+                    all(
+                        p.grad is not None
+                        for p in model.parameters()
+                        if p.requires_grad
+                    )
+                )
+        model.eval()
+        with patch("specforge.training.strategies.canonical.dist.all_reduce") as reduce:
+            evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
+            self.assertIsNone(evaluated.replay_loss)
+            reduce.assert_not_called()
 
     def test_reject_mixed_sources_and_backend(self):
         draft = draft_config()

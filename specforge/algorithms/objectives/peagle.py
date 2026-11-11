@@ -18,6 +18,7 @@ from .registry import register_protocol
 
 @register_protocol(
     "peagle",
+    requires=("teacher_logits",),
     architectures=("PEagleDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     provides=(

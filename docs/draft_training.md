@@ -105,8 +105,8 @@ runtime = build_objective_model(
 ```
 
 For legacy EAGLE LK semantics, select `options.target="teacher"` and retain the
-default geometric weighting. Training configuration and resume serialization must
-carry these selections when the canonical training entry adopts them.
+default geometric weighting. The training entry resolves loss and weighting
+before capture, and records both in the exact-resume contract.
 
 ## Training entry point
 
@@ -115,8 +115,15 @@ mapping or an ordinary YAML/JSON file. Presets use this same file path; there is
 no separate preset selector. The architecture chooses the default objective.
 `training.objective` can select another compatible registration, and its settings
 are passed through `training.objective_options` (unknown options are errors).
-Legacy algorithm switches remain on the legacy route; use objective options on
-the canonical route. Nondefault legacy loss/sampling settings are rejected.
+`training.loss` and `training.weighting` select the common token objective and
+position weights; omitting them preserves the protocol defaults. Capture inputs
+combine protocol and loss requirements. A teacher head is loaded only when the
+loss or protocol requires teacher logits; final-state inputs alone do not imply
+a head is needed.
+Legacy algorithm switches remain on the legacy route. On the canonical route,
+use loss/weighting for the common objective and objective_options for sampling
+and auxiliary training. DFlash2 selector_warmup_ratio/selector_ramp_ratio belong
+in objective_options. Nondefault legacy loss/sampling settings are rejected.
 
 ```yaml
 model:
@@ -132,7 +139,11 @@ training:
   attention_backend: eager
   objective_options:
     num_anchors: 128
-    loss_decay_gamma: 7.0
+  loss:
+    kind: kl
+  weighting:
+    kind: exponential
+    gamma: 7.0
   max_steps: 1000
   save_interval: 100
 
@@ -158,7 +169,9 @@ none of these fields may mix with legacy `model.draft_*` source fields.
 Checkpoints contain the canonical `config.json` alongside the existing
 `training_state.pt` and per-rank optimizer/RNG files. The public loader reads only
 the draft tensors, while the trainer alone restores training state. Exact resume
-checks structure, objective/options, frozen prefixes, target provenance and dtype.
+checks structure, resolved loss/weighting, objective/options, frozen prefixes,
+target provenance and dtype. A changed or missing loss/weighting contract is
+rejected rather than guessed.
 An existing vocabulary mapping is preserved on resume; it is not regenerated from
 the dataset. `training.frozen` lists module or parameter paths excluded from
 training, and is part of the resume contract.
@@ -174,6 +187,13 @@ The new route supports eager attention and data parallel training, including FSD
 and DDP. Frozen target bindings and the teacher head remain replicated outside
 FSDP, matching the existing training backend's frozen-table policy. The canonical
 model's requested dtype also controls FSDP computation. Optimized backends and
-legacy optional loss variants remain on the legacy route. Online wiring is
+sequence-parallel execution remain on the legacy route. Online wiring is
 validated through capture contracts; a live SGLang capture run is not part of the
 current integration tests.
+
+DSpine training uses a graph-free prepass and RNG-preserving replay for every
+optimizer window, including a single microbatch. The strategy reduces backbone
+CE once per window and passes the alignment coefficient into the objective.
+Objective evaluation performs no collectives; the objective itself never reduces
+its alignment statistics across ranks. Transfer-space initialization and
+restoration remain owned by the public model loader.

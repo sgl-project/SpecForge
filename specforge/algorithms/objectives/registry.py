@@ -13,13 +13,16 @@ class ProtocolRegistration:
     inputs: tuple[str, ...]
     provides: frozenset[str]
     trains: tuple[str, ...]
+    requires: frozenset[str] = frozenset()
 
 
 _PROTOCOLS = {}
 _DEFAULTS = {}
 
 
-def register_protocol(name, *, architectures, inputs, provides, trains, default=True):
+def register_protocol(
+    name, *, architectures, inputs, provides, trains, requires=(), default=True
+):
     def register(factory):
         if name in _PROTOCOLS:
             raise ValueError(f"objective already registered: {name}")
@@ -31,6 +34,7 @@ def register_protocol(name, *, architectures, inputs, provides, trains, default=
             tuple(inputs),
             frozenset(provides),
             tuple(trains),
+            frozenset(requires),
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))
@@ -39,17 +43,23 @@ def register_protocol(name, *, architectures, inputs, provides, trains, default=
     return register
 
 
-def build_objective_model(
-    draft_model,
-    *,
-    name=None,
-    options=None,
-    frozen=(),
-    target_head=None,
-    loss=None,
-    weighting=None,
+@dataclass(frozen=True)
+class ResolvedObjective:
+    name: str
+    registration: ProtocolRegistration
+    objective: object
+    loss: TokenLoss
+    weighting: PositionWeighting
+
+    @property
+    def requires_teacher(self):
+        return "teacher_logits" in self.registration.requires | self.loss.requires
+
+
+def resolve_objective(
+    architecture, *, name=None, options=None, loss=None, weighting=None
 ):
-    architecture = draft_model.config.draft.architecture
+    """Resolve defaults and capture requirements without constructing a model."""
     name = name or default_protocol(architecture)
     if name not in _PROTOCOLS:
         raise ValueError(f"unknown objective: {name!r}")
@@ -69,7 +79,9 @@ def build_objective_model(
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
     )
-    missing = (selected_loss.requires | position_weighting.requires) - entry.provides
+    missing = (
+        entry.requires | selected_loss.requires | position_weighting.requires
+    ) - entry.provides
     if missing:
         raise ValueError(
             f"protocol {name!r} lacks required capabilities: {sorted(missing)}"
@@ -77,6 +89,27 @@ def build_objective_model(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
+    return ResolvedObjective(name, entry, objective, selected_loss, position_weighting)
+
+
+def build_objective_model(
+    draft_model,
+    *,
+    name=None,
+    options=None,
+    frozen=(),
+    target_head=None,
+    loss=None,
+    weighting=None,
+):
+    resolved = resolve_objective(
+        draft_model.config.draft.architecture,
+        name=name,
+        options=options,
+        loss=loss,
+        weighting=weighting,
+    )
+    name, entry, objective = resolved.name, resolved.registration, resolved.objective
     frozen = tuple(frozen) + getattr(objective, "frozen_parameters", ())
     to_freeze = []
     for prefix in frozen:
@@ -111,8 +144,8 @@ def build_objective_model(
         target_head,
         registration=entry,
         name=name,
-        token_loss=token_loss,
-        weighting=position_weighting,
+        token_loss=resolved.loss,
+        weighting=resolved.weighting,
     )
 
 

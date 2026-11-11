@@ -999,6 +999,8 @@ class InitializationConfig(StrictConfigModel):
 class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
+    loss: dict = Field(default_factory=dict)
+    weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
     strategy: str = "eagle3"
@@ -1256,9 +1258,11 @@ class Config(StrictConfigModel):
             self.training.objective
             or self.training.objective_options
             or self.training.frozen
+            or self.training.loss
+            or self.training.weighting is not None
         ):
             raise ValueError(
-                "objective/options/frozen require the canonical draft loading path"
+                "objective/options/frozen/loss/weighting require the canonical draft loading path"
             )
         mode = self.mode
         deployment = self.deployment.mode
