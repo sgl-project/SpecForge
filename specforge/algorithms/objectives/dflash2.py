@@ -4,17 +4,19 @@ from dataclasses import dataclass
 
 from specforge.core.fused_loss import ce_l1_loss
 
-from .base import check_options, reduce_loss
+from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import AuxiliaryLoss, PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "dflash2",
     architectures=("DFlash2DraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    outputs=("logits", "hidden_states"),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=COMMON_MODULES + ("candidate_selector",),
 )
 @dataclass
@@ -27,6 +29,8 @@ class DFlash2Objective:
     selector_warmup_ratio: float = 0.0
     selector_ramp_ratio: float = 0.0
     selector_stop_gradient: bool = False
+
+    default_loss = TokenLoss(kind="ce")
 
     def __post_init__(self):
         check_options(
@@ -73,35 +77,42 @@ class DFlash2Objective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            weighting=runtime.weighting,
         )
-        output = model(blocks.input_ids, batch["hidden_states"], blocks.layer_inputs)
-        labels = blocks.labels.flatten(1)
-        terms = ce_l1_loss(
-            output.logits, labels, top_k=model.config.draft.spec_config.selector_top_k
+        output = model(
+            blocks.input_ids,
+            batch["hidden_states"],
+            blocks.layer_inputs,
+            output_logits=False,
         )
-        unary, hidden = terms.topk_values, output.hidden_states
-        if self.selector_stop_gradient:
-            unary, hidden = unary.detach(), hidden.detach()
-        scores = model.candidate_selector.score_candidates(
-            candidate_ids=terms.topk_ids,
-            unary_logits=unary,
-            hidden_states=hidden,
-            predecessor_ids=blocks.predecessors.flatten(1),
-        )
-        covered = terms.topk_ids == labels[..., None]
-        selector = ce_l1_loss(
-            scores, covered.long().argmax(-1)
-        ).cross_entropy * covered.any(-1)
-        scale = self.selector_scale(step, total_steps)
-        loss = runtime.loss(
-            output.logits,
-            labels,
+        scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
+
+        def auxiliary(predictions, projected, teacher, weights):
+            labels = predictions.labels
+            terms = ce_l1_loss(
+                projected["logits"],
+                labels,
+                top_k=model.config.draft.spec_config.selector_top_k,
+            )
+            unary, hidden = terms.topk_values, predictions.hidden
+            if self.selector_stop_gradient:
+                unary, hidden = unary.detach(), hidden.detach()
+            scores = model.candidate_selector.score_candidates(
+                candidate_ids=terms.topk_ids,
+                unary_logits=unary,
+                hidden_states=hidden,
+                predecessor_ids=predictions.auxiliary_inputs["predecessors"],
+            )
+            covered = terms.topk_ids == labels[..., None]
+            selector = ce_l1_loss(
+                scores, covered.long().argmax(-1)
+            ).cross_entropy * covered.any(-1)
+            return AuxiliaryLoss(scale * selector)
+
+        predictions = runtime.block_predictions(
+            output,
+            blocks,
             batch,
-            blocks.label_positions.flatten(1) - 1,
-            default=terms.cross_entropy,
+            auxiliary=auxiliary,
+            auxiliary_inputs={"predecessors": blocks.predecessors},
         )
-        loss = loss + self.selector_loss_alpha * scale * selector
-        return reduce_loss(
-            loss, blocks.weights.flatten(1), logits=output.logits, labels=labels
-        )
+        return PredictionBatch((predictions,))

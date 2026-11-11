@@ -14,6 +14,7 @@ from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import (
+    capture_projections,
     dflash2_config,
     dspark_config,
     dspine_config,
@@ -82,7 +83,10 @@ class ObjectiveContractTest(unittest.TestCase):
                 runtime(
                     {**batch, field: torch.zeros(1, 8, 32)}, step=0, total_steps=None
                 )
-        with patch.object(runtime, "objective") as objective:
+        with (
+            patch.object(runtime, "objective") as objective,
+            patch("specforge.algorithms.objectives.execution.execute_batch"),
+        ):
             runtime(batch, step=0, total_steps=None)
             captured = objective.call_args.args[1]
             self.assertEqual(captured["hidden_states"].dtype, torch.bfloat16)
@@ -126,10 +130,7 @@ class ObjectiveContractTest(unittest.TestCase):
         )
         batch = training_batch(config)
         batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
-        captured = []
-        runtime.draft_model.register_forward_hook(
-            lambda m, a, output: captured.append(output)
-        )
+        captured = capture_projections(runtime.draft_model)
         result = runtime(batch, step=0, total_steps=None)
         result.loss.backward()
         self.assertIn("target_last_hidden_states", runtime.registration.inputs)
@@ -139,7 +140,7 @@ class ObjectiveContractTest(unittest.TestCase):
                 for p in runtime.draft_model.candidate_selector.parameters()
             )
         )
-        logits = captured[0].logits
+        logits = captured[0]["logits"]
         teacher = torch.randn_like(logits)
         expected = torch.nn.functional.kl_div(
             logits.float().log_softmax(-1),
@@ -249,13 +250,86 @@ class ObjectiveContractTest(unittest.TestCase):
         teacher = torch.zeros(1, 6, config.vocab_size)
         teacher[..., 2] = 10
         batch["target_logits"] = teacher
-        captured = []
-        model.register_forward_hook(
-            lambda m, args, output: captured.append(output.logits)
-        )
+        captured = capture_projections(model)
         runtime = build_objective_model(model, options={"num_depths": 1})
         result = runtime(batch, step=0, total_steps=None)
         probabilities = teacher[..., model.vocabulary.t2d].softmax(-1)
-        ce = -(probabilities * captured[0].log_softmax(-1)).sum(-1)
+        ce = -(
+            probabilities * captured[0]["logits"].reshape(1, 6, -1).log_softmax(-1)
+        ).sum(-1)
         torch.testing.assert_close(result.loss, ce[:, [0, 1, 3, 4]].mean())
         self.assertEqual(result.denominator.item(), 1)
+
+    def test_registered_loss_extends_existing_algorithm(self):
+        from specforge.algorithms.objectives import register_loss
+        from specforge.algorithms.objectives.losses import _LOSSES
+
+        with patch.dict(_LOSSES):
+
+            @register_loss("custom", requires=("logits", "labels", "teacher_logits"))
+            def custom(logits, labels, teacher):
+                return (logits.float() - teacher).square().mean(-1)
+
+            config = dflash2_config()
+            runtime = build_objective_model(
+                build_draft_model(config),
+                options={"num_anchors": 1},
+                loss={"kind": "custom"},
+            )
+            batch = training_batch(config)
+            batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
+            runtime(batch, step=0, total_steps=None).loss.backward()
+            self.assertIn("target_last_hidden_states", runtime.registration.inputs)
+            self.assertTrue(
+                all(
+                    p.grad is not None
+                    for p in runtime.draft_model.candidate_selector.parameters()
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "already registered"):
+                register_loss("custom")(custom)
+
+    def test_explicit_weighting_replaces_eagle_default(self):
+        config = eagle_config()
+        model = build_draft_model(config)
+        install_mapping(model)
+        batch = training_batch(config)
+        batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
+        runtime = build_objective_model(model, options={"ttt_length": 3})
+        projected = capture_projections(model)
+        default_loss = runtime(batch, step=0, total_steps=None).loss
+        expected = []
+        valid = batch["loss_mask"].bool() & batch["attention_mask"].bool()
+        for depth, output in enumerate(projected):
+            positions = torch.arange(9)[None] + depth + 1
+            safe = positions.clamp(max=8)
+            mask = (
+                valid.gather(1, safe)
+                & (positions < 9)
+                & model.vocabulary.t2d[
+                    batch["target_logits"].argmax(-1).gather(1, safe)
+                ]
+            )
+            teacher = batch["target_logits"][:, safe[0], :][
+                ..., model.vocabulary.t2d
+            ].softmax(-1)
+            logits = output["logits"].reshape(1, 9, -1)
+            ce = -(teacher * logits.log_softmax(-1)).sum(-1)
+            expected.append((ce * mask).sum() / 9)
+        torch.testing.assert_close(
+            default_loss, sum(0.8**i * term for i, term in enumerate(expected))
+        )
+        for weighting in (
+            {"kind": "uniform"},
+            {"kind": "geometric", "factor": 0.5},
+            {"kind": "exponential", "gamma": 2},
+        ):
+            with self.subTest(weighting=weighting):
+                configured = build_objective_model(
+                    model, options={"ttt_length": 3}, weighting=weighting
+                )
+                result = configured(batch, step=0, total_steps=None)
+                factors = configured.weighting(torch.ones(3), torch.arange(3))
+                torch.testing.assert_close(
+                    result.loss, (torch.stack(expected) * factors).sum()
+                )

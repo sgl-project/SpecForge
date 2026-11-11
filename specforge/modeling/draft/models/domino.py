@@ -91,7 +91,24 @@ class DominoDraftModel(DraftPreTrainedModel):
         hidden = self.backbone(self.embed_tokens(input_ids), prepared)
         if not output_logits:
             return DominoOutput(hidden_states=hidden)
-        shape = (input_ids.shape[0], input_ids.shape[1] // slots, slots)
+        return DominoOutput(
+            hidden_states=hidden,
+            **self.project(
+                hidden,
+                predecessor_ids=predecessor_ids,
+                output_correction_logits=output_correction_logits,
+            ),
+        )
+
+    def project(
+        self, hidden: Tensor, *, predecessor_ids: Tensor, output_correction_logits=False
+    ):
+        """Keep GRU context and its suffix in the same projection block."""
+        spec = self.config.draft.spec_config
+        slots = spec.protocol.num_model_slots
+        if hidden.ndim != 3 or hidden.shape[1] % slots:
+            raise ValueError("Domino projection requires whole blocks")
+        shape = (hidden.shape[0], hidden.shape[1] // slots, slots)
         states = hidden.reshape(*shape, hidden.shape[-1])
         previous = self.embed_tokens(predecessor_ids).reshape_as(states)
         # Unshifted slot zero is the committed anchor, not a GRU prediction.
@@ -106,9 +123,8 @@ class DominoDraftModel(DraftPreTrainedModel):
             ),
             dim=-2,
         ).reshape_as(base)
-        return DominoOutput(
-            hidden_states=hidden,
-            logits=logits,
-            base_logits=base,
-            correction_logits=correction if output_correction_logits else None,
-        )
+        return {
+            "logits": logits,
+            "base_logits": base,
+            "correction_logits": correction if output_correction_logits else None,
+        }

@@ -7,26 +7,30 @@ from .losses import PositionWeighting, TokenLoss
 
 
 @dataclass(frozen=True)
-class ObjectiveRegistration:
+class ProtocolRegistration:
     factory: type
     architectures: tuple[str, ...]
     inputs: tuple[str, ...]
-    outputs: tuple[str, ...]
+    provides: frozenset[str]
     trains: tuple[str, ...]
 
 
-_OBJECTIVES = {}
+_PROTOCOLS = {}
 _DEFAULTS = {}
 
 
-def register_objective(name, *, architectures, inputs, outputs, trains, default=True):
+def register_protocol(name, *, architectures, inputs, provides, trains, default=True):
     def register(factory):
-        if name in _OBJECTIVES:
+        if name in _PROTOCOLS:
             raise ValueError(f"objective already registered: {name}")
         if default and any(architecture in _DEFAULTS for architecture in architectures):
             raise ValueError("architecture already has a default objective")
-        _OBJECTIVES[name] = ObjectiveRegistration(
-            factory, tuple(architectures), tuple(inputs), tuple(outputs), tuple(trains)
+        _PROTOCOLS[name] = ProtocolRegistration(
+            factory,
+            tuple(architectures),
+            tuple(inputs),
+            frozenset(provides),
+            tuple(trains),
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))
@@ -46,20 +50,33 @@ def build_objective_model(
     weighting=None,
 ):
     architecture = draft_model.config.draft.architecture
-    name = name or default_objective(architecture)
-    if name not in _OBJECTIVES:
+    name = name or default_protocol(architecture)
+    if name not in _PROTOCOLS:
         raise ValueError(f"unknown objective: {name!r}")
-    entry = _OBJECTIVES[name]
+    entry = _PROTOCOLS[name]
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
     token_loss = TokenLoss(**(loss or {}))
     if weighting is None:
         gamma = getattr(objective, "loss_decay_gamma", None)
-        weighting = {"kind": "exponential", "gamma": gamma} if gamma is not None else {}
+        weighting = getattr(objective, "default_weighting", None)
+        if weighting is None:
+            weighting = (
+                {"kind": "exponential", "gamma": gamma} if gamma is not None else {}
+            )
     position_weighting = PositionWeighting(**weighting)
-    if token_loss.requires_teacher and "target_last_hidden_states" not in entry.inputs:
-        entry = replace(entry, inputs=entry.inputs + ("target_last_hidden_states",))
+    selected_loss = (
+        objective.default_loss if token_loss.kind == "default" else token_loss
+    )
+    missing = (selected_loss.requires | position_weighting.requires) - entry.provides
+    if missing:
+        raise ValueError(
+            f"protocol {name!r} lacks required capabilities: {sorted(missing)}"
+        )
+    entry = replace(
+        entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
+    )
     frozen = tuple(frozen) + getattr(objective, "frozen_parameters", ())
     to_freeze = []
     for prefix in frozen:
@@ -99,11 +116,17 @@ def build_objective_model(
     )
 
 
-def objective_registrations():
-    return dict(_OBJECTIVES)
+def protocol_registrations():
+    return dict(_PROTOCOLS)
 
 
-def default_objective(architecture):
+def default_protocol(architecture):
     if architecture not in _DEFAULTS:
         raise ValueError(f"no default objective for {architecture!r}")
     return _DEFAULTS[architecture]
+
+
+# Existing training callers use these names until the entry-point PR is updated.
+objective_registrations = protocol_registrations
+default_objective = default_protocol
+register_objective = register_protocol

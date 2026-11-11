@@ -4,21 +4,24 @@ from dataclasses import dataclass
 
 import torch
 
-from .base import reduce_loss
 from .dflash import COMMON_MODULES
 from .inputs import gather, sequence_inputs, valid_tokens
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "mtp",
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
-    outputs=("logits",),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=COMMON_MODULES,
 )
 @dataclass
 class MTPObjective:
+    default_loss = TokenLoss(kind="ce")
+
     def __call__(self, runtime, batch, **context):
         model, spec = runtime.draft_model, runtime.draft_model.config.draft.spec_config
         ids, supervised = batch["input_ids"], valid_tokens(batch)
@@ -42,6 +45,7 @@ class MTPObjective:
                 positions + spec.feature_token_offset,
             ).to(dtype=model.embed_tokens.weight.dtype),
             sequence_inputs(model.config.draft, positions, visibility),
+            output_logits=False,
         )
         label_positions = positions + spec.prediction_token_offset
         labels = gather(ids, label_positions)
@@ -50,9 +54,12 @@ class MTPObjective:
             & (label_positions < ids.shape[1])
             & padding
         ).float()
-        return reduce_loss(
-            runtime.loss(output.logits, labels, batch, label_positions - 1),
-            runtime.weighting(weights, positions - positions[:, :1]),
-            logits=output.logits,
+        predictions = runtime.predictions(
+            output.hidden_states,
+            batch,
+            label_positions - 1,
             labels=labels,
+            mask=weights,
+            positions=positions - positions[:, :1],
         )
+        return PredictionBatch((predictions,))

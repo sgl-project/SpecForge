@@ -4,23 +4,18 @@ from dataclasses import dataclass
 
 import torch
 
-from .base import ObjectiveResult, check_options
+from .base import check_options
 from .inputs import gather, sequence_inputs, valid_tokens
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import PredictionBatch
+from .registry import register_protocol
 
 
-def teacher_distribution(model, logits):
-    vocabulary = model.vocabulary
-    vocabulary.require_ready()
-    keep = vocabulary.t2d[logits.argmax(-1)]
-    return logits[..., vocabulary.t2d].float().softmax(-1), keep
-
-
-@register_objective(
+@register_protocol(
     "eagle3",
     architectures=("Eagle3DraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    outputs=("logits", "hidden_states"),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=("backbone", "fusion", "embed_tokens", "lm_head"),
 )
 @dataclass
@@ -28,13 +23,22 @@ class Eagle3Objective:
     ttt_length: int = 7
     depth_decay: float = 0.8
 
+    default_loss = TokenLoss(kind="soft_ce")
+
     def __post_init__(self):
         check_options(
             counts={"ttt_length": self.ttt_length},
             probabilities={"depth_decay": self.depth_decay},
         )
 
+    @property
+    def default_weighting(self):
+        return {"kind": "geometric", "factor": self.depth_decay}
+
     def __call__(self, runtime, batch, **context):
+        return PredictionBatch(self.rollout(runtime, batch), reduction="sum_means")
+
+    def rollout(self, runtime, batch):
         model, ids = runtime.draft_model, batch["input_ids"]
         valid = valid_tokens(batch)
         if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
@@ -43,7 +47,6 @@ class Eagle3Objective:
         anchor = torch.arange(length, device=ids.device)
         initial = model.fusion(batch["hidden_states"])
         hidden, prefix, positions = initial, None, []
-        total, ratios = initial.sum() * 0, {}
         for depth in range(self.ttt_length):
             original = (anchor + depth + 1).expand(ids.shape[0], -1)
             tokens = gather(ids, original).masked_fill(original >= length, 0)
@@ -79,33 +82,23 @@ class Eagle3Objective:
                 ),
                 recurrent_hidden=hidden,
                 kv_prefix=prefix,
+                output_logits=False,
             )
-            hidden, logits = output.hidden_states, output.logits
+            hidden = output.hidden_states
             prefix = output.kv.prepend(prefix)
-            teacher_logits = runtime.teacher_logits(batch, original)
-            teacher, included = teacher_distribution(model, teacher_logits)
+            model.vocabulary.require_ready()
             supervised = gather(valid, original) & (original < length)
-            weight = supervised & included
-            ce = -(teacher * logits.float().log_softmax(-1)).sum(-1)
-            ce = runtime.loss(
-                logits,
-                teacher.argmax(-1),
+            yield runtime.predictions(
+                hidden,
                 batch,
                 original,
-                default=ce,
-                teacher=teacher_logits[..., model.vocabulary.t2d],
+                mask=supervised,
+                positions=torch.tensor(depth, device=ids.device),
+                vocab_mask=model.vocabulary.t2d,
+                draft_to_target=model.vocabulary.d2t,
+                requires=frozenset({"teacher_logits"}),
+                default_loss=self.default_loss,
+                denominator=hidden.new_tensor(ids.numel()),
+                accuracy_name=f"position_{depth}_accuracy",
+                report_accuracy=depth == 0,
             )
-            weight = runtime.weighting(
-                weight.float(), torch.tensor(depth, device=weight.device)
-            )
-            total = total + self.depth_decay**depth * (ce * weight).sum()
-            prediction = logits.argmax(-1)
-            prediction = prediction + model.vocabulary.d2t[prediction]
-            ratios[f"position_{depth}_accuracy"] = (
-                ((prediction == teacher_logits.argmax(-1)) * supervised).sum().detach(),
-                supervised.sum().detach(),
-            )
-        # Legacy EAGLE normalizes masked soft CE by all sequence positions.
-        denominator = total.new_tensor(ids.numel())
-        ratios["acc"] = ratios["position_0_accuracy"]
-        return ObjectiveResult(total / denominator, total.new_ones(()), ratios)

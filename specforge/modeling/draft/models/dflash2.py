@@ -69,6 +69,9 @@ class DFlash2DraftModel(DraftPreTrainedModel):
             logits = torch.tanh(logits / cap) * cap
         return logits
 
+    def compute_logits(self, hidden: Tensor) -> Tensor:
+        return self.transform_unary_logits(self.lm_head(hidden))
+
     def forward(
         self,
         input_ids: Tensor,
@@ -88,7 +91,5 @@ class DFlash2DraftModel(DraftPreTrainedModel):
             num_layers=self.backbone.num_layers,
         )
         hidden = self.backbone(self.embed_tokens(input_ids), prepared)
-        logits = (
-            self.transform_unary_logits(self.lm_head(hidden)) if output_logits else None
-        )
+        logits = self.compute_logits(hidden) if output_logits else None
         return DFlash2Output(hidden_states=hidden, logits=logits)

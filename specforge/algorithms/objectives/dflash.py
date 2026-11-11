@@ -2,24 +2,28 @@
 
 from dataclasses import dataclass
 
-from .base import check_options, reduce_loss
+from .base import check_options
 from .inputs import prepare_blocks
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import PredictionBatch
+from .registry import register_protocol
 
 COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 
 
-@register_objective(
+@register_protocol(
     "dflash",
     architectures=("DFlashDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    outputs=("logits",),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=COMMON_MODULES,
 )
 @dataclass
 class DFlashObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+
+    default_loss = TokenLoss(kind="ce")
 
     def __post_init__(self):
         check_options(
@@ -33,9 +37,11 @@ class DFlashObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            weighting=runtime.weighting,
         )
-        output = model(blocks.input_ids, batch["hidden_states"], blocks.layer_inputs)
-        logits = output.logits.reshape(*blocks.labels.shape, -1)
-        loss = runtime.loss(logits, blocks.labels, batch, blocks.label_positions - 1)
-        return reduce_loss(loss, blocks.weights, logits=logits, labels=blocks.labels)
+        output = model(
+            blocks.input_ids,
+            batch["hidden_states"],
+            blocks.layer_inputs,
+            output_logits=False,
+        )
+        return PredictionBatch((runtime.block_predictions(output, blocks, batch),))

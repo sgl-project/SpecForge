@@ -2,17 +2,19 @@
 
 from dataclasses import dataclass
 
-from .base import check_options, reduce_loss
+from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import LossTerm, PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "domino",
     architectures=("DominoDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
-    outputs=("logits", "base_logits"),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=COMMON_MODULES + ("gru_head",),
 )
 @dataclass
@@ -21,6 +23,8 @@ class DominoObjective:
     loss_decay_gamma: float | None = None
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+
+    default_loss = TokenLoss(kind="ce")
 
     def __post_init__(self):
         check_options(
@@ -38,7 +42,6 @@ class DominoObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            weighting=runtime.weighting,
             label_offset=int(spec.block.shift_label),
         )
         output = model(
@@ -46,17 +49,17 @@ class DominoObjective:
             batch["hidden_states"],
             blocks.layer_inputs,
             predecessor_ids=blocks.predecessors.flatten(1),
+            output_logits=False,
         )
-        labels = blocks.labels.flatten(1)
         if self.lambda_base_start and not total_steps:
             raise ValueError("Domino base-loss schedule requires total_steps")
         warmup = max(1, int((total_steps or 1) * self.lambda_base_decay_ratio))
         weight = self.lambda_base_start * max(0, 1 - step / warmup)
-        loss = weight * runtime.loss(
-            output.base_logits, labels, batch, blocks.label_positions.flatten(1) - 1
-        ) + (1 - weight) * runtime.loss(
-            output.logits, labels, batch, blocks.label_positions.flatten(1) - 1
+        predictions = runtime.block_predictions(
+            output,
+            blocks,
+            batch,
+            projection_inputs={"predecessor_ids": blocks.predecessors},
+            terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
         )
-        return reduce_loss(
-            loss, blocks.weights.flatten(1), logits=output.logits, labels=labels
-        )
+        return PredictionBatch((predictions,))

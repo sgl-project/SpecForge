@@ -12,11 +12,16 @@ from . import (  # noqa: F401
     peagle,
 )
 from .base import ObjectiveModel, ObjectiveResult
+from .losses import register_loss
+from .predictions import LossTerm, PredictionBatch, Predictions
 from .registry import (
     build_objective_model,
     default_objective,
+    default_protocol,
     objective_registrations,
+    protocol_registrations,
     register_objective,
+    register_protocol,
 )
 
 __all__ = [
@@ -26,4 +31,11 @@ __all__ = [
     "default_objective",
     "objective_registrations",
     "register_objective",
+    "register_loss",
+    "register_protocol",
+    "protocol_registrations",
+    "default_protocol",
+    "Predictions",
+    "PredictionBatch",
+    "LossTerm",
 ]

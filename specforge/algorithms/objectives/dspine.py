@@ -8,16 +8,18 @@ import torch.nn.functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
 
-from .base import check_options, reduce_loss
+from .base import check_options
 from .inputs import prepare_blocks
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import AuxiliaryLoss, PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "dspine",
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    outputs=("logits", "pre_injection", "layer_features"),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=("backbone", "fusion", "injection"),
 )
 @dataclass
@@ -33,6 +35,13 @@ class DSpineObjective:
     replacement_hold_ratio: float = 1 / 6
     replacement_end_ratio: float = 1 / 3
     candidate_mass_threshold: float = 1e-4
+
+    @property
+    def default_loss(self):
+        return TokenLoss(
+            kind="ce_l1",
+            options={"ce_weight": self.ce_weight, "l1_weight": 1 - self.ce_weight},
+        )
 
     def __post_init__(self):
         check_options(
@@ -66,7 +75,6 @@ class DSpineObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            weighting=runtime.weighting,
             prefix=True,
         )
         probability = self.replacement_probability if model.training else 0
@@ -97,57 +105,70 @@ class DSpineObjective:
             blocks.layer_inputs,
             block_token_ids=blocks.labels,
             replace_masks=masks,
+            output_logits=False,
         )
-        teacher = runtime.teacher_logits(batch, blocks.label_positions - 1)
-        terms = ce_l1_loss(
-            output.logits, blocks.labels, teacher_logits=teacher, top_k=self.top_k
-        )
-        refined = model.refine(output.pre_injection, blocks.predecessors)
-        weights = model.lm_head.candidate_weights(terms.topk_ids)
-        scores = torch.einsum("...h,...kh->...k", refined, weights).float()
-        covered = terms.topk_ids == blocks.labels[..., None]
-        refinement = ce_l1_loss(
-            scores,
-            covered.long().argmax(-1),
-            teacher_logits=teacher.gather(-1, terms.topk_ids),
-        )
-        mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
-        refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(-1) + (
-            1 - self.ce_weight
-        ) * refinement.teacher_l1 * (mass > self.candidate_mass_threshold)
-        codes = F.embedding(blocks.labels, model.transfer_codes).float()
-        alignment = (
-            1 - F.cosine_similarity(output.layer_features.float(), codes[None], dim=-1)
-        ).sum(0)
-        ce_num = (terms.cross_entropy * blocks.weights).sum()
-        denominator = blocks.weights.sum().detach()
-        if alignment_ce is None:
-            totals = torch.stack((ce_num.detach(), denominator))
-            if model.training and dist.is_initialized():
-                dist.all_reduce(totals)
-            alignment_ce = totals[0] / totals[1].where(totals[1] > 0, 1)
         beta = self.alignment_weight * (
             min(step / self.alignment_warmup_steps, 1)
             if self.alignment_warmup_steps
             else 1
         )
-        base_loss = (
-            self.ce_weight * terms.cross_entropy
-            + (1 - self.ce_weight) * terms.teacher_l1
-        )
-        loss = runtime.loss(
-            output.logits,
-            blocks.labels,
+
+        def auxiliary(predictions, projected, teacher, weights):
+            labels = predictions.labels
+            terms = ce_l1_loss(
+                projected["logits"], labels, teacher_logits=teacher, top_k=self.top_k
+            )
+            refined = model.refine(
+                predictions.auxiliary_inputs["pre_injection"],
+                predictions.auxiliary_inputs["predecessors"],
+            )
+            candidates = model.lm_head.candidate_weights(terms.topk_ids)
+            scores = torch.einsum("...h,...kh->...k", refined, candidates).float()
+            covered = terms.topk_ids == labels[..., None]
+            refinement = ce_l1_loss(
+                scores,
+                covered.long().argmax(-1),
+                teacher_logits=teacher.gather(-1, terms.topk_ids),
+            )
+            mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
+            refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(
+                -1
+            ) + (1 - self.ce_weight) * refinement.teacher_l1 * (
+                mass > self.candidate_mass_threshold
+            )
+            codes = F.embedding(labels, model.transfer_codes).float()
+            alignment = (
+                1
+                - F.cosine_similarity(
+                    predictions.auxiliary_inputs["layer_features"].float(),
+                    codes[:, :, None],
+                    dim=-1,
+                )
+            ).sum(-1)
+            ce_num = (terms.cross_entropy * weights).sum()
+            denominator = weights.sum().detach()
+            coefficient = alignment_ce
+            if coefficient is None:
+                totals = torch.stack((ce_num.detach(), denominator))
+                if model.training and dist.is_initialized():
+                    dist.all_reduce(totals)
+                coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
+            return AuxiliaryLoss(
+                refined_loss + beta * coefficient.detach() * alignment,
+                {"dspine/backbone_ce": (ce_num.detach(), denominator)},
+            )
+
+        predictions = runtime.block_predictions(
+            output,
+            blocks,
             batch,
-            blocks.label_positions - 1,
-            default=base_loss,
-            teacher=teacher,
+            auxiliary=auxiliary,
+            requires=frozenset({"teacher_logits"}),
+            default_loss=self.default_loss,
+            auxiliary_inputs={
+                "pre_injection": output.pre_injection,
+                "predecessors": blocks.predecessors,
+                "layer_features": output.layer_features.movedim(0, -2),
+            },
         )
-        loss = loss + refined_loss + beta * alignment_ce.detach() * alignment
-        return reduce_loss(
-            loss,
-            blocks.weights,
-            logits=output.logits,
-            labels=blocks.labels,
-            ratios={"dspine/backbone_ce": (ce_num.detach(), denominator)},
-        )
+        return PredictionBatch((predictions,))

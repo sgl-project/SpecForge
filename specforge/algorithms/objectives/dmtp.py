@@ -2,23 +2,27 @@
 
 from dataclasses import dataclass
 
-from .base import check_options, reduce_loss
+from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import gather, prepare_blocks
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "dmtp",
     architectures=("DMTPDraftModel",),
     inputs=("input_ids", "hidden_states", "mtp_hidden_states", "loss_mask"),
-    outputs=("logits",),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=COMMON_MODULES + ("mtp_fusion",),
 )
 @dataclass
 class DMTPObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+
+    default_loss = TokenLoss(kind="ce")
 
     def __post_init__(self):
         check_options(
@@ -32,7 +36,6 @@ class DMTPObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            weighting=runtime.weighting,
             input_offset=1,
             label_offset=1,
             context_offset=spec.context_end_offset,
@@ -47,11 +50,6 @@ class DMTPObjective:
             blocks.layer_inputs,
             mtp_features=mtp,
             block_keep_mask=blocks.keep,
+            output_logits=False,
         )
-        logits = output.logits.reshape(*blocks.labels.shape, -1)
-        return reduce_loss(
-            runtime.loss(logits, blocks.labels, batch, blocks.label_positions - 1),
-            blocks.weights,
-            logits=logits,
-            labels=blocks.labels,
-        )
+        return PredictionBatch((runtime.block_predictions(output, blocks, batch),))

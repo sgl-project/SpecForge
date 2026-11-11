@@ -161,7 +161,7 @@ class DSpineDraftModel(DraftPreTrainedModel):
             hidden_states=hidden,
             pre_injection=pre_injection,
             layer_features=torch.stack(features),
-            logits=self.lm_head(hidden) if output_logits else None,
+            logits=self.compute_logits(hidden) if output_logits else None,
         )
 
     def refine(self, hidden: Tensor, predecessor_ids: Tensor) -> Tensor:

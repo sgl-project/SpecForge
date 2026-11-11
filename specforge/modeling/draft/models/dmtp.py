@@ -107,5 +107,6 @@ class DMTPDraftModel(DraftPreTrainedModel):
         )
         hidden = self.backbone(assembled, prepared)
         return DMTPOutput(
-            hidden_states=hidden, logits=self.lm_head(hidden) if output_logits else None
+            hidden_states=hidden,
+            logits=self.compute_logits(hidden) if output_logits else None,
         )

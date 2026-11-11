@@ -9,17 +9,18 @@ from specforge.algorithms.common.cod import (
     generate_cod_sample_indices,
 )
 
-from .base import ObjectiveResult, check_options, reduce_loss
-from .eagle3 import teacher_distribution
+from .base import check_options
 from .inputs import gather, sequence_inputs, valid_tokens
-from .registry import register_objective
+from .losses import TokenLoss
+from .predictions import PredictionBatch
+from .registry import register_protocol
 
 
-@register_objective(
+@register_protocol(
     "peagle",
     architectures=("PEagleDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
-    outputs=("logits",),
+    provides=("logits", "labels", "teacher_logits", "chain_positions"),
     trains=("backbone", "fusion", "embed_tokens", "lm_head", "mask_hidden"),
 )
 @dataclass
@@ -27,6 +28,8 @@ class PEagleObjective:
     num_depths: int = 8
     down_sample_ratio: float = 0.8
     down_sample_ratio_min: float = 0.2
+
+    default_loss = TokenLoss(kind="soft_ce")
 
     def __post_init__(self):
         check_options(
@@ -73,21 +76,17 @@ class PEagleObjective:
             gather(batch["hidden_states"], original),
             sequence_inputs(model.config.draft, original, visible),
             feature_mask=feature_mask,
+            output_logits=False,
         )
-        teacher_logits = runtime.teacher_logits(batch, original + 1)
-        teacher, included = teacher_distribution(model, teacher_logits)
-        weight = gather(supervised, original).float() * included
-        ce = -(teacher * output.logits.float().log_softmax(-1)).sum(-1)
-        ce = runtime.loss(
-            output.logits,
-            teacher.argmax(-1),
+        model.vocabulary.require_ready()
+        predictions = runtime.predictions(
+            output.hidden_states,
             batch,
             original + 1,
-            default=ce,
-            teacher=teacher_logits[..., model.vocabulary.t2d],
+            mask=gather(supervised, original),
+            positions=depths[None],
+            vocab_mask=model.vocabulary.t2d,
+            requires=frozenset({"teacher_logits"}),
+            default_loss=self.default_loss,
         )
-        weight = runtime.weighting(weight, depths[None])
-        result = reduce_loss(
-            ce, weight, logits=output.logits, labels=teacher.argmax(-1)
-        )
-        return ObjectiveResult(result.loss, weight.new_ones(()), result.ratios)
+        return PredictionBatch((predictions,), reduction="sum_means")

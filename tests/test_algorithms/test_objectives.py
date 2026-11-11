@@ -61,6 +61,19 @@ def training_batch(config, device="cpu"):
     )
 
 
+def capture_projections(model):
+    outputs = []
+    project = model.project
+
+    def capture(*args, **kwargs):
+        output = project(*args, **kwargs)
+        outputs.append(output)
+        return output
+
+    model.project = capture
+    return outputs
+
+
 class ObjectiveTest(unittest.TestCase):
     def test_defaults_train_every_serving_parameter(self):
         for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
@@ -154,15 +167,12 @@ class ObjectiveTest(unittest.TestCase):
         config = mtp_config(target_bindings=(), target_logit_transform=None)
         model = build_draft_model(config)
         batch = training_batch(config)
-        captured = []
-        handle = model.register_forward_hook(
-            lambda module, args, output: captured.append(output.logits)
-        )
+        captured = capture_projections(model)
         result = build_objective_model(model)(batch, step=0, total_steps=None)
-        handle.remove()
         labels = batch["input_ids"][:, 2:8]
         reference = torch.nn.functional.cross_entropy(
-            captured[0][:, :6].flatten(0, 1), labels.flatten()
+            captured[0]["logits"].reshape(1, 8, -1)[:, :6].flatten(0, 1),
+            labels.flatten(),
         )
         torch.testing.assert_close(result.loss, reference)
 
@@ -174,10 +184,7 @@ class ObjectiveTest(unittest.TestCase):
             blocks = prepare_blocks(
                 config, batch, num_anchors=2, label_offset=int(shifted)
             )
-            captured = []
-            model.register_forward_hook(
-                lambda module, args, output: captured.append(output)
-            )
+            captured = capture_projections(model)
             runtime = build_objective_model(model, options={"num_anchors": 2})
             with (
                 patch(
@@ -206,10 +213,10 @@ class ObjectiveTest(unittest.TestCase):
                 )
 
             expected = (
-                (0.8 * ce(output.base_logits) + 0.2 * ce(output.logits)) * weights
+                (0.8 * ce(output["base_logits"]) + 0.2 * ce(output["logits"])) * weights
             ).sum() / weights.sum()
             torch.testing.assert_close(result.loss, expected)
-            self.assertIsNone(output.correction_logits)
+            self.assertIsNone(output["correction_logits"])
 
     def test_reject_incompatible_or_unknown_options(self):
         model = build_draft_model(dflash2_config())

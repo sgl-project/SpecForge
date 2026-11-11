@@ -79,7 +79,6 @@ def prepare_blocks(
     batch,
     *,
     num_anchors=512,
-    weighting=None,
     label_offset=0,
     input_offset=0,
     context_offset=0,
@@ -121,8 +120,6 @@ def prepare_blocks(
         # Do not bridge an unsupervised gap inside a rollout.
         allowed = (allowed | ~prediction).long().cumprod(-1).bool() & allowed
     weights = (allowed & prediction).float()
-    if weighting is not None:
-        weights = weighting(weights, slots - spec.protocol.prediction_positions[0])
     noisy = torch.full_like(labels, spec.target_features.mask_token_id)
     noisy[..., 0] = gather(ids, anchors + input_offset).masked_fill(
         ~keep, spec.target_features.mask_token_id

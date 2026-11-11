@@ -91,10 +91,70 @@ class ObjectiveModel(nn.Module):
             hidden = batch["target_last_hidden_states"]
             return self.target_head(gather(hidden, positions).detach())
 
-    def loss(self, logits, labels, batch, positions, *, default=None, teacher=None):
-        if self.token_loss.requires_teacher and teacher is None:
-            teacher = self.teacher_logits(batch, positions)
-        return self.token_loss(logits, labels, teacher=teacher, default=default)
+    def predictions(
+        self,
+        hidden,
+        batch,
+        teacher_positions,
+        *,
+        mask,
+        labels=None,
+        positions=None,
+        unit_size=1,
+        projection_inputs=None,
+        auxiliary_inputs=None,
+        **options,
+    ):
+        from .inputs import gather
+        from .predictions import Predictions, Teacher
+
+        def align(value):
+            return value.reshape(-1, unit_size, *value.shape[mask.ndim :])
+
+        teacher = None
+        if "target_logits" in batch:
+            teacher = Teacher(
+                align(gather(batch["target_logits"], teacher_positions)).detach()
+            )
+        elif self.target_head is not None and "target_last_hidden_states" in batch:
+            teacher = Teacher(
+                align(
+                    gather(batch["target_last_hidden_states"], teacher_positions)
+                ).detach(),
+                self.target_head,
+            )
+        if positions is None:
+            positions = torch.arange(unit_size, device=hidden.device)
+        return Predictions(
+            hidden=hidden.reshape(-1, unit_size, hidden.shape[-1]),
+            projector=self.draft_model.project,
+            mask=mask.reshape(-1, unit_size),
+            labels=None if labels is None else labels.reshape(-1, unit_size),
+            positions=torch.broadcast_to(positions, mask.shape).reshape(-1, unit_size),
+            teacher=teacher,
+            projection_inputs={
+                key: align(value) for key, value in (projection_inputs or {}).items()
+            },
+            auxiliary_inputs={
+                key: align(value) for key, value in (auxiliary_inputs or {}).items()
+            },
+            **options,
+        )
+
+    def block_predictions(self, output, blocks, batch, **options):
+        protocol = self.draft_model.config.draft.spec_config.protocol
+        slots = protocol.num_model_slots
+        return self.predictions(
+            output.hidden_states,
+            batch,
+            blocks.label_positions - 1,
+            mask=blocks.weights,
+            labels=blocks.labels,
+            unit_size=slots,
+            positions=torch.arange(slots, device=blocks.labels.device)
+            - protocol.prediction_positions[0],
+            **options,
+        )
 
     def forward(self, batch, *, step, total_steps, alignment_ce=None):
         from .inputs import valid_tokens
@@ -109,8 +169,16 @@ class ObjectiveModel(nn.Module):
         for key in ("hidden_states", "mtp_hidden_states"):
             if key in batch:
                 batch[key] = batch[key].to(dtype=dtype)
-        return self.objective(
+        from .execution import execute_batch
+
+        prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, alignment_ce=alignment_ce
+        )
+        return execute_batch(
+            prepared,
+            self.token_loss,
+            self.weighting,
+            training=self.draft_model.training,
         )
 
 

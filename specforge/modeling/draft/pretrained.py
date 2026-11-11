@@ -126,6 +126,14 @@ class DraftPreTrainedModel(PreTrainedModel):
                 f"{type(module).__name__} must define reset_draft_parameters"
             )
 
+    def compute_logits(self, hidden):
+        """Project decoder states; specialized models retain their own transforms."""
+        return self.lm_head(hidden)
+
+    def project(self, hidden):
+        """Run prediction heads without repeating backbone execution."""
+        return {"logits": self.compute_logits(hidden)}
+
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         options = dict(gradient_checkpointing_kwargs or {})
         if options.pop("use_reentrant", False) is not False or options:

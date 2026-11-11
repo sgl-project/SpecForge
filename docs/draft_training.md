@@ -4,7 +4,7 @@
 canonical draft and an optional frozen target head in one module, so distributed
 training executes the entire differentiable computation through its wrapper.
 Objectives register independently from model construction and checkpoint formats.
-A registration declares supported architectures, input/output names and parameter
+A registration declares supported architectures, input names, capabilities and parameter
 prefixes it trains. A trainable parameter outside that coverage fails construction;
 explicitly frozen parameters and target bindings are excluded.
 
@@ -27,11 +27,13 @@ result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
 `loss.kind` accepts `default`, `ce` (explicit labels), `soft_ce`, `kl`, `reverse_kl`,
-`js`, `tv`, `nla` and `lk`. Distillation needs aligned teacher logits or final states
+`js`, `tv`, `nla`, `lk` and `ce_l1`. Distillation needs aligned teacher logits or final states
 plus a frozen head. `default` preserves each algorithm's base loss. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
-Weighting accepts `uniform` or `exponential`; omitting it preserves the objective's
-`loss_decay_gamma`. EAGLE/P-EAGLE apply it to rollout depth. DFlash2 selector warmup
+Weighting accepts `uniform`, `exponential` (gamma) or `geometric` (factor).
+Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
+An explicit weighting replaces that default; EAGLE does not apply another depth
+factor. EAGLE/P-EAGLE apply weighting to rollout depth. DFlash2 selector warmup
 and ramp accept either absolute steps or ratios of total optimizer steps.
 
 Input batches use **unshifted** `input_ids`, `loss_mask` and teacher features at the
@@ -58,3 +60,26 @@ multiplier. Its transfer space must be initialized or restored before the first
 forward. Callers pass `step` and `total_steps` explicitly (`None` when no total-step
 schedule is used). EAGLE and block objectives reject packed sequences. P-EAGLE
 supports packed documents and excludes shifted labels crossing document ends.
+
+Each protocol owns sampling, model execution and auxiliary supervision. It returns
+`Predictions` containing hidden states, aligned labels/masks, a deferred teacher
+source and model-owned `project()`. The shared executor checks capabilities,
+projects logits, applies the selected loss and weighting, then reduces results.
+Auxiliary selector, confidence and alignment losses remain protocol callbacks.
+All differentiable work runs inside `ObjectiveModel.forward`, including projection.
+
+`register_protocol` declares the capabilities a protocol provides;
+`register_loss(name, requires=...)` declares what a loss consumes. Compatibility
+is checked at construction and against the actual predictions before projection.
+Teacher-dependent losses extend capture inputs; teacher projection runs only when
+needed. Architecture checks select execution protocols, not permitted loss lists.
+
+`Predictions.select()` slices complete projection units. DSpark's Markov head and
+Domino's GRU keep a full block together; independent token projections use
+single-token units. Projection does not rerun the backbone, and Domino computes
+base and corrected logits together. This boundary supports later chunked projection
+and fused-loss executors; this PR still uses the eager executor. Chunked DSpine
+training must reuse the optimizer-window alignment multiplier across chunks.
+D-PACE and the full legacy LK option set are not exposed by this API. Training
+configuration and resume serialization must carry loss and weighting selections
+when the canonical training entry adopts them.
