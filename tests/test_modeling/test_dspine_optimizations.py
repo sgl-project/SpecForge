@@ -45,6 +45,9 @@ class DSpineRefinementLossTest(unittest.TestCase):
         for device, dtype in product(devices, (torch.float32, torch.bfloat16)):
             with self.subTest(device=device, dtype=dtype):
                 self.model.to(device=device, dtype=dtype)
+                self.model.draft_model.lm_head.load_target_weight(
+                    self.model.target_head.weight
+                )
                 self.model.objective = replace(
                     self.model.objective, ce_weight=0, candidate_mass_threshold=0
                 )

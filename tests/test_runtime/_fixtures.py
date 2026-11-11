@@ -385,7 +385,7 @@ def build_block_model(
     draft.embed_tokens.requires_grad_(False)
     draft.lm_head.requires_grad_(False)
     if hasattr(draft, "initialize_transfer_space"):
-        draft.initialize_transfer_space(target.lm_head.weight)
+        draft.initialize_transfer_space()
     options = dict(num_anchors=num_anchors)
     if kind == "dflash":
         options["teacher_metrics"] = False

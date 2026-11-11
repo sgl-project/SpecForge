@@ -68,7 +68,9 @@ class ObjectiveOptimizationTest(unittest.TestCase):
                 config.hidden_size, config.vocab_size, bias=False, device=device
             )
             if hasattr(model, "initialize_transfer_space"):
-                model.initialize_transfer_space(teacher.weight)
+                model.embed_tokens.load_target_weight(torch.randn_like(teacher.weight))
+                model.lm_head.load_target_weight(teacher.weight)
+                model.initialize_transfer_space()
             batch = training_batch(config, device)
             variants = (
                 [

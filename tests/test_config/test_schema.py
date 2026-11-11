@@ -38,8 +38,6 @@ def _online_payload(strategy: str = "eagle3") -> dict:
     payload["data"] = {"train_data_path": "/train.jsonl"}
     payload["training"] = {"max_steps": 1}
     payload["draft"] = f"specforge/config/draft/presets/qwen3-8b-{strategy}.yaml"
-    if strategy == "peagle":
-        payload["training"]["objective_options"] = {"mask_token_id": 151669}
     payload["deployment"] = copy.deepcopy(ONLINE_DEPLOYMENT)
     if strategy == "mtp":
         from specforge.config.draft.codec import encode_config

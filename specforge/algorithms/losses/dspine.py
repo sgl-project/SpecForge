@@ -4,7 +4,6 @@ import torch
 from torch.nn import functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
-from specforge.modeling.draft.bindings import BoundLMHead
 
 from .blocks import logits_loss_terms
 
@@ -34,12 +33,7 @@ def dspine_chunk_terms(
     )
     candidates = terms.topk_ids
     refined = model.refine(pre_injection, predecessors)
-    head = model.lm_head
-    candidate_weights = (
-        head.candidate_weights(candidates)
-        if isinstance(head, BoundLMHead)
-        else F.embedding(candidates, head.weight)
-    )
+    candidate_weights = model.lm_head.candidate_weights(candidates)
     scores = torch.einsum("bmh,bmkh->bmk", refined, candidate_weights).float()
     target_candidates = teacher_logits.softmax(dim=-1, dtype=torch.float32).gather(
         -1, candidates

@@ -31,6 +31,7 @@ def tiny_config(head_dim=4):
             base.spec_config,
             target_features=replace(
                 base.spec_config.target_features,
+                hidden_size=16,
                 mask_token_id=31,
                 target_layer_ids=(1, 4, 6),
             ),
@@ -42,7 +43,9 @@ def training_model(chunk_size=0, head_dim=4, backend="sdpa", **options):
     torch.manual_seed(17)
     draft = build_draft_model(tiny_config(head_dim), backend=backend)
     head = nn.Linear(16, 32, bias=False)
-    draft.initialize_transfer_space(head.weight, chunk_size=7)
+    draft.embed_tokens.load_target_weight(torch.randn(32, 16))
+    draft.lm_head.load_target_weight(head.weight)
+    draft.initialize_transfer_space(chunk_size=7)
     with torch.no_grad():
         for write in draft.injection.writes:
             write.weight.normal_(std=0.05)

@@ -46,7 +46,11 @@ def target_directory(root):
 
 def run_config(target, draft, **updates):
     raw = dict(
-        model={"target_model_path": str(target), "torch_dtype": "float32"},
+        model={
+            "target_model_path": str(target),
+            "torch_dtype": "float32",
+            "use_liger_kernel": False,
+        },
         data={
             "hidden_states_path": str(target.parent / "features"),
             "dataloader_num_workers": 0,

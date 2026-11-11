@@ -26,7 +26,7 @@ def _payload(
     if algorithm in {"eagle3", "peagle"} and mode == "online":
         model["vocab_mapping_path"] = "mapping.pt"
     training = {
-        "objective_options": {"mask_token_id": 0} if algorithm == "peagle" else {},
+        "objective_options": {},
         "max_steps": 1,
         "attention_backend": "flex_attention",
         "batch_size": 1,

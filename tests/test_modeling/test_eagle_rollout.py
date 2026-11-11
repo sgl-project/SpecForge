@@ -2,6 +2,7 @@
 
 import copy
 import unittest
+from dataclasses import replace
 
 import torch
 
@@ -27,8 +28,21 @@ class EagleRolloutTest(unittest.TestCase):
         self.check_backends(torch.bfloat16, ["sdpa", "fa"], 0.025)
 
     def check_backends(self, dtype, backends, tolerance):
+        for norm_output in (False, True):
+            with self.subTest(norm_output=norm_output):
+                self._check_backends(dtype, backends, tolerance, norm_output)
+
+    def _check_backends(self, dtype, backends, tolerance, norm_output):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        original = build_draft_model(model_config(), device=device, dtype=dtype)
+        config = model_config(norm_output=norm_output)
+        config = replace(
+            config,
+            attention_configs={
+                name: replace(node, head_dim=16)
+                for name, node in config.attention_configs.items()
+            },
+        )
+        original = build_draft_model(config, device=device, dtype=dtype)
         ids = torch.arange(8, device=device)[None]
         features = torch.randn(
             1,

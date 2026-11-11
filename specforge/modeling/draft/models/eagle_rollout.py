@@ -93,7 +93,9 @@ class EagleRollout:
             hidden, key, value = self.model.backbone.layers[0](
                 torch.cat((embeds, features), -1), cached_step=cached_step
             )
-            return self.model.backbone.final_norm(hidden), key, value
+            if self.model.config.draft.spec_config.norm_output:
+                hidden = self.model.backbone.final_norm(hidden)
+            return hidden, key, value
 
         if self.model.is_gradient_checkpointing and torch.is_grad_enabled():
             output, key, value = checkpoint(
