@@ -49,6 +49,15 @@ class DraftPreTrainedModel(PreTrainedModel):
                 validate()
         return (model, info) if output_loading_info else model
 
+    def finalize_initialization(self, *, loaded_keys: frozenset[str]) -> None:
+        """Finish scratch/warm-start initialization after copying and binding weights.
+
+        loaded_keys names the draft state supplied by the weight plan. Overrides
+        may initialize fresh derived state, but must preserve loaded state and
+        reject incomplete groups. This hook performs no file I/O and is not
+        called when restoring a complete checkpoint.
+        """
+
     def init_weights(self):
         on_meta = [
             tensor.is_meta for tensor in chain(self.parameters(), self.buffers())

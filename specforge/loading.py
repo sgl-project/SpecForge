@@ -17,7 +17,6 @@ from specforge.checkpoint.weight_plan import _validate_unquantized
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.models.dspine import DSpineDraftModel
 from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 
 
@@ -199,20 +198,7 @@ def initialize_draft(
     model = build_draft_model(draft, device=device, dtype=dtype, backend=backend)
     apply_weight_plan(model, plan)
     _validate_vocabulary(model, plan)
-    if isinstance(model, DSpineDraftModel):
-        transfer_keys = {"transfer_codes", "transfer_ready"} | {
-            name
-            for name in model.state_dict()
-            if name.startswith("injection.readouts.")
-        }
-        loaded = transfer_keys.intersection(dict(plan.weights))
-        if loaded and (loaded != transfer_keys or not model.transfer_ready.item()):
-            raise ValueError(
-                "Cannot initialize an incomplete DSpine transfer space over loaded state; "
-                "load the complete transfer space or mark all of it allow_new"
-            )
-        if not loaded:
-            model.initialize_transfer_space()
+    model.finalize_initialization(loaded_keys=frozenset(dict(plan.weights)))
     return model
 
 

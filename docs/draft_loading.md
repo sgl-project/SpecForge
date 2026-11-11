@@ -91,6 +91,8 @@ A saved copy of a target-bound table must match the supplied target; importing
 must not silently replace trained weights. Hub imports also fetch
 `training_state.pt` for these structural records, without restoring training state.
 
-`initialize_draft` initializes a fresh DSpine transfer space after binding the
-target head. Warm starts preserve a loaded transfer space; partial transfer-state
-loads are rejected rather than overwriting trained readouts.
+After copying and binding weights, `initialize_draft` calls the model's
+`finalize_initialization(loaded_keys=...)`. Models own derived-state initialization
+and consistency checks; the loader supplies only the loaded draft tensor names.
+DSpine initializes a fresh transfer space here, preserves complete loaded state,
+and rejects partial transfer-state loads. `load_draft` does not call this hook.

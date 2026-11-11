@@ -72,6 +72,20 @@ class DSpineDraftModel(DraftPreTrainedModel):
         init.zeros_(self.transfer_codes)
         init.zeros_(self.transfer_ready)
 
+    def finalize_initialization(self, *, loaded_keys: frozenset[str]) -> None:
+        transfer_keys = {"transfer_codes", "transfer_ready"} | {
+            f"injection.readouts.{name}"
+            for name in self.injection.readouts.state_dict()
+        }
+        loaded = transfer_keys & loaded_keys
+        if loaded and (loaded != transfer_keys or not self.transfer_ready.item()):
+            raise ValueError(
+                "Cannot initialize an incomplete DSpine transfer space over loaded state; "
+                "load the complete transfer space or mark all of it allow_new"
+            )
+        if not loaded:
+            self.initialize_transfer_space()
+
     @torch.no_grad()
     def initialize_transfer_space(self, *, chunk_size: int = 4096) -> None:
         if self.transfer_ready.item():
