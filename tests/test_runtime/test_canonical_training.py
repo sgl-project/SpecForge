@@ -97,8 +97,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             for draft in configs:
                 with self.subTest(architecture=draft.architecture):
                     cfg = run_config(target, draft)
-                    if draft.architecture == "PEagleDraftModel":
-                        cfg.training.objective_options = {"mask_token_id": 0}
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
                         resolved.config, algorithm=resolved.algorithm

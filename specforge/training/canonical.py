@@ -353,7 +353,7 @@ def build_bundle(cfg, algorithm):
     if hasattr(model, "initialize_transfer_space") and not bool(model.transfer_ready):
         if source:
             raise ValueError("DSpine checkpoint has no initialized transfer space")
-        model.initialize_transfer_space(teacher.bound_weight())
+        model.initialize_transfer_space()
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
