@@ -81,7 +81,10 @@ def read_legacy(payload, store, target_config, *, check_target=True):
         if recorded is not None and (
             type(recorded) is not bool or recorded != expected
         ):
-            raise ValueError(f"recorded {name} conflicts with legacy configuration")
+            raise ValueError(
+                f"recorded {name}={recorded!r} conflicts with the draft config; "
+                "use the config of the run that wrote training_state.pt"
+            )
     prefix = _CONTEXT_RECORD_PREFIXES.get(architecture)
     if prefix is not None:
         spec = config.spec_config
@@ -96,8 +99,9 @@ def read_legacy(payload, store, target_config, *, check_target=True):
                 recorded = tuple(recorded)
             if recorded is not None and recorded != value:
                 raise ValueError(
-                    f"recorded {prefix}_{field}={recorded!r} conflicts with legacy "
-                    f"configuration ({value!r}); supply the run's draft config"
+                    f"recorded {prefix}_{field}={recorded!r} conflicts with the draft "
+                    f"config ({value!r}); use the config of the run that wrote "
+                    "training_state.pt"
                 )
     if architecture == "DFlashDraftModel":
         architecture = config.architecture
