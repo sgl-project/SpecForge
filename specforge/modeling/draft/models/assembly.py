@@ -2,13 +2,18 @@
 
 from dataclasses import replace
 
+from torch import nn
+
 from specforge.config.draft import DraftConfig
+from specforge.config.draft.architecture.features import TargetFeatureSpec
 from specforge.config.draft.residual import StandardResidualSpec
 
 from ..backbone import DraftBackbone
 from ..layers import DecoderLayer, build_component, component_builder
 from ..layers.attention.backends import AttentionPreparationScope
 from ..layers.rope import build_rotary
+from .target_features import TargetFeatureFusion
+from .tokens import build_token_modules
 
 
 class DecoderBackbone(DraftBackbone):
@@ -125,3 +130,26 @@ def build_decoder_backbone(
         rotary=rotary,
         residual=residual,
     )
+
+
+def build_target_context_modules(
+    config: DraftConfig,
+    target_features: TargetFeatureSpec,
+    *,
+    backend: str,
+    device=None,
+    dtype=None,
+) -> tuple[DraftBackbone, TargetFeatureFusion, nn.Module, nn.Module]:
+    """Build backbone, context fusion, embedding and head; the model owns initialization."""
+    backbone = build_decoder_backbone(
+        config, backend=backend, device=device, dtype=dtype
+    )
+    fusion = TargetFeatureFusion(
+        target_features,
+        hidden_size=config.hidden_size,
+        norm=config.norm_config,
+        device=device,
+        dtype=dtype,
+    )
+    embedding, head = build_token_modules(config, device=device, dtype=dtype)
+    return backbone, fusion, embedding, head

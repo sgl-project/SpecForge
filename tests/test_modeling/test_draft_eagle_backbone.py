@@ -90,11 +90,7 @@ class EagleBackboneTest(unittest.TestCase):
                         ]
                     ).to(device)
                     references.load_state_dict(actual.layers.state_dict(), strict=True)
-                    final_norm = (
-                        LlamaRMSNorm(32).to(device)
-                        if kind == "peagle" or option
-                        else nn.Identity()
-                    )
+                    final_norm = LlamaRMSNorm(32).to(device)
                     final_norm.load_state_dict(
                         actual.final_norm.state_dict(), strict=True
                     )
@@ -232,7 +228,7 @@ class EagleBackboneTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Eagle3Spec or PEagleSpec"):
                 build_eagle_backbone(draft_config(), backend="eager")
             with self.assertRaisesRegex(ValueError, "unsupported attention backend"):
-                build_eagle_backbone(eagle_config(), backend="flex")
+                build_eagle_backbone(eagle_config(), backend="unknown")
             with patch.dict(_BUILDERS):
                 _BUILDERS.pop(("norm", "rms"))
                 with self.assertRaisesRegex(ValueError, "no modeling builder"):

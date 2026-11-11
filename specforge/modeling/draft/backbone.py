@@ -7,9 +7,14 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from .layers.inputs import LayerInputs
+from .layers.inputs import LayerInputs, LayerOutput
 from .layers.residual import ResidualStreams
 from .layers.rope import NODE_DETERMINED_ROTARY_TYPES
+
+
+def _call_layer(layer, hidden, inputs, layer_kwargs):
+    """Keep layer keyword arguments separate from checkpoint control options."""
+    return layer(hidden, inputs, **layer_kwargs)
 
 
 @dataclass(frozen=True, eq=False)
@@ -18,6 +23,7 @@ class BackboneState:
     layer_inputs: tuple[LayerInputs, ...]
     next_layer: int
     _owner: object = field(repr=False)
+    layer_output: LayerOutput | None = None
 
     def with_hidden(self, hidden: Tensor) -> "BackboneState":
         """Replace a layer result without detaching its graph or changing layout."""
@@ -25,13 +31,18 @@ class BackboneState:
             raise ValueError(
                 "replacement hidden state must preserve the residual layout"
             )
-        return replace(self, hidden=hidden)
+        output = self.layer_output
+        return replace(
+            self,
+            hidden=hidden,
+            layer_output=replace(output, hidden=hidden) if output is not None else None,
+        )
 
 
 class DraftBackbone(nn.Module):
     """Own modules and execution order; architectures own fusion and injections.
 
-    Each layer implements layer(hidden, inputs: LayerInputs) -> Tensor. Builders
+    Layers return a Tensor or a LayerOutput with additional typed tensors. Builders
     provide validated components; this class does not interpret configuration.
     Mutable serving caches are not part of this initial execution interface.
     """
@@ -94,7 +105,8 @@ class DraftBackbone(nn.Module):
         if state._owner is not self._state_owner:
             raise ValueError("state belongs to another backbone")
 
-    def run_next_layer(self, state: BackboneState) -> BackboneState:
+    def run_next_layer(self, state: BackboneState, **layer_kwargs) -> BackboneState:
+        """Run one stage; optional arguments and extra results belong to that stage."""
         self._check_state(state)
         if not 0 <= state.next_layer < self.num_layers:
             raise ValueError("no next layer remains")
@@ -103,12 +115,25 @@ class DraftBackbone(nn.Module):
         if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             # Non-reentrant checkpointing retains gradients for nested context/RoPE
             # tensors, and works when inputs are frozen but layer weights are not.
-            # Pass the selected module directly: recomputation must not close over
-            # an advancing layer index. Normal module hooks still run.
-            hidden = checkpoint(layer, state.hidden, inputs, use_reentrant=False)
+            # Pass the module and its kwargs as positional inputs, so checkpoint
+            # cannot consume a layer argument such as debug or use_reentrant.
+            result = checkpoint(
+                _call_layer,
+                layer,
+                state.hidden,
+                inputs,
+                layer_kwargs,
+                use_reentrant=False,
+            )
         else:
-            hidden = layer(state.hidden, inputs)
-        return replace(state, hidden=hidden, next_layer=state.next_layer + 1)
+            result = _call_layer(layer, state.hidden, inputs, layer_kwargs)
+        output = result if isinstance(result, LayerOutput) else None
+        return replace(
+            state,
+            hidden=output.hidden if output is not None else result,
+            next_layer=state.next_layer + 1,
+            layer_output=output,
+        )
 
     def finalize(self, state: BackboneState) -> Tensor:
         self._check_state(state)

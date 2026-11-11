@@ -9,6 +9,7 @@ from torch import nn
 
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.modeling.draft.backbone import DraftBackbone, LayerInputs
+from specforge.modeling.draft.layers.inputs import LayerOutput
 from specforge.modeling.draft.layers.residual import ResidualStreams, StandardResidual
 
 
@@ -79,6 +80,42 @@ class BackboneTest(unittest.TestCase):
         for layer, entry in zip(backbone.layers, inputs):
             self.assertIs(layer.seen_inputs[-1].target_context, entry.target_context)
             self.assertIsNone(entry.position_embeddings)
+
+    def test_typed_layer_results_share_execution_and_checkpointing(self):
+        @dataclasses.dataclass(frozen=True, eq=False)
+        class Output(LayerOutput):
+            feature: torch.Tensor
+
+        class Layer(TestLayer):
+            def forward(self, hidden, inputs, *, debug=False):
+                hidden = super().forward(hidden, inputs)
+                return Output(hidden, hidden * (2 if debug else 1))
+
+        backbone = make_backbone()
+        backbone.layers = nn.ModuleList([Layer(), Layer()])
+        hidden, inputs = torch.randn(1, 3, 4), make_inputs()
+        expected = backbone(hidden, inputs)
+        reference_grads = None
+        for checkpointing in (False, True):
+            backbone.zero_grad(set_to_none=True)
+            backbone.gradient_checkpointing = checkpointing
+            state = backbone.begin(hidden, inputs)
+            for _ in backbone.layers:
+                state = backbone.run_next_layer(state, debug=True)
+            torch.testing.assert_close(
+                backbone.finalize(state), expected, rtol=0, atol=0
+            )
+            torch.testing.assert_close(state.layer_output.feature, state.hidden * 2)
+            injected = state.with_hidden(state.hidden + 1)
+            self.assertIs(injected.layer_output.hidden, injected.hidden)
+            self.assertIs(injected.layer_output.feature, state.layer_output.feature)
+            state.layer_output.feature.sum().backward()
+            grads = [
+                p.grad.clone() for layer in backbone.layers for p in layer.parameters()
+            ]
+            if reference_grads is not None:
+                torch.testing.assert_close(grads, reference_grads, rtol=0, atol=0)
+            reference_grads = grads
 
     def test_model_owned_injection_keeps_intermediate_gradients(self):
         backbone = make_backbone()

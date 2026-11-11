@@ -1,13 +1,12 @@
 """Assemble EAGLE's fused first stage and ordinary later decoder layers."""
 
-from torch import nn
-
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.architecture import Eagle3Spec, PEagleSpec
 from specforge.config.draft.residual import StandardResidualSpec
 
 from ..backbone import DraftBackbone
 from ..layers import DecoderLayer, build_component, component_builder
+from ..layers.attention.backends import resolve_attention_backend
 from ..layers.rope import build_rotary
 from .assembly import DecoderBackbone
 from .eagle_fusion import EagleDecoderStage
@@ -18,9 +17,9 @@ def build_eagle_backbone(
 ) -> DraftBackbone:
     """Consume concatenated token embeddings and already projected features.
 
-    EAGLE3's norm_output=False leaves normalization to the model's logits path;
-    norm_output=True and P-EAGLE normalize here. Feature projection, learned
-    feature masking, vocabulary mappings and the LM head remain model-owned.
+    The output norm always lives here; EAGLE3 may apply it only for logits.
+    Feature projection, learned feature masking, vocabulary mappings and the
+    LM head remain model-owned.
     """
     if type(config) is not DraftConfig:
         raise TypeError("EAGLE assembly requires a resolved DraftConfig")
@@ -29,6 +28,7 @@ def build_eagle_backbone(
         raise ValueError("EAGLE assembly requires Eagle3Spec or PEagleSpec")
     if type(config.residual_config) is not StandardResidualSpec:
         raise ValueError("EAGLE assembly currently requires standard residuals")
+    backend = resolve_attention_backend(backend)
     convolved = [
         name
         for name in dict.fromkeys(config.layer_types)
@@ -97,14 +97,9 @@ def build_eagle_backbone(
                 **options,
             )
         )
-    normalize_output = type(spec) is PEagleSpec or spec.norm_output
     return DecoderBackbone(
         layers,
         rotary=rotary,
-        final_norm=(
-            build_component("norm", config.norm_config, **options)
-            if normalize_output
-            else nn.Identity()
-        ),
+        final_norm=build_component("norm", config.norm_config, **options),
         residual=residual,
     )

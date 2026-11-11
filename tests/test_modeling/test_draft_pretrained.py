@@ -95,6 +95,19 @@ def model_inputs(model):
 
 
 class DraftPreTrainedTest(unittest.TestCase):
+    def test_hf_embedding_getter_fallbacks(self):
+        model = DFlashDraftModel(model_config())
+        self.assertIs(model.get_input_embeddings(), model.embed_tokens)
+        self.assertIs(model.get_output_embeddings(), model.lm_head)
+        model.tokens = model.embed_tokens
+        del model.embed_tokens, model.lm_head
+        model._input_embed_layer = "tokens"
+        self.assertIs(model.get_input_embeddings(), model.tokens)
+        self.assertIsNone(model.get_output_embeddings())
+        del model.tokens
+        with self.assertRaises(NotImplementedError):
+            model.get_input_embeddings()
+
     def test_buffer_only_modules_require_reset(self):
         model = DFlashDraftModel(model_config())
         for persistent in (False, True):

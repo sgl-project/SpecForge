@@ -12,11 +12,9 @@ from ..heads.markov import build_markov_head
 from ..hf_config import SpecForgeDraftConfig
 from ..layers.inputs import LayerInputs
 from ..pretrained import DraftPreTrainedModel
-from .assembly import build_decoder_backbone
+from .assembly import build_target_context_modules
 from .context import prepare_context_inputs
 from .registry import register_draft_model
-from .target_features import TargetFeatureFusion
-from .tokens import build_token_modules
 
 
 @dataclass
@@ -42,18 +40,10 @@ class DSparkDraftModel(DraftPreTrainedModel):
     ):
         super().__init__(config)
         draft, spec = config.draft, config.draft.spec_config
-        self.backbone = build_decoder_backbone(
-            draft, backend=backend, device=device, dtype=dtype
-        )
-        self.fusion = TargetFeatureFusion(
-            spec.target_features,
-            hidden_size=draft.hidden_size,
-            norm=draft.norm_config,
-            device=device,
-            dtype=dtype,
-        )
-        self.embed_tokens, self.lm_head = build_token_modules(
-            draft, device=device, dtype=dtype
+        self.backbone, self.fusion, self.embed_tokens, self.lm_head = (
+            build_target_context_modules(
+                draft, spec.target_features, backend=backend, device=device, dtype=dtype
+            )
         )
         self.markov_head = build_markov_head(
             spec.markov,
@@ -72,12 +62,6 @@ class DSparkDraftModel(DraftPreTrainedModel):
             else None
         )
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
 
     def forward(
         self,
