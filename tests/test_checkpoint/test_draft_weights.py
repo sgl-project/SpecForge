@@ -74,6 +74,8 @@ def _sharded_load(rank, directory):
 
 
 def _fsdp1_refusal(rank, directory):
+    from datetime import timedelta
+
     import torch.distributed as dist
     from torch.distributed.fsdp import FullyShardedDataParallel
 
@@ -82,6 +84,7 @@ def _fsdp1_refusal(rank, directory):
         init_method="file://" + directory + "/rendezvous",
         rank=rank,
         world_size=2,
+        timeout=timedelta(seconds=30),
     )
     try:
         config = draft_config(target_bindings=(), target_logit_transform=None)
@@ -97,14 +100,20 @@ def _fsdp1_refusal(rank, directory):
             use_orig_params=True,
             device_id=torch.device("cpu"),
         )
-        for call, message in (
-            (lambda: make_weight_plan(wrapped, {}), "FSDP1"),
-            (lambda: save_draft(wrapped, Path(directory) / f"draft-{rank}"), "FSDP1"),
-            (lambda: save_draft(inner, Path(directory) / f"inner-{rank}"), "match"),
-        ):
+        calls = [
+            (lambda: save_draft(inner, Path(directory) / f"inner-{rank}"), "match")
+        ]
+        if rank == 0:
+            # Alone, so a refusal after FSDP1's state_dict all-gather times out.
+            calls += [
+                (lambda: make_weight_plan(wrapped, {}), "FSDP1"),
+                (lambda: save_draft(wrapped, Path(directory) / "draft"), "FSDP1"),
+            ]
+        for call, message in calls:
             with unittest.TestCase().assertRaisesRegex(TypeError, message):
                 call()
-        assert not any(Path(directory).glob("*-[01]")), "a refused save wrote files"
+        written = [p.name for p in Path(directory).iterdir() if p.name != "rendezvous"]
+        assert not written, f"a refused save wrote {written}"
     finally:
         dist.destroy_process_group()
 
