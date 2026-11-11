@@ -57,7 +57,8 @@ def read_legacy(payload, store, target_config, *, check_target=True):
         payload, target_config=target_config, check_target=check_target, **settings
     )
     checks = {}
-    if "embed_tokens" in config.target_bindings:
+    if architecture == "LlamaForCausalLMEagle3":
+        # main reads this flag only for EAGLE-family drafts
         checks["load_target_embedding"] = (
             provenance.get("load_target_embedding"),
             True,

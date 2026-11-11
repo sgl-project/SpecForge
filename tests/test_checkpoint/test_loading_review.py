@@ -18,6 +18,7 @@ from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
 from tests.test_checkpoint.test_loading import write_target
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
 
 
@@ -225,8 +226,35 @@ class LoadingReviewTest(unittest.TestCase):
                 {"specforge_model_provenance": (("load_target_embedding", False),)},
                 source / "training_state.pt",
             )
+            # main ignores the flag for MTP; only EAGLE3 honors it
+            read_draft(source, target=target)
+            eagle = Path(tmp) / "eagle"
+            eagle.mkdir()
+            (eagle / "config.json").write_text(
+                json.dumps(
+                    eagle_payload()
+                    | dict(
+                        hidden_size=32,
+                        intermediate_size=64,
+                        num_attention_heads=4,
+                        num_key_value_heads=2,
+                        head_dim=8,
+                        vocab_size=64,
+                        draft_vocab_size=64,
+                        target_hidden_size=32,
+                        bos_token_id=None,
+                        eos_token_id=None,
+                        pad_token_id=None,
+                    )
+                )
+            )
+            save_file({"fc.weight": torch.zeros(32, 96)}, eagle / "model.safetensors")
+            torch.save(
+                {"specforge_model_provenance": (("load_target_embedding", False),)},
+                eagle / "training_state.pt",
+            )
             with self.assertRaisesRegex(ValueError, "load_target_embedding"):
-                read_draft(source, target=target)
+                read_draft(eagle, target=target)
             torch.save({}, source / "training_state.pt")
             checkpoint = read_draft(source, target=target)
             model = build_draft_model(checkpoint.config)
