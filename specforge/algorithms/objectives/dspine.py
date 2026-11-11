@@ -6,12 +6,13 @@ import torch
 import torch.nn.functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss
 from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import TrainingRequirements, register_protocol
+from .registry import TrainingRequirements, WindowStatistic, register_protocol
 
 
 @register_protocol(
@@ -19,9 +20,10 @@ from .registry import TrainingRequirements, register_protocol
     training=TrainingRequirements(
         capture_method="dspark",
         minimum_loss_tokens=2,
-        consecutive_loss_tokens=True,
-        dataloader_workers=8,
-        window_statistic=("dspine/backbone_ce", "alignment_ce"),
+        loss_mask_filter=has_consecutive_supervised_tokens,
+        window_statistic=WindowStatistic(
+            ratio_name="dspine/backbone_ce", argument_name="alignment_ce"
+        ),
     ),
     requires=("teacher_logits",),
     architectures=("DSpineDraftModel",),

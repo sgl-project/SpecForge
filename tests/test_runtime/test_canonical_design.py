@@ -29,6 +29,9 @@ from tests.test_runtime.test_canonical_training import (
 
 class CanonicalDesignTest(unittest.TestCase):
     def test_custom_objective_does_not_resolve_legacy_registry(self):
+        def supervised_last_token(mask):
+            return bool(mask[-1])
+
         with patch.dict(registry._PROTOCOLS), patch.dict(registry._DEFAULTS):
             register_protocol(
                 "custom",
@@ -36,13 +39,17 @@ class CanonicalDesignTest(unittest.TestCase):
                 inputs=("input_ids", "hidden_states", "loss_mask"),
                 provides=("logits", "labels", "chain_positions"),
                 trains=("backbone", "fusion"),
-                training=TrainingRequirements(capture_method="dflash"),
+                training=TrainingRequirements(
+                    capture_method="dflash",
+                    attention_backends=frozenset({"sdpa"}),
+                    loss_mask_filter=supervised_last_token,
+                ),
                 default=False,
             )(DFlashObjective)
             cfg = run_config(
                 Path("target"),
                 draft_config(),
-                training={"attention_backend": "eager", "objective": "custom"},
+                training={"attention_backend": "sdpa", "objective": "custom"},
             )
             with patch(
                 "specforge.algorithms.builtin.builtin_algorithm_registry",
@@ -51,11 +58,42 @@ class CanonicalDesignTest(unittest.TestCase):
                 resolved = resolve_run(cfg)
             self.assertEqual(resolved.algorithm.name, "custom")
             self.assertEqual(
+                resolved.algorithm.spec.capabilities.attention_backends,
+                frozenset({"sdpa"}),
+            )
+            self.assertIs(
+                resolved.algorithm.providers.model.loss_mask_filter,
+                supervised_last_token,
+            )
+            self.assertTrue(resolved.algorithm.providers.model.loss_mask_filter([0, 1]))
+            cfg.training.attention_backend = "eager"
+            with self.assertRaisesRegex(ValueError, "attention_backend"):
+                resolve_run(cfg)
+            self.assertEqual(
                 resolved.algorithm.providers.server_streaming_for(
                     "text"
                 ).capture_method,
                 "dflash",
             )
+
+    def test_worker_defaults_and_legacy_identifiers(self):
+        from specforge.training.assembly import _dataloader_num_workers
+        from tests.test_algorithms.test_objectives import configurations
+
+        for draft in configurations():
+            with self.subTest(architecture=draft.architecture):
+                cfg = run_config(Path("target"), draft)
+                cfg.data.dataloader_num_workers = None
+                run = resolve_run(cfg)
+                self.assertEqual(_dataloader_num_workers(run.config, run.algorithm), 4)
+                for workers in (0, 8):
+                    run.config.data.dataloader_num_workers = workers
+                    self.assertEqual(
+                        _dataloader_num_workers(run.config, run.algorithm), workers
+                    )
+                if draft.architecture in ("DFlash2DraftModel", "DMTPDraftModel"):
+                    self.assertEqual(run.algorithm.name, "dflash")
+                    self.assertEqual(run.config.training.strategy, "dflash")
 
     def test_target_metadata_is_raw_and_shared_with_capture(self):
         with TemporaryDirectory() as temp:

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from specforge.core.fused_loss import ce_l1_loss
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from .base import check_options
 from .dflash import COMMON_MODULES
@@ -14,12 +15,11 @@ from .registry import TrainingRequirements, register_protocol
 
 @register_protocol(
     "dflash2",
+    legacy_strategy="dflash",
     training=TrainingRequirements(
         capture_method="dflash",
-        strategy="dflash",
         minimum_loss_tokens=2,
-        consecutive_loss_tokens=True,
-        dataloader_workers=8,
+        loss_mask_filter=has_consecutive_supervised_tokens,
     ),
     architectures=("DFlash2DraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),

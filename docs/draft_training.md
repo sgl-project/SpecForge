@@ -232,11 +232,20 @@ imports must explicitly match saved training settings in `training.objective_opt
 ### Canonical training requirements
 
 `register_protocol(..., training=TrainingRequirements(...))` declares capture
-method, vocabulary mapping, batch-size constraints and data filtering. Canonical
+method, vocabulary mapping, batch-size constraints, `attention_backends` and an
+optional `loss_mask_filter` callable. Existing objectives keep eager attention;
+block objectives register the shared consecutive-supervision filter. Canonical
 composition builds providers directly from these requirements; it does not resolve
-a legacy algorithm registration. An optional `window_statistic=(ratio, argument)`
+a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
 requests accumulation-window reduction and replay, passing the result to the
 objective by the declared argument name.
+
+`legacy_strategy` is separate registration metadata that preserves existing data
+and rendezvous identifiers; it does not select a legacy provider.
+`supports_vocab_mapping` declares draft-vocabulary support.
+Worker counts belong to `data.dataloader_num_workers`, not objective requirements.
+Canonical runs use a shared default of 4; set this explicitly to 8 to retain the
+previous DFlash-family/MTP default. Legacy provider defaults are unchanged.
 
 Canonical parsing, training and capture read target metadata from the same raw
 `config.json` reader, including nested `text_config`. Transformers defaults are

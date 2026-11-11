@@ -265,7 +265,7 @@ def resolve_run(cfg, *, target_config=None):
             raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
     requirements = entry.training
-    family = requirements.strategy or objective
+    family = entry.legacy_strategy or objective
     if cfg.training.strategy not in (defaults.strategy, family, objective):
         raise ValueError("training.strategy conflicts with the objective")
     if (
@@ -344,11 +344,11 @@ def resolve_run(cfg, *, target_config=None):
         contracts.append(
             replace(contracts[0], mode=FeatureMode.STREAMING, storage=None)
         )
-    vocab = requirements.vocabulary
+    vocab = requirements.supports_vocab_mapping
     if cfg.model.vocab_mapping_path and not vocab:
         raise ValueError("model.vocab_mapping_path requires a draft vocabulary")
     capabilities = AlgorithmCapabilities(
-        attention_backends=frozenset({"eager"}),
+        attention_backends=requirements.attention_backends,
         required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
         supports_liger_kernel=True,
@@ -362,19 +362,13 @@ def resolve_run(cfg, *, target_config=None):
         feature_contracts=tuple(contracts),
         capabilities=capabilities,
     )
-    from specforge.data.loss_mask import has_consecutive_supervised_tokens
-
     provider = ModelProvider(
         build_draft=None,
         build_training_model=None,
         build_bundle=build_bundle,
         needs_input_tools=online_needs_input_tools,
-        default_dataloader_num_workers=requirements.dataloader_workers,
-        loss_mask_filter=(
-            has_consecutive_supervised_tokens
-            if requirements.consecutive_loss_tokens
-            else None
-        ),
+        default_dataloader_num_workers=None,
+        loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
         resolve_capture_layers=capture_layers,
         minimum_loss_tokens=partial(

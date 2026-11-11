@@ -423,8 +423,8 @@ class DataConfig(StrictConfigModel):
     is_preformatted: bool = False
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
-    #: Ordered background feature-loader workers. ``None`` preserves the
-    #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
+    #: Ordered background feature-loader workers. ``None`` uses the shared
+    #: default (4) for canonical runs, or the provider default for legacy runs.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None

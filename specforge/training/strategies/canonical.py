@@ -50,7 +50,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             step=ctx.global_step,
             total_steps=ctx.total_steps,
             **(
-                {self.window_statistic[1]: window_value}
+                {self.window_statistic.argument_name: window_value}
                 if self.window_statistic
                 else {}
             ),
@@ -102,7 +102,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
 
         def replay(window_ratios):
             if self._statistic_window is not window_ratios:
-                numerator, denominator = window_ratios[self.window_statistic[0]]
+                numerator, denominator = window_ratios[self.window_statistic.ratio_name]
                 totals = torch.stack((numerator, denominator))
                 if dist.is_initialized():
                     dist.all_reduce(totals)

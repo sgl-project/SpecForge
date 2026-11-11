@@ -1,5 +1,6 @@
 """Training-only registry; no checkpoint, data-provider or launch registrations."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
@@ -7,17 +8,24 @@ from .losses import PositionWeighting, TokenLoss
 
 
 @dataclass(frozen=True)
+class WindowStatistic:
+    """Window-wide ratio passed back to the objective during replay."""
+
+    ratio_name: str
+    argument_name: str
+
+
+@dataclass(frozen=True)
 class TrainingRequirements:
     """Data and execution requirements used by canonical training composition."""
 
     capture_method: str | None = None
-    strategy: str | None = None
-    vocabulary: bool = False
+    supports_vocab_mapping: bool = False
     required_batch_size: int | None = None
     minimum_loss_tokens: int = 1
-    consecutive_loss_tokens: bool = False
-    dataloader_workers: int = 4
-    window_statistic: tuple[str, str] | None = None  # (ratio name, objective argument)
+    loss_mask_filter: Callable[[object], bool] | None = None
+    attention_backends: frozenset[str] = frozenset({"eager"})
+    window_statistic: WindowStatistic | None = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,7 @@ class ProtocolRegistration:
     trains: tuple[str, ...]
     requires: frozenset[str] = frozenset()
     training: TrainingRequirements = TrainingRequirements()
+    legacy_strategy: str | None = None  # Preserve existing data/rendezvous identifiers.
 
 
 _PROTOCOLS = {}
@@ -45,6 +54,7 @@ def register_protocol(
     requires=(),
     default=True,
     training=TrainingRequirements(),
+    legacy_strategy=None,
 ):
     def register(factory):
         if name in _PROTOCOLS:
@@ -59,6 +69,7 @@ def register_protocol(
             tuple(trains),
             frozenset(requires),
             training,
+            legacy_strategy,
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))

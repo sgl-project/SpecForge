@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
+
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
@@ -18,8 +20,7 @@ from .registry import TrainingRequirements, register_protocol
     training=TrainingRequirements(
         capture_method="dspark",
         minimum_loss_tokens=2,
-        consecutive_loss_tokens=True,
-        dataloader_workers=8,
+        loss_mask_filter=has_consecutive_supervised_tokens,
     ),
     requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),

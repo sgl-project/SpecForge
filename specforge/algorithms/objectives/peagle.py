@@ -19,7 +19,7 @@ from .registry import TrainingRequirements, register_protocol
 @register_protocol(
     "peagle",
     training=TrainingRequirements(
-        capture_method="eagle3", vocabulary=True, required_batch_size=1
+        capture_method="eagle3", supports_vocab_mapping=True, required_batch_size=1
     ),
     requires=("teacher_logits",),
     architectures=("PEagleDraftModel",),

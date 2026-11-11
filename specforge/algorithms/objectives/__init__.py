@@ -16,6 +16,7 @@ from .losses import register_loss
 from .predictions import LossTerm, PredictionBatch, Predictions
 from .registry import (
     TrainingRequirements,
+    WindowStatistic,
     build_objective_model,
     default_objective,
     default_protocol,
@@ -28,6 +29,7 @@ from .registry import (
 
 __all__ = [
     "TrainingRequirements",
+    "WindowStatistic",
     "ObjectiveModel",
     "ObjectiveResult",
     "build_objective_model",

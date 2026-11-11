@@ -542,7 +542,7 @@ def _dataloader_num_workers(cfg: Config, algorithm: AlgorithmRegistration) -> in
         dataloader_num_workers = (
             algorithm.providers.model.default_dataloader_num_workers
         )
-    return dataloader_num_workers
+    return 4 if dataloader_num_workers is None else dataloader_num_workers
 
 
 def _profiling_options(cfg: Config):

@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
+
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import gather, prepare_blocks
@@ -12,11 +14,10 @@ from .registry import TrainingRequirements, register_protocol
 
 @register_protocol(
     "dmtp",
+    legacy_strategy="dflash",
     training=TrainingRequirements(
-        strategy="dflash",
         minimum_loss_tokens=2,
-        consecutive_loss_tokens=True,
-        dataloader_workers=8,
+        loss_mask_filter=has_consecutive_supervised_tokens,
     ),
     architectures=("DMTPDraftModel",),
     inputs=("input_ids", "hidden_states", "mtp_hidden_states", "loss_mask"),
