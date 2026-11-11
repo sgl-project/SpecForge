@@ -77,5 +77,6 @@ class MTPDraftModel(DraftPreTrainedModel):
             self.fusion(self.embed_tokens(input_ids), target_features), layer_inputs
         )
         return MTPOutput(
-            hidden_states=hidden, logits=self.lm_head(hidden) if output_logits else None
+            hidden_states=hidden,
+            logits=self.compute_logits(hidden) if output_logits else None,
         )

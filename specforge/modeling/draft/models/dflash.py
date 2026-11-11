@@ -73,5 +73,5 @@ class DFlashDraftModel(DraftPreTrainedModel):
         hidden = self.backbone(self.embed_tokens(input_ids), prepared)
         return DFlashOutput(
             hidden_states=hidden,
-            logits=self.lm_head(hidden) if output_logits else None,
+            logits=self.compute_logits(hidden) if output_logits else None,
         )

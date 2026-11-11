@@ -95,9 +95,28 @@ class DSparkDraftModel(DraftPreTrainedModel):
         hidden = self.backbone(self.embed_tokens(input_ids), prepared)
         if not output_logits:
             return DSparkOutput(hidden_states=hidden)
+        return DSparkOutput(
+            hidden_states=hidden,
+            **self.project(hidden, predecessor_ids=predecessor_ids),
+        )
+
+    def project(self, hidden: Tensor, *, predecessor_ids: Tensor | None = None):
+        """Project whole blocks so recurrent Markov state never crosses a chunk."""
+        slots = self.config.draft.spec_config.protocol.num_model_slots
+        if hidden.ndim != 3 or hidden.shape[1] % slots:
+            raise ValueError("DSpark projection requires whole blocks")
+        if self.markov_head is not None and (
+            predecessor_ids is None
+            or predecessor_ids.shape != hidden.shape[:2]
+            or predecessor_ids.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "configured Markov head requires integer predecessor_ids "
+                "aligned with hidden states"
+            )
         logits = self.lm_head(hidden)
         if self.markov_head is not None:
-            shape = (input_ids.shape[0], input_ids.shape[1] // slots, slots)
+            shape = (hidden.shape[0], hidden.shape[1] // slots, slots)
             logits = self.markov_head.apply_block_logits(
                 logits.reshape(*shape, logits.shape[-1]),
                 token_ids=predecessor_ids.reshape(shape),
@@ -112,6 +131,4 @@ class DSparkDraftModel(DraftPreTrainedModel):
                 )
                 features = torch.cat((hidden, previous), dim=-1)
             confidence = self.confidence_head(features).float()
-        return DSparkOutput(
-            hidden_states=hidden, logits=logits, confidence_scores=confidence
-        )
+        return {"logits": logits, "confidence_scores": confidence}
