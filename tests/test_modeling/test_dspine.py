@@ -3,6 +3,7 @@
 import copy
 import math
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -116,6 +117,18 @@ class DSpineTest(unittest.TestCase):
         config.is_causal = False
         with self.assertRaisesRegex(ValueError, "DSpine requires causal"):
             DSpineDraftModel(config)
+
+    def test_online_model_tracks_replaced_draft_config(self):
+        model = training_model()
+        config = replace(
+            model.draft_model.dspine_config,
+            replacement_probability=0.0,
+            alignment_warmup_steps=0,
+        )
+        model.draft_model.dspine_config = config
+        self.assertIs(model.dspine_config, config)
+        self.assertEqual(model.dspine_config.replacement_probability, 0.0)
+        self.assertEqual(model.dspine_config.alignment_warmup_steps, 0)
 
     def test_zero_writes_are_identity_against_the_shared_causal_backbone(self):
         model, _ = initialized_model()
