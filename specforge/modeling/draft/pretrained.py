@@ -6,9 +6,13 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel
 from transformers import initialization as init
-from transformers.modeling_utils import get_torch_context_manager_or_global_device
+from transformers.modeling_utils import (
+    get_device,
+    get_torch_context_manager_or_global_device,
+)
 
 from .backbone import DraftBackbone
+from .bindings import _TargetWeight
 from .hf_config import SpecForgeDraftConfig
 
 
@@ -38,6 +42,21 @@ class DraftPreTrainedModel(PreTrainedModel):
         if any(on_meta):
             raise ValueError("draft is partly on meta; materialize every tensor first")
         super().init_weights()
+
+    def _move_missing_keys_from_meta_to_device(
+        self, missing_keys, device_map, device_mesh, hf_quantizer
+    ):
+        super()._move_missing_keys_from_meta_to_device(
+            missing_keys, device_map, device_mesh, hf_quantizer
+        )
+        # Bound weights are deliberately absent from the draft state_dict, so HF
+        # does not include them in missing_keys. Allocate, but leave them unbound.
+        for name, module in self.named_modules():
+            if isinstance(module, _TargetWeight) and module.weight.is_meta:
+                device = get_device(
+                    device_map, f"{name}.weight", valid_torch_device=True
+                )
+                module.to_empty(device=device)
 
     def _initialize_weights(self, module, is_custom_code=False):
         # HF's custom-code shortcut skips resets that initialize child tensors.
