@@ -44,7 +44,10 @@ def resolve_bindings(config, store, target_config):
         ):
             candidates = [key for key in _TARGET_KEYS["embed_tokens"] if key in refs]
         if len(candidates) != 1:
-            raise ValueError(f"{module}: expected one target key, found {candidates}")
+            raise ValueError(
+                f"{module}: expected one target key of {list(_TARGET_KEYS[module])}, "
+                f"found {candidates}"
+            )
         bindings[module] = refs[candidates[0]]
     return bindings
 
@@ -189,13 +192,20 @@ def make_initialization_plan(
             raise ValueError(
                 f"target copy missing tensors: {sorted(covered - copies.keys())}"
             )
-        if (covered | copies.keys()) & (weights.keys() | allowed):
-            raise ValueError("from_target overlaps weights_from or allow_new")
-        if any(
-            target_store.files[ref.key].suffix != ".safetensors"
+        overlap = (covered | copies.keys()) & (weights.keys() | allowed)
+        if overlap:
+            raise ValueError(
+                f"from_target overlaps weights_from or allow_new: {sorted(overlap)}"
+            )
+        unchecked = sorted(
+            ref.key
             for ref in copies.values()
-        ):
-            raise ValueError("strict target copies require safetensors header metadata")
+            if target_store.files[ref.key].suffix != ".safetensors"
+        )
+        if unchecked:
+            raise ValueError(
+                f"strict target copies require safetensors header metadata: {unchecked}"
+            )
         logger.info(
             "Target weight mapping: %s", {k: v.key for k, v in sorted(copies.items())}
         )
