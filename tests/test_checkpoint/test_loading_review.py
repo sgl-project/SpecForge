@@ -11,8 +11,9 @@ import torch
 from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.initialization import _TARGET_KEYS, resolve_bindings
+from specforge.checkpoint.initialization import resolve_bindings
 from specforge.checkpoint.resolve import target_configuration
+from specforge.checkpoint.target import _TARGET_KEYS
 from specforge.checkpoint.tensors import TensorStore
 from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
