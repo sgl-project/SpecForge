@@ -17,17 +17,6 @@ _CONTEXT_RECORD_PREFIXES = {
     "DSpineDraftModel": "dspine",
 }
 
-ARCHITECTURES = {
-    "DFlashDraftModel",
-    "DFlash2DraftModel",
-    "DSparkDraftModel",
-    "DSpineDraftModel",
-    "DominoDraftModel",
-    "PEagleDraftModel",
-    "LlamaForCausalLMEagle3",
-    "Qwen3_5MTPDraftModel",
-}
-
 
 def _recorded_settings(directory):
     path = directory / "training_state.pt"

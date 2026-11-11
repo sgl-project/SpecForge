@@ -5,11 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from specforge.config.draft import DraftConfig
+from specforge.config.draft.codec.legacy import LEGACY_ARCHITECTURES
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling.draft.hf_config import _METADATA, SpecForgeDraftConfig
 
 from .draft_dir import read_artifact_metadata
-from .formats.legacy import ARCHITECTURES, read_legacy
+from .formats.legacy import read_legacy
 from .tensors import TensorStore
 
 _ADAPTERS = {}
@@ -84,7 +85,7 @@ register_adapter(
     lambda p: p.get("model_type") != "specforge_draft"
     and isinstance(p.get("architectures"), list)
     and len(p["architectures"]) == 1
-    and p["architectures"][0] in ARCHITECTURES,
+    and p["architectures"][0] in LEGACY_ARCHITECTURES,
     read_legacy,
 )
 
