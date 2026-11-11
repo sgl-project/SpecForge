@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -23,25 +24,23 @@ from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 
 
-def model_config(*, bound=False):
+def model_config():
     base = dspine_config()
     return replace(
         base,
         spec_config=replace(base.spec_config, block=AnchoredBlockSpec(block_size=4)),
-        **({} if bound else {"target_bindings": (), "target_logit_transform": None}),
     )
 
 
-def initialized_model(device="cpu", dtype=torch.float32, *, bound=False):
-    model = build_draft_model(model_config(bound=bound), device=device, dtype=dtype)
-    head = torch.randn(64, 32, device=device)
-    model.initialize_transfer_space(head, chunk_size=7)
+def initialized_model(device="cpu", dtype=torch.float32):
+    model = build_draft_model(model_config(), device=device, dtype=dtype)
+    head = torch.randn(64, 32, device=device, dtype=dtype)
+    model.embed_tokens.load_target_weight(torch.randn_like(head))
+    model.lm_head.load_target_weight(head)
+    model.initialize_transfer_space(chunk_size=7)
     with torch.no_grad():
         for write in model.injection.writes:
             write.weight.normal_(std=0.1)
-    if bound:
-        model.embed_tokens.load_target_weight(torch.randn_like(head))
-        model.lm_head.load_target_weight(head)
     return model
 
 
@@ -85,6 +84,8 @@ class CanonicalDSpineTest(unittest.TestCase):
             if dtype == torch.bfloat16
             else 1e-2 if dtype == torch.float16 else 1e-5
         )
+        if device == "cpu":
+            tolerance = 0
         torch.manual_seed(0)
         for cutoff in (0, 1, 2):
             with self.subTest(device=device, dtype=dtype, cutoff=cutoff):
@@ -112,9 +113,7 @@ class CanonicalDSpineTest(unittest.TestCase):
                     },
                     strict=True,
                 )
-                embedding, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-                    actual.lm_head
-                )
+                embedding, head = actual.embed_tokens, actual.lm_head
                 (ids, features, entries), tokens, mask = model_inputs(
                     config, device, dtype
                 )
@@ -163,17 +162,10 @@ class CanonicalDSpineTest(unittest.TestCase):
                     features.grad, other.grad, rtol=tolerance, atol=tolerance
                 )
                 for name, parameter in actual.named_parameters():
-                    ref = (
-                        embedding.weight
-                        if name == "embed_tokens.weight"
-                        else (
-                            head.weight
-                            if name == "lm_head.weight"
-                            else dict(reference.named_parameters())[
-                                legacy_name(name) or name
-                            ]
-                        )
-                    )
+                    if not parameter.requires_grad:
+                        self.assertIsNone(parameter.grad, name)
+                        continue
+                    ref = dict(reference.named_parameters())[legacy_name(name) or name]
                     self.assertIsNotNone(parameter.grad, name)
                     torch.testing.assert_close(
                         parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
@@ -214,7 +206,7 @@ class CanonicalDSpineTest(unittest.TestCase):
         )
 
     def test_checkpointing_and_hf_restore_keep_transfer_state(self):
-        model = initialized_model(bound=True)
+        model = initialized_model()
         checkpointed = copy.deepcopy(model)
         checkpointed.gradient_checkpointing_enable()
         args, tokens, mask = model_inputs(model.config.draft)
@@ -251,25 +243,35 @@ class CanonicalDSpineTest(unittest.TestCase):
         torch.testing.assert_close(result.logits, output.logits, rtol=0, atol=0)
         self.assertNotIn("lm_head.weight", model.state_dict())
 
-    def test_owned_and_bound_heads_expose_candidate_weights(self):
+    def test_transfer_space_uses_bound_head(self):
+        model = build_draft_model(model_config())
+        with self.assertRaisesRegex(RuntimeError, "bound"):
+            model.initialize_transfer_space()
+        model.lm_head.load_target_weight(torch.randn(64, 32))
+        with patch(
+            "specforge.modeling.draft.models.dspine.initialize_transfer_space"
+        ) as initialize:
+            model.initialize_transfer_space(chunk_size=7)
+        initialize.assert_called_once_with(
+            model.lm_head.bound_weight(),
+            model.transfer_codes,
+            model.injection.readouts,
+            chunk_size=7,
+        )
         ids = torch.tensor([[1, 7, 9]])
-        for bound in (False, True):
-            model = initialized_model(bound=bound)
-            weights = model.lm_head.candidate_weights(ids)
-            torch.testing.assert_close(
-                weights, model.lm_head.weight[ids], rtol=0, atol=0
-            )
-            self.assertEqual(weights.requires_grad, not bound)
+        weights = model.lm_head.candidate_weights(ids)
+        torch.testing.assert_close(weights, model.lm_head.bound_weight()[ids])
+        self.assertFalse(weights.requires_grad)
 
     def test_transfer_space_cannot_overwrite_trained_state(self):
         model = initialized_model()
         before = copy.deepcopy(model.state_dict())
         with self.assertRaisesRegex(RuntimeError, "already initialized"):
-            model.initialize_transfer_space(torch.randn(64, 32))
+            model.initialize_transfer_space()
         torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
 
     def test_hf_restore_rejects_incomplete_or_unexpected_state(self):
-        model = initialized_model(bound=True)
+        model = initialized_model()
         with TemporaryDirectory() as path:
             model.save_pretrained(path)
             weights = Path(path) / "model.safetensors"
@@ -297,7 +299,9 @@ class CanonicalDSpineTest(unittest.TestCase):
         args, tokens, mask = model_inputs(config)
         with self.assertRaisesRegex(RuntimeError, "transfer space"):
             model(*args, block_token_ids=tokens)
-        model.initialize_transfer_space(torch.randn(64, 32))
+        model.embed_tokens.load_target_weight(torch.randn(64, 32))
+        model.lm_head.load_target_weight(torch.randn(64, 32))
+        model.initialize_transfer_space()
         self.assertTrue(
             all(
                 torch.count_nonzero(write.weight) == 0

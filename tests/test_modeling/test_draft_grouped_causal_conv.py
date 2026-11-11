@@ -178,27 +178,23 @@ class GroupedCausalConvTest(unittest.TestCase):
             run_pair(restored.conv, hidden), expected, rtol=0, atol=0
         )
 
-    def test_hf_missing_projection_restores_identity(self):
+    def test_new_projection_is_identity_and_hf_restore_requires_it(self):
         model = DFlashDraftModel(model_config())
+        self.assertEqual(model.conv.kernel_projection.weight.count_nonzero().item(), 0)
+        hidden = torch.randn(1, 8, 16)
+        prepared, coefficients = model.conv.prepare(hidden)
+        torch.testing.assert_close(prepared, hidden, rtol=0, atol=0)
+        torch.testing.assert_close(
+            model.conv.finish(hidden, coefficients), hidden, rtol=0, atol=0
+        )
         with TemporaryDirectory() as directory:
             model.save_pretrained(directory)
             weights_path = Path(directory) / "model.safetensors"
             weights = load_file(weights_path)
             del weights["conv.kernel_projection.weight"]
             save_file(weights, weights_path)
-            restored = DFlashDraftModel.from_pretrained(directory)
-        torch.testing.assert_close(
-            restored.conv.base_kernel, model.conv.base_kernel, rtol=0, atol=0
-        )
-        self.assertEqual(
-            restored.conv.kernel_projection.weight.count_nonzero().item(), 0
-        )
-        hidden = torch.randn(1, 8, 16)
-        prepared, coefficients = restored.conv.prepare(hidden)
-        torch.testing.assert_close(prepared, hidden, rtol=0, atol=0)
-        torch.testing.assert_close(
-            restored.conv.finish(hidden, coefficients), hidden, rtol=0, atol=0
-        )
+            with self.assertRaisesRegex(ValueError, "conv.kernel_projection.weight"):
+                DFlashDraftModel.from_pretrained(directory)
 
     def test_invalid_dimensions_fail_before_allocation(self):
         node = GroupedCausalConvSpec(kernel_size=3, group_size=4)

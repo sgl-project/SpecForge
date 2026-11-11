@@ -47,6 +47,8 @@ class DSpineSpec(ArchitectureSpec):
 
 def validate_dspine(config: DraftConfig) -> None:
     validate_target_context(config)
+    if "lm_head" not in config.target_bindings:
+        raise ValueError("DSpine requires lm_head in target_bindings")
     rank = config.spec_config.injection.transfer_rank
     if rank > min(config.hidden_size, config.vocab_size - 1):
         raise ValueError(

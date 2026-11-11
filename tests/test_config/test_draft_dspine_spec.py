@@ -108,6 +108,20 @@ class DSpineSpecTest(unittest.TestCase):
             ),
         )
 
+    def test_target_head_must_be_bound(self):
+        for bindings in ((), ("embed_tokens",)):
+            with (
+                self.subTest(bindings=bindings),
+                self.assertRaisesRegex(
+                    ValueError, "DSpine requires lm_head in target_bindings"
+                ),
+            ):
+                dataclasses.replace(
+                    dspine_config(),
+                    target_bindings=bindings,
+                    target_logit_transform=None,
+                )
+
     def test_every_attention_must_be_explicitly_causal(self):
         base = dspine_config()
         attention = base.attention_configs["full"]

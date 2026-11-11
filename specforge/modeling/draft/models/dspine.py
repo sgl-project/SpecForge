@@ -35,8 +35,8 @@ class DSpineDraftModel(DraftPreTrainedModel):
     """Consume explicit block visibility, token blocks and per-layer replacement masks.
 
     The caller prepares replacement masks; training schedules and layer cutoffs
-    do not enter this model. Transfer initialization consumes an already loaded
-    target head tensor, and is called only when starting a new transfer space.
+    do not enter this model. Transfer initialization reads the bound target head
+    and is called only when starting a new transfer space.
     """
 
     _no_split_modules = ["DecoderLayer"]
@@ -89,13 +89,11 @@ class DSpineDraftModel(DraftPreTrainedModel):
         return self.lm_head
 
     @torch.no_grad()
-    def initialize_transfer_space(
-        self, head_weight: Tensor, chunk_size: int = 4096
-    ) -> None:
+    def initialize_transfer_space(self, *, chunk_size: int = 4096) -> None:
         if self.transfer_ready.item():
             raise RuntimeError("DSpine transfer space is already initialized")
         initialize_transfer_space(
-            head_weight,
+            self.lm_head.bound_weight(),
             self.transfer_codes,
             self.injection.readouts,
             chunk_size=chunk_size,
