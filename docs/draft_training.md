@@ -91,6 +91,8 @@ sequence. Credit weights are detached; the denominator counts valid sequences,
 not credit mass. This applies to explicit D-PACE selection, including protocols
 whose default loss uses a microbatch mean. The eager executor materializes complete
 chains before weighting; future chunked executors must preserve this normalization.
+On a reduced-vocabulary draft, a supervised depth whose teacher top-1 is outside the
+draft vocabulary carries no loss and ends its chain, since the draft cannot propose it.
 
 Legacy LK modes use `lk_alpha`, `lk_tv` and `lk_lambda`. Their `options.target` is
 `labels` by default (one-hot acceptance), or `teacher` for distribution overlap.

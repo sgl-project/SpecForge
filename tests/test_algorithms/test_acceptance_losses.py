@@ -7,14 +7,22 @@ from dataclasses import replace
 import torch
 
 from specforge.algorithms.objectives import losses
-from specforge.algorithms.objectives.execution import execute_batch
+from specforge.algorithms.objectives.execution import (
+    chain_weights,
+    execute_batch,
+    project_predictions,
+)
 from specforge.algorithms.objectives.losses import (
     LossContext,
     PositionWeighting,
     TokenLoss,
     register_loss,
 )
-from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
+from specforge.algorithms.objectives.predictions import (
+    PredictionBatch,
+    Predictions,
+    Teacher,
+)
 from specforge.core.lk_loss import compute_lk_loss
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objective_legacy_parity import (
@@ -285,3 +293,27 @@ class AcceptanceLossTest(unittest.TestCase):
             torch.tensor([0.0, 1.0, 1.0]), torch.tensor([-1, 0, 1])
         )
         self.assertTrue(torch.isfinite(weights).all())
+
+    def test_dpace_ends_chains_at_targets_outside_the_draft_vocabulary(self):
+        """A teacher top-1 the draft cannot propose stops the acceptance chain."""
+        teacher = torch.full((1, 3, 4), -5.0)
+        teacher[0, 0, 0] = teacher[0, 1, 3] = teacher[0, 2, 1] = 5.0
+        prediction = Predictions(
+            hidden=torch.zeros(1, 3, 3),
+            projector=lambda hidden: {"logits": hidden},
+            mask=torch.ones(1, 3),
+            positions=torch.arange(3)[None],
+            chain_ids=torch.zeros(1, 3, dtype=torch.long),
+            sequence_ids=torch.zeros(1, 3, dtype=torch.long),
+            teacher=Teacher(teacher),
+            vocab_mask=torch.tensor([True, True, True, False]),
+            requires=frozenset({"teacher_logits"}),
+            default_loss=TokenLoss(kind="soft_ce"),
+        )
+        for kind in DPACE_LOSS_TYPES:
+            with self.subTest(kind=kind):
+                weighting = PositionWeighting(kind=kind, alpha=0.0)
+                projected = project_predictions(prediction, TokenLoss(), weighting)
+                [(weights, _)] = chain_weights([prediction], [projected], weighting)
+                self.assertGreater(weights[0].item(), 0)
+                self.assertEqual(weights[1:].tolist(), [0.0, 0.0])

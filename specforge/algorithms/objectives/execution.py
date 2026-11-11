@@ -104,6 +104,8 @@ def chain_weights(predictions, projected, weighting):
     chain = torch.cat([p.chain_ids.flatten() for p in predictions])
     sequence = torch.cat([p.sequence_ids.flatten() for p in predictions])
     position = torch.cat([p.positions.flatten() for p in predictions])
+    supervised = torch.cat([p.mask.flatten().float() for p in predictions])
+    # the loss mask also drops targets outside a reduced draft vocabulary
     mask = torch.cat([p.mask.flatten().float() for p in projected])
     probability = torch.cat(
         [
@@ -115,6 +117,8 @@ def chain_weights(predictions, projected, weighting):
             for p in projected
         ]
     )
+    # the draft can never propose an unreachable target: the chain stops there
+    probability = torch.where(mask > 0, probability, 0.0)
     _, chain = chain.unique(return_inverse=True)
     order = position.argsort(stable=True)
     order = order[chain[order].argsort(stable=True)]
@@ -132,11 +136,16 @@ def chain_weights(predictions, projected, weighting):
     if (sequence != chain_sequence[chain]).any():
         raise ValueError("a prediction chain cannot span sequences")
     dense_mask = mask.new_zeros((counts.numel(), int(counts.max())))
+    dense_supervised = torch.zeros_like(dense_mask)
     dense_probability = torch.ones_like(dense_mask)
     dense_mask[sorted_chain, offsets] = mask[order]
+    dense_supervised[sorted_chain, offsets] = supervised[order]
     dense_probability[sorted_chain, offsets] = probability[order]
     credit = dpace_weights(
-        dense_probability, dense_mask, alpha=weighting.alpha, mode=weighting.kind
+        dense_probability,
+        dense_supervised,
+        alpha=weighting.alpha,
+        mode=weighting.kind,
     )
     valid = dense_mask.any(-1)
     _, sequence_index = chain_sequence.unique(return_inverse=True)
