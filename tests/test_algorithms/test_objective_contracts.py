@@ -10,8 +10,10 @@ from torch import nn
 from specforge.algorithms.objectives import build_objective_model
 from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
 from specforge.algorithms.objectives.dflash2 import DFlash2Objective
+from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
-from specforge.algorithms.objectives.losses import PositionWeighting
+from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.predictions import Predictions
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import (
     capture_projections,
@@ -384,3 +386,25 @@ class ObjectiveContractTest(unittest.TestCase):
         predictions = next(runtime.objective.rollout(runtime, batch))
         self.assertEqual(predictions.denominator.dtype, torch.float32)
         self.assertEqual(predictions.denominator.item(), length)
+
+    def test_accuracy_counts_supervised_positions_unweighted(self):
+        """Position weights shape the loss, not acc, which picks the best checkpoint."""
+        logits = torch.full((1, 3, 5), -5.0)
+        logits[0, 0, 4] = logits[0, 1, 1] = logits[0, 2, 2] = 5.0
+        predictions = Predictions(
+            hidden=torch.zeros(1, 3, 2),
+            projector=lambda hidden: {"logits": logits},
+            mask=torch.ones(1, 3),
+            positions=torch.tensor([[0, 1, 2]]),
+            labels=torch.tensor([[3, 1, 2]]),
+        )
+        for weighting in (
+            PositionWeighting(kind="uniform"),
+            PositionWeighting(kind="exponential", gamma=1.0),
+            PositionWeighting(kind="geometric", factor=0.5),
+        ):
+            with self.subTest(weighting=weighting.kind):
+                correct, total = evaluate_predictions(
+                    predictions, TokenLoss(), weighting
+                ).ratios["acc"]
+                self.assertEqual((correct.item(), total.item()), (2.0, 3.0))

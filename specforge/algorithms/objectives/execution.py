@@ -69,7 +69,7 @@ def evaluate_predictions(
         per_token = per_token + auxiliary.values
         ratios.update(auxiliary.ratios)
     prediction = logits.argmax(-1)
-    metric_weights = weights
+    metric_weights = mask.float()
     target = labels
     if predictions.draft_to_target is not None:
         prediction = prediction + predictions.draft_to_target[prediction]
