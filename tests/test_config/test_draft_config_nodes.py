@@ -143,10 +143,10 @@ class DraftConfigNodesTest(unittest.TestCase):
             output_multiplier=1.0,
             final_logit_softcapping=None,
         )
-        with self.assertRaisesRegex(ValueError, "requires sublayer_conv"):
-            dataclasses.replace(
-                base, architecture="DFlash2DraftModel", spec_config=spec
-            )
+        without_conv = dataclasses.replace(
+            base, architecture="DFlash2DraftModel", spec_config=spec
+        )
+        self.assertIsNone(without_conv.layer_configs["full_dense"].sublayer_conv)
         node = dataclasses.replace(
             base,
             architecture="DFlash2DraftModel",

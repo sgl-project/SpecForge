@@ -40,7 +40,7 @@ def validate_dflash2(config: DraftConfig) -> None:
         raise ValueError("spec_config.selector_top_k must not exceed draft_vocab_size")
     for name, layer in config.layer_configs.items():
         if layer.sublayer_conv is None:
-            raise ValueError(f"layer_configs.{name}: DFlash2 requires sublayer_conv")
+            continue
         if (
             "block_sublayer_pair"
             not in config.conv_configs[layer.sublayer_conv].capabilities()
