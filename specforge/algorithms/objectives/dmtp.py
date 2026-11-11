@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
-
 from .base import check_options, reduce_loss
 from .dflash import COMMON_MODULES
 from .inputs import gather, prepare_blocks
@@ -34,7 +32,7 @@ class DMTPObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+            weighting=runtime.weighting,
             input_offset=1,
             label_offset=1,
             context_offset=spec.context_end_offset,
@@ -52,7 +50,7 @@ class DMTPObjective:
         )
         logits = output.logits.reshape(*blocks.labels.shape, -1)
         return reduce_loss(
-            ce_l1_loss(logits, blocks.labels).cross_entropy,
+            runtime.loss(logits, blocks.labels, batch, blocks.label_positions - 1),
             blocks.weights,
             logits=logits,
             labels=blocks.labels,

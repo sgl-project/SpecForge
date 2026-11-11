@@ -4,8 +4,6 @@ from dataclasses import dataclass
 
 import torch
 
-from specforge.core.fused_loss import ce_l1_loss
-
 from .base import reduce_loss
 from .dflash import COMMON_MODULES
 from .inputs import gather, sequence_inputs, valid_tokens
@@ -42,7 +40,7 @@ class MTPObjective:
             gather(
                 batch["target_last_hidden_states"],
                 positions + spec.feature_token_offset,
-            ),
+            ).to(dtype=model.embed_tokens.weight.dtype),
             sequence_inputs(model.config.draft, positions, visibility),
         )
         label_positions = positions + spec.prediction_token_offset
@@ -53,8 +51,8 @@ class MTPObjective:
             & padding
         ).float()
         return reduce_loss(
-            ce_l1_loss(output.logits, labels).cross_entropy,
-            weights,
+            runtime.loss(output.logits, labels, batch, label_positions - 1),
+            runtime.weighting(weights, positions - positions[:, :1]),
             logits=output.logits,
             labels=labels,
         )

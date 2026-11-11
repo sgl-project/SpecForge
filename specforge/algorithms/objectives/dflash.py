@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
-
 from .base import check_options, reduce_loss
 from .inputs import prepare_blocks
 from .registry import register_objective
@@ -35,11 +33,9 @@ class DFlashObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+            weighting=runtime.weighting,
         )
         output = model(blocks.input_ids, batch["hidden_states"], blocks.layer_inputs)
         logits = output.logits.reshape(*blocks.labels.shape, -1)
-        terms = ce_l1_loss(logits, blocks.labels)
-        return reduce_loss(
-            terms.cross_entropy, blocks.weights, logits=logits, labels=blocks.labels
-        )
+        loss = runtime.loss(logits, blocks.labels, batch, blocks.label_positions - 1)
+        return reduce_loss(loss, blocks.weights, logits=logits, labels=blocks.labels)

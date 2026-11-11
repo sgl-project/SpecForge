@@ -4,12 +4,12 @@ from dataclasses import dataclass
 
 import torch
 
-from specforge.algorithms.peagle.model import (
+from specforge.algorithms.common.cod import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
 
-from .base import check_options, reduce_loss
+from .base import ObjectiveResult, check_options, reduce_loss
 from .eagle3 import teacher_distribution
 from .inputs import gather, sequence_inputs, valid_tokens
 from .registry import register_objective
@@ -37,6 +37,9 @@ class PEagleObjective:
             },
         )
 
+        if not 0 < self.down_sample_ratio_min <= self.down_sample_ratio:
+            raise ValueError("sampling ratios must satisfy 0 < min <= ratio <= 1")
+
     def __call__(self, runtime, batch, **context):
         model, ids = runtime.draft_model, batch["input_ids"]
         if ids.shape[0] != 1:
@@ -46,6 +49,11 @@ class PEagleObjective:
         shifted = torch.cat((ids[:, 1:], torch.zeros_like(ids[:, :1])), 1)
         supervised = torch.cat((valid[:, 1:], torch.zeros_like(valid[:, :1])), 1)
         lengths = batch.get("lengths", ids.new_tensor([ids.shape[1]]))
+        # A shifted label must stay in the same packed document.
+        ends = lengths.to(device=ids.device).cumsum(0)
+        supervised &= ~torch.isin(
+            torch.arange(1, ids.shape[1] + 1, device=ids.device), ends
+        )[None]
         anchors, depths = generate_cod_sample_indices(
             ids.shape[1],
             supervised,
@@ -66,9 +74,20 @@ class PEagleObjective:
             sequence_inputs(model.config.draft, original, visible),
             feature_mask=feature_mask,
         )
-        teacher, included = teacher_distribution(
-            model, runtime.teacher_logits(batch, original + 1)
-        )
+        teacher_logits = runtime.teacher_logits(batch, original + 1)
+        teacher, included = teacher_distribution(model, teacher_logits)
         weight = gather(supervised, original).float() * included
         ce = -(teacher * output.logits.float().log_softmax(-1)).sum(-1)
-        return reduce_loss(ce, weight, logits=output.logits, labels=teacher.argmax(-1))
+        ce = runtime.loss(
+            output.logits,
+            teacher.argmax(-1),
+            batch,
+            original + 1,
+            default=ce,
+            teacher=teacher_logits[..., model.vocabulary.t2d],
+        )
+        weight = runtime.weighting(weight, depths[None])
+        result = reduce_loss(
+            ce, weight, logits=output.logits, labels=teacher.argmax(-1)
+        )
+        return ObjectiveResult(result.loss, weight.new_ones(()), result.ratios)

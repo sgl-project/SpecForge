@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
 
-from .base import check_options, reduce_loss
+from .base import check_options, microbatch_mean, reduce_loss
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .registry import register_objective
@@ -44,8 +44,9 @@ class DSparkObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+            weighting=runtime.weighting,
             label_offset=1,
+            prefix=True,
         )
         output = model(
             blocks.input_ids,
@@ -60,6 +61,14 @@ class DSparkObjective:
             self.ce_loss_alpha * terms.cross_entropy
             + self.l1_loss_alpha * terms.teacher_l1
         )
+        loss = runtime.loss(
+            output.logits,
+            labels,
+            batch,
+            blocks.label_positions.flatten(1) - 1,
+            default=loss,
+            teacher=teacher,
+        )
         if output.confidence_scores is not None:
             acceptance = (1 - terms.teacher_l1.detach() / 2).clamp(0, 1)
             confidence = output.confidence_scores.reshape_as(labels)
@@ -70,6 +79,7 @@ class DSparkObjective:
                     confidence, acceptance, reduction="none"
                 )
             )
-        return reduce_loss(
+        result = reduce_loss(
             loss, blocks.weights.flatten(1), logits=output.logits, labels=labels
         )
+        return microbatch_mean(result, global_denominator=model.training)

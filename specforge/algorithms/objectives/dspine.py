@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from specforge.core.fused_loss import ce_l1_loss
 
 from .base import check_options, reduce_loss
-from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .registry import register_objective
 
@@ -19,7 +18,7 @@ from .registry import register_objective
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     outputs=("logits", "pre_injection", "layer_features"),
-    trains=COMMON_MODULES + ("injection",),
+    trains=("backbone", "fusion", "injection"),
 )
 @dataclass
 class DSpineObjective:
@@ -54,6 +53,8 @@ class DSpineObjective:
                 "replacement_end_ratio": self.replacement_end_ratio,
             },
         )
+        if self.candidate_mass_threshold >= 1:
+            raise ValueError("candidate_mass_threshold must be below one")
         if not self.replacement_hold_ratio < self.replacement_end_ratio:
             raise ValueError(
                 "replacement_hold_ratio must be below replacement_end_ratio"
@@ -65,10 +66,10 @@ class DSpineObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+            weighting=runtime.weighting,
             prefix=True,
         )
-        probability = self.replacement_probability if runtime.training else 0
+        probability = self.replacement_probability if model.training else 0
         if probability:
             if not total_steps:
                 raise ValueError("DSpine replacement schedule requires total_steps")
@@ -81,7 +82,11 @@ class DSpineObjective:
                 ),
                 1,
             )
-        replacement = (torch.rand_like(blocks.keep.float()) < probability) & blocks.keep
+        replacement = (
+            (torch.rand_like(blocks.keep.float()) < probability) & blocks.keep
+            if probability
+            else torch.zeros_like(blocks.keep)
+        )
         masks = tuple(
             replacement if index < self.replacement_layers else None
             for index in range(model.backbone.num_layers)
@@ -118,20 +123,27 @@ class DSpineObjective:
         denominator = blocks.weights.sum().detach()
         if alignment_ce is None:
             totals = torch.stack((ce_num.detach(), denominator))
-            if dist.is_initialized():
+            if model.training and dist.is_initialized():
                 dist.all_reduce(totals)
-            alignment_ce = totals[0] / totals[1].clamp_min(1)
+            alignment_ce = totals[0] / totals[1].where(totals[1] > 0, 1)
         beta = self.alignment_weight * (
             min(step / self.alignment_warmup_steps, 1)
             if self.alignment_warmup_steps
             else 1
         )
-        loss = (
+        base_loss = (
             self.ce_weight * terms.cross_entropy
             + (1 - self.ce_weight) * terms.teacher_l1
-            + refined_loss
-            + beta * alignment_ce.detach() * alignment
         )
+        loss = runtime.loss(
+            output.logits,
+            blocks.labels,
+            batch,
+            blocks.label_positions - 1,
+            default=base_loss,
+            teacher=teacher,
+        )
+        loss = loss + refined_loss + beta * alignment_ce.detach() * alignment
         return reduce_loss(
             loss,
             blocks.weights,

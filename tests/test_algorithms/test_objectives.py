@@ -144,7 +144,9 @@ class ObjectiveTest(unittest.TestCase):
         self.assertFalse(visible[:4, 13:].any())
         batch["loss_mask"].zero_()
         model = build_draft_model(config)
-        result = build_objective_model(model, options={"num_anchors": 2})(batch)
+        result = build_objective_model(model, options={"num_anchors": 2})(
+            batch, step=0, total_steps=None
+        )
         self.assertEqual(result.loss.item(), 0)
         result.loss.backward()
 
@@ -156,7 +158,7 @@ class ObjectiveTest(unittest.TestCase):
         handle = model.register_forward_hook(
             lambda module, args, output: captured.append(output.logits)
         )
-        result = build_objective_model(model)(batch)
+        result = build_objective_model(model)(batch, step=0, total_steps=None)
         handle.remove()
         labels = batch["input_ids"][:, 2:8]
         reference = torch.nn.functional.cross_entropy(
@@ -187,7 +189,7 @@ class ObjectiveTest(unittest.TestCase):
                     model.lm_head, "forward", wraps=model.lm_head.forward
                 ) as projection,
             ):
-                result = runtime(batch, step=1, total_steps=10)
+                result = runtime(batch, step=1, total_steps=11)
                 result.loss.backward()
                 self.assertEqual(projection.call_count, 1)
                 torch.testing.assert_close(

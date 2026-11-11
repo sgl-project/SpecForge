@@ -46,3 +46,8 @@ jobs:
           tests.test_modeling.test_draft_eagle_rope_codec -v
       - name: Test checkpoint loading and publication on CPU
         run: python -m unittest discover -s tests/test_checkpoint -t . -v
+      - name: Test canonical training objectives on CPU
+        run: >-
+          python -m unittest
+          tests.test_algorithms.test_objectives
+          tests.test_algorithms.test_objective_contracts -v

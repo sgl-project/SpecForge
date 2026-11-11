@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
-
 from .base import check_options, reduce_loss
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
@@ -40,7 +38,7 @@ class DominoObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            gamma=self.loss_decay_gamma,
+            weighting=runtime.weighting,
             label_offset=int(spec.block.shift_label),
         )
         output = model(
@@ -52,11 +50,12 @@ class DominoObjective:
         labels = blocks.labels.flatten(1)
         if self.lambda_base_start and not total_steps:
             raise ValueError("Domino base-loss schedule requires total_steps")
-        warmup = max(1, (total_steps or 1) * self.lambda_base_decay_ratio)
+        warmup = max(1, int((total_steps or 1) * self.lambda_base_decay_ratio))
         weight = self.lambda_base_start * max(0, 1 - step / warmup)
-        loss = (
-            weight * ce_l1_loss(output.base_logits, labels).cross_entropy
-            + (1 - weight) * ce_l1_loss(output.logits, labels).cross_entropy
+        loss = weight * runtime.loss(
+            output.base_logits, labels, batch, blocks.label_positions.flatten(1) - 1
+        ) + (1 - weight) * runtime.loss(
+            output.logits, labels, batch, blocks.label_positions.flatten(1) - 1
         )
         return reduce_loss(
             loss, blocks.weights.flatten(1), logits=output.logits, labels=labels

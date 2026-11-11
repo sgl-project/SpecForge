@@ -15,18 +15,31 @@ class ObjectiveResult:
 
     @property
     def loss(self):
-        return self.numerator / self.denominator.clamp_min(1)
+        return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
 def reduce_loss(per_token, weights, *, logits=None, labels=None, ratios=None):
     denominator = weights.sum().detach()
     metrics = dict(ratios or {})
     if logits is not None:
-        metrics["accuracy"] = (
+        metrics["acc"] = (
             ((logits.argmax(-1) == labels) * weights).sum().detach(),
             denominator,
         )
     return ObjectiveResult((per_token * weights).sum(), denominator, metrics)
+
+
+def microbatch_mean(result, *, global_denominator=False):
+    """Preserve mean-of-microbatch losses; DDP averages rank gradients."""
+    import torch.distributed as dist
+
+    denominator = result.denominator.detach().clone()
+    world_size = 1
+    if global_denominator and dist.is_initialized():
+        world_size = dist.get_world_size()
+        dist.all_reduce(denominator)
+    loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
+    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
 
 
 class ObjectiveModel(nn.Module):
@@ -37,7 +50,15 @@ class ObjectiveModel(nn.Module):
     """
 
     def __init__(
-        self, draft_model, objective, target_head=None, *, registration=None, name=None
+        self,
+        draft_model,
+        objective,
+        target_head=None,
+        *,
+        registration=None,
+        name=None,
+        token_loss=None,
+        weighting=None,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -45,6 +66,8 @@ class ObjectiveModel(nn.Module):
         self.registration = registration
         self.objective_name = name
         self.target_head = target_head
+        self.token_loss = token_loss
+        self.weighting = weighting
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
@@ -68,14 +91,22 @@ class ObjectiveModel(nn.Module):
             hidden = batch["target_last_hidden_states"]
             return self.target_head(gather(hidden, positions).detach())
 
-    def forward(self, batch, *, step=0, total_steps=None, alignment_ce=None):
+    def loss(self, logits, labels, batch, positions, *, default=None, teacher=None):
+        if self.token_loss.requires_teacher and teacher is None:
+            teacher = self.teacher_logits(batch, positions)
+        return self.token_loss(logits, labels, teacher=teacher, default=default)
+
+    def forward(self, batch, *, step, total_steps, alignment_ce=None):
+        from .inputs import valid_tokens
+
+        valid_tokens(batch)
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
             key: value.detach() if isinstance(value, Tensor) else value
             for key, value in batch.items()
         }
         dtype = self.draft_model.embed_tokens.weight.dtype
-        for key in ("hidden_states", "target_last_hidden_states", "mtp_hidden_states"):
+        for key in ("hidden_states", "mtp_hidden_states"):
             if key in batch:
                 batch[key] = batch[key].to(dtype=dtype)
         return self.objective(

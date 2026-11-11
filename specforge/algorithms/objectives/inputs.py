@@ -17,14 +17,19 @@ def gather(sequence: Tensor, positions: Tensor) -> Tensor:
     ]
 
 
-def sequence_inputs(config, positions, visibility, *, key_positions=None):
+def sequence_inputs(
+    config, positions, visibility, *, key_positions=None, rotary_positions=None
+):
     layout = AttentionLayout(
         query_positions=positions,
         key_positions=positions if key_positions is None else key_positions,
         visibility=visibility[:, None],
     )
     return tuple(
-        LayerInputs(position_ids=positions, attention_layout=layout)
+        LayerInputs(
+            position_ids=positions if rotary_positions is None else rotary_positions,
+            attention_layout=layout,
+        )
         for _ in config.layer_types
     )
 
@@ -36,6 +41,24 @@ def valid_tokens(batch):
     padding = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.bool))
     if padding.shape != ids.shape:
         raise ValueError("attention_mask must align with input_ids")
+    for name in (
+        "hidden_states",
+        "target_last_hidden_states",
+        "mtp_hidden_states",
+        "target_logits",
+    ):
+        if name in batch and (
+            batch[name].ndim != 3 or batch[name].shape[:2] != ids.shape
+        ):
+            raise ValueError(
+                f"{name} must align with input_ids [batch, sequence, width]"
+            )
+    if "position_ids" in batch:
+        positions = batch["position_ids"]
+        if positions.ndim not in (2, 3) or positions.shape[-2:] != ids.shape:
+            raise ValueError(
+                "position_ids must be [batch, sequence] or [axes, batch, sequence]"
+            )
     return (mask > 0.5) & padding.bool()
 
 
@@ -56,7 +79,7 @@ def prepare_blocks(
     batch,
     *,
     num_anchors=512,
-    gamma=None,
+    weighting=None,
     label_offset=0,
     input_offset=0,
     context_offset=0,
@@ -67,8 +90,8 @@ def prepare_blocks(
     All positions are in the original, unshifted sequence. Offsets are explicit
     at algorithm call sites, including DMTP's external first candidate.
     """
-    if num_anchors < 1 or (gamma is not None and gamma <= 0):
-        raise ValueError("num_anchors and loss decay must be positive")
+    if num_anchors < 1:
+        raise ValueError("num_anchors must be positive")
     ids = batch["input_ids"]
     supervised = valid_tokens(batch)
     if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
@@ -98,11 +121,8 @@ def prepare_blocks(
         # Do not bridge an unsupervised gap inside a rollout.
         allowed = (allowed | ~prediction).long().cumprod(-1).bool() & allowed
     weights = (allowed & prediction).float()
-    if gamma is not None:
-        weights *= torch.exp(
-            -(slots - spec.protocol.prediction_positions[0]).clamp_min(0).float()
-            / gamma
-        )
+    if weighting is not None:
+        weights = weighting(weights, slots - spec.protocol.prediction_positions[0])
     noisy = torch.full_like(labels, spec.target_features.mask_token_id)
     noisy[..., 0] = gather(ids, anchors + input_offset).masked_fill(
         ~keep, spec.target_features.mask_token_id

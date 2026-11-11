@@ -1,0 +1,261 @@
+"""Regression checks for canonical objective alignment and reduction contracts."""
+
+import unittest
+from dataclasses import replace
+from unittest.mock import patch
+
+import torch
+from torch import nn
+
+from specforge.algorithms.objectives import build_objective_model
+from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
+from specforge.algorithms.objectives.dflash2 import DFlash2Objective
+from specforge.algorithms.objectives.inputs import prepare_blocks
+from specforge.algorithms.objectives.losses import PositionWeighting
+from specforge.modeling import build_draft_model
+from tests.test_algorithms.test_objectives import (
+    dflash2_config,
+    dspark_config,
+    dspine_config,
+    eagle_config,
+    peagle_config,
+    training_batch,
+)
+from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+
+class ObjectiveContractTest(unittest.TestCase):
+    def test_fractional_denominator_and_microbatch_mean(self):
+        first = ObjectiveResult(torch.tensor(0.6), torch.tensor(0.2))
+        second = ObjectiveResult(torch.tensor(10.0), torch.tensor(2.0))
+        self.assertAlmostEqual(first.loss.item(), 3)
+        means = [microbatch_mean(x) for x in (first, second)]
+        self.assertAlmostEqual(
+            (
+                sum(x.numerator for x in means) / sum(x.denominator for x in means)
+            ).item(),
+            4,
+        )
+        self.assertEqual(
+            ObjectiveResult(torch.tensor(0.0), torch.tensor(0.0)).loss.item(), 0
+        )
+
+    def test_selector_schedule_and_disabled_parameters(self):
+        objective = DFlash2Objective(selector_warmup_ratio=0.2, selector_ramp_ratio=0.3)
+        self.assertEqual(
+            [objective.selector_scale(i, 10) for i in range(6)],
+            [0, 0, 1 / 3, 2 / 3, 1, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "steps or ratio"):
+            DFlash2Objective(selector_ramp_steps=2, selector_ramp_ratio=0.2)
+        model = build_draft_model(dflash2_config())
+        build_objective_model(model, options={"selector_loss_alpha": 0})
+        self.assertFalse(
+            any(p.requires_grad for p in model.candidate_selector.parameters())
+        )
+
+    def test_freezing_failure_does_not_mutate_parameters(self):
+        model = build_draft_model(dflash2_config())
+        before = [p.requires_grad for p in model.parameters()]
+        with self.assertRaisesRegex(ValueError, "unknown frozen"):
+            build_objective_model(model, frozen=("fusion", "missing"))
+        self.assertEqual(before, [p.requires_grad for p in model.parameters()])
+        config = dspine_config()
+        config = replace(config, target_bindings=("lm_head",))
+        model = build_draft_model(config)
+        with self.assertRaisesRegex(ValueError, "embed_tokens"):
+            build_objective_model(model, frozen=("fusion",))
+        self.assertTrue(all(p.requires_grad for p in model.fusion.parameters()))
+        build_objective_model(model, frozen=("embed_tokens",))
+
+    def test_capture_shapes_and_teacher_precision(self):
+        model = build_draft_model(dflash2_config(), dtype=torch.bfloat16)
+        runtime = build_objective_model(model, target_head=nn.Linear(32, 32))
+        batch = training_batch(model.config.draft)
+        for field in (
+            "hidden_states",
+            "target_last_hidden_states",
+            "mtp_hidden_states",
+            "target_logits",
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                runtime(
+                    {**batch, field: torch.zeros(1, 8, 32)}, step=0, total_steps=None
+                )
+        with patch.object(runtime, "objective") as objective:
+            runtime(batch, step=0, total_steps=None)
+            captured = objective.call_args.args[1]
+            self.assertEqual(captured["hidden_states"].dtype, torch.bfloat16)
+            self.assertEqual(captured["target_last_hidden_states"].dtype, torch.float32)
+            self.assertEqual(
+                runtime.teacher_logits(captured, torch.tensor([[1]])).dtype,
+                torch.float32,
+            )
+
+    def test_dspark_stops_at_unsupervised_gap(self):
+        config = dspark_config()
+        batch = training_batch(config)
+        batch["loss_mask"] = torch.tensor([[1, 1, 0, 1, 0, 0, 0, 0, 0]])
+        runtime = build_objective_model(
+            build_draft_model(config),
+            options={"num_anchors": 1},
+            target_head=nn.Linear(32, config.vocab_size),
+        )
+        captured = []
+
+        def prepare(*args, **kwargs):
+            blocks = prepare_blocks(*args, **kwargs)
+            captured.append(blocks)
+            return blocks
+
+        with patch(
+            "specforge.algorithms.objectives.dspark.prepare_blocks", side_effect=prepare
+        ):
+            result = runtime(batch, step=0, total_steps=None)
+        self.assertEqual(captured[0].weights.flatten().tolist(), [1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(result.denominator.item(), 1)
+        self.assertIn("acc", result.ratios)
+
+    def test_common_loss_and_weighting_keep_selector(self):
+        config = dflash2_config()
+        runtime = build_objective_model(
+            build_draft_model(config),
+            options={"num_anchors": 2},
+            loss={"kind": "kl"},
+            weighting={"kind": "exponential", "gamma": 2},
+        )
+        batch = training_batch(config)
+        batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
+        captured = []
+        runtime.draft_model.register_forward_hook(
+            lambda m, a, output: captured.append(output)
+        )
+        result = runtime(batch, step=0, total_steps=None)
+        result.loss.backward()
+        self.assertIn("target_last_hidden_states", runtime.registration.inputs)
+        self.assertTrue(
+            all(
+                p.grad is not None
+                for p in runtime.draft_model.candidate_selector.parameters()
+            )
+        )
+        logits = captured[0].logits
+        teacher = torch.randn_like(logits)
+        expected = torch.nn.functional.kl_div(
+            logits.float().log_softmax(-1),
+            teacher.float().softmax(-1),
+            reduction="none",
+        ).sum(-1)
+        torch.testing.assert_close(
+            runtime.token_loss(logits, logits.argmax(-1), teacher=teacher), expected
+        )
+        torch.testing.assert_close(
+            runtime.weighting(torch.ones(4), torch.arange(4)),
+            torch.exp(-torch.arange(4) / 2),
+        )
+
+    def test_eagle_positions_and_full_vocabulary_accuracy(self):
+        config = eagle_config()
+        model = build_draft_model(config)
+        install_mapping(model)
+        batch = training_batch(config)
+        batch["position_ids"] = torch.arange(9)[None] * 2 + 17
+        batch["target_logits"] = torch.zeros(1, 9, config.vocab_size)
+        batch["target_logits"][..., 1] = 20  # Outside the even-ID draft vocabulary.
+        runtime = build_objective_model(model, options={"ttt_length": 2})
+        entries = []
+        model.register_forward_pre_hook(lambda m, args: entries.append(args[2][0]))
+        result = runtime(batch, step=0, total_steps=None)
+        for depth, entry in enumerate(entries):
+            torch.testing.assert_close(
+                entry.position_ids, batch["position_ids"] + depth
+            )
+            torch.testing.assert_close(
+                entry.attention_layout.query_positions, torch.arange(9)[None] + depth
+            )
+        self.assertEqual(result.ratios["acc"][0].item(), 0)
+        self.assertEqual(result.ratios["acc"][1].item(), 6)
+        self.assertEqual(result.denominator.item(), 1)
+        with self.assertRaisesRegex(ValueError, "unpacked"):
+            runtime(
+                {**batch, "lengths": torch.tensor([4, 5])}, step=0, total_steps=None
+            )
+
+    def test_option_bounds(self):
+        for config, options in (
+            (peagle_config(), {"down_sample_ratio": 0}),
+            (peagle_config(), {"down_sample_ratio": 0.1, "down_sample_ratio_min": 0.2}),
+            (dspine_config(), {"candidate_mass_threshold": 1}),
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                build_objective_model(build_draft_model(config), options=options)
+        with self.assertRaises(ValueError):
+            PositionWeighting(kind="exponential")
+
+    def test_dspine_eval_disables_replacement(self):
+        config = dspine_config()
+        model = build_draft_model(config)
+        for name in config.target_bindings:
+            model.get_submodule(name).load_target_weight(
+                torch.randn(config.vocab_size, config.hidden_size)
+            )
+        model.initialize_transfer_space()
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 1},
+            target_head=nn.Linear(32, config.vocab_size),
+        )
+        model.eval()  # Existing trainers change draft mode, not wrapper mode.
+        with patch(
+            "torch.rand_like", side_effect=AssertionError("replacement sampled in eval")
+        ):
+            result = runtime(training_batch(config), step=0, total_steps=None)
+        self.assertTrue(torch.isfinite(result.loss))
+
+    def test_registry_agreement(self):
+        from specforge.algorithms.objectives import objective_registrations
+        from specforge.config.draft.registry import _SPECS
+        from specforge.modeling.draft.models.registry import _MODELS
+
+        architectures = {
+            architecture
+            for registration in objective_registrations().values()
+            for architecture in registration.architectures
+        }
+        self.assertEqual(architectures, set(_SPECS))
+        self.assertEqual(architectures, set(_MODELS))
+
+    def test_import_without_optional_kernels(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "tests.test_algorithms.objective_import_check"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_peagle_excludes_cross_document_labels(self):
+        config = peagle_config()
+        model = build_draft_model(config)
+        install_mapping(model)
+        batch = {key: value[:, :6] for key, value in training_batch(config).items()}
+        batch.update(
+            loss_mask=torch.ones(1, 6),
+            attention_mask=torch.ones(1, 6),
+            lengths=torch.tensor([3, 3]),
+        )
+        teacher = torch.zeros(1, 6, config.vocab_size)
+        teacher[..., 2] = 10
+        batch["target_logits"] = teacher
+        captured = []
+        model.register_forward_hook(
+            lambda m, args, output: captured.append(output.logits)
+        )
+        runtime = build_objective_model(model, options={"num_depths": 1})
+        result = runtime(batch, step=0, total_steps=None)
+        probabilities = teacher[..., model.vocabulary.t2d].softmax(-1)
+        ce = -(probabilities * captured[0].log_softmax(-1)).sum(-1)
+        torch.testing.assert_close(result.loss, ce[:, [0, 1, 3, 4]].mean())
+        self.assertEqual(result.denominator.item(), 1)
