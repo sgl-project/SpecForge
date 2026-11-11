@@ -132,6 +132,16 @@ class LoadingReviewTest(unittest.TestCase):
                         replace(draft_config(), hidden_size=16), target="test/target"
                     )
                 store.assert_not_called()
+                with TemporaryDirectory() as other:
+                    source = Path(other) / "draft"
+                    save_draft(build_draft_model(draft_config()), source)
+                    with self.assertRaisesRegex(ValueError, "does not match"):
+                        load_draft(
+                            source,
+                            target="test/target",
+                            draft=replace(draft_config(), initializer_range=0.5),
+                        )
+                store.assert_not_called()
 
     def test_target_copy_into_one_name_of_a_tied_pair(self):
         """Copying the embedding of a tied, owned table also fills its lm_head alias."""
