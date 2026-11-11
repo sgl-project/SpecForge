@@ -28,7 +28,6 @@ class DraftVocabulary(nn.Module):
             "d2t", torch.empty(draft_vocab_size, device=device, dtype=torch.long)
         )
         self._ready = False
-        self.register_load_state_dict_post_hook(self._after_load)
         self.reset_draft_parameters()
 
     def reset_draft_parameters(self):
@@ -41,22 +40,37 @@ class DraftVocabulary(nn.Module):
     def ready(self) -> bool:
         return self._ready
 
-    def _after_load(self, module, incompatible_keys):
-        self.validate_draft_state()
+    def _apply(self, fn, recurse=True):
+        was_ready = self._ready
+        self._ready = False
+        result = super()._apply(fn, recurse=recurse)
+        if was_ready:
+            self.validate_draft_state()
+        return result
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        self._ready = False
-        for name in ("t2d", "d2t"):
-            if prefix + name not in state_dict:
-                raise ValueError(f"missing vocabulary tensor: {prefix + name}")
-        self._validate_mapping(state_dict[prefix + "t2d"], state_dict[prefix + "d2t"])
+        keys = (prefix + "t2d", prefix + "d2t")
+        present = [key in state_dict for key in keys]
+        if any(present):
+            self._ready = False
+            if not all(present):
+                raise ValueError(
+                    f"missing vocabulary tensor: {keys[present.index(False)]}"
+                )
+            self._validate_mapping(
+                *(state_dict[key] for key in keys), allow_unmapped=True
+            )
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if all(present):
+            self.validate_draft_state()
 
     def validate_draft_state(self) -> None:
         """Validate restored buffers once, before any token IDs are interpreted."""
         self._ready = False
-        self._validate_mapping(self.t2d, self.d2t)
-        self._ready = True
+        if not (self.t2d.is_meta or self.d2t.is_meta):
+            self._ready = self._validate_mapping(
+                self.t2d, self.d2t, allow_unmapped=True
+            )
 
     @torch.no_grad()
     def load_mapping(self, *, t2d: Tensor, d2t: Tensor) -> None:
@@ -70,7 +84,9 @@ class DraftVocabulary(nn.Module):
         self.d2t.copy_(d2t)
         self._ready = True
 
-    def _validate_mapping(self, t2d: Tensor, d2t: Tensor) -> None:
+    def _validate_mapping(
+        self, t2d: Tensor, d2t: Tensor, *, allow_unmapped=False
+    ) -> bool:
         if t2d.shape != self.t2d.shape or t2d.dtype != torch.bool:
             raise ValueError("t2d must be boolean [vocab_size]")
         if d2t.shape != self.d2t.shape or d2t.dtype != torch.long:
@@ -79,12 +95,16 @@ class DraftVocabulary(nn.Module):
             raise ValueError(
                 "materialize vocabulary tensors before installing a mapping"
             )
+        if allow_unmapped and self.draft_vocab_size < self.vocab_size:
+            if not t2d.any().item() and not d2t.any().item():
+                return False
         selected = t2d.nonzero().flatten()
         mapped = d2t.to(selected.device) + torch.arange(
             self.draft_vocab_size, device=selected.device
         )
         if not torch.equal(selected, mapped):
             raise ValueError("t2d/d2t must describe the same ascending target IDs")
+        return True
 
     def require_ready(self):
         if not self._ready:

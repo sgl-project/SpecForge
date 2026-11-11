@@ -31,7 +31,12 @@ class BackboneState:
             raise ValueError(
                 "replacement hidden state must preserve the residual layout"
             )
-        return replace(self, hidden=hidden)
+        output = self.layer_output
+        return replace(
+            self,
+            hidden=hidden,
+            layer_output=replace(output, hidden=hidden) if output is not None else None,
+        )
 
 
 class DraftBackbone(nn.Module):

@@ -78,13 +78,45 @@ def legacy_name(name):
     for prefix, target in (
         ("backbone.layers.0.", "midlayer."),
         ("backbone.final_norm.", "norm."),
-        ("logit_norm.", "norm."),
         ("fusion.", ""),
         ("vocabulary.", ""),
     ):
         if name.startswith(prefix):
             return target + name[len(prefix) :]
     return name
+
+
+def legacy_model(actual, device="cpu", dtype=torch.float32):
+    spec = actual.config.draft.spec_config
+    normalize, norm_output = spec.normalize_features, spec.norm_output
+    legacy = LlamaConfig(
+        hidden_size=32,
+        target_hidden_size=48,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=1,
+        vocab_size=64,
+        draft_vocab_size=32,
+        max_position_embeddings=128,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        pretraining_tp=1,
+        fc_norm=normalize,
+        norm_output=norm_output,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    reference = LlamaForCausalLMEagle3(legacy).to(device=device, dtype=dtype)
+    # Keep legacy frequency buffers in FP32, matching canonical RoPE.
+    reference.midlayer.self_attn.rotary_emb = LlamaRotaryEmbedding(
+        8, max_position_embeddings=128, base=10000, device=device
+    )
+    reference.load_state_dict(
+        {legacy_name(n): v for n, v in actual.state_dict().items()},
+        strict=True,
+    )
+    return reference
 
 
 class CanonicalEagle3Test(unittest.TestCase):
@@ -111,35 +143,7 @@ class CanonicalEagle3Test(unittest.TestCase):
                 config = model_config(normalize=normalize, norm_output=norm_output)
                 actual = build_draft_model(config, device=device, dtype=dtype)
                 install_mapping(actual)
-                legacy = LlamaConfig(
-                    hidden_size=32,
-                    target_hidden_size=48,
-                    intermediate_size=64,
-                    num_attention_heads=4,
-                    num_key_value_heads=2,
-                    head_dim=8,
-                    num_hidden_layers=1,
-                    vocab_size=64,
-                    draft_vocab_size=32,
-                    max_position_embeddings=128,
-                    rms_norm_eps=1e-6,
-                    hidden_act="silu",
-                    pretraining_tp=1,
-                    fc_norm=normalize,
-                    norm_output=norm_output,
-                    rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
-                )
-                reference = LlamaForCausalLMEagle3(legacy).to(
-                    device=device, dtype=dtype
-                )
-                # Keep legacy frequency buffers in FP32, matching canonical RoPE.
-                reference.midlayer.self_attn.rotary_emb = LlamaRotaryEmbedding(
-                    8, max_position_embeddings=128, base=10000, device=device
-                )
-                reference.load_state_dict(
-                    {legacy_name(n): v for n, v in actual.state_dict().items()},
-                    strict=True,
-                )
+                reference = legacy_model(actual, device, dtype)
                 ids, features, entries = model_inputs(config, device, dtype)
                 other = features.detach().clone().requires_grad_()
                 mask = (
@@ -316,6 +320,100 @@ class CanonicalEagle3Test(unittest.TestCase):
                             atol=1e-5,
                             msg=name,
                         )
+
+    @eager_legacy_reference()
+    @legacy_fp32_rope()
+    def test_sdpa_rollout_matches_legacy_cache_hidden(self):
+        devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+        for device, norm_output in product(devices, (False, True)):
+            with self.subTest(device=device, norm_output=norm_output):
+                model = build_draft_model(
+                    model_config(norm_output=norm_output), backend="sdpa", device=device
+                )
+                install_mapping(model)
+                self.assertFalse(model._no_split_modules)
+                self.assertIn("backbone.final_norm.weight", model.state_dict())
+                self.assertNotIn("logit_norm.weight", model.state_dict())
+                reference = legacy_model(model, device)
+                ids, features, entries = model_inputs(model.config.draft, device)
+                other = features.detach().clone().requires_grad_()
+                positions = entries[0].position_ids
+                causal = positions[:, None, None, :] <= positions[:, None, :, None]
+                additive = torch.zeros_like(causal, dtype=torch.float32).masked_fill(
+                    ~causal, float("-inf")
+                )
+                diagonal = torch.eye(ids.shape[1], dtype=torch.bool, device=device)[
+                    None, None
+                ].expand(2, 1, -1, -1)
+                prefix, hidden, cache = None, None, [[], []]
+                expected_hidden = reference.project_hidden_states(other)
+                losses, expected_losses = [], []
+                for depth in range(4):
+                    layout = replace(
+                        entries[0].attention_layout,
+                        query_positions=positions + depth,
+                        key_positions=torch.cat(
+                            [positions + i for i in range(depth + 1)], dim=1
+                        ),
+                        visibility=torch.cat([causal] + [diagonal] * depth, dim=-1),
+                    )
+                    output = model(
+                        ids,
+                        features if depth == 0 else None,
+                        [
+                            LayerInputs(
+                                attention_layout=layout, position_ids=positions + depth
+                            )
+                        ],
+                        recurrent_hidden=hidden,
+                        kv_prefix=prefix,
+                    )
+                    expected_hidden = reference.backbone(
+                        reference.embed_tokens(ids),
+                        expected_hidden,
+                        cache,
+                        additive,
+                        positions,
+                    )
+                    logits = reference.compute_logits(expected_hidden)
+                    torch.testing.assert_close(
+                        output.logits, logits, rtol=1e-4, atol=1e-5
+                    )
+                    losses.append(output.logits.square().mean())
+                    expected_losses.append(logits.square().mean())
+                    hidden, prefix = output.hidden_states, output.kv.prepend(prefix)
+                sum(losses).backward()
+                sum(expected_losses).backward()
+                torch.testing.assert_close(
+                    features.grad, other.grad, rtol=1e-4, atol=1e-5
+                )
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(
+                        parameter.grad,
+                        dict(reference.named_parameters())[legacy_name(name)].grad,
+                        rtol=1e-4,
+                        atol=1e-5,
+                        msg=name,
+                    )
+
+    def test_autocast_fusion_preserves_feature_dtype(self):
+        from tests.test_modeling.test_canonical_peagle import (
+            model_config as peagle_config,
+        )
+
+        for config in (model_config(), peagle_config()):
+            model = build_draft_model(config, backend="sdpa")
+            ids, features, entries = model_inputs(config, dtype=torch.bfloat16)
+            with (
+                torch.autocast("cpu", dtype=torch.bfloat16),
+                patch.object(
+                    model.backbone, "begin", wraps=model.backbone.begin
+                ) as begin,
+            ):
+                output = model(ids, features, entries, output_logits=False)
+            self.assertEqual(begin.call_args.args[0].dtype, torch.bfloat16)
+            output.hidden_states.float().sum().backward()
+            self.assertIsNotNone(features.grad)
 
     def test_checkpointing_binding_and_hf_restore(self):
         config = model_config(normalize=True, bound=True, target_width=32)

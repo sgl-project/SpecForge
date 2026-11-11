@@ -106,6 +106,9 @@ class BackboneTest(unittest.TestCase):
                 backbone.finalize(state), expected, rtol=0, atol=0
             )
             torch.testing.assert_close(state.layer_output.feature, state.hidden * 2)
+            injected = state.with_hidden(state.hidden + 1)
+            self.assertIs(injected.layer_output.hidden, injected.hidden)
+            self.assertIs(injected.layer_output.feature, state.layer_output.feature)
             state.layer_output.feature.sum().backward()
             grads = [
                 p.grad.clone() for layer in backbone.layers for p in layer.parameters()

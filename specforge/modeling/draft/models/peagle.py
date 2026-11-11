@@ -106,23 +106,25 @@ class PEagleDraftModel(DraftPreTrainedModel):
             )
         if type(output_logits) is not bool:
             raise TypeError("output_logits must be boolean")
-        if feature_mask is not None:
-            if (
-                feature_mask.shape != input_ids.shape
-                or feature_mask.dtype != torch.bool
-            ):
-                raise ValueError("feature_mask must be boolean [batch, sequence]")
-            input_ids = input_ids.masked_fill(
-                feature_mask, self.config.draft.spec_config.mask_token_id
-            )
-            target_features = torch.where(
-                feature_mask[..., None],
-                self.mask_hidden.to(target_features.dtype),
-                target_features,
-            )
+        if feature_mask is None:
+            feature_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if feature_mask.shape != input_ids.shape or feature_mask.dtype != torch.bool:
+            raise ValueError("feature_mask must be boolean [batch, sequence]")
+        input_ids = input_ids.masked_fill(
+            feature_mask, self.config.draft.spec_config.mask_token_id
+        )
+        target_features = torch.where(
+            feature_mask[..., None],
+            self.mask_hidden.to(target_features.dtype),
+            target_features,
+        )
         features = self.fusion(target_features)
         hidden = self.backbone(
-            torch.cat((self.embed_tokens(input_ids), features), dim=-1), layer_inputs
+            torch.cat(
+                (self.embed_tokens(input_ids).to(target_features.dtype), features),
+                dim=-1,
+            ),
+            layer_inputs,
         )
         return PEagleOutput(
             hidden_states=hidden,

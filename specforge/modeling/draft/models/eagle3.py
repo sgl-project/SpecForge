@@ -4,11 +4,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-from torch import Tensor, nn
+from torch import Tensor
 from transformers.utils import ModelOutput
 
 from ..hf_config import SpecForgeDraftConfig
-from ..layers import build_component
 from ..layers.attention.kv import AttentionKV
 from ..layers.inputs import LayerInputs
 from ..pretrained import DraftPreTrainedModel
@@ -38,8 +37,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
     only new tokens, while attention visibility covers prefix plus new tokens.
     """
 
-    _no_split_modules = ["EagleDecoderStage"]
-
     def __init__(
         self, config: SpecForgeDraftConfig, *, backend="eager", device=None, dtype=None
     ):
@@ -59,17 +56,6 @@ class Eagle3DraftModel(DraftPreTrainedModel):
         self.embed_tokens, self.lm_head = build_token_modules(
             draft, device=device, dtype=dtype
         )
-        self.logit_norm = (
-            nn.Identity()
-            if spec.norm_output
-            else build_component(
-                "norm",
-                draft.norm_config,
-                hidden_size=draft.hidden_size,
-                device=device,
-                dtype=dtype,
-            )
-        )
         self.vocabulary = DraftVocabulary(
             vocab_size=draft.vocab_size,
             draft_vocab_size=draft.draft_vocab_size,
@@ -79,7 +65,9 @@ class Eagle3DraftModel(DraftPreTrainedModel):
 
     def compute_logits(self, hidden: Tensor) -> Tensor:
         self.vocabulary.require_ready()
-        return self.lm_head(self.logit_norm(hidden))
+        if not self.config.draft.spec_config.norm_output:
+            hidden = self.backbone.final_norm(hidden)
+        return self.lm_head(hidden)
 
     def forward(
         self,
@@ -110,10 +98,17 @@ class Eagle3DraftModel(DraftPreTrainedModel):
             )
         # EAGLE3 has one stage. The caller owns depth iteration and K/V lifetime.
         state = self.backbone.begin(
-            torch.cat((self.embed_tokens(input_ids), features), dim=-1), layer_inputs
+            torch.cat(
+                (self.embed_tokens(input_ids).to(features.dtype), features), dim=-1
+            ),
+            layer_inputs,
         )
         state = self.backbone.run_next_layer(state, kv_prefix=kv_prefix, output_kv=True)
-        hidden = self.backbone.finalize(state)
+        hidden = (
+            self.backbone.finalize(state)
+            if self.config.draft.spec_config.norm_output
+            else self.backbone.residual.reduce(state.hidden)
+        )
         return Eagle3Output(
             hidden_states=hidden,
             kv=state.layer_output.kv,

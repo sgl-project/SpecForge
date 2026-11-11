@@ -75,6 +75,9 @@ class CanonicalPEagleTest(unittest.TestCase):
         for normalized in (False, True):
             with self.subTest(device=device, dtype=dtype, normalized=normalized):
                 config = model_config(normalized=normalized)
+                config = replace(
+                    config, spec_config=replace(config.spec_config, pad_token_id=0)
+                )
                 actual = build_draft_model(config, device=device, dtype=dtype)
                 install_mapping(actual)
                 with torch.no_grad():
@@ -94,6 +97,7 @@ class CanonicalPEagleTest(unittest.TestCase):
                     hidden_act="silu",
                     pretraining_tp=1,
                     norm_before_residual=normalized,
+                    pad_token_id=config.spec_config.pad_token_id,
                     rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
                 )
                 reference = LegacyPEagleDraftModel(legacy).to(
@@ -266,6 +270,9 @@ class CanonicalPEagleTest(unittest.TestCase):
         torch.testing.assert_close(
             output.hidden_states, unmasked.hidden_states, rtol=0, atol=0
         )
+        output.hidden_states.sum().backward()
+        self.assertIsNotNone(actual.mask_hidden.grad)
+        self.assertEqual(actual.mask_hidden.grad.count_nonzero().item(), 0)
         self.assertIsNone(output.logits)
         with self.assertRaisesRegex(RuntimeError, "mapping"):
             actual.compute_logits(output.hidden_states)

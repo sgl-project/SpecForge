@@ -30,12 +30,6 @@ class DraftPreTrainedModel(PreTrainedModel):
             raise ValueError("model class name must match draft.architecture")
         super().__init__(config)
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """Restore complete draft artifacts; partial weights use explicit loading APIs."""

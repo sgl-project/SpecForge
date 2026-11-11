@@ -112,6 +112,37 @@ class DraftVocabularyTest(unittest.TestCase):
                 self.assertFalse(owner.vocabulary.ready)
                 install(owner.vocabulary)
 
+    def test_partial_load_preserves_mapping_and_full_load_installs_it(self):
+        owner = DFlashDraftModel(model_config())
+        install(owner.vocabulary)
+        expected = owner.vocabulary.to_target(torch.arange(4))
+        owner.load_state_dict({"projection.weight": torch.eye(4)}, strict=False)
+        torch.testing.assert_close(
+            owner.vocabulary.to_target(torch.arange(4)), expected
+        )
+        restored = DraftVocabulary(vocab_size=8, draft_vocab_size=4)
+        restored.load_state_dict(owner.vocabulary.state_dict())
+        torch.testing.assert_close(restored.to_target(torch.arange(4)), expected)
+
+    def test_replaced_storage_invalidates_mapping(self):
+        vocabulary = DraftVocabulary(vocab_size=8, draft_vocab_size=4)
+        install(vocabulary)
+        vocabulary.to("meta").to_empty(device="cpu")
+        self.assertFalse(vocabulary.ready)
+        with self.assertRaisesRegex(RuntimeError, "mapping"):
+            vocabulary.to_target(torch.arange(4))
+        install(vocabulary)
+        self.assertTrue(vocabulary.ready)
+
+    def test_unmapped_checkpoint_restores_without_enabling_logits(self):
+        owner = DFlashDraftModel(model_config())
+        with TemporaryDirectory() as path:
+            owner.save_pretrained(path)
+            restored = DFlashDraftModel.from_pretrained(path)
+        self.assertFalse(restored.vocabulary.ready)
+        with self.assertRaisesRegex(RuntimeError, "mapping"):
+            restored.vocabulary.to_target(torch.arange(4))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cpu_mapping_can_be_installed_on_cuda(self):
         vocabulary = DraftVocabulary(vocab_size=8, draft_vocab_size=4, device="cuda")
