@@ -84,19 +84,27 @@ def _fsdp1_refusal(rank, directory):
         world_size=2,
     )
     try:
+        config = draft_config(target_bindings=(), target_logit_transform=None)
         wrapped = FullyShardedDataParallel(
-            build_draft_model(
-                draft_config(target_bindings=(), target_logit_transform=None)
-            ),
+            build_draft_model(config),
             use_orig_params=True,
             device_id=torch.device("cpu"),
         )
-        for call in (
-            lambda: make_weight_plan(wrapped, {}),
-            lambda: save_draft(wrapped, Path(directory) / f"draft-{rank}"),
+        # The trainer's layout: one FSDP1 root above a draft with no unit of its own.
+        inner = build_draft_model(config)
+        FullyShardedDataParallel(
+            torch.nn.ModuleDict({"draft_model": inner}),
+            use_orig_params=True,
+            device_id=torch.device("cpu"),
+        )
+        for call, message in (
+            (lambda: make_weight_plan(wrapped, {}), "FSDP1"),
+            (lambda: save_draft(wrapped, Path(directory) / f"draft-{rank}"), "FSDP1"),
+            (lambda: save_draft(inner, Path(directory) / f"inner-{rank}"), "match"),
         ):
-            with unittest.TestCase().assertRaisesRegex(TypeError, "FSDP1"):
+            with unittest.TestCase().assertRaisesRegex(TypeError, message):
                 call()
+        assert not any(Path(directory).glob("*-[01]")), "a refused save wrote files"
     finally:
         dist.destroy_process_group()
 
@@ -172,8 +180,8 @@ class DraftWeightsTest(unittest.TestCase):
             )
             torch.multiprocessing.spawn(_sharded_load, args=(tmp,), nprocs=2, join=True)
 
-    def test_fsdp1_wrapped_draft_is_refused_on_every_rank(self):
-        """Its state_dict is a collective of temporary views: saves hang, loads vanish."""
+    def test_fsdp1_sharded_draft_is_refused_on_every_rank(self):
+        """Otherwise saves hang or publish shard views, and loads copy into nothing."""
         with TemporaryDirectory() as tmp:
             torch.multiprocessing.spawn(
                 _fsdp1_refusal, args=(tmp,), nprocs=2, join=True
