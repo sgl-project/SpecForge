@@ -8,11 +8,12 @@ from .dflash import COMMON_MODULES
 from .inputs import gather, sequence_inputs, valid_tokens
 from .losses import TokenLoss
 from .predictions import PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "mtp",
+    training=TrainingRequirements(capture_method="dflash", dataloader_workers=8),
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
     provides=(

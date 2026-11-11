@@ -9,11 +9,18 @@ from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .losses import TokenLoss
 from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "dflash2",
+    training=TrainingRequirements(
+        capture_method="dflash",
+        strategy="dflash",
+        minimum_loss_tokens=2,
+        consecutive_loss_tokens=True,
+        dataloader_workers=8,
+    ),
     architectures=("DFlash2DraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
     provides=(

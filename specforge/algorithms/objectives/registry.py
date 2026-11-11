@@ -7,6 +7,20 @@ from .losses import PositionWeighting, TokenLoss
 
 
 @dataclass(frozen=True)
+class TrainingRequirements:
+    """Data and execution requirements used by canonical training composition."""
+
+    capture_method: str | None = None
+    strategy: str | None = None
+    vocabulary: bool = False
+    required_batch_size: int | None = None
+    minimum_loss_tokens: int = 1
+    consecutive_loss_tokens: bool = False
+    dataloader_workers: int = 4
+    window_statistic: tuple[str, str] | None = None  # (ratio name, objective argument)
+
+
+@dataclass(frozen=True)
 class ProtocolRegistration:
     factory: type
     architectures: tuple[str, ...]
@@ -14,6 +28,7 @@ class ProtocolRegistration:
     provides: frozenset[str]
     trains: tuple[str, ...]
     requires: frozenset[str] = frozenset()
+    training: TrainingRequirements = TrainingRequirements()
 
 
 _PROTOCOLS = {}
@@ -21,7 +36,15 @@ _DEFAULTS = {}
 
 
 def register_protocol(
-    name, *, architectures, inputs, provides, trains, requires=(), default=True
+    name,
+    *,
+    architectures,
+    inputs,
+    provides,
+    trains,
+    requires=(),
+    default=True,
+    training=TrainingRequirements(),
 ):
     def register(factory):
         if name in _PROTOCOLS:
@@ -35,6 +58,7 @@ def register_protocol(
             frozenset(provides),
             tuple(trains),
             frozenset(requires),
+            training,
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))

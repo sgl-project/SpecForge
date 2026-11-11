@@ -7,11 +7,17 @@ from .dflash import COMMON_MODULES
 from .inputs import gather, prepare_blocks
 from .losses import TokenLoss
 from .predictions import PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "dmtp",
+    training=TrainingRequirements(
+        strategy="dflash",
+        minimum_loss_tokens=2,
+        consecutive_loss_tokens=True,
+        dataloader_workers=8,
+    ),
     architectures=("DMTPDraftModel",),
     inputs=("input_ids", "hidden_states", "mtp_hidden_states", "loss_mask"),
     provides=(

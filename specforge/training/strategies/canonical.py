@@ -18,12 +18,13 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         seen = set()
         self._duplicate_parameters = set()
         inner = model.module if isinstance(model, DistributedDataParallel) else model
+        self.window_statistic = inner.registration.training.window_statistic
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
             seen.add(id(value))
-        self._alignment_window = None
-        self._alignment_ce = None
+        self._statistic_window = None
+        self._window_value = None
 
     def trainable_module(self):
         return self.model
@@ -37,7 +38,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             and key[len(prefix) :] not in self._duplicate_parameters
         }
 
-    def _forward(self, batch, ctx, alignment_ce=None):
+    def _forward(self, batch, ctx, window_value=None):
         self.validate_batch(batch)
         device = next(self.model.parameters()).device
         tensors = {
@@ -48,7 +49,11 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             tensors,
             step=ctx.global_step,
             total_steps=ctx.total_steps,
-            alignment_ce=alignment_ce,
+            **(
+                {self.window_statistic[1]: window_value}
+                if self.window_statistic
+                else {}
+            ),
         )
         positions = sorted(
             int(name.split("_")[1])
@@ -76,7 +81,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def forward_loss(self, batch, ctx=None):
         ctx = ctx or StepContext()
         if (
-            self.objective != "dspine"
+            self.window_statistic is None
             or not self.trainable_module().training
             or not torch.is_grad_enabled()
         ):
@@ -88,7 +93,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         device_rng = [device_module.get_rng_state(index) for index in devices]
         with torch.no_grad():
             output = self._forward(
-                batch, ctx, alignment_ce=torch.zeros((), device=device)
+                batch, ctx, window_value=torch.zeros((), device=device)
             )
         replay_batch = replace(
             batch,
@@ -96,18 +101,18 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         )
 
         def replay(window_ratios):
-            if self._alignment_window is not window_ratios:
-                numerator, denominator = window_ratios["dspine/backbone_ce"]
+            if self._statistic_window is not window_ratios:
+                numerator, denominator = window_ratios[self.window_statistic[0]]
                 totals = torch.stack((numerator, denominator))
                 if dist.is_initialized():
                     dist.all_reduce(totals)
                 denominator = totals[1].where(totals[1] > 0, 1)
-                self._alignment_ce = (totals[0] / denominator).detach()
-                self._alignment_window = window_ratios
+                self._window_value = (totals[0] / denominator).detach()
+                self._statistic_window = window_ratios
             with torch.random.fork_rng(devices=devices, device_type=device.type):
                 torch.set_rng_state(cpu_rng)
                 for index, state in zip(devices, device_rng):
                     device_module.set_rng_state(state, index)
-                return self._forward(replay_batch, ctx, self._alignment_ce)
+                return self._forward(replay_batch, ctx, self._window_value)
 
         return replace(output, replay_loss=replay)

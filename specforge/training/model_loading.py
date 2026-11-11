@@ -463,15 +463,9 @@ __all__ = [
 
 
 def training_target_config(cfg):
-    """Load text metadata before parsing a training draft."""
-    from specforge.modeling.target.target_utils import (
-        load_target_config,
-        target_text_config,
-    )
+    """Use the checkpoint reader's target metadata for canonical training."""
+    from specforge.checkpoint.resolve import read_target_config
 
-    target = load_target_config(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
+    return read_target_config(
+        cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
     )
-    return target_text_config(target).to_dict()

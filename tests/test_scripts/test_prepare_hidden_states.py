@@ -271,3 +271,63 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalCaptureTest(unittest.TestCase):
+    def test_eagle_yaml_capture_matches_training_inputs(self):
+        import yaml
+
+        from specforge.config.draft.codec import encode_config
+        from specforge.training.canonical_data import normalize_sample
+        from tests.test_modeling.test_canonical_eagle3 import model_config as eagle
+        from tests.test_modeling.test_canonical_peagle import model_config as peagle
+        from tests.test_runtime.test_canonical_training import target_directory
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            for factory in (eagle, peagle):
+                draft = factory(target_width=32)
+                path = root / "draft.yaml"
+                path.write_text(yaml.safe_dump(encode_config(draft)))
+                argv = [
+                    "prepare_hidden_states.py",
+                    "--draft",
+                    str(path),
+                    "--target-model-path",
+                    str(target),
+                    "--server-urls",
+                    "http://localhost:30000",
+                    "--data-path",
+                    "data.jsonl",
+                ]
+                with mock.patch("sys.argv", argv):
+                    args = parse_args()
+                plan = resolve_offline_capture_plan(args)
+                self.assertEqual(plan.capture_method, "eagle3")
+                self.assertEqual(
+                    plan.capture_layers,
+                    draft.spec_config.target_features.target_layer_ids,
+                )
+                record = plan.layout.materialize(
+                    {
+                        "input_ids": torch.tensor([1, 2, 3]),
+                        "loss_mask": torch.tensor([1, 1, 0]),
+                        "aux_hidden_states": torch.randn(
+                            1, 3, len(plan.capture_layers) * 32
+                        ),
+                        "last_hidden_states": torch.randn(1, 3, 32),
+                    }
+                )
+                self.assertEqual(
+                    set(record),
+                    {
+                        "input_ids",
+                        "loss_mask",
+                        "hidden_states",
+                        "target_last_hidden_states",
+                    },
+                )
+                sample = normalize_sample(record, keys=tuple(record), max_len=3)
+                self.assertEqual(sample["target_last_hidden_states"].shape, (1, 3, 32))
+                self.assertEqual(sample["input_ids"].tolist(), [[1, 2, 3]])

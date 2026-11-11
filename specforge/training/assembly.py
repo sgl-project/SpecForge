@@ -187,10 +187,9 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
     from specforge.modeling.target.target_utils import (
         target_vocab_size as resolve_target_vocab_size,
     )
-    from specforge.training.canonical import build_bundle, enabled
 
-    if enabled(cfg):
-        return build_bundle(cfg, algorithm)
+    if algorithm.providers.model.build_bundle is not None:
+        return algorithm.providers.model.build_bundle(cfg, algorithm)
     provider = algorithm.providers.model
     draft_config, draft_model = _load_draft(cfg, algorithm)
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)

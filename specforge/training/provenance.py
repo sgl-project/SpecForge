@@ -275,7 +275,11 @@ def _compute_model_resume_provenance(
     return {
         MODEL_SOURCE_IDENTITY_FORMAT_FIELD: MODEL_SOURCE_IDENTITY_FORMAT,
         "target_model": model_source_identity(cfg.model.target_model_path),
-        "target_revision": getattr(target_config, "_commit_hash", None),
+        "target_revision": (
+            target_config.get("_commit_hash")
+            if isinstance(target_config, dict)
+            else getattr(target_config, "_commit_hash", None)
+        ),
         "draft_config": model_source_identity(draft_source),
         "draft_revision": getattr(draft_config, "_commit_hash", None),
         "vocab_mapping": model_source_identity(cfg.model.vocab_mapping_path or None),

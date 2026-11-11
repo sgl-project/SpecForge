@@ -71,7 +71,11 @@ def parse_args():
         default="eagle3",
         help="Offline draft strategy (default: eagle3)",
     )
-    model_group.add_argument(
+    draft_group = model_group.add_mutually_exclusive_group()
+    draft_group.add_argument(
+        "--draft", help="Canonical draft YAML file (including presets)"
+    )
+    draft_group.add_argument(
         "--draft-model-config",
         type=str,
         default=None,
@@ -242,9 +246,9 @@ def _generate_shared_vocab_mapping(
 
 def resolve_offline_capture_plan(
     args: argparse.Namespace,
-    target_config: AutoConfig,
+    target_config=None,
 ) -> OfflineCapturePlan:
-    """Resolve capture layers and output keys through the algorithm registry."""
+    """Resolve capture layers and output keys through training composition."""
 
     strategy = getattr(args, "strategy", "eagle3")
     model = {
@@ -259,7 +263,12 @@ def resolve_offline_capture_plan(
             "hidden_states_path": args.output_path or "__offline_capture__",
             "max_length": args.max_length,
         },
-        training={"strategy": strategy},
+        draft=getattr(args, "draft", None),
+        training=(
+            {"attention_backend": "eager"}
+            if getattr(args, "draft", None)
+            else {"strategy": strategy}
+        ),
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(
@@ -274,12 +283,17 @@ def resolve_offline_capture_plan(
 
 def build_capture_client(args, model_config, plan):
     text_config = getattr(model_config, "text_config", model_config)
+    hidden_size = (
+        text_config["hidden_size"]
+        if isinstance(text_config, dict)
+        else text_config.hidden_size
+    )
     return OfflineCaptureClient(
         args.server_urls,
         target_model_path=args.target_model_path,
         capture_layers=plan.capture_layers,
         layout=plan.layout,
-        target_hidden_size=text_config.hidden_size,
+        target_hidden_size=hidden_size,
         timeout_s=args.capture_timeout,
     )
 
@@ -495,11 +509,18 @@ def main():
             Path(__file__).parent.parent, "cache", "hidden_states"
         )
 
-    target_model_config = AutoConfig.from_pretrained(
-        args.target_model_path,
-        cache_dir=args.cache_dir,
-        trust_remote_code=args.trust_remote_code,
-    )
+    if args.draft:
+        from specforge.checkpoint.resolve import read_target_config
+
+        target_model_config = read_target_config(
+            args.target_model_path, cache_dir=args.cache_dir
+        )
+    else:
+        target_model_config = AutoConfig.from_pretrained(
+            args.target_model_path,
+            cache_dir=args.cache_dir,
+            trust_remote_code=args.trust_remote_code,
+        )
     capture_plan = resolve_offline_capture_plan(args, target_model_config)
     draft_vocab_size = _resolve_draft_vocab_size(capture_plan.draft_config)
 
@@ -510,7 +531,14 @@ def main():
         print_args_with_dots(args)
         if _rank() == 0:
             print("Resolved draft model config:")
-            print(capture_plan.draft_config.to_json_string(use_diff=False))
+            if args.draft:
+                import json
+
+                from specforge.config.draft.codec import encode_config
+
+                print(json.dumps(encode_config(capture_plan.draft_config), indent=2))
+            else:
+                print(capture_plan.draft_config.to_json_string(use_diff=False))
         print_with_rank(
             f"Resolved {capture_plan.strategy} offline "
             f"capture method {capture_plan.capture_method!r}, layers: "
@@ -520,7 +548,11 @@ def main():
         target_text_config = getattr(
             target_model_config, "text_config", target_model_config
         )
-        target_vocab_size = int(target_text_config.vocab_size)
+        target_vocab_size = int(
+            target_text_config["vocab_size"]
+            if isinstance(target_text_config, dict)
+            else target_text_config.vocab_size
+        )
         if draft_vocab_size > target_vocab_size:
             raise ValueError(
                 f"draft_vocab_size={draft_vocab_size} exceeds target "

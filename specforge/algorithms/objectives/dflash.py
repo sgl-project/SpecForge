@@ -6,13 +6,19 @@ from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss
 from .predictions import PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 
 
 @register_protocol(
     "dflash",
+    training=TrainingRequirements(
+        capture_method="dflash",
+        minimum_loss_tokens=2,
+        consecutive_loss_tokens=True,
+        dataloader_workers=8,
+    ),
     architectures=("DFlashDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
     provides=(

@@ -11,11 +11,18 @@ from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss
 from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "dspine",
+    training=TrainingRequirements(
+        capture_method="dspark",
+        minimum_loss_tokens=2,
+        consecutive_loss_tokens=True,
+        dataloader_workers=8,
+        window_statistic=("dspine/backbone_ce", "alignment_ce"),
+    ),
     requires=("teacher_logits",),
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
@@ -75,7 +82,9 @@ class DSpineObjective:
                 "replacement_hold_ratio must be below replacement_end_ratio"
             )
 
-    def __call__(self, runtime, batch, *, step, total_steps, alignment_ce, **context):
+    def __call__(
+        self, runtime, batch, *, step, total_steps, alignment_ce=None, **context
+    ):
         model = runtime.draft_model
         blocks = prepare_blocks(
             model.config.draft,

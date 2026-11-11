@@ -227,3 +227,33 @@ legacy defaults produce a warning and do not enable those optimizations.
 path. Neither is copied into the other. A canonical checkpoint supplied through
 `training.resume_from` also selects the canonical training route. Legacy DSpine
 imports must explicitly match saved training settings in `training.objective_options`.
+
+
+### Canonical training requirements
+
+`register_protocol(..., training=TrainingRequirements(...))` declares capture
+method, vocabulary mapping, batch-size constraints and data filtering. Canonical
+composition builds providers directly from these requirements; it does not resolve
+a legacy algorithm registration. An optional `window_statistic=(ratio, argument)`
+requests accumulation-window reduction and replay, passing the result to the
+objective by the declared argument name.
+
+Canonical parsing, training and capture read target metadata from the same raw
+`config.json` reader, including nested `text_config`. Transformers defaults are
+not added to the canonical configuration.
+
+Parameters frozen by `training.frozen` or an objective must have loaded weights:
+a complete checkpoint, `weights_from`, `from_target`, or a target binding.
+Freezing a newly initialized parameter fails before model allocation; partial
+imports must cover every frozen parameter, including tied aliases.
+
+Prepare canonical EAGLE3/P-EAGLE records using the same draft YAML as training:
+
+```bash
+python scripts/prepare_hidden_states.py --draft /configs/eagle3.yaml \
+  --target-model-path /models/target --server-urls http://localhost:30000 \
+  --data-path /data/train.jsonl --output-path /data/canonical-features
+```
+
+`--draft` and the legacy `--draft-model-config` are mutually exclusive. The
+canonical YAML selects the architecture, capture layers and output schema.

@@ -10,11 +10,17 @@ from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .losses import TokenLoss
 from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "dspark",
+    training=TrainingRequirements(
+        capture_method="dspark",
+        minimum_loss_tokens=2,
+        consecutive_loss_tokens=True,
+        dataloader_workers=8,
+    ),
     requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),

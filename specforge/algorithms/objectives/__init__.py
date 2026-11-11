@@ -15,6 +15,7 @@ from .base import ObjectiveModel, ObjectiveResult
 from .losses import register_loss
 from .predictions import LossTerm, PredictionBatch, Predictions
 from .registry import (
+    TrainingRequirements,
     build_objective_model,
     default_objective,
     default_protocol,
@@ -26,6 +27,7 @@ from .registry import (
 )
 
 __all__ = [
+    "TrainingRequirements",
     "ObjectiveModel",
     "ObjectiveResult",
     "build_objective_model",

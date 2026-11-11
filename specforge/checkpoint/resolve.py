@@ -51,6 +51,13 @@ def read_json(source):
     return json.loads(Path(source).read_text())
 
 
+def read_target_config(source, *, cache_dir=None):
+    """Read target text metadata without adding Transformers defaults."""
+    return target_configuration(
+        resolve_directory(source, cache_dir=cache_dir, config_only=True)
+    )
+
+
 def target_configuration(directory):
     config = read_json(Path(directory) / "config.json")
     text = dict(config.get("text_config", config))

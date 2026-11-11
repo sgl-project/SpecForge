@@ -8,11 +8,12 @@ from .base import check_options
 from .inputs import gather, sequence_inputs, valid_tokens
 from .losses import TokenLoss
 from .predictions import PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
     "eagle3",
+    training=TrainingRequirements(capture_method="eagle3", vocabulary=True),
     requires=("teacher_logits",),
     architectures=("Eagle3DraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),

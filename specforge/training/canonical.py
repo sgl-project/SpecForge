@@ -92,19 +92,17 @@ def resolve_config(cfg, *, target_config=None):
 
 def capture_layers(cfg, draft, target_config):
     from specforge.config.draft.codec import parse_draft
-    from specforge.modeling.target.target_utils import target_text_config
 
     if isinstance(draft, dict):
         draft = parse_draft(
             draft,
-            target_config=target_text_config(target_config).to_dict(),
+            target_config=target_config,
         )
     from specforge.config.draft.architecture.features import FinalHiddenFeatureSpec
 
     features = draft.spec_config.target_features
     if isinstance(features, FinalHiddenFeatureSpec):
-        target = target_text_config(target_config)
-        if target.num_hidden_layers < 2:
+        if target_config["num_hidden_layers"] < 2:
             raise ValueError(
                 "final-hidden capture requires a target with at least two layers"
             )
@@ -113,8 +111,8 @@ def capture_layers(cfg, draft, target_config):
     return list(features.target_layer_ids)
 
 
-def minimum_loss_tokens(cfg, draft):
-    return 2
+def minimum_loss_tokens(cfg, draft, *, count):
+    return count
 
 
 def build_step(wrapped_model, *, target_head=None, **options):
@@ -157,19 +155,22 @@ def _validate_imported_objective(cfg, resolved):
             )
 
 
-def resolve_run(cfg, registry, *, target_config=None):
+def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
     from specforge.algorithms.common.defaults import (
         empty_options,
         empty_resume_contract,
         no_missing_checkpoint_keys,
+        online_needs_input_tools,
     )
     from specforge.algorithms.common.providers import (
         AlgorithmProviders,
         DraftConfigProvider,
+        ModelProvider,
         OfflineCaptureLayout,
         OfflineDataProvider,
         ServerCaptureLayout,
+        ServerStreamingProvider,
         StepProvider,
         make_registration,
     )
@@ -181,7 +182,7 @@ def resolve_run(cfg, registry, *, target_config=None):
         FeatureMode,
         OfflineStorageContract,
     )
-    from specforge.algorithms.objectives import default_objective, resolve_objective
+    from specforge.algorithms.objectives import resolve_objective
     from specforge.config.draft.codec import encode_config
 
     from . import canonical_data
@@ -191,10 +192,6 @@ def resolve_run(cfg, registry, *, target_config=None):
             "canonical checkpoint cannot mix with legacy model.draft_* sources"
         )
     draft = resolve_config(cfg, target_config=target_config)
-    default = default_objective(draft.architecture)
-    family = "dflash" if default in ("dflash2", "dmtp") else default
-    if cfg.training.strategy not in ("eagle3", family, default):
-        raise ValueError("training.strategy conflicts with the draft architecture")
     # New objectives have their own options. Never silently consume legacy
     # algorithm switches with a different meaning on the canonical path.
     optimization_options = {
@@ -267,6 +264,10 @@ def resolve_run(cfg, registry, *, target_config=None):
         ):
             raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
+    requirements = entry.training
+    family = requirements.strategy or objective
+    if cfg.training.strategy not in (defaults.strategy, family, objective):
+        raise ValueError("training.strategy conflicts with the objective")
     if (
         cfg.training.tp_size,
         cfg.training.sp_ulysses_size,
@@ -281,7 +282,6 @@ def resolve_run(cfg, registry, *, target_config=None):
     )
     cfg = cfg.model_copy(update={"draft": encode_config(draft), "training": training})
     keys = tuple(entry.inputs)
-    base = registry.resolve(family)
     normalizer = "canonical_unshifted_v1"
     storage = OfflineStorageContract(
         format="specforge_hidden_states_v1",
@@ -305,9 +305,9 @@ def resolve_run(cfg, registry, *, target_config=None):
     # frozen-MTP feature producer, so only precomputed records are accepted.
     layout = (
         None
-        if default == "dmtp"
+        if requirements.capture_method is None
         else OfflineCaptureLayout(
-            capture_method=base.providers.server_streaming_for("text").capture_method,
+            capture_method=requirements.capture_method,
             aux_feature="hidden_states" if "hidden_states" in keys else None,
             last_hidden_feature="target_last_hidden_states" if target_repr else None,
             passthrough=(("input_ids", "input_ids"), ("loss_mask", "loss_mask")),
@@ -322,8 +322,7 @@ def resolve_run(cfg, registry, *, target_config=None):
         capture_layout=layout,
     )
     streaming = ()
-    if default != "dmtp":
-        original = base.providers.server_streaming_for("text")
+    if layout is not None:
         server_layout = ServerCaptureLayout(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,
@@ -333,8 +332,9 @@ def resolve_run(cfg, registry, *, target_config=None):
             ),
         )
         streaming = (
-            replace(
-                original,
+            ServerStreamingProvider(
+                modality="text",
+                capture_method=requirements.capture_method,
                 target_representation=target_repr,
                 layout=server_layout,
                 build_collator=partial(canonical_data.build_collator, keys=keys),
@@ -344,12 +344,12 @@ def resolve_run(cfg, registry, *, target_config=None):
         contracts.append(
             replace(contracts[0], mode=FeatureMode.STREAMING, storage=None)
         )
-    vocab = default in ("eagle3", "peagle")
+    vocab = requirements.vocabulary
     if cfg.model.vocab_mapping_path and not vocab:
         raise ValueError("model.vocab_mapping_path requires a draft vocabulary")
     capabilities = AlgorithmCapabilities(
         attention_backends=frozenset({"eager"}),
-        required_batch_size=1 if default == "peagle" else None,
+        required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
         supports_liger_kernel=True,
     )
@@ -362,11 +362,24 @@ def resolve_run(cfg, registry, *, target_config=None):
         feature_contracts=tuple(contracts),
         capabilities=capabilities,
     )
-    provider = replace(
-        base.providers.model,
+    from specforge.data.loss_mask import has_consecutive_supervised_tokens
+
+    provider = ModelProvider(
+        build_draft=None,
+        build_training_model=None,
+        build_bundle=build_bundle,
+        needs_input_tools=online_needs_input_tools,
+        default_dataloader_num_workers=requirements.dataloader_workers,
+        loss_mask_filter=(
+            has_consecutive_supervised_tokens
+            if requirements.consecutive_loss_tokens
+            else None
+        ),
         draft_config=DraftConfigProvider(architecture=draft.architecture),
         resolve_capture_layers=capture_layers,
-        minimum_loss_tokens=minimum_loss_tokens,
+        minimum_loss_tokens=partial(
+            minimum_loss_tokens, count=requirements.minimum_loss_tokens
+        ),
     )
     step = StepProvider(
         build=build_step,
@@ -401,20 +414,11 @@ def build_bundle(cfg, algorithm):
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
     from specforge.modeling.draft.layers.kernels import configure_kernels
-    from specforge.modeling.target.target_utils import (
-        load_target_config,
-        target_hidden_size,
-        target_text_config,
-        target_vocab_size,
-    )
     from specforge.training.assembly import ModelBundle, _device
+    from specforge.training.model_loading import training_target_config
 
-    target = load_target_config(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    draft = resolve_config(cfg, target_config=target_text_config(target).to_dict())
+    target = training_target_config(cfg)
+    draft = resolve_config(cfg, target_config=target)
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
     init = cfg.initialization
@@ -470,6 +474,8 @@ def build_bundle(cfg, algorithm):
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
+            require_loaded=tuple(cfg.training.frozen)
+            + getattr(resolved.objective, "frozen_parameters", ()),
             from_target=from_target or None,
             legacy_config=init.legacy_config if init else None,
             legacy_settings=_legacy_settings(cfg),
@@ -482,8 +488,8 @@ def build_bundle(cfg, algorithm):
         else:
             teacher = BoundLMHead(
                 transform,
-                vocab_size=target_vocab_size(target),
-                hidden_size=target_hidden_size(target),
+                vocab_size=target["vocab_size"],
+                hidden_size=target["hidden_size"],
                 device=device,
                 dtype=dtype,
             )
@@ -537,8 +543,8 @@ def build_bundle(cfg, algorithm):
         draft_model=model,
         draft_config=draft,
         target_head=teacher,
-        target_hidden_size=target_hidden_size(target),
-        target_vocab_size=target_vocab_size(target),
+        target_hidden_size=target["hidden_size"],
+        target_vocab_size=target["vocab_size"],
         draft_vocab_size=draft.draft_vocab_size,
         capture_layers=capture_layers(cfg, draft, target),
         strategy_kwargs=StepRuntimeConfig(

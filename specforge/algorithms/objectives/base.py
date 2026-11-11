@@ -169,7 +169,7 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def forward(self, batch, *, step, total_steps, alignment_ce=None):
+    def forward(self, batch, *, step, total_steps, **context):
         from .inputs import valid_tokens
 
         valid_tokens(batch)
@@ -185,7 +185,7 @@ class ObjectiveModel(nn.Module):
         from .execution import execute_batch
 
         prepared = self.objective(
-            self, batch, step=step, total_steps=total_steps, alignment_ce=alignment_ce
+            self, batch, step=step, total_steps=total_steps, **context
         )
         return execute_batch(
             prepared,

@@ -36,10 +36,12 @@ class CanonicalReviewTest(unittest.TestCase):
             case.doCleanups()
 
     def test_depth_metrics_and_runtime_eval_mode(self):
+        from specforge.algorithms.objectives import objective_registrations
         from specforge.eval import Evaluator
         from tests.test_runtime.test_evaluator_aggregation import _batch
 
         runtime = torch.nn.Module()
+        runtime.registration = objective_registrations()["eagle3"]
         runtime.draft_model = torch.nn.Linear(1, 1)
         ratios = {
             "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
@@ -115,7 +117,9 @@ class CanonicalReviewTest(unittest.TestCase):
             resolved = resolve_run(cfg)
             bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
             self.assertIs(bundle.target_head, bundle.draft_model.lm_head)
-            self.assertEqual(capture_layers(cfg, mtp_config(), config), [0])
+            self.assertEqual(
+                capture_layers(cfg, mtp_config(), config.text_config.to_dict()), [0]
+            )
 
     def test_unused_settings_fail_and_resume_override_is_independent(self):
         with TemporaryDirectory() as temp:
