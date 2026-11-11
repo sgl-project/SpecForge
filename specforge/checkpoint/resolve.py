@@ -1,7 +1,7 @@
 """Select a reader by configuration/format, never by directory names."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from specforge.config.draft import DraftConfig
@@ -24,7 +24,7 @@ def register_adapter(name, matches, read):
     _ADAPTERS[name] = (matches, read)
 
 
-def resolve_directory(source, *, cache_dir=None):
+def resolve_directory(source, *, cache_dir=None, config_only=False):
     path = Path(str(source).removeprefix("file://")).expanduser()
     if path.exists():
         return path
@@ -36,7 +36,11 @@ def resolve_directory(source, *, cache_dir=None):
         snapshot_download(
             str(source),
             cache_dir=cache_dir,
-            allow_patterns=["*.json", "*.safetensors", "*.bin"],
+            allow_patterns=(
+                ["config.json"]
+                if config_only
+                else ["*.json", "*.safetensors", "*.bin", "training_state.pt"]
+            ),
         )
     )
 
@@ -49,7 +53,10 @@ def read_json(source):
 
 def target_configuration(directory):
     config = read_json(Path(directory) / "config.json")
-    return config.get("text_config", config)
+    text = dict(config.get("text_config", config))
+    if "tie_word_embeddings" not in text and "tie_word_embeddings" in config:
+        text["tie_word_embeddings"] = config["tie_word_embeddings"]
+    return text
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,7 @@ class DraftCheckpoint:
     weights: dict
     hf_metadata: dict
     source: str
+    bound_copies: dict = field(default_factory=dict)
 
 
 def _canonical(payload, store, target):
@@ -82,7 +90,13 @@ register_adapter(
 
 
 def read_checkpoint(
-    source, *, target_config=None, legacy_config=None, adapter=None, cache_dir=None
+    source,
+    *,
+    target_config=None,
+    legacy_config=None,
+    adapter=None,
+    cache_dir=None,
+    check_target=True,
 ):
     path = resolve_directory(source, cache_dir=cache_dir)
     directory = path.parent if path.is_file() else path
@@ -113,7 +127,18 @@ def read_checkpoint(
         raise ValueError(
             f"expected one checkpoint adapter, found {matches}; select adapter explicitly if ambiguous"
         )
-    config, weights, metadata = _ADAPTERS[matches[0]][1](
-        payload, TensorStore(path), target_config
-    )
-    return DraftCheckpoint(config, weights, metadata, str(path))
+    store = TensorStore(path)
+    bound_copies = {}
+    if matches[0] == "legacy":
+        config, weights, metadata = read_legacy(
+            payload, store, target_config, check_target=check_target
+        )
+        for name in config.target_bindings:
+            key = name + ".weight"
+            if key in weights:
+                bound_copies[name] = weights.pop(key)
+    else:
+        config, weights, metadata = _ADAPTERS[matches[0]][1](
+            payload, store, target_config if check_target else None
+        )
+    return DraftCheckpoint(config, weights, metadata, str(path), bound_copies)

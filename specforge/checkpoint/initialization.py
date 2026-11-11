@@ -8,11 +8,18 @@ from .weight_plan import make_weight_plan
 logger = logging.getLogger(__name__)
 _TARGET_KEYS = {
     "embed_tokens": (
+        "language_model.model.embed_tokens.weight",
+        "embed.weight",
+        "model.llm.embed.weight",
+        "model.word_embeddings.weight",
         "model.language_model.embed_tokens.weight",
         "model.embed_tokens.weight",
         "embed_tokens.weight",
     ),
     "lm_head": (
+        "language_model.lm_head.weight",
+        "head.weight",
+        "model.llm.unembed.weight",
         "model.language_model.lm_head.weight",
         "model.lm_head.weight",
         "lm_head.weight",
@@ -154,9 +161,15 @@ def make_initialization_plan(
         ):
             raise ValueError(f"allow_new selects no draft tensor: {pattern}")
     if weights_from is not None:
-        weights, used = _expand(
-            weights_from.weights, {"": ""} if mapping is None else mapping
-        )
+        if mapping is None:
+            weights = {
+                name: ref
+                for name, ref in weights_from.weights.items()
+                if name in state and name not in allowed
+            }
+            used = weights.keys()
+        else:
+            weights, used = _expand(weights_from.weights, mapping)
         unused = weights_from.weights.keys() - used
     copies = {}
     if from_target is not None:
@@ -186,7 +199,7 @@ def make_initialization_plan(
     if weights_from is None:
         allowed = state.keys() - weights.keys()
     if unused:
-        logger.info("Unused source draft tensors: %s", sorted(unused))
+        logger.warning("Unused source draft tensors: %s", sorted(unused))
     return make_weight_plan(
         model,
         weights,

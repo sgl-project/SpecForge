@@ -13,7 +13,7 @@ from ...model import DraftConfig
 from ...norm import RMSNormSpec
 from ...residual import StandardResidualSpec
 from ...rope import DefaultRoPESpec, MultiAxisRoPESpec
-from ..target import _text_config, resolve_target_logits, validate_target
+from ..target import _text_config, resolve_target_logits
 from .context import (
     _DEFAULTS,
     _HF_METADATA,
@@ -195,5 +195,4 @@ def decode_mtp(payload, *, target_config):
         ),
         target_logit_transform=logits,
     )
-    validate_target(config, target)
     return config

@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from ...architecture import PEagleSpec
 from ...model import DraftConfig
 from ...rope import DefaultRoPESpec
-from ..target import validate_target
 from .auxiliary import _FIELDS, read_auxiliary
 from .context import _check_fields
 from .rules import resolve_alias
@@ -85,5 +84,4 @@ def decode_peagle(
         ),
         **fields,
     )
-    validate_target(config, target_config)
     return config

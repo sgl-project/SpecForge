@@ -45,8 +45,10 @@ model = initialize_draft(
 )
 ```
 
-Omitting `mapping` matches canonical names. Every owned tensor must be assigned
-or explicitly new; unused source tensors are reported. Mapping keys are draft
+Omitting `mapping` selects matching canonical names, excluding `allow_new`.
+Every owned tensor must be assigned or explicitly new; unused source tensors
+are reported. A warm-start source supplies weights only and is not checked
+against the new target configuration. Mapping keys are draft
 prefixes and values are source prefixes. A `*` matches one path segment.
 
 Target copies are declared separately:
@@ -83,3 +85,8 @@ For distributed construction, use the same `make_initialization_plan` or
 Plans validate global metadata; Shard/Replicate DTensor destinations read only
 their local slices. Partial placements are rejected. CLI/training orchestration
 and export conversion will adopt these APIs in subsequent integration steps.
+
+Legacy imports check recorded capture, mask, residual and binding settings.
+A saved copy of a target-bound table must match the supplied target; importing
+must not silently replace trained weights. Hub imports also fetch
+`training_state.pt` for these structural records, without restoring training state.

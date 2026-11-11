@@ -16,37 +16,53 @@ ARCHITECTURES = {
 }
 
 
-def _recorded_settings(directory, architecture):
+def _recorded_settings(directory):
     path = directory / "training_state.pt"
     if not path.is_file():
-        return {}
-    # Read structural provenance only; never restore optimizer or trainer state.
+        return {}, {}
+    # Inspect structural provenance, never restore optimizer or trainer state.
     state = torch.load(path, map_location="meta", weights_only=True, mmap=True)
-    provenance = state.get("specforge_model_provenance")
     try:
-        settings = {"capture_layers": dict(provenance or ()).get("capture_layers")}
+        provenance = dict(state.get("specforge_model_provenance") or ())
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid legacy model provenance") from exc
-    if architecture == "PEagleDraftModel":
-        settings.update(
-            mask_token_id=state.get("peagle_mask_token_id"),
-            norm_before_residual=state.get("peagle_norm_before_residual"),
-        )
-    return settings
+    return state, provenance
 
 
-def read_legacy(payload, store, target_config):
+def read_legacy(payload, store, target_config, *, check_target=True):
     if target_config is None:
         raise ValueError(
             "legacy import requires target configuration to resolve saved semantics"
         )
     architecture = payload["architectures"][0]
-    settings = (
-        _recorded_settings(store.root, architecture)
-        if architecture in {"LlamaForCausalLMEagle3", "PEagleDraftModel"}
-        else {}
+    state, provenance = _recorded_settings(store.root)
+    settings = {}
+    if architecture in {"LlamaForCausalLMEagle3", "PEagleDraftModel"}:
+        settings["capture_layers"] = provenance.get("capture_layers")
+    if architecture == "PEagleDraftModel":
+        settings.update(
+            mask_token_id=state.get("peagle_mask_token_id"),
+            norm_before_residual=state.get("peagle_norm_before_residual"),
+        )
+    config = decode_legacy_config(
+        payload, target_config=target_config, check_target=check_target, **settings
     )
-    config = decode_legacy_config(payload, target_config=target_config, **settings)
+    checks = {}
+    if "embed_tokens" in config.target_bindings:
+        checks["load_target_embedding"] = (
+            provenance.get("load_target_embedding"),
+            True,
+        )
+    if architecture == "Qwen3_5MTPDraftModel":
+        checks["mtp_share_lm_head"] = (
+            state.get("mtp_share_lm_head"),
+            "lm_head" in config.target_bindings,
+        )
+    for name, (recorded, expected) in checks.items():
+        if recorded is not None and (
+            type(recorded) is not bool or recorded != expected
+        ):
+            raise ValueError(f"recorded {name} conflicts with legacy configuration")
     if architecture == "DFlashDraftModel":
         architecture = config.architecture
     weights = {}
@@ -63,13 +79,12 @@ def read_legacy(payload, store, target_config):
             name = name.removeprefix("logit_head.")
         if architecture == "Qwen3_5MTPDraftModel":
             name = name.removeprefix("mtp.")
-        if name in {n + ".weight" for n in config.target_bindings}:
-            continue  # Old formats sometimes stored frozen target token tables.
         for prefix, replacement in (
             ("layers.", "backbone.layers."),
             ("midlayer.", "backbone.layers.0."),
             ("norm.", "backbone.final_norm."),
             ("fc.", "fusion.fc."),
+            ("fc_norm.", "fusion.fc_norm."),
             ("hidden_norm.", "fusion.hidden_norm."),
             ("pre_fc_norm_embedding.", "fusion.pre_fc_norm_embedding."),
             ("pre_fc_norm_hidden.", "fusion.pre_fc_norm_hidden."),

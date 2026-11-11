@@ -13,17 +13,39 @@ from specforge.checkpoint.resolve import (
     target_configuration,
 )
 from specforge.checkpoint.tensors import TensorStore
+from specforge.checkpoint.weight_plan import _validate_unquantized
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 
 
-def _target(source, cache_dir):
+def _target_config(source, cache_dir):
     if source is None:
-        return None, None
-    directory = resolve_directory(source, cache_dir=cache_dir)
-    return TensorStore(directory), target_configuration(directory)
+        return None
+    return target_configuration(
+        resolve_directory(source, cache_dir=cache_dir, config_only=True)
+    )
+
+
+def _target_store(source, config, from_target, cache_dir):
+    if source is None or not (config.target_bindings or from_target):
+        return None
+    return TensorStore(resolve_directory(source, cache_dir=cache_dir))
+
+
+def _check_bound_copies(checkpoint, preview, plan):
+    """Do not silently replace a legacy table with a different target table."""
+    bindings = dict(plan.bindings)
+    for name, ref in checkpoint.bound_copies.items():
+        _validate_unquantized(name, ref)
+        saved = ref.read()
+        target = bindings[name].read().to(saved.dtype).clone()
+        preview.get_submodule(name)._transform_weight(target)
+        if saved.shape != target.shape or not torch.equal(saved, target):
+            raise ValueError(
+                f"legacy {ref.key} differs from bound target {bindings[name].key}"
+            )
 
 
 def read_draft(
@@ -34,11 +56,7 @@ def read_draft(
     target is a checkpoint path/repository, not a target model instance. A source
     without config.json needs an explicit supplementary legacy configuration.
     """
-    target_config = None
-    if target is not None:
-        target_config = target_configuration(
-            resolve_directory(target, cache_dir=cache_dir)
-        )
+    target_config = _target_config(target, cache_dir)
     return read_checkpoint(
         source,
         target_config=target_config,
@@ -95,7 +113,7 @@ def load_draft(
     copies into its initialized tensors. Missing weights are never randomized.
     Target-bound weights must be supplied before the returned model can run.
     """
-    target_store, target_config = _target(target, cache_dir)
+    target_config = _target_config(target, cache_dir)
     checkpoint = read_checkpoint(
         source,
         target_config=target_config,
@@ -113,11 +131,13 @@ def load_draft(
     preview = build_draft_model(
         checkpoint.config, device="meta", dtype=dtype, backend=backend
     )
+    target_store = _target_store(target, checkpoint.config, None, cache_dir)
     plan = make_weight_plan(
         preview,
         checkpoint.weights,
         bindings=resolve_bindings(checkpoint.config, target_store, target_config),
     )
+    _check_bound_copies(checkpoint, preview, plan)
     model = build_draft_model(
         checkpoint.config, device=device, dtype=dtype, backend=backend
     )
@@ -150,7 +170,7 @@ def initialize_draft(
     """
     if type(draft) is not DraftConfig:
         raise TypeError("draft must be a resolved DraftConfig")
-    target_store, target_config = _target(target, cache_dir)
+    target_config = _target_config(target, cache_dir)
     if target_config is not None:
         validate_target(draft, target_config)
     checkpoint = (
@@ -158,12 +178,14 @@ def initialize_draft(
         if weights_from is None
         else read_checkpoint(
             weights_from,
+            check_target=False,
             target_config=target_config,
             legacy_config=legacy_config,
             cache_dir=cache_dir,
         )
     )
     preview = build_draft_model(draft, device="meta", dtype=dtype, backend=backend)
+    target_store = _target_store(target, draft, from_target, cache_dir)
     plan = make_initialization_plan(
         preview,
         weights_from=checkpoint,
