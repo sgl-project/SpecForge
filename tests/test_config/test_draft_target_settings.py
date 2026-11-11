@@ -14,6 +14,8 @@ from specforge.config.draft.logits import MuPLogitTransformSpec, NoLogitTransfor
 from specforge.config.draft.registry import register_spec
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_canonical_codec import shorthand
+from tests.test_config.test_draft_dmtp_spec import dmtp_config
+from tests.test_config.test_draft_peagle_spec import peagle_config
 
 TARGET = {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 8}
 
@@ -171,6 +173,29 @@ class TargetSettingsTest(unittest.TestCase):
                 decode_config(payload, target_config={**TARGET, name: 128})
         with self.assertRaisesRegex(ValueError, "target_layer_ids"):
             decode_config(payload, target_config={**TARGET, "num_hidden_layers": 3})
+
+    def test_unbound_embeddings_cover_target_token_ids(self):
+        for factory in (draft_config, dmtp_config, peagle_config):
+            config = factory(target_bindings=(), target_logit_transform=None)
+            payload = encode_config(config)
+            for reader in (parse_draft, decode_config):
+                with self.subTest(architecture=config.architecture, reader=reader):
+                    for size in (32, 64):
+                        self.assertEqual(
+                            reader(
+                                payload, target_config={**TARGET, "vocab_size": size}
+                            ),
+                            config,
+                        )
+                    with self.assertRaisesRegex(ValueError, "cover target vocab_size"):
+                        reader(payload, target_config={**TARGET, "vocab_size": 80})
+                    for size in (None, True, 0):
+                        with self.assertRaisesRegex(
+                            ValueError, "target_config.vocab_size"
+                        ):
+                            reader(
+                                payload, target_config={**TARGET, "vocab_size": size}
+                            )
 
     def test_unbound_head_does_not_inherit_target_transform(self):
         node = draft_config(

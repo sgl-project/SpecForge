@@ -68,7 +68,11 @@ class PEagleSpecTest(unittest.TestCase):
         self.assertEqual(
             decode_config(
                 encode_config(node),
-                target_config={"hidden_size": 48, "num_hidden_layers": 8},
+                target_config={
+                    "hidden_size": 48,
+                    "vocab_size": 64,
+                    "num_hidden_layers": 8,
+                },
             ),
             node,
         )

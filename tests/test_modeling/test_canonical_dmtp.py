@@ -81,6 +81,8 @@ class CanonicalDMTPTest(unittest.TestCase):
             if dtype == torch.bfloat16
             else 1e-2 if dtype == torch.float16 else 1e-5
         )
+        if device == "cpu":
+            tolerance = 0
         torch.manual_seed(0)
         for causal in (False, True):
             with self.subTest(device=device, dtype=dtype, causal=causal):
