@@ -528,6 +528,14 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
     requested_layers = cfg.model.draft_num_hidden_layers
     if requested_layers is not None:
         layer_types = draft_config.layer_types
+        if (
+            not isinstance(layer_types, (list, tuple))
+            or not layer_types
+            or any(not isinstance(layer, str) for layer in layer_types)
+        ):
+            raise ValueError(
+                "DFlash layer_types must be a non-empty list of attention types"
+            )
         if len(layer_types) != requested_layers:
             if len(set(layer_types)) > 1:
                 raise ValueError(
@@ -535,15 +543,22 @@ def apply_dflash_overrides(cfg: Config, draft_config: Any) -> None:
                     "DFlash layer_types layout; provide a draft config with "
                     "exactly the requested per-layer layout"
                 )
+            target_layers = getattr(draft_config, "num_target_layers", None)
+            if type(target_layers) is not int or target_layers <= 0:
+                raise ValueError(
+                    "Resizing DFlash requires a positive integer num_target_layers "
+                    "to rebuild capture layers; otherwise provide a draft config "
+                    "with the requested depth and explicit target_layer_ids"
+                )
             draft_config.layer_types = [layer_types[0]] * requested_layers
 
-        draft_config.dflash_config = {
-            **method_config,
-            "target_layer_ids": build_target_layer_ids(
-                int(draft_config.num_target_layers),
-                requested_layers,
-            ),
-        }
+            draft_config.dflash_config = {
+                **method_config,
+                "target_layer_ids": build_target_layer_ids(
+                    target_layers,
+                    requested_layers,
+                ),
+            }
 
     resolve_dflash_attention_layout(draft_config)
     validate_dflash_attention_config(draft_config)
