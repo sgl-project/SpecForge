@@ -15,6 +15,7 @@ from specforge.algorithms.objectives.losses import PositionWeighting
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import (
     capture_projections,
+    configurations,
     dflash2_config,
     dspark_config,
     dspine_config,
@@ -23,6 +24,23 @@ from tests.test_algorithms.test_objectives import (
     training_batch,
 )
 from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+
+def build_runtime(architecture, *, dtype=None, **selection):
+    config = next(c for c in configurations() if c.architecture == architecture)
+    torch.manual_seed(0)
+    model = build_draft_model(config, **({"dtype": dtype} if dtype else {}))
+    if hasattr(model, "vocabulary"):
+        install_mapping(model)
+    for name in config.target_bindings:
+        model.get_submodule(name).load_target_weight(
+            torch.randn(config.vocab_size, config.hidden_size)
+        )
+    if hasattr(model, "initialize_transfer_space"):
+        model.initialize_transfer_space()
+    width = training_batch(config)["target_last_hidden_states"].shape[-1]
+    head = nn.Linear(width, config.vocab_size, bias=False)
+    return config, build_objective_model(model, target_head=head, **selection)
 
 
 class ObjectiveContractTest(unittest.TestCase):
@@ -333,3 +351,21 @@ class ObjectiveContractTest(unittest.TestCase):
                 torch.testing.assert_close(
                     result.loss, (torch.stack(expected) * factors).sum()
                 )
+
+    def test_mtp_rejects_position_weightings(self):
+        """MTP proposes one token per position; decay or D-PACE has nothing to act on."""
+        for weighting in (
+            {"kind": "exponential", "gamma": 1.0},
+            {"kind": "geometric", "factor": 0.5},
+            {"kind": "dpace"},
+        ):
+            with self.subTest(weighting=weighting["kind"]):
+                with self.assertRaisesRegex(ValueError, "capabilities"):
+                    build_runtime("MTPDraftModel", weighting=weighting)
+        config, default = build_runtime("MTPDraftModel")
+        _, uniform = build_runtime("MTPDraftModel", weighting={"kind": "uniform"})
+        batch = training_batch(config)
+        torch.testing.assert_close(
+            uniform(batch, step=0, total_steps=1).loss,
+            default(batch, step=0, total_steps=1).loss,
+        )

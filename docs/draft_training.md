@@ -35,7 +35,8 @@ Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
 (alpha, default 0.5).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
-factor. EAGLE/P-EAGLE apply weighting to rollout depth. DFlash2 selector warmup
+factor. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
+position and accepts only uniform weighting. DFlash2 selector warmup
 and ramp accept either absolute steps or ratios of total optimizer steps.
 
 Input batches use **unshifted** `input_ids`, `loss_mask` and teacher features at the

@@ -159,6 +159,8 @@ class AcceptanceLossTest(unittest.TestCase):
         from tests.test_algorithms.test_objectives import configurations
 
         for config in configurations():
+            if config.architecture == "MTPDraftModel":
+                continue  # one proposal per position: D-PACE is rejected at build
             with self.subTest(architecture=config.architecture):
                 torch.manual_seed(11)
                 device = "cuda" if torch.cuda.is_available() else "cpu"

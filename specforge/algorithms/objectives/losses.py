@@ -191,6 +191,8 @@ class TokenLoss:
 class PositionWeighting:
     @property
     def requires(self):
+        if self.kind == "uniform":
+            return frozenset()
         flags = {"chain_positions"}
         if self.kind in DPACE_LOSS_TYPES:
             flags |= {"logits", "labels", "acceptance_chain"}
