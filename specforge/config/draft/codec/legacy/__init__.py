@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 
+from ..target import validate_target
 from .dflash import decode_dflash
 from .domino import decode_domino
 from .dspark import decode_dspark
@@ -20,12 +21,14 @@ _DECODERS = {
     "LlamaForCausalLMEagle3": decode_eagle3,
     "Qwen3_5MTPDraftModel": decode_mtp,
 }
+LEGACY_ARCHITECTURES = frozenset(_DECODERS)
 
 
 def decode_legacy_config(
     payload: Mapping,
     *,
     target_config: Mapping,
+    check_target=True,
     capture_layers=None,
     mask_token_id=None,
     norm_before_residual=None,
@@ -54,22 +57,26 @@ def decode_legacy_config(
         raise ValueError(
             f"unsupported legacy architectures; expected one of {sorted(_DECODERS)}"
         )
+    settings = {}
     if architecture == "PEagleDraftModel":
-        return decode_peagle(
-            payload,
-            target_config=target_config,
+        settings.update(
             capture_layers=capture_layers,
             mask_token_id=mask_token_id,
             norm_before_residual=norm_before_residual,
         )
-    if mask_token_id is not None or norm_before_residual is not None:
-        raise ValueError(
-            "recorded mask/residual settings are only supported for legacy P-EAGLE"
-        )
-    if architecture == "LlamaForCausalLMEagle3":
-        return _DECODERS[architecture](
-            payload, target_config=target_config, capture_layers=capture_layers
-        )
-    if capture_layers is not None:
-        raise ValueError("recorded capture_layers are only supported for legacy EAGLE")
-    return _DECODERS[architecture](payload, target_config=target_config)
+    else:
+        if mask_token_id is not None or norm_before_residual is not None:
+            raise ValueError(
+                "recorded mask/residual settings are only supported for legacy P-EAGLE"
+            )
+        if architecture == "LlamaForCausalLMEagle3":
+            settings["capture_layers"] = capture_layers
+        elif capture_layers is not None:
+            raise ValueError(
+                "recorded capture_layers are only supported for legacy EAGLE"
+            )
+    config = _DECODERS[architecture](payload, target_config=target_config, **settings)
+    # A weights-only source need not be compatible with the new target.
+    if check_target:
+        validate_target(config, target_config)
+    return config

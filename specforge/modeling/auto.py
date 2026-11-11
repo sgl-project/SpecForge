@@ -11,6 +11,10 @@ from .draft.registry import DRAFT_REGISTRY, available_drafts
 class AutoDraftModel(AutoModelForCausalLMBase):
     @classmethod
     def _model_cls_from_config(cls, config: PretrainedConfig):
+        if getattr(config, "model_type", None) == "specforge_draft":
+            raise ValueError(
+                "canonical drafts must use build_draft_model or load_draft"
+            )
         archs = getattr(config, "architectures", None) or []
         if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
             raise ValueError(

@@ -7,7 +7,6 @@ from ...architecture import DFlash2Spec, DFlashSpec
 from ...architecture.block import AnchoredBlockSpec
 from ...conv import GroupedCausalConvSpec
 from ...model import DraftConfig
-from ..target import validate_target
 from .context import _COMMON_FIELDS, _TOP_FIELDS, _check_fields, read_context
 
 _DFLASH2_FIELDS = {
@@ -61,5 +60,4 @@ def decode_dflash(payload, *, target_config):
             for name, layer in fields["layer_configs"].items()
         }
     config = DraftConfig(architecture=architectures[0], spec_config=spec, **fields)
-    validate_target(config, target_config)
     return config

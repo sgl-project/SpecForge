@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from ...architecture import DominoSpec
 from ...architecture.domino import DominoBlockSpec, GRUHeadSpec
 from ...model import DraftConfig
-from ..target import validate_target
 from .context import _COMMON_FIELDS, _TOP_FIELDS, _check_fields, read_context
 from .rules import resolve_alias
 
@@ -38,5 +37,4 @@ def decode_domino(payload, *, target_config):
         ),
         **fields,
     )
-    validate_target(config, target_config)
     return config

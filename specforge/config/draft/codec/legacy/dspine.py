@@ -7,7 +7,6 @@ from ...architecture import DSpineSpec
 from ...architecture.block import AnchoredBlockSpec
 from ...architecture.dspine import AdjacentInjectionSpec
 from ...model import DraftConfig
-from ..target import validate_target
 from .context import _COMMON_FIELDS, _TOP_FIELDS, _check_fields, read_context
 
 _INJECTION_DEFAULTS = {"transfer_rank": 1024, "message_size": 512}
@@ -107,5 +106,4 @@ def decode_dspine(payload, *, target_config):
         ),
         **fields,
     )
-    validate_target(config, target_config)
     return config

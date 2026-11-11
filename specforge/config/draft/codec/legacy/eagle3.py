@@ -2,7 +2,6 @@
 
 from ...architecture import Eagle3Spec
 from ...model import DraftConfig
-from ..target import validate_target
 from .auxiliary import _FIELDS, read_auxiliary
 from .context import _check_fields
 from .eagle_rope import resolve_eagle_rope
@@ -35,5 +34,4 @@ def decode_eagle3(payload, *, target_config, capture_layers=None):
         ),
         **fields,
     )
-    validate_target(config, target_config)
     return config
