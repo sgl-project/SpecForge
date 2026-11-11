@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from specforge.config.draft.architecture.dspark import MarkovHeadSpec
+
 
 def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
     if temperature < 1e-5:
@@ -20,15 +22,19 @@ def _sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
 class VanillaMarkovHead(nn.Module):
     """Low-rank previous-token logit bias used by DSpark."""
 
-    def __init__(self, *, vocab_size: int, markov_rank: int):
+    def __init__(self, *, vocab_size: int, markov_rank: int, device=None, dtype=None):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
         self.markov_head_type = "vanilla"
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be > 0, got {self.markov_rank}")
-        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w1 = nn.Embedding(
+            self.vocab_size, self.markov_rank, device=device, dtype=dtype
+        )
+        self.markov_w2 = nn.Linear(
+            self.markov_rank, self.vocab_size, bias=False, device=device, dtype=dtype
+        )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -103,10 +109,22 @@ class VanillaMarkovHead(nn.Module):
 
 
 class GatedMarkovHead(VanillaMarkovHead):
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            vocab_size=vocab_size, markov_rank=markov_rank, device=device, dtype=dtype
+        )
         self.markov_head_type = "gated"
-        self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
+        self.gate_proj = nn.Linear(
+            hidden_size + markov_rank, markov_rank, device=device, dtype=dtype
+        )
 
     def compute_gate(
         self,
@@ -132,11 +150,23 @@ class GatedMarkovHead(VanillaMarkovHead):
 class RNNMarkovHead(VanillaMarkovHead):
     """Recurrent DSpark Markov head unrolled inside one draft block."""
 
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            vocab_size=vocab_size, markov_rank=markov_rank, device=device, dtype=dtype
+        )
         self.markov_head_type = "rnn"
         self.state_size = markov_rank
-        self.joint_proj = nn.Linear(2 * markov_rank + hidden_size, 3 * markov_rank)
+        self.joint_proj = nn.Linear(
+            2 * markov_rank + hidden_size, 3 * markov_rank, device=device, dtype=dtype
+        )
 
     def _rnn_step(
         self,
@@ -234,3 +264,25 @@ class RNNMarkovHead(VanillaMarkovHead):
             sampled_tokens.append(next_token_ids)
             prev_token_ids = next_token_ids
         return torch.stack(sampled_tokens, dim=1), torch.cat(corrected_logits, dim=1)
+
+
+def build_markov_head(
+    config: MarkovHeadSpec | None,
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    device=None,
+    dtype=None,
+) -> VanillaMarkovHead | None:
+    """Construct the explicitly selected head without legacy configuration rules."""
+    if config is None:
+        return None
+    if type(config) is not MarkovHeadSpec:
+        raise TypeError("Markov construction requires MarkovHeadSpec or None")
+    options = dict(
+        vocab_size=vocab_size, markov_rank=config.rank, device=device, dtype=dtype
+    )
+    if config.type == "vanilla":
+        return VanillaMarkovHead(**options)
+    cls = {"gated": GatedMarkovHead, "rnn": RNNMarkovHead}[config.type]
+    return cls(hidden_size=hidden_size, **options)
