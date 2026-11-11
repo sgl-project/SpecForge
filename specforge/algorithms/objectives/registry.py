@@ -71,12 +71,7 @@ def build_objective_model(
         "loss",
     )
     if weighting is None:
-        gamma = getattr(objective, "loss_decay_gamma", None)
-        weighting = getattr(objective, "default_weighting", None)
-        if weighting is None:
-            weighting = (
-                {"kind": "exponential", "gamma": gamma} if gamma is not None else {}
-            )
+        weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss

@@ -511,3 +511,15 @@ class ObjectiveContractTest(unittest.TestCase):
         )
         _, eagle = build_runtime("Eagle3DraftModel")
         self.assertEqual(eagle.token_loss, TokenLoss(kind="soft_ce"))
+
+    def test_protocols_declare_their_default_weighting(self):
+        _, dflash = build_runtime("DFlashDraftModel", options={"loss_decay_gamma": 2.0})
+        self.assertEqual(
+            dflash.weighting, PositionWeighting(kind="exponential", gamma=2.0)
+        )
+        _, dspine = build_runtime("DSpineDraftModel")
+        self.assertEqual(
+            dspine.weighting, PositionWeighting(kind="exponential", gamma=7.0)
+        )
+        _, mtp = build_runtime("MTPDraftModel")
+        self.assertEqual(mtp.weighting, PositionWeighting())

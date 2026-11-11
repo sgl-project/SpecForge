@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .base import check_options
 from .inputs import prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import PredictionBatch
 from .registry import register_protocol
 
@@ -31,6 +31,10 @@ class DFlashObjective:
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
         check_options(

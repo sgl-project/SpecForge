@@ -7,7 +7,7 @@ from specforge.core.fused_loss import ce_l1_loss
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import register_protocol
 
@@ -38,6 +38,10 @@ class DFlash2Objective:
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
         check_options(

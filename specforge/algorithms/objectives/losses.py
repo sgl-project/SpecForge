@@ -151,6 +151,13 @@ def _accepted_options(compute):
     }
 
 
+def decay_weighting(gamma):
+    """A block protocol's default weighting: exponential decay when gamma is set."""
+    if gamma is None:
+        return {"kind": "uniform"}
+    return {"kind": "exponential", "gamma": gamma}
+
+
 @dataclass(frozen=True)
 class TokenLoss:
     """Select a common loss without replacing algorithm execution or auxiliary loss."""

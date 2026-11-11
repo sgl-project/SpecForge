@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import register_protocol
 
@@ -36,6 +36,10 @@ class DSparkObjective:
 
     default_weighting_options = ("loss_decay_gamma",)
     default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     @property
     def frozen_parameters(self):

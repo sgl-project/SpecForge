@@ -10,7 +10,7 @@ from specforge.core.fused_loss import ce_l1_loss
 
 from .base import check_options
 from .inputs import prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import register_protocol
 
@@ -43,6 +43,10 @@ class DSpineObjective:
     candidate_mass_threshold: float = 1e-4
 
     default_weighting_options = ("loss_decay_gamma",)
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     @property
     def default_loss(self):
