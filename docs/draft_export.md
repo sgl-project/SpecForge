@@ -5,7 +5,7 @@ Its `specforge_artifact` field records format metadata outside the draft structu
 Export reads that configuration; no training YAML is needed.
 
 ```bash
-specforge export --checkpoint RUN/STEP --output-dir MODEL
+specforge export --checkpoint CHECKPOINT_PATH --output-dir MODEL
 ```
 
 HF export writes canonical configuration, exact owned tensors, and model code
