@@ -1,11 +1,15 @@
 {
-    "name": "sglang",
+    "name": "SpecForge",
     "build": {
-        "dockerfile": "Dockerfile"
+        "dockerfile": "Dockerfile",
+        "context": ".."
     },
     "remoteUser": "devuser",
     "customizations": {
         "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "/opt/specforge-venv/bin/python"
+            },
             "extensions": [
                 // Python development
                 "ms-python.python",
@@ -21,10 +25,9 @@
         "--gpus",
         "all"
     ],
-    // The two lines below ensures that your local changes in the sglang
-    // repo is automatically synced to the sglang pip package installed
-    // in the dev docker container. You can remove / comment out these
-    // two lines if you prefer to sync code changes manually.
+    // Restore environment ownership after Dev Containers remaps devuser's UID/GID.
+    // Editable installs connect the mounted source to the running packages.
+    "postCreateCommand": "sudo chown -R \"$(id -u):$(id -g)\" /opt/specforge-venv && /opt/specforge-venv/bin/python -m pip install --no-deps --no-build-isolation -e . -e plugins/sglang-spec-capture",
     "workspaceMount": "source=${localWorkspaceFolder},target=/sgl-workspace/specforge,type=bind",
     "workspaceFolder": "/sgl-workspace/specforge"
 }
