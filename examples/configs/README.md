@@ -196,7 +196,7 @@ historical suffixes.
 | `output_dir` | `./output` | Shared checkpoint, profiler, and tracker output directory. Every trainer rank must resolve it to the same location. |
 | `draft` | `null` | Canonical draft mapping or YAML/JSON path, including preset files. Its architecture selects the default objective. |
 | `initialization` | `null` | Canonical weights-only loading: `checkpoint`, or `weights_from` (`checkpoint`, `mapping`, `allow_new`) with optional disjoint `from_target` copies. See [canonical training](../../docs/draft_training.md). |
-| `resume` | `null` | Canonical full training resume; restores structure from the checkpoint and aliases `training.resume_from`. Excludes initialization. |
+| `resume` | `null` | Canonical full training resume; restores structure from the checkpoint. A canonical checkpoint given in `training.resume_from` resumes the same way; if both fields are set they must agree. Excludes initialization. |
 
 The top-level `model` and `data` sections are required. `training`, `tracking`,
 `profiling`, `runtime`, and `deployment` have defaults, but checked-in recipes
@@ -215,7 +215,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
+| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. Canonical runs (top-level `draft`, `initialization` or `resume`, or a canonical checkpoint in `training.resume_from`) use PyTorch kernels unless this is `true`; `true` swaps in Liger RMSNorm and SiLU-gated SwiGLU on CUDA/ROCm only and is recorded in the resume contract. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -269,7 +269,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.is_preformatted` | `false` | Treat each record's text as already formatted by `chat_template`. |
 | `data.train_only_last_turn` | `false` | Restrict the loss mask to the final assistant turn. |
 | `data.build_dataset_num_proc` | `8` | Positive CPU process count for dataset preprocessing. |
-| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; use 0 for synchronous loading. |
+| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; canonical runs use 4. Use 0 for synchronous loading. |
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
