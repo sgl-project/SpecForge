@@ -230,6 +230,13 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
+`model.moe_experts_kernel` selects the routed-expert kernel of MoE drafts:
+`grouped_mm` (default) runs every expert in one `F.grouped_mm` call, which torch
+accepts only when `hidden_size` and the expert `intermediate_size` are multiples
+of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
+device. Startup probes the chosen kernel on every MoE layer and fails rather
+than falling back; the choice is recorded in the training resume contract.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,

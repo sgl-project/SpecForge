@@ -642,7 +642,9 @@ def build_bundle(cfg, algorithm):
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
     use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(model, use_liger=use_liger)
+    configure_kernels(
+        model, use_liger=use_liger, moe_experts_kernel=cfg.model.moe_experts_kernel
+    )
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -674,6 +676,7 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_use_liger_kernel": use_liger,
+        "canonical_moe_experts_kernel": cfg.model.moe_experts_kernel,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),

@@ -146,6 +146,15 @@ class RoutedExperts(nn.Module):
         out = torch.empty_like(out).index_copy_(0, order, out)
         return out.view(num_tokens, top_k, -1).sum(dim=1, dtype=torch.float32)
 
+    @torch.no_grad()
+    def probe_kernel(self, kernel: str) -> None:
+        """Run `kernel` once on zeros routed to expert 0, so a kernel the installed
+        torch cannot run on this device, dtype or width fails at startup."""
+        x = self.gate_up_proj.new_zeros(16, self.gate_up_proj.shape[-1])
+        indices = torch.zeros(16, 1, dtype=torch.long, device=x.device)
+        weights = torch.ones(16, 1, dtype=torch.float32, device=x.device)
+        self(x, indices, weights, kernel=kernel)
+
 
 class SharedExpert(nn.Module):
     """Always-on FFN added to the routed output: `gated` is act(gate_proj)·up_proj as in

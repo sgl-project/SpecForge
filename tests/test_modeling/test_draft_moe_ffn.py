@@ -336,6 +336,43 @@ class MoEFFNTest(unittest.TestCase):
         configure_kernels(model, use_liger=False)
         self.assertTrue(all(m.liger_swiglu is None for m in model.values()))
 
+    def test_configure_kernels_selects_and_checks_the_expert_kernel(self):
+        aligned = torch.nn.Sequential(
+            MoEFFN(moe_spec(), hidden_size=H), MoEFFN(qwen_spec(), hidden_size=H)
+        )
+        for module in aligned:
+            module.experts_kernel = "loop"
+        configure_kernels(aligned)  # the default resolves to grouped_mm
+        self.assertEqual([m.experts_kernel for m in aligned], ["grouped_mm"] * 2)
+        configure_kernels(aligned, moe_experts_kernel="loop")
+        self.assertEqual([m.experts_kernel for m in aligned], ["loop"] * 2)
+        with self.assertRaisesRegex(ValueError, "unknown moe_experts_kernel 'triton'"):
+            configure_kernels(aligned, moe_experts_kernel="triton")
+        # torch accepts F.grouped_mm only with 16-byte strides; the probe reports
+        # the layer and torch's reason, and points at the loop kernel.
+        for dtype, hidden_size, intermediate_size in (
+            (torch.float32, 18, 32),
+            (torch.float32, 32, 18),
+            (torch.bfloat16, 20, 32),
+        ):
+            with self.subTest(dtype=dtype, widths=(hidden_size, intermediate_size)):
+                misaligned = MoEFFN(
+                    moe_spec(intermediate_size=intermediate_size),
+                    hidden_size=hidden_size,
+                    dtype=dtype,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"'grouped_mm' cannot run a MoE layer \(hidden_size {hidden_size}, "
+                    rf"intermediate_size {intermediate_size}, {dtype} on cpu\): .*"
+                    r"set model.moe_experts_kernel: loop",
+                ):
+                    configure_kernels(misaligned)
+                configure_kernels(misaligned, moe_experts_kernel="loop")
+                self.assertEqual(misaligned.experts_kernel, "loop")
+        with self.assertRaisesRegex(ValueError, "unknown experts kernel 'nope'"):
+            aligned[0].experts.probe_kernel("nope")
+
     def test_generic_base_initializes_from_golden_config(self):
         owner = DFlashDraftModel(model_config(initializer_range=0))
         node = qwen_spec(router=router_spec(expert_bias=True))
