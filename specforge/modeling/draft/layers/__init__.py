@@ -5,7 +5,7 @@ from .conv import GroupedCausalConv
 from .decoder import DecoderLayer
 from .layout import ComponentLayout, StackedParameter
 from .logits import MuPLogitTransform, NoLogitTransform, TargetLogitTransform
-from .mlp import DenseFFN
+from .mlp import DenseFFN, MoEFFN
 from .norm import RMSNorm
 from .registry import (
     build_component,
@@ -23,6 +23,7 @@ __all__ = [
     "GQAAttention",
     "GroupedCausalConv",
     "MLAAttention",
+    "MoEFFN",
     "MuPLogitTransform",
     "NoLogitTransform",
     "RMSNorm",

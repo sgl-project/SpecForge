@@ -1,4 +1,6 @@
-"""MoE FFN components: the top-k router, fused routed experts and the shared expert."""
+"""Routed experts over fused weights with named kernels, and the always-on shared expert."""
+
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -7,118 +9,25 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 
 from specforge.config.draft._validation import positive_int
-from specforge.config.draft.mlp import MoERouterSpec, MoESharedExpertSpec
+from specforge.config.draft.mlp import MoESharedExpertSpec
+
+# Routed-expert kernels over one parameter layout, picked by name once at startup.
+EXPERT_KERNELS: dict[str, Callable[..., Tensor]] = {}
 
 
-class Router(nn.Module):
-    """Linear gate scored by `config.scoring`; `expert_bias` shifts the top-k choice only."""
+def expert_kernel(name: str):
+    """Register the decorated routed-expert kernel under `name`."""
 
-    def __init__(
-        self,
-        config: MoERouterSpec,
-        *,
-        num_experts: int,
-        hidden_size: int,
-        top_k: int,
-        device=None,
-        dtype=None,
-    ):
-        super().__init__()
-        if type(config) is not MoERouterSpec:
-            raise TypeError("Router requires MoERouterSpec")
-        for name, value in (
-            ("num_experts", num_experts),
-            ("hidden_size", hidden_size),
-            ("top_k", top_k),
-        ):
-            positive_int(name, value)
-        if top_k > num_experts:
-            raise ValueError(f"top_k {top_k} exceeds num_experts {num_experts}")
-        self.config = config
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.weight = nn.Parameter(
-            torch.empty(num_experts, hidden_size, device=device, dtype=dtype)
-        )
-        # fp32 and persistent: a routing input that serving must apply too.
-        self.register_buffer(
-            "expert_bias",
-            (
-                torch.zeros(num_experts, dtype=torch.float32, device=device)
-                if config.expert_bias
-                else None
-            ),
-        )
+    def register(kernel):
+        if name in EXPERT_KERNELS:
+            raise ValueError(f"experts kernel {name!r} already registered")
+        EXPERT_KERNELS[name] = kernel
+        return kernel
 
-    def _apply(self, fn, recurse=True):
-        # Casts keep the bias in fp32 with its values; moves follow the weight.
-        old = self.expert_bias
-        super()._apply(fn, recurse)
-        new = self.expert_bias
-        if old is not None and new.dtype != torch.float32:
-            self.expert_bias = new.float() if old.is_meta else old.to(new.device)
-        return self
-
-    def reset_draft_parameters(self, *, initializer_range: float) -> None:
-        init.normal_(self.weight, mean=0.0, std=initializer_range)
-        if self.expert_bias is not None:
-            init.zeros_(self.expert_bias)
-
-    def validate_draft_state(self) -> None:
-        if self.config.expert_bias != (self.expert_bias is not None):
-            raise ValueError("expert_bias buffer disagrees with the router node")
-        if self.expert_bias is not None and (
-            self.expert_bias.dtype != torch.float32
-            or tuple(self.expert_bias.shape) != (self.num_experts,)
-        ):
-            raise ValueError("expert_bias must be fp32 with one entry per expert")
-
-    def validate_export_state(self, state) -> None:
-        expected = {"weight"} | ({"expert_bias"} if self.config.expert_bias else set())
-        if set(state) != expected:
-            raise ValueError(f"router state {sorted(state)} must be {sorted(expected)}")
-        if self.config.expert_bias and (
-            state["expert_bias"].dtype != torch.float32
-            or tuple(state["expert_bias"].shape) != (self.num_experts,)
-        ):
-            raise ValueError("expert_bias must be fp32 with one entry per expert")
-
-    def score(self, x: Tensor) -> Tensor:
-        """`x` [T, H] -> fp32 affinities [T, E]; logits stay in the input dtype as in Qwen."""
-        logits = F.linear(x, self.weight).float()
-        return (
-            logits.softmax(dim=-1)
-            if self.config.scoring == "softmax"
-            else torch.sigmoid(logits)
-        )
-
-    def select(self, scores: Tensor) -> Tensor:
-        choice = scores if self.expert_bias is None else scores + self.expert_bias
-        return choice.topk(self.top_k, dim=-1).indices
-
-    def routing_weights(self, scores: Tensor, indices: Tensor) -> Tensor:
-        weights = scores.gather(-1, indices)
-        if self.config.normalize_top_k:
-            # DeepSeek's 1e-20: a sigmoid top-k sum can be zero; a no-op for softmax.
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-        return weights * self.config.route_scale
-
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """`x` [T, H] -> fp32 scores [T, E], indices [T, K], fp32 weights [T, K]."""
-        scores = self.score(x)
-        indices = self.select(scores)
-        return scores, indices, self.routing_weights(scores, indices)
-
-    @torch.no_grad()
-    def update_expert_bias(self, tokens_per_expert: Tensor, *, rate: float) -> None:
-        """One DeepSeek-V3 step: nudge under-used experts up by `rate`, zero-mean overall."""
-        if self.expert_bias is None or rate == 0:
-            return
-        load = tokens_per_expert.to(self.expert_bias.device, torch.float32)
-        delta = rate * torch.sign(load.mean() - load)
-        self.expert_bias += delta - delta.mean()
+    return register
 
 
+@expert_kernel("grouped_mm")
 def grouped_mm_experts(
     x_sorted: Tensor,
     w_sorted: Tensor,
@@ -137,6 +46,7 @@ def grouped_mm_experts(
     return F.grouped_mm(hidden, down_proj.transpose(-1, -2), offs=offsets)
 
 
+@expert_kernel("loop")
 def looped_experts(
     x_sorted: Tensor,
     w_sorted: Tensor,
@@ -156,10 +66,6 @@ def looped_experts(
         outputs.append(hidden @ down_proj[expert].T)
         start = end
     return torch.cat(outputs)
-
-
-# Routed-expert kernels over one parameter layout, picked by name once at startup.
-EXPERT_KERNELS = {"grouped_mm": grouped_mm_experts, "loop": looped_experts}
 
 
 class RoutedExperts(nn.Module):
