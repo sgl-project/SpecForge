@@ -34,11 +34,21 @@ optional `training.frozen` prefixes freeze them independently of initialization.
 
 For continuation use `initialization.checkpoint`; for full training resume use
 `resume`. Neither takes `from_target`. To merge trained weights back into a
-separate target directory, use `specforge export --format sglang --target-model
-TARGET` (see `specforge export --help` for source/output arguments). Export checks
-target computation fields, replaces old MTP tensors, and leaves the source intact.
+separate target directory:
+
+```bash
+specforge export --converter sglang --checkpoint CHECKPOINT_PATH \
+  --target-model TARGET_PATH --output-dir OUTPUT_DIR
+```
+
+A complete native `mtp` root copy checks target computation fields, including
+RoPE, during training preparation and initialization. Individual tensor copies
+do not impose this native structure contract. Export repeats the same checks,
+replaces old MTP tensors, and leaves the source intact.
 
 Current coverage is dense Qwen3.5 MTP and text training inputs. MoE native presets
 are not advertised. Tests validate full preset shapes on meta, then use smaller
 hidden/vocabulary widths with the same head geometry, gates and RoPE for exact
-copy/export/copy checks and numerical comparison with pinned SGLang.
+copy/export/copy checks and numerical comparison with pinned SGLang. Independent
+real configuration and weight-header fixtures check the mapping; a CPU comparison
+with the HF decoder uses distinct T/H/W positions to check multi-axis RoPE.
