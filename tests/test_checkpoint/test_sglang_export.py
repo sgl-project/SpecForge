@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import ClassVar
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -18,6 +19,7 @@ from specforge.checkpoint.formats.sglang import (
     convert_config,
 )
 from specforge.checkpoint.formats.sglang.converters import serving_weights
+from specforge.checkpoint.formats.sglang.native import export_native
 from specforge.checkpoint.tensors import TensorStore
 from specforge.cli import main
 from specforge.config.draft.logits import NoLogitTransformSpec
@@ -29,6 +31,7 @@ from specforge.loading import read_draft
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import configurations
 from tests.test_checkpoint.test_loading import write_target
+from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
@@ -192,27 +195,54 @@ class SGLangExportTest(unittest.TestCase):
                     },
                 )
             )
+        config = multi_axis_config(config, interleaved=True)
         for copy in (False, True):
             with self.subTest(copy=copy), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 target = root / "target"
                 tables = write_target(target)
-                payload = convert_config(config) | {"model_type": "qwen3_5_text"}
+                # Target metadata is independent of the converter, with HF defaults omitted.
+                payload = dict(
+                    model_type="qwen3_5_text",
+                    hidden_size=32,
+                    vocab_size=64,
+                    intermediate_size=64,
+                    rms_norm_eps=1e-6,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    head_dim=8,
+                    max_position_embeddings=256,
+                    rope_parameters=dict(
+                        rope_type="default",
+                        rope_theta=10000,
+                        partial_rotary_factor=1,
+                        mrope_section=[2, 1, 1],
+                        mrope_interleaved=True,
+                    ),
+                )
                 (target / "config.json").write_text(json.dumps(payload))
                 (target / "model.safetensors").unlink()
                 save_file(tables, target / "tables.safetensors")
+                model = build_draft_model(config)
+                state = serving_weights(config, model.state_dict())
+                old_native = {
+                    "mtp." + name: torch.zeros_like(value)
+                    for name, value in state.items()
+                }
                 save_file(
-                    {"target.weight": torch.ones(2), "mtp.obsolete": torch.zeros(3)},
+                    {"target.weight": torch.ones(2), **old_native},
                     target / "mixed.safetensors",
                 )
+                (target / "chat_template.jinja").write_text("{{ messages }}")
+                (target / "chat_templates").mkdir()
+                (target / "chat_templates/tool.jinja").write_text("{{ tools }}")
                 index = {name: "tables.safetensors" for name in tables} | {
                     "target.weight": "mixed.safetensors",
-                    "mtp.obsolete": "mixed.safetensors",
+                    **{name: "mixed.safetensors" for name in old_native},
                 }
                 (target / "model.safetensors.index.json").write_text(
                     json.dumps({"weight_map": index})
                 )
-                model = build_draft_model(config)
                 save_draft(model, root / "draft")
                 export_to_sglang(
                     str(root / "draft"),
@@ -238,9 +268,76 @@ class SGLangExportTest(unittest.TestCase):
                 self.assertEqual(
                     restored.files["lm_head.weight"].is_symlink(), not copy
                 )
-                for shard in (root / "served").glob("*.safetensors"):
-                    self.assertNotIn("mtp.obsolete", load_file(shard))
-                self.assertIn("mtp.obsolete", load_file(target / "mixed.safetensors"))
+                for shard in (root / "served").glob("target-*.safetensors"):
+                    self.assertFalse(
+                        any(name.startswith("mtp.") for name in load_file(shard))
+                    )
+                self.assertEqual(
+                    (root / "served/chat_template.jinja").read_text(), "{{ messages }}"
+                )
+                self.assertEqual(
+                    (root / "served/chat_templates/tool.jinja").read_text(),
+                    "{{ tools }}",
+                )
+                self.assertEqual(
+                    set(load_file(target / "mixed.safetensors")),
+                    {"target.weight", *old_native},
+                )
+                if not copy:
+                    for changed, error in (
+                        (
+                            {k: v for k, v in state.items() if k != "fc.weight"},
+                            "coverage",
+                        ),
+                        (state | {"renamed.weight": state["fc.weight"]}, "coverage"),
+                        (state | {"fc.weight": torch.zeros(1)}, "shape"),
+                    ):
+                        with patch.object(
+                            TensorStore,
+                            "read",
+                            side_effect=AssertionError("read before preflight"),
+                        ):
+                            with self.assertRaisesRegex(ValueError, error):
+                                export_native(
+                                    config,
+                                    convert_config(config),
+                                    changed,
+                                    target,
+                                    root / "bad",
+                                )
+                    for quantized in (
+                        tables
+                        | {
+                            "model.embed_tokens.weight": tables[
+                                "model.embed_tokens.weight"
+                            ].to(torch.int8)
+                        },
+                        tables | {"lm_head.weight_scale": torch.ones(1)},
+                    ):
+                        save_file(quantized, target / "tables.safetensors")
+                        quant_index = index | {
+                            name: "tables.safetensors" for name in quantized
+                        }
+                        (target / "model.safetensors.index.json").write_text(
+                            json.dumps({"weight_map": quant_index})
+                        )
+                        with patch.object(
+                            TensorStore,
+                            "read",
+                            side_effect=AssertionError("read before preflight"),
+                        ):
+                            with self.assertRaisesRegex(ValueError, "quantized"):
+                                export_native(
+                                    config,
+                                    convert_config(config),
+                                    state,
+                                    target,
+                                    root / "bad",
+                                )
+                    save_file(tables, target / "tables.safetensors")
+                    (target / "model.safetensors.index.json").write_text(
+                        json.dumps({"weight_map": index})
+                    )
                 payload["hidden_size"] += 1
                 (target / "config.json").write_text(json.dumps(payload))
                 with self.assertRaises(ValueError):

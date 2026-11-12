@@ -90,6 +90,32 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
     bindings = resolve_bindings(config, store, text)
     for name, ref in bindings.items():
         _validate_unquantized(name, ref)
+        require(
+            ref.info.dtype.is_floating_point,
+            f"{name}: native binding requires unquantized floating weights",
+        )
+    shapes = {name: tuple(value.shape) for name, value in weights.items()}
+    shapes.update(
+        {f"mtp.{name}.weight": ref.info.shape for name, ref in bindings.items()}
+    )
+    previous = {
+        name: info for name, info in store.metadata.items() if name.startswith("mtp.")
+    }
+    missing = previous.keys() - shapes.keys()
+    added = (
+        shapes.keys()
+        - previous.keys()
+        - {"mtp.embed_tokens.weight", "mtp.lm_head.weight"}
+    )
+    require(
+        not missing and not added,
+        f"native weight coverage differs: missing={sorted(missing)}, unexpected={sorted(added)}",
+    )
+    for name, info in previous.items():
+        require(
+            shapes[name] == info.shape,
+            f"native weight shape differs for {name}: {shapes[name]} != {info.shape}",
+        )
     for name, ref in bindings.items():
         weights[f"mtp.{name}.weight"] = ref.read()
     destination = Path(output)
@@ -126,15 +152,17 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
             staging / "draft.safetensors",
         )
         weight_map.update({name: "draft.safetensors" for name in weights})
-        # Preserve tokenizer and other JSON/text assets, never stale artifact/code.
+        # Preserve target assets, including HF chat templates, but not stale weights.
         for file in source.iterdir():
             if (
                 file.is_file()
                 and file.name not in {"config.json", "artifact.json"}
-                and file.suffix in {".json", ".txt", ".model", ".tiktoken"}
+                and file.suffix not in {".safetensors", ".bin", ".pt", ".pth"}
                 and not file.name.endswith(".index.json")
             ):
                 shutil.copy2(file, staging / file.name)
+            elif file.is_dir() and file.name == "chat_templates":
+                shutil.copytree(file, staging / file.name)
         (staging / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {}, "weight_map": weight_map}, indent=2) + "\n"
         )
