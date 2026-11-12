@@ -13,11 +13,36 @@ from specforge.application.composition import resolve_run
 from specforge.config import load_config
 from specforge.config.draft.codec import decode_legacy_config
 from specforge.training.canonical import resolve_config
+from tests.test_config.test_draft_legacy_dflash import CONFIGS
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
 from tests.test_runtime.test_canonical_training import run_config, target_directory
 
 
 class RetiredExportTest(unittest.TestCase):
+    def test_bundled_legacy_files_resolve_through_training_entry(self):
+        for path in sorted(CONFIGS.glob("*.json")):
+            with self.subTest(path=path.name):
+                payload = json.loads(path.read_text())
+                options = (
+                    {"mask_token_id": 1}
+                    if payload["architectures"] == ["PEagleDraftModel"]
+                    else {}
+                )
+                target = {
+                    "hidden_size": payload["hidden_size"],
+                    "vocab_size": payload["vocab_size"],
+                    "num_hidden_layers": payload.get("num_target_layers", 128),
+                }
+                expected = decode_legacy_config(
+                    payload, **options, target_config=target
+                )
+                cfg = run_config(path.parent, expected).model_copy(
+                    update={"draft": str(path)}
+                )
+                if options:
+                    cfg.model.mask_token_id = options["mask_token_id"]
+                self.assertEqual(resolve_config(cfg, target_config=target), expected)
+
     def test_old_merge_cli_delegates_to_checked_native_export(self):
         with patch("scripts.merge_mtp_to_base.export_draft") as export:
             main(
@@ -50,6 +75,7 @@ class RetiredExportTest(unittest.TestCase):
         )
 
     def test_mtp_recipes_use_canonical_sdpa(self):
+        from specforge.training.capture_contract import resolve_server_capture_contract
         from tests.test_checkpoint.test_native_contracts import FIXTURE
 
         target = json.loads((FIXTURE / "config.json").read_text())["text_config"]
@@ -71,6 +97,14 @@ class RetiredExportTest(unittest.TestCase):
                 self.assertEqual(
                     resolved.config.training.objective_options["objective_chunk_size"],
                     4096,
+                )
+                capture = resolve_server_capture_contract(
+                    resolved.config, algorithm=resolved.algorithm
+                )
+                self.assertEqual(capture.method, "dflash")
+                self.assertEqual(capture.aux_layer_ids, (0,))
+                self.assertLess(
+                    max(capture.aux_layer_ids), target["num_hidden_layers"] - 1
                 )
 
     def test_legacy_config_file_resolves_through_codec(self):

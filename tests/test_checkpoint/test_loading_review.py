@@ -385,10 +385,12 @@ class LoadingReviewTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "lm_head"):
                             store.resolve("lm_head")
 
-    def test_run_output_directory_error_names_the_checkpoint_directory(self):
-        """A run root has no config.json; the error must not only ask for a legacy config."""
+    def test_run_root_without_complete_checkpoint_is_rejected(self):
+        """An empty step directory is not a loadable training checkpoint."""
         with TemporaryDirectory() as temp:
             run = Path(temp) / "run"
             (run / "run-step2").mkdir(parents=True)
-            with self.assertRaisesRegex(ValueError, "rather than a run output"):
+            with self.assertRaisesRegex(
+                FileNotFoundError, "no complete checkpoint found"
+            ):
                 read_draft(run)

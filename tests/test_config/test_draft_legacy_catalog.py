@@ -30,15 +30,6 @@ class LegacyCatalogTest(unittest.TestCase):
                     "num_hidden_layers": payload.get("num_target_layers", 128),
                 }
                 node = decode_legacy_config(payload, **options, target_config=target)
-                from specforge.training.canonical import resolve_config
-                from tests.test_runtime.test_canonical_training import run_config
-
-                cfg = run_config(path.parent, node).model_copy(
-                    update={"draft": str(path)}
-                )
-                if options:
-                    cfg.model.mask_token_id = options["mask_token_id"]
-                self.assertEqual(resolve_config(cfg, target_config=target), node)
                 restored = decode_config(
                     json.loads(json.dumps(encode_config(node))),
                     target_config=target,

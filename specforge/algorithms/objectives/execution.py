@@ -162,12 +162,26 @@ def chain_weights(predictions, projected, weighting):
     return list(zip(weights.split(sizes), denominator.split(sizes)))
 
 
+def combine_results(results):
+    ratios = {}
+    for result in results:
+        for key, pair in result.ratios.items():
+            ratios[key] = (
+                tuple(a + b for a, b in zip(ratios[key], pair))
+                if key in ratios
+                else pair
+            )
+    return ObjectiveResult(
+        sum(r.numerator for r in results), sum(r.denominator for r in results), ratios
+    )
+
+
 def evaluate_chunks(predictions, loss, weighting, chunk_size):
     selected = predictions.default_loss if loss.kind == "default" else loss
     length = predictions.hidden.shape[0]
     # Contextual losses use whole-set statistics; preserve that reduction.
     if not chunk_size or chunk_size >= length or selected.registration.contextual:
-        return [evaluate_predictions(predictions, loss, weighting)]
+        return evaluate_predictions(predictions, loss, weighting)
     from torch.utils.checkpoint import checkpoint
 
     results = []
@@ -180,7 +194,11 @@ def evaluate_chunks(predictions, loss, weighting, chunk_size):
         else:
             result = evaluate_predictions(item, loss, weighting)
         results.append(result)
-    return results
+    result = combine_results(results)
+    # A supplied denominator belongs to the whole prediction set, not each chunk.
+    if predictions.denominator is not None:
+        result.denominator = predictions.denominator
+    return result
 
 
 def execute_batch(batch, loss, weighting, *, training):
@@ -203,29 +221,18 @@ def execute_batch(batch, loss, weighting, *, training):
         ]
     else:
         results = [
-            result
+            evaluate_chunks(item, loss, weighting, batch.chunk_size)
             for item in batch.predictions
-            for result in evaluate_chunks(item, loss, weighting, batch.chunk_size)
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")
-    ratios = {}
-    for result in results:
-        for key, pair in result.ratios.items():
-            ratios[key] = (
-                tuple(a + b for a, b in zip(ratios[key], pair))
-                if key in ratios
-                else pair
-            )
+    result = combine_results(results)
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
         return ObjectiveResult(
-            sum(result.loss for result in results),
+            sum(item.loss for item in results),
             results[0].denominator.new_ones(()),
-            ratios,
+            result.ratios,
         )
-    result = ObjectiveResult(
-        sum(r.numerator for r in results), sum(r.denominator for r in results), ratios
-    )
     if batch.reduction == "global_microbatch":
         return microbatch_mean(result, global_denominator=training)
     if batch.reduction not in ("tokens", "sum_means"):

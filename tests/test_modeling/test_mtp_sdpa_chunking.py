@@ -165,13 +165,16 @@ class MTPBackendObjectiveTest(unittest.TestCase):
     def test_fp32_ce_against_legacy_bf16_and_fp64(self):
         from specforge.algorithms.objectives.losses import cross_entropy
 
-        logits = torch.randn(
-            4, 248320, generator=torch.Generator().manual_seed(31)
-        ).bfloat16()
+        logits = (
+            torch.randn(4, 248320, generator=torch.Generator().manual_seed(31))
+            .bfloat16()
+            .requires_grad_()
+        )
+        reference_logits = logits.detach().double().requires_grad_()
         labels = torch.tensor([1, 123, 45000, 248319])
         actual = cross_entropy(logits, labels)
         reference = torch.nn.functional.cross_entropy(
-            logits.double(), labels, reduction="none"
+            reference_logits, labels, reduction="none"
         )
         legacy = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
         self.assertEqual(actual.dtype, torch.float32)
@@ -179,6 +182,21 @@ class MTPBackendObjectiveTest(unittest.TestCase):
         torch.testing.assert_close(actual, legacy.float(), rtol=0.01, atol=0.01)
         self.assertLess(
             (actual - reference).abs().max(), (legacy - reference).abs().max()
+        )
+        actual_grad = torch.autograd.grad(actual.mean(), logits)[0].double()
+        legacy_grad = torch.autograd.grad(legacy.mean(), logits)[0].double()
+        reference_grad = torch.autograd.grad(reference.mean(), reference_logits)[0]
+        # The FP32 CE backward is rounded back to the BF16 input dtype.
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=0.004, atol=1e-9)
+        # Historical BF16 log-softmax changes small probabilities substantially;
+        # compare the aggregate gradient rather than impose elementwise parity.
+        relative_change = torch.linalg.vector_norm(
+            actual_grad - legacy_grad
+        ) / torch.linalg.vector_norm(reference_grad)
+        self.assertLess(relative_change, 0.01)
+        self.assertLess(
+            torch.linalg.vector_norm(actual_grad - reference_grad),
+            torch.linalg.vector_norm(legacy_grad - reference_grad),
         )
 
 
