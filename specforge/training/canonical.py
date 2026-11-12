@@ -504,15 +504,14 @@ def build_bundle(cfg, algorithm):
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
         )
-        if (
-            source
-            and bool(model.vocabulary.ready)
-            and (
-                not torch.equal(model.vocabulary.t2d, mapping["t2d"])
-                or not torch.equal(model.vocabulary.d2t, mapping["d2t"])
-            )
+        # a loaded or copied vocabulary was trained with its own mapping
+        if bool(model.vocabulary.ready) and (
+            not torch.equal(model.vocabulary.t2d, mapping["t2d"])
+            or not torch.equal(model.vocabulary.d2t, mapping["d2t"])
         ):
-            raise ValueError("vocab_mapping_path disagrees with checkpoint vocabulary")
+            raise ValueError(
+                "vocab_mapping_path disagrees with the loaded draft vocabulary"
+            )
         model.vocabulary.load_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
     runtime = build_objective_model(
         model,

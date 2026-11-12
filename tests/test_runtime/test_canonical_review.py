@@ -299,3 +299,45 @@ class CanonicalReviewTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "target logit width 64"):
                 build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+
+    def test_vocab_mapping_cannot_replace_a_copied_vocabulary(self):
+        """weights_from copies lm_head rows trained under the source's mapping."""
+        from specforge.loading import initialize_draft
+        from specforge.training.assembly import build_model_bundle
+        from tests.test_modeling.test_canonical_eagle3 import install_mapping
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            draft = eagle_config(target_width=32)
+            source = initialize_draft(draft, target=target)
+            install_mapping(source)
+            source.save_pretrained(root / "source")
+            t2d = torch.zeros(draft.vocab_size, dtype=torch.bool)
+            t2d[: draft.draft_vocab_size] = True
+            torch.save(
+                {
+                    "t2d": t2d,
+                    "d2t": torch.zeros(draft.draft_vocab_size, dtype=torch.long),
+                },
+                root / "mapping.pt",
+            )
+            resolved = resolve_run(
+                run_config(
+                    target,
+                    draft,
+                    model={
+                        "target_model_path": str(target),
+                        "torch_dtype": "float32",
+                        "vocab_mapping_path": str(root / "mapping.pt"),
+                    },
+                    initialization={
+                        "weights_from": {"checkpoint": str(root / "source")}
+                    },
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "vocab_mapping_path disagrees"):
+                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
