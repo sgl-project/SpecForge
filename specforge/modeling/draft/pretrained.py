@@ -49,6 +49,27 @@ class DraftPreTrainedModel(PreTrainedModel):
                 validate()
         return (model, info) if output_loading_info else model
 
+    def validate_export_state(self, state) -> None:
+        """Validate owned checkpoint tensors without loading them into the model.
+
+        The model may be on meta and target bindings remain unmaterialized.
+        Components receive their local state keys; architecture overrides call
+        super() before checking model-owned state.
+        """
+        for name, module in self.named_modules():
+            if not name:
+                continue
+            validate = getattr(module, "validate_export_state", None)
+            if validate is not None:
+                prefix = name + "."
+                validate(
+                    {
+                        key[len(prefix) :]: value
+                        for key, value in state.items()
+                        if key.startswith(prefix)
+                    }
+                )
+
     def finalize_initialization(self, *, loaded_keys: frozenset[str]) -> None:
         """Finish scratch/warm-start initialization after copying and binding weights.
 

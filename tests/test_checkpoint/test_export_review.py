@@ -10,14 +10,59 @@ from unittest.mock import patch
 import torch
 from click.testing import CliRunner
 
+from specforge.checkpoint import save_draft
 from specforge.checkpoint.draft_dir import write_artifact
 from specforge.checkpoint.formats.hf import bundle_code
 from specforge.cli import cli
 from specforge.export.canonical import read_export
+from specforge.modeling import build_draft_model
+from specforge.modeling.draft.pretrained import DraftPreTrainedModel
 from specforge.training.checkpoint import CheckpointManager
+from tests.test_config.draft_fixtures import draft_config
+from tests.test_modeling.test_canonical_dspine import model_config as dspine_config
+from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
 
 
 class ExportReviewTest(unittest.TestCase):
+    def test_export_delegates_to_components_without_materializing_target(self):
+        class Component(torch.nn.Module):
+            def validate_export_state(self, state):
+                torch.testing.assert_close(state["weight"], torch.ones(1))
+                raise ValueError("component rejected state")
+
+        config = draft_config()
+        model = build_draft_model(config, device="meta")
+        model.add_module("custom", Component())
+        with self.assertRaisesRegex(ValueError, "component rejected"):
+            model.validate_export_state({"custom.weight": torch.ones(1)})
+
+        validate = DraftPreTrainedModel.validate_export_state
+
+        def check_meta(preview, state):
+            self.assertTrue(all(p.is_meta for p in preview.parameters()))
+            self.assertNotIn("lm_head.weight", state)
+            validate(preview, state)
+
+        with TemporaryDirectory() as temp:
+            save_draft(build_draft_model(config), temp)
+            with patch.object(
+                DraftPreTrainedModel, "validate_export_state", check_meta
+            ):
+                read_export(temp)
+
+    def test_export_rejects_unready_model_and_component_state(self):
+        for config, error in (
+            (dspine_config(), "transfer_ready"),
+            (eagle_config(), "t2d/d2t"),
+        ):
+            with (
+                self.subTest(architecture=config.architecture),
+                TemporaryDirectory() as temp,
+            ):
+                save_draft(build_draft_model(config), temp)
+                with self.assertRaisesRegex(ValueError, error):
+                    read_export(temp)
+
     def test_cli_defaults_to_canonical_and_rejects_legacy_options_early(self):
         args = ["export", "--checkpoint", "missing", "--output-dir", "out"]
         with patch("specforge.export.to_hf.export_to_hf") as export:

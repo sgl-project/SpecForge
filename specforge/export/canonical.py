@@ -55,14 +55,5 @@ def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=Non
         if ref not in seen:
             state[name] = ref.read().contiguous()
             seen.add(ref)
-    if "transfer_ready" in state and not bool(state["transfer_ready"]):
-        raise ValueError("transfer_ready: serving state is not initialized")
-    if "vocabulary.t2d" in state:
-        from specforge.modeling.draft.models.vocabulary import DraftVocabulary
-
-        mapping = DraftVocabulary(
-            vocab_size=checkpoint.config.vocab_size,
-            draft_vocab_size=checkpoint.config.draft_vocab_size,
-        )
-        mapping.load_mapping(t2d=state["vocabulary.t2d"], d2t=state["vocabulary.d2t"])
+    preview.validate_export_state(state)
     return checkpoint, state, type(preview)
