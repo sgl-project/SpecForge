@@ -394,3 +394,16 @@ class LoadingReviewTest(unittest.TestCase):
                 FileNotFoundError, "no complete checkpoint found"
             ):
                 read_draft(run)
+
+    def test_config_less_model_directories_are_not_run_roots(self):
+        """Config-only hub snapshots and subfolder shards resolve to themselves."""
+        from specforge.checkpoint.resolve import resolve_checkpoint_path
+
+        with TemporaryDirectory() as temp:
+            snapshot = Path(temp) / "snapshot"
+            snapshot.mkdir()
+            sharded = Path(temp) / "sharded"
+            (sharded / "shards").mkdir(parents=True)
+            (sharded / "model.safetensors.index.json").write_text("{}")
+            for path in (snapshot, sharded):
+                self.assertEqual(resolve_checkpoint_path(path), path)

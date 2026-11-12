@@ -204,12 +204,12 @@ def _validate_imported_objective(cfg, resolved):
     init = cfg.initialization
     if init is None or init.checkpoint is None:
         return
-    from specforge.checkpoint.resolve import read_json, resolve_directory
+    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
     from specforge.config.draft.codec.legacy.dspine import (
         extract_dspine_training_settings,
     )
 
-    source = resolve_directory(
+    source = resolve_checkpoint_path(
         init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
     )
     directory = source.parent if source.is_file() else source

@@ -83,15 +83,27 @@ def resolve_run_directory(path: str) -> str:
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def _is_run_root(path: Path) -> bool:
+    return any(
+        child.is_dir()
+        and (child.name.endswith("-latest") or re.fullmatch(r".+-step\d+", child.name))
+        for child in path.iterdir()
+    )
+
+
 def resolve_checkpoint_path(source, *, cache_dir=None, config_only=False):
     """Resolve model directories and training run roots without choosing a run silently."""
     path = resolve_directory(source, cache_dir=cache_dir, config_only=config_only)
-    if path.is_dir() and not any(
-        (path / name).exists() for name in ("config.json", "training_state.pt")
+    # positive evidence only: config-less model dirs and config-only snapshots
+    # hold neither config.json nor weights at their root
+    if (
+        path.is_dir()
+        and not any(
+            (path / name).exists() for name in ("config.json", "training_state.pt")
+        )
+        and _is_run_root(path)
     ):
-        # Config-less historical model directories remain valid with legacy_config.
-        if not any(path.glob("*.safetensors")) and not any(path.glob("*.bin")):
-            path = Path(resolve_run_directory(str(path)))
+        path = Path(resolve_run_directory(str(path)))
     return path
 
 
