@@ -351,6 +351,8 @@ def resolve_run(cfg, *, target_config=None):
         required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
         supports_liger_kernel=True,
+        # a checkpoint import's legacy config becomes the draft; the reader checks it
+        allows_aux_layer_override=bool(init and init.checkpoint),
     )
     spec = AlgorithmSpec(
         name=family,

@@ -341,3 +341,51 @@ class CanonicalReviewTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "vocab_mapping_path disagrees"):
                 build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+
+    def test_legacy_import_accepts_matching_aux_layer_override(self):
+        """The documented legacy override must reach the legacy reader."""
+        import shutil
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            legacy = shutil.copytree(fixture, Path(temp) / "legacy")
+
+            def resolve(layers):
+                raw = dict(
+                    model={
+                        "target_model_path": str(target),
+                        "torch_dtype": "float32",
+                        "mask_token_id": 63,
+                        "aux_hidden_state_layer_ids": layers,
+                    },
+                    initialization={"checkpoint": str(legacy)},
+                    data={"hidden_states_path": str(Path(temp) / "features")},
+                    training={"attention_backend": "eager", "batch_size": 1},
+                )
+                return resolve_run(Config.model_validate(raw))
+
+            features = resolve([1, 2, 3]).config.draft["spec_config"]["target_features"]
+            self.assertEqual(list(features["target_layer_ids"]), [1, 2, 3])
+            with self.assertRaisesRegex(ValueError, "capture_layers conflict"):
+                resolve([1, 2, 4])
+            # weights_from keeps the supplied draft's layers, so an override is refused
+            from specforge.loading import read_draft
+
+            imported = read_draft(
+                legacy, target=target, legacy_settings={"mask_token_id": 63}
+            ).config
+            raw = dict(
+                model={
+                    "target_model_path": str(target),
+                    "torch_dtype": "float32",
+                    "mask_token_id": 63,
+                    "aux_hidden_state_layer_ids": [1, 2, 3],
+                },
+                draft=encode_config(imported),
+                initialization={"weights_from": {"checkpoint": str(legacy)}},
+                data={"hidden_states_path": str(Path(temp) / "features")},
+                training={"attention_backend": "eager", "batch_size": 1},
+            )
+            with self.assertRaisesRegex(ValueError, "would be ignored"):
+                resolve_run(Config.model_validate(raw))
