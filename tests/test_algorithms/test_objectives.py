@@ -171,7 +171,7 @@ class ObjectiveTest(unittest.TestCase):
         result = build_objective_model(model)(batch, step=0, total_steps=None)
         labels = batch["input_ids"][:, 2:8]
         reference = torch.nn.functional.cross_entropy(
-            captured[0]["logits"].reshape(1, 8, -1)[:, :6].flatten(0, 1),
+            captured[0]["logits"].flatten(0, 1),
             labels.flatten(),
         )
         torch.testing.assert_close(result.loss, reference)

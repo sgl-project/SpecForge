@@ -19,7 +19,7 @@ from tests.test_runtime.test_canonical_training import run_config, target_direct
 
 class RetiredExportTest(unittest.TestCase):
     def test_old_merge_cli_delegates_to_checked_native_export(self):
-        with patch("scripts.merge_mtp_to_base.export_to_sglang") as export:
+        with patch("scripts.merge_mtp_to_base.export_draft") as export:
             main(
                 [
                     "--base-model-path",
@@ -28,11 +28,15 @@ class RetiredExportTest(unittest.TestCase):
                     "draft",
                     "--output-path",
                     "output",
-                    "--copy-target",
                 ]
             )
         export.assert_called_once_with(
-            "draft", None, "output", target_model="target", copy_target=True
+            "draft",
+            None,
+            "output",
+            target_model="target",
+            copy_target=True,
+            export_mode="native",
         )
 
     def test_canonical_import_does_not_load_old_implementations(self):

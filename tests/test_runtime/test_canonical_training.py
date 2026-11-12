@@ -61,6 +61,21 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_mtp_training_requires_explicit_initialization(self):
+        from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
+
+        with TemporaryDirectory() as tmp:
+            target = target_directory(Path(tmp))
+            cfg = run_config(target, owned_mtp_config())
+            resolved = resolve_run(cfg)  # Capture planning does not initialize weights.
+            with self.assertRaisesRegex(ValueError, "initialization: {}"):
+                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            raw = cfg.model_dump()
+            raw["initialization"] = {}
+            resolved = resolve_run(Config.model_validate(raw))
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertIsNotNone(bundle.draft_model)
+
     def test_target_tables_are_reused_and_owned_embedding_is_initialized(self):
         from safetensors.torch import load_file
 
@@ -238,7 +253,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             ]
             for draft in configs:
                 with self.subTest(architecture=draft.architecture):
-                    cfg = run_config(target, draft)
+                    cfg = run_config(target, draft, initialization={})
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
                         resolved.config, algorithm=resolved.algorithm

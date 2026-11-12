@@ -96,10 +96,11 @@ def resolve_config(cfg, *, target_config=None):
             draft = json.loads(text)
         except json.JSONDecodeError:
             draft = yaml.safe_load(text)
-    if isinstance(draft, dict) and draft.get("model_type") not in (
+    legacy_draft = isinstance(draft, dict) and draft.get("model_type") not in (
         None,
         "specforge_draft",
-    ):
+    )
+    if legacy_draft:
         from specforge.config.draft.codec import decode_legacy_config
 
         if target_config is None:
@@ -146,7 +147,11 @@ def resolve_config(cfg, *, target_config=None):
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
-    if _legacy_settings(cfg) and not (initialization and initialization.weights_from):
+    if (
+        _legacy_settings(cfg)
+        and not legacy_draft
+        and not (initialization and initialization.weights_from)
+    ):
         raise ValueError(
             "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
         )
@@ -523,6 +528,15 @@ def build_bundle(cfg, algorithm):
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
     init = cfg.initialization
+    if (
+        resolved.registration.training.explicit_initialization
+        and init is None
+        and not cfg.resume_path
+    ):
+        raise ValueError(
+            f"{resolved.name} requires an explicit initialization source; "
+            "set initialization: {} to train from scratch, or use resume"
+        )
     source = init.checkpoint if init else None
     if cfg.resume_path:
         from specforge.training.checkpoint import CheckpointManager

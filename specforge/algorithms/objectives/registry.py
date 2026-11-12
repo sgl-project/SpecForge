@@ -20,6 +20,7 @@ class TrainingRequirements:
     """Data and execution requirements used by canonical training composition."""
 
     capture_method: str | None = None
+    explicit_initialization: bool = False
     supports_vocab_mapping: bool = False
     required_batch_size: int | None = None
     minimum_loss_tokens: int = 1

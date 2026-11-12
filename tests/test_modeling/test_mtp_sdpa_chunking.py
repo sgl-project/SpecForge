@@ -145,10 +145,15 @@ class MTPBackendObjectiveTest(unittest.TestCase):
         batch.update(prepare_supervised_rows(batch, config))
         batch = {key: value.cuda() for key, value in batch.items()}
         runtime = build_objective_model(build_draft_model(config, device="cuda"))
-        with patch.object(
-            torch.Tensor, "nonzero", side_effect=AssertionError("device row lookup")
-        ):
-            runtime(batch, step=0, total_steps=None).loss.backward()
+        previous = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            with patch.object(
+                torch.Tensor, "nonzero", side_effect=AssertionError("device row lookup")
+            ):
+                runtime(batch, step=0, total_steps=None).loss.backward()
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
 
     def test_chunk_sizes_validate(self):
         from specforge.algorithms.objectives.mtp import MTPObjective
@@ -156,6 +161,25 @@ class MTPBackendObjectiveTest(unittest.TestCase):
         for value in (-1, True, 0.5):
             with self.assertRaises(ValueError):
                 MTPObjective(objective_chunk_size=value)
+
+    def test_fp32_ce_against_legacy_bf16_and_fp64(self):
+        from specforge.algorithms.objectives.losses import cross_entropy
+
+        logits = torch.randn(
+            4, 248320, generator=torch.Generator().manual_seed(31)
+        ).bfloat16()
+        labels = torch.tensor([1, 123, 45000, 248319])
+        actual = cross_entropy(logits, labels)
+        reference = torch.nn.functional.cross_entropy(
+            logits.double(), labels, reduction="none"
+        )
+        legacy = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual.double(), reference, rtol=1e-6, atol=2e-6)
+        torch.testing.assert_close(actual, legacy.float(), rtol=0.01, atol=0.01)
+        self.assertLess(
+            (actual - reference).abs().max(), (legacy - reference).abs().max()
+        )
 
 
 if __name__ == "__main__":

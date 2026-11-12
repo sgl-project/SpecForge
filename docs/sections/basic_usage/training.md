@@ -762,7 +762,7 @@ text-only offline recipe is available at
 `examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
 ```bash
-specforge export --format sglang \
+specforge export --export-mode native \
   --checkpoint ./outputs/native-mtp/native-mtp-latest \
   --target-model Qwen/Qwen3.5-4B \
   --output-dir ./exports/Qwen3.5-4B-MTP
@@ -771,9 +771,41 @@ specforge export --format sglang \
 Native export rewrites shards containing old MTP tensors and links unchanged
 shards; add `--copy-target` for a self-contained directory. Historical checkpoints
 use the same importer, with `--draft-config OLD.json` when configuration is absent.
-The `scripts/merge_mtp_to_base.py` CLI is a compatibility wrapper for this exporter;
+The `scripts/merge_mtp_to_base.py` CLI copies target shards by default for a
+self-contained directory; `--no-copy-target` opts into links. It is a compatibility
+wrapper for this exporter;
 there is no separate legacy merge implementation. Target computation mismatches
 fail instead of rewriting the target's settings to fit a draft.
+
+Prepare records with the same run configuration, against a capture server configured
+for its resolved capture contract:
+
+```bash
+python scripts/prepare_hidden_states.py \
+  -c examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml \
+  --server-urls http://localhost:30000 \
+  --data-path /data/train.jsonl --output-path /data/mtp-features
+```
+
+MTP migration changes:
+
+- Replace old `model.draft_*` recipes with `draft` and `initialization`. Training
+  requires an explicit initialization choice; use `initialization: {}` for random
+  weights, `from_target` for native weights, or `checkpoint` for an existing draft.
+  Capture planning does not require weight initialization.
+- The former MTP JSON is retained at `tests/fixtures/legacy_mtp/original_config.json`
+  for compatibility tests. New runs should use the ordinary native YAML preset.
+- `model.embedding_key` and `model.lm_head_key` still select target binding tensors;
+  they do not replace explicit `from_target` mappings for owned parameters.
+- An owned LM head can be saved and exported as a standalone canonical draft.
+  Native Qwen3.5 merge-back requires the matching native structure and target bindings;
+  standalone SGLang MTP serving is not implemented.
+- CE computes in FP32 rather than the old BF16 reduction. Small loss/gradient
+  differences are intentional. Only supervised rows are projected, in bounded chunks.
+- Old optimizer state cannot resume under the canonical implementation. Import
+  model weights instead. Canonical resume rejects a changed `objective_chunk_size`.
+- `draft: OLD.json` uses the registered legacy codecs for all supported architectures,
+  not only MTP; required recorded settings such as P-EAGLE's mask token stay explicit.
 
 The canonical MTP trainer supports eager and SDPA attention. Set
 `training.objective_options.objective_chunk_size` (default 4096; 0 disables

@@ -34,6 +34,7 @@ def prepare_supervised_rows(batch, config):
     "mtp",
     training=TrainingRequirements(
         capture_method="dflash",
+        explicit_initialization=True,
         attention_backends=frozenset({"eager", "sdpa"}),
         host_inputs=prepare_supervised_rows,
     ),

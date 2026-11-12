@@ -15,6 +15,8 @@ KV prefix with explicit dense visibility; it does not add algorithm hooks or mut
 KV caches to the backbone.
 This is an eager reference path, including dense vocabulary projections; fused
 losses, sparse attention and sequence parallel execution are not implemented here.
+MTP projects only supervised rows and checkpoints its chunked projection/loss;
+other protocols retain their existing execution paths.
 The legacy training path retains the optimized kernels. MTP/DMTP CE is evaluated
 in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
 
@@ -228,7 +230,9 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
-Canonical objectives do not consume legacy `objective_chunk_blocks`,
+MTP accepts `objective_chunk_size` through objective options and maps the legacy
+`mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
+Other canonical objectives do not consume legacy `objective_chunk_blocks`,
 `objective_checkpointing`, `fused_logits_loss`, `mtp_objective_chunk_size` or
 `trim_loss_positions`. Non-default values fail validation; explicitly supplied
 legacy defaults produce a warning and do not enable those optimizations.
