@@ -147,4 +147,163 @@ class ConstantWarmupLR(_WarmupScheduler):
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
 
 
-__all__ = ["ConstantWarmupLR", "CosineAnnealingWarmupLR"]
+# --------------------------------------------------------------------------
+# Per-update closed forms. ``update`` is the 1-based optimizer update index:
+# the value is ``param_groups[*]["lr"]`` while update ``update`` runs (the
+# trainer's logged ``lr`` after completing update g is the value for g + 1).
+
+
+def warmup_updates(warmup_ratio: float, total_steps: int) -> int:
+    """Warmup length used by ``BF16Optimizer``: ``int(warmup_ratio * total_steps)``."""
+    return int(warmup_ratio * total_steps)
+
+
+def constant_warmup_lr(update: int, base_lr: float, warmup_updates: int) -> float:
+    """``constant`` schedule: ``update / W * base`` for ``update <= W``, else base.
+
+    Same float expression as ``_WarmupScheduler.get_lr`` (``last_epoch + 1 ==
+    update``), so the scheduler and this helper agree bit for bit.
+    """
+    if update < 1:
+        raise ValueError(f"update is 1-based, got {update}")
+    if update <= warmup_updates:
+        return update / warmup_updates * base_lr
+    return base_lr
+
+
+def constant_linear_decay_lr(
+    update: int,
+    base_lr: float,
+    warmup_updates: int,
+    decay_start: int,
+    decay_end: int,
+) -> float:
+    """``constant_linear_decay``: ``constant`` through update D, then linear.
+
+    For ``D < update <= T``: ``base_lr * ((T - update + 1) / (T - D))`` (the
+    ratio is formed first, so update D+1 is exactly ``base_lr`` -- the value a
+    ``constant`` checkpoint at update <= D restores -- and update T is
+    ``base_lr * (1 / (T - D))``). Past T the rate is 0.0 (only reached by the
+    scheduler step that follows the last update).
+    """
+    _validate_decay_window(warmup_updates, decay_start, decay_end)
+    if update <= decay_start:
+        return constant_warmup_lr(update, base_lr, warmup_updates)
+    if update > decay_end:
+        return 0.0
+    return base_lr * ((decay_end - update + 1) / (decay_end - decay_start))
+
+
+def _validate_decay_window(warmup: int, decay_start: int, decay_end: int) -> None:
+    for name, value in (
+        ("warmup_updates", warmup),
+        ("decay_start", decay_start),
+        ("decay_end", decay_end),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an int, got {value!r}")
+    if not 0 <= warmup <= decay_start < decay_end:
+        raise ValueError(
+            "constant_linear_decay requires 0 <= warmup <= decay_start < "
+            f"decay_end, got warmup={warmup}, decay_start={decay_start}, "
+            f"decay_end={decay_end}"
+        )
+
+
+class _FlatThenLinearDecayLR(_LRScheduler):
+    """Post-warmup stage of ``constant_linear_decay``.
+
+    ``last_epoch`` counts post-warmup updates exactly like ``_FlatLR``: value
+    ``e`` produces the rate of update ``W + e + 1``. A ``constant`` scheduler
+    state therefore loads unchanged (this state is a superset of
+    ``_FlatLR``'s); the extra decay fields must match on load.
+    """
+
+    DECAY_FIELDS = ("lr_warmup_updates", "lr_decay_start_update", "lr_decay_end_update")
+
+    def __init__(self, optimizer, warmup_steps, decay_start, decay_end, last_epoch=-1):
+        _validate_decay_window(warmup_steps, decay_start, decay_end)
+        self.lr_warmup_updates = warmup_steps
+        self.lr_decay_start_update = decay_start
+        self.lr_decay_end_update = decay_end
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        update = self.lr_warmup_updates + self.last_epoch + 1
+        return [
+            constant_linear_decay_lr(
+                update,
+                base_lr,
+                self.lr_warmup_updates,
+                self.lr_decay_start_update,
+                self.lr_decay_end_update,
+            )
+            for base_lr in self.base_lrs
+        ]
+
+    def load_state_dict(self, state_dict):
+        for key in self.DECAY_FIELDS:
+            if key in state_dict and state_dict[key] != getattr(self, key):
+                raise ValueError(
+                    f"checkpoint scheduler has {key}={state_dict[key]} but this "
+                    f"run has {key}={getattr(self, key)}"
+                )
+        super().load_state_dict(state_dict)
+
+
+class ConstantLinearDecayWarmupLR(_WarmupScheduler):
+    """``constant`` (linear warmup to base, then flat) through update
+    ``decay_start``, then linear decay to ``base / (decay_end - decay_start)`` at
+    update ``decay_end``. See :func:`constant_linear_decay_lr`."""
+
+    def __init__(
+        self,
+        optimizer,
+        total_steps: int,
+        warmup_steps: int = 0,
+        *,
+        decay_start: int,
+        decay_end: int,
+        last_epoch: int = -1,
+    ):
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}")
+        if not 0 <= warmup_steps < total_steps:
+            raise ValueError(
+                "warmup_steps must be in [0, total_steps), got "
+                f"{warmup_steps} for total_steps={total_steps}"
+            )
+        if decay_end > total_steps:
+            raise ValueError(f"decay_end={decay_end} exceeds total_steps={total_steps}")
+        base_scheduler = _FlatThenLinearDecayLR(
+            optimizer, warmup_steps, decay_start, decay_end, last_epoch=last_epoch
+        )
+        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+    def completed_updates(self) -> int:
+        """Optimizer updates already applied (from the restored counters)."""
+        return completed_updates_from_state(self.state_dict())
+
+
+def completed_updates_from_state(state_dict) -> int:
+    """Updates a saved ``constant``/``constant_linear_decay`` scheduler has seen.
+
+    Before warmup ends the outer ``last_epoch`` counts updates; from update W on
+    ``finished`` is set and the nested ``last_epoch`` counts updates past W.
+    """
+    if state_dict.get("finished"):
+        return int(state_dict["warmup_epochs"]) + int(
+            state_dict["after_scheduler_dict"]["last_epoch"]
+        )
+    return int(state_dict["last_epoch"])
+
+
+__all__ = [
+    "ConstantLinearDecayWarmupLR",
+    "ConstantWarmupLR",
+    "CosineAnnealingWarmupLR",
+    "completed_updates_from_state",
+    "constant_linear_decay_lr",
+    "constant_warmup_lr",
+    "warmup_updates",
+]
