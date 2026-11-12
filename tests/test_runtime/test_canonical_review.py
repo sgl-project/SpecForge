@@ -44,6 +44,7 @@ class CanonicalReviewTest(unittest.TestCase):
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
         runtime.draft_model = torch.nn.Linear(1, 1)
+        runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
             "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
             "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
