@@ -184,7 +184,8 @@ def initialize_draft(
 
     This entry point accepts neither checkpoint continuation nor training resume;
     those use load_draft and the training layer's state restoration respectively.
-    require_loaded names parameter/module prefixes that may not be initialized anew.
+    require_loaded names parameter/module prefixes that may not be initialized anew;
+    a prefix naming a head the draft disables (None) requires nothing.
     """
     if type(draft) is not DraftConfig:
         raise TypeError("draft must be a resolved DraftConfig")
@@ -224,6 +225,9 @@ def initialize_draft(
             if not prefix or name == prefix or name.startswith(prefix + ".")
         }
         if not selected:
+            # an optional head this draft disables (None) has nothing to load
+            if prefix and hasattr(preview, prefix) and getattr(preview, prefix) is None:
+                continue
             raise ValueError(f"unknown required parameter or module: {prefix!r}")
         missing = [
             name

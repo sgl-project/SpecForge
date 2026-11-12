@@ -389,3 +389,34 @@ class CanonicalReviewTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "would be ignored"):
                 resolve_run(Config.model_validate(raw))
+
+    def test_objective_frozen_head_that_the_draft_disables_needs_no_weights(self):
+        """DSpark freezes its confidence head at alpha 0, which a draft may omit."""
+        from specforge.training.assembly import build_model_bundle
+        from tests.test_modeling.test_canonical_dspark import model_config as dspark
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for confidence in (False, True):
+                cfg = run_config(
+                    target,
+                    dspark(confidence=confidence),
+                    training={
+                        "attention_backend": "eager",
+                        "objective_options": {"confidence_loss_alpha": 0.0},
+                    },
+                )
+                resolved = resolve_run(cfg)
+                with self.subTest(confidence=confidence):
+                    if confidence:
+                        # a present but untrained head still needs a source
+                        with self.assertRaisesRegex(ValueError, "require loaded"):
+                            build_model_bundle(
+                                resolved.config, algorithm=resolved.algorithm
+                            )
+                        continue
+                    bundle = build_model_bundle(
+                        resolved.config, algorithm=resolved.algorithm
+                    )
+                    self.assertIsNone(bundle.draft_model.confidence_head)
+                    self.assertEqual(bundle.model.frozen_parameters, ())
