@@ -51,7 +51,8 @@ class CanonicalExportTest(unittest.TestCase):
                 ):
                     with self.subTest(linked=linked, path=path):
                         self.assertEqual(
-                            Path(CheckpointManager.resolve_resume_dir(path)), step
+                            Path(CheckpointManager.resolve_resume_dir(path)).resolve(),
+                            step.resolve(),
                         )
                         self.assertEqual(read_draft(path).config, config)
                         self.assertEqual(read_export(path)[0].config, config)
