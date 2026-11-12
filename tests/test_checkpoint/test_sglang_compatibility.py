@@ -22,6 +22,9 @@ from transformers import AutoConfig, PretrainedConfig
 
 from specforge.checkpoint.formats.sglang import NON_COMPUTATIONAL_READS, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
+from specforge.checkpoint.formats.sglang.models.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.norm import RMSNormSpec
@@ -35,6 +38,7 @@ from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
+from tests.test_checkpoint.test_native_presets import native_configs
 from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
 from tests.test_checkpoint.test_sglang_export import serving_configs
 from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -290,6 +294,7 @@ class SGLangCompatibilityTest(unittest.TestCase):
             configs.append(multi_axis_config(serving_configs()[-1]))
             configs.append(dspark_config(bound=True, confidence=False))
             if torch.cuda.is_available():
+                configs.extend(native_configs(small=True))
                 base = mtp_config()
                 configs.append(
                     replace(
@@ -324,8 +329,8 @@ class SGLangCompatibilityTest(unittest.TestCase):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         torch.manual_seed(12)
-        fields = convert_config(config)
         native = config.architecture == "MTPDraftModel"
+        fields = convert_qwen3_5_config(config) if native else convert_config(config)
         device = "cuda" if native else "cpu"
         if native:
             from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig

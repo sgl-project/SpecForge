@@ -8,6 +8,34 @@ Export reads that configuration; no training YAML is needed.
 specforge export --checkpoint CHECKPOINT_PATH --output-dir MODEL
 ```
 
+`--export-mode standalone` is the default for every architecture, including MTP,
+DFlash and DSpark. It publishes a canonical draft directory. Native merge-back is
+an explicit public export mode and does not require a serving engine:
+
+```bash
+specforge export --export-mode native --checkpoint CHECKPOINT_PATH \
+  --target-model TARGET --output-dir MERGED_TARGET
+```
+
+Native export selects an adapter by target model type and draft architecture.
+A missing adapter is an error; it never falls back to standalone. Registering an
+adapter does not change standalone exports. Dense Qwen3.5 MTP is the current
+built-in adapter; other combinations can register their own implementation.
+`--copy-target` is native-only. Native artifacts retain the target's configuration
+format, with `specforge_artifact: {format: native, version: 1}`; reload the canonical
+draft checkpoint to continue draft training.
+
+Native export requires explicit target computation fields and checks them against
+the draft without changing the target configuration. Missing or conflicting fields
+are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
+tensors and links unaffected shards. `--copy-target` copies unaffected shards for
+a self-contained directory. Embedding/head copies are written under native names;
+The target is not modified.
+
+`--converter sglang` converts a standalone draft into a serving format. Native
+export already writes the target format, so explicit native mode takes no
+`--converter`. Serving compatibility is separate from these publication modes.
+
 HF export writes canonical configuration, exact owned tensors, and model code
 for `AutoModel.from_pretrained(MODEL, trust_remote_code=True)`. SpecForge need
 not be installed. Use `specforge.loading.load_draft(MODEL, target=TARGET)` inside
@@ -66,10 +94,16 @@ first. Training optimizer/RNG state remains owned by the training checkpoint man
 
 ```bash
 specforge export --converter sglang --checkpoint CHECKPOINT_PATH --output-dir SERVING
-# Native dense Qwen3.5 MTP: target checkpoint with its MTP tensors replaced.
-specforge export --converter sglang --checkpoint CHECKPOINT_PATH --target-model TARGET \
-  --output-dir SERVING
+# Explicit native export is independent of SGLang.
+specforge export --export-mode native --checkpoint CHECKPOINT_PATH --target-model TARGET \
+  --output-dir MERGED_TARGET
 ```
+
+For compatibility, an old `--converter sglang` command with no export mode still
+performs native merge-back for Qwen3.5 MTP, with a migration warning. Replace
+`--converter sglang` with `--export-mode native`. This exception is fixed to the
+historical target/architecture pair; future registrations do not extend it.
+Legacy `--to` exporters remain unchanged and do not accept `--export-mode`.
 
 The converter targets SGLang commit
 `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, also pinned in CI. Each artifact records
@@ -85,7 +119,7 @@ loading rejects a serving artifact.
 | Domino | `DFlashDraftModel` with explicit Domino projector settings |
 | DSpark | `DSparkDraftModel`; Markov head required; confidence head optional in static mode |
 | EAGLE3 | `LlamaForCausalLMEagle3`; embedding bound, draft head owned |
-| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default or multi-axis RoPE |
+| MTP | No standalone SGLang converter; use explicit native export for dense Qwen3.5 merge-back |
 | DSpine, DMTP, P-EAGLE | Rejected: this pinned SGLang has no matching serving implementation |
 
 Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
@@ -108,13 +142,6 @@ prefixes are removed for serving, vocabulary readiness is validated rather than
 serialized, and Domino uses SGLang's registered DFlash architecture name. These
 are format changes; tensors are not cast or transformed.
 
-Native export requires explicit target computation fields, checks them against
-the draft, and preserves the target configuration. Missing or conflicting fields
-are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
-tensors and links unaffected shards. `--copy-target` copies unaffected shards for
-a self-contained directory. Embedding/head copies are written under native names;
-SGLang's worker also attaches the target token modules. The target is not modified.
-
 The pinned compatibility gate constructs real SGLang models and loads converted
 weights, records top-level and nested configuration reads for non-native models, and compares
 FP32 reference outputs. It checks that exported weights reach serving loaders,
@@ -131,3 +158,20 @@ SPECFORGE_SGLANG_EXPORT_TESTS=1 TORCHDYNAMO_DISABLE=1 \
   python -m unittest tests.test_checkpoint.test_sglang_export \
   tests.test_checkpoint.test_sglang_compatibility -v
 ```
+
+## Adding family adapters
+
+Keep family-specific code in `specforge/checkpoint/formats/native/models/` or
+`specforge/checkpoint/formats/sglang/models/`. Add an explicit import in that
+package's `__init__.py` so registration runs when the package loads.
+
+Native adapters call `register_native_target(model_type, architecture, ...)` and
+provide validation and export callbacks. They can reuse `native/writer.py` for
+weight checks and publication without changing the public exporter.
+Standalone serving converters use `register_converter(architecture)`; shared
+algorithm conversions remain in `sglang/converters.py`.
+
+The SGLang Qwen3.5 module is a compatibility helper for the historical native
+command and parity tests, not a standalone MTP converter. Do not register it
+under `MTPDraftModel`: that would incorrectly select Qwen3.5 for every target.
+Native registration never selects an export mode or adds standalone engine support.

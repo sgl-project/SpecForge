@@ -208,6 +208,9 @@ def initialize_draft(
     target_config = _target_config(target, cache_dir)
     if target_config is not None:
         validate_target(draft, target_config)
+        from specforge.checkpoint.native import validate_target_initialization
+
+        validate_target_initialization(draft, target_config, from_target)
     checkpoint = (
         None
         if weights_from is None

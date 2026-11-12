@@ -46,4 +46,4 @@ def artifact_metadata():
 
 
 # Import for registration, after the registry is defined.
-from . import converters  # noqa: E402,F401
+from . import converters, models  # noqa: E402,F401

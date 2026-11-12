@@ -65,7 +65,7 @@ class ExportReviewTest(unittest.TestCase):
 
     def test_cli_defaults_to_canonical_and_rejects_legacy_options_early(self):
         args = ["export", "--checkpoint", "missing", "--output-dir", "out"]
-        with patch("specforge.export.to_hf.export_to_hf") as export:
+        with patch("specforge.export.model.export_draft") as export:
             result = CliRunner().invoke(cli, args)
             self.assertEqual(result.exit_code, 0, result.output)
             export.assert_called_once()
@@ -85,10 +85,11 @@ class ExportReviewTest(unittest.TestCase):
 
     def test_sglang_cli_options_and_forwarding(self):
         args = ["export", "--checkpoint", "checkpoint", "--output-dir", "out"]
-        with patch("specforge.export.to_sglang.export_to_sglang") as export:
+        with patch("specforge.export.model.export_draft") as export:
             for options, error in (
+                (["--copy-target"], "requires native export"),
                 (["--converter", "sglang", "--to", "hf"], "mutually exclusive"),
-                (["--copy-target"], "requires --converter sglang"),
+                (["--to", "hf", "--copy-target"], "cannot be combined"),
             ):
                 result = CliRunner().invoke(cli, args + options)
                 self.assertEqual(result.exit_code, 2, result.output)
@@ -115,6 +116,8 @@ class ExportReviewTest(unittest.TestCase):
                 vocab_mapping_path=None,
                 target_model="target",
                 copy_target=True,
+                export_mode=None,
+                converter="sglang",
             )
 
     def test_run_root_uses_complete_steps_and_rejects_multiple_runs(self):

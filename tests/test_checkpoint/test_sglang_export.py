@@ -2,6 +2,7 @@
 
 import json
 import unittest
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from specforge.checkpoint import save_draft
+from specforge.checkpoint.formats.native.writer import export_native
 from specforge.checkpoint.formats.sglang import (
     _CONVERTERS,
     SGLANG_COMMIT,
@@ -19,7 +21,9 @@ from specforge.checkpoint.formats.sglang import (
     convert_config,
 )
 from specforge.checkpoint.formats.sglang.converters import serving_weights
-from specforge.checkpoint.formats.sglang.native import export_native
+from specforge.checkpoint.formats.sglang.models.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.tensors import TensorStore
 from specforge.cli import main
 from specforge.config.draft.logits import NoLogitTransformSpec
@@ -65,7 +69,14 @@ class SGLangExportTest(unittest.TestCase):
     def test_registry_and_artifact_boundary(self):
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/test.yaml"
         self.assertIn("SGLANG_COMMIT: " + SGLANG_COMMIT, workflow.read_text())
-        self.assertEqual(set(_CONVERTERS), {c.architecture for c in configurations()})
+        self.assertEqual(
+            set(_CONVERTERS),
+            {
+                c.architecture
+                for c in configurations()
+                if c.architecture != "MTPDraftModel"
+            },
+        )
         for config in serving_configs():
             with (
                 self.subTest(architecture=config.architecture),
@@ -184,7 +195,7 @@ class SGLangExportTest(unittest.TestCase):
             norm_config=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1),
         )
         with self.assertRaisesRegex(ValueError, "default or multi-axis"):
-            convert_config(
+            convert_qwen3_5_config(
                 replace(
                     config,
                     attention_configs={
@@ -251,12 +262,21 @@ class SGLangExportTest(unittest.TestCase):
                     json.dumps({"weight_map": index})
                 )
                 save_draft(model, root / "draft")
-                export_to_sglang(
-                    str(root / "draft"),
-                    None,
-                    str(root / "served"),
-                    target_model=str(target),
-                    copy_target=copy,
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always", FutureWarning)
+                    export_to_sglang(
+                        str(root / "draft"),
+                        None,
+                        str(root / "served"),
+                        target_model=str(target),
+                        copy_target=copy,
+                    )
+                self.assertTrue(
+                    any(
+                        issubclass(w.category, FutureWarning)
+                        and "export-mode native" in str(w.message)
+                        for w in captured
+                    )
                 )
                 restored = TensorStore(root / "served")
                 exported = json.loads((root / "served" / "config.json").read_text())
@@ -317,19 +337,22 @@ class SGLangExportTest(unittest.TestCase):
                         ):
                             export_native(
                                 config,
-                                convert_config(config),
                                 state,
                                 target,
                                 root / "bad",
                             )
                     (target / "config.json").write_text(json.dumps(payload))
+                    state = model.state_dict()
                     for changed, error in (
                         (
-                            {k: v for k, v in state.items() if k != "fc.weight"},
+                            {k: v for k, v in state.items() if k != "fusion.fc.weight"},
                             "coverage",
                         ),
-                        (state | {"renamed.weight": state["fc.weight"]}, "coverage"),
-                        (state | {"fc.weight": torch.zeros(1)}, "shape"),
+                        (
+                            state | {"renamed.weight": state["fusion.fc.weight"]},
+                            "unexpected",
+                        ),
+                        (state | {"fusion.fc.weight": torch.zeros(1)}, "shape"),
                     ):
                         with patch.object(
                             TensorStore,
@@ -339,7 +362,6 @@ class SGLangExportTest(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, error):
                                 export_native(
                                     config,
-                                    convert_config(config),
                                     changed,
                                     target,
                                     root / "bad",
@@ -368,7 +390,6 @@ class SGLangExportTest(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, "quantized"):
                                 export_native(
                                     config,
-                                    convert_config(config),
                                     state,
                                     target,
                                     root / "bad",

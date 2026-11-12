@@ -1,12 +1,13 @@
 """Export canonical or imported legacy weights to a pinned serving format."""
 
 import argparse
+import warnings
 
 from specforge.checkpoint.draft_dir import write_artifact
 from specforge.checkpoint.formats.sglang import artifact_metadata, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
 
-from .canonical import read_export
+from .model import export_draft
 
 
 def export_to_sglang(
@@ -18,43 +19,60 @@ def export_to_sglang(
     copy_target=False,
     vocab_mapping_path=None,
     weight_map=None,
+    export_mode=None,
 ):
     if weight_map is not None:
         raise ValueError(
             "arbitrary weight_map overrides are not supported by the serving format"
         )
-    checkpoint, state, _ = read_export(
+    return export_draft(
         checkpoint_path,
-        draft_config=draft_config_path,
-        target=target_model,
-        vocab_mapping=vocab_mapping_path,
+        draft_config_path,
+        output_dir,
+        converter="sglang",
+        export_mode=export_mode,
+        target_model=target_model,
+        copy_target=copy_target,
+        vocab_mapping_path=vocab_mapping_path,
     )
+
+
+def write_sglang(checkpoint, state, output_dir):
     fields = convert_config(checkpoint.config, hf_metadata=checkpoint.hf_metadata)
     weights = serving_weights(checkpoint.config, state)
-    if checkpoint.config.architecture == "MTPDraftModel":
-        from specforge.checkpoint.formats.sglang.native import export_native
-
-        export_native(
-            checkpoint.config,
-            fields,
-            weights,
-            target_model,
-            output_dir,
-            copy_target=copy_target,
-        )
-    else:
-        if copy_target:
-            raise ValueError("copy_target is only supported for native MTP export")
-        dtypes = {
-            str(t.dtype).removeprefix("torch.")
-            for t in weights.values()
-            if t.is_floating_point()
-        }
-        if len(dtypes) != 1:
-            raise ValueError("SGLang export requires one floating-point dtype")
-        fields["torch_dtype"] = dtypes.pop()
-        write_artifact(output_dir, fields, weights, metadata=artifact_metadata())
+    dtypes = {
+        str(t.dtype).removeprefix("torch.")
+        for t in weights.values()
+        if t.is_floating_point()
+    }
+    if len(dtypes) != 1:
+        raise ValueError("SGLang export requires one floating-point dtype")
+    fields["torch_dtype"] = dtypes.pop()
+    write_artifact(output_dir, fields, weights, metadata=artifact_metadata())
     return output_dir
+
+
+def legacy_native_mode(config, target_model):
+    """Preserve only the historical Qwen3.5 command; never consult new registrations."""
+    if config.architecture != "MTPDraftModel":
+        return False
+    if target_model is None:
+        raise ValueError(
+            "historical MTP serving export requires --target-model; use --export-mode standalone for a canonical draft"
+        )
+    from specforge.checkpoint.resolve import read_target_config
+
+    if read_target_config(target_model).get("model_type") != "qwen3_5_text":
+        return False
+    from specforge.checkpoint.formats.sglang.models.qwen3_5 import convert_config
+
+    convert_config(config)
+    warnings.warn(
+        "Implicit Qwen3.5 native export is deprecated; replace --converter sglang with --export-mode native",
+        FutureWarning,
+        stacklevel=3,
+    )
+    return True
 
 
 def main(argv=None):

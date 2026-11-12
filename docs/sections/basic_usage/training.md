@@ -736,8 +736,9 @@ both formats omit bound target embeddings and LM heads; HF callers must bind tar
 running the model. Restore vocabulary mappings before export; export does not
 replace checkpoint tensors.
 
-SGLang conversion supports DFlash, DFlash2, Domino, DSpark, EAGLE3 and native
-dense Qwen3.5 MTP within the pinned serving format's representable structures.
+SGLang conversion supports DFlash, DFlash2, Domino, DSpark and EAGLE3 within
+the pinned serving format's representable structures. Dense Qwen3.5 MTP uses
+`--export-mode native --target-model TARGET` for native merge-back.
 DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
 exported. Mixed per-layer causality is also rejected by the current pin.
 See [draft export](../../draft_export.md) for restrictions and validation.
@@ -747,7 +748,7 @@ saved precision when tensors share one floating-point dtype; SGLang casts to
 its serving dtype. Mixed-dtype HF artifacts retain the original tensors, but
 public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
-For canonical native MTP, use `--converter sglang --target-model TARGET`. It rewrites
+For canonical native MTP, use `--export-mode native --target-model TARGET`. It rewrites
 shards containing old native tensors and links unchanged shards; add
 `--copy-target` for a self-contained directory. The following legacy merge
 script remains available for historical training outputs.

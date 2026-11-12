@@ -19,6 +19,10 @@ def read_artifact_metadata(config):
     metadata = config["specforge_artifact"]
     if not isinstance(metadata, dict):
         raise ValueError("artifact metadata must be an object")
+    if metadata.get("format") == "native":
+        raise ValueError(
+            "native artifacts are target checkpoints; load the canonical draft checkpoint"
+        )
     if metadata.get("format") == "sglang":
         raise ValueError(
             "SGLang artifacts are serving-only; load the canonical checkpoint"

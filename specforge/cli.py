@@ -284,6 +284,12 @@ def train(
 )
 @click.option("--converter", type=click.Choice(("sglang",)), default=None)
 @click.option(
+    "--export-mode",
+    type=click.Choice(("standalone", "native")),
+    default=None,
+    help="Standalone draft (default) or native target merge-back.",
+)
+@click.option(
     "--copy-target",
     is_flag=True,
     help="Copy unchanged native target shards instead of linking them.",
@@ -320,6 +326,7 @@ def export(
     ctx: click.Context,
     legacy_format: Optional[str],
     converter: Optional[str],
+    export_mode: Optional[str],
     copy_target: bool,
     checkpoint: str,
     draft_config: Optional[str],
@@ -334,8 +341,10 @@ def export(
         raise click.UsageError(
             "--converter and legacy --to are mutually exclusive", ctx
         )
-    if copy_target and converter != "sglang":
-        raise click.UsageError("--copy-target requires --converter sglang", ctx)
+    if legacy_format is not None and (export_mode is not None or copy_target):
+        raise click.UsageError(
+            "--export-mode/--copy-target cannot be combined with legacy --to", ctx
+        )
     if legacy_format is None:
         if embedding_source is not None:
             raise click.UsageError(
@@ -351,26 +360,24 @@ def export(
                 "reads the vocabulary mapping from the checkpoint",
                 ctx,
             )
-        if converter == "sglang":
-            from specforge.export.to_sglang import export_to_sglang
+        from specforge.export.model import check_export_options, export_draft
 
-            export_to_sglang(
-                checkpoint,
-                draft_config,
-                output_dir,
-                vocab_mapping_path=vocab_mapping,
-                target_model=target_model,
-                copy_target=copy_target,
-            )
-            return 0
-        from specforge.export.to_hf import export_to_hf
-
-        export_to_hf(
+        options = dict(
+            export_mode=export_mode,
+            converter=converter,
+            target_model=target_model,
+            copy_target=copy_target,
+        )
+        try:
+            check_export_options(**options)
+        except ValueError as error:
+            raise click.UsageError(str(error), ctx) from error
+        export_draft(
             checkpoint,
             draft_config,
             output_dir,
+            **options,
             vocab_mapping_path=vocab_mapping,
-            target_model=target_model,
         )
         return 0
     if draft_config is None:

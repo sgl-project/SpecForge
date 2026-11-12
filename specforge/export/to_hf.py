@@ -25,11 +25,7 @@ def export_to_hf(
     target_model: Optional[str] = None,
 ) -> str:
     """Publish canonical config, exact owned weights and standalone HF code."""
-    from specforge.checkpoint.draft_dir import write_artifact
-    from specforge.checkpoint.formats.hf import bundle_code
-    from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
-
-    from .canonical import read_export
+    from .model import export_draft
 
     if embedding_key != "model.embed_tokens.weight":
         raise ValueError("custom embedding keys are not part of canonical export")
@@ -38,12 +34,21 @@ def export_to_hf(
             "embedding_source is not supported for canonical export; use target_model "
             "(--target-model). Target embeddings remain external."
         )
-    checkpoint, state, model_class = read_export(
+    return export_draft(
         checkpoint_path,
-        draft_config=draft_config_path,
-        target=target_model,
-        vocab_mapping=vocab_mapping_path,
+        draft_config_path,
+        output_dir,
+        export_mode="standalone",
+        target_model=target_model,
+        vocab_mapping_path=vocab_mapping_path,
     )
+
+
+def write_hf(checkpoint, state, model_class, output_dir):
+    from specforge.checkpoint.draft_dir import write_artifact
+    from specforge.checkpoint.formats.hf import bundle_code
+    from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
+
     config = SpecForgeDraftConfig(checkpoint.config, **checkpoint.hf_metadata).to_dict()
 
     def write_code(directory):
