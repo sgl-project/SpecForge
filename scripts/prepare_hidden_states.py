@@ -64,7 +64,12 @@ def parse_args():
 
     # model-related arguments
     model_group = parser.add_argument_group("model")
-    model_group.add_argument("--target-model-path", type=str, required=True)
+    model_group.add_argument(
+        "--target-model-path",
+        type=str,
+        default=None,
+        help="Target model; defaults to model.target_model_path of --config",
+    )
     model_group.add_argument(
         "--strategy",
         type=str,
@@ -73,7 +78,16 @@ def parse_args():
     )
     draft_group = model_group.add_mutually_exclusive_group()
     draft_group.add_argument(
-        "--draft", help="Canonical draft YAML file (including presets)"
+        "-c",
+        "--config",
+        help=(
+            "Canonical run YAML; capture follows its draft, initialization, "
+            "objective, loss and weighting"
+        ),
+    )
+    draft_group.add_argument(
+        "--draft",
+        help="Canonical draft YAML file (including presets); default objective and loss",
     )
     draft_group.add_argument(
         "--draft-model-config",
@@ -152,6 +166,18 @@ def parse_args():
     for name in ("batch_size", "io_queue_size", "file_group_size", "capture_timeout"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.config:
+        from specforge.config.schema import load_config
+
+        run_target = load_config(args.config).model.target_model_path
+        if args.target_model_path not in (None, run_target):
+            parser.error(
+                f"--target-model-path {args.target_model_path!r} differs from "
+                f"model.target_model_path {run_target!r} in {args.config}"
+            )
+        args.target_model_path = run_target
+    elif args.target_model_path is None:
+        parser.error("--target-model-path is required without --config")
     return args
 
 
@@ -250,6 +276,31 @@ def resolve_offline_capture_plan(
 ) -> OfflineCapturePlan:
     """Resolve capture layers and output keys through training composition."""
 
+    if getattr(args, "config", None):
+        from specforge.config.draft import DraftConfig
+        from specforge.config.schema import load_config
+
+        cfg = load_config(args.config)
+        # offline capture mode; the run's other data settings do not shape the plan
+        data = cfg.data.model_copy(
+            update={"hidden_states_path": args.output_path or "__offline_capture__"}
+        )
+        resolved = resolve_offline_capture(
+            cfg.model_copy(update={"data": data}), target_config=target_config
+        )
+        if type(resolved.draft_config) is not DraftConfig:
+            raise ValueError(
+                f"{args.config} is not a canonical run (draft, initialization or "
+                "resume); use --strategy and --draft-model-config for legacy runs"
+            )
+        return OfflineCapturePlan(
+            strategy=resolved.run.algorithm.name,
+            draft_config=resolved.draft_config,
+            capture_method=resolved.capture_method,
+            capture_layers=resolved.capture_layers,
+            layout=resolved.layout,
+            loss_mask_filter=resolved.loss_mask_filter,
+        )
     strategy = getattr(args, "strategy", "eagle3")
     model = {
         "target_model_path": args.target_model_path,
@@ -509,7 +560,8 @@ def main():
             Path(__file__).parent.parent, "cache", "hidden_states"
         )
 
-    if args.draft:
+    canonical = bool(args.draft or args.config)
+    if canonical:
         from specforge.checkpoint.resolve import read_target_config
 
         target_model_config = read_target_config(
@@ -531,7 +583,7 @@ def main():
         print_args_with_dots(args)
         if _rank() == 0:
             print("Resolved draft model config:")
-            if args.draft:
+            if canonical:
                 import json
 
                 from specforge.config.draft.codec import encode_config
@@ -545,14 +597,14 @@ def main():
             f"{list(capture_plan.capture_layers)}"
         )
 
-        target_text_config = getattr(
-            target_model_config, "text_config", target_model_config
-        )
-        target_vocab_size = int(
-            target_text_config["vocab_size"]
-            if isinstance(target_text_config, dict)
-            else target_text_config.vocab_size
-        )
+        if canonical:
+            # the draft vocabulary spans the target logits, padded_vocab_size included
+            target_vocab_size = capture_plan.draft_config.vocab_size
+        else:
+            target_text_config = getattr(
+                target_model_config, "text_config", target_model_config
+            )
+            target_vocab_size = int(target_text_config.vocab_size)
         if draft_vocab_size > target_vocab_size:
             raise ValueError(
                 f"draft_vocab_size={draft_vocab_size} exceeds target "

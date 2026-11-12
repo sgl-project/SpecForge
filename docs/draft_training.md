@@ -266,13 +266,17 @@ a complete checkpoint, `weights_from`, `from_target`, or a target binding.
 Freezing a newly initialized parameter fails before model allocation; partial
 imports must cover every frozen parameter, including tied aliases.
 
-Prepare canonical EAGLE3/P-EAGLE records using the same draft YAML as training:
+Prepare canonical records from the run YAML used for training, so the records
+carry what its objective and loss read (for example `target_last_hidden_states`
+for `loss: {kind: kl}`):
 
 ```bash
-python scripts/prepare_hidden_states.py --draft /configs/eagle3.yaml \
-  --target-model-path /models/target --server-urls http://localhost:30000 \
+python scripts/prepare_hidden_states.py -c /configs/run.yaml \
+  --server-urls http://localhost:30000 \
   --data-path /data/train.jsonl --output-path /data/canonical-features
 ```
 
-`--draft` and the legacy `--draft-model-config` are mutually exclusive. The
+`--target-model-path` defaults to the run's `model.target_model_path`.
+`--draft /configs/eagle3.yaml` captures for the default objective and loss only.
+`-c`, `--draft` and the legacy `--draft-model-config` are mutually exclusive. The
 canonical YAML selects the architecture, capture layers and output schema.

@@ -274,6 +274,76 @@ if __name__ == "__main__":
 
 
 class CanonicalCaptureTest(unittest.TestCase):
+    def test_run_config_captures_what_its_loss_needs(self):
+        """--draft resolves the default loss; -c run.yaml carries training.loss."""
+        import yaml
+
+        from specforge.config.draft.codec import encode_config
+        from tests.test_config.draft_fixtures import draft_config
+        from tests.test_runtime.test_canonical_training import target_directory
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            draft = root / "draft.yaml"
+            draft.write_text(yaml.safe_dump(encode_config(draft_config())))
+            run = root / "run.yaml"
+            run.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"target_model_path": str(target)},
+                        "draft": str(draft),
+                        "data": {"hidden_states_path": str(root / "features")},
+                        "training": {
+                            "attention_backend": "eager",
+                            "loss": {"kind": "kl"},
+                        },
+                    }
+                )
+            )
+            argv = [
+                "prepare_hidden_states.py",
+                "--server-urls",
+                "http://localhost:30000",
+                "--data-path",
+                "data.jsonl",
+            ]
+            selections = {
+                "draft": ["--draft", str(draft), "--target-model-path", str(target)],
+                "config": ["-c", str(run)],
+            }
+            plans = {}
+            for name, selection in selections.items():
+                with mock.patch("sys.argv", argv + selection):
+                    args = parse_args()
+                self.assertEqual(args.target_model_path, str(target))
+                plans[name] = resolve_offline_capture_plan(args)
+            self.assertIsNone(plans["draft"].layout.last_hidden_feature)
+            self.assertEqual(
+                plans["config"].layout.last_hidden_feature,
+                "target_last_hidden_states",
+            )
+            other = ["--target-model-path", str(root / "other")]
+            with (
+                mock.patch("sys.argv", argv + selections["config"] + other),
+                mock.patch("sys.stderr"),
+                self.assertRaises(SystemExit),
+            ):
+                parse_args()
+            legacy = root / "legacy.yaml"
+            legacy.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"target_model_path": str(target)},
+                        "data": {"hidden_states_path": str(root / "features")},
+                    }
+                )
+            )
+            with mock.patch("sys.argv", argv + ["-c", str(legacy)]):
+                args = parse_args()
+            with self.assertRaisesRegex(ValueError, "not a canonical run"):
+                resolve_offline_capture_plan(args)
+
     def test_eagle_yaml_capture_matches_training_inputs(self):
         import yaml
 
