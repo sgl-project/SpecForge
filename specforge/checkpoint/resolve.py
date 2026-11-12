@@ -1,6 +1,9 @@
 """Select a reader by configuration/format, never by directory names."""
 
+import glob
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +26,73 @@ def register_adapter(name, matches, read):
     if not callable(matches) or not callable(read):
         raise TypeError("adapter detection and reader must be callable")
     _ADAPTERS[name] = (matches, read)
+
+
+def resolve_run_directory(path: str) -> str:
+    """Resolve one unambiguous resume target to its checkpoint directory.
+
+    A run output directory is convenient in declarative configs, but it
+    must never choose between unrelated runs silently.  Prefer its single
+    complete ``*-latest`` pointer; when symlinks are unavailable, fall back
+    to the highest complete ``<run-id>-stepN`` directory only if all
+    candidates belong to the same run id.
+    """
+    path = str(path)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.basename(path) == "training_state.pt":
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
+        path = os.path.dirname(path)
+    if os.path.isfile(os.path.join(path, "training_state.pt")):
+        return path
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"checkpoint path does not exist: {path}")
+
+    latest = []
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
+        resolved = os.path.realpath(candidate)
+        if os.path.isfile(os.path.join(resolved, "training_state.pt")):
+            latest.append(resolved)
+    latest = sorted(set(latest))
+    if len(latest) == 1:
+        return latest[0]
+    if len(latest) > 1:
+        raise ValueError(
+            f"resume root {path} contains multiple complete *-latest runs: "
+            f"{latest}; select one checkpoint explicitly"
+        )
+
+    by_run: dict[str, list[tuple[int, str]]] = {}
+    pattern = re.compile(r"^(.+)-step(\d+)$")
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
+        match = pattern.match(os.path.basename(candidate))
+        if match and os.path.isfile(os.path.join(candidate, "training_state.pt")):
+            by_run.setdefault(match.group(1), []).append(
+                (int(match.group(2)), candidate)
+            )
+    if not by_run:
+        raise FileNotFoundError(f"no complete checkpoint found under {path}")
+    if len(by_run) > 1:
+        raise ValueError(
+            f"resume root {path} contains multiple checkpoint runs: "
+            f"{sorted(by_run)}; select one checkpoint explicitly"
+        )
+    candidates = next(iter(by_run.values()))
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def resolve_checkpoint_path(source, *, cache_dir=None, config_only=False):
+    """Resolve model directories and training run roots without choosing a run silently."""
+    path = resolve_directory(source, cache_dir=cache_dir, config_only=config_only)
+    if path.is_dir() and not any(
+        (path / name).exists() for name in ("config.json", "training_state.pt")
+    ):
+        # Config-less historical model directories remain valid with legacy_config.
+        if not any(path.glob("*.safetensors")) and not any(path.glob("*.bin")):
+            path = Path(resolve_run_directory(str(path)))
+    return path
 
 
 def resolve_directory(source, *, cache_dir=None, config_only=False):
@@ -107,7 +177,7 @@ def read_checkpoint(
     cache_dir=None,
     check_target=True,
 ):
-    path = resolve_directory(source, cache_dir=cache_dir)
+    path = resolve_checkpoint_path(source, cache_dir=cache_dir)
     directory = path.parent if path.is_file() else path
     config_path = directory / "config.json"
     if config_path.exists():

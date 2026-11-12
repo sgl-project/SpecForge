@@ -46,9 +46,11 @@ def _legacy_settings(cfg):
 
 
 def _is_canonical_checkpoint(cfg, source):
-    from specforge.checkpoint.resolve import read_json, resolve_directory
+    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
 
-    path = resolve_directory(source, cache_dir=cfg.model.cache_dir, config_only=True)
+    path = resolve_checkpoint_path(
+        source, cache_dir=cfg.model.cache_dir, config_only=True
+    )
     config = (path.parent if path.is_file() else path) / "config.json"
     return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
 
