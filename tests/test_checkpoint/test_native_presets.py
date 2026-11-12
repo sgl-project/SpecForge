@@ -12,7 +12,9 @@ import yaml
 from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.formats.sglang import convert_config
+from specforge.checkpoint.formats.native.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.checkpoint.tensors import TensorStore
 from specforge.config.draft.codec import parse_draft
@@ -88,7 +90,7 @@ class NativePresetTest(unittest.TestCase):
                 weights["model.language_model.embed_tokens.weight"] = torch.randn(
                     64, 32
                 )
-                payload = convert_config(config) | {
+                payload = convert_qwen3_5_config(config) | {
                     "model_type": "qwen3_5_text",
                     "tie_word_embeddings": True,
                 }

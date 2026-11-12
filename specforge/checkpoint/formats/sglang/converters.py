@@ -393,13 +393,6 @@ def eagle3(config):
     return result
 
 
-@register_converter("MTPDraftModel")
-def mtp(config):
-    from ..native.qwen3_5 import convert_config
-
-    return convert_config(config)
-
-
 def unsupported(config):
     raise ValueError(
         f"SGLang export: pinned SGLang has no serving implementation for {config.architecture}"

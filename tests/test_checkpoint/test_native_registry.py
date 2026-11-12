@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 import torch
 from safetensors.torch import save_file
 
-from specforge.checkpoint.formats.sglang.native import write_native
+from specforge.checkpoint.formats.sglang import convert_config
+from specforge.checkpoint.formats.sglang.native import export_native, write_native
 from specforge.checkpoint.native import (
     _TARGETS,
     register_native_target,
@@ -21,6 +22,33 @@ from specforge.export.to_sglang import export_to_sglang
 
 
 class NativeRegistryTest(unittest.TestCase):
+    def test_mtp_conversion_requires_a_target_implementation(self):
+        config = SimpleNamespace(architecture="MTPDraftModel")
+        with self.assertRaisesRegex(ValueError, "no SGLang converter"):
+            convert_config(config)
+        validate, export = Mock(), Mock()
+        with patch.dict(_TARGETS), TemporaryDirectory() as tmp:
+            register_native_target(
+                "another_target",
+                "MTPDraftModel",
+                source_prefix="next_token",
+                validate=validate,
+                export=export,
+            )
+            source = Path(tmp)
+            payload = {"model_type": "another_target"}
+            (source / "config.json").write_text(json.dumps(payload))
+            export_native(config, {}, source, source / "output")
+            validate.assert_called_once_with(config, payload)
+            export.assert_called_once_with(
+                config,
+                {},
+                source,
+                payload,
+                source / "output",
+                copy_target=False,
+            )
+
     def test_registered_native_uses_its_own_validation_and_layout(self):
         config = SimpleNamespace(architecture="ExternalNative", target_bindings=())
         state = {"weight": torch.ones(2)}

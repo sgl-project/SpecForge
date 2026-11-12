@@ -12,6 +12,9 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from specforge.checkpoint import save_draft
+from specforge.checkpoint.formats.native.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.formats.sglang import (
     _CONVERTERS,
     SGLANG_COMMIT,
@@ -20,6 +23,7 @@ from specforge.checkpoint.formats.sglang import (
 )
 from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.checkpoint.formats.sglang.native import export_native
+from specforge.checkpoint.native import is_native_architecture
 from specforge.checkpoint.tensors import TensorStore
 from specforge.cli import main
 from specforge.config.draft.logits import NoLogitTransformSpec
@@ -65,7 +69,14 @@ class SGLangExportTest(unittest.TestCase):
     def test_registry_and_artifact_boundary(self):
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/test.yaml"
         self.assertIn("SGLANG_COMMIT: " + SGLANG_COMMIT, workflow.read_text())
-        self.assertEqual(set(_CONVERTERS), {c.architecture for c in configurations()})
+        self.assertEqual(
+            set(_CONVERTERS),
+            {
+                c.architecture
+                for c in configurations()
+                if not is_native_architecture(c.architecture)
+            },
+        )
         for config in serving_configs():
             with (
                 self.subTest(architecture=config.architecture),
@@ -184,7 +195,7 @@ class SGLangExportTest(unittest.TestCase):
             norm_config=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1),
         )
         with self.assertRaisesRegex(ValueError, "default or multi-axis"):
-            convert_config(
+            convert_qwen3_5_config(
                 replace(
                     config,
                     attention_configs={

@@ -5,6 +5,9 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from specforge.checkpoint.formats.native.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.formats.sglang import convert_config
 from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.config.draft.layer import LayerSpec
@@ -133,8 +136,11 @@ class ServingBoundariesTest(unittest.TestCase):
         native = replace(
             native, norm_config=replace(native.norm_config, weight_offset=1)
         )
-        for config in (eagle, native):
-            fields = convert_config(config)
+        for config, convert in (
+            (eagle, convert_config),
+            (native, convert_qwen3_5_config),
+        ):
+            fields = convert(config)
             self.assertEqual(fields["rope_parameters"]["rope_type"], "default")
             self.assertEqual(fields["rope_parameters"]["mrope_section"], [2, 1, 1])
             self.assertEqual(
@@ -145,7 +151,7 @@ class ServingBoundariesTest(unittest.TestCase):
         self.assertFalse(fields["enable_confidence_head"])
         self.assertFalse(fields["confidence_head_with_markov"])
         with self.assertRaisesRegex(ValueError, "one layer"):
-            convert_config(replace(native, layer_types=native.layer_types * 2))
+            convert_qwen3_5_config(replace(native, layer_types=native.layer_types * 2))
         attention = next(iter(eagle.attention_configs.values()))
         with self.assertRaisesRegex(ValueError, "divisible"):
             convert_config(

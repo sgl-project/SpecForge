@@ -20,6 +20,9 @@ from unittest.mock import patch
 import torch
 from transformers import AutoConfig, PretrainedConfig
 
+from specforge.checkpoint.formats.native.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.formats.sglang import NON_COMPUTATIONAL_READS, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.config.draft.attention import MLASpec
@@ -326,8 +329,8 @@ class SGLangCompatibilityTest(unittest.TestCase):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         torch.manual_seed(12)
-        fields = convert_config(config)
         native = config.architecture == "MTPDraftModel"
+        fields = convert_qwen3_5_config(config) if native else convert_config(config)
         device = "cuda" if native else "cpu"
         if native:
             from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
