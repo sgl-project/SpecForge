@@ -231,6 +231,18 @@ def resolve_run(cfg, *, target_config=None):
             "canonical checkpoint cannot mix with legacy model.draft_* sources"
         )
     draft = resolve_config(cfg, target_config=target_config)
+    if cfg.initialization and cfg.initialization.from_target:
+        from specforge.checkpoint.native import validate_target_initialization
+        from specforge.checkpoint.resolve import read_target_config
+
+        target = (
+            target_config
+            if target_config is not None
+            else read_target_config(
+                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
+            )
+        )
+        validate_target_initialization(draft, target, cfg.initialization.from_target)
     # New objectives have their own options. Never silently consume legacy
     # algorithm switches with a different meaning on the canonical path.
     optimization_options = {

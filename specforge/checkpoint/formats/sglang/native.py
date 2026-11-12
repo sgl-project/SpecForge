@@ -10,6 +10,7 @@ from pathlib import Path
 from safetensors.torch import save_file
 
 from specforge.checkpoint.initialization import resolve_bindings
+from specforge.checkpoint.native import validate_qwen3_5_mtp
 from specforge.checkpoint.resolve import resolve_directory
 from specforge.checkpoint.tensors import TensorStore
 from specforge.checkpoint.weight_plan import _validate_unquantized
@@ -33,6 +34,7 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         not payload.get("quantization_config") and not text.get("quantization_config"),
         "native merge requires an unquantized target",
     )
+    validate_qwen3_5_mtp(config, text)
     for name in (
         "hidden_size",
         "vocab_size",
