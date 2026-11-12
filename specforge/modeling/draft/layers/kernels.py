@@ -1,6 +1,7 @@
 """Opt-in Liger RMSNorm and SwiGLU without changing checkpoint parameters."""
 
 from .mlp.dense import DenseFFN
+from .mlp.moe import SharedExpert
 from .norm.rms import RMSNorm
 
 
@@ -16,7 +17,7 @@ def configure_kernels(model, *, use_liger=False):
         for module in model.modules():
             if isinstance(module, RMSNorm):
                 module.liger_norm = None
-            elif isinstance(module, DenseFFN):
+            elif isinstance(module, (DenseFFN, SharedExpert)):
                 module.liger_swiglu = None
         return
     if any(p.device.type != "cuda" for p in model.parameters()):
@@ -26,7 +27,9 @@ def configure_kernels(model, *, use_liger=False):
         if isinstance(module, RMSNorm):
             # the Liger kernel scales by a weight; weightless norms stay on PyTorch
             module.liger_norm = rms_norm if module.weight is not None else None
-        elif isinstance(module, DenseFFN) and module.config.hidden_act in {
+        elif isinstance(
+            module, (DenseFFN, SharedExpert)
+        ) and module.config.hidden_act in {
             "silu",
             "swish",
         }:
