@@ -219,9 +219,8 @@ Explicit training masks work with eager, SDPA, and Flex Attention. Native
 draft inference without a supplied mask supports these settings through
 eager/SDPA and Flex Attention, including cached decoding. HF exports preserve
 `is_causal`.
-The SGLang normalization gate rejects bidirectional sliding-window exports
-until that external serving path is validated; it does not silently fall back
-to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
+The SGLang converter supports bidirectional sliding windows when the window
+covers the draft block. A window of size 1 is rejected. These settings do not change CE/L1 losses or kernel optimizations.
 
 DSpine requires causal attention for both full and sliding layers and rejects
 `is_causal: false`. It uses the shared DFlash attention masks.
@@ -405,7 +404,7 @@ specforge train \
   model.target_model_path=/path/to/Qwen3.6-27B
 ```
 
-Export the result with `specforge export --to hf`. Serving requires an SGLang
+Export for serving with `specforge export --converter sglang`. Serving requires an SGLang
 version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
 name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
 new path automatically.
@@ -719,56 +718,39 @@ Runtime checkpoints contain training state and are not serving model
 directories. Export the final checkpoint before loading it with SGLang or
 Transformers.
 
-For EAGLE3 SGLang serving:
+Canonical checkpoints carry their model configuration. Export them without a
+training YAML:
 
 ```bash
-specforge export --to sglang \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --output-dir ./exports/qwen3-8b-eagle3-sglang
+specforge export --converter sglang --checkpoint /path/to/checkpoint --output-dir ./serving
+specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 ```
 
-`--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
-For an EAGLE-family self-contained Hugging Face directory, provide the target model as
-the source of the frozen embedding when it is absent from the runtime
-checkpoint:
+Historical checkpoints without `config.json` additionally require
+`--draft-config OLD.json --target-model TARGET` for canonical export. Legacy
+`--to hf` and `--to sglang` retain their original exporters and require
+`--draft-config`; they are not aliases for canonical export. Default HF exports
+contain canonical configuration and bundled code for
+Transformers, and cannot be served directly by SGLang. Except for native merge-back,
+both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
+running the model. Restore vocabulary mappings before export; export does not
+replace checkpoint tensors.
 
-Serving weight names are a fail-silent boundary in SGLang: an unrecognized key
-may be skipped while the server still starts. The exporter therefore validates
-the required `fc.weight`, `norm.weight`, `lm_head.weight`, `t2d`, and `d2t`
-keys and rejects any remaining trainer prefix. `LlamaForCausalLMEagle3` uses an
-identity map for its `midlayer.*` and required keys; `embed_tokens.weight` is
-deliberately omitted because serving reuses the target model embedding. A new
-architecture (including a future MLA draft) must add an explicit, loader-version
-matched weight map and required-key contract before SGLang export is enabled.
-The export tests cover key structure and tensor round-trip; loading the result
-in a real speculative-decoding server and measuring acceptance remains a GPU
-serving validation step.
+SGLang conversion supports DFlash, DFlash2, Domino, DSpark, EAGLE3 and native
+dense Qwen3.5 MTP within the pinned serving format's representable structures.
+DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
+exported. Mixed per-layer causality is also rejected by the current pin.
+See [draft export](../../draft_export.md) for restrictions and validation.
 
-```bash
-specforge export --to hf \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --embedding-source Qwen/Qwen3-8B \
-  --output-dir ./exports/qwen3-8b-eagle3-hf
-```
+Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
+saved precision when tensors share one floating-point dtype; SGLang casts to
+its serving dtype. Mixed-dtype HF artifacts retain the original tensors, but
+public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
-Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
-mapping buffers or when you intentionally need to refresh them.
-
-Both exporters preserve the dtype and values of the draft weights stored in the
-checkpoint. When all floating-point tensors share one dtype (FP32, FP16, or
-BF16), that dtype is written into the exported `config.json`, so
-`AutoDraftModel.from_pretrained` without an explicit dtype restores the saved
-precision and values. SGLang casts the served draft to its own dtype at load
-time.
-
-For checkpoints with mixed floating-point dtypes, the exported weight tensors
-retain their original dtypes, but the exported config falls back to BF16.
-Default reloading therefore does not guarantee restoration of each tensor's
-original precision. Native mixed-precision or quantized MTP models require
-model-specific loading and export support beyond this precision guarantee.
+For canonical native MTP, use `--converter sglang --target-model TARGET`. It rewrites
+shards containing old native tensors and links unchanged shards; add
+`--copy-target` for a self-contained directory. The following legacy merge
+script remains available for historical training outputs.
 
 MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
 and attention computations. Do not resume those runs; retrain from native MTP

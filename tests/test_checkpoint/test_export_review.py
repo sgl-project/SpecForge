@@ -77,11 +77,45 @@ class ExportReviewTest(unittest.TestCase):
             self.assertEqual(result.exit_code, 2)
             self.assertIn("--vocab-mapping belongs to legacy --to", result.output)
             export.assert_not_called()
-        with patch("specforge.export.to_sglang.export_to_sglang") as export:
+        with patch("specforge.export.legacy_sglang.export_to_sglang") as export:
             result = CliRunner().invoke(cli, args + ["--to", "sglang"])
             self.assertEqual(result.exit_code, 2)
             self.assertIn("--draft-config", result.output)
             export.assert_not_called()
+
+    def test_sglang_cli_options_and_forwarding(self):
+        args = ["export", "--checkpoint", "checkpoint", "--output-dir", "out"]
+        with patch("specforge.export.to_sglang.export_to_sglang") as export:
+            for options, error in (
+                (["--converter", "sglang", "--to", "hf"], "mutually exclusive"),
+                (["--copy-target"], "requires --converter sglang"),
+            ):
+                result = CliRunner().invoke(cli, args + options)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn(error, result.output)
+                export.assert_not_called()
+            result = CliRunner().invoke(
+                cli,
+                args
+                + [
+                    "--converter",
+                    "sglang",
+                    "--draft-config",
+                    "old.json",
+                    "--target-model",
+                    "target",
+                    "--copy-target",
+                ],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            export.assert_called_once_with(
+                "checkpoint",
+                "old.json",
+                "out",
+                vocab_mapping_path=None,
+                target_model="target",
+                copy_target=True,
+            )
 
     def test_run_root_uses_complete_steps_and_rejects_multiple_runs(self):
         with TemporaryDirectory() as temp:

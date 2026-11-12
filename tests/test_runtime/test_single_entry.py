@@ -615,11 +615,11 @@ class TestCliLifecycle(unittest.TestCase):
         self.assertEqual(calls[0][1]["embedding_source"], "target")
 
     def test_sglang_export_rejects_embedding_source_as_usage_error(self):
-        module = types.ModuleType("specforge.export.to_sglang")
+        module = types.ModuleType("specforge.export.legacy_sglang")
         module.export_to_sglang = mock.Mock()
         stderr = io.StringIO()
         with (
-            mock.patch.dict(sys.modules, {"specforge.export.to_sglang": module}),
+            mock.patch.dict(sys.modules, {"specforge.export.legacy_sglang": module}),
             contextlib.redirect_stderr(stderr),
         ):
             status = main(

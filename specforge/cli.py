@@ -282,6 +282,12 @@ def train(
     default=None,
     help="Legacy export layout; omit for a canonical HF directory.",
 )
+@click.option("--converter", type=click.Choice(("sglang",)), default=None)
+@click.option(
+    "--copy-target",
+    is_flag=True,
+    help="Copy unchanged native target shards instead of linking them.",
+)
 @click.option("--checkpoint", required=True, metavar="PATH")
 @click.option(
     "--draft-config",
@@ -313,6 +319,8 @@ def train(
 def export(
     ctx: click.Context,
     legacy_format: Optional[str],
+    converter: Optional[str],
+    copy_target: bool,
     checkpoint: str,
     draft_config: Optional[str],
     target_model: Optional[str],
@@ -322,6 +330,12 @@ def export(
     embedding_key: str,
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
+    if converter is not None and legacy_format is not None:
+        raise click.UsageError(
+            "--converter and legacy --to are mutually exclusive", ctx
+        )
+    if copy_target and converter != "sglang":
+        raise click.UsageError("--copy-target requires --converter sglang", ctx)
     if legacy_format is None:
         if embedding_source is not None:
             raise click.UsageError(
@@ -337,6 +351,18 @@ def export(
                 "reads the vocabulary mapping from the checkpoint",
                 ctx,
             )
+        if converter == "sglang":
+            from specforge.export.to_sglang import export_to_sglang
+
+            export_to_sglang(
+                checkpoint,
+                draft_config,
+                output_dir,
+                vocab_mapping_path=vocab_mapping,
+                target_model=target_model,
+                copy_target=copy_target,
+            )
+            return 0
         from specforge.export.to_hf import export_to_hf
 
         export_to_hf(
@@ -365,7 +391,7 @@ def export(
     else:
         if embedding_source is not None or embedding_key != "model.embed_tokens.weight":
             raise click.UsageError("embedding options are only valid with --to hf", ctx)
-        from specforge.export.to_sglang import export_to_sglang
+        from specforge.export.legacy_sglang import export_to_sglang
 
         export_to_sglang(
             checkpoint, draft_config, output_dir, vocab_mapping_path=vocab_mapping

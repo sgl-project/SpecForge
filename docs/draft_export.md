@@ -33,12 +33,23 @@ use canonical names and store each tensor in its own dtype; `config.json` declar
 a dtype only when all floating-point tensors share one.
 
 During migration, `--to hf` and `--to sglang` retain the original exporters and
-require `--draft-config`. In particular, legacy DFlash serving scripts can continue
-using `--to hf`; this is distinct from the default canonical export. Only legacy
+require `--draft-config`. Use `--converter sglang` for DFlash-family serving exports.
+Legacy `--to` remains necessary when importing an external vocabulary mapping
+for an old EAGLE3 checkpoint. Only legacy
 `--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
 rejects it and uses `--target-model` for import validation and configuration.
-The SGLang converter and retirement of `--to` belong to the next export step
-(#1162); no converter flag is advertised before it exists.
+`--format` is not needed. Use `--converter sglang` for canonical serving export.
+Legacy `--to` paths remain available during migration, including mixed-causality
+recipes that the pinned converter cannot express. For historical EAGLE3 checkpoints
+without vocabulary buffers, the existing legacy path accepts an explicit mapping:
+
+```bash
+specforge export --to sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
+  --vocab-mapping MAPPING --output-dir SERVING
+```
+
+Canonical export requires the mapping to be stored in the checkpoint. It preserves
+recorded `bos_token_id`, `eos_token_id`, and `pad_token_id` metadata.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.
 Restore those explicitly before exporting. Missing, unexpected or misshaped
@@ -50,3 +61,73 @@ Both `save_draft(model, ...)` and canonical HF export use `write_artifact` for
 sharding, metadata and atomic directory publication. Model saving performs its
 wrapper/materialization checks first; export validates its checkpoint weight plan
 first. Training optimizer/RNG state remains owned by the training checkpoint manager.
+
+## SGLang
+
+```bash
+specforge export --converter sglang --checkpoint CHECKPOINT_PATH --output-dir SERVING
+# Native dense Qwen3.5 MTP: target checkpoint with its MTP tensors replaced.
+specforge export --converter sglang --checkpoint CHECKPOINT_PATH --target-model TARGET \
+  --output-dir SERVING
+```
+
+The converter targets SGLang commit
+`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, also pinned in CI. Each artifact records
+that revision and the converter version in `config.json`'s `specforge_artifact`
+field. Conversion needs neither SGLang nor a
+GPU. Load/re-export/continued training use the canonical checkpoint; public draft
+loading rejects a serving artifact.
+
+| Architecture | Serving format / restriction |
+|---|---|
+| DFlash | `DFlashDraftModel`; both token tables bound to the target |
+| DFlash2 | `DFlash2DraftModel`, including convolution and selector |
+| Domino | `DFlashDraftModel` with explicit Domino projector settings |
+| DSpark | `DSparkDraftModel`; Markov head required; confidence head optional in static mode |
+| EAGLE3 | `LlamaForCausalLMEagle3`; embedding bound, draft head owned |
+| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default or multi-axis RoPE |
+| DSpine, DMTP, P-EAGLE | Rejected: this pinned SGLang has no matching serving implementation |
+
+Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
+GQA/MHA or MLA, and explicit supported RoPE settings. Layer-specific values are
+accepted only where SGLang can express them. Mixed causality is supported only
+for causal sliding layers with bidirectional full layers; `is_causal: null` selects
+that SGLang rule. Different head geometry across layers and window=1 are rejected.
+Noncausal sliding windows must cover at least one model block.
+The pinned converter rejects muP targets for DFlash2/Domino and offset RMSNorm
+for DSpark because their serving paths do not implement those computations. Unsupported component kinds and binding
+sets also fail. The pinned DSpark implementation chooses confidence-head use
+through its ragged-verification runtime mode; `cap-accept` exercises that head.
+Drafts without a confidence head require `SGLANG_RAGGED_VERIFY_MODE=static`.
+EAGLE3 supports multi-axis RoPE for VL targets; native MTP uses equal text
+positions on all axes.
+
+Compared with historical exports, configuration fields such as causality, heads,
+rotary settings and block quantities are now written explicitly. Canonical module
+prefixes are removed for serving, vocabulary readiness is validated rather than
+serialized, and Domino uses SGLang's registered DFlash architecture name. These
+are format changes; tensors are not cast or transformed.
+
+Native export requires explicit target computation fields, checks them against
+the draft, and preserves the target configuration. Missing or conflicting fields
+are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
+tensors and links unaffected shards. `--copy-target` copies unaffected shards for
+a self-contained directory. Embedding/head copies are written under native names;
+SGLang's worker also attaches the target token modules. The target is not modified.
+
+The pinned compatibility gate constructs real SGLang models and loads converted
+weights, records top-level and nested configuration reads for non-native models, and compares
+FP32 reference outputs. It checks that exported weights reach serving loaders,
+uses production recipe fields as an independent baseline, and covers MLA context
+projection, scaled/multi-axis RoPE and the DSpark stacked context-KV writer. It uses
+a dense attention oracle in place of paged KV-cache attention, so it is not an
+end-to-end serving/performance test. Separate tests cover native physical shard
+replacement and exact weight recovery, unsupported structures, and rejection of
+canonical HF configurations by SGLang's native constructor and generic
+Transformers compatibility gate. Run the gate with:
+
+```bash
+SPECFORGE_SGLANG_EXPORT_TESTS=1 TORCHDYNAMO_DISABLE=1 \
+  python -m unittest tests.test_checkpoint.test_sglang_export \
+  tests.test_checkpoint.test_sglang_compatibility -v
+```

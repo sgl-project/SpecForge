@@ -163,6 +163,17 @@ jobs:
           python -c 'import importlib.util, shutil, torch; assert torch.cuda.is_available(), "live capture gate requires CUDA"; assert importlib.util.find_spec("mooncake.store"), "live capture gate requires mooncake.store"; assert shutil.which("mooncake_master") or __import__("os").environ.get("MOONCAKE_MASTER_SERVER_ADDR"), "live capture gate requires mooncake_master"'
           python -m unittest tests.test_runtime.test_server_capture_gate -v
 
+      - name: Validate canonical SGLang exports
+        timeout-minutes: 10
+        shell: bash
+        env:
+          SPECFORGE_SGLANG_EXPORT_TESTS: "1"
+          TORCHDYNAMO_DISABLE: "1"
+        run: |
+          source sf/bin/activate
+          export PYTHONPATH=$PWD
+          python -m unittest tests.test_checkpoint.test_sglang_export tests.test_checkpoint.test_sglang_compatibility -v
+
       - name: Run Liger kernel tests
         timeout-minutes: 10
         shell: bash
