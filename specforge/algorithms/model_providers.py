@@ -363,6 +363,7 @@ def _build_dflash_family_model(
     common = {
         "draft_model": draft_model,
         "target_lm_head": target_parts.lm_head,
+        "target_logit_transform": target_parts.logit_transform,
         "target_embed_tokens": target_parts.embed_tokens,
         "mask_token_id": mask_token_id,
         "block_size": int(draft_model.block_size),

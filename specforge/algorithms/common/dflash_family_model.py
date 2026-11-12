@@ -18,6 +18,7 @@ from specforge.modeling.draft.dflash_mask import (
     create_dflash_sdpa_mask,
 )
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+from specforge.modeling.target.logit_transform import IDENTITY, TargetLogitTransform
 
 try:
     from torch.nn.attention.flex_attention import BlockMask
@@ -267,6 +268,7 @@ class OnlineDFlashModel(nn.Module):
         teacher_metrics: bool = True,
         fused_logits_loss: bool = True,
         objective_checkpointing: bool = True,
+        target_logit_transform: Optional[TargetLogitTransform] = None,
     ):
         super().__init__()
         if metric_top_k <= 0:
@@ -292,6 +294,9 @@ class OnlineDFlashModel(nn.Module):
 
         self.draft_model = draft_model
         self.lm_head = target_lm_head
+        # Target-only logit transform for teacher logits; the draft-visible part
+        # is already folded into ``target_lm_head``.
+        self.target_logit_transform = target_logit_transform or IDENTITY
         self.embed_tokens = target_embed_tokens
         self.block_size = block_size
         self.mask_token_id = mask_token_id
@@ -730,6 +735,12 @@ class OnlineDFlashModel(nn.Module):
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
 
+    def _teacher_logits(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """The target's served logits for captured target hidden states."""
+        return self.target_logit_transform.apply_teacher(
+            self._project_logits(target_hidden)
+        )
+
     def _dflash_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self._project_logits(hidden)
         transform = getattr(self.draft_model, "transform_unary_logits", None)
@@ -1124,7 +1135,7 @@ class OnlineDFlashModel(nn.Module):
             return _DFlashTeacherTerms.zeros(position_den)
 
         block_size = aligned_target_hidden.shape[2]
-        teacher_logits = self._project_logits(aligned_target_hidden)
+        teacher_logits = self._teacher_logits(aligned_target_hidden)
         teacher_probabilities = torch.softmax(teacher_logits.float(), dim=-1)
         teacher_ids = teacher_logits.argmax(dim=-1)
         expected_acceptance = (
@@ -1629,6 +1640,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         shift_label: bool = False,
         objective_checkpointing: bool = True,
         fused_logits_loss: bool = True,
+        target_logit_transform: Optional[TargetLogitTransform] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -1643,6 +1655,7 @@ class OnlineDominoModel(OnlineDFlashModel):
             objective_checkpointing=objective_checkpointing,
             loss_type="dflash",
             fused_logits_loss=fused_logits_loss,
+            target_logit_transform=target_logit_transform,
         )
         self.shift_label = shift_label
 
@@ -1918,6 +1931,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         objective_chunk_blocks: int = 128,
         fused_logits_loss: bool = True,
         objective_checkpointing: bool = True,
+        target_logit_transform: Optional[TargetLogitTransform] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -1932,6 +1946,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             objective_checkpointing=objective_checkpointing,
             loss_type="dflash",
             fused_logits_loss=fused_logits_loss,
+            target_logit_transform=target_logit_transform,
         )
         if dspark_ce_loss_alpha < 0:
             raise ValueError("dspark_ce_loss_alpha must be >= 0")
@@ -2015,7 +2030,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         target_logits = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
-                target_logits = self._project_logits(aligned_target_hidden)
+                target_logits = self._teacher_logits(aligned_target_hidden)
         terms = self._logits_loss_terms(
             draft_logits, target_ids, teacher_logits=target_logits
         )

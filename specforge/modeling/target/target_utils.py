@@ -9,6 +9,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
+from specforge.modeling.target.logit_transform import resolve_target_logit_transform
 
 logger = logging.getLogger(__name__)
 
@@ -144,20 +145,18 @@ class TargetEmbeddingsAndHead(nn.Module):
             cache_dir=cache_dir,
         )
 
-        text_config = target_text_config(config)
-        mup_multiplier = getattr(
-            text_config,
-            "logits_mup_width_multiplier",
-            getattr(config, "logits_mup_width_multiplier", None),
-        )
-        if mup_multiplier:
+        # The head SGLang's draft paths borrow is shared by draft and teacher;
+        # the target-only part is applied to teacher logits by the trainer.
+        transform = resolve_target_logit_transform(config)
+        if not transform.head_is_identity:
             if instance.lm_head.weight is instance.embed_tokens.weight:
                 raise RuntimeError(
-                    "cannot fold logits_mup_width_multiplier into a tied "
-                    "embedding/LM head"
+                    f"cannot fold {transform.source} into a tied embedding/LM head"
                 )
-            instance.lm_head.weight.data.div_(float(mup_multiplier))
-            instance.lm_head_mup_folded = float(mup_multiplier)
+            instance.lm_head.weight.data.copy_(
+                transform.fold_into_head(instance.lm_head.weight.data)
+            )
+        instance.logit_transform = transform
 
         # 4. Move to Device & Freeze
         instance.to(device=device, dtype=dtype)
