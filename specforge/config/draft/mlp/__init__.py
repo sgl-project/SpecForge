@@ -2,5 +2,6 @@
 
 from .base import FFNSpec
 from .dense import DenseFFNSpec
+from .moe import MoEFFNSpec, MoERouterSpec
 
-__all__ = ["FFNSpec", "DenseFFNSpec"]
+__all__ = ["FFNSpec", "DenseFFNSpec", "MoEFFNSpec", "MoERouterSpec"]

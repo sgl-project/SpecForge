@@ -56,6 +56,7 @@ class ComponentBuilderTest(unittest.TestCase):
         }
         exceptions = {
             ("rope", "none"),  # build_rotary returns None; there is no module.
+            ("mlp", "moe"),  # Builder arrives with the MoEFFN component.
         }
         self.assertLessEqual(exceptions, schemas.keys())
         self.assertLessEqual(_BUILDERS.keys(), _SCHEMAS.keys())
