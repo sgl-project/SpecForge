@@ -150,6 +150,7 @@ assert not torch.cuda.is_initialized()
     def test_target_derived_defaults_match_legacy_trainers(self):
         cases = (
             ("eagle3", "LlamaForCausalLMEagle3", 1, None),
+            ("eagle4", "LlamaForCausalLMEagle4", 1, None),
             ("peagle", "PEagleDraftModel", 4, None),
             ("dflash", "DFlashDraftModel", 1, 16),
         )
@@ -173,6 +174,8 @@ assert not torch.cuda.is_initialized()
                     self.assertEqual(resolved.layer_types, ["full_attention"])
                     self.assertIsNone(resolved.sliding_window)
                     self.assertFalse(resolved.use_sliding_window)
+                elif strategy == "eagle4":
+                    self.assertEqual(resolved.draft_vocab_size, resolved.vocab_size)
                 else:
                     self.assertEqual(resolved.draft_vocab_size, 32000)
 

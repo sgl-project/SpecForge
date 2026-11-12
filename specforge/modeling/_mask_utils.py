@@ -31,11 +31,22 @@ def _make_causal_mask(
     dtype: torch.dtype,
     device: torch.device,
     past_key_values_length: int = 0,
+    window: Optional[int] = None,
 ):
     """
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
+    if window is not None:
+        query = torch.arange(tgt_len, device=device) + past_key_values_length
+        key = torch.arange(tgt_len + past_key_values_length, device=device)
+        distance = query[:, None] - key[None, :]
+        allowed = (distance >= 0) & (distance < window)
+        mask = torch.full(
+            allowed.shape, torch.finfo(dtype).min, dtype=dtype, device=device
+        )
+        mask.masked_fill_(allowed, 0)
+        return mask[None, None].expand(bsz, 1, tgt_len, key.numel())
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
@@ -79,6 +90,7 @@ def prepare_decoder_attention_mask(
     batch_size: int,
     seq_length: int,
     past_key_values_length: int = 0,
+    window: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     """
     Build the additive decoder attention mask of shape `[bsz, 1, tgt_seq_len, src_seq_len]`
@@ -87,12 +99,13 @@ def prepare_decoder_attention_mask(
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
     combined_attention_mask = None
-    if seq_length > 1:
+    if seq_length > 1 or window is not None:
         combined_attention_mask = _make_causal_mask(
             (batch_size, seq_length),
             hidden_states.dtype,
             device=hidden_states.device,
             past_key_values_length=past_key_values_length,
+            window=window,
         )
 
     if attention_mask is not None:

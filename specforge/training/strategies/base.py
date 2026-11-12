@@ -200,9 +200,11 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         trim_loss_positions: bool = False,
         compact_teacher: bool = False,
         compact_teacher_chunk_size: Optional[int] = None,
+        name: str = "eagle3",
     ) -> None:
         self.eagle3_model = eagle3_model
         self.target_head = target_head
+        self.name = name
         self.ploss_decay = ploss_decay
         self.trim_loss_positions = trim_loss_positions
         self.compact_teacher = compact_teacher
@@ -267,6 +269,21 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model
+
+    def _live_eagle3_model(self) -> nn.Module:
+        model = self.eagle3_model
+        if not hasattr(model, "draft_model") and hasattr(model, "module"):
+            model = model.module
+        return model
+
+    def after_optimizer_step(self) -> None:
+        draft = getattr(self._live_eagle3_model(), "draft_model", None)
+        updater = getattr(draft, "update_moe_router_bias", None)
+        if updater is None:
+            return
+        imbalance = updater()
+        if imbalance is not None:
+            self._moe_load_imbalance = imbalance
 
     def _device(self) -> torch.device:
         return next(self.eagle3_model.parameters()).device
@@ -349,17 +366,21 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         )
         weights = [self.ploss_decay**i for i in range(len(plosses))]
         loss = sum(weights[i] * plosses[i] for i in range(len(plosses)))
+        metrics = {
+            "plosses": [p.detach() for p in plosses],
+            "acces": [a.detach() for a in acces],
+            "acceptance_rates": [a.detach() for a in acceptance_rates],
+            "acc_corrects": [c.detach() for c in acc_corrects],
+            "acc_denoms": [d.detach() for d in acc_denoms],
+            "metric_losses": [m.detach() for m in metric_losses],
+            "metric_loss_denoms": [d.detach() for d in metric_loss_denoms],
+        }
+        imbalance = getattr(self, "_moe_load_imbalance", None)
+        if imbalance is not None:
+            metrics["moe_load_imbalance"] = imbalance
         return StepOutput(
             loss=loss,
-            metrics={
-                "plosses": [p.detach() for p in plosses],
-                "acces": [a.detach() for a in acces],
-                "acceptance_rates": [a.detach() for a in acceptance_rates],
-                "acc_corrects": [c.detach() for c in acc_corrects],
-                "acc_denoms": [d.detach() for d in acc_denoms],
-                "metric_losses": [m.detach() for m in metric_losses],
-                "metric_loss_denoms": [d.detach() for d in metric_loss_denoms],
-            },
+            metrics=metrics,
         )
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:

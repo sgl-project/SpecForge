@@ -276,6 +276,12 @@ def train(
 
 @cli.command(short_help="materialize a runtime checkpoint as a model directory")
 @click.option(
+    "--svd-device",
+    default="cpu",
+    show_default=True,
+    help="Device for EAGLE-4 export SVD (cpu or cuda).",
+)
+@click.option(
     "--to",
     "target",
     type=click.Choice(("hf", "sglang")),
@@ -307,6 +313,7 @@ def export(
     vocab_mapping: Optional[str],
     embedding_source: Optional[str],
     embedding_key: str,
+    svd_device: str,
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
     if target == "hf":
@@ -319,6 +326,7 @@ def export(
             vocab_mapping_path=vocab_mapping,
             embedding_source=embedding_source,
             embedding_key=embedding_key,
+            svd_device=svd_device,
         )
         return 0
     if embedding_source is not None:
@@ -330,6 +338,7 @@ def export(
         draft_config,
         output_dir,
         vocab_mapping_path=vocab_mapping,
+        svd_device=svd_device,
     )
     return 0
 
