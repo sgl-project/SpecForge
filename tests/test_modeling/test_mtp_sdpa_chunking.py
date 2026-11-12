@@ -178,7 +178,12 @@ class MTPBackendObjectiveTest(unittest.TestCase):
         )
         legacy = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
         self.assertEqual(actual.dtype, torch.float32)
-        torch.testing.assert_close(actual.double(), reference, rtol=1e-6, atol=2e-6)
+        fp32 = torch.nn.functional.cross_entropy(
+            logits.float(), labels, reduction="none"
+        )
+        torch.testing.assert_close(actual, fp32, rtol=0, atol=0)
+        # fp32 log-sum-exp over 248k logits drifts ~2e-5 from fp64 on some CPUs
+        torch.testing.assert_close(actual.double(), reference, rtol=0, atol=1e-4)
         torch.testing.assert_close(actual, legacy.float(), rtol=0.01, atol=0.01)
         self.assertLess(
             (actual - reference).abs().max(), (legacy - reference).abs().max()
