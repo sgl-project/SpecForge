@@ -21,23 +21,27 @@ name alone. `auto_map` selects the bundled implementation for Transformers.
 HF code bundling currently supports in-tree SpecForge architectures only; external
 architectures and ambiguous flattened module names are rejected before publication.
 
-A historical checkpoint without `config.json` additionally needs
-`--draft-config OLD.json --target-model TARGET`. The target configuration resolves
-legacy target-derived semantics. Legacy training remains available during the
-migration; its old checkpoints must use this import path. New HF exports always
-use canonical names and preserve each tensor's dtype.
+A historical checkpoint needs `--target-model TARGET`, and also
+`--draft-config OLD.json` when it has no `config.json`. The target configuration
+resolves legacy target-derived semantics, and any copy of a target table that the
+checkpoint saved must equal the target's. Legacy training remains available during
+the migration; its old checkpoints must use this import path. New HF exports always
+use canonical names and store each tensor in its own dtype; `config.json` declares
+a dtype only when all floating-point tensors share one.
 
 During migration, `--to hf` and `--to sglang` retain the original exporters and
 require `--draft-config`. In particular, legacy DFlash serving scripts can continue
 using `--to hf`; this is distinct from the default canonical export. Only legacy
 `--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
 rejects it and uses `--target-model` for import validation and configuration.
-`--format` is not needed. The SGLang converter and retirement of `--to` belong to
-the next export step (#1162); no converter flag is advertised before it exists.
+The SGLang converter and retirement of `--to` belong to the next export step
+(#1162); no converter flag is advertised before it exists.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.
 Restore those explicitly before exporting. Missing, unexpected or misshaped
-weights fail before publication. A nonempty output directory is rejected.
+weights fail before publication, and so does serving state that was never
+initialized (a reduced vocabulary without its mapping, an uninitialized DSpine
+transfer space). A nonempty output directory is rejected.
 
 Both `save_draft(model, ...)` and canonical HF export use `write_artifact` for
 sharding, metadata and atomic directory publication. Model saving performs its

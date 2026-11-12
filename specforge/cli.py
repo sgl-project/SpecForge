@@ -283,8 +283,19 @@ def train(
     help="Legacy export layout; omit for a canonical HF directory.",
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
-@click.option("--draft-config", default=None, metavar="PATH")
-@click.option("--target-model", default=None, metavar="PATH")
+@click.option(
+    "--draft-config",
+    default=None,
+    metavar="PATH",
+    help="Legacy draft config: required with --to, and for canonical export of a "
+    "checkpoint without config.json.",
+)
+@click.option(
+    "--target-model",
+    default=None,
+    metavar="PATH",
+    help="Canonical export only: target checkpoint that resolves legacy semantics.",
+)
 @click.option("--output-dir", required=True, metavar="PATH")
 @click.option("--vocab-mapping", default=None, metavar="PATH")
 @click.option(

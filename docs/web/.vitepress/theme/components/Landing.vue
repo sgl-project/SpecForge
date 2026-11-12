@@ -37,7 +37,7 @@ const steps = [
   { title: 'Install SpecForge', text: 'From source or PyPI, on the accelerator you have.', link: '/get_started/installation' },
   { title: 'Prepare a dataset', text: 'Regenerate responses with the target model so the draft learns its distribution.', link: '/basic_usage/data_preparation' },
   { title: 'Train the draft', text: 'Point <code>specforge train</code> at a YAML recipe; capture hidden states online or offline.', link: '/basic_usage/training' },
-  { title: 'Export and serve', text: 'Run <code>specforge export</code> and launch SGLang with the draft for faster decoding.', link: '/get_started/about' },
+  { title: 'Export and serve', text: 'Run <code>specforge export --to hf</code> (or <code>--to sglang</code> for EAGLE3) and launch SGLang with the draft for faster decoding.', link: '/get_started/about' },
 ]
 
 const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino', 'MTP']
