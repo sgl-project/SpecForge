@@ -96,6 +96,12 @@ class CheckpointManager:
                         os.path.join(ckpt_dir, self._rank_file(self._rank())),
                     )
                 if self.is_rank0() and state is not None:
+                    if "canonical_draft_config" in state:
+                        self._atomic_json(
+                            state["canonical_draft_config"],
+                            os.path.join(ckpt_dir, "config.json"),
+                        )
+                    # training_state.pt marks a complete checkpoint to readers.
                     self._atomic_save(state, self._state_path(ckpt_dir))
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"

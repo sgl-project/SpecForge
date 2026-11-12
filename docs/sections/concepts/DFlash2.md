@@ -9,7 +9,7 @@ training strategy or feature protocol.
 | --- | --- |
 | Training strategy | `training.strategy: dflash` |
 | Draft architecture | `DFlash2DraftModel` |
-| Online server capture | `--spec-capture-method dflash` |
+| Online server capture | `--speculative-algorithm DFLASH` |
 | Offline feature schema | DFlash `input_ids`, `loss_mask`, `hidden_states` |
 | Export target | `specforge export --to hf` |
 | SGLang serving algorithm | `DFLASH` |
@@ -105,19 +105,21 @@ trainer process. Update its model/data paths and GPU allocation, then run:
 
 ```bash
 specforge train \
-  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml
+  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml
 ```
 
 For external online services, use the same YAML model and training fields but
 omit `deployment.disaggregated.managed_local`, provide the Mooncake endpoints
-and `server_urls`, and start SGLang with `--spec-capture-method dflash`. Its
+and `server_urls`, and start SGLang with `--speculative-algorithm DFLASH`. Its
 auxiliary layer IDs must exactly match `dflash_config.target_layer_ids`.
 
-Offline DFlash2 uses the normal DFlash feature preparation path:
+Offline DFlash2 uses the normal DFlash feature preparation path. First start
+the matching plugin server and Mooncake using the
+[offline capture guide](../../../examples/offline/README.md):
 
 ```bash
-torchrun --nproc_per_node=8 \
-  scripts/prepare_hidden_states.py \
+python scripts/prepare_hidden_states.py \
+  --server-urls http://127.0.0.1:30000 \
   --strategy dflash \
   --target-model-path /path/to/Qwen3.6-27B \
   --draft-model-config configs/qwen3.6-27b-dflash2.json \

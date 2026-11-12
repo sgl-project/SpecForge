@@ -3,14 +3,20 @@
 single-authority dispatch/book-keeping path (CPU only, no torch.distributed)."""
 
 import os
+import random
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import DPAckController, gather_id_union
+from specforge.runtime.control_plane.flow_control import (
+    FlowControlLimits,
+    ProducerFlowControl,
+)
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.ref_distributor import InboxChannel, RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import (
@@ -105,8 +111,292 @@ class TestRefDistributor(unittest.TestCase):
             dp_size,
             feature_store=self.feature_store,
             refs_per_rank_step=refs_per_rank_step,
+            dispatch_policy=kwargs.pop("dispatch_policy", "round_robin"),
+            num_anchors=kwargs.pop("num_anchors", 512),
+            block_size=kwargs.pop("block_size", 16),
             **kwargs,
         )
+
+    def test_two_window_backpressure_resumes_with_six_refs_remaining(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                self.producer = StreamingRefChannel(os.path.join(self.dir, policy))
+                self.source = StreamingRefChannel(self.producer.path)
+                dist = self._distributor(refs_per_rank_step=2, dispatch_policy=policy)
+                flow = ProducerFlowControl(FlowControlLimits(14, 8))
+                self.producer.publish_batch([_ref(str(i)) for i in range(14)])
+                self.assertTrue(flow.should_pause(in_flight_refs=14))
+                _pump_until_quiet(dist)
+                self.assertEqual(dist.stats["dispatched"], 8)
+                # Simulate the inbox acknowledgements after two durable steps.
+                for rank in range(2):
+                    StreamingRefChannel(
+                        dist.inbox_path(self.inbox_dir, rank)
+                    ).mark_consumed(4)
+                _pump_until_quiet(dist)
+                remaining = self.producer.in_flight_remote()
+                self.assertEqual(remaining, 6)
+                self.assertFalse(flow.should_pause(in_flight_refs=remaining))
+                self.producer.publish_batch([_ref("14"), _ref("15")])
+                _pump_until_quiet(dist)
+                self.assertEqual(dist.stats["dispatched"], 16)
+
+    def test_cost_balancing_preserves_windows_and_balances_accumulation(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            dispatch_policy="cost_balanced",
+        )
+        for window in range(2):
+            for index, anchors in enumerate((400, 100, 300, 200)):
+                self.producer.publish(
+                    replace(
+                        _ref(f"w{window}s{index}"),
+                        num_tokens=1024,
+                        metadata={"valid_anchor_count": anchors},
+                    )
+                )
+        _pump_until_quiet(dist)
+        first = _inbox_ids(self.inbox_dir, 0)
+        second = _inbox_ids(self.inbox_dir, 1)
+        self.assertEqual(first, ["w0s0", "w0s1", "w1s0", "w1s1"])
+        self.assertEqual(second, ["w0s2", "w0s3", "w1s2", "w1s3"])
+        self.assertEqual(dist.stats["dispatched"], 8)
+        self.assertEqual(dist._window_dispatched, 0)
+
+    def _check_dispatch_without_accumulation(self, policy):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=1,
+            refs_per_rank_batch=1,
+            dispatch_policy=policy,
+            block_size=16,
+        )
+        refs = [
+            replace(
+                _ref(str(index)),
+                num_tokens=32,
+                metadata={"valid_anchor_count": anchors},
+            )
+            for index, anchors in enumerate((10, 1, 9, 2))
+        ]
+        for ref in refs:
+            self.producer.publish(ref)
+        _pump_until_quiet(dist)
+        delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(rank) for rank in delivered], [2, 2])
+        self.assertEqual(set(sum(delivered, [])), {ref.sample_id for ref in refs})
+        by_id = {ref.sample_id: ref for ref in refs}
+        critical = sum(
+            max(dist._batch_cost([by_id[rank[step]]]) for rank in delivered)
+            for step in range(2)
+        )
+        anchor_cost = 19 if policy == "cost_balanced" else 12
+        self.assertAlmostEqual(critical, anchor_cost * 16 + 9.6)
+
+    def test_single_window_balancing_without_accumulation_keeps_step_costs(self):
+        self._check_dispatch_without_accumulation("cost_balanced")
+
+    def test_two_window_bucketing_can_help_without_accumulation(self):
+        self._check_dispatch_without_accumulation("two_window_bucketed")
+
+    def test_joint_balancing_can_help_without_accumulation(self):
+        self._check_dispatch_without_accumulation("two_window_joint_balanced")
+
+    def test_joint_balancing_uses_two_windows_without_losing_samples(self):
+        self.test_bucketed_dispatch_uses_two_windows_without_losing_samples(
+            "two_window_joint_balanced"
+        )
+
+    def test_joint_balancing_improves_estimated_critical_path(self):
+        dist = self._distributor(
+            dp_size=32,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
+            dispatch_policy="two_window_joint_balanced",
+            num_anchors=512,
+            block_size=16,
+        )
+        rng = random.Random(42)
+        refs = [
+            replace(
+                _ref(str(index)),
+                num_tokens=600,
+                strategy="dflash",
+                metadata={
+                    "valid_anchor_count": min(
+                        512, max(1, int(rng.expovariate(1 / 400)))
+                    )
+                },
+            )
+            for index in range(256)
+        ]
+        baseline = [
+            dist._balanced_batches(refs[start : start + 128]) for start in (0, 128)
+        ]
+        actual = dist._joint_balanced_windows(refs)
+
+        def critical(windows):
+            return sum(
+                max(dist._rank_cost(rank) for rank in window) for window in windows
+            )
+
+        self.assertLess(critical(actual), critical(baseline) * 0.95)
+        delivered = [
+            ref.sample_id for window in actual for rank in window for ref in rank
+        ]
+        self.assertEqual(len(delivered), 256)
+        self.assertEqual(set(delivered), {str(index) for index in range(256)})
+        self.assertTrue(all(len(rank) == 4 for window in actual for rank in window))
+
+    def test_bucketed_dispatch_uses_two_windows_without_losing_samples(
+        self, policy="two_window_bucketed"
+    ):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            dispatch_policy=policy,
+        )
+        for index, anchors in enumerate((512, 4, 400, 8, 500, 3, 450, 9)):
+            self.producer.publish(
+                replace(
+                    _ref(f"s{index}"),
+                    strategy="dflash",
+                    num_tokens=600,
+                    metadata={"valid_anchor_count": anchors},
+                )
+            )
+            if index == 3:
+                _pump_until_quiet(dist)
+                self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        _pump_until_quiet(dist)
+        delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(items) for items in delivered], [4, 4])
+        self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
+        if policy == "two_window_bucketed":
+            self.assertEqual(
+                set(delivered[0][:2] + delivered[1][:2]), {"s0", "s2", "s4", "s6"}
+            )
+
+    def test_joint_balancing_flushes_one_closed_window_and_drops_only_tail(self):
+        self.test_bucketed_dispatch_flushes_one_closed_window_and_drops_only_tail(
+            "two_window_joint_balanced"
+        )
+
+    def test_bucketed_dispatch_flushes_one_closed_window_and_drops_only_tail(
+        self, policy="two_window_bucketed"
+    ):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
+            dispatch_policy=policy,
+        )
+        for index in range(11):
+            self.producer.publish(replace(_ref(f"s{index}"), strategy="dflash"))
+        self.producer.publish(replace(_ref("s3"), strategy="dflash"))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = sum([_inbox_ids(self.inbox_dir, rank) for rank in range(2)], [])
+        self.assertEqual(len(delivered), 8)
+        self.assertEqual(len(set(delivered)), 8)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 3)
+        self.assertTrue(dist.finished)
+
+    def test_joint_balancing_reconciles_durable_refs(self):
+        self.test_bucketed_dispatch_reconciles_durable_refs("two_window_joint_balanced")
+
+    def test_bucketed_dispatch_reconciles_durable_refs(
+        self, policy="two_window_bucketed"
+    ):
+        store = SQLiteMetadataStore(os.path.join(self.dir, "two-window-resume.sqlite"))
+        self.addCleanup(store.close)
+        original = DataFlowController("run0", metadata_store=store)
+        refs = [_ref("s0"), _ref("s1")]
+        for ref in refs:
+            self.producer.publish(ref)
+        original.commit_samples("old-distributor", refs)
+        original.ack_train_refs(
+            "trainer", ["s0"], global_step=1, optimizer_durable=True
+        )
+        self.source.mark_consumed(1)
+        restarted = DataFlowController("run0", metadata_store=store)
+        report = restarted.reconcile_on_restart(self.feature_store)
+        dist = self._distributor(
+            dp_size=1,
+            controller=restarted,
+            skip_ids=report["released"],
+            requeued_ids=report["requeued"],
+            dispatch_policy=policy,
+        )
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        self.producer.close()
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        self.assertEqual(dist.stats["skipped"], 1)
+        self.assertEqual(dist.stats["duplicates"], 1)
+        queue = StreamingRefQueue(
+            StreamingRefChannel(RefDistributor.inbox_path(self.inbox_dir, 0))
+        )
+        queue.ack(queue.get(1))
+        dist._forward_consumed()
+        _pump_until_quiet(dist)
+        self.assertEqual(self.producer.consumed_remote(), 2)
+
+    def test_cost_balancing_waits_for_full_window_and_settles_tail(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=4,
+            refs_per_rank_batch=2,
+            dispatch_policy="cost_balanced",
+        )
+        for index in range(7):
+            self.producer.publish(_ref(f"s{index}"))
+        _pump_until_quiet(dist)
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
+        self.producer.publish(_ref("s7"))
+        self.producer.publish(_ref("s8"))
+        self.producer.publish(_ref("s7"))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = [_inbox_ids(self.inbox_dir, rank) for rank in range(2)]
+        self.assertEqual([len(batch) for batch in delivered], [4, 4])
+        self.assertEqual(set(sum(delivered, [])), {f"s{index}" for index in range(8)})
+        self.assertEqual(dist.stats["duplicates"], 1)
+        self.assertEqual(dist.stats["dropped"], 1)
+        self.assertTrue(dist.finished)
+
+    def test_cost_balancing_reconciles_sqlite_and_ack_counters(self):
+        original = self._distributor
+        with mock.patch.object(
+            self,
+            "_distributor",
+            side_effect=lambda **kwargs: original(
+                dispatch_policy="cost_balanced", **kwargs
+            ),
+        ):
+            self.test_resume_skips_acked_and_dispatches_reconciled_unacked()
+
+    def test_cost_balancing_skips_durable_refs_on_replay(self):
+        dist = self._distributor(
+            dp_size=2,
+            refs_per_rank_step=2,
+            refs_per_rank_batch=1,
+            dispatch_policy="cost_balanced",
+            skip_ids={"saved"},
+        )
+        for name in ("saved", "a", "b", "c", "d"):
+            self.producer.publish(_ref(name))
+        self.producer.close()
+        _pump_until_quiet(dist)
+        delivered = sum([_inbox_ids(self.inbox_dir, rank) for rank in range(2)], [])
+        self.assertEqual(set(delivered), {"a", "b", "c", "d"})
+        self.assertEqual(dist.stats["skipped"], 1)
+        self.assertTrue(dist.finished)
 
     def test_round_robin_equal_counts_and_unaligned_tail_closes_cleanly(self):
         dist = self._distributor(dp_size=2)
@@ -308,7 +598,7 @@ class TestRefDistributor(unittest.TestCase):
         ledger_path = os.path.join(self.dir, "resume-dup.sqlite")
         store = SQLiteMetadataStore(ledger_path)
         original = DataFlowController("run0", metadata_store=store)
-        ref = _ref("s0")
+        ref = replace(_ref("s0"), estimated_bytes=9)
         self.producer.publish(ref)
         self.producer.publish(ref)  # at-least-once duplicate record
         original.commit_samples("old-distributor", [ref])
@@ -316,7 +606,7 @@ class TestRefDistributor(unittest.TestCase):
             "trainer", ["s0"], global_step=1, optimizer_durable=True
         )
         # The prior attempt settled the ack AND its polled duplicate.
-        self.source.mark_consumed(2)
+        self.source.mark_consumed(2, num_bytes=18)
 
         restarted = DataFlowController("run0", metadata_store=store)
         report = restarted.reconcile_on_restart(self.feature_store)
@@ -331,7 +621,7 @@ class TestRefDistributor(unittest.TestCase):
 
         self.assertEqual(dist.stats["skipped"], 2)
         # published == consumed: nothing over-advanced, in-flight is exactly 0.
-        self.assertEqual(self.producer.consumed_remote(), 2)
+        self.assertEqual(self.producer.consumed_state_remote(), (2, 18))
         self.assertEqual(self.producer.in_flight_remote(), 0)
         self.assertEqual(_inbox_ids(self.inbox_dir, 0), [])
         store.close()
@@ -340,12 +630,15 @@ class TestRefDistributor(unittest.TestCase):
         ledger_path = os.path.join(self.dir, "resume-counter.sqlite")
         store = SQLiteMetadataStore(ledger_path)
         original = DataFlowController("run0", metadata_store=store)
-        refs = [_ref("s0"), _ref("s1")]
+        refs = [
+            replace(_ref("s0"), estimated_bytes=1),
+            replace(_ref("s1"), estimated_bytes=10),
+        ]
         for ref in refs:
             self.producer.publish(ref)
         original.commit_samples("old-distributor", refs)
         original.ack_train_refs(
-            "trainer", ["s0"], global_step=1, optimizer_durable=True
+            "trainer", ["s1"], global_step=1, optimizer_durable=True
         )
         # Crash here: the SQLite marker exists, but the rank-local inbox ack did
         # not yet advance the source sidecar.
@@ -359,9 +652,15 @@ class TestRefDistributor(unittest.TestCase):
             skip_ids=report["released"],
             requeued_ids=report["requeued"],
         )
-        self.assertEqual(self.producer.consumed_remote(), 1)
+        self.assertEqual(self.producer.consumed_state_remote(), (1, 10))
         _pump_until_quiet(dist)
-        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s1"])
+        self.assertEqual(_inbox_ids(self.inbox_dir, 0), ["s0"])
+        queue = StreamingRefQueue(
+            StreamingRefChannel(dist.inbox_path(self.inbox_dir, 0))
+        )
+        queue.ack(queue.get(1))
+        dist._forward_consumed()
+        self.assertEqual(self.producer.consumed_state_remote(), (2, 11))
         store.close()
 
     def test_reconciled_unacked_refs_redistribute_across_consumer_dp_sizes(self):

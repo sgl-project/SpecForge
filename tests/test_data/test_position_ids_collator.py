@@ -32,6 +32,18 @@ class PositionIdsCollatorTest(unittest.TestCase):
             )
         )
 
+    def test_usp_keeps_position_ids_local(self):
+        collator = DataCollatorWithPadding.__new__(DataCollatorWithPadding)
+        collator.sp_degree = 2
+        collator.ulysses_degree = 2
+        batch = collator([_feature(5, torch.tensor([[4, 5, 6, 7]]))])
+        # Pad positions to the input length, without SP rounding or
+        # Ulysses expansion: RoPE runs before the sequence exchange.
+        self.assertEqual(batch["input_ids"].shape, (1, 5))
+        self.assertTrue(
+            torch.equal(batch["position_ids"], torch.tensor([[4, 5, 6, 7, 0]]))
+        )
+
     def test_collates_generic_3d_position_ids(self):
         features = [
             _feature(

@@ -65,7 +65,10 @@ def build_step(wrapped_model, *, target_head=None, **_options):
 def resume_contract(_config, draft_model, training_model):
     """Persist resolved DFlash architecture, sampling, and loss semantics."""
 
+    from specforge.modeling.draft.dflash import dflash_attention_resume_contract
+
     contract = {
+        **dflash_attention_resume_contract(draft_model),
         "dflash_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
         "dflash_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
@@ -106,18 +109,30 @@ def resume_contract(_config, draft_model, training_model):
     return contract
 
 
-def resolve_dflash_kernels(config):
-    if not config.model.use_liger_kernel:
-        return None
-    if config.training.strategy != "dflash":
-        raise ValueError(
-            "model.use_liger_kernel is currently supported only with "
-            "training.strategy=dflash"
+def resolve_dflash_kernels(config, draft_config):
+    """Resolve ``model.use_liger_kernel`` on this trainer rank's device.
+
+    Planning already rejected an explicit ``true`` for other strategies. Export
+    and inference build the draft without kernels, so they stay native.
+    """
+    from specforge.modeling.draft.dflash_kernels import (
+        load_liger_dflash_kernels,
+        resolve_draft_liger_kernel_choice,
+    )
+    from specforge.training.checkpoint import CheckpointManager
+
+    choice = resolve_draft_liger_kernel_choice(
+        config.model.use_liger_kernel, draft_config
+    )
+    kernels = load_liger_dflash_kernels(choice) if choice.enabled else None
+    if CheckpointManager.is_rank0():
+        advice = (
+            "; compare the loss against model.use_liger_kernel: false"
+            if choice.unvalidated
+            else ""
         )
-
-    from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
-
-    return load_liger_dflash_kernels()
+        print(f"[dflash] {choice.describe()}{advice}", flush=True)
+    return kernels
 
 
 def build_draft(config, draft_config):
@@ -126,7 +141,7 @@ def build_draft(config, draft_config):
     return build_dflash_draft(
         config,
         draft_config,
-        resolve_dflash_kernels(config),
+        resolve_dflash_kernels(config, draft_config),
     )
 
 
@@ -209,6 +224,7 @@ def algorithm_spec() -> AlgorithmSpec:
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
             supports_teacher_metrics_opt_out=True,
+            supports_liger_kernel=True,
         ),
     )
 

@@ -10,9 +10,9 @@ split only changes the endpoints and `CUDA_VISIBLE_DEVICES`.
 The flow is the standard disaggregated setup
 (`docs/basic_usage/disaggregated_training.md`); what is DeepSeek-V4-specific:
 
-- **Capture hook**: SGLang `v0.5.18` patched with
-  `scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18`, launched
-  with `--spec-capture-method dspark`. The generic DFlash capture is not
+- **Capture hook**: a compatible SGLang build with the
+  [capture plugin](../../plugins/sglang-spec-capture/README.md), launched
+  with `--enable-return-aux-hidden-states --speculative-algorithm DSPARK`. The generic DFlash capture is not
   equivalent for V4: the inter-layer residual is the widened mHC tensor, so
   capture must use the model's own `set_dspark_layers_to_capture` hook.
 - **Chat encoding**: the checkpoint ships a Python encoder rather than tokenizer
@@ -56,7 +56,7 @@ export MOONCAKE_GLOBAL_SEGMENT_SIZE=$((200 << 30))
 export MOONCAKE_LOCAL_BUFFER_SIZE=$((1 << 30))
 export FLASHINFER_USE_CUDA_NORM=1
 export FLASHINFER_USE_CUDA_QUANT=1
-CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=0,1 env SPECFORGE_SPEC_CAPTURE=1 python -m sglang.launch_server \
   --host 0.0.0.0 \
   --port 30000 \
   --model-path deepseek-ai/DeepSeek-V4-Flash-0731 \
@@ -69,23 +69,23 @@ CUDA_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
   --chunked-prefill-size -1 \
   --max-prefill-tokens 8704 \
   --moe-runner-backend flashinfer_mxfp4 \
-  --enable-spec-capture \
-  --spec-capture-method dspark \
-  --spec-capture-aux-layer-ids 1 11 21 31 41
+  --enable-return-aux-hidden-states --return-hidden-states-mode full \
+  --speculative-algorithm DSPARK \
+  --return-aux-hidden-state-layer-ids 1 11 21 31 41
 ```
 
 ## Trainer (GPUs 4-7)
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 specforge train \
-  -c examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-disaggregated.yaml
+  -c examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark.yaml
 ```
 
 Supply `HF_TOKEN` and `WANDB_API_KEY` through the environment, not YAML.
 
 ## On AMD MI355X
 
-Use [`deepseek-v4-flash-dspark-disaggregated-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-disaggregated-amd.yaml),
+Use [`deepseek-v4-flash-dspark-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/deepseek-v4-flash-dspark-amd.yaml),
 this recipe with the capture-server fields changed for ROCm, inside the
 `lmsysorg/sglang:v0.5.18-rocm720-mi35x` container from the
 [AMD ROCm tutorial](../sections/basic_usage/AMD/amd_rocm.md). Everything above

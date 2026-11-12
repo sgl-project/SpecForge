@@ -271,9 +271,10 @@ def benchmark_draft(model, config, args):
         S=seq_len,
         block_size=block_size,
         device=device,
+        is_causal=getattr(model.config, "is_causal", None),
     )
     if flex_attention_backend() == "FLASH":
-        mask_args["flex_block_size"] = (256, 128)
+        mask_args["BLOCK_SIZE"] = (256, 128)
     attention_mask = create_dflash_block_mask(**mask_args)
     if model.sliding_window is not None:
         attention_mask = {

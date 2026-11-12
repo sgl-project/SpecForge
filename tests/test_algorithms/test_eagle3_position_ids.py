@@ -63,14 +63,14 @@ class Eagle3PositionIdsTest(unittest.TestCase):
         self.assertEqual(prepared.shape, (2, 2, 4))
         self.assertTrue(torch.equal(prepared, position_ids))
 
-    def test_usp_preserves_ulysses_expanded_position_ids(self):
+    def test_usp_preserves_local_positions_with_global_offset(self):
         self.model.attention_backend = "usp"
-        position_ids = torch.arange(8, dtype=torch.int32).reshape(1, 8)
+        position_ids = torch.arange(4, 8, dtype=torch.int32).reshape(1, 4)
 
-        prepared = self._prepare(position_ids, seq_length=4)
+        prepared = self._prepare(position_ids, seq_length=7)
 
         self.assertIs(prepared, position_ids)
-        self.assertEqual(prepared.shape, (1, 8))
+        self.assertEqual(prepared.shape, (1, 4))
         self.assertEqual(prepared.dtype, torch.int32)
 
     def test_rejects_position_ids_with_an_invalid_shape(self):

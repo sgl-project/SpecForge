@@ -59,6 +59,13 @@ def log_softmax_forward_kernel(
     m_ptr,
     d_ptr,
     n_cols,
+    acceptance_target_ptr,
+    acceptance_ptr,
+    tokens_per_batch,
+    acceptance_batch_stride,
+    acceptance_token_stride,
+    acceptance_vocab_stride,
+    WITH_ACCEPTANCE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     program_id = tl.program_id(0).to(tl.int64)
@@ -66,8 +73,15 @@ def log_softmax_forward_kernel(
     target_ptr += program_id * target_stride
     position_mask_ptr += program_id * position_mask_stride
     position_mask = tl.load(position_mask_ptr)
-    if position_mask == 0:
-        return
+    if not WITH_ACCEPTANCE:
+        if position_mask == 0:
+            return
+
+    if WITH_ACCEPTANCE:
+        acceptance_target_ptr += (
+            program_id // tokens_per_batch * acceptance_batch_stride
+            + program_id % tokens_per_batch * acceptance_token_stride
+        )
 
     m = float("-inf")
     d = 0.0
@@ -86,6 +100,7 @@ def log_softmax_forward_kernel(
         m = m_new
 
     loss = 0.0
+    acceptance = 0.0
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_cols
@@ -101,13 +116,26 @@ def log_softmax_forward_kernel(
         log_softmax_logits = normalized_logits - log_normalizer
         weighted_log_prob = target_block * log_softmax_logits
         loss += tl.sum(tl.where(mask, weighted_log_prob, 0.0))
+        if WITH_ACCEPTANCE:
+            acceptance_target = tl.load(
+                acceptance_target_ptr + offsets * acceptance_vocab_stride,
+                mask=mask,
+                other=0.0,
+            )
+            draft_prob = tl.exp(normalized_logits) / d
+            accepted_prob = tl.minimum(
+                acceptance_target, draft_prob, propagate_nan=tl.PropagateNan.ALL
+            )
+            acceptance += tl.sum(tl.where(mask, accepted_prob, 0.0))
 
     loss_ptr += program_id * loss_stride
     m_ptr += program_id
     d_ptr += program_id
-    tl.store(loss_ptr, -loss)
+    tl.store(loss_ptr, tl.where(position_mask, -loss, 0.0))
     tl.store(m_ptr, m.to(tl.float32))
     tl.store(d_ptr, d.to(tl.float32))
+    if WITH_ACCEPTANCE:
+        tl.store(acceptance_ptr + program_id, acceptance)
 
 
 @triton.jit
@@ -172,8 +200,21 @@ def log_softmax_backward_kernel(
 
 class LogSoftmaxLoss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, target, position_mask):
+    def forward(ctx, logits, target, position_mask, acceptance_target=None):
         B, T, V = logits.shape
+        acceptance = None
+        acceptance_strides = (0, 0, 0)
+        if acceptance_target is not None:
+            if acceptance_target.shape != logits.shape:
+                raise ValueError("acceptance_target must have the same shape as logits")
+            if acceptance_target.dtype != torch.float32:
+                raise ValueError("acceptance_target must have dtype torch.float32")
+            if acceptance_target.device != logits.device:
+                raise ValueError(
+                    "acceptance_target must be on the same device as logits"
+                )
+            acceptance = torch.empty((B, T), device=logits.device, dtype=torch.float32)
+            acceptance_strides = acceptance_target.stride()
         loss = torch.zeros((B * T, 1), device=logits.device)
         logits_flat = logits.contiguous().view(B * T, V)
         target_flat = target.contiguous().view(B * T, V)
@@ -194,14 +235,23 @@ class LogSoftmaxLoss(torch.autograd.Function):
             m,
             d,
             V,
+            acceptance_target,
+            acceptance,
+            T,
+            *acceptance_strides,
+            WITH_ACCEPTANCE=acceptance_target is not None,
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
         ctx.save_for_backward(logits.detach(), target, position_mask, m, d)
+        if acceptance is not None:
+            ctx.mark_non_differentiable(acceptance)
+            ctx.set_materialize_grads(False)
+            return loss.squeeze(1).mean(), acceptance
         return loss.squeeze(1).mean()
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output, grad_acceptance=None):
         logits, target, position_mask, m, d = ctx.saved_tensors
         B, T, V = logits.shape
         scaling_factor = 1.0 / (B * T)
@@ -225,4 +275,6 @@ class LogSoftmaxLoss(torch.autograd.Function):
             num_warps=num_warps,
         )
         logits = logits.view(B, T, V)
+        if len(ctx.needs_input_grad) == 4:
+            return logits, None, None, None
         return logits, None, None

@@ -35,13 +35,22 @@ examples/configs/
 | `online/disaggregated/managed-local` | Live SGLang capture | Producer + consumer | SpecForge starts local Mooncake and SGLang from `managed_local` |
 
 The directory is the source of truth for mode, topology, and service ownership.
-Some filenames retain historical `-online`, `-offline`, or `-disaggregated`
-labels so existing recipe identities and run names remain recognizable.
+Recipe filenames use `<model>-<draft-type>[-<servers>server-dp<ranks>][-<hardware>].yaml`,
+for example `qwen3.6-27b-dflash-1server-dp2.yaml` or
+`qwen3.8-27b-dflash2-5server-dp3-h200.yaml`. Hardware suffixes such as `npu`,
+`amd`, or `h200` come last; ordinary GPU recipes need no hardware suffix.
+Optional topology suffixes distinguish deployment variants; `dp<ranks>` records
+the number of trainer ranks. An omitted suffix does not imply a default topology;
+refer to `deployment` for the actual server and trainer configuration.
+Filenames omit `online`, `offline`, and `disaggregated` because the directories
+already encode those choices. Different directories may contain the same
+filename, so identify recipes by their relative paths. Run IDs and output
+directories are configured independently of the recipe filename.
 
 Run any recipe through the one public training entry:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 `model.draft_model_config` may name a local JSON file, a local model directory,
@@ -55,13 +64,13 @@ Every recipe records its audited process count under `deployment.trainer`.
 Multi-process configs self-launch through torch distributed:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.yaml
 ```
 
 The Qwen3-30B-A3B EAGLE3.1 variant uses the same unified entry point:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml
 ```
 
 Its draft config enables per-layer RMS normalization before the three captured
@@ -71,28 +80,28 @@ second runtime or launch path.
 
 Recipes under `online/disaggregated/managed-local` are opt-in, single-node
 full-stack examples. Their typed `managed_local` blocks own Mooncake, one or
-more patched SGLang capture servers, and the trainer GPU allocation; the same
+more SGLang capture servers, and the trainer GPU allocation; the same
 `specforge train -c ...` command starts and cleans up the complete stack.
 Recipes under `online/disaggregated/external` omit `managed_local`, so Mooncake
 and SGLang remain owned by the user, scheduler, or service platform.
 
-The `kimi-k3-dspark-disaggregated.yaml` recipe is the external
+The `kimi-k3-dspark.yaml` recipe is the external
 two-node migration of the 64K Kimi K3 continual run. Its dedicated
 [runbook](../../docs/recipes/kimi-k3-dspark-disaggregated.md) pins the K3
-SGLang revision and patch target, preserves the old effective global batch and
+SGLang capture plugin requirements, preserves the old effective global batch and
 prompt order, and documents the TP8 capture plus four-rank trainer topology.
 
-`deepseek-v4-flash-dspark-disaggregated.yaml` trains a DSpark drafter for
+`deepseek-v4-flash-dspark.yaml` trains a DSpark drafter for
 DeepSeek-V4-Flash-0731 from scratch on ShareGPT, with external capture
 servers. Its
 [runbook](../../docs/recipes/deepseek-v4-flash-dspark-disaggregated.md)
-covers the v0.5.18 SGLang capture patch and the bundled `deepseek-v4` chat
+covers the SGLang capture plugin and the bundled `deepseek-v4` chat
 template (the checkpoint ships no Jinja template).
 
-`qwen3.8-27b-dflash2-disaggregated.yaml` (external services, two nodes) and
-its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`
+`qwen3.8-27b-dflash2.yaml` (external services, two nodes) and
+its managed-local siblings `qwen3.8-27b-dflash2-4server-dp4.yaml`
 (one node, four capture servers plus a DP4 trainer) and
-`qwen3.8-27b-dflash2-h200-5server-dp3-disaggregated.yaml` (one 8x H200 node,
+`qwen3.8-27b-dflash2-5server-dp3-h200.yaml` (one 8x H200 node,
 five FP8 capture servers with FA3 and FlashInfer GDN, a DP3 trainer, RDMA
 loopback) train the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
 Qwen3.8-27B. Their
@@ -164,16 +173,16 @@ assume the command runs from the repository root.
 
 | Workflow | Canonical starting point |
 | --- | --- |
-| EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3-offline.yaml`](offline/colocated/qwen3-8b-eagle3-offline.yaml) |
-| DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash-offline.yaml`](offline/colocated/qwen3-8b-dflash-offline.yaml) |
-| Domino offline, colocated | [`offline/colocated/qwen3-8b-domino-offline.yaml`](offline/colocated/qwen3-8b-domino-offline.yaml) |
-| DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark-offline.yaml`](offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml`](offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml`](online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
-| DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
-| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4-disaggregated.yaml) |
-| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2-disaggregated.yaml) |
-| Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
+| EAGLE3 offline, colocated | [`offline/colocated/qwen3-8b-eagle3.yaml`](offline/colocated/qwen3-8b-eagle3.yaml) |
+| DFlash offline, colocated | [`offline/colocated/qwen3-8b-dflash.yaml`](offline/colocated/qwen3-8b-dflash.yaml) |
+| Domino offline, colocated | [`offline/colocated/qwen3-8b-domino.yaml`](offline/colocated/qwen3-8b-domino.yaml) |
+| DSpark offline, colocated | [`offline/colocated/qwen3-4b-dspark.yaml`](offline/colocated/qwen3-4b-dspark.yaml) |
+| EAGLE3 offline, disaggregated | [`offline/disaggregated/qwen3-8b-eagle3.yaml`](offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| EAGLE3 online, external services | [`online/disaggregated/external/qwen3-8b-eagle3.yaml`](online/disaggregated/external/qwen3-8b-eagle3.yaml) |
+| DFlash online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
+| DFlash 2 online, managed-local stack | [`online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml`](online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml) |
+| DFlash 2 online, external services on two nodes | [`online/disaggregated/external/qwen3.8-27b-dflash2.yaml`](online/disaggregated/external/qwen3.8-27b-dflash2.yaml) |
+| Domino online, managed-local stack | [`online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml`](online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml) |
 
 The runtime derives online/offline mode from the selected `data` source and
 reads topology from `deployment.mode`; it does not parse the filename or its
@@ -185,6 +194,9 @@ historical suffixes.
 | --- | --- | --- |
 | `run_id` | `specforge-run` | Stable identifier for the run. It names checkpoints and is also the default disaggregated store namespace. Use a new value for a fresh attempt. |
 | `output_dir` | `./output` | Shared checkpoint, profiler, and tracker output directory. Every trainer rank must resolve it to the same location. |
+| `draft` | `null` | Canonical draft mapping or YAML/JSON path, including preset files. Its architecture selects the default objective. |
+| `initialization` | `null` | Canonical weights-only loading: `checkpoint`, or `weights_from` (`checkpoint`, `mapping`, `allow_new`) with optional disjoint `from_target` copies. See [canonical training](../../docs/draft_training.md). |
+| `resume` | `null` | Canonical full training resume; restores structure from the checkpoint. A canonical checkpoint given in `training.resume_from` resumes the same way; if both fields are set they must agree. Excludes initialization. |
 
 The top-level `model` and `data` sections are required. `training`, `tracking`,
 `profiling`, `runtime`, and `deployment` have defaults, but checked-in recipes
@@ -203,7 +215,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `false` | Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash training. Requires the `specforge[liger]` extra. |
+| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. Canonical runs (top-level `draft`, `initialization` or `resume`, or a canonical checkpoint in `training.resume_from`) use PyTorch kernels unless this is `true`; `true` swaps in Liger RMSNorm and SiLU-gated SwiGLU on CUDA/ROCm only and is recorded in the resume contract. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -239,7 +251,7 @@ should make their training strategy and topology explicit.
 | `model.sglang_linear_attn_prefill_backend` | `null` | Optional linear-attention (GDN/KDA) prefill kernel backend for hybrid targets (`--linear-attn-prefill-backend`). |
 | `model.sglang_fp8_gemm_backend` | `null` | Optional blockwise FP8 GEMM runner (`--fp8-gemm-backend`). |
 | `model.sglang_disable_cuda_graph` | `false` | Pass `--disable-cuda-graph`, which disables SGLang's decode and prefill CUDA graphs. |
-| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the `--spec-capture-*` flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
+| `model.sglang_extra_args` | `[]` | Further SGLang CLI tokens appended to every managed-local capture server, one flag or value per list item (`["--prefill-max-requests", "8"]`). The list must start with a `--flag`. Flags the launcher owns (`--model-path`, `--port`, `--host`, `--tp-size`, `--dtype`, `--trust-remote-code`, `--skip-tokenizer-init`, `--chunked-prefill-size`, `--context-length`, the auxiliary hidden-state capture flags) and flags another `model.sglang_*` field already renders are rejected, including their SGLang aliases and abbreviations; so are `--api-key` (the capture adapter sends no key), `--enable-dp-attention`/`--enable-dp-lm-head` (unsupported by managed-local capture) and `--config`. External servers take their flags from their own launch command. |
 
 ### `data`: choose exactly one training source
 
@@ -257,7 +269,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.is_preformatted` | `false` | Treat each record's text as already formatted by `chat_template`. |
 | `data.train_only_last_turn` | `false` | Restrict the loss mask to the final assistant turn. |
 | `data.build_dataset_num_proc` | `8` | Positive CPU process count for dataset preprocessing. |
-| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; use 0 for synchronous loading. |
+| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; canonical runs use 4. Use 0 for synchronous loading. |
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
@@ -273,12 +285,20 @@ Common fields:
 | Field | Default | What to write |
 | --- | --- | --- |
 | `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
+| `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
+| `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
+| `training.loss` | `{}` | Canonical token loss, for example `{kind: kl}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
+| `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
+| `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
+| `training.fused_logits_loss` | `true` | Optimized FP32 logits loss, including Domino's specialized CE. Enabled by default for all supported models. `false` uses eager losses. Independent of projection and checkpointing. |
+| `training.objective_checkpointing` | `true` | Recompute DFlash-family objective chunks during backward, including projection. With `objective_chunk_blocks=0`, checkpoints the whole objective. Without it, saved logits accumulate across chunks. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
@@ -291,7 +311,7 @@ Common fields:
 | `training.muon_ns_steps` | `5` | Newton-Schulz iterations in `[1, 99]`. |
 | `training.muon_weight_decay` | `0.0` | Decoupled weight decay of the Muon matrices (`W *= 1 - lr_t * wd`). |
 | `training.muon_adjust_lr_fn` | `original` | Shape-aware Muon step: `original` (`lr * sqrt(max(1, rows / cols))`) or `match_rms_adamw` (`lr * 0.2 * sqrt(max(rows, cols))`, rates on AdamW's scale). |
-| `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
+| `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. Canonical objectives accept `eager` (EAGLE3 also `sdpa`), so a canonical YAML must set it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
@@ -350,12 +370,13 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.inbox_server_url` | `null` | Optional private `http://host:port` rank-0 relay for tensor-free inbox refs when remote trainer ranks cannot share `control_dir`. Online multi-node only; no credentials, path, query, TLS, or built-in authentication. |
 | `deployment.disaggregated.store_root` | `null` | Shared feature directory; required when `backend: shared_dir`. |
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
-| `deployment.disaggregated.server_urls` | `[]` | External patched SGLang capture endpoints. One rollout worker is created per entry. Do not set with `managed_local`. |
+| `deployment.disaggregated.server_urls` | `[]` | External SGLang capture endpoints (running the capture plugin). One rollout worker is created per entry. Do not set with `managed_local`. |
+| `deployment.disaggregated.server_capture` | `auto` | SGLang capture uses the `specforge-sglang-capture` plugin; allowed values are `auto` and `plugin`. `auto` honors `DISAGG_SERVER_CAPTURE=plugin`, otherwise managed-local planning checks each server interpreter for the plugin and its required SGLang APIs. External capture detects `spec_capture_backend: plugin` in `/server_info`. Missing support fails with installation instructions; source-patch servers are unsupported. See [plugin setup](../../plugins/sglang-spec-capture/README.md). |
 | `deployment.disaggregated.mooncake_metadata_server` | `null` | External Mooncake metadata URL. |
 | `deployment.disaggregated.mooncake_master_server_addr` | `null` | External Mooncake RPC `host:port`. |
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |
-| `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol such as `tcp` or `rdma`. |
-| `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
+| `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol, `tcp` or `rdma`. An exported `MOONCAKE_PROTOCOL` overrides this value; with neither set, `tcp`: SpecForge cannot see an external server's protocol, and every server and trainer of one store must use the same one. |
+| `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection; an exported `MOONCAKE_RDMA_DEVICES` overrides it. Under `rdma`, a producer or trainer checks every listed device, and unset selects the usable HCAs of its node; external capture servers must list theirs in `MOONCAKE_RDMA_DEVICES`. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
 | `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
@@ -391,8 +412,6 @@ deployment:
     backend: mooncake
     managed_local:
       trainer_cuda_visible_devices: ["2", "3"]
-      mooncake:
-        protocol: tcp
       capture_servers:
         - port: 30000
           cuda_visible_devices: ["0"]
@@ -408,29 +427,57 @@ Managed-local fields:
 | --- | --- | --- |
 | `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. |
 | `deployment.disaggregated.managed_local.mooncake` | default object | Owned loopback Mooncake configuration described by the nested fields below. |
-| `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned patched SGLang server definitions. |
+| `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned SGLang server running the capture plugin definitions. |
 | `deployment.disaggregated.managed_local.shutdown_grace_s` | `30` | Positive graceful process-group shutdown window. |
 | `deployment.disaggregated.managed_local.mooncake.rpc_port` | `35551` | Owned Mooncake RPC port. |
 | `deployment.disaggregated.managed_local.mooncake.metadata_port` | `35880` | Owned metadata HTTP port. |
 | `deployment.disaggregated.managed_local.mooncake.metrics_port` | `35903` | Owned metrics port. |
 | `deployment.disaggregated.managed_local.mooncake.local_hostname` | `127.0.0.1` | Local transfer hostname. |
-| `deployment.disaggregated.managed_local.mooncake.protocol` | `tcp` | `tcp` or `rdma`. |
-| `deployment.disaggregated.managed_local.mooncake.rdma_devices` | `null` | RDMA-device selection when using RDMA. |
+| `deployment.disaggregated.managed_local.mooncake.protocol` | `null` | `tcp`, `rdma`, or `nvlink`. Unset resolves to `rdma`, or to `tcp` on Ascend hosts, once when the plan is built. `tcp` opts out of RDMA. `nvlink` keeps captures in server GPU arenas and requires `arena_bytes` and `receive_buffers: cuda`. |
+| `deployment.disaggregated.managed_local.mooncake.rdma_devices` | `null` | Comma-separated HCAs for `rdma`. Unset selects every usable HCA of one link layer (InfiniBand before RoCE); a listed device that is not usable is an error. |
 | `deployment.disaggregated.managed_local.mooncake.global_segment_size_bytes` | `34359738368` | Owned global segment size. |
+| `deployment.disaggregated.managed_local.mooncake.arena_bytes` | `null` | Positive HBM capacity in bytes reserved by each capture server for capture objects. Required only with `protocol: nvlink`; omit for other protocols. Leave room for the arena when setting `mem_fraction_static`, and set `runtime.resident_high_watermark_bytes` no higher than the total arena capacity across capture servers. |
 | `deployment.disaggregated.managed_local.mooncake.local_buffer_size_bytes` | `1073741824` | Owned local client buffer. |
 | `deployment.disaggregated.managed_local.mooncake.startup_timeout_s` | `60` | Positive Mooncake readiness timeout. |
 | `deployment.disaggregated.managed_local.mooncake.probe_timeout_s` | `5` | Positive, finite budget for one HTTP + TCP readiness probe, capped by the remaining startup timeout. |
 | `deployment.disaggregated.managed_local.mooncake.default_kv_lease_ttl_ms` | `500` | Master key-lease TTL (ms) forwarded to `mooncake_master --default_kv_lease_ttl`. Kept below the consumer's teardown drain window so managed_local shuts down cleanly; set `null` to inherit Mooncake's stock default. |
 | `deployment.disaggregated.managed_local.capture_servers[].port` | required | Unique capture HTTP port. |
+| `deployment.disaggregated.managed_local.capture_servers[].python_executable` | `null` | Python executable for a separate SGLang environment; defaults to the trainer's Python. |
 | `deployment.disaggregated.managed_local.capture_servers[].cuda_visible_devices` | required | Device tokens for this server. Their count must equal its `tp_size`. |
-| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Automatically publish from CUDA memory when the capture worker uses RDMA. Set `false` to use host publication or `true` to require GPU publication; `true` requires `mooncake.protocol: rdma`. |
+| `deployment.disaggregated.managed_local.capture_servers[].gpu_put` | `null` | Publish from CUDA memory automatically when `mooncake.protocol: rdma` is set explicitly; with the protocol unset, `null` keeps host publication. Set `false` to use host publication or `true` to require GPU publication; `true` requires the stack to resolve to RDMA or NVLink. RDMA GPU publication needs GPUDirect RDMA (`nvidia_peermem` or DMA-BUF support). NVLink requires GPU publication and rejects `false`. |
 | `deployment.disaggregated.managed_local.capture_servers[].tp_size` | `1` | Target-model tensor parallelism for this server. |
 | `deployment.disaggregated.managed_local.capture_servers[].mem_fraction_static` | `null` | Optional SGLang static-memory override in `(0, 1]`; otherwise inherit `model.sglang_mem_fraction_static`. |
 | `deployment.disaggregated.managed_local.capture_servers[].attention_backend` | `null` | Server-specific override; otherwise inherit `model.sglang_attention_backend`. |
 | `deployment.disaggregated.managed_local.capture_servers[].startup_timeout_s` | `1800` | Positive server readiness timeout. |
 | `deployment.disaggregated.managed_local.capture_servers[].extra_args` | `[]` | SGLang CLI tokens for this server only, appended after `model.sglang_extra_args` under the same rules. A flag may appear once per command line, so set a per-server flag here and not in the global list. |
-| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture patch's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
+| `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture plugin's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
 | `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
+
+Managed-local stacks use Mooncake RDMA by default and never fall back to TCP
+silently. The launcher resolves the transport once, when it builds the plan, and
+renders the resolved `MOONCAKE_PROTOCOL` and `MOONCAKE_RDMA_DEVICES` into every
+capture server, the producer and the trainer; `--plan` prints them. An HCA is
+usable when the one port Mooncake opens (`MC_IB_PORT`, default 1) is ACTIVE
+InfiniBand, or ACTIVE RoCE with a RoCE v2 GID bound to a network interface (a
+non-zero GID at `MC_GID_INDEX` when that is set), when its
+`/dev/infiniband/uverbs*` node is readable and writable by the launching
+process, and when `MC_TE_FILTERS`, if set, admits it. The launch fails, naming
+the reason for each device, when no HCA is usable, when a listed device is not,
+when `MC_FORCE_TCP`, `MC_MS_AUTO_DISC=1`, `MC_USE_TENT` or `MC_USE_TEV1` is
+set, when `MC_TE_FILTERS` excludes a selected device, or when `RLIMIT_MEMLOCK`
+is below the host memory Mooncake registers (every host buffer once per HCA;
+`ulimit -l unlimited` or `CAP_IPC_LOCK` satisfies it). In a container, pass
+`--device /dev/infiniband` and `--ulimit memlock=-1`. Set
+`mooncake.protocol: tcp` to opt out; Ascend hosts default to TCP. On a host
+without the HCAs, such as a laptop, `--plan` still prints the plan with the
+configured devices and reports why they do not resolve (`managed_rdma_error`);
+launching it there fails.
+
+With the protocol unset, capture servers keep host publication unless an entry
+sets `gpu_put: true`. An explicit `protocol: rdma` also turns on GPU
+publication, whose GPUDirect RDMA requirement is met only at the first capture,
+after the servers report healthy; set `gpu_put: false` to keep RDMA with host
+publication.
 
 `startup_timeout_s` bounds the overall readiness wait; `probe_timeout_s` controls
 each probe within that window. Increasing only the startup timeout cannot fix
@@ -445,8 +492,9 @@ the strategy's non-blocking copy.
 Select `receive_buffers: pageable` to restore fresh host receives. The 8 GiB receive-pool
 budget is allocated lazily per rank and excludes returned tensors and overflow buffers.
 
-Patched CUDA capture servers use GPU publication automatically when
-`MOONCAKE_PROTOCOL=rdma`; TCP and non-CUDA workers use host publication. External
+CUDA capture servers with the plugin use GPU publication automatically when
+`MOONCAKE_PROTOCOL=rdma` (managed-local: when `mooncake.protocol: rdma` is set
+explicitly); TCP and non-CUDA workers use host publication. External
 servers can set `SGLANG_SPEC_CAPTURE_GPU_PUT=0` to disable it or `1` to explicitly
 enable it. Managed-local `gpu_put: false` also disables an inherited enable flag.
 
@@ -470,6 +518,7 @@ unless tuning throughput or memory pressure.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `runtime.producer_lease` | `8` | Prompts leased to a rollout worker at once. |
+| `runtime.consumer_dispatch` | `round_robin` | Use `cost_balanced` within each optimizer window, or `two_window_bucketed` / `two_window_joint_balanced` across two windows. Two-window policies can change sample grouping and require both `in_flight_high_watermark` and `in_flight_low_watermark` to cover two global optimizer windows. |
 | `runtime.producer_concurrency` | `1` | Concurrent capture calls maintained by each server's logical producer. Increase to keep ingress full without duplicating producers. |
 | `runtime.in_flight_high_watermark` | `256` | Pause production at this many committed, unacknowledged refs. |
 | `runtime.in_flight_low_watermark` | `192` | Resume production at or below this count; it cannot exceed the high watermark. |
@@ -542,6 +591,11 @@ specforge train -c ./my-run.yaml \
   'deployment.disaggregated.server_urls=["http://capture-0:30000"]'
 ```
 
+Keys under an untyped mapping such as `training.objective_options` may be new,
+and their values are parsed as YAML (`training.objective_options.num_anchors=64`
+passes an integer). An unset mapping takes a whole value:
+`'training.loss={kind: kl}'`.
+
 For deeper lifecycle and recovery semantics, see the
 [training guide](../../docs/sections/basic_usage/training.md) and
 [disaggregated training guide](../../docs/sections/basic_usage/disaggregated_training.md).
@@ -556,7 +610,7 @@ For deeper lifecycle and recovery semantics, see the
 | DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
-`qwen3-8b-dpace-online.yaml` is the D-PACE recipe. It deliberately uses the
+`qwen3-8b-dpace.yaml` is the D-PACE recipe. It deliberately uses the
 shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
 selection inside the unified trainer, not another training entry.
 
@@ -595,7 +649,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml
 ```
 
 The unified launcher provides rank/world/rendezvous variables and the runtime
@@ -609,13 +663,13 @@ control/data-plane state; capture producers always start a fresh attempt.
 Migration notes:
 
 - The former `run_qwen3_8b_dflash_disagg_1srv_dp7.sh` self-contained topology
-  is retained as `qwen3-8b-dflash-1server-dp7-disaggregated.yaml`: one managed
+  is retained as `qwen3-8b-dflash-1server-dp7.yaml`: one managed
   capture server on GPU 0 and seven DFlash trainer ranks on GPUs 1–7.
 - The former `run_qwen3_8b_domino_disagg_1srv_dp7.sh` self-contained topology
-  is retained as `qwen3-8b-domino-1server-dp7-disaggregated.yaml`: one managed
+  is retained as `qwen3-8b-domino-1server-dp7.yaml`: one managed
   capture server on GPU 0 and seven trainer ranks on GPUs 1–7.
 - The former `run_qwen3.6_27b_dflash_disagg.sh` one-server topology is retained
-  as `qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml`: one managed capture
+  as `qwen3.6-27b-dflash-1server-dp2.yaml`: one managed capture
   server on GPU 0 and two trainer ranks on GPUs 1–2. The external-service YAML
   remains available for scheduler-managed deployments.
 - The latest pre-cleanup `run_qwen3_8b_domino_disagg_multiserver.sh` had been
@@ -624,7 +678,7 @@ Migration notes:
   without restoring the legacy trainer script; the external-service Domino
   recipe also accepts any number of typed `deployment.disaggregated.server_urls`.
 - The former GPT-OSS-120B shell accidentally selected the 20B draft config;
-  `gpt-oss-120b-eagle3-online.yaml` points to the matching 120B config.
+  `gpt-oss-120b-eagle3.yaml` points to the matching 120B config.
 - The former Qwen3-235B shell accidentally launched Qwen3-Next-80B; the two now
   have separate recipes.
 - Qwen3-Next online EAGLE3 retains its batch size of two. P-EAGLE requires

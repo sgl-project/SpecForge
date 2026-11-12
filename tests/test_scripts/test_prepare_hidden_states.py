@@ -11,7 +11,6 @@ from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _resolve_draft_vocab_size,
-    build_target_model,
     parse_args,
     resolve_offline_capture_plan,
 )
@@ -24,6 +23,8 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
     def test_cli_defaults_to_legacy_eagle3_capture(self):
         argv = [
             "prepare_hidden_states.py",
+            "--server-urls",
+            "http://localhost:30000",
             "--target-model-path",
             "target",
             "--data-path",
@@ -34,28 +35,17 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertEqual("eagle3", args.strategy)
         self.assertIsNone(args.draft_model_config)
-        self.assertFalse(args.sglang_disable_radix_cache)
+        self.assertEqual(args.server_urls, ["http://localhost:30000"])
+        self.assertFalse(hasattr(args, "tp_size"))
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
         self.assertFalse(hasattr(args, "capture_layers"))
 
-    def test_cli_can_explicitly_disable_radix_cache(self):
-        argv = [
-            "prepare_hidden_states.py",
-            "--target-model-path",
-            "target",
-            "--data-path",
-            "data.jsonl",
-            "--sglang-disable-radix-cache",
-        ]
-        with mock.patch("sys.argv", argv):
-            args = parse_args()
-
-        self.assertTrue(args.sglang_disable_radix_cache)
-
     def test_cli_accepts_dflash_family_config(self):
         argv = [
             "prepare_hidden_states.py",
+            "--server-urls",
+            "http://localhost:30000",
             "--target-model-path",
             "target",
             "--data-path",
@@ -135,84 +125,6 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 else:
                     self.assertTrue(plan.loss_mask_filter([0, 1, 1]))
                     self.assertFalse(plan.loss_mask_filter([1, 0, 1]))
-
-    def test_build_uses_dedicated_offline_loader(self):
-        config = SimpleNamespace(num_hidden_layers=32, dtype=None)
-        args = SimpleNamespace(
-            target_model_path="target",
-            trust_remote_code=True,
-            sglang_attention_backend="fa3",
-            sglang_mem_fraction_static=0.4,
-            sglang_context_length=4096,
-            sglang_enable_nccl_nvls=False,
-            sglang_enable_symm_mem=False,
-            sglang_enable_torch_compile=False,
-            sglang_enable_dp_attention=False,
-            sglang_enable_dp_lm_head=False,
-            sglang_ep_size=1,
-            sglang_disable_radix_cache=False,
-            batch_size=4,
-            max_length=128,
-        )
-        target = mock.Mock()
-        with mock.patch(
-            "scripts.prepare_hidden_states.load_offline_capture",
-            return_value=target,
-        ) as load:
-            self.assertIs(
-                build_target_model(args, config, capture_layers=[2, 7, 19]),
-                target,
-            )
-
-        load.assert_called_once()
-        self.assertEqual(load.call_args.args, ("target",))
-        self.assertNotIn("device", load.call_args.kwargs)
-        self.assertNotIn("cache_dir", load.call_args.kwargs)
-        self.assertFalse(load.call_args.kwargs["disable_radix_cache"])
-        target.set_capture_layers.assert_called_once_with(
-            [2, 7, 19],
-            capture_method="eagle3",
-        )
-
-    def test_build_accepts_pre_resolved_arbitrary_capture_layers(self):
-        config = SimpleNamespace(num_hidden_layers=40, dtype=None)
-        args = SimpleNamespace(
-            target_model_path="target",
-            trust_remote_code=True,
-            sglang_attention_backend="fa3",
-            sglang_mem_fraction_static=0.4,
-            sglang_context_length=4096,
-            sglang_enable_nccl_nvls=False,
-            sglang_enable_symm_mem=False,
-            sglang_enable_torch_compile=False,
-            sglang_enable_dp_attention=False,
-            sglang_enable_dp_lm_head=False,
-            sglang_ep_size=1,
-            sglang_disable_radix_cache=True,
-            batch_size=4,
-            max_length=128,
-        )
-        target = mock.Mock()
-        capture_layers = [1, 9, 17, 25, 33]
-        with mock.patch(
-            "scripts.prepare_hidden_states.load_offline_capture",
-            return_value=target,
-        ) as load:
-            self.assertIs(
-                build_target_model(
-                    args,
-                    config,
-                    capture_layers=capture_layers,
-                    capture_method="dflash",
-                ),
-                target,
-            )
-
-        self.assertTrue(load.call_args.kwargs["disable_radix_cache"])
-        target.set_capture_layers.assert_called_once_with(
-            capture_layers,
-            capture_method="dflash",
-        )
 
 
 class PrepareHiddenStatesSerializationTest(unittest.TestCase):
@@ -334,6 +246,10 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
                     side_effect=generate,
                 ) as generate_mock,
                 mock.patch(
+                    "scripts.prepare_hidden_states.dist.is_initialized",
+                    return_value=True,
+                ),
+                mock.patch(
                     "scripts.prepare_hidden_states.dist.get_rank", return_value=0
                 ),
                 mock.patch(
@@ -355,3 +271,133 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CanonicalCaptureTest(unittest.TestCase):
+    def test_run_config_captures_what_its_loss_needs(self):
+        """--draft resolves the default loss; -c run.yaml carries training.loss."""
+        import yaml
+
+        from specforge.config.draft.codec import encode_config
+        from tests.test_config.draft_fixtures import draft_config
+        from tests.test_runtime.test_canonical_training import target_directory
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            draft = root / "draft.yaml"
+            draft.write_text(yaml.safe_dump(encode_config(draft_config())))
+            run = root / "run.yaml"
+            run.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"target_model_path": str(target)},
+                        "draft": str(draft),
+                        "data": {"hidden_states_path": str(root / "features")},
+                        "training": {
+                            "attention_backend": "eager",
+                            "loss": {"kind": "kl"},
+                        },
+                    }
+                )
+            )
+            argv = [
+                "prepare_hidden_states.py",
+                "--server-urls",
+                "http://localhost:30000",
+                "--data-path",
+                "data.jsonl",
+            ]
+            selections = {
+                "draft": ["--draft", str(draft), "--target-model-path", str(target)],
+                "config": ["-c", str(run)],
+            }
+            plans = {}
+            for name, selection in selections.items():
+                with mock.patch("sys.argv", argv + selection):
+                    args = parse_args()
+                self.assertEqual(args.target_model_path, str(target))
+                plans[name] = resolve_offline_capture_plan(args)
+            self.assertIsNone(plans["draft"].layout.last_hidden_feature)
+            self.assertEqual(
+                plans["config"].layout.last_hidden_feature,
+                "target_last_hidden_states",
+            )
+            other = ["--target-model-path", str(root / "other")]
+            with (
+                mock.patch("sys.argv", argv + selections["config"] + other),
+                mock.patch("sys.stderr"),
+                self.assertRaises(SystemExit),
+            ):
+                parse_args()
+            legacy = root / "legacy.yaml"
+            legacy.write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {"target_model_path": str(target)},
+                        "data": {"hidden_states_path": str(root / "features")},
+                    }
+                )
+            )
+            with mock.patch("sys.argv", argv + ["-c", str(legacy)]):
+                args = parse_args()
+            with self.assertRaisesRegex(ValueError, "not a canonical run"):
+                resolve_offline_capture_plan(args)
+
+    def test_eagle_yaml_capture_matches_training_inputs(self):
+        import yaml
+
+        from specforge.config.draft.codec import encode_config
+        from specforge.training.canonical_data import normalize_sample
+        from tests.test_modeling.test_canonical_eagle3 import model_config as eagle
+        from tests.test_modeling.test_canonical_peagle import model_config as peagle
+        from tests.test_runtime.test_canonical_training import target_directory
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            for factory in (eagle, peagle):
+                draft = factory(target_width=32)
+                path = root / "draft.yaml"
+                path.write_text(yaml.safe_dump(encode_config(draft)))
+                argv = [
+                    "prepare_hidden_states.py",
+                    "--draft",
+                    str(path),
+                    "--target-model-path",
+                    str(target),
+                    "--server-urls",
+                    "http://localhost:30000",
+                    "--data-path",
+                    "data.jsonl",
+                ]
+                with mock.patch("sys.argv", argv):
+                    args = parse_args()
+                plan = resolve_offline_capture_plan(args)
+                self.assertEqual(plan.capture_method, "eagle3")
+                self.assertEqual(
+                    plan.capture_layers,
+                    draft.spec_config.target_features.target_layer_ids,
+                )
+                record = plan.layout.materialize(
+                    {
+                        "input_ids": torch.tensor([1, 2, 3]),
+                        "loss_mask": torch.tensor([1, 1, 0]),
+                        "aux_hidden_states": torch.randn(
+                            1, 3, len(plan.capture_layers) * 32
+                        ),
+                        "last_hidden_states": torch.randn(1, 3, 32),
+                    }
+                )
+                self.assertEqual(
+                    set(record),
+                    {
+                        "input_ids",
+                        "loss_mask",
+                        "hidden_states",
+                        "target_last_hidden_states",
+                    },
+                )
+                sample = normalize_sample(record, keys=tuple(record), max_len=3)
+                self.assertEqual(sample["target_last_hidden_states"].shape, (1, 3, 32))
+                self.assertEqual(sample["input_ids"].tolist(), [[1, 2, 3]])

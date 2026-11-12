@@ -369,34 +369,42 @@ class ModelProvider:
     """
 
     draft_config: DraftConfigProvider
-    build_draft: Factory
-    build_training_model: Factory
+    build_draft: Factory | None
+    build_training_model: Factory | None
     resolve_capture_layers: Factory
     minimum_loss_tokens: Factory
     needs_input_tools: Factory
-    default_dataloader_num_workers: int
+    default_dataloader_num_workers: int | None
     allow_missing_warm_start_embedding: bool = False
     loss_mask_filter: Factory | None = None
+    build_bundle: Factory | None = None
 
     def __post_init__(self) -> None:
+        if self.build_bundle is None:
+            _factories_are_callable(
+                (
+                    ("build_draft", self.build_draft),
+                    ("build_training_model", self.build_training_model),
+                )
+            )
+        else:
+            _factories_are_callable((("build_bundle", self.build_bundle),))
         if not isinstance(self.draft_config, DraftConfigProvider):
             raise TypeError("draft_config must be a DraftConfigProvider")
         _factories_are_callable(
             (
-                ("build_draft", self.build_draft),
-                ("build_training_model", self.build_training_model),
                 ("resolve_capture_layers", self.resolve_capture_layers),
                 ("minimum_loss_tokens", self.minimum_loss_tokens),
                 ("needs_input_tools", self.needs_input_tools),
             )
         )
-        if (
+        if self.default_dataloader_num_workers is not None and (
             isinstance(self.default_dataloader_num_workers, bool)
             or not isinstance(self.default_dataloader_num_workers, int)
             or self.default_dataloader_num_workers < 0
         ):
             raise ValueError(
-                "default_dataloader_num_workers must be a non-negative integer"
+                "default_dataloader_num_workers must be a non-negative integer or None"
             )
         if not isinstance(self.allow_missing_warm_start_embedding, bool):
             raise TypeError("allow_missing_warm_start_embedding must be a bool")
@@ -406,7 +414,7 @@ class ModelProvider:
 
 @dataclass(frozen=True)
 class OfflineCaptureLayout:
-    """Map one generic local capture onto the persisted offline schema.
+    """Map generic captured tensors onto the persisted offline schema.
 
     Local capture always exposes the same four per-sample sources:
     ``input_ids``, ``loss_mask``, ``aux_hidden_states``, and

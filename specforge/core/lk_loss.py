@@ -62,14 +62,26 @@ def compute_acceptance_rate(
         logits=logits,
         target_probs=target_probs,
     )
+    return _reduce_acceptance_rows(
+        acceptance_rate_per_token, position_mask, eps=eps, reduce_fn=reduce_fn
+    )
+
+
+def _reduce_acceptance_rows(
+    acceptance_rate_per_token: torch.Tensor,
+    position_mask: torch.Tensor,
+    eps: float = 1e-8,
+    reduce_fn: Optional[Callable[..., Tuple[torch.Tensor, torch.Tensor]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     acceptance_rate = _masked_mean(
         values_per_token=acceptance_rate_per_token,
         position_mask=position_mask,
         eps=eps,
         reduce_fn=reduce_fn,
     )
-    log_acceptance_rate_per_token = torch.where(
-        acceptance_rate_per_token > 0, torch.log(acceptance_rate_per_token), 0
+    # Select before log so zero-acceptance rows also have a zero gradient.
+    log_acceptance_rate_per_token = torch.log(
+        torch.where(acceptance_rate_per_token > 0, acceptance_rate_per_token, 1)
     )
     log_acceptance_rate = _masked_mean(
         values_per_token=log_acceptance_rate_per_token,

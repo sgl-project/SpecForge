@@ -33,12 +33,26 @@ def resolve_server_capture_contract(
 
     streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
 
-    target_cfg = load_target_config(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    target_cfg = target_text_config(target_cfg)
+    from specforge.training.canonical import enabled
+    from specforge.training.model_loading import training_target_config
+
+    canonical = enabled(cfg)
+    if canonical:
+        target_cfg = training_target_config(cfg)
+        from specforge.config.draft.codec.target import bound_vocab_size
+
+        hidden_size, vocab_size = target_cfg["hidden_size"], bound_vocab_size(
+            target_cfg
+        )
+    else:
+        target_cfg = target_text_config(
+            load_target_config(
+                cfg.model.target_model_path,
+                cache_dir=cfg.model.cache_dir,
+                trust_remote_code=cfg.model.trust_remote_code,
+            )
+        )
+        hidden_size, vocab_size = target_cfg.hidden_size, target_vocab_size(target_cfg)
     model_provider = algorithm.providers.model
     draft_cfg = draft_config_dict(cfg, provider=model_provider.draft_config)
     layers = model_provider.resolve_capture_layers(cfg, draft_cfg, target_cfg)
@@ -60,8 +74,8 @@ def resolve_server_capture_contract(
     return ServerCaptureContract(
         method=streaming.capture_method,
         aux_layer_ids=tuple(layers),
-        target_hidden_size=int(target_cfg.hidden_size),
-        target_vocab_size=target_vocab_size(target_cfg),
+        target_hidden_size=int(hidden_size),
+        target_vocab_size=int(vocab_size),
         draft_vocab_size=int(
             draft_cfg.get("draft_vocab_size") or draft_cfg["vocab_size"]
         ),

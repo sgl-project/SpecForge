@@ -42,6 +42,7 @@ from .parse import (
     GeneralParser,
     GLMParser,
     HarmonyParser,
+    MuseParser,
     ThinkingParser,
 )
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -153,6 +154,8 @@ def preprocess_conversations(
         parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "muse":
+        parser = MuseParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
     kwargs_list = [{} for _ in range(len(conversations))]
@@ -163,7 +166,7 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        parsed = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
@@ -171,6 +174,10 @@ def preprocess_conversations(
             tool=tool,
             **kwargs_item,
         )
+        if parsed is None:
+            # the parser found nothing to render (e.g. no 'user' turn), skip it
+            continue
+        input_ids, loss_mask = parsed
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
@@ -513,9 +520,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
         attention_mask[:, :valid_len] = 1
         new_data["attention_mask"] = attention_mask
 
-        # Position ids should align with Ulysses all2all-expanded sequence length.
-        # Within each ring group there are sp_ulysses_size Ulysses peers; each holds a
-        # distinct usp_chunk_size slice, so position IDs must differ by ulysses_rank offset.
+        # RoPE runs on local Q/K before Ulysses all-to-all. Each rank needs
+        # the global positions of its own chunk, excluding rollout overlap.
+        # Preserve both Ring-block and Ulysses-peer offsets.
         sp_ulysses_size = max(1, sp_size // sp_ring_size)
         usp_chunk_size = max(local_len - ttt_length, 0)
         ring_chunk = usp_chunk_size * sp_ulysses_size

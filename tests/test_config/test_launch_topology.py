@@ -17,10 +17,7 @@ def _recipes() -> dict[str, Path]:
         for path in sorted(EXAMPLE_CONFIG_DIR.rglob("*.yaml"))
         if not path.name.startswith(".")
     ]
-    recipes = {path.name: path for path in paths}
-    if len(recipes) != len(paths):
-        raise AssertionError("example recipe filenames must be globally unique")
-    return recipes
+    return {str(path.relative_to(EXAMPLE_CONFIG_DIR)): path for path in paths}
 
 
 class ExampleLaunchTopologyTest(unittest.TestCase):

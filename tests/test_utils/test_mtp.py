@@ -21,13 +21,22 @@ from types import SimpleNamespace
 
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5Attention,
+    Qwen3_5TextRotaryEmbedding,
+)
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.mtp.providers import _init_from_native_mtp
 from specforge.core.mtp import OnlineMTPModel
 from specforge.modeling.draft import available_drafts, resolve_draft
 from specforge.modeling.draft.mtp import Qwen3_5MTPDraftModel
-from specforge.training.strategies.base import MTPTrainStrategy
+from specforge.modeling.draft.mtp.qwen3_5 import (
+    PartialRotaryEmbedding,
+    Qwen3MTPAttention,
+)
+from specforge.training.strategies.base import MTPTrainStrategy, _cpu_supervised_rows
 
 
 def _tiny_config(**overrides) -> Qwen3Config:
@@ -60,6 +69,14 @@ def _tiny_batch(config: Qwen3Config, seq_len: int = 16, batch: int = 2):
     hidden_states = torch.randn(batch, seq_len, config.hidden_size)
     loss_mask = torch.ones(batch, seq_len)
     return input_ids, hidden_states, loss_mask
+
+
+def _sparse_loss_mask(like: torch.Tensor) -> torch.Tensor:
+    """Mostly prompt: a few supervised spans, as in multi-turn data."""
+    loss_mask = torch.zeros_like(like)
+    loss_mask[0, 3:6] = 1.0
+    loss_mask[1, 10:15] = 1.0
+    return loss_mask
 
 
 def _cfg(target_model_path: str, draft_checkpoint_path: str = ""):
@@ -107,18 +124,90 @@ class OnlineMTPModelTest(unittest.TestCase):
     def test_chunked_objective_matches_unchunked(self):
         self._assert_objective_parity(torch.device("cpu"), torch.float32)
 
+    def test_sparse_supervision_matches_unchunked(self):
+        self._assert_objective_parity(torch.device("cpu"), torch.float32, sparse=True)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_chunked_objective_cuda_matches_legacy(self):
         for dtype in (torch.float32, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                self._assert_objective_parity(torch.device("cuda"), dtype)
+            for sparse in (False, True):
+                with self.subTest(dtype=dtype, sparse=sparse):
+                    self._assert_objective_parity(
+                        torch.device("cuda"), dtype, sparse=sparse
+                    )
 
-    def _assert_objective_parity(self, device, dtype):
+    def test_unsupervised_batch_backward_gives_zero_grads(self):
+        config = _tiny_config()
+        draft = Qwen3_5MTPDraftModel(config)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        loss_mask = torch.zeros_like(loss_mask)
+        # rows found in the model, and the empty rows found on the host
+        for supervised_rows in (None, _cpu_supervised_rows(loss_mask)):
+            for chunk_size in (0, 4):
+                with self.subTest(
+                    host_rows=supervised_rows is not None, chunk_size=chunk_size
+                ):
+                    draft.zero_grad(set_to_none=True)
+                    model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
+                    loss, corrects, denoms = model(
+                        input_ids=input_ids,
+                        hidden_states=hidden_states,
+                        loss_mask=loss_mask,
+                        supervised_rows=supervised_rows,
+                    )
+                    loss.backward()
+
+                    self.assertEqual(0.0, loss.item())
+                    self.assertEqual(0.0, corrects[0].sum().item())
+                    self.assertEqual(0.0, denoms[0].sum().item())
+                    for name, parameter in draft.named_parameters():
+                        if parameter.requires_grad:
+                            self.assertIsNotNone(parameter.grad, name)
+                            self.assertEqual(
+                                0.0, parameter.grad.abs().sum().item(), name
+                            )
+
+    def test_host_supervised_rows_match_model_lookup(self):
+        config = _tiny_config()
+        torch.manual_seed(0)
+        draft = Qwen3_5MTPDraftModel(config)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        loss_mask = _sparse_loss_mask(loss_mask)
+        rows = _cpu_supervised_rows(loss_mask)
+        for chunk_size in (0, 4):
+            results = []
+            for supervised_rows in (None, rows):
+                draft.zero_grad(set_to_none=True)
+                model = OnlineMTPModel(draft, objective_chunk_size=chunk_size)
+                loss, corrects, denoms = model(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                    supervised_rows=supervised_rows,
+                )
+                loss.backward()
+                grads = {
+                    name: parameter.grad.clone()
+                    for name, parameter in draft.named_parameters()
+                    if parameter.requires_grad
+                }
+                results.append((loss.detach(), corrects[0], denoms[0], grads))
+            with self.subTest(chunk_size=chunk_size):
+                lookup, precomputed = results
+                self.assertTrue(torch.equal(lookup[0], precomputed[0]))
+                self.assertTrue(torch.equal(lookup[1], precomputed[1]))
+                self.assertTrue(torch.equal(lookup[2], precomputed[2]))
+                for name in lookup[3]:
+                    self.assertTrue(torch.equal(lookup[3][name], precomputed[3][name]))
+
+    def _assert_objective_parity(self, device, dtype, sparse=False):
         config = _tiny_config()
         torch.manual_seed(0)
         input_ids, hidden_states, loss_mask = _tiny_batch(config)
         # ragged supervision so chunk boundaries cross masked/unmasked rows
         loss_mask[0, 5:9] = 0.0
+        if sparse:
+            loss_mask = _sparse_loss_mask(loss_mask)
         input_ids, loss_mask = input_ids.to(device), loss_mask.to(device)
         hidden_states = hidden_states.to(device=device, dtype=dtype)
         for frozen_head in (False, True):
@@ -247,6 +336,114 @@ class OnlineMTPModelTest(unittest.TestCase):
         self.assertEqual([[5, 6, 7, 8]], draft.position_ids.tolist())
 
 
+def _transformers_qwen3_5_config(config: Qwen3Config) -> Qwen3_5TextConfig:
+    """The transformers Qwen3.5 text config with the same attention geometry."""
+    return Qwen3_5TextConfig(
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        rms_norm_eps=config.rms_norm_eps,
+        attention_bias=config.attention_bias,
+        attention_dropout=config.attention_dropout,
+        partial_rotary_factor=config.partial_rotary_factor,
+        rope_theta=config.rope_parameters["rope_theta"],
+    )
+
+
+class Qwen3MTPAttentionTest(unittest.TestCase):
+    def test_matches_transformers_qwen3_5_attention(self):
+        """Same weights, same output as transformers' Qwen3_5Attention."""
+        for impl in ("eager", "sdpa"):
+            with self.subTest(attn_implementation=impl):
+                config = _tiny_config(rope_theta=1e7)
+                config._attn_implementation = impl
+                reference_config = _transformers_qwen3_5_config(config)
+                reference_config._attn_implementation = impl
+                torch.manual_seed(0)
+                attn = Qwen3MTPAttention(config, layer_idx=0).double().eval()
+                with torch.no_grad():
+                    # q/k norm weights default to zero; randomize everything
+                    for parameter in attn.parameters():
+                        parameter.normal_(0.0, 0.2)
+                reference = Qwen3_5Attention(reference_config, layer_idx=0)
+                reference.double().eval()
+                reference.load_state_dict(attn.state_dict(), strict=True)
+
+                bsz, seq_len = 2, 7
+                hidden = torch.randn(bsz, seq_len, config.hidden_size).double()
+                position_ids = torch.arange(seq_len).expand(bsz, -1)
+                cos, sin = PartialRotaryEmbedding(config, config.head_dim)(
+                    hidden, position_ids
+                )
+                causal = torch.full((seq_len, seq_len), float("-inf")).triu(1)
+                mask = causal.double().expand(bsz, 1, seq_len, seq_len)
+
+                out, _ = attn(
+                    hidden, attention_mask=mask, position_embeddings=(cos, sin)
+                )
+                expected, _ = reference(
+                    hidden, position_embeddings=(cos, sin), attention_mask=mask
+                )
+
+                torch.testing.assert_close(out, expected)
+
+
+class PartialRotaryEmbeddingTest(unittest.TestCase):
+    def test_matches_transformers_rotary_embedding(self):
+        """rope_theta comes from rope_parameters (transformers 5)."""
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+        reference = Qwen3_5TextRotaryEmbedding(_transformers_qwen3_5_config(config))
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[0, 1, 100, 1000, 10000, 30000]])
+
+        cos, sin = rope(x, position_ids)
+        expected_cos, expected_sin = reference(x, position_ids)
+
+        self.assertEqual(1e7, rope.rope_theta)
+        torch.testing.assert_close(cos, expected_cos)
+        torch.testing.assert_close(sin, expected_sin)
+
+    def test_reads_legacy_rope_theta_attribute(self):
+        config = SimpleNamespace(rope_theta=1e6, partial_rotary_factor=0.25)
+        rope = PartialRotaryEmbedding(config, head_dim=16)
+
+        self.assertEqual(1e6, rope.rope_theta)
+
+    def test_missing_rope_theta_raises(self):
+        config = SimpleNamespace(partial_rotary_factor=0.25)
+        with self.assertRaisesRegex(ValueError, "rope_theta"):
+            PartialRotaryEmbedding(config, head_dim=16)
+
+    def test_autocast_keeps_fp32_frequencies(self):
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[100, 1000, 10000, 30000]])
+
+        cos, sin = rope(x, position_ids)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            cos_autocast, sin_autocast = rope(x, position_ids)
+
+        torch.testing.assert_close(cos_autocast, cos)
+        torch.testing.assert_close(sin_autocast, sin)
+
+    def test_bf16_cast_keeps_fp32_frequencies(self):
+        """build_draft casts the draft to bf16; long positions must not drift."""
+        config = _tiny_config(rope_theta=1e7)
+        rope = PartialRotaryEmbedding(config, config.head_dim)
+        rope_bf16 = copy.deepcopy(rope).to(dtype=torch.bfloat16)
+        x = torch.zeros(1)
+        position_ids = torch.tensor([[100, 1000, 10000, 30000]])
+
+        cos, sin = rope(x, position_ids)
+        cos_bf16, sin_bf16 = rope_bf16(x, position_ids)
+
+        torch.testing.assert_close(cos_bf16, cos)
+        torch.testing.assert_close(sin_bf16, sin)
+
+
 class MTPTrainStrategyTest(unittest.TestCase):
     def test_forward_loss_adapts_model_outputs(self):
         loss = torch.tensor(1.5, requires_grad=True)
@@ -258,7 +455,7 @@ class MTPTrainStrategyTest(unittest.TestCase):
                 super().__init__()
                 self.proj = torch.nn.Linear(1, 1)
 
-            def forward(self, input_ids, hidden_states, loss_mask):
+            def forward(self, input_ids, hidden_states, loss_mask, supervised_rows):
                 return loss, corrects, denoms
 
         strategy = MTPTrainStrategy(_Stub())
@@ -282,6 +479,67 @@ class MTPTrainStrategyTest(unittest.TestCase):
         self.assertIsNotNone(loss_num.grad_fn)
         self.assertEqual(4.5, loss_num.item())
         self.assertEqual(3.0, loss_den.item())
+
+    def test_forward_loss_passes_supervised_rows_from_host(self):
+        received = {}
+
+        class _Stub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(1, 1)
+
+            def forward(self, input_ids, hidden_states, loss_mask, supervised_rows):
+                received["supervised_rows"] = supervised_rows
+                zeros = torch.zeros(1, 5)
+                return self.proj.weight.sum(), [zeros], [zeros]
+
+        strategy = MTPTrainStrategy(_Stub())
+        loss_mask = torch.tensor([[0, 1, 1, 0, 1, 1]])
+        batch = SimpleNamespace(
+            tensors={
+                "input_ids": torch.zeros(1, 6, dtype=torch.long),
+                "loss_mask": loss_mask,
+                "target_last_hidden_states": torch.zeros(1, 6, 4),
+            }
+        )
+
+        strategy.forward_loss(batch)
+
+        # labels are x[t+2]: shifted mask [1, 0, 1, 1, 0]
+        self.assertEqual([0, 2, 3], received["supervised_rows"].tolist())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_forward_loss_does_not_sync_cuda(self):
+        config = _tiny_config()
+        torch.manual_seed(0)
+        model = OnlineMTPModel(Qwen3_5MTPDraftModel(config)).cuda()
+        strategy = MTPTrainStrategy(model)
+        input_ids, hidden_states, loss_mask = _tiny_batch(config)
+        loss_mask[:, :9] = 0.0
+        # pinned host features, as Mooncake receives deliver them
+        tensors = {
+            "input_ids": input_ids.pin_memory(),
+            "loss_mask": loss_mask.pin_memory(),
+            "target_last_hidden_states": hidden_states.pin_memory(),
+        }
+        batch = SimpleNamespace(tensors=tensors)
+        strategy.forward_loss(batch)  # warm up lazy initialization
+        torch.cuda.synchronize()
+
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            strategy.forward_loss(batch)
+            # without host-side indices the model's nonzero has to sync
+            with self.assertRaises(RuntimeError):
+                model(
+                    input_ids=tensors["input_ids"].cuda(non_blocking=True),
+                    hidden_states=tensors["target_last_hidden_states"].cuda(
+                        non_blocking=True
+                    ),
+                    loss_mask=tensors["loss_mask"].cuda(non_blocking=True),
+                )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
 
     def test_forward_loss_rejects_missing_features(self):
         strategy = MTPTrainStrategy(torch.nn.Linear(1, 1))

@@ -1,26 +1,6 @@
 # coding=utf-8
 """Typed run configuration (Pydantic) + loader for the ``specforge`` CLI."""
 
-from specforge.config.schema import (
-    SGLANG_CAPTURE_CONTEXT_HEADROOM,
-    Config,
-    DataConfig,
-    DeploymentConfig,
-    DisaggregatedDeploymentConfig,
-    ManagedLocalCaptureServerConfig,
-    ManagedLocalMooncakeConfig,
-    ManagedLocalStackConfig,
-    ModelConfig,
-    ProfilingConfig,
-    RuntimeConfig,
-    TrackingConfig,
-    TrainerDeploymentConfig,
-    TrainingConfig,
-    apply_overrides,
-    load_config,
-    migrate_legacy_config,
-)
-
 __all__ = [
     "Config",
     "ModelConfig",
@@ -40,3 +20,14 @@ __all__ = [
     "apply_overrides",
     "migrate_legacy_config",
 ]
+
+
+def __getattr__(name):
+    # Importing draft specs must not load the run schema or runtime packages.
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from specforge.config import schema
+
+    value = getattr(schema, name)
+    globals()[name] = value
+    return value

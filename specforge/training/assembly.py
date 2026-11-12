@@ -188,6 +188,8 @@ def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> Mode
         target_vocab_size as resolve_target_vocab_size,
     )
 
+    if algorithm.providers.model.build_bundle is not None:
+        return algorithm.providers.model.build_bundle(cfg, algorithm)
     provider = algorithm.providers.model
     draft_config, draft_model = _load_draft(cfg, algorithm)
     needs_input_tools = provider.needs_input_tools(cfg, draft_model)
@@ -458,6 +460,10 @@ def _install_dataset_vocab_mapping(
     """Build, cache, and install one deterministic EAGLE vocabulary map."""
     if (
         cfg.model.vocab_mapping_path
+        or (
+            hasattr(bundle.draft_model, "vocabulary")
+            and bool(bundle.draft_model.vocabulary.ready)
+        )
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return
@@ -472,7 +478,15 @@ def _install_dataset_vocab_mapping(
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{key}.pt")
     if os.path.exists(path):
-        bundle.draft_model.load_vocab_mapping(path)
+        if hasattr(bundle.draft_model, "vocabulary"):
+            import torch
+
+            mapping = torch.load(path, map_location="cpu", weights_only=True)
+            bundle.draft_model.vocabulary.load_mapping(
+                t2d=mapping["t2d"], d2t=mapping["d2t"]
+            )
+        else:
+            bundle.draft_model.load_vocab_mapping(path)
         return
 
     import torch
@@ -488,9 +502,12 @@ def _install_dataset_vocab_mapping(
     # Every rank derives the same mapping and installs it directly, so training
     # does not depend on a shared cache filesystem. Rank 0 alone persists the
     # reusable cache file, avoiding concurrent torch.save writes.
-    bundle.draft_model.d2t.copy_(d2t)
-    bundle.draft_model.t2d.copy_(t2d)
-    bundle.draft_model.vocab_mapping_loaded = True
+    if hasattr(bundle.draft_model, "vocabulary"):
+        bundle.draft_model.vocabulary.load_mapping(t2d=t2d, d2t=d2t)
+    else:
+        bundle.draft_model.d2t.copy_(d2t)
+        bundle.draft_model.t2d.copy_(t2d)
+        bundle.draft_model.vocab_mapping_loaded = True
     distributed = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
     )
@@ -510,6 +527,10 @@ def _ensure_offline_vocab_mapping(
         return
     if (
         cfg.model.vocab_mapping_path
+        or (
+            hasattr(bundle.draft_model, "vocabulary")
+            and bool(bundle.draft_model.vocabulary.ready)
+        )
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return
@@ -548,7 +569,7 @@ def _dataloader_num_workers(cfg: Config, algorithm: AlgorithmRegistration) -> in
         dataloader_num_workers = (
             algorithm.providers.model.default_dataloader_num_workers
         )
-    return dataloader_num_workers
+    return 4 if dataloader_num_workers is None else dataloader_num_workers
 
 
 def _profiling_options(cfg: Config):
@@ -632,6 +653,7 @@ def build_training_run(
 
     if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
+        from specforge.training.model_loading import preflight_draft_kernels
 
         run_logger = _configured_logger(cfg)
         try:
@@ -639,6 +661,9 @@ def build_training_run(
                 cfg,
                 algorithm=algorithm,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
+                    run_cfg, algorithm=algorithm
+                ),
+                preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
                 ),
                 prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(
@@ -673,7 +698,7 @@ def build_training_run(
             num_epochs=t.num_epochs,
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
-            resume_from=t.resume_from,
+            resume_from=cfg.resume_path,
             **_common_launch_kwargs(
                 cfg,
                 bundle,

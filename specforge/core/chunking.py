@@ -21,11 +21,13 @@ def checkpointed_chunk_reduce(
 ) -> ChunkTerms:
     """Sum additive terms over aligned tensor slices.
 
-    ``chunk_size=0`` evaluates the full dimension once without checkpointing.
-    Positive chunk sizes bound intermediates and use non-reentrant activation
-    checkpointing when gradients are enabled and an input requires gradients.
-    ``checkpoint=False`` keeps the chunking but saves each chunk's activations,
-    for chunk functions whose saved state is already small.
+    ``chunk_size=0`` treats the full dimension as one chunk; positive sizes split
+    it into smaller chunks. Independently, ``checkpoint=True`` uses non-reentrant
+    activation checkpointing when gradients are enabled and an input requires
+    gradients, including for a single full-size chunk.
+    ``checkpoint=False`` keeps chunking but retains each chunk's saved activations
+    until backward. Smaller chunks then bound temporaries, not total saved state
+    (for example, full-vocabulary logits retained by a fused loss).
     ``None`` arguments are forwarded unchanged, which keeps optional objective
     inputs aligned with the tensors that are sliced.
     """
@@ -73,7 +75,6 @@ def checkpointed_chunk_reduce(
         )
         should_checkpoint = (
             checkpoint
-            and chunk_size > 0
             and torch.is_grad_enabled()
             and any(
                 tensor is not None and tensor.requires_grad for tensor in chunk_args

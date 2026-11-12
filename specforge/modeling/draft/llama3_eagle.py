@@ -1324,21 +1324,38 @@ class LlamaUSPFlashAttention(LlamaAttention):
         local_q_len = q_len
 
         # =============================================================
-        # 1. Projections & Ulysses Scatter
+        # 1. Local projections & RoPE
         # =============================================================
-        query_states = self.q_proj(hidden_states)
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.head_dim
+        )
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+
+        # Rotate each rank's own token rows before exchanging sequence/head
+        # dimensions. Keep the global table length so dynamic RoPE scaling is
+        # consistent across all peers, and preserve the EAGLE3 rollout/cache offset.
+        global_q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
+        lck = 0 if cache_hidden is None else len(cache_hidden[0])
+        cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+        )
+
+        # =============================================================
+        # 2. Ulysses exchange (already-rotated Q/K; unrotated V)
+        # =============================================================
         query_states = SeqAllToAll4D.apply(
             self.ulysses_pg,
             query_states,
             self.scatter_idx,
             self.gather_idx,
             self.use_sync,
-        )
-
-        key_states = self.k_proj(hidden_states)
-        key_states = key_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
         )
         key_states = SeqAllToAll4D.apply(
             self.ulysses_pg,
@@ -1347,30 +1364,12 @@ class LlamaUSPFlashAttention(LlamaAttention):
             self.gather_idx,
             self.use_sync,
         )
-
-        value_states = self.v_proj(hidden_states)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        )
         value_states = SeqAllToAll4D.apply(
             self.ulysses_pg,
             value_states,
             self.scatter_idx,
             self.gather_idx,
             self.use_sync,
-        )
-
-        # Global length calculation (for RoPE)
-        global_q_len = q_len * self.sp_ring_degree * self.sp_ulysses_degree
-        # =============================================================
-        # 2. RoPE & Cache Management
-        # =============================================================
-        lck = 0 if cache_hidden is None else len(cache_hidden[0])
-
-        cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
-        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
         )
 
         # Update Cache (Eagle3 Logic: Cache is a list of tensors for tree branches)

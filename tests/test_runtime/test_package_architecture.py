@@ -114,26 +114,26 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
         "docs/sections/benchmarks/domino-disaggregated-performance.md",
     ),
     "examples/disagg/run_qwen2.5_7b_eagle3_disagg.sh": (
-        "examples/configs/offline/disaggregated/qwen2.5-7b-eagle3-offline-disaggregated.yaml",
+        "examples/configs/offline/disaggregated/qwen2.5-7b-eagle3.yaml",
         "examples/disagg/run_offline_2node.sh",
         "docs/sections/benchmarks/eagle3-disaggregated-parity.md",
     ),
     "examples/disagg/run_qwen3.6_27b_dflash_disagg.sh": (
-        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2-disaggregated.yaml",
-        "examples/configs/online/disaggregated/external/qwen3.6-27b-dflash-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2.yaml",
+        "examples/configs/online/disaggregated/external/qwen3.6-27b-dflash-1server-dp2.yaml",
     ),
     "examples/disagg/run_qwen3.6_27b_dflash_disagg_multiserver.sh": (
-        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml",
     ),
     "examples/disagg/run_qwen3_8b_dflash_disagg_1srv_dp7.sh": (
-        "examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml",
     ),
     "examples/disagg/run_qwen3_8b_domino_disagg_1srv_dp7.sh": (
-        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml",
         "docs/sections/benchmarks/domino-disaggregated-performance.md",
     ),
     "examples/disagg/run_qwen3_8b_domino_disagg_multiserver.sh": (
-        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml",
+        "examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml",
     ),
     "examples/disagg/run_domino_dflash_serving_gate.sh": (
         "scripts/gates/README.md",
@@ -274,7 +274,6 @@ DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/core/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
-    "specforge/modeling/__init__.py",
     "specforge/modeling/target/__init__.py",
 )
 
@@ -687,7 +686,7 @@ class TestPackageArchitecture(unittest.TestCase):
             )
         )
 
-    def test_offline_capture_uses_only_the_dedicated_local_capture(self):
+    def test_offline_capture_uses_the_plugin_client(self):
         source = (REPO_ROOT / "scripts" / "prepare_hidden_states.py").read_text()
         self.assertNotIn("--enable-aux-hidden-states", source)
         self.assertNotIn("--aux-hidden-states-layers", source)
@@ -695,7 +694,8 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertNotIn("get_target_engine", source)
         self.assertNotIn("return_last_hidden_states=True", source)
         self.assertNotIn("return_logits=False", source)
-        self.assertIn("load_offline_capture", source)
+        self.assertIn("OfflineCaptureClient", source)
+        self.assertNotIn("ModelRunner", source)
 
     def test_only_canonical_draft_configs_are_checked_in(self):
         present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
@@ -716,6 +716,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "inkling-dspark.json",
                 "kimi-k3-dspark.json",
                 "ling-3.0-tiny-dspark.json",
+                "minimax-m3-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
                 "qwen3.6-27b-dspark.json",

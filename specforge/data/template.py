@@ -182,12 +182,15 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# DeepSeek-R1-Distill renders every assistant turn as
+# '<｜Assistant｜>' + answer + '<｜end▁of▁sentence｜>'; the end-of-sentence token
+# closes each supervised span, as it does for DeepSeek-V3.
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(
         assistant_header="<｜Assistant｜>",
         user_header="<｜User｜>",
-        end_of_turn_token=None,
+        end_of_turn_token="<｜end▁of▁sentence｜>",
         system_prompt=None,
     ),
 )
@@ -210,7 +213,7 @@ TEMPLATE_REGISTRY.register(
     template=ChatTemplate(
         assistant_header="<|im_start|>assistant\n",
         user_header="<|im_start|>user\n",
-        system_prompt="You are a helpful assistant.",
+        system_prompt="",
         end_of_turn_token="<|im_end|>\n",
         ignore_token=["<think>\n\n</think>\n\n"],
     ),
@@ -267,6 +270,23 @@ TEMPLATE_REGISTRY.register(
         # Keep the XTML renderer default for reasoning stored inline.
         enable_thinking=None,
         ignore_token=["<|end_of_msg|>"],
+    ),
+)
+
+# MiniMax-M3 renders every assistant turn as `]~b]ai\n`. The header stops
+# there: under adaptive thinking the model emits `<mm:think>` itself, so that
+# opener stays inside the loss. system_prompt is None because the tokenizer
+# template already emits the system preamble.
+TEMPLATE_REGISTRY.register(
+    name="minimax-m3",
+    template=ChatTemplate(
+        assistant_header="]~b]ai\n",
+        user_header="]~b]user\n",
+        system_prompt=None,
+        end_of_turn_token="[e~[\n",
+        parser_type="thinking",
+        enable_thinking=False,
+        ignore_token=["[e~["],
     ),
 )
 
@@ -375,6 +395,23 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# GLM-5.3 renders the same role/think tokens as GLM-5.2 (verified against
+# the zai-org chat_template.jinja: user/assistant headers with a
+# think opener and the user tag as the turn separator), so the field
+# set matches glm-5.2; a separate entry lets 5.3-specific drift diverge.
+TEMPLATE_REGISTRY.register(
+    name="glm-5.3",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="gemma",
     template=ChatTemplate(
@@ -406,6 +443,21 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+
+# Muse Spark renders through the target tokenizer. reasoning_content becomes
+# assistant to=self, closed by <|eom|>; the answer becomes assistant to=user,
+# closed by <|eot|>. Tool-call and commentary messages use the same shape with
+# a different recipient, so the muse parser masks each rendered span itself.
+TEMPLATE_REGISTRY.register(
+    name="muse",
+    template=ChatTemplate(
+        assistant_header=None,
+        user_header="<|start|>user<|message|>",
+        system_prompt=None,
+        end_of_turn_token=None,
+        parser_type="muse",
+    ),
+)
 
 TEMPLATE_REGISTRY.register(
     name="qwen3.5",

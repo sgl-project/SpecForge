@@ -257,6 +257,13 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 
 ## Prepare offline target features
 
+First start a compatible SGLang plugin capture server and Mooncake using the
+[offline capture guide](../../../examples/offline/README.md). The commands below
+are CPU clients; `--server-urls` must point to servers configured for the same
+target, capture method and layer IDs. TP and attention-backend flags belong to
+the server. Optional `torchrun --standalone --nproc_per_node=N` launches N CPU
+clients with non-overlapping dataset shards.
+
 Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
 target features created by `scripts/prepare_hidden_states.py`. Select the same
 strategy and draft
@@ -265,8 +272,8 @@ the target layers captured and the checkpoint schema. For example, prepare the
 checked-in Qwen3-8B DFlash recipe with:
 
 ```bash
-torchrun --nproc_per_node=8 \
-    scripts/prepare_hidden_states.py \
+python scripts/prepare_hidden_states.py \
+    --server-urls http://127.0.0.1:30000 \
     --strategy dflash \
     --target-model-path Qwen/Qwen3-8B \
     --draft-model-config configs/qwen3-8b-dflash.json \
@@ -274,7 +281,6 @@ torchrun --nproc_per_node=8 \
     --output-path ./cache/hidden_states/qwen3-8b-dflash-sharegpt \
     --chat-template qwen \
     --max-length 3072 \
-    --tp-size 1 \
     --batch-size 32
 ```
 
@@ -322,8 +328,8 @@ For preformatted input, add `--is-preformatted` to the same command and keep
 `--chat-template` aligned with the template already applied to the text:
 
 ```bash
-torchrun --nproc_per_node=8 \
-    scripts/prepare_hidden_states.py \
+python scripts/prepare_hidden_states.py \
+    --server-urls http://127.0.0.1:30000 \
     --strategy eagle3 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
     --draft-model-config configs/llama3-8B-eagle3.json \
@@ -341,7 +347,7 @@ Launch the matching recipe after its `data.hidden_states_path` points at the
 generated directory:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash.yaml
 ```
 
 See the [Training](training.md) guide for the complete run schema and supported

@@ -11,7 +11,8 @@ A3 (64GB) host.
 ## 1. Installation
 
 You need an Ascend host with the driver, CANN, and a `torch_npu`-enabled
-PyTorch already installed, plus SGLang `0.5.18` with NPU support. Then install
+PyTorch already installed, plus an NPU-compatible SGLang `main` build with
+the capture extension APIs described below. Then install
 SpecForge without touching that stack:
 
 ```bash
@@ -24,24 +25,24 @@ python -m pip install -e . --no-deps
 torch/sglang. If a later step reports a missing lightweight dependency, install
 just that package, also with `--no-deps`.
 
-### Apply the SGLang capture patches (online runs only)
+`liger-kernel` is not needed: on NPU, DFlash drafts keep the native
+RMSNorm/SwiGLU (`model.use_liger_kernel` resolves to off). Liger's Ascend
+backend is not validated in SpecForge; an explicit `model.use_liger_kernel:
+true` tries it and logs a warning.
 
-Online capture needs two patches on top of the installed SGLang, applied **in
-this order**:
+### Install the SGLang capture plugin (online and offline preparation)
+
+Use an Ascend-compatible SGLang build with the generic extension APIs required
+by [the plugin guide](../../../../plugins/sglang-spec-capture/README.md):
 
 ```bash
-# Base capture patch: --enable-spec-capture server flags + the capture sink
-bash scripts/apply_sglang_spec_capture_patch.sh
-
-# Ascend companion patch: skip the wildcard segment mount that Ascend
-# Mooncake rejects, and mount the feature segment with location="cpu"
-SGLANG_DIR=$(python -c "import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))")
-cd "$SGLANG_DIR" && git apply /path/to/SpecForge/patches/sglang/v0.5.18/spec-capture-ascend-mount.patch
+python -m pip install --no-deps plugins/sglang-spec-capture
+export SPECFORGE_SPEC_CAPTURE=1
 ```
 
-Skip both for offline training, which reads features from disk. The companion
-patch is a no-op on non-Ascend hosts (it keys off `ASCEND_RT_VISIBLE_DEVICES`),
-so a shared installation stays CUDA-safe.
+Release 0.5.23 lacks the required capture APIs. The plugin handles Ascend's CPU
+segment mount directly. Offline training from
+existing feature files needs no capture service.
 
 ### Device visibility on Ascend
 
@@ -96,9 +97,9 @@ guide.
 ## 3. Online training (external capture server)
 
 Online training is always **disaggregated**: a producer drives prompts through
-a patched SGLang capture server, features stream through Mooncake, and a
+a SGLang capture server, features stream through Mooncake, and a
 consumer trains the draft. The checked-in
-[`qwen3.5-4b-dflash-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml)
+[`qwen3.5-4b-dflash-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml)
 recipe targets an externally started capture server.
 
 ### Step 1: Start Mooncake and the capture server
@@ -109,7 +110,7 @@ mooncake_master --enable_http_metadata_server=true \
   --metrics_port=35903 --enable_metric_reporting=false &
 ```
 
-Start the patched capture server on NPU 0. The `--spec-capture-aux-layer-ids`
+Start the plugin-enabled capture server on NPU 0. The `--return-aux-hidden-state-layer-ids`
 must match the draft's `target_layer_ids` — for DFlash these come from
 `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29`. A mismatch produces zero
 features with no error:
@@ -121,6 +122,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
+SPECFORGE_SPEC_CAPTURE=1 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-4B \
   --trust-remote-code \
@@ -128,8 +130,8 @@ python -m sglang.launch_server \
   --tp-size 1 \
   --mem-fraction-static 0.8 \
   --attention-backend ascend \
-  --enable-spec-capture --spec-capture-method dflash \
-  --spec-capture-aux-layer-ids 1 8 15 22 29 \
+  --enable-return-aux-hidden-states --return-hidden-states-mode full --speculative-algorithm DFLASH \
+  --return-aux-hidden-state-layer-ids 1 8 15 22 29 \
   --host 127.0.0.1 --port 30000 &
 ```
 
@@ -141,7 +143,7 @@ On the remaining NPUs:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 \
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml
 ```
 
 Before rerunning, clear stale control state:
@@ -159,14 +161,14 @@ Before rerunning, clear stale control state:
 
 DFlash 2 reuses the DFlash strategy and capture path end to end, so the
 external-server setup above carries over unchanged — including the
-`--spec-capture-aux-layer-ids 1 8 15 22 29` flags, which match
+`--return-aux-hidden-state-layer-ids 1 8 15 22 29` flags, which match
 `configs/qwen3.5-4b-dflash2.json`. Use the checked-in
-[`qwen3.5-4b-dflash2-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml)
+[`qwen3.5-4b-dflash2-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-npu.yaml)
 recipe:
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=1,2,3,4,5,6,7,8 \
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash2-npu.yaml
 ```
 
 Notes specific to DFlash 2 on Ascend:
@@ -190,7 +192,7 @@ Notes specific to DFlash 2 on Ascend:
 ## 4. Managed-local full stack (one command)
 
 Instead of starting Mooncake and capture servers by hand, the
-[`qwen3.5-4b-dflash-disaggregated-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml)
+[`qwen3.5-4b-dflash-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-npu.yaml)
 recipe lets a single `specforge train` command own the whole single-node
 stack — Mooncake, capture server(s), and the trainer — and derives their
 endpoints and device assignments:
@@ -200,7 +202,7 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_CONNECT_TIMEOUT=7200 HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml
+specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-npu.yaml
 ```
 
 The checked-in layout parks the capture server on device 0 and runs a 14-rank
@@ -214,7 +216,7 @@ trainer's data wait then dominates step time. To give capture more cards,
 override the layout inline — e.g. a 6:10 split with six TP=1 capture servers:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-disaggregated-npu.yaml \
+specforge train -c examples/configs/online/disaggregated/managed-local/qwen3.5-4b-dflash-npu.yaml \
   'deployment.trainer.nproc_per_node=10' \
   'deployment.disaggregated.managed_local.trainer_cuda_visible_devices=["6","7","8","9","10","11","12","13","14","15"]' \
   'deployment.disaggregated.managed_local.capture_servers=[{port: 40000, cuda_visible_devices: ["0"], tp_size: 1}, {port: 40001, cuda_visible_devices: ["1"], tp_size: 1}, {port: 40002, cuda_visible_devices: ["2"], tp_size: 1}, {port: 40003, cuda_visible_devices: ["3"], tp_size: 1}, {port: 40004, cuda_visible_devices: ["4"], tp_size: 1}, {port: 40005, cuda_visible_devices: ["5"], tp_size: 1}]'
@@ -259,8 +261,8 @@ the [Disaggregated training](../disaggregated_training.md) guide.
   `sp_ulysses_size` / `sp_ring_size` at 1 and use the `sdpa` trainer backend.
 - **Ascend Mooncake rejects wildcard buffer registration** — the trainer side
   forces `local_buffer_size=0` automatically (SpecForge roles are pure
-  zero-copy clients), and the capture side needs the companion patch from
-  Section 1.
+  zero-copy clients), and the capture plugin mounts its feature segment
+  with `location="cpu"`.
 - **`ACL_ERROR_RT_CONTEXT_NULL` in the capture producer** — the Mooncake
   transfer engine needs a bound device context; SpecForge binds the local NPU
   before `setup()`. Seeing this error means the installation predates #722.

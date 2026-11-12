@@ -151,6 +151,9 @@ class TrainingBackend(abc.ABC):
     #: ``TrainerCore`` skip its own synchronizing check.
     checks_loss_denominator: bool = False
 
+    def accumulation_context(self, *, is_boundary: bool = True):
+        return contextlib.nullcontext()
+
     @abc.abstractmethod
     def prepare_model(self, model: nn.Module) -> nn.Module: ...
 
@@ -209,7 +212,15 @@ class FSDPTrainingBackend(TrainingBackend):
         all-gather them before every optimizer window without saving optimizer
         memory, which is the wrong trade-off for the current trainer recipes.
         """
-        modules = []
+        modules = list(getattr(model, "frozen_target_modules", ()))
+        if any(
+            parameter.requires_grad
+            for module in modules
+            for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "frozen_target_modules must contain only frozen parameters"
+            )
         for name in ("lm_head", "embed_tokens"):
             module = getattr(model, name, None)
             if not isinstance(module, nn.Module):
@@ -281,6 +292,11 @@ class FSDPTrainingBackend(TrainingBackend):
                     process_group=pc.fsdp_process_group,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
+                    bucket_cap_mb=(
+                        float(os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"])
+                        if "SPECFORGE_DDP_BUCKET_CAP_MB" in os.environ
+                        else None
+                    ),
                 )
                 self._wrapper_kind = "ddp"
             else:
@@ -293,7 +309,8 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
+                        buffer_dtype=torch.float32,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
@@ -342,14 +359,19 @@ class FSDPTrainingBackend(TrainingBackend):
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-step with one gradient collective per window.
 
-        Non-boundary micro-steps run under the FSDP/DDP ``no_sync()`` context;
-        the boundary backward reduces the accumulated sum once.
+        FSDP defers reduction here; DDP requires ``accumulation_context``
+        around both forward and backward to defer its reducer.
         """
-        if is_boundary or not self._wrapped:
+        if is_boundary or not self._wrapped or self._wrapper_kind == "ddp":
             loss.backward()
         else:
             with self.module.no_sync():
                 loss.backward()
+
+    def accumulation_context(self, *, is_boundary: bool = True):
+        if self._wrapper_kind == "ddp" and not is_boundary:
+            return self.module.no_sync()
+        return contextlib.nullcontext()
 
     def scale_gradients(self, factor: torch.Tensor) -> None:
         if self.module is None:

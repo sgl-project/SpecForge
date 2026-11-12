@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Server-capture gate: a LIVE patched SGLang server writes features into a
+"""Server-capture gate: a LIVE SGLang plugin server writes features into a
 LIVE Mooncake store; the data plane consumes them zero-copy and trains.
 
 What is pinned here:
@@ -21,11 +21,10 @@ What is pinned here:
   ``extra_key`` namespace.
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
-GPU, sglang patched with
-``patches/sglang/v0.5.18/spec-capture.patch`` (see
-``scripts/apply_sglang_spec_capture_patch.sh``), the ``mooncake`` package, and
-a reachable/spawnable ``mooncake_master``; opt in locally with
-``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
+GPU, the ``mooncake`` package, a reachable/spawnable ``mooncake_master``, and a
+capture-capable SGLang with the SpecForge plugin and its required extension APIs.
+A separate server interpreter can be set with
+``SPECFORGE_CAPTURE_GATE_SERVER_PYTHON`` and ``SPECFORGE_SERVER_CAPTURE=plugin``.
 """
 
 import importlib.util
@@ -43,7 +42,7 @@ from tests.utils import terminate_process_trees
 
 CUDA = torch.cuda.is_available()
 ENABLED = os.environ.get("SPECFORGE_RUN_SERVER_CAPTURE_TESTS") == "1"
-PORT = 30989
+PORT = int(os.environ.get("SPECFORGE_CAPTURE_GATE_PORT", "30989"))
 AUX_LAYER_IDS = [1, 3, 4]
 H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
@@ -68,8 +67,46 @@ def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
     )
 
 
-def _patched_sglang() -> bool:
-    return importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
+def _capture_plugin() -> bool:
+    return all(
+        importlib.util.find_spec(name) is not None
+        for name in (
+            "specforge_sglang_capture",
+            "sglang.srt.model_executor.forward_observer",
+        )
+    )
+
+
+def _server_capture_backend():
+    requested = os.environ.get("SPECFORGE_SERVER_CAPTURE")
+    if requested:
+        if requested != "plugin":
+            raise ValueError("SPECFORGE_SERVER_CAPTURE must be plugin")
+        return requested
+    if os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"):
+        raise ValueError(
+            "Set SPECFORGE_SERVER_CAPTURE=plugin when using "
+            "SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"
+        )
+    if _capture_plugin():
+        return "plugin"
+    return None
+
+
+SERVER_CAPTURE = _server_capture_backend()
+
+
+def _capture_server_flags():
+    layer_ids = [str(i) for i in AUX_LAYER_IDS]
+    return [
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--enable-return-aux-hidden-states",
+        "--return-aux-hidden-state-layer-ids",
+        *layer_ids,
+        "--return-hidden-states-mode",
+        "full",
+    ]
 
 
 def _mooncake_available() -> bool:
@@ -97,19 +134,27 @@ class TestServerCaptureGate(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        if not _patched_sglang():
+        if SERVER_CAPTURE is None:
             raise unittest.SkipTest(
-                "installed sglang lacks spec_capture_sink — apply "
-                "patches/sglang/v0.5.18/spec-capture.patch "
-                "(scripts/apply_sglang_spec_capture_patch.sh)"
+                "installed sglang has no spec capture — install the "
+                "specforge-sglang-capture plugin on an SGLang build with "
+                "forward observers"
             )
         if not _mooncake_available():
             raise unittest.SkipTest("mooncake package not installed")
 
         from transformers import LlamaConfig, LlamaForCausalLM
 
-        cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
-        cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
+        cls.workdir = os.environ.get("SPECFORGE_CAPTURE_GATE_WORKDIR")
+        if cls.workdir:
+            os.makedirs(cls.workdir, exist_ok=True)
+            if os.path.exists(os.path.join(cls.workdir, "target")):
+                raise RuntimeError(
+                    f"capture gate target already exists in {cls.workdir}"
+                )
+        else:
+            cls.workdir = tempfile.mkdtemp(prefix="spec_capture_gate_")
+            cls.addClassCleanup(shutil.rmtree, cls.workdir, True)
         # Class cleanups still run when setUpClass raises. Register process
         # cleanup last so it runs before the temporary log directory is removed.
         cls.addClassCleanup(cls._cleanup_processes)
@@ -138,9 +183,19 @@ class TestServerCaptureGate(unittest.TestCase):
                 "MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"
             ),
         )
+        if SERVER_CAPTURE == "plugin":
+            env["SPECFORGE_SPEC_CAPTURE"] = "1"
+        server_python = os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON")
+        if server_python:
+            server_bin = os.path.dirname(
+                os.path.abspath(shutil.which(server_python) or server_python)
+            )
+            env["PATH"] = server_bin + os.pathsep + env.get("PATH", "")
+            env.pop("PYTHONPATH", None)
+            env.pop("VIRTUAL_ENV", None)
         cls.server = subprocess.Popen(
             [
-                sys.executable,
+                server_python or sys.executable,
                 "-m",
                 "sglang.launch_server",
                 "--model-path",
@@ -150,11 +205,19 @@ class TestServerCaptureGate(unittest.TestCase):
                 "triton",
                 "--mem-fraction-static",
                 "0.3",
+                "--max-total-tokens",
+                "4096",
+                (
+                    "--cuda-graph-max-bs-decode"
+                    if SERVER_CAPTURE == "plugin"
+                    else "--cuda-graph-max-bs"
+                ),
+                "4",
                 "--chunked-prefill-size",
                 "-1",
-                "--enable-spec-capture",
-                "--spec-capture-aux-layer-ids",
-                *[str(i) for i in AUX_LAYER_IDS],
+                "--tp-size",
+                os.environ.get("SPECFORGE_CAPTURE_GATE_TP_SIZE", "1"),
+                *_capture_server_flags(),
                 "--port",
                 str(PORT),
             ],
@@ -278,6 +341,57 @@ class TestServerCaptureGate(unittest.TestCase):
         return aux, logits
 
     # -- tests -------------------------------------------------------------------
+    def test_offline_plugin_to_files_matches_reference_and_resumes(self):
+        from pathlib import Path
+
+        from scripts.prepare_hidden_states import HiddenStatesGenerator
+        from specforge.algorithms.builtin import builtin_algorithm_registry
+        from specforge.offline_capture import OfflineCaptureClient
+
+        layout = (
+            builtin_algorithm_registry()
+            .resolve("eagle3")
+            .providers.offline_for("text")
+            .capture_layout
+        )
+        tokens = [[5, 6, 7, 8, 9, 10], [11, 12, 13]]
+        rows = [
+            {
+                "input_ids": row,
+                "attention_mask": [1] * len(row),
+                "loss_mask": [1] * len(row),
+            }
+            for row in tokens
+        ]
+        with tempfile.TemporaryDirectory(dir=self.workdir) as directory:
+            with (
+                OfflineCaptureClient(
+                    [f"http://localhost:{PORT}"],
+                    target_model_path=self.target_dir,
+                    capture_layers=AUX_LAYER_IDS,
+                    layout=layout,
+                    target_hidden_size=H,
+                ) as client,
+                HiddenStatesGenerator(client, layout) as generator,
+            ):
+                generator.generate([rows], directory)
+                files = sorted(Path(directory).rglob("*.ckpt"))
+                self.assertEqual(len(files), len(rows))
+                mtimes = [path.stat().st_mtime_ns for path in files]
+                generator.generate([rows], directory)
+                self.assertEqual(mtimes, [path.stat().st_mtime_ns for path in files])
+            for row, path in zip(tokens, files):
+                aux, _ = self._hf_reference([row])
+                record = torch.load(path, weights_only=True)
+                self.assertEqual(set(record), set(layout.output_names))
+                self.assertEqual(record["input_ids"].tolist(), row)
+                torch.testing.assert_close(
+                    record["aux_hidden_state"].float(),
+                    aux[0].float(),
+                    rtol=TOL,
+                    atol=TOL,
+                )
+
     def test_eagle3_zero_copy_end_to_end(self):
         from specforge.inference.adapters.server_capture import (
             SGLangServerCaptureAdapter,
@@ -293,6 +407,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate0",
             algorithm="eagle3",
             schema=_capture_schema("eagle3"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={
@@ -357,7 +472,9 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29576")
+        fx.build_single_rank_distributed(
+            port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
+        )
         torch.manual_seed(0)
         draft_cfg = AutoDraftModelConfig.from_file(
             fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
@@ -410,6 +527,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate1",
             algorithm="dflash",
             schema=_capture_schema("dflash"),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
@@ -452,6 +570,7 @@ class TestServerCaptureGate(unittest.TestCase):
             run_id="gate2",
             algorithm="dflash",
             schema=_capture_schema("dflash", teacher_metrics=False),
+            server_capture=SERVER_CAPTURE,
         )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},

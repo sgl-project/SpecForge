@@ -24,6 +24,8 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.config.schema import resolve_ref_watermarks
+from specforge.runtime.contracts import consumer_dispatch_quantum
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -126,46 +128,52 @@ def _env(name: str) -> str:
 
 
 def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
+    from specforge.config.schema import validate_receive_buffers
     from specforge.runtime.data_plane.disaggregated import AuthPolicy
     from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 
     token = os.environ.get("DISAGG_AUTH_TOKEN") or None
-    setup_kwargs = {
-        "local_hostname": os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"),
-        "metadata_server": _env("MOONCAKE_METADATA_SERVER"),
-        "master_server_addr": _env("MOONCAKE_MASTER_SERVER_ADDR"),
-        "protocol": os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
-        "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
-    }
-    for env_name, key in (
-        ("MOONCAKE_GLOBAL_SEGMENT_SIZE", "global_segment_size"),
-        ("DISAGG_CLIENT_SEGMENT_SIZE", "global_segment_size"),
-        ("MOONCAKE_LOCAL_BUFFER_SIZE", "local_buffer_size"),
-        ("DISAGG_CLIENT_BUFFER_SIZE", "local_buffer_size"),
-    ):
-        if os.environ.get(env_name):
-            setup_kwargs[key] = int(os.environ[env_name])
+    local_hostname = os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1")
+    protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
     deployment = cfg.deployment.disaggregated
     receive_kwargs: Dict[str, Any] = {
         "receive_buffers": deployment.receive_buffers if deployment else "pinned"
     }
     if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
-        if (
-            receive_kwargs["receive_buffers"] == "cuda"
-            and setup_kwargs["protocol"] != "rdma"
+    validate_receive_buffers(receive_kwargs["receive_buffers"], protocol)
+    if protocol == "nvlink":
+        # Currently only online NVLink capture uses the arena: objects stay on
+        # the capture servers and there is no store to join.
+        from specforge.runtime.data_plane.mooncake_arena import ArenaObjectClient
+
+        store_kwargs: Dict[str, Any] = {
+            "store": ArenaObjectClient(local_hostname=local_hostname)
+        }
+    else:
+        setup_kwargs = {
+            "local_hostname": local_hostname,
+            "metadata_server": _env("MOONCAKE_METADATA_SERVER"),
+            "master_server_addr": _env("MOONCAKE_MASTER_SERVER_ADDR"),
+            "protocol": protocol,
+            "rdma_devices": os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
+        }
+        for env_name, key in (
+            ("MOONCAKE_GLOBAL_SEGMENT_SIZE", "global_segment_size"),
+            ("DISAGG_CLIENT_SEGMENT_SIZE", "global_segment_size"),
+            ("MOONCAKE_LOCAL_BUFFER_SIZE", "local_buffer_size"),
+            ("DISAGG_CLIENT_BUFFER_SIZE", "local_buffer_size"),
         ):
-            raise ValueError(
-                "DISAGG_RECEIVE_BUFFERS=cuda needs MOONCAKE_PROTOCOL=rdma; the "
-                f"{setup_kwargs['protocol']!r} transport cannot write into device memory"
-            )
+            if os.environ.get(env_name):
+                setup_kwargs[key] = int(os.environ[env_name])
+        store_kwargs = {"setup_kwargs": setup_kwargs}
     if os.environ.get("DISAGG_RECEIVE_POOL_BYTES"):
         receive_kwargs["receive_pool_bytes"] = int(
             os.environ["DISAGG_RECEIVE_POOL_BYTES"]
         )
     return MooncakeFeatureStore(
         store_id=os.environ.get("DISAGG_STORE_ID", cfg.run_id),
-        setup_kwargs=setup_kwargs,
+        **store_kwargs,
         auth=AuthPolicy(token),
         credential=token,
         retain_on_release=retain_on_release,
@@ -210,6 +218,15 @@ def _server_urls(cfg: Config) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _server_capture(cfg: Config) -> str:
+    """Capture backend of the servers: explicit deployment config, else
+    DISAGG_SERVER_CAPTURE (a managed supervisor exports its resolution), else
+    ``auto``, which each adapter detects from its server's /server_info."""
+    from specforge.launch_plan import requested_server_capture
+
+    return requested_server_capture(cfg, os.environ)
+
+
 def _consumer_database_path(cfg: Config) -> Optional[str]:
     configured = os.environ.get("DISAGG_DB")
     if configured:
@@ -242,23 +259,14 @@ def _online_prompt_seed(cfg: Config) -> int:
 def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
     """Resolve and validate producer ref watermarks before prompt preparation.
 
-    The consumer dispatches one complete global optimizer window at a time.
+    The consumer needs one or two complete optimizer windows before dispatch.
     Validating this contract only after tokenizing/materializing prompts can
     waste tens of minutes and many GiB for a large online dataset.
     """
     from specforge.runtime.control_plane.flow_control import FlowControlLimits
 
-    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
-    high = int(high_override or cfg.runtime.in_flight_high_watermark)
-    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
-    # Preserve the legacy one-watermark environment override: when only the
-    # old high value is supplied, resume at that same threshold.
-    low = (
-        int(low_override)
-        if low_override is not None
-        else (
-            None if high_override is not None else cfg.runtime.in_flight_low_watermark
-        )
+    high, low = resolve_ref_watermarks(
+        cfg.runtime.in_flight_high_watermark, cfg.runtime.in_flight_low_watermark
     )
     limits = FlowControlLimits(
         high_watermark_refs=high,
@@ -266,16 +274,17 @@ def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
         max_prompt_lease_per_worker=cfg.runtime.producer_lease,
     )
     trainer = cfg.deployment.trainer
-    consumer_quantum = (
+    consumer_quantum = consumer_dispatch_quantum(
+        cfg.runtime.consumer_dispatch,
         trainer.nnodes
         * trainer.nproc_per_node
         * cfg.training.batch_size
-        * cfg.training.accumulation_steps
+        * cfg.training.accumulation_steps,
     )
     if high < consumer_quantum:
         raise ValueError(
             "producer in-flight high watermark "
-            f"{high} is smaller than the consumer's global optimizer-step "
+            f"{high} is smaller than the consumer's dispatch "
             f"quantum {consumer_quantum}; set "
             "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
         )
@@ -283,7 +292,7 @@ def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
         raise ValueError(
             "producer in-flight low watermark "
             f"{limits.resolved_low_watermark_refs} is smaller than the "
-            f"consumer's global optimizer-step quantum {consumer_quantum}; "
+            f"consumer's dispatch quantum {consumer_quantum}; "
             "set DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
         )
     return high, low
@@ -435,6 +444,7 @@ def _build_offline(
     build_model_bundle: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -521,6 +531,9 @@ def _build_offline(
 
         return TrainingRun(execute=produce)
 
+    if preflight_model_bundle is not None:
+        # The model is otherwise first built only after the whole ingest.
+        preflight_model_bundle(cfg)
     _wait_for(done, failure_path=manifest + ".failed")
     from specforge.launch import build_disagg_offline_runtime
     from specforge.runtime.data_plane.disagg_ingest import read_ref_manifest
@@ -553,7 +566,7 @@ def _build_offline(
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         max_checkpoints=cfg.training.max_checkpoints,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -599,6 +612,7 @@ def _build_online(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -612,6 +626,10 @@ def _build_online(
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
         _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    elif preflight_model_bundle is not None:
+        # Check trainer dependencies before opening the store or waiting on
+        # the producer, so a failed preflight owns no transport resources.
+        preflight_model_bundle(cfg)
     # The producer owns capture and explicit attempt cleanup. The consumer must
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
@@ -684,6 +702,7 @@ def _build_online(
                 schema=capture_schema,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
+                server_capture=_server_capture(cfg),
             )
             for url in _server_urls(cfg)
         ]
@@ -834,10 +853,12 @@ def _build_online(
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
+        consumer_dispatch=cfg.runtime.consumer_dispatch,
+        dispatch_num_anchors=cfg.training.num_anchors,
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)
@@ -851,8 +872,13 @@ def build_disaggregated_run(
     prepare_prompts: Callable,
     optimizer_factory: Callable,
     logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
 ):
-    """Assemble the configured producer or consumer role."""
+    """Assemble the configured producer or consumer role.
+
+    ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
+    producer, so dependencies ``build_model_bundle`` needs fail at startup.
+    """
     if cfg.training.role not in ("producer", "consumer"):
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
@@ -865,6 +891,7 @@ def build_disaggregated_run(
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
                 logger=logger,
+                preflight_model_bundle=preflight_model_bundle,
             )
         return _build_online(
             cfg,
@@ -873,6 +900,7 @@ def build_disaggregated_run(
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
             logger=logger,
+            preflight_model_bundle=preflight_model_bundle,
         )
     except BaseException as exc:
         _publish_role_assembly_failure(cfg, exc)

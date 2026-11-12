@@ -68,6 +68,18 @@ clobbers the image's ROCm torch/sglang. If a later step reports a missing
 lightweight dependency (for example `accelerate`), install just that package,
 also with `--no-deps`.
 
+DFlash drafts use the Liger RMSNorm/SwiGLU kernels by default on ROCm
+(`model.use_liger_kernel`), and training stops with an install hint when Liger
+cannot be imported. Install it without dependencies so pip keeps the image's
+ROCm Triton instead of pulling the CUDA `triton` wheel:
+
+```bash
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
+```
+
+Set `model.use_liger_kernel: false` to train with the native Qwen3 modules
+instead.
+
 The images ship neither `wandb` nor TensorBoard:
 
 ```bash
@@ -75,20 +87,18 @@ python -m pip install wandb
 python -m pip install --no-deps tensorboard tensorboard-data-server absl-py markdown werkzeug
 ```
 
-### Step 4: Apply the capture patch (online runs only)
+### Step 4: Install the capture plugin (online and offline preparation)
 
-These images pin SGLang to exactly `0.5.18` (editable at `/sgl-workspace/sglang`),
-so the online capture patch applies unchanged. Skip this step for offline
-training, which reads features from disk and needs no capture service:
+The images' stock SGLang 0.5.18 lacks the generic capture extension APIs.
+Use a separate ROCm-compatible SGLang environment with the APIs documented in
+[the plugin guide](../../../../plugins/sglang-spec-capture/README.md), then install:
 
 ```bash
-cd /workspace/SpecForge
-scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18
+python -m pip install --no-deps plugins/sglang-spec-capture
 ```
 
-The patch adds the `--enable-spec-capture`, `--spec-capture-method`, and
-`--spec-capture-aux-layer-ids` server flags plus the `sglang.srt.spec_capture_sink`
-module used by online capture.
+Set `SPECFORGE_SPEC_CAPTURE=1` when launching the capture server. Offline
+training from existing feature files needs neither SGLang nor this plugin.
 
 ### Step 5: Attention backends on ROCm
 
@@ -97,7 +107,7 @@ ROCm. The `fa` (flash-attn) and `usp` backends, and `yunchang`-based
 Ulysses/Ring sequence parallel (`sp_ulysses_size` / `sp_ring_size` > 1), depend
 on a CUDA flash-attn build; the single-GPU / data-parallel path never loads
 `yunchang`, and selecting those backends raises a clear error. The checked-in
-[`qwen3.5-4b-dflash-offline-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml)
+[`qwen3.5-4b-dflash-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml)
 recipe already uses `flex_attention`, so it runs on ROCm unchanged as a
 single-GPU offline DFlash example.
 
@@ -128,21 +138,26 @@ see the [Data Preparation](../data_preparation.md) guide.
 
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
-training loop, and needs no capture patch or Mooncake. This section trains a
+training loop, and needs no capture service or Mooncake. This section trains a
 **Qwen3.5-4B DFlash** draft (`configs/qwen3.5-4b-dflash.json`).
 
 ### Step 1: Capture hidden states
 
 Feature preparation is a data-processing step, not a second training entry point.
 Qwen3.5-4B is a hybrid linear-attention/Mamba target, so run the capture under
-**AITER** and pass `--sglang-disable-radix-cache`. Without it, SGLang's Mamba
+**AITER** and pass `--disable-radix-cache` to the capture server. Without it, SGLang's Mamba
 radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
+Start the compatible plugin server and Mooncake following the
+[offline guide](../../../../examples/offline/README.md), with
+`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`
+and server flags `--attention-backend aiter --disable-radix-cache
+--mem-fraction-static 0.8 --context-length 2560`. Then run the CPU client:
+
 ```bash
-SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
-torchrun --standalone --nproc_per_node 1 \
-  scripts/prepare_hidden_states.py \
+python scripts/prepare_hidden_states.py \
+  --server-urls http://127.0.0.1:30000 \
   --target-model-path Qwen/Qwen3.5-4B \
   --strategy dflash \
   --draft-model-config configs/qwen3.5-4b-dflash.json \
@@ -151,12 +166,7 @@ torchrun --standalone --nproc_per_node 1 \
   --output-path ./cache/hidden_states/qwen3.5-4b-dflash-sharegpt \
   --chat-template qwen3.5 \
   --max-length 2048 \
-  --tp-size 1 \
-  --batch-size 8 \
-  --sglang-attention-backend aiter \
-  --sglang-disable-radix-cache \
-  --sglang-mem-fraction-static 0.8 \
-  --sglang-context-length 2560
+  --batch-size 8
 ```
 
 The output path matches `data.hidden_states_path` in the checked-in offline
@@ -177,13 +187,13 @@ The checked-in offline recipe already uses `flex_attention` for the trainer, so
 it runs on ROCm unchanged:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml
 ```
 
 Override any field inline without copying the YAML, e.g. a quick smoke run:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-offline-amd.yaml \
+specforge train --config examples/configs/offline/colocated/qwen3.5-4b-dflash-amd.yaml \
   training.max_steps=20 output_dir=./outputs/dflash-offline-smoke
 ```
 
@@ -207,7 +217,7 @@ for the complete contract.
 
 ## 4. Online disaggregated training
 
-Online training captures target features live from a patched SGLang server and
+Online training captures target features live from a SGLang server running the capture plugin and
 streams them through Mooncake to the trainer. Every online run is
 **disaggregated**: a producer drives prompts through the capture server and a
 consumer trains the draft model. The choices below change service ownership and
@@ -220,7 +230,7 @@ command supervises the producer and consumer. Mooncake and SGLang remain
 external services started by the user.
 
 This section uses the external
-[`qwen3.5-4b-dflash-online-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml)
+[`qwen3.5-4b-dflash-amd.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml)
 recipe as a single-node smoke test. `external` means that the user starts
 Mooncake and SGLang; the services still run locally in this example. Complete
 Step 4 of the installation first.
@@ -251,7 +261,7 @@ mooncake_master --enable_http_metadata_server=true \
   --default_kv_lease_ttl=500 &
 ```
 
-Start the patched capture server on GPU 0. **The `--spec-capture-aux-layer-ids`
+Start the plugin-enabled capture server on GPU 0. **The `--return-aux-hidden-state-layer-ids`
 must match the draft's `target_layer_ids`** — for DFlash these are read straight
 from `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29` (this is not the EAGLE3
 `[1, num_layers//2 - 1, num_layers - 4]` formula). A mismatch produces zero
@@ -267,6 +277,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
+SPECFORGE_SPEC_CAPTURE=1 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-4B \
   --trust-remote-code \
@@ -277,8 +288,8 @@ python -m sglang.launch_server \
   --attention-backend aiter \
   --chunked-prefill-size -1 \
   --disable-radix-cache \
-  --enable-spec-capture --spec-capture-method dflash \
-  --spec-capture-aux-layer-ids 1 8 15 22 29 \
+  --enable-return-aux-hidden-states --return-hidden-states-mode full --speculative-algorithm DFLASH \
+  --return-aux-hidden-state-layer-ids 1 8 15 22 29 \
   --host 127.0.0.1 --port 30000 &
 ```
 
@@ -298,7 +309,7 @@ MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
 MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
 MOONCAKE_PROTOCOL=tcp \
 MOONCAKE_GLOBAL_SEGMENT_SIZE=$((32<<30)) \
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml \
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml \
   training.max_steps=20 training.num_epochs=1 \
   training.save_interval=20 training.log_interval=5
 ```
@@ -338,10 +349,10 @@ launched explicitly:
 
 ```bash
 # Inference / capture pool
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role producer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml --role producer
 
 # Trainer pool
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-amd.yaml --role consumer
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml --role consumer
 ```
 
 The checked-in AMD recipe is a single-node example and deliberately uses
@@ -366,7 +377,7 @@ specforge train -c run.yaml --role consumer --node-rank 1   # trainer-1
 
 A fresh attempt requires fresh control and consumer-state directories, and every
 capture server must use the same target model, revision, capture method, and
-auxiliary layer ids — for this recipe `--spec-capture-method dflash` with aux ids
+auxiliary layer ids — for this recipe `--speculative-algorithm DFLASH` with aux ids
 `1 8 15 22 29`, and on ROCm each must run under AITER with `--disable-radix-cache`
 (see External services, Step 2). For external-service prerequisites, freshness
 rules, multi-server capture, inbox relays, and resume, see the
@@ -393,8 +404,8 @@ The SGLang side (offline capture and online capture server) runs the hybrid
 Mamba target under **AITER** on ROCm — export
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1` and use
 `--attention-backend aiter`. A ROCm-specific requirement: the target needs
-the radix cache disabled (offline capture: `--sglang-disable-radix-cache`;
-external online server: `--disable-radix-cache`; managed-local config:
+the radix cache disabled (offline/online capture server:
+`--disable-radix-cache`; managed-local config:
 `model.sglang_disable_radix_cache: true`). SGLang's Mamba radix cache
 auto-selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU (FLA) at
 server init and fails on ROCm; disabling the radix cache bypasses that path.

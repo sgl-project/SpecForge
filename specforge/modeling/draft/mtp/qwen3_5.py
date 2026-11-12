@@ -94,21 +94,40 @@ class PartialRotaryEmbedding(nn.Module):
 
     def __init__(self, config, head_dim):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        # transformers 5 keeps rope_theta in config.rope_parameters; read it
+        # first, as SGLang's get_rope_config does. A silent default would
+        # train with frequencies SGLang does not serve.
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is None:
+            rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            raise ValueError(
+                "MTP draft config has no rope_theta (neither "
+                "config.rope_parameters['rope_theta'] nor config.rope_theta)"
+            )
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        dim = int(head_dim * partial_rotary_factor)
-        inv_freq = 1.0 / (
-            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim)
+        self.rope_theta = float(rope_theta)
+        self.rotary_dim = int(head_dim * partial_rotary_factor)
+        self.register_buffer(
+            "inv_freq", self._inv_freq(torch.device("cpu")), persistent=False
         )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _inv_freq(self, device) -> torch.Tensor:
+        dim = self.rotary_dim
+        return 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
+        )
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-        freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+        # Recompute in fp32: model.to(bfloat16) also casts the inv_freq buffer,
+        # and bf16 frequencies are off by radians at long positions.
+        inv_freq = self._inv_freq(position_ids.device)
+        # Elementwise outer product, not a matmul: autocast and TF32 lower
+        # matmul precision but leave fp32 elementwise ops exact.
+        freqs = position_ids[..., None].float() * inv_freq
         emb = torch.cat((freqs, freqs), dim=-1)
         cos = emb.cos()
         sin = emb.sin()
@@ -231,8 +250,9 @@ class Qwen3MTPAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
+        # transformers attention interfaces already return [b, s, heads, d];
+        # another transpose here would mix heads and positions.
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
 
         if self.attn_output_gate:
             attn_output = attn_output * torch.sigmoid(gate)

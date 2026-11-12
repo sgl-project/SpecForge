@@ -352,6 +352,28 @@ class Trainer:
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]
+            if "canonical_draft_config" in algorithm_checkpoint_extra:
+                # Canonical artifacts store shared parameters once. Expand only
+                # aliases already established by model construction; missing
+                # independent parameters still fail the strict check below.
+                saved_weights = dict(saved_weights)
+                aliases = {}
+                for name, parameter in model.draft_model.named_parameters(
+                    remove_duplicate=False
+                ):
+                    aliases.setdefault(id(parameter), []).append(name)
+                for names in aliases.values():
+                    source = next(
+                        (
+                            saved_weights[name]
+                            for name in names
+                            if name in saved_weights
+                        ),
+                        None,
+                    )
+                    if source is not None:
+                        for name in names:
+                            saved_weights.setdefault(name, source)
             load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             missing_keys = set(load_result.missing_keys)

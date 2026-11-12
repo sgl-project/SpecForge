@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
@@ -21,23 +24,84 @@ from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
 from specforge.launch_plan import (
+    _SERVER_CAPTURE_REQUIREMENTS,
     CommandSpec,
     LaunchPlan,
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
+    _managed_preflight,
+    _managed_rdma_preflight,
+    _spawn_command,
 )
 from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
+from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
 
+FAKE_RDMA_DEVICES = "mlx5_0,mlx5_1"
+
+
+def _fake_rdma_devices(requested, *, defaulted, env):
+    """Stand in for the sysfs HCA probe so plan tests never read this host."""
+    return requested or FAKE_RDMA_DEVICES
+
+
+def _unexpected_rdma_devices(requested, *, defaulted, env):
+    raise AssertionError("this plan must not resolve RDMA devices")
+
+
+def _installed_capture(*backends):
+    """Stand in for the capture-interpreter probe: only *backends* resolve."""
+    provided = {
+        name for backend in backends for name in _SERVER_CAPTURE_REQUIREMENTS[backend]
+    }
+
+    def probe(command, modules):
+        return [name for name in modules if name not in provided]
+
+    return probe
+
+
+def _unexpected_capture_probe(command, modules):
+    raise AssertionError("this plan must not probe the capture interpreter")
+
+
 def build_launch_plan(cfg, **kwargs):
-    """Build every test plan with one already-resolved registration."""
+    """Build every test plan with one already-resolved registration.
+
+    Capture interpreters default to SGLang with the plugin, so server_capture=auto
+    resolves to the plugin as it does for existing deployments.
+    """
+    kwargs.setdefault("rdma_device_resolver", _fake_rdma_devices)
+    kwargs.setdefault("capture_module_probe", _installed_capture("plugin"))
     return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
+
+
+def _managed_raw(control_dir="/fresh/managed-transport", **mooncake):
+    raw = _managed_config(control_dir).model_dump()
+    raw["deployment"]["disaggregated"]["managed_local"]["mooncake"].update(mooncake)
+    return raw
+
+
+def _build_managed(raw, **kwargs):
+    with mock.patch(
+        "specforge.training.capture_contract.resolve_server_capture_contract",
+        return_value=CAPTURE_CONTRACT,
+    ):
+        return build_launch_plan(
+            Config.model_validate(raw), config_path="run.yaml", env={}, **kwargs
+        )
+
+
+def _mooncake_clients(plan):
+    """Every owned command that opens a Mooncake transfer client."""
+    return (*(service.command for service in plan.services[1:]), *plan.commands)
 
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
@@ -139,7 +203,9 @@ def _managed_plan(root):
                 0,
             ),
             ServiceSpec(
-                CommandSpec("capture-server-0", ("capture",)),
+                CommandSpec(
+                    "capture-server-0", (sys.executable, "-m", "sglang.launch_server")
+                ),
                 ReadinessSpec("http", "http://127.0.0.1:30000/health", 1),
                 os.path.join(log_dir, "capture.log"),
                 1,
@@ -249,6 +315,254 @@ class LaunchPlanTest(unittest.TestCase):
             )
         for command in plan.commands:
             self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+
+    def test_managed_nvlink_needs_device_receives_and_bounded_arenas(self):
+        raw = _managed_config("/shared/attempt-nvlink").model_dump()
+        deployment = raw["deployment"]["disaggregated"]
+        mooncake = deployment["managed_local"]["mooncake"]
+        mooncake["protocol"] = "nvlink"
+        with self.assertRaisesRegex(ValidationError, "arena_bytes is required"):
+            Config.model_validate(raw)
+        mooncake["arena_bytes"] = 8192
+        with self.assertRaisesRegex(ValidationError, "receive_buffers=cuda"):
+            Config.model_validate(raw)
+        deployment["receive_buffers"] = "cuda"
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = False
+        with self.assertRaisesRegex(ValidationError, "gpu_put cannot be false"):
+            Config.model_validate(raw)
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = None
+        for watermark in (None, 8193):
+            raw["runtime"]["resident_high_watermark_bytes"] = watermark
+            with self.assertRaisesRegex(ValidationError, "8192 bytes of"):
+                Config.model_validate(raw)
+        raw["runtime"]["resident_high_watermark_bytes"] = 8192
+        with mock.patch(
+            "specforge.training.capture_contract.resolve_server_capture_contract",
+            return_value=CAPTURE_CONTRACT,
+        ):
+            plan = build_launch_plan(
+                Config.model_validate(raw), config_path="run.yaml", env={}
+            )
+        server = next(s for s in plan.services if s.command.label == "capture-server-0")
+        self.assertEqual(server.command.env["SGLANG_SPEC_CAPTURE_ARENA_BYTES"], "8192")
+        for env in [command.env for command in plan.commands] + [server.command.env]:
+            self.assertEqual(env["MOONCAKE_PROTOCOL"], "nvlink")
+            self.assertEqual(env["MC_FORCE_MNNVL"], "1")
+
+    def test_arena_size_only_applies_to_nvlink(self):
+        raw = _managed_config("/shared/attempt-rdma").model_dump()
+        raw["deployment"]["disaggregated"]["managed_local"]["mooncake"].update(
+            protocol="rdma", arena_bytes=8192
+        )
+        with self.assertRaisesRegex(ValidationError, "applies only to it"):
+            Config.model_validate(raw)
+
+    def test_external_nvlink_needs_a_watermark_but_no_store_endpoints(self):
+        raw = _config(mode="disaggregated").model_dump()
+        raw["deployment"]["disaggregated"].update(
+            receive_buffers="cuda", mooncake_protocol="nvlink"
+        )
+        with self.assertRaisesRegex(ValueError, "resident_high_watermark_bytes"):
+            build_launch_plan(
+                Config.model_validate(raw), config_path="run.yaml", env={}
+            )
+        raw["runtime"]["resident_high_watermark_bytes"] = 1 << 30
+        plan = build_launch_plan(
+            Config.model_validate(raw), config_path="run.yaml", env={}
+        )
+        for command in plan.commands:
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "nvlink")
+            self.assertEqual(command.env["MC_FORCE_MNNVL"], "1")
+
+    def test_managed_protocol_defaults_to_rdma_on_resolved_devices(self):
+        calls = []
+
+        def resolver(requested, *, defaulted, env):
+            calls.append((requested, defaulted, env))
+            return "mlx5_2,mlx5_3"
+
+        raw = _managed_raw()
+        managed = Config.model_validate(raw).deployment.disaggregated.managed_local
+        self.assertIsNone(managed.mooncake.protocol)
+        plan = _build_managed(raw, rdma_device_resolver=resolver)
+
+        # The probe sees the environment the owned processes inherit.
+        self.assertEqual(calls, [(None, True, {})])
+        self.assertNotIn("MOONCAKE_PROTOCOL", plan.services[0].command.env)
+        for command in _mooncake_clients(plan):
+            with self.subTest(command=command.label):
+                self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+                self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_2,mlx5_3")
+        # Two HCAs register the largest client: the trainer's 256 MiB client
+        # buffer plus its 8 GiB pinned receive pool.
+        self.assertEqual(plan.managed_rdma_memlock_bytes, 2 * ((256 << 20) + (8 << 30)))
+        rendered = json.loads(plan.render())
+        self.assertEqual(
+            rendered["services"][1]["command"]["env"]["MOONCAKE_RDMA_DEVICES"],
+            "mlx5_2,mlx5_3",
+        )
+        self.assertEqual(
+            rendered["managed_rdma_memlock_bytes"], plan.managed_rdma_memlock_bytes
+        )
+
+        calls.clear()
+        plan = _build_managed(
+            _managed_raw(protocol="rdma", rdma_devices="mlx5_4"),
+            rdma_device_resolver=lambda requested, *, defaulted, env: (
+                calls.append((requested, defaulted, env)) or requested
+            ),
+        )
+        self.assertEqual(calls, [("mlx5_4", False, {})])
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_4")
+
+    def _build_on_host_without_hcas(self, raw):
+        with tempfile.TemporaryDirectory() as root:
+            # The default resolver probes sysfs; point it at an empty host.
+            with (
+                mock.patch(
+                    "specforge.launch_plan.resolve_rdma_devices",
+                    side_effect=functools.partial(
+                        mooncake_rdma.resolve_rdma_devices, root=root
+                    ),
+                ),
+                mock.patch(
+                    "specforge.training.capture_contract."
+                    "resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+            ):
+                return _build_launch_plan(
+                    Config.model_validate(raw),
+                    algorithm=ALGORITHM,
+                    config_path="run.yaml",
+                    env={},
+                    capture_module_probe=_installed_capture("plugin"),
+                )
+
+    def test_managed_rdma_without_usable_devices_names_the_opt_out(self):
+        # The plan still renders off the training node (--plan on a laptop).
+        plan = self._build_on_host_without_hcas(_managed_raw())
+        message = plan.managed_rdma_error
+        self.assertIn(
+            "managed_local.mooncake.protocol defaulted to rdma and "
+            "managed_local.mooncake.rdma_devices is unset, but no usable RDMA "
+            "device was found on this host:",
+            message,
+        )
+        self.assertIn("To use TCP, set managed_local.mooncake.protocol: tcp.", message)
+        self.assertIn("--device /dev/infiniband", message)
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "rdma")
+            self.assertNotIn("MOONCAKE_RDMA_DEVICES", command.env)
+        self.assertIsNone(plan.managed_rdma_memlock_bytes)
+        self.assertEqual(json.loads(plan.render())["managed_rdma_error"], message)
+        # Launching it fails before anything starts.
+        with self.assertRaises(RuntimeError) as raised:
+            _managed_rdma_preflight(plan)
+        self.assertEqual(str(raised.exception), message)
+
+        # A listed device that does not resolve renders as configured.
+        plan = self._build_on_host_without_hcas(
+            _managed_raw(protocol="rdma", rdma_devices="mlx5_0,mlx5_1")
+        )
+        self.assertIn(
+            "managed_local.mooncake.rdma_devices lists RDMA devices that Mooncake "
+            "cannot use",
+            plan.managed_rdma_error,
+        )
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_0,mlx5_1")
+        self.assertIsNone(
+            json.loads(_build_managed(_managed_raw()).render())["managed_rdma_error"]
+        )
+
+    def test_managed_explicit_tcp_is_unchanged(self):
+        plan = _build_managed(
+            _managed_raw(protocol="tcp", rdma_devices="mlx5_0"),
+            rdma_device_resolver=_unexpected_rdma_devices,
+        )
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "tcp")
+            self.assertEqual(command.env["MOONCAKE_RDMA_DEVICES"], "mlx5_0")
+            self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", command.env)
+        self.assertIsNone(plan.managed_rdma_memlock_bytes)
+        self.assertIsNone(json.loads(plan.render())["managed_rdma_memlock_bytes"])
+
+    def test_managed_ascend_default_keeps_tcp(self):
+        ascend = mock.patch(
+            "specforge.launch_plan._device_visibility_env_var",
+            return_value="ASCEND_RT_VISIBLE_DEVICES",
+        )
+        with ascend:
+            plan = _build_managed(
+                _managed_raw(), rdma_device_resolver=_unexpected_rdma_devices
+            )
+        for command in _mooncake_clients(plan):
+            self.assertEqual(command.env["MOONCAKE_PROTOCOL"], "tcp")
+            self.assertNotIn("MOONCAKE_RDMA_DEVICES", command.env)
+            self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", command.env)
+        self.assertIsNone(plan.managed_rdma_memlock_bytes)
+
+        gpu_put = _managed_raw()
+        managed = gpu_put["deployment"]["disaggregated"]["managed_local"]
+        managed["capture_servers"][0]["gpu_put"] = True
+        cuda = _managed_raw()
+        cuda["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        for name, raw, message in (
+            ("gpu_put", gpu_put, "gpu_put needs Mooncake RDMA"),
+            ("cuda", cuda, "receive_buffers=cuda needs Mooncake RDMA"),
+        ):
+            with self.subTest(feature=name), ascend:
+                with self.assertRaisesRegex(
+                    ValueError, rf"{message}, but .*defaulted to tcp on this Ascend"
+                ):
+                    _build_managed(raw, rdma_device_resolver=_unexpected_rdma_devices)
+
+    def test_managed_rdma_features_are_checked_after_resolution(self):
+        raw = _managed_raw()
+        deployment = raw["deployment"]["disaggregated"]
+        deployment["receive_buffers"] = "cuda"
+        deployment["managed_local"]["capture_servers"][0]["gpu_put"] = True
+        # An unset protocol passes the schema and resolves to rdma here.
+        plan = _build_managed(raw)
+        self.assertEqual(
+            plan.services[1].command.env["SGLANG_SPEC_CAPTURE_GPU_PUT"], "1"
+        )
+        consumer = plan.commands[1]
+        self.assertEqual(consumer.env["DISAGG_RECEIVE_BUFFERS"], "cuda")
+        self.assertEqual(consumer.env["MOONCAKE_PROTOCOL"], "rdma")
+        # cuda receive pools live in device memory.
+        self.assertEqual(plan.managed_rdma_memlock_bytes, 2 * (256 << 20))
+
+    def test_managed_gpu_publication_needs_an_explicit_rdma_protocol(self):
+        servers = [
+            {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+            {
+                "port": 30002,
+                "cuda_visible_devices": ["2"],
+                "tp_size": 1,
+                "gpu_put": True,
+            },
+        ]
+        servers[1]["gpu_put"] = False
+        # GPU publication also needs GPUDirect RDMA, which nothing checks before
+        # the first capture, so only an explicit rdma turns it on by itself (the
+        # sink's default when SGLANG_SPEC_CAPTURE_GPU_PUT is unset).
+        for mooncake, unset in (({}, "0"), ({"protocol": "rdma"}, None)):
+            with self.subTest(mooncake=mooncake):
+                raw = _managed_raw(**mooncake)
+                managed = raw["deployment"]["disaggregated"]["managed_local"]
+                managed["capture_servers"] = servers
+                plan = _build_managed(raw)
+                self.assertEqual(
+                    [
+                        service.command.env.get("SGLANG_SPEC_CAPTURE_GPU_PUT")
+                        for service in plan.services
+                    ],
+                    [None, unset, "0", "1"],
+                )
 
     def test_disaggregated_receives_default_to_pinned_and_allow_override(self):
         for requested, expected in ((None, "pinned"), ("pageable", "pageable")):
@@ -682,6 +996,33 @@ class LaunchPlanTest(unittest.TestCase):
 
         self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
 
+    def test_managed_capture_servers_can_use_separate_python(self):
+        cfg = _managed_config(
+            "/fresh/managed-attempt",
+            servers=[
+                {"port": 30000, "cuda_visible_devices": ["0"]},
+                {
+                    "port": 30001,
+                    "cuda_visible_devices": ["1"],
+                    "python_executable": "/capture-venv/bin/python",
+                },
+            ],
+        )
+        plan = _build_managed(cfg.model_dump())
+
+        self.assertEqual(plan.services[1].command.argv[0], sys.executable)
+        self.assertEqual(
+            plan.services[2].command.argv[:3],
+            ("/capture-venv/bin/python", "-m", "sglang.launch_server"),
+        )
+        env = plan.services[2].command.env
+        self.assertIsNone(env["PYTHONPATH"])
+        self.assertIsNone(env["VIRTUAL_ENV"])
+        self.assertTrue(env["PATH"].startswith("/capture-venv/bin" + os.pathsep))
+        self.assertTrue(
+            all(command.argv[0] == sys.executable for command in plan.commands)
+        )
+
     def test_managed_local_gpu_put_override_can_disable_rdma_publication(self):
         servers = [
             {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
@@ -712,6 +1053,297 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(envs["capture-server-0"]["SGLANG_SPEC_CAPTURE_GPU_PUT"], "1")
         self.assertEqual(envs["capture-server-1"]["SGLANG_SPEC_CAPTURE_GPU_PUT"], "0")
         self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", envs["mooncake"])
+
+    def _managed_plan_for(self, server_capture=None, *, servers=None, **kwargs):
+        with tempfile.TemporaryDirectory() as root:
+            raw = _managed_config(
+                os.path.join(root, "attempt"), servers=servers
+            ).model_dump()
+            if server_capture is not None:
+                raw["deployment"]["disaggregated"]["server_capture"] = server_capture
+            cfg = Config.model_validate(raw)
+            kwargs.setdefault("env", {})
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ) as contract:
+                plan = build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    **kwargs,
+                )
+            # Probing for auto reuses the one resolved capture contract.
+            contract.assert_called_once()
+            return plan
+
+    def _capture_preflight(self, plan):
+        """Run the managed preflight up to its capture checks."""
+        with (
+            mock.patch(
+                "specforge.launch_plan.shutil.which",
+                return_value="/usr/bin/mooncake_master",
+            ),
+            mock.patch(
+                "specforge.launch_plan.importlib.util.find_spec",
+                return_value=object(),
+            ),
+            mock.patch("specforge.launch_plan._managed_rdma_preflight"),
+        ):
+            _managed_preflight(replace(plan, managed_ports=(), preflight_checks=()))
+
+    def _assert_capture_flags(self, plan, server_capture):
+        producer = plan.commands[0]
+        captures = [
+            service.command
+            for service in plan.services
+            if service.command.label.startswith("capture-server-")
+        ]
+        self.assertTrue(captures)
+        for capture in captures:
+            if server_capture == "plugin":
+                self.assertIn("--enable-return-aux-hidden-states", capture.argv)
+                self.assertNotIn("--enable-spec-capture", capture.argv)
+                self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
+            else:
+                for flag in (
+                    "--enable-spec-capture",
+                    "--enable-return-aux-hidden-states",
+                    "--speculative-algorithm",
+                ):
+                    self.assertNotIn(flag, capture.argv)
+                self.assertNotIn("SPECFORGE_SPEC_CAPTURE", capture.env)
+        if server_capture is None:
+            self.assertNotIn("DISAGG_SERVER_CAPTURE", producer.env)
+        else:
+            self.assertEqual(producer.env["DISAGG_SERVER_CAPTURE"], server_capture)
+        self.assertNotIn("DISAGG_SERVER_CAPTURE", plan.commands[1].env)
+
+    def test_server_capture_defaults_to_auto(self):
+        cfg = _managed_config("/fresh/attempt")
+        self.assertEqual(cfg.deployment.disaggregated.server_capture, "auto")
+
+    def test_managed_auto_capture_resolves_to_the_installed_backend(self):
+        for installed, expected in ((("plugin",), "plugin"),):
+            with self.subTest(installed=installed):
+                plan = self._managed_plan_for(
+                    capture_module_probe=_installed_capture(*installed)
+                )
+
+                self.assertEqual(plan.server_capture, expected)
+                self.assertTrue(plan.server_capture_detected)
+                self.assertIsNone(plan.server_capture_error)
+                rendered = json.loads(plan.render())
+                self.assertEqual(rendered["server_capture"], expected)
+                self.assertTrue(rendered["server_capture_detected"])
+                self._assert_capture_flags(plan, expected)
+                with mock.patch(
+                    "specforge.launch_plan._missing_capture_modules",
+                    side_effect=AssertionError("planning already probed"),
+                ):
+                    self._capture_preflight(plan)
+
+    def test_managed_auto_capture_probes_every_server_interpreter(self):
+        servers = [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0"],
+                "tp_size": 1,
+                "python_executable": "/envs/sglang-a/bin/python",
+            },
+            {
+                "port": 30001,
+                "cuda_visible_devices": ["1"],
+                "tp_size": 1,
+                "python_executable": "/envs/sglang-b/bin/python",
+            },
+        ]
+        probed = []
+
+        def probe(command, modules):
+            probed.append((command.label, command.argv[0], tuple(modules)))
+            return _installed_capture("plugin")(command, modules)
+
+        plan = self._managed_plan_for(servers=servers, capture_module_probe=probe)
+
+        self.assertEqual(plan.server_capture, "plugin")
+        requirements = tuple(
+            name for needed in _SERVER_CAPTURE_REQUIREMENTS.values() for name in needed
+        )
+        self.assertIn(
+            "sglang.srt.managers.deferred_output:ResponseCompletion", requirements
+        )
+        self.assertEqual(
+            probed,
+            [
+                ("capture-server-0", "/envs/sglang-a/bin/python", requirements),
+                ("capture-server-1", "/envs/sglang-b/bin/python", requirements),
+            ],
+        )
+
+    def test_managed_auto_capture_records_unresolved_backends(self):
+        two_servers = [
+            {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+        ]
+        plugin_only = _installed_capture("plugin")
+        no_plugin = _installed_capture()
+
+        def mixed(command, modules):
+            probe = plugin_only if command.label == "capture-server-0" else no_plugin
+            return probe(command, modules)
+
+        def without_mooncake(command, modules):
+            return ["mooncake.store", *plugin_only(command, modules)]
+
+        def uninspectable(command, modules):
+            raise RuntimeError("Cannot inspect capture-server-0 Python '/missing'")
+
+        cases = {
+            "mixed servers": (
+                two_servers,
+                mixed,
+                r"found no capture backend for capture-server-1",
+            ),
+            "neither installed": (
+                None,
+                _installed_capture(),
+                "found no capture backend for capture-server-0.*"
+                "specforge-sglang-capture plugin",
+            ),
+            "mooncake missing": (
+                None,
+                without_mooncake,
+                r"specforge-sglang-capture plugin.*missing \['mooncake.store'\]",
+            ),
+            "uninspectable": (None, uninspectable, "Cannot inspect capture-server-0"),
+        }
+        for name, (servers, probe, message) in cases.items():
+            with self.subTest(name):
+                plan = self._managed_plan_for(
+                    servers=servers, capture_module_probe=probe
+                )
+
+                self.assertEqual(plan.server_capture, "auto")
+                self.assertFalse(plan.server_capture_detected)
+                self.assertRegex(plan.server_capture_error, message)
+                rendered = json.loads(plan.render())
+                self.assertEqual(rendered["server_capture"], "auto")
+                self.assertEqual(
+                    rendered["server_capture_error"], plan.server_capture_error
+                )
+                self._assert_capture_flags(plan, None)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._capture_preflight(plan)
+
+    def test_explicit_server_capture_skips_the_probe(self):
+        for backend in ("plugin",):
+            for source in ("config", "env"):
+                with self.subTest(backend=backend, source=source):
+                    plan = self._managed_plan_for(
+                        backend if source == "config" else None,
+                        env=(
+                            {"DISAGG_SERVER_CAPTURE": backend}
+                            if source == "env"
+                            else {}
+                        ),
+                        capture_module_probe=_unexpected_capture_probe,
+                    )
+
+                    self.assertEqual(plan.server_capture, backend)
+                    self.assertFalse(plan.server_capture_detected)
+                    self._assert_capture_flags(plan, backend)
+                    # The preflight still checks an explicit choice.
+                    with mock.patch(
+                        "specforge.launch_plan._missing_capture_modules",
+                        return_value=[],
+                    ) as probe:
+                        self._capture_preflight(plan)
+                    probe.assert_called_once_with(
+                        plan.services[1].command,
+                        _SERVER_CAPTURE_REQUIREMENTS[backend],
+                    )
+
+    def test_explicit_config_server_capture_wins_over_the_env(self):
+        plan = self._managed_plan_for(
+            "plugin",
+            env={"DISAGG_SERVER_CAPTURE": "patch"},
+            capture_module_probe=_unexpected_capture_probe,
+        )
+        self._assert_capture_flags(plan, "plugin")
+
+        plan = self._managed_plan_for(
+            env={"DISAGG_SERVER_CAPTURE": "auto"},
+            capture_module_probe=_installed_capture("plugin"),
+        )
+        self._assert_capture_flags(plan, "plugin")
+
+        with self.assertRaisesRegex(ValueError, "DISAGG_SERVER_CAPTURE must be"):
+            self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "sidecar"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "patch"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for("patch")
+
+    def test_producer_reads_the_exported_server_capture(self):
+        from specforge.training.disaggregated import _server_capture
+
+        auto = _managed_config("/fresh/attempt")
+        raw = auto.model_dump()
+        raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
+        explicit = Config.model_validate(raw)
+        # Legacy configs without deployment.disaggregated use the env contract.
+        legacy = _config()
+        self.assertIsNone(legacy.deployment.disaggregated)
+        for cfg, env, expected in (
+            # Unset: each adapter detects its server from /server_info.
+            (auto, {}, "auto"),
+            (legacy, {}, "auto"),
+            # A managed supervisor exports its resolution to the producer.
+            (auto, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+            (legacy, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+            (explicit, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+        ):
+            with (
+                self.subTest(env=env, expected=expected),
+                mock.patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(_server_capture(cfg), expected)
+
+    def test_managed_local_plugin_capture_renders_plugin_flags(self):
+        plan = self._managed_plan_for("plugin")
+
+        self.assertEqual(plan.server_capture, "plugin")
+        self.assertEqual(json.loads(plan.render())["server_capture"], "plugin")
+        capture = plan.services[1].command
+        argv = capture.argv
+        for flag in (
+            "--enable-spec-capture",
+            "--spec-capture-method",
+            "--spec-capture-aux-layer-ids",
+        ):
+            self.assertNotIn(flag, argv)
+        self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+        self.assertIn("--enable-return-aux-hidden-states", argv)
+        layers = argv.index("--return-aux-hidden-state-layer-ids")
+        self.assertEqual(argv[layers + 1 : layers + 6], ("1", "9", "17", "25", "33"))
+        self.assertEqual(argv[argv.index("--return-hidden-states-mode") + 1], "full")
+        self.assertEqual(argv[argv.index("--chunked-prefill-size") + 1], "-1")
+        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
+
+    def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
+        for backend, inherited, expected in (("plugin", "0", "1"),):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
+            ):
+                plan = self._managed_plan_for(backend)
+                popen = mock.Mock()
+                _spawn_command(plan.services[1].command, popen=popen)
+                child_env = popen.call_args.kwargs["env"]
+                self.assertEqual(child_env["SPECFORGE_SPEC_CAPTURE"], expected)
+                self.assertEqual(os.environ["SPECFORGE_SPEC_CAPTURE"], inherited)
 
     def test_managed_local_plan_owns_mooncake_and_multiple_capture_servers(self):
         servers = [
@@ -789,12 +1421,12 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(mooncake.readiness.kind, "mooncake")
         for index, service in enumerate(plan.services[1:]):
             argv = service.command.argv
-            self.assertIn("--enable-spec-capture", argv)
+            self.assertIn("--enable-return-aux-hidden-states", argv)
             self.assertIn("--disable-radix-cache", argv)
             self.assertEqual(argv[argv.index("--dtype") + 1], "float32")
             self.assertEqual(argv[argv.index("--download-dir") + 1], "/models/cache")
-            self.assertEqual(argv[argv.index("--spec-capture-method") + 1], "dflash")
-            layer_index = argv.index("--spec-capture-aux-layer-ids")
+            self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+            layer_index = argv.index("--return-aux-hidden-state-layer-ids")
             self.assertEqual(
                 argv[layer_index + 1 : layer_index + 6],
                 ("1", "9", "17", "25", "33"),
@@ -1048,6 +1680,18 @@ class LaunchPlanTest(unittest.TestCase):
                 server(env={"SGLANG_SPEC_CAPTURE_GPU_PUT": "1"}),
                 r"set from capture_servers\[\].gpu_put",
             ),
+            "plugin enable env": (
+                server(env={"SPECFORGE_SPEC_CAPTURE": "1"}),
+                "set from deployment.disaggregated.server_capture",
+            ),
+            "plugin capture flag": (
+                model(sglang_extra_args=["--enable-return-aux-hidden-states"]),
+                "--enable-return-aux-hidden-states; it is rendered from the algorithm",
+            ),
+            "legacy hidden-state flag": (
+                server(extra_args=["--enable-return-hidden-states"]),
+                "--enable-return-hidden-states",
+            ),
             "invalid env name": (
                 server(env={"NOT-A-NAME": "1"}),
                 "environment variable names",
@@ -1196,7 +1840,7 @@ class LaunchPlanTest(unittest.TestCase):
                             server["extra_args"] = [second]
                         Config.model_validate(raw)
 
-    def test_flag_tables_match_the_pinned_sglang_parser(self):
+    def test_flag_tables_match_the_installed_sglang_parser(self):
         import argparse
 
         from sglang.srt.server_args import ServerArgs
@@ -1241,7 +1885,7 @@ class LaunchPlanTest(unittest.TestCase):
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
             Path(__file__).resolve().parents[2]
-            / "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-multiserver-disaggregated.yaml"
+            / "examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml"
         )
         cfg = Config.from_file(str(path))
         with (
@@ -1307,13 +1951,18 @@ class LaunchPlanTest(unittest.TestCase):
                 )
             os.makedirs(os.path.join(control_dir, "logs"))
 
+            # Children reuse the supervisor's resolution instead of reprobing.
             producer = build_launch_plan(
                 cfg,
                 config_path="run.yaml",
                 requested_role="producer",
                 env=parent.commands[0].env,
+                rdma_device_resolver=_unexpected_rdma_devices,
             )
             self.assertEqual((producer.kind, producer.role), ("worker", "producer"))
+            self.assertEqual(
+                producer.worker_env["MOONCAKE_RDMA_DEVICES"], FAKE_RDMA_DEVICES
+            )
 
             consumer_env = {
                 **parent.commands[1].env,
@@ -1328,8 +1977,13 @@ class LaunchPlanTest(unittest.TestCase):
                 config_path="run.yaml",
                 requested_role="consumer",
                 env=consumer_env,
+                rdma_device_resolver=_unexpected_rdma_devices,
             )
             self.assertEqual((consumer.kind, consumer.role), ("worker", "consumer"))
+            self.assertEqual(consumer.worker_env["MOONCAKE_PROTOCOL"], "rdma")
+            self.assertEqual(
+                consumer.worker_env["MOONCAKE_RDMA_DEVICES"], FAKE_RDMA_DEVICES
+            )
 
             for role in ("producer", "consumer"):
                 with self.subTest(projected_role=role):
@@ -1557,6 +2211,76 @@ class LaunchPlanTest(unittest.TestCase):
             self.assertEqual(payload["kind"], "command")
             self.assertEqual(set(payload), {"kind", "role", "commands", "worker_env"})
             self.assertNotIn("--plan", payload["commands"][0]["argv"])
+
+    def test_cli_plan_warns_when_managed_rdma_devices_do_not_resolve(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "run.json")
+            raw = Config.model_validate(
+                _managed_raw(os.path.join(root, "attempt"))
+            ).model_dump(mode="json")
+            raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(raw, stream)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                # A host without HCAs, such as a laptop.
+                mock.patch(
+                    "specforge.launch_plan.resolve_rdma_devices",
+                    side_effect=functools.partial(
+                        mooncake_rdma.resolve_rdma_devices, root=root
+                    ),
+                ),
+                mock.patch(
+                    "specforge.training.capture_contract."
+                    "resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch("specforge.launch_plan.run_commands") as run,
+                mock.patch("builtins.print") as output,
+                mock.patch("click.echo") as warning,
+            ):
+                self.assertEqual(main(["train", "-c", path, "--plan"]), 0)
+        run.assert_not_called()
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload["kind"], "managed_supervisor")
+        error = payload["managed_rdma_error"]
+        self.assertIn("no usable RDMA device was found on this host", error)
+        warning.assert_called_once_with(f"warning: {error}", err=True)
+
+    def test_cli_plan_warns_when_auto_capture_does_not_resolve(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "run.json")
+            raw = Config.model_validate(
+                _managed_raw(os.path.join(root, "attempt"), protocol="tcp")
+            ).model_dump(mode="json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(raw, stream)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                # A host without the capture server's SGLang, such as a laptop.
+                mock.patch(
+                    "specforge.launch_plan._missing_capture_modules",
+                    side_effect=lambda command, modules: list(modules),
+                ),
+                mock.patch(
+                    "specforge.training.capture_contract."
+                    "resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch("specforge.launch_plan.run_commands") as run,
+                mock.patch("builtins.print") as output,
+                mock.patch("click.echo") as warning,
+            ):
+                self.assertEqual(main(["train", "-c", path, "--plan"]), 0)
+        run.assert_not_called()
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload["server_capture"], "auto")
+        error = payload["server_capture_error"]
+        self.assertIn("found no capture backend for capture-server-0", error)
+        warning.assert_called_once_with(
+            f"warning: {error}; the capture servers are shown without capture flags",
+            err=True,
+        )
 
     def test_cli_producer_projection_preserves_canonical_consumer_state(self):
         with tempfile.TemporaryDirectory() as root:
@@ -1836,7 +2560,10 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertIn((capture.pid, signal.SIGTERM), signals)
         self.assertIn((mooncake.pid, signal.SIGTERM), signals)
 
-    def test_managed_preflight_rejects_an_occupied_port_before_spawning(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_an_occupied_port_before_spawning(
+        self, _capture_modules
+    ):
         with tempfile.TemporaryDirectory() as parent:
             root = os.path.join(parent, "attempt")
             port = 30000
@@ -1865,6 +2592,455 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "is unavailable"),
             ):
                 run_commands(plan, popen=mock.Mock())
+
+    def test_managed_preflight_requires_the_selected_capture_backend(self):
+        cases = (
+            ("plugin", "specforge_sglang_capture", "specforge-sglang-capture plugin"),
+            ("plugin", "sglang.srt.managers.deferred_output", "deferred_output"),
+        )
+        for server_capture, missing, message in cases:
+            with (
+                self.subTest(server_capture=server_capture, missing=missing),
+                tempfile.TemporaryDirectory() as parent,
+            ):
+                plan = _managed_plan(os.path.join(parent, "attempt"))
+                plan = LaunchPlan(**{**plan.__dict__, "server_capture": server_capture})
+                with (
+                    mock.patch(
+                        "specforge.launch_plan.shutil.which",
+                        return_value="/usr/bin/mooncake_master",
+                    ),
+                    mock.patch(
+                        "specforge.launch_plan.importlib.util.find_spec",
+                        side_effect=lambda name: None if name == missing else object(),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, message),
+                ):
+                    run_commands(plan, popen=mock.Mock())
+
+    def test_managed_preflight_checks_the_capture_python_environment(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            python = root / "capture-python"
+            python.symlink_to(sys.executable)
+            packages = root / "packages"
+            for name in (
+                "mooncake/store",
+                "specforge_sglang_capture",
+                "sglang/srt/model_executor/forward_observer",
+                "sglang/srt/managers/deferred_output",
+            ):
+                package = packages / name
+                package.mkdir(parents=True, exist_ok=True)
+                (package / "__init__.py").touch()
+            (packages / "sglang" / "__init__.py").write_text(
+                "import os\n"
+                "assert os.environ['SPECFORGE_SPEC_CAPTURE'] == '0'\n"
+                "assert os.environ['CUDA_VISIBLE_DEVICES'] == ''\n"
+            )
+            deferred_output = packages / "sglang/srt/managers/deferred_output"
+            (deferred_output / "__init__.py").write_text(
+                "class ResponseCompletion:\n    pass\n"
+            )
+            plan = _managed_plan(str(root / "attempt"))
+            mooncake, capture = plan.services
+            capture = replace(
+                capture,
+                command=CommandSpec(
+                    capture.command.label,
+                    (str(python), "-m", "sglang.launch_server"),
+                    {
+                        "PYTHONPATH": str(packages),
+                        "SPECFORGE_SPEC_CAPTURE": "1",
+                        "CUDA_VISIBLE_DEVICES": "0",
+                    },
+                ),
+            )
+            plan = replace(
+                plan,
+                services=(mooncake, capture),
+                managed_ports=(),
+                server_capture="plugin",
+            )
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which", return_value="mooncake_master"
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "specforge.launch_plan._module_available",
+                    side_effect=AssertionError("must inspect the capture interpreter"),
+                ),
+            ):
+                _managed_preflight(plan)
+                # The earlier deferred-output revision lacks the completion API.
+                (deferred_output / "__init__.py").write_text(
+                    "class DeferredOutputSource:\n    pass\n"
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "capture-python.*deferred_output:ResponseCompletion"
+                ):
+                    _managed_preflight(plan)
+                shutil.rmtree(deferred_output)
+                with self.assertRaisesRegex(
+                    RuntimeError, "capture-python.*deferred_output"
+                ):
+                    _managed_preflight(plan)
+                python.unlink()
+                with self.assertRaisesRegex(RuntimeError, "python_executable"):
+                    _managed_preflight(plan)
+
+    def _rdma_plan(self, root, *, server_env=None, memlock_bytes=None, protocol="rdma"):
+        plan = _managed_plan(root)
+        mooncake, capture = plan.services
+        env = {
+            "MOONCAKE_PROTOCOL": protocol,
+            "MOONCAKE_RDMA_DEVICES": "mlx5_0",
+            **(server_env or {}),
+        }
+        capture = ServiceSpec(
+            CommandSpec(capture.command.label, capture.command.argv, env),
+            capture.readiness,
+            capture.log_path,
+            capture.phase,
+        )
+        return LaunchPlan(
+            **{
+                **plan.__dict__,
+                "services": (mooncake, capture),
+                "managed_rdma_memlock_bytes": memlock_bytes,
+            }
+        )
+
+    def _run_preflight(self, plan):
+        popen = mock.Mock()
+        with (
+            mock.patch(
+                "specforge.launch_plan.shutil.which",
+                return_value="/usr/bin/mooncake_master",
+            ),
+            mock.patch(
+                "specforge.launch_plan.importlib.util.find_spec",
+                return_value=object(),
+            ),
+        ):
+            try:
+                run_commands(plan, popen=popen)
+            finally:
+                popen.assert_not_called()
+
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_mooncake_tcp_overrides(self, _capture_modules):
+        with (
+            tempfile.TemporaryDirectory() as parent,
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=parent
+                ),
+            ),
+        ):
+            FakeHost(parent).add("mlx5_0")
+            root = os.path.join(parent, "attempt")
+            with mock.patch.dict(os.environ, {"MC_FORCE_TCP": "1"}, clear=True):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"Mooncake RDMA is selected, but the capture-server-0 "
+                    r"environment sets MC_FORCE_TCP='1' \(installs the TCP "
+                    r"transport\)\. Unset it, or, to use TCP, set "
+                    r"managed_local\.mooncake\.protocol: tcp\.",
+                ):
+                    self._run_preflight(self._rdma_plan(root))
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "MC_USE_TENT='1'"):
+                    self._run_preflight(
+                        self._rdma_plan(root, server_env={"MC_USE_TENT": "1"})
+                    )
+            for environ, plan in (
+                ({"MC_MS_AUTO_DISC": "0"}, self._rdma_plan(root)),
+                ({"MC_TE_FILTERS": "mlx5_0,mlx5_1"}, self._rdma_plan(root)),
+                # TCP stacks ignore every RDMA switch.
+                (
+                    {"MC_FORCE_TCP": "1", "MC_TE_FILTERS": "mlx5_9"},
+                    self._rdma_plan(root, protocol="tcp"),
+                ),
+                ({"MC_FORCE_TCP": "1"}, _managed_plan(root)),
+            ):
+                with (
+                    self.subTest(environ=environ),
+                    mock.patch.dict(os.environ, environ, clear=True),
+                ):
+                    _managed_rdma_preflight(plan)
+            with mock.patch.dict(os.environ, {"MC_MS_AUTO_DISC": "1"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "MC_MS_AUTO_DISC='1'"):
+                    _managed_rdma_preflight(self._rdma_plan(root))
+            # A server's own whitelist would silently shrink the rendered list.
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"capture-server-0 environment sets MC_TE_FILTERS='mlx5_1' "
+                    r"\(Mooncake skips mlx5_0 of the RDMA device list without a "
+                    r"warning\)",
+                ):
+                    _managed_rdma_preflight(
+                        self._rdma_plan(root, server_env={"MC_TE_FILTERS": "mlx5_1"})
+                    )
+
+    def test_managed_preflight_reprobes_final_capture_environment(self):
+        with (
+            tempfile.TemporaryDirectory() as root,
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=root
+                ),
+            ),
+            mock.patch("specforge.launch_plan.memlock_shortfall", return_value=None),
+        ):
+            host = FakeHost(root)
+            host.add(
+                "mlx5_0",
+                other_ports=[("2", "1: DOWN"), ("3", "4: ACTIVE")],
+                gids=[("IB/RoCE v1", "eth0", "0000:0000:0000:0001")],
+            )
+            for server_env, error in (
+                ({"MC_IB_PORT": "2"}, "port 2 is not ACTIVE"),
+                ({"MC_GID_INDEX": "1"}, "no GID at index 1"),
+                ({"NCCL_IB_GID_INDEX": "1"}, "no GID at index 1"),
+                ({"MC_IB_PORT": "3"}, None),
+                ({"MC_GID_INDEX": "0"}, None),
+            ):
+                with self.subTest(server_env=server_env):
+                    raw = _managed_raw(protocol="rdma", rdma_devices="mlx5_0")
+                    raw["deployment"]["disaggregated"]["managed_local"][
+                        "capture_servers"
+                    ][0]["env"] = server_env
+                    plan = _build_managed(raw)
+                    self.assertIsNone(plan.managed_rdma_error)
+                    if error is None:
+                        _managed_rdma_preflight(plan)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, error) as raised:
+                            _managed_rdma_preflight(plan)
+                        self.assertIn("capture-server-0", str(raised.exception))
+
+            # Match _spawn_command: a child override wins, and None removes an
+            # inherited switch instead of passing it to the resolver.
+            with mock.patch.dict(os.environ, {"MC_IB_PORT": "2"}):
+                for value in ("3", None):
+                    with self.subTest(port_override=value):
+                        _managed_rdma_preflight(
+                            self._rdma_plan(root, server_env={"MC_IB_PORT": value})
+                        )
+                with self.assertRaisesRegex(RuntimeError, "port 2 is not ACTIVE"):
+                    _managed_rdma_preflight(self._rdma_plan(root))
+
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_requires_memlock_for_rdma_registration(
+        self, _capture_modules
+    ):
+        with (
+            tempfile.TemporaryDirectory() as parent,
+            mock.patch(
+                "specforge.launch_plan.resolve_rdma_devices",
+                side_effect=functools.partial(
+                    mooncake_rdma.resolve_rdma_devices, root=parent
+                ),
+            ),
+        ):
+            FakeHost(parent).add("mlx5_0")
+            host = os.path.join(parent, "host")
+            os.makedirs(os.path.join(host, "proc", "self"))
+            with open(
+                os.path.join(host, "proc", "self", "status"), "w", encoding="utf-8"
+            ) as status:
+                status.write("CapEff:\t0000000000000000\n")
+            shortfall = mock.patch(
+                "specforge.launch_plan.memlock_shortfall",
+                side_effect=functools.partial(
+                    mooncake_rdma.memlock_shortfall, root=host
+                ),
+            )
+            plan = self._rdma_plan(
+                os.path.join(parent, "attempt"), memlock_bytes=1 << 30
+            )
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                shortfall,
+                mock.patch.object(
+                    mooncake_rdma.resource, "getrlimit", return_value=(65536, 65536)
+                ),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    self._run_preflight(plan)
+            self.assertEqual(
+                str(raised.exception),
+                "managed_local Mooncake RDMA registers up to 1073741824 bytes "
+                "(1.0 GiB) of host memory in one process (every host buffer once "
+                "per selected HCA), but RLIMIT_MEMLOCK is 65536 bytes and this "
+                "process lacks CAP_IPC_LOCK; owned processes inherit both. Raise "
+                "the limit before launching (ulimit -l unlimited; in a container "
+                "--ulimit memlock=-1 or --cap-add IPC_LOCK), or, to use TCP, set "
+                "managed_local.mooncake.protocol: tcp.",
+            )
+            unlimited = mooncake_rdma.resource.RLIM_INFINITY
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                shortfall,
+                mock.patch.object(
+                    mooncake_rdma.resource,
+                    "getrlimit",
+                    return_value=(unlimited, unlimited),
+                ),
+            ):
+                _managed_rdma_preflight(plan)
+            with mock.patch.object(mooncake_rdma.resource, "getrlimit") as getrlimit:
+                _managed_rdma_preflight(_managed_plan(os.path.join(parent, "tcp")))
+            getrlimit.assert_not_called()
+
+    def test_managed_plan_defers_the_trainer_liger_import_check(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["model"]["use_liger_kernel"] = False
+            disabled = Config.model_validate(raw)
+            with (
+                mock.patch(
+                    "specforge.training.capture_contract.resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config"
+                ) as resolve_draft_config,
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
+                ) as load_liger,
+            ):
+                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+                disabled_plan = build_launch_plan(
+                    disabled, config_path="run.yaml", env={}
+                )
+                # Planning only records the check; the preflight runs it.
+                resolve_draft_config.assert_not_called()
+                self.assertEqual(1, len(plan.preflight_checks))
+                self.assertEqual(1, len(disabled_plan.preflight_checks))
+                # An explicit false never resolves the draft or imports Liger.
+                disabled_plan.preflight_checks[0]()
+            resolve_draft_config.assert_not_called()
+            load_liger.assert_not_called()
+
+            draft_config = mock.Mock(hidden_act="silu")
+            with (
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config",
+                    return_value=draft_config,
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    return_value="rocm",
+                ),
+                mock.patch.dict(
+                    sys.modules,
+                    {"liger_kernel": None, "liger_kernel.transformers": None},
+                ),
+                self.assertRaisesRegex(
+                    ImportError,
+                    r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
+                    r'not be imported.*pip install --no-deps "liger-kernel>=',
+                ),
+            ):
+                plan.preflight_checks[0]()
+
+            draft_config.hidden_act = "gelu"
+            with (
+                mock.patch(
+                    "specforge.training.model_loading.resolve_draft_config",
+                    return_value=draft_config,
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                    return_value="cuda",
+                ),
+                mock.patch(
+                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
+                ) as load_liger,
+            ):
+                plan.preflight_checks[0]()
+            load_liger.assert_not_called()
+
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_runs_trainer_checks_before_spawning(
+        self, _capture_modules
+    ):
+        with tempfile.TemporaryDirectory() as parent:
+            root = os.path.join(parent, "attempt")
+            check = mock.Mock(side_effect=ImportError("liger missing"))
+            plan = LaunchPlan(
+                **{
+                    **_managed_plan(root).__dict__,
+                    "managed_ports": (),
+                    "preflight_checks": (check,),
+                }
+            )
+            popen = mock.Mock()
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which",
+                    return_value="/usr/bin/mooncake_master",
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                self.assertRaisesRegex(ImportError, "liger missing"),
+            ):
+                run_commands(plan, popen=popen)
+            check.assert_called_once_with()
+            popen.assert_not_called()
+            self.assertFalse(os.path.exists(root))
+
+    def test_supervisor_runs_trainer_checks_before_spawning_either_role(self):
+        plan = build_launch_plan(
+            _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
+        )
+        self.assertEqual("supervisor", plan.kind)
+        self.assertEqual(1, len(plan.preflight_checks))
+
+        draft_config = mock.Mock(hidden_act="silu")
+        popen = mock.Mock()
+        with (
+            mock.patch(
+                "specforge.training.model_loading.resolve_draft_config",
+                return_value=draft_config,
+            ),
+            mock.patch(
+                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                return_value="cuda",
+            ),
+            mock.patch.dict(
+                sys.modules,
+                {"liger_kernel": None, "liger_kernel.transformers": None},
+            ),
+            self.assertRaisesRegex(
+                ImportError,
+                r"resolved to true \(auto: DFlash on CUDA\) but Liger could not "
+                r'be imported.*Install it \(pip install "liger-kernel>=',
+            ),
+        ):
+            run_commands(plan, popen=popen)
+        popen.assert_not_called()
+
+        # A plan built without a registration has nothing to check.
+        self.assertEqual(
+            (),
+            _build_launch_plan(
+                _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
+            ).preflight_checks,
+        )
 
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(

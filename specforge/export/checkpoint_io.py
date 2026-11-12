@@ -141,6 +141,20 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
     )
 
 
+def checkpoint_dtype(state_dict: Dict[str, Any]) -> Optional[torch.dtype]:
+    """The single floating-point dtype the checkpoint's draft weights share.
+
+    Returns ``None`` when the checkpoint holds no floating-point tensor or mixes
+    dtypes, in which case callers keep their own default.
+    """
+    dtypes = {
+        value.dtype
+        for value in state_dict.values()
+        if torch.is_tensor(value) and value.is_floating_point()
+    }
+    return dtypes.pop() if len(dtypes) == 1 else None
+
+
 def materialize_draft(
     state: Dict[str, Any],
     draft_config_path: str,
@@ -149,16 +163,20 @@ def materialize_draft(
 ):
     """Build the draft model and load the checkpoint's draft weights into it.
 
-    Validates the state dict against the architecture: unexpected keys fail, and
-    the only tolerated missing keys are the embeddings (excluded from draft
-    checkpoints by design — serving loads them from the target). Legacy
-    ``t2d``/``d2t`` buffers are tolerated only when ``vocab_mapping_path`` is
-    supplied to restore them.
+    The module is materialized in the checkpoint's floating-point dtype, so its
+    parameters and the ``dtype`` that ``save_pretrained`` stamps into the
+    exported config both carry the trained precision; a checkpoint that mixes
+    dtypes falls back to BF16. Validates the state dict against the
+    architecture: unexpected keys fail, and the only tolerated missing keys are
+    the embeddings (excluded from draft checkpoints by design — serving loads
+    them from the target). Legacy ``t2d``/``d2t`` buffers are tolerated only
+    when ``vocab_mapping_path`` is supplied to restore them.
     """
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
-    model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
+    torch_dtype = checkpoint_dtype(state["draft_state_dict"]) or torch.bfloat16
+    model = AutoDraftModel.from_config(draft_config, torch_dtype=torch_dtype)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:
         raise ValueError(
@@ -183,6 +201,7 @@ def materialize_draft(
 
 __all__ = [
     "apply_legacy_rope_scaling",
+    "checkpoint_dtype",
     "resolve_training_state",
     "materialize_draft",
     "STATE_FILE",

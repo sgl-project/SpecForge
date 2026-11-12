@@ -370,6 +370,7 @@ def _build_dflash_family_model(
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
+        "objective_checkpointing": cfg.training.objective_checkpointing,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
@@ -403,6 +404,7 @@ def build_dflash_model(
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,
             teacher_metrics=cfg.training.dflash_teacher_metrics,
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
@@ -423,6 +425,7 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
+            fused_logits_loss=cfg.training.fused_logits_loss,
         ),
     )
 
@@ -444,7 +447,27 @@ def build_dspark_model(
             **common,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
+            fused_logits_loss=cfg.training.fused_logits_loss,
             dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+        ),
+    )
+
+
+def build_dspine_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.dspine.model import OnlineDSpineModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineDSpineModel(
+            **common, fused_logits_loss=cfg.training.fused_logits_loss
         ),
     )
 
@@ -532,6 +555,7 @@ __all__ = [
     "build_dflash_model",
     "build_domino_model",
     "build_dspark_model",
+    "build_dspine_model",
     "build_eagle3_draft",
     "build_eagle3_model",
     "build_peagle_draft",

@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from specforge.runtime.contracts import consumer_dispatch_quantum
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -40,9 +42,11 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--skip-tokenizer-init": "the capture launcher",
     "--tp-size": "capture_servers[].tp_size",
     "--chunked-prefill-size": "the capture launcher (complete prefills)",
-    "--enable-spec-capture": "the capture launcher",
-    "--spec-capture-method": "the algorithm's capture contract",
-    "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
+    "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
+    "--enable-return-aux-hidden-states": "the algorithm's capture contract",
+    "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
+    "--return-hidden-states-mode": "the capture launcher (full prefill capture)",
+    "--enable-return-hidden-states": "the capture launcher (full prefill capture)",
     "--host": "the capture launcher (loopback)",
     "--port": "capture_servers[].port",
     "--context-length": "model.sglang_context_length",
@@ -60,7 +64,7 @@ _SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
     ),
     "--config": "SGLang merges that file unchecked; list its flags instead",
 }
-#: SGLang v0.5.18 spellings that write the same option, checked against its
+#: Pinned SGLang CLI spellings that write the same option, checked against its
 #: parser in tests. Positive/negative boolean flags belong to one group too:
 #: they conflict under the no-overrides rule, but their argv is never rewritten.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
@@ -81,33 +85,26 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
     "--lora-strict-loading": ("--no-lora-strict-loading",),
     "--dllm-fdfo": ("--no-dllm-fdfo",),
-    "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
-    "--stream-output": ("--incremental-streaming-output",),
-    "--cuda-graph-bs-decode": ("--cuda-graph-bs",),
-    "--cuda-graph-max-bs-decode": ("--cuda-graph-max-bs",),
-    "--cuda-graph-bs-prefill": ("--piecewise-cuda-graph-tokens",),
-    "--cuda-graph-max-bs-prefill": ("--piecewise-cuda-graph-max-tokens",),
-    "--cuda-graph-backend-prefill": (
-        "--enable-breakable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
-        "--enforce-piecewise-cuda-graph",
+    "--enable-tf32-matmul": ("--no-enable-tf32-matmul",),
+    "--attn-dp-size": ("--attention-data-parallel-size",),
+    "--cuda-graph-prefill-max-context": ("--context-bucket",),
+    "--enable-fused-qk-norm-rope": ("--no-enable-fused-qk-norm-rope",),
+    "--speculative-enable-w4a4-mxfp4-megamoe": (
+        "--no-speculative-enable-w4a4-mxfp4-megamoe",
     ),
-    "--cuda-graph-tc-compiler": ("--piecewise-cuda-graph-compiler",),
-    "--dsa-prefill-cp-mode": ("--nsa-prefill-cp-mode",),
-    "--dsa-prefill-backend": ("--nsa-prefill-backend",),
-    "--dsa-decode-backend": ("--nsa-decode-backend",),
-    "--enable-dsa-prefill-context-parallel": ("--enable-nsa-prefill-context-parallel",),
-    "--enable-linear-replayssm-spec": ("--enable-gdn-replayssm-spec",),
-    "--speculative-draft-window-size": ("--speculative-dflash-draft-window-size",),
+    "--enable-hierarchical-cache": ("--enable-hicache",),
+    "--mm-enable-dp-encoder": ("--no-mm-enable-dp-encoder",),
+    "--ple-offload-embedding": ("--no-ple-offload-embedding",),
+    "--enable-decoder-swa-bounded-replay": ("--no-enable-decoder-swa-bounded-replay",),
+    "--enable-megamoe-for-layernorm-sp": ("--no-enable-megamoe-for-layernorm-sp",),
+    "--enable-dsa-fused-indexer": ("--no-enable-dsa-fused-indexer",),
 }
-#: Complete SGLang v0.5.18 options that are also prefixes of other options.
+#: Complete pinned SGLang CLI options that are also prefixes of other options.
 #: argparse matches these exactly instead of expanding them. Keep this small
-#: table in sync with the pinned parser (covered by the launch-plan tests),
+#: table in sync with the installed parser (covered by the launch-plan tests),
 #: without importing SGLang/PyTorch during configuration validation.
 _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
     {
-        "--cuda-graph-bs",
-        "--cuda-graph-max-bs",
         "--disable-cuda-graph",
         "--dllm-algorithm",
         "--enable-dp-attention",
@@ -122,7 +119,9 @@ _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
         "--log-level",
         "--log-requests",
         "--model",
+        "--prefill-decode-interval",
         "--quantization",
+        "--radix-eviction-policy",
         "--sidecar",
         "--speculative-adaptive",
         "--speculative-draft-model",
@@ -150,6 +149,8 @@ _OWNED_SERVER_ENV = {
     "HIP_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ROCR_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "SGLANG_SPEC_CAPTURE_GPU_PUT": "capture_servers[].gpu_put",
+    "SPECFORGE_SPEC_CAPTURE": "deployment.disaggregated.server_capture",
+    "SGLANG_SPEC_CAPTURE_ARENA_BYTES": "mooncake.arena_bytes",
     "FLASHINFER_DISABLE_VERSION_CHECK": "the capture launcher",
 }
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -286,8 +287,12 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Enable Liger Qwen3 RMSNorm/SwiGLU kernels for DFlash. Requires ``specforge[liger]``.
-    use_liger_kernel: bool = False
+    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
+    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
+    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
+    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
+    #: that cannot be imported are an error in both the auto and explicit cases.
+    use_liger_kernel: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -418,8 +423,8 @@ class DataConfig(StrictConfigModel):
     is_preformatted: bool = False
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
-    #: Ordered background feature-loader workers. ``None`` preserves the
-    #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
+    #: Ordered background feature-loader workers. ``None`` uses the shared
+    #: default (4) for canonical runs, or the provider default for legacy runs.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -467,10 +472,35 @@ class ProfilingConfig(StrictConfigModel):
     record_shapes: bool = False
 
 
+def resolve_ref_watermarks(high: int, low: Optional[int]) -> tuple[int, Optional[int]]:
+    """Apply producer environment overrides before validating ref watermarks."""
+    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+    high = int(high_override) if high_override is not None else high
+    # The legacy high-only override resumes at the same threshold.
+    low = (
+        int(low_override)
+        if low_override is not None
+        else (None if high_override is not None else low)
+    )
+    resolved_low = high if low is None else low
+    if high < 1 or not 0 <= resolved_low <= high:
+        raise ValueError(
+            "effective ref watermarks require high >= 1 and 0 <= low <= high"
+        )
+    return high, low
+
+
 class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    consumer_dispatch: Literal[
+        "round_robin",
+        "cost_balanced",
+        "two_window_bucketed",
+        "two_window_joint_balanced",
+    ] = "round_robin"
     producer_concurrency: int = Field(default=1, gt=0)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
@@ -481,11 +511,9 @@ class RuntimeConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
-        if self.in_flight_low_watermark > self.in_flight_high_watermark:
-            raise ValueError(
-                "runtime.in_flight_low_watermark must be <= "
-                "runtime.in_flight_high_watermark"
-            )
+        resolve_ref_watermarks(
+            self.in_flight_high_watermark, self.in_flight_low_watermark
+        )
         if (
             self.resident_high_watermark_bytes is None
             and self.resident_low_watermark_bytes is not None
@@ -541,6 +569,23 @@ class TrainerDeploymentConfig(StrictConfigModel):
         return self
 
 
+def validate_receive_buffers(receive_buffers: str, protocol: str) -> None:
+    """Device receive buffers need a transport that writes device memory.
+
+    NVLink reads only into device memory, so it also requires them.
+    """
+    if receive_buffers == "cuda" and protocol not in ("rdma", "nvlink"):
+        raise ValueError(
+            "deployment.disaggregated.receive_buffers=cuda needs an RDMA or NVLink "
+            f"Mooncake transport; the effective MOONCAKE_PROTOCOL is {protocol!r}"
+        )
+    if protocol == "nvlink" and receive_buffers != "cuda":
+        raise ValueError(
+            "MOONCAKE_PROTOCOL=nvlink reads into device memory; set "
+            "deployment.disaggregated.receive_buffers=cuda"
+        )
+
+
 def _validate_cuda_devices(devices: List[str], *, field_name: str) -> None:
     for device in devices:
         if not device or device.strip() != device or "," in device:
@@ -559,9 +604,18 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: Transport for every owned Mooncake client. None is resolved once when
+    #: the launch plan is built: tcp on Ascend hosts and rdma everywhere else;
+    #: the launch fails when no usable HCA is found. tcp opts out of RDMA.
+    protocol: Optional[Literal["tcp", "rdma", "nvlink"]] = None
+    #: nvlink keeps captures in server GPU arenas; see arena_bytes.
+    #: Comma-separated HCAs for rdma. None selects every usable HCA of one link
+    #: layer; a listed device that is not usable is an error.
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
+    #: Arena size: HBM each capture server reserves for capture objects.
+    #: Required with ``nvlink``. Leave room for it below ``mem_fraction_static``.
+    arena_bytes: Optional[int] = Field(default=None, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)
     startup_timeout_s: float = Field(default=60.0, gt=0)
     #: Budget for one readiness probe, capped by the remaining startup timeout.
@@ -578,6 +632,13 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
         ports = (self.rpc_port, self.metadata_port, self.metrics_port)
         if len(set(ports)) != len(ports):
             raise ValueError("managed_local Mooncake ports must be unique")
+        # Currently only online NVLink capture uses the arena.
+        if (self.protocol == "nvlink") != (self.arena_bytes is not None):
+            raise ValueError(
+                "managed_local.mooncake.arena_bytes is required with protocol "
+                "'nvlink', the only protocol that uses the arena, and applies "
+                "only to it"
+            )
         if (
             not self.local_hostname
             or self.local_hostname.strip() != self.local_hostname
@@ -590,7 +651,7 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor.
+    """One SGLang capture server owned by the local supervisor.
 
     ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
     them to the accelerator's visibility env var.
@@ -598,13 +659,17 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
 
     port: int = Field(gt=0, le=65535)
     cuda_visible_devices: List[str] = Field(min_length=1)
+    #: Python from a separate SGLang environment; None uses the trainer's Python.
+    python_executable: Optional[str] = Field(default=None, min_length=1)
     tp_size: int = Field(default=1, gt=0)
     #: Optional server-specific override. When omitted, inherit the canonical
     #: model.sglang_mem_fraction_static setting instead of silently shadowing it.
     mem_fraction_static: Optional[float] = Field(default=None, gt=0.0, le=1.0)
     attention_backend: Optional[str] = None
     startup_timeout_s: float = Field(default=1800.0, gt=0)
-    #: None selects CUDA publication on RDMA in the capture worker.
+    #: None selects CUDA publication in the capture worker when
+    #: mooncake.protocol is rdma explicitly, and host publication when the
+    #: protocol is left unset (CUDA publication also needs GPUDirect RDMA).
     gpu_put: Optional[bool] = None
     #: SGLang's generation-based /health waits at least one second internally.
     probe_timeout_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
@@ -612,7 +677,7 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     #: ``model.sglang_extra_args``.
     extra_args: List[str] = Field(default_factory=list)
     #: Extra environment for this server process, such as the capture
-    #: patch's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
+    #: plugin's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
     #: (Mooncake, transport and device visibility) are rejected.
     env: Dict[str, str] = Field(default_factory=dict)
 
@@ -708,13 +773,22 @@ class ManagedLocalStackConfig(StrictConfigModel):
         capture_ports = [server.port for server in self.capture_servers]
         if len(set(capture_ports)) != len(capture_ports):
             raise ValueError("managed_local capture server ports must be unique")
+        # An unset protocol can still resolve to tcp; the launch plan repeats
+        # this check after resolving it.
         if any(server.gpu_put for server in self.capture_servers) and (
-            self.mooncake.protocol != "rdma"
+            self.mooncake.protocol == "tcp"
         ):
             raise ValueError(
                 "managed_local capture_servers[].gpu_put needs mooncake.protocol "
-                f"'rdma'; the {self.mooncake.protocol!r} transport cannot read "
-                "device memory"
+                f"'rdma' or 'nvlink'; the {self.mooncake.protocol!r} transport "
+                "cannot read device memory"
+            )
+        if self.mooncake.protocol == "nvlink" and any(
+            server.gpu_put is False for server in self.capture_servers
+        ):
+            raise ValueError(
+                "managed_local mooncake.protocol 'nvlink' publishes device "
+                "memory; capture_servers[].gpu_put cannot be false"
             )
         overlap = mooncake_ports.intersection(capture_ports)
         if overlap:
@@ -760,6 +834,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
+    #: SGLang capture uses the
+    #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
+    #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
+    #: ``auto`` takes ``DISAGG_SERVER_CAPTURE`` when set, else detects the
+    #: backend: managed_local probes each capture server's interpreter while
+    #: planning; the producer reads an external server's ``/server_info``.
+    server_capture: Literal["auto", "plugin"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -801,15 +882,12 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     def _validate_store(self):
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
-        if self.receive_buffers == "cuda" and self.managed_local is not None:
+        if self.managed_local is not None:
             # External deployments resolve environment overrides in the launch
-            # plan. Managed-local transport is authoritative over the environment.
-            if self.managed_local.mooncake.protocol != "rdma":
-                raise ValueError(
-                    "deployment.disaggregated.receive_buffers=cuda needs an RDMA "
-                    "Mooncake transport (mooncake_protocol or "
-                    "managed_local.mooncake.protocol = rdma); the TCP transport "
-                    "cannot write into device memory"
+            # plan. An unset managed protocol is checked after resolution.
+            if self.managed_local.mooncake.protocol is not None:
+                validate_receive_buffers(
+                    self.receive_buffers, self.managed_local.mooncake.protocol
                 )
         if self.consumer_state_dir is not None and (
             not self.consumer_state_dir
@@ -892,7 +970,39 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class WeightsFromConfig(StrictConfigModel):
+    checkpoint: str
+    mapping: Optional[dict] = None
+    allow_new: List[str] = Field(default_factory=list)
+
+
+class InitializationConfig(StrictConfigModel):
+    checkpoint: Optional[str] = None
+    weights_from: Optional[WeightsFromConfig] = None
+    from_target: Optional[dict] = None
+    adapter: Optional[str] = None
+    legacy_config: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exclusive_sources(self):
+        if self.checkpoint and (self.weights_from or self.from_target):
+            raise ValueError(
+                "initialization.checkpoint excludes weights_from/from_target"
+            )
+        if self.adapter and not self.checkpoint:
+            raise ValueError("adapter requires initialization.checkpoint")
+        if self.legacy_config and not (self.checkpoint or self.weights_from):
+            raise ValueError("legacy_config requires a checkpoint source")
+        return self
+
+
 class TrainingConfig(StrictConfigModel):
+    objective: Optional[str] = None
+    objective_options: dict = Field(default_factory=dict)
+    loss: dict = Field(default_factory=dict)
+    weighting: Optional[dict] = None
+    frozen: List[str] = Field(default_factory=list)
+
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
@@ -900,6 +1010,9 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
+    #: Joint logits loss; independent of objective checkpointing.
+    fused_logits_loss: bool = True
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -948,8 +1061,10 @@ class TrainingConfig(StrictConfigModel):
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
     loss_decay_gamma: Optional[float] = None
-    #: Anchor blocks per objective slice (0 = materialize all objective logits).
+    #: Anchor blocks per objective slice; 0 treats the whole objective as one chunk.
     objective_chunk_blocks: int = Field(default=128, ge=0)
+    #: Recompute each objective chunk during backward, independently of its backend.
+    objective_checkpointing: bool = True
     loss_type: Literal[
         "dflash",
         "dpace",
@@ -1127,6 +1242,9 @@ def migrate_legacy_config(values: dict) -> dict:
 
 
 class Config(StrictConfigModel):
+    draft: Optional[dict | str] = None
+    initialization: Optional[InitializationConfig] = None
+    resume: Optional[str] = None
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
@@ -1151,12 +1269,72 @@ class Config(StrictConfigModel):
         raw["training"] = training
         return raw
 
+    @property
+    def resume_path(self) -> Optional[str]:
+        return self.resume or self.training.resume_from
+
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        if self.resume:
+            if self.training.resume_from and self.training.resume_from != self.resume:
+                raise ValueError("resume and training.resume_from disagree")
+        canonical = (
+            self.draft is not None
+            or self.initialization is not None
+            or self.resume is not None
+        )
+        if canonical:
+            if self.model.draft_model_config or self.model.draft_checkpoint_path:
+                raise ValueError(
+                    "draft/initialization/resume cannot mix with legacy model.draft_* sources"
+                )
+            if self.initialization is not None and self.resume_path:
+                raise ValueError("initialization and resume are mutually exclusive")
+            if self.draft is None and not (
+                self.resume
+                or self.resume_path
+                or (self.initialization and self.initialization.checkpoint)
+            ):
+                raise ValueError(
+                    "scratch/weights_from/from_target requires draft structure"
+                )
+        elif not self.resume_path and (
+            self.training.objective
+            or self.training.objective_options
+            or self.training.frozen
+            or self.training.loss
+            or self.training.weighting is not None
+        ):
+            raise ValueError(
+                "objective/options/frozen/loss/weighting require the canonical draft loading path"
+            )
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.runtime.consumer_dispatch in (
+            "two_window_bucketed",
+            "two_window_joint_balanced",
+        ):
+            dispatch = self.runtime.consumer_dispatch
+            window = (
+                self.deployment.trainer.nnodes
+                * self.deployment.trainer.nproc_per_node
+                * self.training.batch_size
+                * self.training.accumulation_steps
+            )
+            required = consumer_dispatch_quantum(dispatch, window)
+            high, low = resolve_ref_watermarks(
+                self.runtime.in_flight_high_watermark,
+                self.runtime.in_flight_low_watermark,
+            )
+            for level, value in (("high", high), ("low", high if low is None else low)):
+                if value < required:
+                    raise ValueError(
+                        f"{dispatch} requires a {level} watermark of at least two "
+                        f"global batches (dispatch quantum {required})"
+                    )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
@@ -1181,7 +1359,7 @@ class Config(StrictConfigModel):
 
         if (
             self.model.draft_checkpoint_path is not None
-            and self.training.resume_from is not None
+            and self.resume_path is not None
         ):
             raise ValueError(
                 "model.draft_checkpoint_path (weights-only warm start) and "
@@ -1278,8 +1456,18 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "managed_local requires the persisted training role to be auto"
                 )
-            if self.training.resume_from is not None:
+            if self.resume_path is not None:
                 raise ValueError("managed_local does not support resume")
+            mooncake = managed_local.mooncake
+            if mooncake.protocol == "nvlink":
+                arenas = mooncake.arena_bytes * len(managed_local.capture_servers)
+                watermark = self.runtime.resident_high_watermark_bytes
+                if watermark is None or watermark > arenas:
+                    raise ValueError(
+                        f"NVLink capture keeps objects in {arenas} bytes of "
+                        "capture-server HBM (arena_bytes per server); set "
+                        "runtime.resident_high_watermark_bytes no higher"
+                    )
             minimum_context_length = (
                 self.data.max_length + SGLANG_CAPTURE_CONTEXT_HEADROOM
             )
@@ -1345,7 +1533,7 @@ class Config(StrictConfigModel):
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
                 )
-        if self.training.role == "producer" and self.training.resume_from is not None:
+        if self.training.role == "producer" and self.resume_path is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":
             if mode != "offline":
@@ -1406,24 +1594,36 @@ class Config(StrictConfigModel):
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
-    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+    """Apply dotted ``section.field=value`` overrides, re-validating the result.
+
+    Only the file's own fields and the overridden ones count as set afterwards.
+    Keys under an untyped mapping (``training.objective_options`` and the like)
+    may be new, and their values are parsed as YAML.
+    """
+    import yaml
+
+    raw = config.model_dump(exclude_unset=True)
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
-        node = raw
         keys = path.split(".")
+        owner, node = config, raw
         for key in keys[:-1]:
-            if not isinstance(node.get(key), dict):
+            owner = _override_field(owner, key, path)
+            if not isinstance(owner, (BaseModel, dict)):
                 raise ValueError(f"override path {path!r} does not exist")
+            if not isinstance(node.get(key), dict):
+                node[key] = (
+                    owner.model_dump(exclude_unset=True)
+                    if isinstance(owner, BaseModel)
+                    else dict(owner)
+                )
             node = node[key]
-        if keys[-1] not in node:
-            raise ValueError(f"override path {path!r} does not exist")
-        current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
-            import yaml
-
+        current = _override_field(owner, keys[-1], path)
+        untyped = isinstance(owner, dict)
+        structured = isinstance(current, (dict, list)) or current is None
+        if untyped or (structured and value.lstrip().startswith(("[", "{"))):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:
@@ -1432,6 +1632,14 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
     return Config.model_validate(raw)
+
+
+def _override_field(owner, key, path):
+    if isinstance(owner, BaseModel):
+        if key not in type(owner).model_fields:
+            raise ValueError(f"override path {path!r} does not exist")
+        return getattr(owner, key)
+    return owner.get(key)
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:

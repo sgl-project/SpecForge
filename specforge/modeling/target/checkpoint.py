@@ -12,7 +12,7 @@ from __future__ import annotations
 import glob
 import json
 import os
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from safetensors import safe_open
@@ -25,36 +25,9 @@ _CANONICAL_LAYOUTS = (
 )
 
 
-def _weight_artifact_paths(checkpoint_dir: str) -> set[str]:
-    """Return top-level files that can participate in weight resolution."""
-
-    paths: set[str] = set()
-    for pattern in ("*.index.json", "*.safetensors", "*.bin"):
-        paths.update(glob.glob(os.path.join(checkpoint_dir, pattern)))
-    return paths
-
-
-def resolve_checkpoint_dir(
-    path_or_repo: str,
-    cache_dir: Optional[str] = None,
-    allow_patterns: Optional[List[str]] = None,
-) -> str:
-    """Return a local checkpoint directory, downloading from the Hub if needed."""
-
-    if os.path.exists(path_or_repo):
-        return path_or_repo
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(
-        repo_id=path_or_repo,
-        cache_dir=cache_dir,
-        allow_patterns=allow_patterns or ["*.json", "*.safetensors", "*.bin"],
-    )
-
-
 def _resolve_weight_layout(
     checkpoint_dir: str, *, allow_missing: bool = False
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Return (kind, path) for one deterministic checkpoint layout.
 
     Hugging Face prefers safetensors when both safetensors and PyTorch weights
@@ -104,6 +77,33 @@ def _read_weight_map_file(index_path: str) -> Dict[str, str]:
     ):
         raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
     return weight_map
+
+
+def _weight_artifact_paths(checkpoint_dir: str) -> set[str]:
+    """Return top-level files that can participate in weight resolution."""
+
+    paths: set[str] = set()
+    for pattern in ("*.index.json", "*.safetensors", "*.bin"):
+        paths.update(glob.glob(os.path.join(checkpoint_dir, pattern)))
+    return paths
+
+
+def resolve_checkpoint_dir(
+    path_or_repo: str,
+    cache_dir: Optional[str] = None,
+    allow_patterns: Optional[List[str]] = None,
+) -> str:
+    """Return a local checkpoint directory, downloading from the Hub if needed."""
+
+    if os.path.exists(path_or_repo):
+        return path_or_repo
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        repo_id=path_or_repo,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns or ["*.json", "*.safetensors", "*.bin"],
+    )
 
 
 def _load_tensor_file(

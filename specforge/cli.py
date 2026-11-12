@@ -120,6 +120,10 @@ def _train(resolved) -> int:
     # Make the typed recipe authoritative for the backend's existing FSDP
     # sharding seam in both direct and managed-local worker processes.
     os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
+    if cfg.training.ddp_bucket_cap_mb is None:
+        os.environ.pop("SPECFORGE_DDP_BUCKET_CAP_MB", None)
+    else:
+        os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"] = str(cfg.training.ddp_bucket_cap_mb)
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process
@@ -228,8 +232,11 @@ def train(
     cfg = load_config(config_path, overrides)
     from specforge.application import bind_run, resolve_run
     from specforge.launch_plan import build_launch_plan, run_commands
+    from specforge.training.canonical import enabled
+    from specforge.training.model_loading import training_target_config
 
-    resolved = resolve_run(cfg)
+    target_config = training_target_config(cfg) if enabled(cfg) else None
+    resolved = resolve_run(cfg, target_config=target_config)
     launch = build_launch_plan(
         resolved.config,
         algorithm=resolved.algorithm,
@@ -240,6 +247,15 @@ def train(
     )
     if plan:
         print(launch.render())
+        # The plan renders anywhere; launching it on this host would fail.
+        if launch.managed_rdma_error is not None:
+            click.echo(f"warning: {launch.managed_rdma_error}", err=True)
+        if launch.server_capture_error is not None:
+            click.echo(
+                f"warning: {launch.server_capture_error}; the capture servers are "
+                "shown without capture flags",
+                err=True,
+            )
         return 0
     if launch.kind == "worker":
         for key, value in launch.worker_env.items():
