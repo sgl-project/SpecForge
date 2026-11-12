@@ -15,11 +15,18 @@ def bundle_code(directory, model_class):
     root = Path(__file__).resolve().parents[2]
     pending = [model_class.__module__, "specforge.modeling.draft.hf_config"]
     visited = set()
+    filenames = {}
 
     def filename(module):
-        return module.replace(".", "_")
+        name = module.replace(".", "_")
+        previous = filenames.setdefault(name, module)
+        if previous != module:
+            raise ValueError(f"bundled filename collision: {previous} and {module}")
+        return name
 
     def source_path(module):
+        if not module.startswith("specforge."):
+            raise ValueError(f"HF export only bundles specforge modules: {module}")
         path = root.joinpath(*module.split(".")[1:])
         return path / "__init__.py" if path.is_dir() else path.with_suffix(".py")
 
@@ -33,6 +40,11 @@ def bundle_code(directory, model_class):
             raise ValueError(f"cannot bundle model dependency {module}")
         package = module if path.name == "__init__.py" else module.rsplit(".", 1)[0]
         tree = ast.parse(path.read_text())
+        if module == model_class.__module__ and not any(
+            isinstance(node, ast.ClassDef) and node.name == model_class.__name__
+            for node in tree.body
+        ):
+            raise ValueError(f"{model_class.__name__} is not defined in {module}")
         if module == "specforge.config.draft.codec.v1":
             for statement in tree.body:
                 if (
@@ -51,6 +63,8 @@ def bundle_code(directory, model_class):
             target = node.module or ""
             if node.level:
                 target = importlib.util.resolve_name("." * node.level + target, package)
+            if target == "specforge":
+                raise ValueError(f"use explicit module imports in {module}")
             if not target.startswith("specforge."):
                 continue
             if node.module is None:

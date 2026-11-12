@@ -276,12 +276,11 @@ def train(
 
 @cli.command(short_help="materialize a runtime checkpoint as a model directory")
 @click.option(
-    "--format",
     "--to",
-    "target",
+    "legacy_format",
     type=click.Choice(("hf", "sglang")),
-    required=True,
-    help="Export layout.",
+    default=None,
+    help="Legacy export layout; omit for a canonical HF directory.",
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
 @click.option("--draft-config", default=None, metavar="PATH")
@@ -292,7 +291,7 @@ def train(
     "--embedding-source",
     default=None,
     metavar="PATH",
-    help="Target model path supplying a frozen embedding for HF export.",
+    help="Target embedding source for legacy --to hf only.",
 )
 @click.option(
     "--embedding-key",
@@ -302,7 +301,7 @@ def train(
 @click.pass_context
 def export(
     ctx: click.Context,
-    target: str,
+    legacy_format: Optional[str],
     checkpoint: str,
     draft_config: Optional[str],
     target_model: Optional[str],
@@ -312,8 +311,31 @@ def export(
     embedding_key: str,
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
-    if target == "hf":
+    if legacy_format is None:
+        if embedding_source is not None:
+            raise click.UsageError(
+                "--embedding-source belongs to legacy --to hf; use --target-model "
+                "for canonical import. Canonical export does not copy target embeddings.",
+                ctx,
+            )
+        if embedding_key != "model.embed_tokens.weight":
+            raise click.UsageError("--embedding-key belongs to legacy --to hf", ctx)
         from specforge.export.to_hf import export_to_hf
+
+        export_to_hf(
+            checkpoint,
+            draft_config,
+            output_dir,
+            vocab_mapping_path=vocab_mapping,
+            target_model=target_model,
+        )
+        return 0
+    if draft_config is None:
+        raise click.UsageError("legacy --to export requires --draft-config", ctx)
+    if target_model is not None:
+        raise click.UsageError("--target-model is only valid for canonical export", ctx)
+    if legacy_format == "hf":
+        from specforge.export.legacy_hf import export_to_hf
 
         export_to_hf(
             checkpoint,
@@ -322,23 +344,15 @@ def export(
             vocab_mapping_path=vocab_mapping,
             embedding_source=embedding_source,
             embedding_key=embedding_key,
-            target_model=target_model,
         )
-        return 0
-    if target_model is not None:
-        raise click.UsageError(
-            "--target-model for SGLang export is not yet supported", ctx
-        )
-    if embedding_source is not None:
-        raise click.UsageError("--embedding-source is only valid with --to hf", ctx)
-    from specforge.export.to_sglang import export_to_sglang
+    else:
+        if embedding_source is not None or embedding_key != "model.embed_tokens.weight":
+            raise click.UsageError("embedding options are only valid with --to hf", ctx)
+        from specforge.export.to_sglang import export_to_sglang
 
-    export_to_sglang(
-        checkpoint,
-        draft_config,
-        output_dir,
-        vocab_mapping_path=vocab_mapping,
-    )
+        export_to_sglang(
+            checkpoint, draft_config, output_dir, vocab_mapping_path=vocab_mapping
+        )
     return 0
 
 

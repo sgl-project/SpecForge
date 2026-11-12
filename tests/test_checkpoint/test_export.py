@@ -29,6 +29,7 @@ class CanonicalExportTest(unittest.TestCase):
                     else draft_config(target_bindings=(), target_logit_transform=None)
                 )
                 model = build_draft_model(cfg).eval()
+                torch.save(model.state_dict(), root / "expected_state.pt")
                 save_draft(model, root / "source")
                 export_to_hf(str(root / "source"), None, str(root / "hf"))
                 self.assertEqual(read_draft(root / "hf").config, cfg)
@@ -64,6 +65,36 @@ class CanonicalExportTest(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     env={**os.environ, "TORCHDYNAMO_DISABLE": "1"},
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_all_architectures_reload_and_resave_without_specforge(self):
+        from tests.test_algorithms.test_objectives import configurations
+        from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+        for cfg in configurations():
+            with (
+                self.subTest(architecture=cfg.architecture),
+                TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                model = build_draft_model(cfg).eval()
+                for name in cfg.target_bindings:
+                    module = model.get_submodule(name)
+                    module.load_target_weight(torch.randn_like(module.weight))
+                if hasattr(model, "vocabulary"):
+                    install_mapping(model)
+                model.finalize_initialization(loaded_keys=frozenset())
+                torch.save(model.state_dict(), root / "expected_state.pt")
+                save_draft(model, root / "source", max_shard_size="5KB")
+                export_to_hf(str(root / "source"), None, str(root / "hf"))
+                script = (
+                    Path(__file__).parent / "helpers" / "check_standalone_export.py"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-I", str(script), str(root / "hf")],
+                    capture_output=True,
+                    text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

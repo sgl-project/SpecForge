@@ -21,16 +21,9 @@ def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=Non
     if path.is_dir() and not any(
         (path / name).exists() for name in ("config.json", "training_state.pt")
     ):
-        latest = [
-            p.resolve()
-            for p in path.glob("*-latest")
-            if (p / "training_state.pt").is_file()
-        ]
-        if len(latest) != 1:
-            raise ValueError(
-                "select an explicit checkpoint directory; expected one latest pointer"
-            )
-        path = latest[0]
+        from specforge.training.checkpoint import CheckpointManager
+
+        path = Path(CheckpointManager.resolve_resume_dir(str(path)))
     directory = path.parent if path.is_file() else path
     supplementary = draft_config if not (directory / "config.json").exists() else None
     checkpoint = read_draft(

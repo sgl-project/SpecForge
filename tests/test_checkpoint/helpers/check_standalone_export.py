@@ -20,11 +20,15 @@ def main(export_dir):
 
     config = AutoConfig.from_pretrained(export_dir, trust_remote_code=True)
     model = AutoModel.from_pretrained(export_dir, trust_remote_code=True)
-    assert model.config.to_dict()["architectures"] == ["DFlashDraftModel"]
+    assert model.config.to_dict()["architectures"] == [config.draft.architecture]
     assert not model.is_backend_compatible()
     assert model.config.draft == config.draft
     assert config.specforge_artifact == {"format": "specforge", "version": 1}
-    if not model.config.draft.target_bindings:
+    expected_state = torch.load(
+        export_dir.parent / "expected_state.pt", weights_only=True
+    )
+    torch.testing.assert_close(model.state_dict(), expected_state, rtol=0, atol=0)
+    if (export_dir.parent / "expected.pt").exists():
         package = type(model).__module__.rsplit(".", 1)[0]
         LayerInputs = importlib.import_module(
             package + ".specforge_modeling_draft_layers_inputs"
@@ -50,8 +54,9 @@ def main(export_dir):
     resaved = export_dir.with_name(export_dir.name + "_resaved")
     model.save_pretrained(resaved)
     again = AutoModel.from_pretrained(resaved, trust_remote_code=True)
-    assert again.config.to_dict()["architectures"] == ["DFlashDraftModel"]
+    assert again.config.to_dict()["architectures"] == [config.draft.architecture]
     assert again.config.specforge_artifact == config.specforge_artifact
+    torch.testing.assert_close(again.state_dict(), expected_state, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

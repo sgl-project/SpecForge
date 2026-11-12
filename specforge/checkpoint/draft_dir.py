@@ -44,7 +44,7 @@ def save_draft(model, path, *, max_shard_size="5GB"):
     if not isinstance(model.config, SpecForgeDraftConfig):
         raise TypeError("save_draft requires a canonical draft model")
     _require_unwrapped(model)
-    state = model.state_dict()
+    state = model.state_dict(keep_vars=True)
     # an FSDP1 root above the draft leaves shard views; wrappers rename keys
     meta = build_draft_model(model.config.draft, device="meta")
     shapes = {key: tuple(value.shape) for key, value in state.items()}
@@ -64,20 +64,13 @@ def save_draft(model, path, *, max_shard_size="5GB"):
             raise ValueError(f"{key}: save requires materialized, gathered tensors")
     if dist.is_initialized() and dist.get_rank() != 0:
         raise ValueError("save_draft must be called on global rank 0")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and (
-        not destination.is_dir() or any(destination.iterdir())
-    ):
-        raise FileExistsError(f"checkpoint directory is not empty: {destination}")
-    with tempfile.TemporaryDirectory(prefix=".draft-", dir=destination.parent) as tmp:
-        staging = Path(tmp) / "artifact"
-        model.save_pretrained(staging, state_dict=state, max_shard_size=max_shard_size)
-        config_path = staging / "config.json"
-        config = json.loads(config_path.read_text())
-        config["specforge_artifact"] = {"format": "specforge", "version": 1}
-        config_path.write_text(json.dumps(config, indent=2) + "\n")
-        os.replace(staging, destination)
+    # Store tied tensors once; their aliases are defined by the configuration.
+    seen, owned = set(), {}
+    for name, tensor in state.items():
+        if id(tensor) not in seen:
+            owned[name] = tensor
+            seen.add(id(tensor))
+    write_artifact(path, model.config.to_dict(), owned, max_shard_size=max_shard_size)
 
 
 def write_artifact(
@@ -98,7 +91,7 @@ def write_artifact(
         for filename, keys in shards.filename_to_tensors.items():
             # Clone to avoid shared storage aliases in safetensors.
             save_file(
-                {k: state[k].clone() for k in keys},
+                {k: state[k].detach().contiguous().clone() for k in keys},
                 staging / filename,
                 metadata={"format": "pt"},
             )
@@ -116,5 +109,12 @@ def write_artifact(
         if write_code is not None:
             write_code(staging)
         payload = config | {"specforge_artifact": metadata}
+        dtypes = {
+            str(t.dtype).removeprefix("torch.")
+            for t in state.values()
+            if t.is_floating_point()
+        }
+        if len(dtypes) == 1:
+            payload["dtype"] = dtypes.pop()
         (staging / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
         os.replace(staging, destination)
