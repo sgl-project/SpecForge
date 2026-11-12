@@ -120,7 +120,8 @@ def read_checkpoint(
         payload = read_json(legacy_config)
     else:
         raise ValueError(
-            "checkpoint has no config.json; supply legacy_config explicitly"
+            f"{directory} has no config.json: point at a checkpoint directory "
+            "rather than a run output directory, or supply legacy_config"
         )
     if not isinstance(payload, dict):
         raise ValueError("checkpoint config must be an object")
