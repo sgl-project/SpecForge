@@ -282,49 +282,47 @@ The legacy codec owns these field mappings. The adapter detects the format, call
 
 A native draft inside a target checkpoint has no import adapter. Its structure is the native preset for that target, written from SpecForge components; its weights are copied by an ordinary `from_target` mapping; and the preset lists `target_bindings` when the native draft shares the target's embeddings and LM head. No code derives draft nodes from the target's configuration, so the target's layer count never becomes the draft's.
 
-## 4. Exporting to HF and SGLang
+## 4. Standalone, Native, and Serving Exports
 
-Training saves only the unified checkpoint. Export runs through a standalone `specforge export` command, without reading training YAML or requiring further training. Without further options it publishes the canonical HF directory, so `export` has one meaning and takes no format flag. SGLang is an optional converter on the same command, and it reads either a training checkpoint or an exported directory, so a user who needs only the serving directory does not write the weights twice:
+Training saves a canonical checkpoint. The public export command selects a mode independently of the draft architecture:
 
 ```bash
-# Publish: canonical configuration and weights, loadable with Transformers.
-specforge export \
-  --checkpoint /path/to/checkpoint \
-  --output-dir /path/to/hf-model
+# Standalone canonical draft (the default).
+specforge export --checkpoint CHECKPOINT_PATH --output-dir MODEL
 
-# Serve: SGLang's own draft format, from the checkpoint or from the published directory.
-specforge export \
-  --checkpoint /path/to/checkpoint-or-hf-model \
-  --converter sglang \
-  --output-dir /path/to/sglang-model
+# Standalone serving artifact, when the pinned converter supports the structure.
+specforge export --converter sglang --checkpoint CHECKPOINT_PATH --output-dir SERVING
+
+# Native merge-back, when an adapter supports this target/architecture pair.
+specforge export --export-mode native --checkpoint CHECKPOINT_PATH \
+  --target-model TARGET --output-dir MERGED_TARGET
 ```
 
-Both sources give the same serving directory. Architecture-specific work, such as EAGLE3 weight renaming and replacing a native draft's tensors in the target's shards, stays inside the converter.
+Native mode takes no `--converter`; it preserves the target format and does not imply engine support. Standalone and native are available to any architecture through the relevant implementation; neither the architecture name nor a preset chooses the mode. Missing adapters and unsupported serving structures fail explicitly.
 
-Model structure comes from the checkpoint configuration. Exports do not store the bound embeddings and LM head, apart from the copies a native SGLang export takes from the target, so most exports need no target. `--target-model` is required in two cases: exporting a native draft to SGLang, because the output is the target checkpoint with its native draft tensors replaced, and reading a checkpoint written before the change, which has no `target_logit_transform`. A native export rewrites only the shards that hold native draft tensors, so no stale copy remains, and links the unchanged shards unless a self-contained directory is requested.
+| Item | Standalone | Standalone + SGLang converter | Native |
+|---|---|---|---|
+| Configuration | Canonical config plus HF metadata | Pinned SGLang format | Target config, validated without draft-derived structural defaults |
+| Weights | SpecForge layout | SGLang loader layout | Native draft tensors replaced in target shards |
+| Bound token tables | Omitted; bind from target on load | Target modules supplied by serving | Copied where required by the native adapter |
+| Artifact metadata | `format: specforge` | `format: sglang`, converter version and engine revision | `format: native` |
+| Target source | Needed for legacy import when target metadata is missing | Same import requirements | Required through `--target-model` |
 
-The canonical configuration is the only published format. The two outputs differ as follows:
+Native export removes stale draft tensors from rewritten shards and links unaffected shards. `--copy-target` is native-only and copies those shards instead. Continue draft training from the canonical checkpoint, not the merged target artifact.
 
-| Item | `specforge export` (default) | `--converter sglang` |
-|---|---|---|
-| Purpose | Publication and loading with Transformers | Serving with SGLang |
-| `config.json` | Canonical encoding of the golden configuration, plus HF metadata | SGLang's own format: every field SGLang reads that affects computation, written explicitly |
-| Extra files | `auto_map` naming the concrete model and configuration classes, and the bundled code | None; the directory is one-way and is never imported |
-| Weights | SpecForge layout | Renamed to the layout the SGLang loader expects. For a native architecture, written back under the native names into the target checkpoint from `--target-model`, rewriting only the affected shards |
-| Artifact metadata | `format: specforge` | `format: sglang`, the converter version, and the SGLang version whose format it targets |
-| Shared embeddings and LM head | Not saved; `target_bindings` is recorded | Not saved; SGLang uses the target's modules. For a native architecture, written as copies under the native names, because SGLang's native format loads them from the checkpoint. A binding set that SGLang's format does not express for the architecture fails the export |
-| Unsupported structure | Not applicable | A structure SGLang's format cannot express fails the export, naming the structure |
+During migration, legacy `--to hf|sglang` remains available, including external vocabulary-map import for old EAGLE3 checkpoints. Those options cannot be combined with the new export modes or converter. The historical Qwen3.5 MTP command with `--converter sglang` and no explicit mode retains implicit native export with a deprecation warning; replace it with `--export-mode native`. This exception is fixed to that old command and does not extend to newly registered families.
 
 SGLang directories are one-way serving artifacts. SpecForge never reads them back, so the converter has no inverse to maintain; continued training and re-export start from the canonical checkpoint or the HF export. Export never modifies `model.config`.
 
 ### 4.1 The SGLang boundary
 
-SGLang is reached only through the `--converter sglang` export. SGLang imports no SpecForge code and never reads canonical configurations, and SpecForge depends only on the draft format that the pinned SGLang version reads (design document, G8):
+Standalone SGLang artifacts are produced with `--converter sglang`; native artifacts use the target format and require separate engine compatibility validation. SGLang imports no SpecForge code and never reads canonical configurations, and SpecForge depends only on the draft format that the pinned SGLang version reads (design document, G8):
 
-1. SGLang owns its draft format: the fields it reads, their defaults, and the weight names its loader expects. The SGLang converter in `checkpoint/formats/sglang.py` is the one place that translates a `DraftConfig` into that format, with one converter function per architecture and shared helper functions for common nodes.
-2. The converter writes every field that SGLang reads and that affects computation: per-layer values where SGLang's format has them, such as layer types and, after the prerequisite change in design step 6, causality; and values that SGLang holds once for all layers, such as KV heads, head size, window, biases, and partial rotation. A draft whose layers differ in a value that SGLang holds once fails the export. SGLang reads many fields with a fallback default, so a CI check records the fields SGLang reads while it builds the draft and fails on any the converter did not write, apart from a versioned list, kept with the converter, of fields that do not affect computation. SGLang's defaults therefore never decide a draft's computation, and no rule, such as the legacy `is_causal` default, is implemented in both repositories.
+1. SGLang owns its draft format: the fields it reads, their defaults, and the weight names its loader expects. The SGLang converter in `checkpoint/formats/sglang/` is the one place that translates a `DraftConfig` into that format, with one converter function per architecture and shared helper functions for common nodes.
+2. The converter writes every field that SGLang reads and that affects computation: per-layer values where SGLang's format has them, such as layer types; and values that SGLang holds once for all layers, such as KV heads, head size, window, biases, and partial rotation. Per-layer differences fail export unless the serving format can represent them, including the verified causality encoding below. SGLang reads many fields with a fallback default, so a CI check records the fields SGLang reads while it builds the draft and fails on any the converter did not write, apart from a versioned list, kept with the converter, of fields that do not affect computation. For mixed causal sliding and bidirectional full-attention layers, the converter writes `is_causal: null` and explicit `layer_types` after verifying that exact combination. This selects the pinned engine's documented per-layer rule; other mixed patterns fail export. Canonical attention nodes remain explicit booleans. Tests check resolved per-layer causality and reference outputs, so this exception does not permit arbitrary serving defaults.
 3. A structure, or a `target_bindings` set, that SGLang's format cannot express fails the export, naming it; this includes an extension kind the converter does not support. Supporting a new structure is an SGLang change to its own format, made with the serving implementation the structure needs anyway; the converter then maps to the new fields.
-4. The artifact metadata records the converter version and the SGLang version whose format it targets. CI loads an export of each architecture's fixture in that SGLang version and compares draft outputs with SpecForge's on reference inputs (below).
+4. Native preset validation separates real checkpoint metadata, exact copy/export round-trips, independent decoder references, and pinned serving fixtures. These checks do not constitute a full real-preset copy → export → serving execution test.
+5. The artifact metadata records the converter version and the SGLang version whose format it targets. CI loads an export of each architecture's fixture in that SGLang version and compares draft outputs with SpecForge's on reference inputs (below).
 
 SGLang must reject a canonical directory instead of serving it with default settings. Three barriers stop it:
 
@@ -511,15 +509,15 @@ These are the user-visible changes compared with SpecForge main. The design docu
 
 | Area | Today | After the change | Kind | Who is affected and how to migrate |
 |---|---|---|---|---|
-| Serving DFlash-family drafts on released SGLang | The output of `specforge export --to hf` is served directly; `--to sglang` supports EAGLE3 only | `specforge export` writes a canonical directory that SGLang rejects; `--converter sglang` writes SGLang's own format for every architecture that main can serve today | Breaking, intentional | Every DFlash-family export-and-serve pipeline; add `--converter sglang`. A draft that served from main's export and cannot be converted is a regression, not a listed change |
-| Export command flags | `--to hf\|sglang`, a required `--draft-config`, `--embedding-source`, `--embedding-key`, and `--vocab-mapping` | No format flag: `specforge export` publishes the canonical directory, and `--converter sglang` writes the serving directory. Structure and the draft vocabulary mapping are read from the checkpoint, with `--target-model` where needed | Breaking, intentional | Scripts that call `specforge export`. Old flags fail with an error naming the replacement. `--to hf` is not accepted as the default export, because that output no longer serves on released SGLang; its error points to `--converter sglang` |
+| Serving DFlash-family drafts on released SGLang | Legacy exports may be served directly | Default standalone export is canonical; `--converter sglang` writes supported serving formats | Intentional | Use the converter; unsupported architectures fail explicitly |
+| Export command flags | Legacy `--to`, separate config and optional vocabulary mapping | Default standalone, optional `--converter sglang`, or `--export-mode native` with `--target-model` | Staged migration | Legacy commands remain for compatibility; do not mix their flags with new modes |
 | Draft structure in training checkpoints | `training_state.pt` holds weights and training state; the draft configuration is supplied separately | The checkpoint also holds the canonical `config.json` | Improvement | Checkpoints written before the change carry no configuration; export and continued training accept the legacy draft configuration file for them, decoded by the legacy codec |
 | HF export contents | For EAGLE-family drafts, self-contained: the frozen target embedding is copied in, so `from_pretrained` finds no missing keys. DFlash-family drafts own no embedding | The bound embedding and LM head are not saved; `target_bindings` records them, and loading takes them from the target | Breaking, intentional | Users who load an HF export without its target model |
 | Draft configuration files and recipes | Legacy JSON files under `configs/`, referenced by recipes | Bundled configurations are YAML presets under `config/draft/presets/`. The `draft` section may still name a user's legacy file, which the legacy codec decodes with the target configuration, and a command rewrites such a file as canonical YAML; saving writes the canonical form | Intentional (step 8) | Recipes that name `configs/*.json` point at the presets instead. A user's own legacy file keeps working |
 | Published legacy drafts | Loaded through their legacy fields | Imported through the external draft adapter; serving on released SGLang is unchanged | Unchanged | None |
 | `num_hidden_layers` | An independent input | Equal to `len(layer_types)`; written for HF tooling and checked on read | Intentional | Canonical configurations only; legacy files decode as before |
 | Normalization and attention fields | `rms_norm_eps`; query and key norms, projection biases, and output gates implied by the model family class | `norm_config` and explicit attention fields | Intentional | Canonical configurations only; the legacy codec fills them from the supported source implementation |
-| Native MTP fine-tuning (step 7) | A family class such as `Qwen3_5MTPDraftModel` owns the network and the `mtp.*` layout; `scripts/merge_mtp_to_base.py` merges trained weights back, copies `mtp.embed_tokens` and `mtp.lm_head`, and overwrites `text_config` dimensions | A native preset with an ordinary `initialization.from_target` mapping in the recipe; `--converter sglang` writes the merged target checkpoint with the same embedding copies, adds missing target configuration fields, and fails on conflicting ones | Intentional | MTP fine-tuning recipes reference the native preset and export through `specforge export`; a target whose configuration conflicts with the draft now fails instead of being overwritten |
+| Native MTP fine-tuning (step 7) | Family-specific model and merge script | Component preset, ordinary `from_target` mapping, and registered native adapter | Intentional | Use `--export-mode native`; required target settings must match and are never filled from the draft |
 | Missing structural fields, unknown fields, and conflicting aliases | Accepted: HF configuration classes fill missing fields with family defaults and keep unknown fields | From step 6, rejected before construction in canonical configurations, with the field named. The legacy codec ignores a closed list of HF metadata keys and rejects any other unknown key | Intentional | Configurations that relied on a silent default or a typo; legacy files decode as before unless they carry a key outside the ignore list |
 | Training configuration keys (step 8) | Draft settings under `model.draft_*`, `training.strategy`, and per-algorithm loss options directly under `training` | `draft`, `initialization`, `training.objective`, and `training.objective_options` | Breaking, intentional | Every training recipe. Each retired key fails with an error naming its replacement, and the training guide carries the full old-to-new table |
 | Offline feature preparation (step 8) | The preparation script selects the algorithm with a strategy flag and a legacy draft configuration | It takes the same `draft` source and objective as training | Breaking, intentional | Scripts that prepare offline features; old flags fail naming the replacement. Whether feature files written on main stay readable is stated with the change |
