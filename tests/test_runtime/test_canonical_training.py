@@ -496,6 +496,35 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertIsNone(evaluated.replay_loss)
             reduce.assert_not_called()
 
+    def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
+        """EAGLE3 declares SDPA; switching backends must not change its loss."""
+        from torch import nn
+
+        from specforge.algorithms.objectives import build_objective_model
+        from specforge.modeling import build_draft_model
+        from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+        draft = eagle_config(target_width=32)
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            resolve_run(
+                run_config(target, draft, training={"attention_backend": "sdpa"})
+            )
+        torch.manual_seed(0)
+        eager = build_draft_model(draft, backend="eager")
+        sdpa = build_draft_model(draft, backend="sdpa")
+        sdpa.load_state_dict(eager.state_dict())
+        head = nn.Linear(32, draft.vocab_size, bias=False)
+        batch = training_batch(draft)
+        losses = []
+        for model in (eager, sdpa):
+            install_mapping(model)
+            runtime = build_objective_model(
+                model, options={"ttt_length": 2}, target_head=head
+            )
+            losses.append(runtime(batch, step=1, total_steps=10).loss)
+        torch.testing.assert_close(losses[1], losses[0])
+
     def test_reject_mixed_sources_and_backend(self):
         draft = draft_config()
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):

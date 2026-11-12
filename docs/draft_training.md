@@ -191,10 +191,10 @@ server capture adapters now supply unshifted canonical records. DMTP currently
 accepts offline records with `mtp_hidden_states`; the generic capture service
 cannot produce frozen-MTP features and DMTP streaming fails validation.
 
-The new route supports eager attention and data parallel training, including FSDP
-and DDP. Frozen target bindings and the teacher head remain replicated outside
+The new route supports eager attention (EAGLE3 also SDPA) and data parallel
+training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
 FSDP, matching the existing training backend's frozen-table policy. The canonical
-model's requested dtype also controls FSDP computation. Optimized backends and
+model's requested dtype also controls FSDP computation. Other optimized backends and
 sequence-parallel execution remain on the legacy route. Online wiring is
 validated through capture contracts; a live SGLang capture run is not part of the
 current integration tests.
@@ -241,7 +241,7 @@ imports must explicitly match saved training settings in `training.objective_opt
 
 `register_protocol(..., training=TrainingRequirements(...))` declares capture
 method, vocabulary mapping, batch-size constraints, `attention_backends` and an
-optional `loss_mask_filter` callable. Existing objectives keep eager attention;
+optional `loss_mask_filter` callable. EAGLE3 also accepts `sdpa`; the other objectives keep eager attention;
 block objectives register the shared consecutive-supervision filter. Canonical
 composition builds providers directly from these requirements; it does not resolve
 a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
