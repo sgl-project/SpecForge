@@ -109,10 +109,12 @@ def make_initialization_plan(
     target_store=None,
     target_config=None,
     from_target=None,
+    cast_target_copies=(),
 ):
     """Scratch or weights-only warm start; never used to resume a checkpoint.
 
-    from_target performs one-to-one bit-preserving copies with explicit renames.
+    from_target performs one-to-one bit-preserving copies with explicit renames;
+    the destinations in cast_target_copies cast to the draft dtype instead.
     Current components store separate parameters; no fused-parameter layout is
     inferred from model-family names. Unexplained target tensors fail validation.
     """
@@ -180,6 +182,11 @@ def make_initialization_plan(
         logger.info(
             "Target weight mapping: %s", {k: v.key for k, v in sorted(copies.items())}
         )
+    cast = set(cast_target_copies)
+    if cast - copies.keys():
+        raise ValueError(
+            f"cast_target_copies names no target copy: {sorted(cast - copies.keys())}"
+        )
     weights.update(copies)
     if weights_from is None:
         # by identity: the tied alias of a copied tensor is not new
@@ -191,7 +198,7 @@ def make_initialization_plan(
         model,
         weights,
         allow_new=allowed,
-        strict_copies=copies,
+        strict_copies=[name for name in copies if name not in cast],
         bindings=resolve_bindings(model.config.draft, target_store, target_config),
         unused=unused,
     )

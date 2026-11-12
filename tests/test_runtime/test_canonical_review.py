@@ -420,3 +420,38 @@ class CanonicalReviewTest(unittest.TestCase):
                     )
                     self.assertIsNone(bundle.draft_model.confidence_head)
                     self.assertEqual(bundle.model.frozen_parameters, ())
+
+    def test_default_target_embedding_copy_follows_the_draft_dtype(self):
+        """Like legacy load_embedding; explicit from_target copies stay strict."""
+        from safetensors.torch import load_file, save_file
+
+        from specforge.checkpoint.initialization import make_initialization_plan
+        from specforge.checkpoint.target import TargetWeights
+        from specforge.modeling import build_draft_model
+        from specforge.training.assembly import build_model_bundle
+        from tests.test_modeling.test_canonical_eagle3 import model_config as eagle
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            path = target / "model.safetensors"
+            tables = {key: value.half() for key, value in load_file(path).items()}
+            save_file(tables, path)
+            model = {"target_model_path": str(target), "torch_dtype": "bfloat16"}
+            cfg = run_config(target, eagle(target_width=32), model=model)
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            embedding = bundle.draft_model.embed_tokens.weight.detach().cpu()
+            self.assertEqual(embedding.dtype, torch.bfloat16)
+            expected = tables["model.embed_tokens.weight"].to(torch.bfloat16)
+            self.assertTrue(torch.equal(embedding, expected))
+            draft = build_draft_model(
+                eagle(target_width=32), device="meta", dtype=torch.bfloat16
+            )
+            store = TargetWeights(target)
+            with self.assertRaisesRegex(ValueError, "narrow"):
+                make_initialization_plan(
+                    draft,
+                    target_store=store,
+                    target_config=store.config,
+                    from_target={"embed_tokens.weight": "model.embed_tokens.weight"},
+                )

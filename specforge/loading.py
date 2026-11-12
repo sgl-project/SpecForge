@@ -172,6 +172,7 @@ def initialize_draft(
     mapping=None,
     allow_new=(),
     require_loaded=(),
+    cast_target_copies=(),
     from_target=None,
     device="cpu",
     dtype=torch.float32,
@@ -186,6 +187,7 @@ def initialize_draft(
     those use load_draft and the training layer's state restoration respectively.
     require_loaded names parameter/module prefixes that may not be initialized anew;
     a prefix naming a head the draft disables (None) requires nothing.
+    cast_target_copies names from_target destinations that cast to dtype.
     """
     if type(draft) is not DraftConfig:
         raise TypeError("draft must be a resolved DraftConfig")
@@ -214,6 +216,7 @@ def initialize_draft(
         target_store=target_store,
         target_config=target_config,
         from_target=from_target,
+        cast_target_copies=cast_target_copies,
     )
     loaded = set(dict(plan.weights)) | {name + ".weight" for name, _ in plan.bindings}
     parameters = dict(preview.named_parameters(remove_duplicate=False))

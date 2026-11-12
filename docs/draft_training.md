@@ -215,9 +215,11 @@ optimizer shards, scheduler state or RNG. For legacy imports, explicit
 keeps these settings in its architecture nodes.
 
 For scratch training, `model.load_target_embedding: true` copies the target table
-into an owned embedding through `from_target`, with shape/dtype validation.
-Explicit target mappings take precedence; checkpoint and warm-start embeddings
-are preserved. Target-bound tables always follow their bindings. Teacher heads
+into an owned embedding with shape validation. Like legacy `load_embedding`, this
+default copy casts to `model.torch_dtype`; explicit `from_target` copies stay
+bit-preserving and only widen. Explicit target mappings take precedence;
+checkpoint and warm-start embeddings are preserved. Target-bound tables always
+follow their bindings. Teacher heads
 and draft bindings use the same target key resolver and cached source tensors;
 a compatible bound head is shared directly.
 

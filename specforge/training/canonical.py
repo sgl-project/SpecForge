@@ -456,6 +456,7 @@ def build_bundle(cfg, algorithm):
     else:
         weights = init.weights_from if init else None
         from_target = dict(init.from_target or {}) if init else {}
+        cast_copies = ()
         if (
             weights is None
             and cfg.model.load_target_embedding
@@ -467,6 +468,8 @@ def build_bundle(cfg, algorithm):
             from_target["embed_tokens.weight"] = target_weights.resolve(
                 "embed_tokens"
             ).key
+            # legacy load_embedding parity: follow model.torch_dtype
+            cast_copies = ("embed_tokens.weight",)
         model = initialize_draft(
             **common,
             weights_from=weights.checkpoint if weights else None,
@@ -475,6 +478,7 @@ def build_bundle(cfg, algorithm):
             require_loaded=tuple(cfg.training.frozen)
             + getattr(resolved.objective, "frozen_parameters", ()),
             from_target=from_target or None,
+            cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
             legacy_settings=_legacy_settings(cfg),
         )
