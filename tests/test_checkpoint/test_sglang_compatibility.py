@@ -7,19 +7,23 @@ convolutions and model loops are SGLang's real implementations.
 
 import copy
 import importlib
+import json
 import os
 import unittest
 from contextlib import ExitStack
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
 from specforge.checkpoint.formats.sglang import NON_COMPUTATIONAL_READS, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.config.draft.attention import MLASpec
+from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.rope import (
     LinearRoPESpec,
@@ -99,15 +103,16 @@ class ReadConfig(PretrainedConfig):
         return missing
 
 
-def load_checked(test, model, weights):
+def load_checked(test, model, weights, *, bindings=None):
     """Every exported tensor must reach a real serving parameter loader."""
     from sglang.srt.model_loader.weight_utils import default_weight_loader
 
-    consumed = set()
+    consumed, loaded = set(), set()
 
     def track(loader):
         def load(parameter, tensor, *args, **kwargs):
             consumed.add(id(tensor))
+            loaded.add(id(parameter))
             return loader(parameter, tensor, *args, **kwargs)
 
         return load
@@ -123,6 +128,10 @@ def load_checked(test, model, weights):
                 )
             )
         model.load_weights(weights.items())
+        # Serving workers bind target tables outside the draft weight loader.
+        for name, tensor in (bindings or {}).items():
+            parameter = model.get_parameter(name)
+            parameter.weight_loader(parameter, tensor)
     ignored = {
         "t2d",
         "d2t",
@@ -131,6 +140,15 @@ def load_checked(test, model, weights):
         {name for name, tensor in weights.items() if id(tensor) not in consumed}
         - ignored,
         set(),
+    )
+    test.assertEqual(
+        {
+            name
+            for name, parameter in model.named_parameters()
+            if id(parameter) not in loaded
+        },
+        set(),
+        "serving parameters missing from the export",
     )
     if "d2t" in weights:
         torch.testing.assert_close(
@@ -213,6 +231,24 @@ class SGLangCompatibilityTest(unittest.TestCase):
             stack.enter_context(patch("sglang.srt.models.utils._is_cuda", False))
             configs = serving_configs()
             base = configs[0]
+            configs.append(
+                replace(
+                    base,
+                    attention_configs={
+                        **base.attention_configs,
+                        "sliding": replace(
+                            base.attention_configs["full"],
+                            sliding_window=2,
+                            is_causal=True,
+                        ),
+                    },
+                    layer_configs={
+                        **base.layer_configs,
+                        "sliding": LayerSpec(attention="sliding", mlp="dense"),
+                    },
+                    layer_types=("sliding", "full_dense"),
+                )
+            )
             common = dict(interleaved=False, rope_theta=10000, partial_rotary_factor=1)
             configs.extend(
                 replace(base, rope_parameters=rope)
@@ -302,7 +338,11 @@ class SGLangCompatibilityTest(unittest.TestCase):
             )
             read = Qwen3_5TextConfig(**fields)
         else:
-            read = ReadConfig(fields)
+            with TemporaryDirectory() as tmp:
+                (Path(tmp) / "config.json").write_text(json.dumps(fields))
+                normalized = AutoConfig.from_pretrained(tmp)
+            read = ReadConfig(normalized.to_dict())
+            read._fields = fields
         eagle = config.architecture == "Eagle3DraftModel"
         module = (
             "llama_eagle3"
@@ -345,7 +385,19 @@ class SGLangCompatibilityTest(unittest.TestCase):
         if native:
             weights = {"mtp." + name: value for name, value in weights.items()}
             weights["mtp.embed_tokens.weight"] = embedding
-        load_checked(self, served, weights)
+        bindings = {}
+        if eagle:
+            bindings["model.embed_tokens.weight"] = embedding
+        if native:
+            bindings["lm_head.weight"] = model.lm_head.weight
+        with self.assertRaisesRegex(AssertionError, "serving parameters missing"):
+            load_checked(
+                self,
+                served,
+                {k: v for k, v in weights.items() if "norm" not in k},
+                bindings=bindings,
+            )
+        load_checked(self, served, weights, bindings=bindings)
         # A missing computation field is a test failure even if SGLang
         # could construct with a fallback value.
         if not native:

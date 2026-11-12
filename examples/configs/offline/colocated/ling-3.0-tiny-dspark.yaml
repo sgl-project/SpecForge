@@ -1,6 +1,6 @@
 # Ling-3.0-tiny DSpark, offline (capture -> train) recipe.
 #
-# Export with `specforge export --format sglang`; the converter writes explicit serving fields.
+# Export with `specforge export --converter sglang`; the converter writes explicit serving fields.
 # Legacy checkpoints also need --draft-config and --target-model. Then serve:
 #   python -m sglang.launch_server --model-path inclusionAI/Ling-3.0-tiny --trust-remote-code \
 #     --speculative-algorithm DSPARK --speculative-draft-model-path <export>

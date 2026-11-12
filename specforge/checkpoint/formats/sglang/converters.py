@@ -49,10 +49,24 @@ def common(config, *, eagle=False, native=False):
     for attention in attentions:
         require(
             type(attention) is type(a)
-            and replace(attention, sliding_window=None)
-            == replace(a, sliding_window=None),
-            "per-layer attention values differ (including is_causal); pinned SGLang holds these once",
+            and replace(attention, sliding_window=None, is_causal=False)
+            == replace(a, sliding_window=None, is_causal=False),
+            "per-layer attention values differ; pinned SGLang holds these once",
         )
+    causalities = {attention.is_causal for attention in attentions}
+    is_causal = a.is_causal
+    if len(causalities) > 1:
+        require(
+            not eagle
+            and not native
+            and all(
+                attention.is_causal == (attention.sliding_window is not None)
+                for attention in attentions
+            ),
+            "mixed causality requires causal sliding and bidirectional full attention",
+        )
+        # None selects SGLang's per-layer rule instead of a uniform override.
+        is_causal = None
     windows = {attention.sliding_window for attention in attentions} - {None}
     require(len(windows) <= 1, "per-layer sliding windows differ")
     require(
@@ -120,7 +134,7 @@ def common(config, *, eagle=False, native=False):
         num_attention_heads=a.num_attention_heads,
         attention_bias=a.attention_bias,
         attention_dropout=0.0,
-        is_causal=a.is_causal,
+        is_causal=is_causal,
         layer_types=[
             "full_attention" if v.sliding_window is None else "sliding_attention"
             for v in attentions
@@ -226,7 +240,9 @@ def context(config):
     protocol = spec.protocol
     window = result["sliding_window"]
     require(
-        a.is_causal or window is None or window >= protocol.num_model_slots,
+        result["is_causal"] is not False
+        or window is None
+        or window >= protocol.num_model_slots,
         "a non-causal sliding window must be at least the block size",
     )
     result["block_size"] = protocol.num_model_slots

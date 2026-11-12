@@ -160,6 +160,66 @@ class ServingBoundariesTest(unittest.TestCase):
                 )
             )
 
+    def test_recipe_causality_tokens_and_auxiliary_layers(self):
+        root = Path(__file__).resolve().parents[2] / "configs"
+        for name in (
+            "minimax-m3-dspark",
+            "qwen3.6-27b-dflash",
+            "qwen3-8b-domino",
+            "qwen3-235B-A22B-eagle3",
+        ):
+            payload = json.loads((root / (name + ".json")).read_text())
+            with self.subTest(recipe=name):
+                config = decode_legacy_config(
+                    payload,
+                    target_config={
+                        "hidden_size": payload["hidden_size"],
+                        "vocab_size": payload["vocab_size"],
+                        "num_hidden_layers": payload.get("num_target_layers", 96),
+                    },
+                )
+                fields = convert_config(config)
+                if "eagle_config" in payload:
+                    self.assertEqual(
+                        fields["eagle_config"]["eagle_aux_hidden_state_layer_ids"],
+                        payload["eagle_config"]["eagle_aux_hidden_state_layer_ids"],
+                    )
+                    continue
+
+                def causalities(values):
+                    return [
+                        (
+                            values["is_causal"]
+                            if values.get("is_causal") is not None
+                            else kind == "sliding_attention"
+                        )
+                        for kind in values["layer_types"]
+                    ]
+
+                self.assertEqual(causalities(fields), causalities(payload))
+                for key in ("target_layer_ids", "mask_token_id"):
+                    self.assertEqual(
+                        fields["dflash_config"][key], payload["dflash_config"][key]
+                    )
+                if name.endswith("domino"):
+                    self.assertEqual(
+                        fields["shift_label"], payload["dflash_config"]["shift_label"]
+                    )
+                    self.assertEqual(
+                        fields["dflash_config"]["shift_label"], fields["shift_label"]
+                    )
+                if name == "qwen3.6-27b-dflash":
+                    self.assertIsNone(fields["is_causal"])
+                    invalid = replace(
+                        config,
+                        attention_configs={
+                            name: replace(attention, is_causal=not attention.is_causal)
+                            for name, attention in config.attention_configs.items()
+                        },
+                    )
+                    with self.assertRaisesRegex(ValueError, "mixed causality"):
+                        convert_config(invalid)
+
     def test_production_dflash2_fields_match_legacy_recipes(self):
         root = Path(__file__).resolve().parents[2]
         for name in ("qwen3.8-27b-dflash2", "qwen3.6-27b-dflash2"):

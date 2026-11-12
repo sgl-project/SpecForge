@@ -219,9 +219,8 @@ Explicit training masks work with eager, SDPA, and Flex Attention. Native
 draft inference without a supplied mask supports these settings through
 eager/SDPA and Flex Attention, including cached decoding. HF exports preserve
 `is_causal`.
-The SGLang normalization gate rejects bidirectional sliding-window exports
-until that external serving path is validated; it does not silently fall back
-to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
+The SGLang converter supports bidirectional sliding windows when the window
+covers the draft block. A window of size 1 is rejected. These settings do not change CE/L1 losses or kernel optimizations.
 
 DSpine requires causal attention for both full and sliding layers and rejects
 `is_causal: false`. It uses the shared DFlash attention masks.

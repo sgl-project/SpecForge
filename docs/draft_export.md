@@ -33,8 +33,9 @@ use canonical names and store each tensor in its own dtype; `config.json` declar
 a dtype only when all floating-point tensors share one.
 
 During migration, `--to hf` and `--to sglang` retain the original exporters and
-require `--draft-config`. In particular, legacy DFlash serving scripts can continue
-using `--to hf`; this is distinct from the default canonical export. Only legacy
+require `--draft-config`. Use `--converter sglang` for DFlash-family serving exports.
+Legacy `--to` remains necessary when importing an external vocabulary mapping
+for an old EAGLE3 checkpoint. Only legacy
 `--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
 rejects it and uses `--target-model` for import validation and configuration.
 `--format` is not needed. Use `--converter sglang` for canonical serving export.
@@ -89,9 +90,10 @@ loading rejects a serving artifact.
 
 Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
 GQA/MHA or MLA, and explicit supported RoPE settings. Layer-specific values are
-accepted only where SGLang can express them. In particular, mixed causality,
-different head geometry across layers and window=1 fail instead of using SGLang
-defaults. Noncausal sliding windows must cover at least one model block.
+accepted only where SGLang can express them. Mixed causality is supported only
+for causal sliding layers with bidirectional full layers; `is_causal: null` selects
+that SGLang rule. Different head geometry across layers and window=1 are rejected.
+Noncausal sliding windows must cover at least one model block.
 The pinned converter rejects muP targets for DFlash2/Domino and offset RMSNorm
 for DSpark because their serving paths do not implement those computations. Unsupported component kinds and binding
 sets also fail. The pinned DSpark implementation chooses confidence-head use
@@ -106,8 +108,9 @@ prefixes are removed for serving, vocabulary readiness is validated rather than
 serialized, and Domino uses SGLang's registered DFlash architecture name. These
 are format changes; tensors are not cast or transformed.
 
-Native export checks target computation fields against the draft, adds missing
-fields, and rejects conflicting values. It rewrites shards containing old `mtp.*`
+Native export requires explicit target computation fields, checks them against
+the draft, and preserves the target configuration. Missing or conflicting fields
+are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
 tensors and links unaffected shards. `--copy-target` copies unaffected shards for
 a self-contained directory. Embedding/head copies are written under native names;
 SGLang's worker also attaches the target token modules. The target is not modified.

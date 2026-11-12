@@ -143,7 +143,7 @@ class SGLangExportTest(unittest.TestCase):
             },
             layer_types=("full_dense", "causal"),
         )
-        with self.assertRaisesRegex(ValueError, "per-layer"):
+        with self.assertRaisesRegex(ValueError, "mixed causality"):
             convert_config(mixed)
         for config in configurations():
             if config.architecture in {
@@ -206,9 +206,11 @@ class SGLangExportTest(unittest.TestCase):
                 root = Path(tmp)
                 target = root / "target"
                 tables = write_target(target)
-                # Target metadata is independent of the converter, with HF defaults omitted.
+                # Target computation fields are explicit and independent of the converter.
                 payload = dict(
                     model_type="qwen3_5_text",
+                    hidden_act="silu",
+                    attn_output_gate=False,
                     hidden_size=32,
                     vocab_size=64,
                     intermediate_size=64,
@@ -259,6 +261,10 @@ class SGLangExportTest(unittest.TestCase):
                 restored = TensorStore(root / "served")
                 exported = json.loads((root / "served" / "config.json").read_text())
                 self.assertEqual(exported["specforge_artifact"], artifact_metadata())
+                self.assertEqual(
+                    {k: v for k, v in exported.items() if k != "specforge_artifact"},
+                    payload,
+                )
                 self.assertFalse((root / "served" / "artifact.json").exists())
                 with self.assertRaisesRegex(ValueError, "serving-only"):
                     read_draft(root / "served")
@@ -289,6 +295,34 @@ class SGLangExportTest(unittest.TestCase):
                     {"target.weight", *old_native},
                 )
                 if not copy:
+                    for path in (
+                        ("attn_output_gate",),
+                        ("hidden_act",),
+                        ("rms_norm_eps",),
+                        ("rope_parameters", "rope_theta"),
+                        ("rope_parameters", "partial_rotary_factor"),
+                    ):
+                        changed = json.loads(json.dumps(payload))
+                        parent = changed if len(path) == 1 else changed[path[0]]
+                        del parent[path[-1]]
+                        (target / "config.json").write_text(json.dumps(changed))
+                        with (
+                            self.subTest(missing=path),
+                            patch.object(
+                                TensorStore,
+                                "read",
+                                side_effect=AssertionError("read before preflight"),
+                            ),
+                            self.assertRaisesRegex(ValueError, path[-1]),
+                        ):
+                            export_native(
+                                config,
+                                convert_config(config),
+                                state,
+                                target,
+                                root / "bad",
+                            )
+                    (target / "config.json").write_text(json.dumps(payload))
                     for changed, error in (
                         (
                             {k: v for k, v in state.items() if k != "fc.weight"},

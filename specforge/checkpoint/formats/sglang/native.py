@@ -43,20 +43,24 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         "num_key_value_heads",
         "head_dim",
         "max_position_embeddings",
-        "partial_rotary_factor",
         "attn_output_gate",
-        "is_causal",
     ):
         require(
-            name not in text or text[name] == fields[name],
-            f"target {name} disagrees with draft",
+            name in text and text[name] == fields[name],
+            f"target {name} must be explicit and match draft",
         )
-        text[name] = fields[name]
-    rope = fields["rope_parameters"]
+    require(
+        text.get("is_causal", True) == fields["is_causal"],
+        "target is_causal disagrees with draft",
+    )
     attention = config.attention_configs[
         config.layer_configs[config.layer_types[0]].attention
     ]
     expected_rope = attention.rope_parameters or config.rope_parameters
+    require(
+        text.get("rope_parameters") is not None or text.get("rope_scaling") is not None,
+        "target must state rope_parameters or rope_scaling",
+    )
     for key in ("rope_parameters", "rope_scaling"):
         if text.get(key) is not None:
             values = dict(text[key])
@@ -71,21 +75,19 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
                 values["rope_type"] = "mrope"
             if values["rope_type"] == "mrope":
                 values.setdefault("mrope_interleaved", False)
-            values.setdefault(
-                "rope_theta", text.get("rope_theta", fields["rope_theta"])
-            )
-            values.setdefault("partial_rotary_factor", fields["partial_rotary_factor"])
+            for name in ("rope_theta", "partial_rotary_factor"):
+                value = values.get(name, text.get(name))
+                require(value is not None, f"target {key}.{name} must be explicit")
+                require(
+                    name not in text or text[name] == value,
+                    f"target {key}.{name} disagrees with top-level {name}",
+                )
+                values[name] = value
             values.setdefault("interleaved", False)
             require(
                 decode_component("rope", values) == expected_rope,
                 f"target {key} disagrees with draft",
             )
-    require(
-        "rope_theta" not in text or text["rope_theta"] == fields["rope_theta"],
-        "target rope_theta disagrees with draft",
-    )
-    text["rope_parameters"] = rope
-    text["rope_theta"] = fields["rope_theta"]
     store = TensorStore(source)
     require(
         all(path.suffix == ".safetensors" for path in store.files.values()),
