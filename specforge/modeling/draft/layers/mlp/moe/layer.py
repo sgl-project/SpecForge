@@ -6,6 +6,7 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.mlp import MoEFFNSpec
 
+from ...inputs import ExpertChoice, MoEOutput
 from ...layout import ComponentLayout, StackedParameter
 from ...registry import register_component_builder, register_component_layout
 from .experts import RoutedExperts, SharedExpert
@@ -70,7 +71,8 @@ class MoEFFN(nn.Module):
             else None
         )
 
-    def forward(self, hidden: Tensor) -> Tensor:
+    def forward(self, hidden: Tensor) -> MoEOutput:
+        """The stream update in `hidden`'s shape, typed together with the expert choice."""
         x = hidden.reshape(-1, hidden.shape[-1])
         scores, indices, weights = self.gate(x)
         out = self.experts(x, indices, weights, kernel=self.experts_kernel)
@@ -80,7 +82,8 @@ class MoEFFN(nn.Module):
                 shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
             out = out + shared
         # The routed sum is fp32; cast back once, after adding the shared expert.
-        return out.to(hidden.dtype).view(hidden.shape)
+        update = out.to(hidden.dtype).view(hidden.shape)
+        return MoEOutput(update=update, expert_choice=ExpertChoice(indices))
 
 
 register_component_builder("mlp", MoEFFNSpec, MoEFFN)

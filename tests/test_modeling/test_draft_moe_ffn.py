@@ -23,6 +23,7 @@ from specforge.config.draft.mlp import (
     MoERouterSpec,
 )
 from specforge.modeling.draft.layers import build_component, component_layout
+from specforge.modeling.draft.layers.inputs import ExpertChoice, MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels
 from specforge.modeling.draft.layers.layout import join, split
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, DenseFFN, MoEFFN
@@ -83,6 +84,8 @@ class MoEFFNTest(unittest.TestCase):
     def _run(module, x, upstream):
         inputs = x.detach().clone().requires_grad_()
         output = module(inputs)
+        if isinstance(output, MoEOutput):
+            output = output.update
         output.backward(upstream)
         grads = {name: p.grad for name, p in module.named_parameters()}
         return output.detach(), inputs.grad, grads
@@ -371,6 +374,26 @@ class MoEFFNTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown experts kernel 'nope'"):
             aligned[0].experts.probe_kernel("nope")
 
+    def test_forward_returns_the_typed_update_with_its_expert_choice(self):
+        module = MoEFFN(qwen_spec(), hidden_size=H)
+        with torch.no_grad():
+            for parameter in module.parameters():
+                parameter.normal_(std=0.2)
+        x = torch.randn(2, 5, H)
+        for training in (True, False):
+            with self.subTest(training=training):
+                module.train(training)
+                output = module(x)
+                self.assertIsInstance(output, MoEOutput)
+                self.assertEqual(tuple(output.update.shape), (2, 5, H))
+                self.assertEqual(output.update.dtype, torch.float32)
+                self.assertIsInstance(output.expert_choice, ExpertChoice)
+                indices = output.expert_choice.expert_ids
+                self.assertEqual(tuple(indices.shape), (10, 2))
+                self.assertEqual(indices.dtype, torch.long)
+                self.assertFalse(indices.requires_grad)
+                self.assertTrue(torch.equal(indices, module.gate(x.reshape(-1, H))[1]))
+
     def test_generic_base_initializes_from_golden_config(self):
         owner = DFlashDraftModel(model_config(initializer_range=0))
         node = qwen_spec(router=router_spec(expert_bias=True))
@@ -410,7 +433,7 @@ class MoEFFNTest(unittest.TestCase):
         rebuilt = join(MOE_LAYOUT, node, parts)
         for key, value in fused.items():
             self.assertTrue(torch.equal(rebuilt[key], value), key)
-        output = module(torch.randn(2, 3, H, dtype=torch.float32))
+        output = module(torch.randn(2, 3, H, dtype=torch.float32)).update
         self.assertEqual(
             (tuple(output.shape), output.dtype), ((2, 3, H), torch.float32)
         )

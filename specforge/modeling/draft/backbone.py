@@ -141,8 +141,16 @@ class DraftBackbone(nn.Module):
             raise ValueError("finalize requires every layer to have run")
         return self.final_norm(self.residual.reduce(state.hidden))
 
-    def forward(self, hidden: Tensor, layer_inputs: Sequence[LayerInputs]) -> Tensor:
+    def forward_with_layer_outputs(
+        self, hidden: Tensor, layer_inputs: Sequence[LayerInputs]
+    ) -> tuple[Tensor, tuple[LayerOutput | None, ...]]:
+        """The sequential forward, also returning each layer's typed output."""
         state = self.begin(hidden, layer_inputs)
+        outputs = []
         for _ in self.layers:
             state = self.run_next_layer(state)
-        return self.finalize(state)
+            outputs.append(state.layer_output)
+        return self.finalize(state), tuple(outputs)
+
+    def forward(self, hidden: Tensor, layer_inputs: Sequence[LayerInputs]) -> Tensor:
+        return self.forward_with_layer_outputs(hidden, layer_inputs)[0]

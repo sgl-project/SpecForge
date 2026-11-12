@@ -41,3 +41,25 @@ class LayerOutput:
     """A layer's hidden result; specialized stages may add typed tensor fields."""
 
     hidden: Tensor
+
+
+@dataclass(frozen=True, eq=False)
+class ExpertChoice:
+    """One MoE layer's expert choice, carried out of the forward for balancing."""
+
+    expert_ids: Tensor  # [tokens, top_k] chosen experts
+
+
+@dataclass(frozen=True, eq=False)
+class MoEOutput:
+    """A MoE FFN's stream update together with its expert choice."""
+
+    update: Tensor
+    expert_choice: ExpertChoice
+
+
+@dataclass(frozen=True, eq=False)
+class MoELayerOutput(LayerOutput):
+    """A decoder layer whose FFN routed: the hidden result plus its expert choice."""
+
+    expert_choice: ExpertChoice

@@ -26,7 +26,7 @@ from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
-from specforge.modeling.draft.layers.inputs import LayerInputs
+from specforge.modeling.draft.layers.inputs import LayerInputs, MoELayerOutput
 from specforge.modeling.draft.layers.residual import (
     ResidualConnection,
     StandardResidual,
@@ -45,6 +45,7 @@ def make_layer(
     dtype=torch.float32,
     convolution=False,
     connections=None,
+    mlp_node=None,
 ):
     conv_node = GroupedCausalConvSpec(kernel_size=3, group_size=4)
     convolutions = (
@@ -66,7 +67,7 @@ def make_layer(
         build(node, rotary_dim=rotary_dim, offset=offset, device=device, dtype=dtype),
         build_component(
             "mlp",
-            DenseFFNSpec(intermediate_size=32, hidden_act="silu"),
+            mlp_node or DenseFFNSpec(intermediate_size=32, hidden_act="silu"),
             hidden_size=16,
             device=device,
             dtype=dtype,
@@ -368,6 +369,93 @@ class DecoderTest(unittest.TestCase):
                 self.assertTrue(
                     all(entry.position_embeddings is None for entry in entries)
                 )
+
+    def test_moe_layers_return_their_expert_choice_through_the_backbone(self):
+        from tests.test_modeling.test_draft_moe_ffn import moe_spec
+
+        layers = [
+            make_layer(make_node(sliding_window=2), mlp_node=moe_spec()),
+            make_layer(
+                make_node(rope_parameters=NoRoPESpec(), is_causal=False), rotary_dim=0
+            ),
+        ]
+        base = DraftBackbone(
+            layers,
+            final_norm=build_component(
+                "norm",
+                RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
+                hidden_size=16,
+            ),
+            rotary=[
+                build_rotary(
+                    DefaultRoPESpec(
+                        interleaved=False, rope_theta=10000.0, partial_rotary_factor=1.0
+                    ),
+                    head_dim=8,
+                ),
+                None,
+            ],
+            residual=StandardResidual(StandardResidualSpec()),
+        )
+        with torch.no_grad():
+            for parameter in base.parameters():
+                parameter.normal_(std=0.1)
+        hidden_base = torch.randn(1, 3, 16)
+        context_base = torch.randn(1, 2, 16)
+        expected, choices = None, []
+        for mode, checkpointed in (
+            ("forward", False),
+            ("outputs", False),
+            ("manual", False),
+            ("outputs", True),
+        ):
+            model = copy.deepcopy(base)
+            model.gradient_checkpointing = checkpointed
+            hidden = hidden_base.clone().requires_grad_()
+            context = context_base.clone().requires_grad_()
+            layout = layout_for(hidden, 2)
+            with AttentionPreparationScope() as scope:
+                entries = [
+                    LayerInputs(
+                        attention=layer.self_attn.prepare(layout, scope, batch_size=1),
+                        target_context=context,
+                        position_ids=layout.key_positions,
+                    )
+                    for layer in model.layers
+                ]
+            torch.manual_seed(43)  # the test nodes use attention dropout
+            if mode == "manual":
+                state = model.begin(hidden, entries)
+                outputs = []
+                for _ in layers:
+                    state = model.run_next_layer(state)
+                    outputs.append(state.layer_output)
+                output = model.finalize(state)
+            elif mode == "outputs":
+                output, outputs = model.forward_with_layer_outputs(hidden, entries)
+            else:
+                output, outputs = model(hidden, entries), None
+            if outputs is not None:
+                # The MoE layer hands its choice up typed; the dense layer adds none.
+                self.assertIsInstance(outputs[0], MoELayerOutput)
+                self.assertIsNone(outputs[1])
+                self.assertEqual(
+                    tuple(outputs[0].expert_choice.expert_ids.shape), (3, 2)
+                )
+                choices.append(outputs[0].expert_choice.expert_ids)
+            output.square().sum().backward()
+            result = [
+                output.detach(),
+                hidden.grad,
+                context.grad,
+                *(parameter.grad for parameter in model.parameters()),
+            ]
+            self.assertTrue(all(value is not None for value in result))
+            if expected is None:
+                expected = result
+            else:
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        self.assertTrue(all(torch.equal(first, choices[0]) for first in choices))
 
     def test_connections_own_stream_reads_writes_and_checkpoint_gradients(self):
         from torch.utils.checkpoint import checkpoint

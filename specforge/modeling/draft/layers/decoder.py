@@ -6,7 +6,7 @@ from specforge.config.draft._validation import positive_int
 from specforge.config.draft.norm import NormSpec
 
 from .attention.backends import PreparedAttention
-from .inputs import LayerInputs
+from .inputs import ExpertChoice, LayerInputs, MoELayerOutput, MoEOutput
 from .registry import build_component
 from .residual import ResidualConnection
 
@@ -72,7 +72,8 @@ class DecoderLayer(nn.Module):
             "norm", norm, hidden_size=hidden_size, device=device, dtype=dtype
         )
 
-    def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
+    def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor | MoELayerOutput:
+        """The stream, or with a MoE FFN the typed layer output with its expert choice."""
         if not isinstance(inputs, LayerInputs):
             raise TypeError("DecoderLayer requires LayerInputs")
         if not isinstance(inputs.attention, PreparedAttention):
@@ -80,7 +81,20 @@ class DecoderLayer(nn.Module):
         hidden = self.attention_connection(
             hidden, lambda stream: self._attention_update(stream, inputs)
         )
-        return self.mlp_connection(hidden, self._mlp_update)
+        choices: list[ExpertChoice] = []
+
+        def mlp_update(stream: Tensor) -> Tensor:
+            update, choice = self._mlp_update(stream)
+            if choice is not None:
+                choices.append(choice)
+            return update
+
+        hidden = self.mlp_connection(hidden, mlp_update)
+        if not choices:
+            return hidden
+        if len(choices) > 1:
+            raise ValueError("a MoE FFN needs a residual connection that calls it once")
+        return MoELayerOutput(hidden=hidden, expert_choice=choices[0])
 
     def _check_stream(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
@@ -111,12 +125,14 @@ class DecoderLayer(nn.Module):
             update = self.attention_conv.finish(update, coefficients)
         return self._check_update(update, hidden, "attention")
 
-    def _mlp_update(self, hidden: Tensor) -> Tensor:
+    def _mlp_update(self, hidden: Tensor) -> tuple[Tensor, ExpertChoice | None]:
         self._check_stream(hidden)
         update = self.post_attention_layernorm(hidden)
         if self.mlp_conv is not None:
             update, coefficients = self.mlp_conv.prepare(update)
-        update = self.mlp(update)
+        result = self.mlp(update)
+        choice = result.expert_choice if isinstance(result, MoEOutput) else None
+        update = result.update if choice is not None else result
         if self.mlp_conv is not None:
             update = self.mlp_conv.finish(update, coefficients)
-        return self._check_update(update, hidden, "mlp")
+        return self._check_update(update, hidden, "mlp"), choice
