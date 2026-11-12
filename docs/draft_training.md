@@ -236,7 +236,8 @@ legacy defaults produce a warning and do not enable those optimizations.
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
 path. Neither is copied into the other. A canonical checkpoint supplied through
 `training.resume_from` also selects the canonical training route. Legacy DSpine
-imports must explicitly match saved training settings in `training.objective_options`.
+imports through `initialization.checkpoint` must explicitly match saved training
+settings in `training.objective_options`; `weights_from` copies weights only.
 
 
 ### Canonical training requirements
@@ -262,7 +263,9 @@ Canonical parsing, training and capture read target metadata from the same raw
 not added to the canonical configuration.
 
 Parameters frozen by `training.frozen` or an objective must have loaded weights:
-a complete checkpoint, `weights_from`, `from_target`, or a target binding.
+a complete checkpoint, `weights_from`, `from_target`, or a target binding. An
+objective's frozen head that the draft disables (DSpark's confidence head at
+`confidence_loss_alpha: 0`) needs none.
 Freezing a newly initialized parameter fails before model allocation; partial
 imports must cover every frozen parameter, including tied aliases.
 
