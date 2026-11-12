@@ -20,6 +20,9 @@ is identified by `model_type: specforge_draft` and its schema, not by the class
 name alone. `auto_map` selects the bundled implementation for Transformers.
 HF code bundling currently supports in-tree SpecForge architectures only; external
 architectures and ambiguous flattened module names are rejected before publication.
+Bundled code may import only torch, transformers and the standard library, so loading
+by Hub repo id needs nothing else; optional packages such as flash-attn are imported
+inside `try`, only when their backend is selected.
 
 A historical checkpoint needs `--target-model TARGET`, and also
 `--draft-config OLD.json` when it has no `config.json`. The target configuration

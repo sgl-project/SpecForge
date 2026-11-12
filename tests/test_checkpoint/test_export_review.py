@@ -165,3 +165,30 @@ class ExportReviewTest(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(ValueError, error):
                         bundle_code(output, cls)
+
+    def test_bundler_keeps_optional_imports_out_of_standalone_requirements(self):
+        cases = {
+            "def f():\n    import flash_attn\nclass Model: pass": "flash_attn",
+            "def f():\n    try:\n        import flash_attn\n"
+            "    except ImportError:\n        raise\nclass Model: pass": None,
+        }
+        for source, error in cases.items():
+            with self.subTest(error=error), TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "modeling/draft").mkdir(parents=True)
+                (root / "modeling/draft/hf_config.py").write_text(
+                    "import torch\nclass SpecForgeDraftConfig: pass"
+                )
+                (root / "model.py").write_text(source)
+                output = root / "output"
+                output.mkdir()
+                cls = SimpleNamespace(__module__="specforge.model", __name__="Model")
+                with patch(
+                    "specforge.checkpoint.formats.hf.__file__",
+                    str(root / "checkpoint/formats/hf.py"),
+                ):
+                    if error is None:
+                        bundle_code(output, cls)
+                    else:
+                        with self.assertRaisesRegex(ValueError, error):
+                            bundle_code(output, cls)

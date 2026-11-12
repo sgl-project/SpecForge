@@ -2,7 +2,10 @@
 
 import ast
 import importlib.util
+import sys
 from pathlib import Path
+
+_STANDALONE_IMPORTS = frozenset({"torch", "transformers", *sys.stdlib_module_names})
 
 
 def bundle_code(directory, model_class):
@@ -71,7 +74,9 @@ def bundle_code(directory, model_class):
                 raise ValueError(f"use explicit module imports in {module}")
             pending.append(target)
             node.module, node.level = filename(target), 1
-        (directory / f"{filename(module)}.py").write_text(ast.unparse(tree) + "\n")
+        path = directory / f"{filename(module)}.py"
+        path.write_text(ast.unparse(tree) + "\n")
+        _require_standalone_imports(path)
     (directory / "draft_model.py").write_text(
         "from .specforge_modeling_draft_hf_config import SpecForgeDraftConfig\n"
         f"from .{filename(model_class.__module__)} import {model_class.__name__}\n"
@@ -83,3 +88,15 @@ def bundle_code(directory, model_class):
         "AutoModel": f"draft_model.{model_class.__name__}",
         "AutoModelForCausalLM": f"draft_model.{model_class.__name__}",
     }
+
+
+def _require_standalone_imports(path):
+    from transformers.dynamic_module_utils import get_imports
+
+    # a Hub load refuses remote code whose imports are missing, unless inside try
+    missing = sorted(set(get_imports(path)) - _STANDALONE_IMPORTS)
+    if missing:
+        raise ValueError(
+            f"{path.name} imports {missing}; bundled code may import only torch, "
+            "transformers and the standard library, or optional packages inside try"
+        )
