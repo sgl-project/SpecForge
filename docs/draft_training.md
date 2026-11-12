@@ -237,6 +237,17 @@ of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
 device. Startup probes the chosen kernel on every MoE layer and fails rather
 than falling back; the choice is recorded in the training resume contract.
 
+A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
+holds the expert count, top-k, per-expert `intermediate_size`, an optional
+`shared_expert` (gated as in Qwen and DeepSeek, or a non-gated `relu2` MLP) with
+an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
+`sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
+that shifts the choice only. Experts are stored fused (`experts.gate_up_proj`,
+`experts.down_proj`) and export under Transformers' per-expert tensor names.
+`configs/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft whose
+every FFN is a MoE of 8 experts with top-1 routing. Load balancing (expert-bias
+updates and the auxiliary loss) is not wired yet, so the bias stays zero.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,
