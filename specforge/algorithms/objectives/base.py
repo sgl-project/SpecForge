@@ -160,6 +160,11 @@ class ObjectiveModel(nn.Module):
         for key in ("hidden_states", "mtp_hidden_states"):
             if key in batch:
                 batch[key] = batch[key].to(dtype=dtype)
+        if self.target_head is not None and "target_last_hidden_states" in batch:
+            # the teacher projects in its head's dtype, whatever the records hold
+            batch["target_last_hidden_states"] = batch["target_last_hidden_states"].to(
+                dtype=self.target_head.weight.dtype
+            )
         from .execution import execute_batch
 
         prepared = self.objective(
