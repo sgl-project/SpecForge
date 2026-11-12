@@ -72,6 +72,10 @@ class DSpineDraftModel(DraftPreTrainedModel):
         init.zeros_(self.transfer_codes)
         init.zeros_(self.transfer_ready)
 
+    def validate_own_export_state(self, state) -> None:
+        if not bool(state["transfer_ready"]):
+            raise ValueError("transfer_ready: serving state is not initialized")
+
     def finalize_initialization(self, *, loaded_keys: frozenset[str]) -> None:
         transfer_keys = {"transfer_codes", "transfer_ready"} | {
             f"injection.readouts.{name}"

@@ -75,7 +75,11 @@ class CanonicalReviewTest(unittest.TestCase):
 
             def save(state, destination):
                 self.assertEqual(
-                    json.loads((path / "config.json").read_text()), {"a": 1}
+                    json.loads((path / "config.json").read_text()),
+                    {
+                        "a": 1,
+                        "specforge_artifact": {"format": "specforge", "version": 1},
+                    },
                 )
                 return original(state, destination)
 

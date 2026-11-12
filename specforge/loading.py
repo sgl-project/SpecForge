@@ -53,6 +53,20 @@ def _check_bound_copies(checkpoint, preview, plan):
             )
 
 
+def check_bound_copies(checkpoint, *, target, cache_dir=None):
+    """Reject legacy copies of bound tables that differ from the target."""
+    if not checkpoint.bound_copies:
+        return
+    preview = build_draft_model(checkpoint.config, device="meta")
+    bindings = resolve_bindings(
+        checkpoint.config,
+        _target_store(target, checkpoint.config, None, cache_dir),
+        _target_config(target, cache_dir),
+    )
+    plan = make_weight_plan(preview, checkpoint.weights, bindings=bindings)
+    _check_bound_copies(checkpoint, preview, plan)
+
+
 def read_draft(
     source,
     *,

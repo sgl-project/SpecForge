@@ -588,11 +588,11 @@ class TestCliLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "environment is incomplete"):
                 _bootstrap_single_process_env()
 
-    def test_hf_export_dispatches_through_shared_cli(self):
+    def test_legacy_hf_export_dispatches_through_shared_cli(self):
         calls = []
-        module = types.ModuleType("specforge.export.to_hf")
+        module = types.ModuleType("specforge.export.legacy_hf")
         module.export_to_hf = lambda *args, **kwargs: calls.append((args, kwargs))
-        with mock.patch.dict(sys.modules, {"specforge.export.to_hf": module}):
+        with mock.patch.dict(sys.modules, {"specforge.export.legacy_hf": module}):
             self.assertEqual(
                 main(
                     [
@@ -639,7 +639,7 @@ class TestCliLifecycle(unittest.TestCase):
             )
         self.assertEqual(status, 2)
         self.assertIn(
-            "--embedding-source is only valid with --to hf", stderr.getvalue()
+            "embedding options are only valid with --to hf", stderr.getvalue()
         )
         module.export_to_sglang.assert_not_called()
 

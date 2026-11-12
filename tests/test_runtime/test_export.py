@@ -219,7 +219,7 @@ class TestHFVocabMappingExport(unittest.TestCase):
             self.assertTrue(torch.equal(reloaded_weights[key], expected), key)
 
     def test_explicit_mapping_replaces_checkpoint_buffers(self):
-        from specforge.export import export_to_hf
+        from specforge.export.legacy_hf import export_to_hf
 
         for key in ("t2d", "d2t"):
             self.assertFalse(torch.equal(self.weights[key], self.replacement[key]))
@@ -232,13 +232,13 @@ class TestHFVocabMappingExport(unittest.TestCase):
         self._assert_export(self.replacement)
 
     def test_no_override_preserves_checkpoint_buffers(self):
-        from specforge.export import export_to_hf
+        from specforge.export.legacy_hf import export_to_hf
 
         export_to_hf(self.checkpoint, self.cfg_path, self.output)
         self._assert_export(self.weights)
 
     def test_explicit_mapping_restores_legacy_checkpoint_buffers(self):
-        from specforge.export import export_to_hf
+        from specforge.export.legacy_hf import export_to_hf
 
         self._save_checkpoint(
             {
@@ -385,7 +385,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
             self.assertTrue(torch.equal(served[key], value), key)
 
     def test_to_hf_reloads_checkpoint_precision_by_default(self):
-        from specforge.export import export_to_hf
+        from specforge.export.legacy_hf import export_to_hf
         from specforge.modeling.auto import AutoDraftModel
 
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
@@ -474,7 +474,7 @@ class TestExporters(unittest.TestCase):
 
         from safetensors.torch import save_file
 
-        from specforge.export import export_to_hf
+        from specforge.export.legacy_hf import export_to_hf
         from specforge.modeling.auto import AutoDraftModel
 
         emb_src = os.path.join(self.workdir, "emb_src")
