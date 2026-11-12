@@ -362,3 +362,25 @@ class LoadingReviewTest(unittest.TestCase):
                 self.assertIn(
                     "training_state.pt", download.call_args.kwargs["allow_patterns"]
                 )
+
+    def test_tied_target_whose_config_omits_the_tie_flag(self):
+        """Diff-mode configs drop tie_word_embeddings when it equals the default."""
+        from specforge.checkpoint.target import TargetWeights
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            save_file(
+                {"model.embed_tokens.weight": torch.randn(64, 32)},
+                root / "model.safetensors",
+            )
+            for model_type, tied in (("gemma3_text", True), ("llama", False)):
+                with self.subTest(model_type=model_type):
+                    payload = {"model_type": model_type, "hidden_size": 32}
+                    (root / "config.json").write_text(json.dumps(payload))
+                    store = TargetWeights(root)
+                    if tied:
+                        key = store.resolve("lm_head").key
+                        self.assertEqual(key, "model.embed_tokens.weight")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "lm_head"):
+                            store.resolve("lm_head")

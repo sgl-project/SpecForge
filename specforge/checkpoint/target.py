@@ -59,7 +59,7 @@ def resolve_target_tensor(store, config, name):
         name == "lm_head"
         and not found
         and name not in overrides
-        and config.get("tie_word_embeddings") is True
+        and _ties_word_embeddings(config)
     ):
         found = candidates("embed_tokens")
     if len(found) != 1:
@@ -70,3 +70,15 @@ def resolve_target_tensor(store, config, name):
     ref = refs[found[0]]
     _validate_unquantized(name, ref)
     return ref
+
+
+def _ties_word_embeddings(config):
+    if "tie_word_embeddings" in config:
+        return config["tie_word_embeddings"] is True
+    # serialized configs omit values equal to the class default (Gemma ties)
+    from transformers import CONFIG_MAPPING
+
+    model_type = config.get("model_type")
+    return model_type in CONFIG_MAPPING and (
+        CONFIG_MAPPING[model_type]().tie_word_embeddings is True
+    )
