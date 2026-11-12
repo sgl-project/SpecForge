@@ -1552,24 +1552,36 @@ class Config(StrictConfigModel):
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
-    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+    """Apply dotted ``section.field=value`` overrides, re-validating the result.
+
+    Only the file's own fields and the overridden ones count as set afterwards.
+    Keys under an untyped mapping (``training.objective_options`` and the like)
+    may be new, and their values are parsed as YAML.
+    """
+    import yaml
+
+    raw = config.model_dump(exclude_unset=True)
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
-        node = raw
         keys = path.split(".")
+        owner, node = config, raw
         for key in keys[:-1]:
-            if not isinstance(node.get(key), dict):
+            owner = _override_field(owner, key, path)
+            if not isinstance(owner, (BaseModel, dict)):
                 raise ValueError(f"override path {path!r} does not exist")
+            if not isinstance(node.get(key), dict):
+                node[key] = (
+                    owner.model_dump(exclude_unset=True)
+                    if isinstance(owner, BaseModel)
+                    else dict(owner)
+                )
             node = node[key]
-        if keys[-1] not in node:
-            raise ValueError(f"override path {path!r} does not exist")
-        current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
-            import yaml
-
+        current = _override_field(owner, keys[-1], path)
+        untyped = isinstance(owner, dict)
+        structured = isinstance(current, (dict, list)) or current is None
+        if untyped or (structured and value.lstrip().startswith(("[", "{"))):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:
@@ -1578,6 +1590,14 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
     return Config.model_validate(raw)
+
+
+def _override_field(owner, key, path):
+    if isinstance(owner, BaseModel):
+        if key not in type(owner).model_fields:
+            raise ValueError(f"override path {path!r} does not exist")
+        return getattr(owner, key)
+    return owner.get(key)
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:

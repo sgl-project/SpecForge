@@ -584,6 +584,11 @@ specforge train -c ./my-run.yaml \
   'deployment.disaggregated.server_urls=["http://capture-0:30000"]'
 ```
 
+Keys under an untyped mapping such as `training.objective_options` may be new,
+and their values are parsed as YAML (`training.objective_options.num_anchors=64`
+passes an integer). An unset mapping takes a whole value:
+`'training.loss={kind: kl}'`.
+
 For deeper lifecycle and recovery semantics, see the
 [training guide](../../docs/sections/basic_usage/training.md) and
 [disaggregated training guide](../../docs/sections/basic_usage/disaggregated_training.md).

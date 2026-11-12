@@ -502,3 +502,13 @@ class CanonicalReviewTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "legacy full resume"):
                     resolve_run(Config.model_validate(raw))
                 read.assert_not_called()
+
+    def test_cli_overrides_do_not_warn_about_unset_legacy_options(self):
+        """apply_overrides marks every field set; only YAML values may warn."""
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = apply_overrides(
+                run_config(target, draft_config()), ["training.max_steps=2"]
+            )
+            with self.assertNoLogs("specforge.training.canonical", level="WARNING"):
+                resolve_run(cfg)

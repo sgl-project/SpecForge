@@ -1047,6 +1047,30 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             apply_overrides(cfg, ["not-an-assignment"])
 
+    def test_overrides_keep_unset_fields_and_parse_mapping_values(self):
+        """Typed CLI values must reach untyped option mappings; defaults stay unset."""
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "some/target"},
+                "data": MINIMAL["data"],
+                "draft": "draft.yaml",
+            }
+        )
+        out = apply_overrides(
+            cfg,
+            [
+                "training.objective_options.num_anchors=64",
+                "training.loss={kind: kl}",
+                "training.weighting={kind: exponential, gamma: 7.0}",
+            ],
+        )
+        self.assertEqual(out.training.objective_options, {"num_anchors": 64})
+        self.assertEqual(out.training.loss, {"kind": "kl"})
+        self.assertEqual(out.training.weighting, {"kind": "exponential", "gamma": 7.0})
+        self.assertNotIn("objective_chunk_blocks", out.training.model_fields_set)
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            apply_overrides(cfg, ["training.objective_options.a.b=1"])
+
     def test_load_config_applies_overrides(self):
         path = _write(MINIMAL, ".json")
         self.addCleanup(os.unlink, path)
