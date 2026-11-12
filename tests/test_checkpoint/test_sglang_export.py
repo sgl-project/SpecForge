@@ -2,6 +2,7 @@
 
 import json
 import unittest
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -261,7 +262,8 @@ class SGLangExportTest(unittest.TestCase):
                     json.dumps({"weight_map": index})
                 )
                 save_draft(model, root / "draft")
-                with self.assertWarnsRegex(FutureWarning, "export-mode native"):
+                with warnings.catch_warnings(record=True) as captured:
+                    warnings.simplefilter("always", FutureWarning)
                     export_to_sglang(
                         str(root / "draft"),
                         None,
@@ -269,6 +271,13 @@ class SGLangExportTest(unittest.TestCase):
                         target_model=str(target),
                         copy_target=copy,
                     )
+                self.assertTrue(
+                    any(
+                        issubclass(w.category, FutureWarning)
+                        and "export-mode native" in str(w.message)
+                        for w in captured
+                    )
+                )
                 restored = TensorStore(root / "served")
                 exported = json.loads((root / "served" / "config.json").read_text())
                 self.assertEqual(exported["specforge_artifact"], artifact_metadata())
