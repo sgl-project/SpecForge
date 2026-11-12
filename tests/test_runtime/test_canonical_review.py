@@ -1,5 +1,6 @@
 """Regression gates for canonical entry, evaluation and checkpoint publication."""
 
+import dataclasses
 import json
 import os
 import unittest
@@ -251,3 +252,50 @@ class CanonicalReviewTest(unittest.TestCase):
                 build_application_run(cfg).run()
                 build_application_run(Config.model_validate(raw)).run()
             self.assertTrue((root / "output" / "specforge-run-step2").is_dir())
+
+    def test_padded_target_vocabulary_sizes_the_teacher(self):
+        """A target that pads its tables gets a teacher with the padded rows."""
+        from safetensors.torch import save_file
+
+        from specforge.training.assembly import build_model_bundle
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            payload = json.loads((target / "config.json").read_text())
+            payload.update(vocab_size=60, padded_vocab_size=64)
+            (target / "config.json").write_text(json.dumps(payload))
+            save_file(
+                {
+                    "model.embed_tokens.weight": torch.randn(64, 32),
+                    "lm_head.weight": torch.randn(64, 32),
+                },
+                target / "model.safetensors",
+            )
+            resolved = resolve_run(
+                run_config(
+                    target,
+                    eagle_config(target_width=32),
+                    training={"attention_backend": "eager", "batch_size": 1},
+                )
+            )
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertEqual(bundle.target_head.weight.shape[0], 64)
+            self.assertEqual(bundle.target_vocab_size, 64)
+            narrow = dataclasses.replace(eagle_config(target_width=32), vocab_size=60)
+            resolved = resolve_run(
+                run_config(
+                    target,
+                    narrow,
+                    model={
+                        "target_model_path": str(target),
+                        "torch_dtype": "float32",
+                        "load_target_embedding": False,
+                    },
+                    training={"attention_backend": "eager", "batch_size": 1},
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "target logit width 64"):
+                build_model_bundle(resolved.config, algorithm=resolved.algorithm)

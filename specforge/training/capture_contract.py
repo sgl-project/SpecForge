@@ -39,7 +39,11 @@ def resolve_server_capture_contract(
     canonical = enabled(cfg)
     if canonical:
         target_cfg = training_target_config(cfg)
-        hidden_size, vocab_size = target_cfg["hidden_size"], target_cfg["vocab_size"]
+        from specforge.config.draft.codec.target import bound_vocab_size
+
+        hidden_size, vocab_size = target_cfg["hidden_size"], bound_vocab_size(
+            target_cfg
+        )
     else:
         target_cfg = target_text_config(
             load_target_config(

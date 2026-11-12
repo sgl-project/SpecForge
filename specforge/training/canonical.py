@@ -402,7 +402,10 @@ def build_bundle(cfg, algorithm):
     from specforge.algorithms.objectives import build_objective_model, resolve_objective
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
-    from specforge.config.draft.codec.target import resolve_target_logits
+    from specforge.config.draft.codec.target import (
+        bound_vocab_size,
+        resolve_target_logits,
+    )
     from specforge.config.schema import ModelConfig
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
@@ -481,12 +484,20 @@ def build_bundle(cfg, algorithm):
         else:
             teacher = BoundLMHead(
                 transform,
-                vocab_size=target["vocab_size"],
+                vocab_size=bound_vocab_size(target),
                 hidden_size=target["hidden_size"],
                 device=device,
                 dtype=dtype,
             )
             teacher.load_target_weight(target_weights.resolve("lm_head").read())
+    if teacher is not None and hasattr(model, "vocabulary"):
+        width = bound_vocab_size(target)
+        if model.vocabulary.vocab_size != width:
+            # t2d must cover every teacher logit column
+            raise ValueError(
+                f"draft vocab_size {model.vocabulary.vocab_size} must equal the "
+                f"target logit width {width} (padded_vocab_size when the target pads)"
+            )
     use_liger = cfg.model.use_liger_kernel is True
     configure_kernels(model, use_liger=use_liger)
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
@@ -537,7 +548,7 @@ def build_bundle(cfg, algorithm):
         draft_config=draft,
         target_head=teacher,
         target_hidden_size=target["hidden_size"],
-        target_vocab_size=target["vocab_size"],
+        target_vocab_size=bound_vocab_size(target),
         draft_vocab_size=draft.draft_vocab_size,
         capture_layers=capture_layers(cfg, draft, target),
         strategy_kwargs=StepRuntimeConfig(
