@@ -244,9 +244,10 @@ an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
 `sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
 that shifts the choice only. Experts are stored fused (`experts.gate_up_proj`,
 `experts.down_proj`) and export under Transformers' per-expert tensor names.
-`configs/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft whose
-every FFN is a MoE of 8 experts with top-1 routing. Load balancing (expert-bias
-updates and the auxiliary loss) is not wired yet, so the bias stays zero.
+`configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
+whose every FFN is a MoE of 8 experts with top-1 routing. Load balancing
+(expert-bias updates and the auxiliary loss) is not wired yet, so the bias stays
+zero.
 
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.

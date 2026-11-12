@@ -14,7 +14,7 @@ model:
   sglang_max_total_tokens: 65536
 
 # Canonical draft: two layers whose FFN is a MoE of 8 experts x 1536 with top-1 routing.
-draft: configs/qwen3-8b-moe-dspark.json
+draft: configs/canonical/qwen3-8b-moe-dspark.json
 
 data:
   train_data_path: ./cache/dataset/perfectblend_train_regen_temperature0_no_think.jsonl
