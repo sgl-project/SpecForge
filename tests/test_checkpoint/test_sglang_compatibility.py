@@ -22,8 +22,10 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
 from tests.test_checkpoint.test_sglang_export import serving_configs
 from tests.test_config.test_draft_mtp_spec import mtp_config
+from tests.test_modeling.test_canonical_dspark import model_config as dspark_config
 
 
 class ReadConfig(PretrainedConfig):
@@ -122,6 +124,8 @@ class SGLangCompatibilityTest(unittest.TestCase):
             )
             stack.enter_context(patch("sglang.srt.models.utils._is_cuda", False))
             configs = serving_configs()
+            configs.append(multi_axis_config(configs[-1]))
+            configs.append(dspark_config(bound=True, confidence=False))
             if torch.cuda.is_available():
                 base = mtp_config()
                 configs.append(
@@ -137,10 +141,21 @@ class SGLangCompatibilityTest(unittest.TestCase):
                         },
                     )
                 )
+            if torch.cuda.is_available():
+                configs.append(multi_axis_config(configs[-1], interleaved=True))
             stack.enter_context(patch("sglang.srt.models.qwen3_5._is_cuda", False))
             for config in configs:
                 with self.subTest(architecture=config.architecture):
-                    self._check_model(config)
+                    mode = (
+                        "static"
+                        if (
+                            config.architecture == "DSparkDraftModel"
+                            and config.spec_config.confidence is None
+                        )
+                        else "cap-accept"
+                    )
+                    with patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": mode}):
+                        self._check_model(config)
 
     def _check_model(self, config):
         from sglang.srt.layers.radix_attention import RadixAttention
@@ -276,7 +291,8 @@ class SGLangCompatibilityTest(unittest.TestCase):
                 )
             elif eagle:
                 batch = SimpleNamespace(
-                    spec_info=SimpleNamespace(hidden_states=features[0])
+                    spec_info=SimpleNamespace(hidden_states=features[0]),
+                    mrope_positions=positions.expand(3, -1),
                 )
                 expected, aux = served.model(
                     ids[0],
@@ -344,6 +360,9 @@ class SGLangCompatibilityTest(unittest.TestCase):
                     torch.zeros(*ids.shape, 64), token_ids=ids, hidden_states=hidden
                 )
                 torch.testing.assert_close(actual, torch.stack(bias, 1))
+                if model.confidence_head is None:
+                    self.assertIsNone(served.confidence_head)
+                    return
                 previous = model.markov_head.get_prev_embeddings(ids)
                 torch.testing.assert_close(
                     model.confidence_head(torch.cat([hidden, previous], -1)),

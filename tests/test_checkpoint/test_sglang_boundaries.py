@@ -6,11 +6,28 @@ from dataclasses import replace
 from specforge.checkpoint.formats.sglang import convert_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.logits import MuPLogitTransformSpec
+from specforge.config.draft.rope import MultiAxisRoPESpec
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
 from tests.test_modeling.test_canonical_domino import model_config as domino_config
 from tests.test_modeling.test_canonical_dspark import model_config as dspark_config
+from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
 from tests.test_modeling.test_draft_mla import mla_node
+
+
+def multi_axis_config(config, *, interleaved=False):
+    rope = config.rope_parameters
+    return replace(
+        config,
+        rope_parameters=MultiAxisRoPESpec(
+            interleaved=False,
+            rope_theta=rope.rope_theta,
+            partial_rotary_factor=rope.partial_rotary_factor,
+            mrope_section=(2, 1, 1),
+            mrope_interleaved=interleaved,
+        ),
+    )
 
 
 class ServingBoundariesTest(unittest.TestCase):
@@ -107,3 +124,36 @@ class ServingBoundariesTest(unittest.TestCase):
             fields["qk_rope_head_dim"],
             config.attention_configs["full"].qk_rope_head_dim,
         )
+
+    def test_multi_axis_and_static_dspark(self):
+        eagle = multi_axis_config(eagle_config(bound=True))
+        native = multi_axis_config(mtp_config(), interleaved=True)
+        native = replace(
+            native, norm_config=replace(native.norm_config, weight_offset=1)
+        )
+        for config in (eagle, native):
+            fields = convert_config(config)
+            self.assertEqual(fields["rope_parameters"]["rope_type"], "default")
+            self.assertEqual(fields["rope_parameters"]["mrope_section"], [2, 1, 1])
+            self.assertEqual(
+                fields["rope_parameters"]["mrope_interleaved"],
+                config.rope_parameters.mrope_interleaved,
+            )
+        fields = convert_config(dspark_config(bound=True, confidence=False))
+        self.assertFalse(fields["enable_confidence_head"])
+        self.assertFalse(fields["confidence_head_with_markov"])
+        with self.assertRaisesRegex(ValueError, "one layer"):
+            convert_config(replace(native, layer_types=native.layer_types * 2))
+        attention = next(iter(eagle.attention_configs.values()))
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            convert_config(
+                replace(
+                    eagle,
+                    attention_configs={
+                        name: replace(
+                            attention, num_attention_heads=3, num_key_value_heads=1
+                        )
+                        for name in eagle.attention_configs
+                    },
+                )
+            )

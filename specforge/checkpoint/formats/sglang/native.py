@@ -13,6 +13,7 @@ from specforge.checkpoint.initialization import resolve_bindings
 from specforge.checkpoint.resolve import resolve_directory
 from specforge.checkpoint.tensors import TensorStore
 from specforge.checkpoint.weight_plan import _validate_unquantized
+from specforge.config.draft.codec.components import decode_component
 
 from . import artifact_metadata
 from .converters import require
@@ -52,9 +53,28 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         )
         text[name] = fields[name]
     rope = fields["rope_parameters"]
+    attention = config.attention_configs[
+        config.layer_configs[config.layer_types[0]].attention
+    ]
+    expected_rope = attention.rope_parameters or config.rope_parameters
     for key in ("rope_parameters", "rope_scaling"):
         if text.get(key) is not None:
-            require(text[key] == rope, f"target {key} disagrees with draft")
+            values = dict(text[key])
+            kind = values.pop("type", "default")
+            values.setdefault("rope_type", kind)
+            if "mrope_section" in values and values["rope_type"] == "default":
+                values["rope_type"] = "mrope"
+            if values["rope_type"] == "mrope":
+                values.setdefault("mrope_interleaved", False)
+            values.setdefault(
+                "rope_theta", text.get("rope_theta", fields["rope_theta"])
+            )
+            values.setdefault("partial_rotary_factor", fields["partial_rotary_factor"])
+            values.setdefault("interleaved", False)
+            require(
+                decode_component("rope", values) == expected_rope,
+                f"target {key} disagrees with draft",
+            )
     require(
         "rope_theta" not in text or text["rope_theta"] == fields["rope_theta"],
         "target rope_theta disagrees with draft",

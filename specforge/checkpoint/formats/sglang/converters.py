@@ -12,6 +12,7 @@ from specforge.config.draft.rope import (
     DefaultRoPESpec,
     LinearRoPESpec,
     Llama3RoPESpec,
+    MultiAxisRoPESpec,
     YaRNSpec,
 )
 
@@ -67,10 +68,18 @@ def common(config, *, eagle=False, native=False):
     require(a.attention_dropout == 0, "attention_dropout must be zero for serving")
     rope = a.rope_parameters or config.rope_parameters
     require(
-        type(rope) in (DefaultRoPESpec, LinearRoPESpec, Llama3RoPESpec, YaRNSpec),
+        type(rope) in (DefaultRoPESpec, LinearRoPESpec, Llama3RoPESpec, YaRNSpec)
+        or ((eagle or native) and type(rope) is MultiAxisRoPESpec),
         f"RoPE kind {type(rope).__name__}",
     )
+    require(
+        not (eagle or native) or not rope.interleaved,
+        "EAGLE3/native MTP require half-split rotary pairing",
+    )
     scaling = asdict(rope) | {"rope_type": rope.rope_type}
+    scaling.pop("interleaved")
+    if type(rope) is MultiAxisRoPESpec:
+        scaling.update(rope_type="default", mrope_section=list(rope.mrope_section))
     if type(rope) is YaRNSpec:
         # SGLang multiplies its mscale ratio by attn_factor. Equal mscale
         # numerator/denominator makes that ratio one; retain MLA score scaling.
@@ -301,10 +310,6 @@ def dspark(config):
     result = context(config)
     spec = config.spec_config
     require(spec.markov is not None, "pinned DSpark requires a Markov head")
-    require(
-        spec.confidence is not None,
-        "pinned DSpark cannot disable its confidence head through config",
-    )
     result["architectures"] = ["DSparkDraftModel"]
     result["dspark_config"] = {}
     result.update(
@@ -322,8 +327,10 @@ def dspark(config):
     values = dict(
         markov_rank=spec.markov.rank,
         markov_head_type=spec.markov.type,
-        enable_confidence_head=True,
-        confidence_head_with_markov=spec.confidence.with_markov,
+        enable_confidence_head=spec.confidence is not None,
+        confidence_head_with_markov=(
+            spec.confidence.with_markov if spec.confidence is not None else False
+        ),
         gamma=spec.protocol.num_draft_tokens,
         sample_from_anchor=True,
         projector_type="dspark",
@@ -339,7 +346,11 @@ def eagle3(config):
         config.target_bindings == ("embed_tokens",),
         "EAGLE3 requires only embed_tokens bound",
     )
-    result, _, _ = common(config, eagle=True)
+    result, attention, _ = common(config, eagle=True)
+    require(
+        config.hidden_size % attention.num_attention_heads == 0,
+        "EAGLE3 hidden_size must be divisible by num_attention_heads",
+    )
     spec = config.spec_config
     result.update(
         architectures=["LlamaForCausalLMEagle3"],
@@ -383,8 +394,9 @@ def mtp(config):
         "native Qwen3.5 requires offset RMSNorm and full attention without biases",
     )
     require(
-        type(a.rope_parameters or config.rope_parameters) is DefaultRoPESpec,
-        "native Qwen3.5 currently supports default RoPE only",
+        type(a.rope_parameters or config.rope_parameters)
+        in (DefaultRoPESpec, MultiAxisRoPESpec),
+        "native Qwen3.5 supports default or multi-axis RoPE only",
     )
     result.update(attn_output_gate=a.output_gate)
     return result

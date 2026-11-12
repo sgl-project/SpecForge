@@ -72,9 +72,9 @@ loading rejects a serving artifact.
 | DFlash | `DFlashDraftModel`; both token tables bound to the target |
 | DFlash2 | `DFlash2DraftModel`, including convolution and selector |
 | Domino | `DFlashDraftModel` with explicit Domino projector settings |
-| DSpark | `DSparkDraftModel`; Markov and confidence heads required by this converter |
+| DSpark | `DSparkDraftModel`; Markov head required; confidence head optional in static mode |
 | EAGLE3 | `LlamaForCausalLMEagle3`; embedding bound, draft head owned |
-| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default RoPE |
+| MTP | Dense Qwen3.5 native merge-back; one layer, offset RMSNorm, default or multi-axis RoPE |
 | DSpine, DMTP, P-EAGLE | Rejected: this pinned SGLang has no matching serving implementation |
 
 Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
@@ -86,6 +86,9 @@ The pinned converter rejects muP targets for DFlash2/Domino and offset RMSNorm
 for DSpark because their serving paths do not implement those computations. Unsupported component kinds and binding
 sets also fail. The pinned DSpark implementation chooses confidence-head use
 through its ragged-verification runtime mode; `cap-accept` exercises that head.
+Drafts without a confidence head require `SGLANG_RAGGED_VERIFY_MODE=static`.
+EAGLE3 supports multi-axis RoPE for VL targets; native MTP uses equal text
+positions on all axes.
 
 Compared with historical exports, configuration fields such as causality, heads,
 rotary settings and block quantities are now written explicitly. Canonical module

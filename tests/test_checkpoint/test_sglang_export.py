@@ -118,7 +118,6 @@ class SGLangExportTest(unittest.TestCase):
             replace(base, target_bindings=(), target_logit_transform=None),
             replace(base, attention_configs={"full": replace(a, qk_norm=False)}),
             replace(base, attention_configs={"full": replace(a, output_gate=True)}),
-            dspark_config(bound=True, confidence=False),
         ]:
             with (
                 self.subTest(config=config),
@@ -176,7 +175,7 @@ class SGLangExportTest(unittest.TestCase):
             mtp_config(),
             norm_config=RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1),
         )
-        with self.assertRaisesRegex(ValueError, "default RoPE only"):
+        with self.assertRaisesRegex(ValueError, "default or multi-axis"):
             convert_config(
                 replace(
                     config,
