@@ -175,6 +175,21 @@ class CanonicalExportTest(unittest.TestCase):
                     restored.fusion.fc.weight, old.fc.weight, rtol=0, atol=0
                 )
 
+    def test_mixed_precision_export_does_not_inherit_a_source_dtype(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = draft_config(target_bindings=(), target_logit_transform=None)
+            model = build_draft_model(cfg).to(torch.bfloat16)
+            model.backbone.final_norm.float()
+            save_draft(model, root / "source")
+            payload = json.loads((root / "source" / "config.json").read_text())
+            (root / "source" / "config.json").write_text(
+                json.dumps(payload | {"dtype": "bfloat16"})
+            )
+            export_to_hf(str(root / "source"), None, str(root / "hf"))
+            config = json.loads((root / "hf" / "config.json").read_text())
+            self.assertIsNone(config.get("dtype"))  # not the stale "bfloat16"
+
     def test_legacy_bound_copy_must_match_the_target(self):
         from safetensors.torch import save_file
 

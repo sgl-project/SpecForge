@@ -116,5 +116,8 @@ def write_artifact(
         }
         if len(dtypes) == 1:
             payload["dtype"] = dtypes.pop()
+        else:
+            # mixed precision has no single dtype; never keep the source's
+            payload.pop("dtype", None)
         (staging / "config.json").write_text(json.dumps(payload, indent=2) + "\n")
         os.replace(staging, destination)
