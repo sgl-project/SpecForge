@@ -496,13 +496,15 @@ def build_bundle(cfg, algorithm):
         weights = init.weights_from if init else None
         from_target = dict(init.from_target or {}) if init else {}
         cast_copies = ()
+        # an explicit copy of the embedding, or of its tied alias, takes precedence
+        explicit = ("", "embed_tokens", "embed_tokens.weight") + (
+            ("lm_head", "lm_head.weight") if draft.tie_word_embeddings else ()
+        )
         if (
             weights is None
             and cfg.model.load_target_embedding
             and "embed_tokens" not in draft.target_bindings
-            and not any(
-                k in from_target for k in ("", "embed_tokens", "embed_tokens.weight")
-            )
+            and not any(k in from_target for k in explicit)
         ):
             from_target["embed_tokens.weight"] = target_weights.resolve(
                 "embed_tokens"

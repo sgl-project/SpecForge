@@ -531,3 +531,27 @@ class CanonicalReviewTest(unittest.TestCase):
                 contract = bundle.strategy_kwargs.resume_contract
                 contracts.append(contract["canonical_frozen"])
             self.assertEqual(contracts[0], contracts[1])
+
+    def test_explicit_copy_of_a_tied_alias_replaces_the_default_embedding_copy(self):
+        """from_target on a tied draft's lm_head already sets embed_tokens."""
+        from safetensors.torch import load_file
+
+        from specforge.training.assembly import build_model_bundle
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            draft = draft_config(
+                tie_word_embeddings=True,
+                target_bindings=(),
+                target_logit_transform=None,
+            )
+            cfg = run_config(
+                target,
+                draft,
+                initialization={"from_target": {"lm_head.weight": "lm_head.weight"}},
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            head = load_file(target / "model.safetensors")["lm_head.weight"]
+            embedding = bundle.draft_model.embed_tokens.weight.detach().cpu()
+            self.assertTrue(torch.equal(embedding, head))
