@@ -1,6 +1,5 @@
-"""Native Qwen3.5 merge-back; remove stale MTP tensors from physical shards."""
+"""Dispatch native exports and publish validated replacement weights."""
 
-import copy
 import json
 import os
 import shutil
@@ -10,92 +9,52 @@ from pathlib import Path
 from safetensors.torch import save_file
 
 from specforge.checkpoint.initialization import resolve_bindings
-from specforge.checkpoint.native import validate_qwen3_5_mtp
+from specforge.checkpoint.native import resolve_native_target
 from specforge.checkpoint.resolve import resolve_directory
 from specforge.checkpoint.tensors import TensorStore
 from specforge.checkpoint.weight_plan import _validate_unquantized
-from specforge.config.draft.codec.components import decode_component
 
 from . import artifact_metadata
 from .converters import require
 
 
-def export_native(config, fields, state, target, output, *, copy_target=False):
-    require(target is not None, "native MTP export requires --target-model")
+def export_native(config, state, target, output, *, copy_target=False):
+    require(target is not None, "native export requires --target-model")
     source = resolve_directory(target)
     payload = json.loads((source / "config.json").read_text())
-    payload = copy.deepcopy(payload)
     text = payload.get("text_config", payload)
-    require(
-        text.get("model_type") == "qwen3_5_text",
-        "native converter supports dense Qwen3.5 targets only",
-    )
+    native = resolve_native_target(config, text)
     require(
         not payload.get("quantization_config") and not text.get("quantization_config"),
         "native merge requires an unquantized target",
     )
-    validate_qwen3_5_mtp(config, text)
-    for name in (
-        "hidden_size",
-        "vocab_size",
-        "intermediate_size",
-        "hidden_act",
-        "rms_norm_eps",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "head_dim",
-        "max_position_embeddings",
-        "attn_output_gate",
-    ):
-        require(
-            name in text and text[name] == fields[name],
-            f"target {name} must be explicit and match draft",
-        )
-    require(
-        text.get("is_causal", True) == fields["is_causal"],
-        "target is_causal disagrees with draft",
-    )
-    attention = config.attention_configs[
-        config.layer_configs[config.layer_types[0]].attention
-    ]
-    expected_rope = attention.rope_parameters or config.rope_parameters
-    require(
-        text.get("rope_parameters") is not None or text.get("rope_scaling") is not None,
-        "target must state rope_parameters or rope_scaling",
-    )
-    for key in ("rope_parameters", "rope_scaling"):
-        if text.get(key) is not None:
-            values = dict(text[key])
-            for option in ("use_fope", "video_rope", "mrope_interleaved_glm"):
-                require(
-                    not values.pop(option, False),
-                    f"target {key}.{option} is unsupported",
-                )
-            kind = values.pop("type", "default")
-            values.setdefault("rope_type", kind)
-            if "mrope_section" in values and values["rope_type"] == "default":
-                values["rope_type"] = "mrope"
-            if values["rope_type"] == "mrope":
-                values.setdefault("mrope_interleaved", False)
-            for name in ("rope_theta", "partial_rotary_factor"):
-                value = values.get(name, text.get(name))
-                require(value is not None, f"target {key}.{name} must be explicit")
-                require(
-                    name not in text or text[name] == value,
-                    f"target {key}.{name} disagrees with top-level {name}",
-                )
-                values[name] = value
-            values.setdefault("interleaved", False)
-            require(
-                decode_component("rope", values) == expected_rope,
-                f"target {key} disagrees with draft",
-            )
+    native.validate(config, text)
+    native.export(config, state, source, payload, output, copy_target=copy_target)
+
+
+def write_native(
+    config,
+    weights,
+    source,
+    payload,
+    output,
+    *,
+    prefix,
+    binding_names,
+    optional_weights=(),
+    copy_target=False,
+):
+    """Replace a native weight subtree after metadata-only validation.
+
+    Family implementations supply the complete destination names and payload.
+    binding_names maps each draft binding to its destination checkpoint key.
+    """
+    text = payload.get("text_config", payload)
     store = TensorStore(source)
     require(
         all(path.suffix == ".safetensors" for path in store.files.values()),
         "native export requires safetensors target shards",
     )
-    weights = {"mtp." + key: value for key, value in state.items()}
     bindings = resolve_bindings(config, store, text)
     for name, ref in bindings.items():
         _validate_unquantized(name, ref)
@@ -105,17 +64,13 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         )
     shapes = {name: tuple(value.shape) for name, value in weights.items()}
     shapes.update(
-        {f"mtp.{name}.weight": ref.info.shape for name, ref in bindings.items()}
+        {binding_names[name]: ref.info.shape for name, ref in bindings.items()}
     )
     previous = {
-        name: info for name, info in store.metadata.items() if name.startswith("mtp.")
+        name: info for name, info in store.metadata.items() if name.startswith(prefix)
     }
     missing = previous.keys() - shapes.keys()
-    added = (
-        shapes.keys()
-        - previous.keys()
-        - {"mtp.embed_tokens.weight", "mtp.lm_head.weight"}
-    )
+    added = shapes.keys() - previous.keys() - set(optional_weights)
     require(
         not missing and not added,
         f"native weight coverage differs: missing={sorted(missing)}, unexpected={sorted(added)}",
@@ -126,7 +81,7 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
             f"native weight shape differs for {name}: {shapes[name]} != {info.shape}",
         )
     for name, ref in bindings.items():
-        weights[f"mtp.{name}.weight"] = ref.read()
+        weights[binding_names[name]] = ref.read()
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and (
@@ -142,7 +97,7 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
         files = set(store.files.values())
         for index, file in enumerate(sorted(files)):
             names = [name for name, path in store.files.items() if path == file]
-            retained = [name for name in names if not name.startswith("mtp.")]
+            retained = [name for name in names if not name.startswith(prefix)]
             if not retained:
                 continue
             filename = f"target-{index:05d}.safetensors"

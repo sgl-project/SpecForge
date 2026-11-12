@@ -317,19 +317,22 @@ class SGLangExportTest(unittest.TestCase):
                         ):
                             export_native(
                                 config,
-                                convert_config(config),
                                 state,
                                 target,
                                 root / "bad",
                             )
                     (target / "config.json").write_text(json.dumps(payload))
+                    state = model.state_dict()
                     for changed, error in (
                         (
-                            {k: v for k, v in state.items() if k != "fc.weight"},
+                            {k: v for k, v in state.items() if k != "fusion.fc.weight"},
                             "coverage",
                         ),
-                        (state | {"renamed.weight": state["fc.weight"]}, "coverage"),
-                        (state | {"fc.weight": torch.zeros(1)}, "shape"),
+                        (
+                            state | {"renamed.weight": state["fusion.fc.weight"]},
+                            "coverage",
+                        ),
+                        (state | {"fusion.fc.weight": torch.zeros(1)}, "shape"),
                     ):
                         with patch.object(
                             TensorStore,
@@ -339,7 +342,6 @@ class SGLangExportTest(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, error):
                                 export_native(
                                     config,
-                                    convert_config(config),
                                     changed,
                                     target,
                                     root / "bad",
@@ -368,7 +370,6 @@ class SGLangExportTest(unittest.TestCase):
                             with self.assertRaisesRegex(ValueError, "quantized"):
                                 export_native(
                                     config,
-                                    convert_config(config),
                                     state,
                                     target,
                                     root / "bad",

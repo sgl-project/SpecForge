@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import yaml
 
-from specforge.checkpoint.formats.sglang import convert_config
 from specforge.checkpoint.formats.sglang.native import export_native
 from specforge.checkpoint.native import validate_target_initialization
 from specforge.config.draft.codec import parse_draft
@@ -64,9 +63,7 @@ class NativeContractTest(unittest.TestCase):
                             changed, target=FIXTURE, from_target=NATIVE_MAPPING
                         )
                 with self.assertRaisesRegex(ValueError, "disagrees with draft"):
-                    export_native(
-                        changed, convert_config(changed), {}, FIXTURE, "unused"
-                    )
+                    export_native(changed, {}, FIXTURE, "unused")
                 # An embedding copy is not a claim to reproduce the native decoder.
                 validate_target_initialization(
                     changed,

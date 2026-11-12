@@ -5,6 +5,7 @@ import argparse
 from specforge.checkpoint.draft_dir import write_artifact
 from specforge.checkpoint.formats.sglang import artifact_metadata, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
+from specforge.checkpoint.native import is_native_architecture
 
 from .canonical import read_export
 
@@ -29,22 +30,21 @@ def export_to_sglang(
         target=target_model,
         vocab_mapping=vocab_mapping_path,
     )
-    fields = convert_config(checkpoint.config, hf_metadata=checkpoint.hf_metadata)
-    weights = serving_weights(checkpoint.config, state)
-    if checkpoint.config.architecture == "MTPDraftModel":
+    if is_native_architecture(checkpoint.config.architecture):
         from specforge.checkpoint.formats.sglang.native import export_native
 
         export_native(
             checkpoint.config,
-            fields,
-            weights,
+            state,
             target_model,
             output_dir,
             copy_target=copy_target,
         )
     else:
+        fields = convert_config(checkpoint.config, hf_metadata=checkpoint.hf_metadata)
+        weights = serving_weights(checkpoint.config, state)
         if copy_target:
-            raise ValueError("copy_target is only supported for native MTP export")
+            raise ValueError("copy_target is only supported for native export")
         dtypes = {
             str(t.dtype).removeprefix("torch.")
             for t in weights.values()

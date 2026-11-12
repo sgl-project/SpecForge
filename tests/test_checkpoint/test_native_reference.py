@@ -11,8 +11,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5TextRotaryEmbedding,
 )
 
-from specforge.checkpoint.formats.sglang import convert_config
-from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.checkpoint.formats.sglang.native import export_native
 from specforge.checkpoint.initialization import make_initialization_plan
 from specforge.checkpoint.tensors import TensorInfo, TensorStore
@@ -60,8 +58,7 @@ class NativeReferenceTest(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "tensor read"):
                 export_native(
                     config,
-                    convert_config(config),
-                    serving_weights(config, model.state_dict()),
+                    model.state_dict(),
                     FIXTURE,
                     "unused",
                 )
