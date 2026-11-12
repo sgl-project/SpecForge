@@ -64,7 +64,11 @@ class CanonicalExportTest(unittest.TestCase):
                     [sys.executable, "-I", str(script), str(root / "hf")],
                     capture_output=True,
                     text=True,
-                    env={**os.environ, "TORCHDYNAMO_DISABLE": "1"},
+                    env={
+                        **os.environ,
+                        "TORCHDYNAMO_DISABLE": "1",
+                        "HF_MODULES_CACHE": str(root / "modules"),
+                    },
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -95,6 +99,7 @@ class CanonicalExportTest(unittest.TestCase):
                     [sys.executable, "-I", str(script), str(root / "hf")],
                     capture_output=True,
                     text=True,
+                    env={**os.environ, "HF_MODULES_CACHE": str(root / "modules")},
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
