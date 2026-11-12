@@ -190,3 +190,64 @@ class CanonicalReviewTest(unittest.TestCase):
             _validate_imported_objective(
                 cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
             )
+
+    def test_scratch_embedding_key_survives_resume(self):
+        """A scratch run that needed model.embedding_key must resume with it."""
+        from safetensors.torch import save_file
+
+        from specforge.application.composition import build_application_run
+        from tests.test_algorithms.test_objectives import training_batch
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    "gloo",
+                    init_method=f"file://{root / 'rendezvous'}",
+                    rank=0,
+                    world_size=1,
+                )
+                self.addCleanup(torch.distributed.destroy_process_group)
+            target = target_directory(root)
+            save_file(
+                {
+                    "transformer.wte.weight": torch.randn(64, 32),
+                    "lm_head.weight": torch.randn(64, 32),
+                },
+                target / "model.safetensors",
+            )
+            draft = draft_config(target_bindings=(), target_logit_transform=None)
+            features = root / "features"
+            features.mkdir()
+            for index in range(2):
+                batch = training_batch(draft)
+                torch.save(
+                    {
+                        key: batch[key][0].detach()
+                        for key in ("input_ids", "loss_mask", "hidden_states")
+                    },
+                    features / f"{index}.ckpt",
+                )
+            cfg = run_config(
+                target,
+                draft,
+                model={
+                    "target_model_path": str(target),
+                    "torch_dtype": "float32",
+                    "embedding_key": "transformer.wte.weight",
+                },
+                training={
+                    "attention_backend": "eager",
+                    "max_steps": 1,
+                    "total_steps": 2,
+                    "save_interval": 1,
+                    "objective_options": {"num_anchors": 2},
+                },
+            )
+            raw = cfg.model_dump()
+            raw.update(draft=None, resume=str(root / "output" / "specforge-run-step1"))
+            raw["training"]["max_steps"] = 2
+            with patch.dict(os.environ, {"FSDP_SHARDING": "NO_SHARD"}):
+                build_application_run(cfg).run()
+                build_application_run(Config.model_validate(raw)).run()
+            self.assertTrue((root / "output" / "specforge-run-step2").is_dir())

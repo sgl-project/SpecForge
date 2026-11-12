@@ -248,16 +248,15 @@ def resolve_run(cfg, *, target_config=None):
     from specforge.config.schema import ModelConfig
 
     init = cfg.initialization
-    scratch = not cfg.resume_path and not (
-        init and (init.checkpoint or init.weights_from)
-    )
+    scratch = not (init and (init.checkpoint or init.weights_from))
     used_keys = {
         "lm_head_key": "lm_head" in draft.target_bindings or resolved.requires_teacher,
         "embedding_key": "embed_tokens" in draft.target_bindings
         or resolved.requires_teacher
         or (scratch and cfg.model.load_target_embedding),
     }
-    for field, used in used_keys.items():
+    # on resume the recorded model provenance pins both keys instead
+    for field, used in () if cfg.resume_path else used_keys.items():
         if (
             not used
             and getattr(cfg.model, field) != ModelConfig.model_fields[field].default
