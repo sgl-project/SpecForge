@@ -576,7 +576,7 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_use_liger_kernel": use_liger,
-        "canonical_frozen": tuple(cfg.training.frozen),
+        "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),
     }

@@ -512,3 +512,22 @@ class CanonicalReviewTest(unittest.TestCase):
             )
             with self.assertNoLogs("specforge.training.canonical", level="WARNING"):
                 resolve_run(cfg)
+
+    def test_frozen_order_does_not_change_the_resume_contract(self):
+        """The same frozen set in another order must still resume."""
+        from specforge.training.assembly import build_model_bundle
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            contracts = []
+            for frozen in (["lm_head", "embed_tokens"], ["embed_tokens", "lm_head"]):
+                training = {"attention_backend": "eager", "frozen": frozen}
+                resolved = resolve_run(
+                    run_config(target, draft_config(), training=training)
+                )
+                bundle = build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm
+                )
+                contract = bundle.strategy_kwargs.resume_contract
+                contracts.append(contract["canonical_frozen"])
+            self.assertEqual(contracts[0], contracts[1])
