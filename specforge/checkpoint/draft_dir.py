@@ -89,9 +89,9 @@ def write_artifact(
         staging = Path(tmp) / "artifact"
         staging.mkdir()
         for filename, keys in shards.filename_to_tensors.items():
-            # Clone to avoid shared storage aliases in safetensors.
+            # Copy to avoid shared storage aliases in safetensors.
             save_file(
-                {k: state[k].detach().contiguous().clone() for k in keys},
+                {k: state[k].detach().to("cpu", copy=True).contiguous() for k in keys},
                 staging / filename,
                 metadata={"format": "pt"},
             )
