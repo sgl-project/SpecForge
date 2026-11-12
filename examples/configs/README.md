@@ -194,6 +194,9 @@ historical suffixes.
 | --- | --- | --- |
 | `run_id` | `specforge-run` | Stable identifier for the run. It names checkpoints and is also the default disaggregated store namespace. Use a new value for a fresh attempt. |
 | `output_dir` | `./output` | Shared checkpoint, profiler, and tracker output directory. Every trainer rank must resolve it to the same location. |
+| `draft` | `null` | Canonical draft mapping or YAML/JSON path, including preset files. Its architecture selects the default objective. |
+| `initialization` | `null` | Canonical weights-only loading: `checkpoint`, or `weights_from` (`checkpoint`, `mapping`, `allow_new`) with optional disjoint `from_target` copies. See [canonical training](../../docs/draft_training.md). |
+| `resume` | `null` | Canonical full training resume; restores structure from the checkpoint. A canonical checkpoint given in `training.resume_from` resumes the same way; if both fields are set they must agree. Excludes initialization. |
 
 The top-level `model` and `data` sections are required. `training`, `tracking`,
 `profiling`, `runtime`, and `deployment` have defaults, but checked-in recipes
@@ -212,7 +215,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. |
+| `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. Canonical runs (top-level `draft`, `initialization` or `resume`, or a canonical checkpoint in `training.resume_from`) use PyTorch kernels unless this is `true`; `true` swaps in Liger RMSNorm and SiLU-gated SwiGLU on CUDA/ROCm only and is recorded in the resume contract. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -266,7 +269,7 @@ Exactly one of the first three fields must be non-empty:
 | `data.is_preformatted` | `false` | Treat each record's text as already formatted by `chat_template`. |
 | `data.train_only_last_turn` | `false` | Restrict the loss mask to the final assistant turn. |
 | `data.build_dataset_num_proc` | `8` | Positive CPU process count for dataset preprocessing. |
-| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; use 0 for synchronous loading. |
+| `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; canonical runs use 4. Use 0 for synchronous loading. |
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
@@ -282,6 +285,11 @@ Common fields:
 | Field | Default | What to write |
 | --- | --- | --- |
 | `training.strategy` | `eagle3` | `eagle3`, `peagle`, `dflash`, `domino`, or `dspark`. |
+| `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
+| `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
+| `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
+| `training.loss` | `{}` | Canonical token loss, for example `{kind: kl}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
+| `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
@@ -296,7 +304,7 @@ Common fields:
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
-| `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
+| `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. Canonical objectives accept `eager` (EAGLE3 also `sdpa`), so a canonical YAML must set it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |
 | `training.sp_ulysses_size` | `1` | Ulysses sequence-parallel factor for offline EAGLE3 USP. |
 | `training.sp_ring_size` | `1` | Ring sequence-parallel factor for offline EAGLE3 USP. |
@@ -575,6 +583,11 @@ specforge train -c ./my-run.yaml \
   training.learning_rate=5e-5 \
   'deployment.disaggregated.server_urls=["http://capture-0:30000"]'
 ```
+
+Keys under an untyped mapping such as `training.objective_options` may be new,
+and their values are parsed as YAML (`training.objective_options.num_anchors=64`
+passes an integer). An unset mapping takes a whole value:
+`'training.loss={kind: kl}'`.
 
 For deeper lifecycle and recovery semantics, see the
 [training guide](../../docs/sections/basic_usage/training.md) and

@@ -52,6 +52,13 @@ def read_json(source):
     return json.loads(Path(source).read_text())
 
 
+def read_target_config(source, *, cache_dir=None):
+    """Read target text metadata without adding Transformers defaults."""
+    return target_configuration(
+        resolve_directory(source, cache_dir=cache_dir, config_only=True)
+    )
+
+
 def target_configuration(directory):
     config = read_json(Path(directory) / "config.json")
     text = dict(config.get("text_config", config))
@@ -95,6 +102,7 @@ def read_checkpoint(
     *,
     target_config=None,
     legacy_config=None,
+    legacy_settings=None,
     adapter=None,
     cache_dir=None,
     check_target=True,
@@ -112,7 +120,8 @@ def read_checkpoint(
         payload = read_json(legacy_config)
     else:
         raise ValueError(
-            "checkpoint has no config.json; supply legacy_config explicitly"
+            f"{directory} has no config.json: point at a checkpoint directory "
+            "rather than a run output directory, or supply legacy_config"
         )
     if not isinstance(payload, dict):
         raise ValueError("checkpoint config must be an object")
@@ -132,13 +141,19 @@ def read_checkpoint(
     bound_copies = {}
     if matches[0] == "legacy":
         config, weights, metadata = read_legacy(
-            payload, store, target_config, check_target=check_target
+            payload,
+            store,
+            target_config,
+            check_target=check_target,
+            settings=legacy_settings,
         )
         for name in config.target_bindings:
             key = name + ".weight"
             if key in weights:
                 bound_copies[name] = weights.pop(key)
     else:
+        if legacy_settings:
+            raise ValueError("legacy_settings apply only to legacy checkpoints")
         config, weights, metadata = _ADAPTERS[matches[0]][1](
             payload, store, target_config if check_target else None
         )

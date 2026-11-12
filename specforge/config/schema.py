@@ -423,8 +423,8 @@ class DataConfig(StrictConfigModel):
     is_preformatted: bool = False
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
-    #: Ordered background feature-loader workers. ``None`` preserves the
-    #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
+    #: Ordered background feature-loader workers. ``None`` uses the shared
+    #: default (4) for canonical runs, or the provider default for legacy runs.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -970,7 +970,39 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class WeightsFromConfig(StrictConfigModel):
+    checkpoint: str
+    mapping: Optional[dict] = None
+    allow_new: List[str] = Field(default_factory=list)
+
+
+class InitializationConfig(StrictConfigModel):
+    checkpoint: Optional[str] = None
+    weights_from: Optional[WeightsFromConfig] = None
+    from_target: Optional[dict] = None
+    adapter: Optional[str] = None
+    legacy_config: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exclusive_sources(self):
+        if self.checkpoint and (self.weights_from or self.from_target):
+            raise ValueError(
+                "initialization.checkpoint excludes weights_from/from_target"
+            )
+        if self.adapter and not self.checkpoint:
+            raise ValueError("adapter requires initialization.checkpoint")
+        if self.legacy_config and not (self.checkpoint or self.weights_from):
+            raise ValueError("legacy_config requires a checkpoint source")
+        return self
+
+
 class TrainingConfig(StrictConfigModel):
+    objective: Optional[str] = None
+    objective_options: dict = Field(default_factory=dict)
+    loss: dict = Field(default_factory=dict)
+    weighting: Optional[dict] = None
+    frozen: List[str] = Field(default_factory=list)
+
     strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
@@ -1168,6 +1200,9 @@ def migrate_legacy_config(values: dict) -> dict:
 
 
 class Config(StrictConfigModel):
+    draft: Optional[dict | str] = None
+    initialization: Optional[InitializationConfig] = None
+    resume: Optional[str] = None
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
@@ -1192,9 +1227,46 @@ class Config(StrictConfigModel):
         raw["training"] = training
         return raw
 
+    @property
+    def resume_path(self) -> Optional[str]:
+        return self.resume or self.training.resume_from
+
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        if self.resume:
+            if self.training.resume_from and self.training.resume_from != self.resume:
+                raise ValueError("resume and training.resume_from disagree")
+        canonical = (
+            self.draft is not None
+            or self.initialization is not None
+            or self.resume is not None
+        )
+        if canonical:
+            if self.model.draft_model_config or self.model.draft_checkpoint_path:
+                raise ValueError(
+                    "draft/initialization/resume cannot mix with legacy model.draft_* sources"
+                )
+            if self.initialization is not None and self.resume_path:
+                raise ValueError("initialization and resume are mutually exclusive")
+            if self.draft is None and not (
+                self.resume
+                or self.resume_path
+                or (self.initialization and self.initialization.checkpoint)
+            ):
+                raise ValueError(
+                    "scratch/weights_from/from_target requires draft structure"
+                )
+        elif not self.resume_path and (
+            self.training.objective
+            or self.training.objective_options
+            or self.training.frozen
+            or self.training.loss
+            or self.training.weighting is not None
+        ):
+            raise ValueError(
+                "objective/options/frozen/loss/weighting require the canonical draft loading path"
+            )
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
@@ -1245,7 +1317,7 @@ class Config(StrictConfigModel):
 
         if (
             self.model.draft_checkpoint_path is not None
-            and self.training.resume_from is not None
+            and self.resume_path is not None
         ):
             raise ValueError(
                 "model.draft_checkpoint_path (weights-only warm start) and "
@@ -1342,7 +1414,7 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "managed_local requires the persisted training role to be auto"
                 )
-            if self.training.resume_from is not None:
+            if self.resume_path is not None:
                 raise ValueError("managed_local does not support resume")
             mooncake = managed_local.mooncake
             if mooncake.protocol == "nvlink":
@@ -1419,7 +1491,7 @@ class Config(StrictConfigModel):
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
                 )
-        if self.training.role == "producer" and self.training.resume_from is not None:
+        if self.training.role == "producer" and self.resume_path is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":
             if mode != "offline":
@@ -1480,24 +1552,36 @@ class Config(StrictConfigModel):
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
-    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+    """Apply dotted ``section.field=value`` overrides, re-validating the result.
+
+    Only the file's own fields and the overridden ones count as set afterwards.
+    Keys under an untyped mapping (``training.objective_options`` and the like)
+    may be new, and their values are parsed as YAML.
+    """
+    import yaml
+
+    raw = config.model_dump(exclude_unset=True)
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
-        node = raw
         keys = path.split(".")
+        owner, node = config, raw
         for key in keys[:-1]:
-            if not isinstance(node.get(key), dict):
+            owner = _override_field(owner, key, path)
+            if not isinstance(owner, (BaseModel, dict)):
                 raise ValueError(f"override path {path!r} does not exist")
+            if not isinstance(node.get(key), dict):
+                node[key] = (
+                    owner.model_dump(exclude_unset=True)
+                    if isinstance(owner, BaseModel)
+                    else dict(owner)
+                )
             node = node[key]
-        if keys[-1] not in node:
-            raise ValueError(f"override path {path!r} does not exist")
-        current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
-            import yaml
-
+        current = _override_field(owner, keys[-1], path)
+        untyped = isinstance(owner, dict)
+        structured = isinstance(current, (dict, list)) or current is None
+        if untyped or (structured and value.lstrip().startswith(("[", "{"))):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:
@@ -1506,6 +1590,14 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
     return Config.model_validate(raw)
+
+
+def _override_field(owner, key, path):
+    if isinstance(owner, BaseModel):
+        if key not in type(owner).model_fields:
+            raise ValueError(f"override path {path!r} does not exist")
+        return getattr(owner, key)
+    return owner.get(key)
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:

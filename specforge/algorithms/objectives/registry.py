@@ -1,9 +1,31 @@
 """Training-only registry; no checkpoint, data-provider or launch registrations."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
 from .losses import PositionWeighting, TokenLoss
+
+
+@dataclass(frozen=True)
+class WindowStatistic:
+    """Window-wide ratio passed back to the objective during replay."""
+
+    ratio_name: str
+    argument_name: str
+
+
+@dataclass(frozen=True)
+class TrainingRequirements:
+    """Data and execution requirements used by canonical training composition."""
+
+    capture_method: str | None = None
+    supports_vocab_mapping: bool = False
+    required_batch_size: int | None = None
+    minimum_loss_tokens: int = 1
+    loss_mask_filter: Callable[[object], bool] | None = None
+    attention_backends: frozenset[str] = frozenset({"eager"})
+    window_statistic: WindowStatistic | None = None
 
 
 @dataclass(frozen=True)
@@ -13,13 +35,27 @@ class ProtocolRegistration:
     inputs: tuple[str, ...]
     provides: frozenset[str]
     trains: tuple[str, ...]
+    requires: frozenset[str] = frozenset()
+    training: TrainingRequirements = TrainingRequirements()
+    legacy_strategy: str | None = None  # Preserve existing data/rendezvous identifiers.
 
 
 _PROTOCOLS = {}
 _DEFAULTS = {}
 
 
-def register_protocol(name, *, architectures, inputs, provides, trains, default=True):
+def register_protocol(
+    name,
+    *,
+    architectures,
+    inputs,
+    provides,
+    trains,
+    requires=(),
+    default=True,
+    training=TrainingRequirements(),
+    legacy_strategy=None,
+):
     def register(factory):
         if name in _PROTOCOLS:
             raise ValueError(f"objective already registered: {name}")
@@ -31,6 +67,9 @@ def register_protocol(name, *, architectures, inputs, provides, trains, default=
             tuple(inputs),
             frozenset(provides),
             tuple(trains),
+            frozenset(requires),
+            training,
+            legacy_strategy,
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))
@@ -39,17 +78,23 @@ def register_protocol(name, *, architectures, inputs, provides, trains, default=
     return register
 
 
-def build_objective_model(
-    draft_model,
-    *,
-    name=None,
-    options=None,
-    frozen=(),
-    target_head=None,
-    loss=None,
-    weighting=None,
+@dataclass(frozen=True)
+class ResolvedObjective:
+    name: str
+    registration: ProtocolRegistration
+    objective: object
+    loss: TokenLoss
+    weighting: PositionWeighting
+
+    @property
+    def requires_teacher(self):
+        return "teacher_logits" in self.registration.requires | self.loss.requires
+
+
+def resolve_objective(
+    architecture, *, name=None, options=None, loss=None, weighting=None
 ):
-    architecture = draft_model.config.draft.architecture
+    """Resolve defaults and capture requirements without constructing a model."""
     name = name or default_protocol(architecture)
     if name not in _PROTOCOLS:
         raise ValueError(f"unknown objective: {name!r}")
@@ -76,7 +121,9 @@ def build_objective_model(
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
     )
-    missing = (selected_loss.requires | position_weighting.requires) - entry.provides
+    missing = (
+        entry.requires | selected_loss.requires | position_weighting.requires
+    ) - entry.provides
     if missing:
         raise ValueError(
             f"protocol {name!r} lacks required capabilities: {sorted(missing)}"
@@ -84,6 +131,27 @@ def build_objective_model(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
+    return ResolvedObjective(name, entry, objective, selected_loss, position_weighting)
+
+
+def build_objective_model(
+    draft_model,
+    *,
+    name=None,
+    options=None,
+    frozen=(),
+    target_head=None,
+    loss=None,
+    weighting=None,
+):
+    resolved = resolve_objective(
+        draft_model.config.draft.architecture,
+        name=name,
+        options=options,
+        loss=loss,
+        weighting=weighting,
+    )
+    name, entry, objective = resolved.name, resolved.registration, resolved.objective
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
     declared = getattr(objective, "frozen_parameters", ())
@@ -129,8 +197,8 @@ def build_objective_model(
         target_head,
         registration=entry,
         name=name,
-        token_loss=selected_loss,
-        weighting=position_weighting,
+        token_loss=resolved.loss,
+        weighting=resolved.weighting,
         frozen_parameters=frozen,
     )
 

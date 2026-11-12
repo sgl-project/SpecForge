@@ -9,9 +9,10 @@ from specforge.checkpoint.initialization import (
 )
 from specforge.checkpoint.resolve import (
     read_checkpoint,
+    read_target_config,
     resolve_directory,
-    target_configuration,
 )
+from specforge.checkpoint.target import TargetWeights
 from specforge.checkpoint.tensors import TensorStore
 from specforge.checkpoint.weight_plan import _validate_unquantized
 from specforge.config.draft import DraftConfig
@@ -21,17 +22,21 @@ from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 
 
 def _target_config(source, cache_dir):
+    if isinstance(source, TargetWeights):
+        return source.config
     if source is None:
         return None
-    return target_configuration(
-        resolve_directory(source, cache_dir=cache_dir, config_only=True)
-    )
+    return read_target_config(source, cache_dir=cache_dir)
 
 
 def _target_store(source, config, from_target, cache_dir):
     if source is None or not (config.target_bindings or from_target):
         return None
-    return TensorStore(resolve_directory(source, cache_dir=cache_dir))
+    return (
+        source
+        if isinstance(source, TargetWeights)
+        else TensorStore(resolve_directory(source, cache_dir=cache_dir))
+    )
 
 
 def _check_bound_copies(checkpoint, preview, plan):
@@ -49,7 +54,13 @@ def _check_bound_copies(checkpoint, preview, plan):
 
 
 def read_draft(
-    source, *, target=None, legacy_config=None, adapter=None, cache_dir=None
+    source,
+    *,
+    target=None,
+    legacy_config=None,
+    legacy_settings=None,
+    adapter=None,
+    cache_dir=None,
 ):
     """Read structure and tensor references without constructing/loading a model.
 
@@ -61,6 +72,7 @@ def read_draft(
         source,
         target_config=target_config,
         legacy_config=legacy_config,
+        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -101,6 +113,7 @@ def load_draft(
     target=None,
     draft=None,
     legacy_config=None,
+    legacy_settings=None,
     adapter=None,
     device="cpu",
     dtype=None,
@@ -117,6 +130,7 @@ def load_draft(
         source,
         target_config=target_config,
         legacy_config=legacy_config,
+        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -157,17 +171,23 @@ def initialize_draft(
     weights_from=None,
     mapping=None,
     allow_new=(),
+    require_loaded=(),
+    cast_target_copies=(),
     from_target=None,
     device="cpu",
     dtype=torch.float32,
     backend="eager",
     cache_dir=None,
     legacy_config=None,
+    legacy_settings=None,
 ):
     """Construct scratch/new-structure weights, optionally copying explicit sources.
 
     This entry point accepts neither checkpoint continuation nor training resume;
     those use load_draft and the training layer's state restoration respectively.
+    require_loaded names parameter/module prefixes that may not be initialized anew;
+    a prefix naming a head the draft disables (None) requires nothing.
+    cast_target_copies names from_target destinations that cast to dtype.
     """
     if type(draft) is not DraftConfig:
         raise TypeError("draft must be a resolved DraftConfig")
@@ -182,6 +202,7 @@ def initialize_draft(
             check_target=False,
             target_config=target_config,
             legacy_config=legacy_config,
+            legacy_settings=legacy_settings,
             cache_dir=cache_dir,
         )
     )
@@ -195,7 +216,29 @@ def initialize_draft(
         target_store=target_store,
         target_config=target_config,
         from_target=from_target,
+        cast_target_copies=cast_target_copies,
     )
+    loaded = set(dict(plan.weights)) | {name + ".weight" for name, _ in plan.bindings}
+    parameters = dict(preview.named_parameters(remove_duplicate=False))
+    loaded_parameters = {id(parameters[name]) for name in loaded if name in parameters}
+    for prefix in require_loaded:
+        selected = {
+            name: parameter
+            for name, parameter in parameters.items()
+            if not prefix or name == prefix or name.startswith(prefix + ".")
+        }
+        if not selected:
+            # an optional head this draft disables (None) has nothing to load
+            if prefix and hasattr(preview, prefix) and getattr(preview, prefix) is None:
+                continue
+            raise ValueError(f"unknown required parameter or module: {prefix!r}")
+        missing = [
+            name
+            for name, parameter in selected.items()
+            if id(parameter) not in loaded_parameters
+        ]
+        if missing:
+            raise ValueError(f"Frozen parameters require loaded weights: {missing}")
     model = build_draft_model(draft, device=device, dtype=dtype, backend=backend)
     apply_weight_plan(model, plan)
     _validate_vocabulary(model, plan)

@@ -3,20 +3,29 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from specforge.core.fused_loss import ce_l1_loss
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import register_protocol
+from .registry import TrainingRequirements, WindowStatistic, register_protocol
 
 
 @register_protocol(
     "dspine",
+    training=TrainingRequirements(
+        capture_method="dspark",
+        minimum_loss_tokens=2,
+        loss_mask_filter=has_consecutive_supervised_tokens,
+        window_statistic=WindowStatistic(
+            ratio_name="dspine/backbone_ce", argument_name="alignment_ce"
+        ),
+    ),
+    requires=("teacher_logits",),
     architectures=("DSpineDraftModel",),
     inputs=("input_ids", "hidden_states", "target_last_hidden_states", "loss_mask"),
     provides=(
@@ -81,7 +90,9 @@ class DSpineObjective:
                 "replacement_hold_ratio must be below replacement_end_ratio"
             )
 
-    def __call__(self, runtime, batch, *, step, total_steps, alignment_ce, **context):
+    def __call__(
+        self, runtime, batch, *, step, total_steps, alignment_ce=None, **context
+    ):
         model = runtime.draft_model
         blocks = prepare_blocks(
             model.config.draft,
@@ -162,8 +173,6 @@ class DSpineObjective:
             coefficient = alignment_ce
             if coefficient is None:
                 totals = torch.stack((ce_num.detach(), denominator))
-                if model.training and dist.is_initialized():
-                    dist.all_reduce(totals)
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
             return AuxiliaryLoss(
                 refined_loss + beta * coefficient.detach() * alignment,

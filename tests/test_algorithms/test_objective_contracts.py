@@ -122,6 +122,20 @@ class ObjectiveContractTest(unittest.TestCase):
             self.assertEqual(teacher.values.dtype, torch.float32)
             self.assertEqual(teacher.logits().dtype, torch.float32)
 
+    def test_teacher_projects_records_in_its_own_dtype(self):
+        """bf16 target records must not crash a float32 teacher at step one."""
+        for architecture in ("DSparkDraftModel", "Eagle3DraftModel"):
+            with self.subTest(architecture=architecture):
+                config, runtime = build_runtime(architecture)
+                batch = training_batch(config)
+                records = batch["target_last_hidden_states"].to(torch.bfloat16)
+                result = runtime(
+                    {**batch, "target_last_hidden_states": records},
+                    step=0,
+                    total_steps=None,
+                )
+                self.assertTrue(torch.isfinite(result.loss))
+
     def test_dspark_stops_at_unsupervised_gap(self):
         config = dspark_config()
         batch = training_batch(config)

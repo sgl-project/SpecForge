@@ -267,7 +267,7 @@ def _resolve_role(
         legacy_role = cfg.training.role
         if disaggregated and legacy_role in ("producer", "consumer"):
             requested = legacy_role
-        elif disaggregated and cfg.training.resume_from:
+        elif disaggregated and cfg.resume_path:
             requested = "consumer"
         else:
             requested = "both" if disaggregated else "all"
@@ -276,7 +276,7 @@ def _resolve_role(
         raise ValueError("disaggregated training does not support --role all")
     if not disaggregated and requested != "all":
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
-    if requested == "both" and cfg.training.resume_from:
+    if requested == "both" and cfg.resume_path:
         raise ValueError(
             "--role both cannot resume a disaggregated producer; use --role consumer"
         )
@@ -919,7 +919,7 @@ def _validate_consumer_database(
     if not database:
         raise ValueError("online disaggregated consumer requires a metadata database")
     state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
-    if cfg.training.resume_from:
+    if cfg.resume_path:
         if state_owner and not os.path.exists(database):
             raise ValueError(
                 f"consumer resume requires the retained metadata database: {database}"

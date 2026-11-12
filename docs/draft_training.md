@@ -113,5 +113,173 @@ runtime = build_objective_model(
 ```
 
 For legacy EAGLE LK semantics, select `options.target="teacher"` and retain the
-default geometric weighting. Training configuration and resume serialization must
-carry these selections when the canonical training entry adopts them.
+default geometric weighting. The training entry resolves loss and weighting
+before capture, and records both in the exact-resume contract.
+
+## Training entry point
+
+The existing `specforge train -c run.yaml` command accepts an expanded draft
+mapping or an ordinary YAML/JSON file. Presets use this same file path; there is
+no separate preset selector. The architecture chooses the default objective.
+`training.objective` can select another compatible registration, and its settings
+are passed through `training.objective_options` (unknown options are errors).
+`training.loss` and `training.weighting` select the common token objective and
+position weights; omitting them preserves the protocol defaults. Capture inputs
+combine protocol and loss requirements. A teacher head is loaded only when the
+loss or protocol requires teacher logits; final-state inputs alone do not imply
+a head is needed.
+Legacy algorithm switches remain on the legacy route. On the canonical route,
+use loss/weighting for the common objective and objective_options for sampling
+and auxiliary training. DFlash2 selector_warmup_ratio/selector_ramp_ratio belong
+in objective_options. Nondefault legacy loss/sampling settings are rejected.
+
+```yaml
+model:
+  target_model_path: /models/target
+  torch_dtype: bfloat16
+
+draft: /configs/dflash.yaml
+
+data:
+  hidden_states_path: /data/canonical-features
+
+training:
+  attention_backend: eager
+  objective_options:
+    num_anchors: 128
+  loss:
+    kind: kl
+  weighting:
+    kind: exponential
+    gamma: 7.0
+  max_steps: 1000
+  save_interval: 100
+
+output_dir: /output/draft
+```
+
+Only one loading path may be selected:
+
+- `draft`: construct a new model with its declared target bindings.
+- `initialization.checkpoint`: restore a complete draft through `load_draft`.
+- `draft` plus `initialization.weights_from`: pass `checkpoint`, `mapping` and
+  `allow_new` to the initialization planner. Optional `initialization.from_target`
+  supplies disjoint strict target copies.
+- `resume`: restore a training checkpoint through the existing trainer, including
+  optimizer, scheduler, RNG and data position. No draft YAML is required. An
+  optional draft must equal the saved structure exactly. Training options and
+  the original schedule horizon must still match the recorded run contract.
+
+`initialization.adapter` and `initialization.legacy_config` handle explicit
+external checkpoint import. `resume` and initialization are mutually exclusive;
+none of these fields may mix with legacy `model.draft_*` source fields.
+
+Checkpoints contain the canonical `config.json` alongside the existing
+`training_state.pt` and per-rank optimizer/RNG files. The public loader reads only
+the draft tensors, while the trainer alone restores training state. Exact resume
+checks structure, resolved loss/weighting, objective/options, frozen prefixes,
+target provenance and dtype. A changed or missing loss/weighting contract is
+rejected rather than guessed.
+An existing vocabulary mapping is preserved on resume; it is not regenerated from
+the dataset. `training.frozen` lists module or parameter paths excluded from
+training, and is part of the resume contract.
+
+Canonical records use the tensor names listed above; EAGLE records using legacy
+`hidden_state` / `aux_hidden_state` names must be regenerated with the canonical
+capture layout or explicitly converted. The generic offline preparation and
+server capture adapters now supply unshifted canonical records. DMTP currently
+accepts offline records with `mtp_hidden_states`; the generic capture service
+cannot produce frozen-MTP features and DMTP streaming fails validation.
+
+The new route supports eager attention (EAGLE3 also SDPA) and data parallel
+training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
+FSDP, matching the existing training backend's frozen-table policy. The canonical
+model's requested dtype also controls FSDP computation. Other optimized backends and
+sequence-parallel execution remain on the legacy route. Online wiring is
+validated through capture contracts; a live SGLang capture run is not part of the
+current integration tests.
+
+DSpine training uses a graph-free prepass and RNG-preserving replay for every
+optimizer window, including a single microbatch. The strategy reduces backbone
+CE once per window and passes the alignment coefficient into the objective.
+Objective evaluation performs no collectives; the objective itself never reduces
+its alignment statistics across ranks. Transfer-space initialization and
+restoration remain owned by the public model loader.
+
+Legacy checkpoints keep their original full-resume path (`model.draft_*` plus
+`training.resume_from`). Importing one through `initialization.checkpoint` or
+`weights_from` reads weights and effective settings only; it does not translate
+optimizer shards, scheduler state or RNG. For legacy imports, explicit
+`model.mask_token_id`, `model.aux_hidden_state_layer_ids` and
+`training.norm_before_residual` must agree with recorded settings. Canonical YAML
+keeps these settings in its architecture nodes.
+
+For scratch training, `model.load_target_embedding: true` copies the target table
+into an owned embedding with shape validation. Like legacy `load_embedding`, this
+default copy casts to `model.torch_dtype`; explicit `from_target` copies stay
+bit-preserving and only widen. Explicit target mappings take precedence;
+checkpoint and warm-start embeddings are preserved. Target-bound tables always
+follow their bindings. Teacher heads
+and draft bindings use the same target key resolver and cached source tensors;
+a compatible bound head is shared directly.
+
+Canonical training uses PyTorch kernels by default. `model.use_liger_kernel: true`
+selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain their
+PyTorch implementation. This option does not change parameter names or canonical
+configuration and is recorded in the training resume contract.
+
+Canonical objectives do not consume legacy `objective_chunk_blocks`,
+`objective_checkpointing`, `fused_logits_loss`, `mtp_objective_chunk_size` or
+`trim_loss_positions`. Non-default values fail validation; explicitly supplied
+legacy defaults produce a warning and do not enable those optimizations.
+
+`resume` and `training.resume_from` are alternative inputs for one resolved resume
+path. Neither is copied into the other. A canonical checkpoint supplied through
+`training.resume_from` also selects the canonical training route. Legacy DSpine
+imports through `initialization.checkpoint` must explicitly match saved training
+settings in `training.objective_options`; `weights_from` copies weights only.
+
+
+### Canonical training requirements
+
+`register_protocol(..., training=TrainingRequirements(...))` declares capture
+method, vocabulary mapping, batch-size constraints, `attention_backends` and an
+optional `loss_mask_filter` callable. EAGLE3 also accepts `sdpa`; the other objectives keep eager attention;
+block objectives register the shared consecutive-supervision filter. Canonical
+composition builds providers directly from these requirements; it does not resolve
+a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
+requests accumulation-window reduction and replay, passing the result to the
+objective by the declared argument name.
+
+`legacy_strategy` is separate registration metadata that preserves existing data
+and rendezvous identifiers; it does not select a legacy provider.
+`supports_vocab_mapping` declares draft-vocabulary support.
+Worker counts belong to `data.dataloader_num_workers`, not objective requirements.
+Canonical runs use a shared default of 4; set this explicitly to 8 to retain the
+previous DFlash-family/MTP default. Legacy provider defaults are unchanged.
+
+Canonical parsing, training and capture read target metadata from the same raw
+`config.json` reader, including nested `text_config`. Transformers defaults are
+not added to the canonical configuration.
+
+Parameters frozen by `training.frozen` or an objective must have loaded weights:
+a complete checkpoint, `weights_from`, `from_target`, or a target binding. An
+objective's frozen head that the draft disables (DSpark's confidence head at
+`confidence_loss_alpha: 0`) needs none.
+Freezing a newly initialized parameter fails before model allocation; partial
+imports must cover every frozen parameter, including tied aliases.
+
+Prepare canonical records from the run YAML used for training, so the records
+carry what its objective and loss read (for example `target_last_hidden_states`
+for `loss: {kind: kl}`):
+
+```bash
+python scripts/prepare_hidden_states.py -c /configs/run.yaml \
+  --server-urls http://localhost:30000 \
+  --data-path /data/train.jsonl --output-path /data/canonical-features
+```
+
+`--target-model-path` defaults to the run's `model.target_model_path`.
+`--draft /configs/eagle3.yaml` captures for the default objective and loss only.
+`-c`, `--draft` and the legacy `--draft-model-config` are mutually exclusive. The
+canonical YAML selects the architecture, capture layers and output schema.

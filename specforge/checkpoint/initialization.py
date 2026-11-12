@@ -6,25 +6,6 @@ from collections.abc import Mapping
 from .weight_plan import make_weight_plan
 
 logger = logging.getLogger(__name__)
-_TARGET_KEYS = {
-    "embed_tokens": (
-        "language_model.model.embed_tokens.weight",
-        "embed.weight",
-        "model.llm.embed.weight",
-        "model.word_embeddings.weight",
-        "model.language_model.embed_tokens.weight",
-        "model.embed_tokens.weight",
-        "embed_tokens.weight",
-    ),
-    "lm_head": (
-        "language_model.lm_head.weight",
-        "head.weight",
-        "model.llm.unembed.weight",
-        "model.language_model.lm_head.weight",
-        "model.lm_head.weight",
-        "lm_head.weight",
-    ),
-}
 
 
 def resolve_bindings(config, store, target_config):
@@ -34,22 +15,12 @@ def resolve_bindings(config, store, target_config):
         raise ValueError(
             "target checkpoint and configuration are required for target_bindings"
         )
-    refs, bindings = store.refs(), {}
-    for module in config.target_bindings:
-        candidates = [key for key in _TARGET_KEYS[module] if key in refs]
-        if (
-            module == "lm_head"
-            and not candidates
-            and target_config.get("tie_word_embeddings") is True
-        ):
-            candidates = [key for key in _TARGET_KEYS["embed_tokens"] if key in refs]
-        if len(candidates) != 1:
-            raise ValueError(
-                f"{module}: expected one target key of {list(_TARGET_KEYS[module])}, "
-                f"found {candidates}"
-            )
-        bindings[module] = refs[candidates[0]]
-    return bindings
+    from .target import resolve_target_tensor
+
+    return {
+        name: resolve_target_tensor(store, target_config, name)
+        for name in config.target_bindings
+    }
 
 
 def _match(name, prefix):
@@ -138,10 +109,12 @@ def make_initialization_plan(
     target_store=None,
     target_config=None,
     from_target=None,
+    cast_target_copies=(),
 ):
     """Scratch or weights-only warm start; never used to resume a checkpoint.
 
-    from_target performs one-to-one bit-preserving copies with explicit renames.
+    from_target performs one-to-one bit-preserving copies with explicit renames;
+    the destinations in cast_target_copies cast to the draft dtype instead.
     Current components store separate parameters; no fused-parameter layout is
     inferred from model-family names. Unexplained target tensors fail validation.
     """
@@ -209,6 +182,11 @@ def make_initialization_plan(
         logger.info(
             "Target weight mapping: %s", {k: v.key for k, v in sorted(copies.items())}
         )
+    cast = set(cast_target_copies)
+    if cast - copies.keys():
+        raise ValueError(
+            f"cast_target_copies names no target copy: {sorted(cast - copies.keys())}"
+        )
     weights.update(copies)
     if weights_from is None:
         # by identity: the tied alias of a copied tensor is not new
@@ -220,7 +198,7 @@ def make_initialization_plan(
         model,
         weights,
         allow_new=allowed,
-        strict_copies=copies,
+        strict_copies=[name for name in copies if name not in cast],
         bindings=resolve_bindings(model.config.draft, target_store, target_config),
         unused=unused,
     )

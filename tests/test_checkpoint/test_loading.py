@@ -114,6 +114,29 @@ class LoadingTest(unittest.TestCase):
                     atol=0,
                 )
 
+    def test_explicit_legacy_settings_preserve_recorded_values(self):
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
+        payload = json.loads((fixture / "config.json").read_text())
+        payload.pop("norm_before_residual", None)
+        with TemporaryDirectory() as tmp:
+            path, target = Path(tmp) / "draft", Path(tmp) / "target"
+            path.mkdir()
+            write_target(target)
+            state = {"draft_state_dict": load_file(fixture / "model.safetensors")}
+            torch.save(state, path / "training_state.pt")
+            settings = {"mask_token_id": 63, "norm_before_residual": True}
+            config = read_draft(
+                path, target=target, legacy_config=payload, legacy_settings=settings
+            ).config
+            self.assertEqual(config.spec_config.mask_token_id, 63)
+            self.assertTrue(config.spec_config.norm_before_residual)
+            state["peagle_mask_token_id"] = 62
+            torch.save(state, path / "training_state.pt")
+            with self.assertRaisesRegex(ValueError, "explicit mask_token_id conflicts"):
+                read_draft(
+                    path, target=target, legacy_config=payload, legacy_settings=settings
+                )
+
     def test_legacy_dflash_records_must_match_supplied_config(self):
         """A config-less DFlash run imported with a stale JSON must not load silently."""
         payload = dflash2_payload()
