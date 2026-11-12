@@ -1,9 +1,12 @@
 """Independent serving constraints and field expectations."""
 
+import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 from specforge.checkpoint.formats.sglang import convert_config
+from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.config.draft.rope import MultiAxisRoPESpec
@@ -51,9 +54,8 @@ class ServingBoundariesTest(unittest.TestCase):
             self.assertFalse(fields["is_causal"])
             self.assertEqual(fields["layer_types"], ["sliding_attention"] * 2)
             self.assertEqual(fields["dflash_config"]["target_layer_ids"], [1, 3])
-            for node in (fields, fields["dflash_config"]):
-                self.assertEqual(node["mask_token"], "<|MASK|>")
-                self.assertEqual(node["mask_token_id"], 63)
+            self.assertEqual(fields["dflash_config"]["mask_token"], "<|MASK|>")
+            self.assertEqual(fields["dflash_config"]["mask_token_id"], 63)
 
     def test_mup_and_offset_norm_limits(self):
         for config in (dflash2_config(bound=True), domino_config(bound=True)):
@@ -157,3 +159,37 @@ class ServingBoundariesTest(unittest.TestCase):
                     },
                 )
             )
+
+    def test_production_dflash2_fields_match_legacy_recipes(self):
+        root = Path(__file__).resolve().parents[2]
+        for name in ("qwen3.8-27b-dflash2", "qwen3.6-27b-dflash2"):
+            with self.subTest(recipe=name):
+                payload = json.loads((root / "configs" / (name + ".json")).read_text())
+                config = decode_legacy_config(
+                    payload,
+                    target_config={
+                        "hidden_size": payload["hidden_size"],
+                        "vocab_size": payload["vocab_size"],
+                        "num_hidden_layers": 64,
+                    },
+                )
+                fields = convert_config(config)
+                for key in (
+                    "is_causal",
+                    "hidden_size",
+                    "num_hidden_layers",
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "head_dim",
+                    "intermediate_size",
+                    "layer_types",
+                    "sliding_window",
+                    "rms_norm_eps",
+                    "attention_bias",
+                ):
+                    self.assertEqual(fields[key], payload[key], key)
+                self.assertEqual(
+                    fields["rope_theta"], payload["rope_parameters"]["rope_theta"]
+                )
+                for key, value in payload["dflash_config"].items():
+                    self.assertEqual(fields["dflash_config"][key], value, key)

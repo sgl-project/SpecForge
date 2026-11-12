@@ -29,7 +29,7 @@ def export_to_sglang(
         target=target_model,
         vocab_mapping=vocab_mapping_path,
     )
-    fields = convert_config(checkpoint.config)
+    fields = convert_config(checkpoint.config, hf_metadata=checkpoint.hf_metadata)
     weights = serving_weights(checkpoint.config, state)
     if checkpoint.config.architecture == "MTPDraftModel":
         from specforge.checkpoint.formats.sglang.native import export_native

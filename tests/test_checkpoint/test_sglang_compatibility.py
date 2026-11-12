@@ -5,6 +5,7 @@ backend is replaced by dense attention; serving projections, norms, RoPE,
 convolutions and model loops are SGLang's real implementations.
 """
 
+import copy
 import importlib
 import os
 import unittest
@@ -18,36 +19,123 @@ from transformers import PretrainedConfig
 
 from specforge.checkpoint.formats.sglang import NON_COMPUTATIONAL_READS, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
+from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.norm import RMSNormSpec
+from specforge.config.draft.rope import (
+    LinearRoPESpec,
+    Llama3RoPESpec,
+    MultiAxisRoPESpec,
+    YaRNSpec,
+)
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from specforge.modeling.draft.layers.rope import apply_rotary, build_rotary
 from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
 from tests.test_checkpoint.test_sglang_export import serving_configs
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dspark import model_config as dspark_config
+from tests.test_modeling.test_draft_mla import mla_node
+
+
+class ReadDict(dict):
+    def __init__(self, values, path, reads):
+        super().__init__(
+            {
+                k: ReadDict(v, f"{path}.{k}", reads) if isinstance(v, dict) else v
+                for k, v in values.items()
+            }
+        )
+        self.path, self.reads = path, reads
+
+    def get(self, key, default=None):
+        self.reads.add(f"{self.path}.{key}")
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.reads.add(f"{self.path}.{key}")
+        return super().__getitem__(key)
 
 
 class ReadConfig(PretrainedConfig):
     def __init__(self, fields):
         super().__init__(**fields)
-        self._written = set(fields)
-        self._reads = set()
+        self._fields, self._reads = fields, set()
+        for key, value in fields.items():
+            if isinstance(value, dict):
+                setattr(self, key, ReadDict(value, key, self._reads))
 
     def __getattribute__(self, name):
-        try:
-            value = super().__getattribute__(name)
-        except AttributeError:
-            if not name.startswith("_") and "_reads" in self.__dict__:
-                self._reads.add(name)
-            raise
-        if (
-            not name.startswith("_")
-            and not callable(value)
-            and "_reads" in self.__dict__
-        ):
+        if not name.startswith("_") and "_reads" in self.__dict__:
             self._reads.add(name)
-        return value
+        return super().__getattribute__(name)
+
+    def missing_reads(self):
+        missing = set()
+        for path in self._reads:
+            if path in NON_COMPUTATIONAL_READS or callable(
+                getattr(type(self), path, None)
+            ):
+                continue
+            group, _, key = path.rpartition(".")
+            values = self._fields.get(group, {}) if group else self._fields
+            if key in values:
+                continue
+            # The pin evaluates top-level fallback arguments even when nested wins.
+            if not group and any(
+                key in self._fields.get(g, {})
+                for g in ("dflash_config", "dspark_config", "eagle_config")
+            ):
+                continue
+            if (
+                group == "dflash_config"
+                and key == "attention_modes"
+                and "attention_mode" in values
+            ):
+                continue
+            if key == "type" and "rope_type" in values:
+                continue
+            missing.add(path)
+        return missing
+
+
+def load_checked(test, model, weights):
+    """Every exported tensor must reach a real serving parameter loader."""
+    from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+    consumed = set()
+
+    def track(loader):
+        def load(parameter, tensor, *args, **kwargs):
+            consumed.add(id(tensor))
+            return loader(parameter, tensor, *args, **kwargs)
+
+        return load
+
+    with ExitStack() as stack:
+        for parameter in model.parameters():
+            stack.enter_context(
+                patch.object(
+                    parameter,
+                    "weight_loader",
+                    track(getattr(parameter, "weight_loader", default_weight_loader)),
+                    create=True,
+                )
+            )
+        model.load_weights(weights.items())
+    ignored = {
+        "t2d",
+        "d2t",
+    }  # EAGLE token maps are consumed separately, not parameters.
+    test.assertEqual(
+        {name for name, tensor in weights.items() if id(tensor) not in consumed}
+        - ignored,
+        set(),
+    )
+    if "d2t" in weights:
+        torch.testing.assert_close(
+            model.get_hot_token_id(), weights["d2t"] + torch.arange(len(weights["d2t"]))
+        )
 
 
 def dense_attention(context, positions, nctx, slots):
@@ -124,7 +212,46 @@ class SGLangCompatibilityTest(unittest.TestCase):
             )
             stack.enter_context(patch("sglang.srt.models.utils._is_cuda", False))
             configs = serving_configs()
-            configs.append(multi_axis_config(configs[-1]))
+            base = configs[0]
+            common = dict(interleaved=False, rope_theta=10000, partial_rotary_factor=1)
+            configs.extend(
+                replace(base, rope_parameters=rope)
+                for rope in (
+                    LinearRoPESpec(**common, factor=2),
+                    Llama3RoPESpec(
+                        **common,
+                        factor=8,
+                        low_freq_factor=1,
+                        high_freq_factor=4,
+                        original_max_position_embeddings=64,
+                    ),
+                    YaRNSpec(
+                        **common,
+                        factor=4,
+                        original_max_position_embeddings=64,
+                        attention_factor=1.1,
+                        beta_fast=32,
+                        beta_slow=1,
+                        truncate=True,
+                        mscale_all_dim=0,
+                    ),
+                )
+            )
+            for rope in (base.rope_parameters, configs[-1].rope_parameters):
+                configs.append(
+                    replace(
+                        base,
+                        rope_parameters=replace(rope, interleaved=True),
+                        attention_configs={
+                            "full": mla_node(
+                                attention_bias=False,
+                                attention_dropout=0,
+                                sliding_window=None,
+                            )
+                        },
+                    )
+                )
+            configs.append(multi_axis_config(serving_configs()[-1]))
             configs.append(dspark_config(bound=True, confidence=False))
             if torch.cuda.is_available():
                 base = mtp_config()
@@ -218,14 +345,39 @@ class SGLangCompatibilityTest(unittest.TestCase):
         if native:
             weights = {"mtp." + name: value for name, value in weights.items()}
             weights["mtp.embed_tokens.weight"] = embedding
-        served.load_weights(weights.items())
+        load_checked(self, served, weights)
         # A missing computation field is a test failure even if SGLang
         # could construct with a fallback value.
         if not native:
             self.assertFalse(
-                read._reads - read._written - NON_COMPUTATIONAL_READS,
-                read._reads - read._written - NON_COMPUTATIONAL_READS,
+                read.missing_reads(),
+                read.missing_reads(),
             )
+        attention = next(iter(config.attention_configs.values()))
+        if isinstance(attention, MLASpec):
+            positions = torch.tensor([[0, 7, 63, 127]])
+            hidden = torch.randn(1, 4, config.hidden_size)
+            rotary = build_rotary(
+                config.rope_parameters, head_dim=attention.qk_rope_head_dim
+            )
+            for own, remote in zip(model.backbone.layers, served.layers):
+                own = own.self_attn
+                latent, k = own.kv_a_proj_with_mqa(hidden).split(
+                    (attention.kv_lora_rank, attention.qk_rope_head_dim), -1
+                )
+                expected_latent = own.kv_a_layernorm(latent)[0, :, None]
+                expected_k = apply_rotary(
+                    k[:, None], rotary(hidden, positions), interleaved=True
+                )[0].transpose(0, 1)
+                actual_latent, actual_k = remote.self_attn.project_context_kv(
+                    positions[0], hidden[0]
+                )
+                torch.testing.assert_close(
+                    actual_latent, expected_latent, rtol=2e-5, atol=2e-6
+                )
+                torch.testing.assert_close(actual_k, expected_k, rtol=2e-5, atol=2e-6)
+                self.assertAlmostEqual(remote.self_attn.scaling, own.scaling)
+            return
         slots = (
             config.spec_config.protocol.num_model_slots
             if config.spec_config.protocol
@@ -249,8 +401,11 @@ class SGLangCompatibilityTest(unittest.TestCase):
                 1, 1, slots, nctx + slots, dtype=torch.bool, device=device
             ),
         )
+        rotary_positions = positions
+        if eagle and isinstance(config.rope_parameters, MultiAxisRoPESpec):
+            rotary_positions = torch.stack((positions, positions + 1, positions + 2))
         entries = [
-            LayerInputs(attention_layout=layout, position_ids=positions)
+            LayerInputs(attention_layout=layout, position_ids=rotary_positions)
         ] * config.num_hidden_layers
         context = {}
         if not eagle and not native:
@@ -260,6 +415,31 @@ class SGLangCompatibilityTest(unittest.TestCase):
                 k, v = attn.kv_proj_only(projected)
                 k = attn.apply_k_rope(positions[0, :nctx], attn.apply_k_norm(k))
                 context[attn.attn.layer_id] = (k, v)
+            if config.architecture == "DSparkDraftModel":
+                written = {}
+
+                def store(attn, loc, k, v, *scales):
+                    written[attn.layer_id] = (k.flatten(1), v.flatten(1))
+
+                pool = SimpleNamespace(
+                    layer_router=SimpleNamespace(
+                        layer=lambda _: SimpleNamespace(store=store)
+                    )
+                )
+                served.write_target_hidden_kv(
+                    target_hidden=features[0],
+                    pool=pool,
+                    positions=positions[0, :nctx],
+                    cache_loc=torch.arange(nctx),
+                )
+                for layer_id in context:
+                    for actual_kv, expected_kv in zip(
+                        written[layer_id], context[layer_id]
+                    ):
+                        torch.testing.assert_close(
+                            actual_kv, expected_kv, rtol=2e-5, atol=2e-6
+                        )
+                context = written
 
         dense = dense_attention(context, positions, nctx, slots)
 
@@ -292,7 +472,11 @@ class SGLangCompatibilityTest(unittest.TestCase):
             elif eagle:
                 batch = SimpleNamespace(
                     spec_info=SimpleNamespace(hidden_states=features[0]),
-                    mrope_positions=positions.expand(3, -1),
+                    mrope_positions=(
+                        rotary_positions[:, 0]
+                        if rotary_positions.ndim == 3
+                        else positions.expand(3, -1)
+                    ),
                 )
                 expected, aux = served.model(
                     ids[0],
@@ -325,10 +509,51 @@ class SGLangCompatibilityTest(unittest.TestCase):
                     actual.hidden_states[0], expected, rtol=2e-5, atol=2e-6
                 )
                 self._check_heads(model, served, actual.hidden_states, ids)
+                if (
+                    torch.cuda.is_available()
+                    and config.architecture == "DSparkDraftModel"
+                    and config.spec_config.confidence is not None
+                ):
+                    self._check_fused_context(served, features[0])
                 self.assertEqual(
                     served.block_size,
                     config.spec_config.protocol.num_model_slots,
                 )
+
+    def _check_fused_context(self, served, features):
+        # SGLang caches rotary modules globally; do not cast another case's cache.
+        for layer in served.layers:
+            layer.self_attn.rotary_emb = copy.deepcopy(layer.self_attn.rotary_emb)
+        served = served.to(device="cuda", dtype=torch.bfloat16)
+        features = features.to(device="cuda", dtype=torch.bfloat16)
+        positions = torch.arange(features.shape[0], device="cuda")
+        projected = served.project_target_hidden(features)
+        expected, buffers = {}, {}
+        for layer in served.layers:
+            attn = layer.self_attn
+            k, v = attn.kv_proj_only(projected)
+            k = attn.apply_k_rope(positions, attn.apply_k_norm(k))
+            pair = tuple(t.view(-1, attn.num_kv_heads, attn.head_dim) for t in (k, v))
+            expected[attn.attn.layer_id] = pair
+            buffers[attn.attn.layer_id] = tuple(torch.empty_like(t) for t in pair)
+
+        def read(layer_id):
+            k, v = buffers[layer_id]
+            return SimpleNamespace(key=lambda: k, value=lambda: v)
+
+        pool = SimpleNamespace(
+            layer_router=SimpleNamespace(read=read),
+            get_key_buffer=lambda i: buffers[i][0],
+            get_value_buffer=lambda i: buffers[i][1],
+        )
+        served._fused_kv_write_cache = None
+        self.assertIsNotNone(served._fused_kv_write_bundle(pool))
+        served.write_target_hidden_kv(
+            target_hidden=features, pool=pool, positions=positions, cache_loc=positions
+        )
+        for layer_id, pair in buffers.items():
+            for actual, reference in zip(pair, expected[layer_id]):
+                torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.02)
 
     def _check_heads(self, model, served, hidden, ids):
         with torch.no_grad():
@@ -373,6 +598,30 @@ class SGLangCompatibilityTest(unittest.TestCase):
                 gru, _ = served.prefix_gru(prefix)
                 expected = served.embed_proj(torch.cat([hidden, gru[:, 1:]], -1))
                 torch.testing.assert_close(model.gru_head(hidden, prefix), expected)
+
+    def test_nested_reads_detect_missing_computation_fields(self):
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+        fields = convert_config(serving_configs()[1])
+        for key in (
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+        ):
+            read = ReadConfig(
+                fields
+                | {
+                    "dflash_config": {
+                        k: v for k, v in fields["dflash_config"].items() if k != key
+                    }
+                }
+            )
+            try:
+                parse_dflash_draft_config(draft_hf_config=read)
+            except ValueError:
+                pass  # The parser may reject the now-incomplete parameter pair.
+            self.assertIn("dflash_config." + key, read.missing_reads())
 
     def test_canonical_hf_remote_code_is_rejected_by_serving(self):
         from pathlib import Path

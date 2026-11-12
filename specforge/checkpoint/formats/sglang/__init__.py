@@ -19,12 +19,21 @@ def register_converter(architecture):
     return register
 
 
-def convert_config(config):
+def convert_config(config, *, hf_metadata=None):
     try:
         converter = _CONVERTERS[config.architecture]
     except KeyError:
         raise ValueError(f"no SGLang converter for {config.architecture}") from None
-    return converter(config)
+    result = converter(config)
+    metadata = hf_metadata or {}
+    result.update(
+        {
+            name: metadata[name]
+            for name in ("bos_token_id", "eos_token_id", "pad_token_id")
+            if name in metadata
+        }
+    )
+    return result
 
 
 def artifact_metadata():

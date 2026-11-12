@@ -60,6 +60,11 @@ def export_native(config, fields, state, target, output, *, copy_target=False):
     for key in ("rope_parameters", "rope_scaling"):
         if text.get(key) is not None:
             values = dict(text[key])
+            for option in ("use_fope", "video_rope", "mrope_interleaved_glm"):
+                require(
+                    not values.pop(option, False),
+                    f"target {key}.{option} is unsupported",
+                )
             kind = values.pop("type", "default")
             values.setdefault("rope_type", kind)
             if "mrope_section" in values and values["rope_type"] == "default":

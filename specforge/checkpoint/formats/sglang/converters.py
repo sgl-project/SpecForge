@@ -78,8 +78,17 @@ def common(config, *, eagle=False, native=False):
     )
     scaling = asdict(rope) | {"rope_type": rope.rope_type}
     scaling.pop("interleaved")
+    if type(rope) is LinearRoPESpec:
+        scaling["factor"] = float(rope.factor)
+    if type(rope) is DefaultRoPESpec:
+        scaling["use_fope"] = False
     if type(rope) is MultiAxisRoPESpec:
-        scaling.update(rope_type="default", mrope_section=list(rope.mrope_section))
+        scaling.update(
+            rope_type="default",
+            mrope_section=list(rope.mrope_section),
+            video_rope=False,
+            mrope_interleaved_glm=False,
+        )
     if type(rope) is YaRNSpec:
         # SGLang multiplies its mscale ratio by attn_factor. Equal mscale
         # numerator/denominator makes that ratio one; retain MLA score scaling.
@@ -239,13 +248,6 @@ def context(config):
         projector_type=None,
         attention_sink_bias=False,
         attention_value_scale=None,
-    )
-    # Explicit aliases read eagerly by the pinned parser's fallback expressions.
-    result.update(
-        target_layer_ids=list(spec.target_features.target_layer_ids),
-        mask_token_id=spec.target_features.mask_token_id,
-        mask_token="<|MASK|>",
-        projector_type=None,
     )
     return result
 

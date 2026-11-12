@@ -38,7 +38,17 @@ using `--to hf`; this is distinct from the default canonical export. Only legacy
 `--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
 rejects it and uses `--target-model` for import validation and configuration.
 `--format` is not needed. Use `--converter sglang` for canonical serving export.
-Legacy `--to` paths remain available during migration.
+Legacy `--to` paths remain available during migration, including mixed-causality
+recipes that the pinned converter cannot express. For historical EAGLE3 checkpoints
+without vocabulary buffers, the existing legacy path accepts an explicit mapping:
+
+```bash
+specforge export --to sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
+  --vocab-mapping MAPPING --output-dir SERVING
+```
+
+Canonical export requires the mapping to be stored in the checkpoint. It preserves
+recorded `bos_token_id`, `eos_token_id`, and `pad_token_id` metadata.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.
 Restore those explicitly before exporting. Missing, unexpected or misshaped
@@ -103,8 +113,10 @@ a self-contained directory. Embedding/head copies are written under native names
 SGLang's worker also attaches the target token modules. The target is not modified.
 
 The pinned compatibility gate constructs real SGLang models and loads converted
-weights, records top-level configuration reads for non-native models, and compares
-FP32 reference outputs. It uses
+weights, records top-level and nested configuration reads for non-native models, and compares
+FP32 reference outputs. It checks that exported weights reach serving loaders,
+uses production recipe fields as an independent baseline, and covers MLA context
+projection, scaled/multi-axis RoPE and the DSpark stacked context-KV writer. It uses
 a dense attention oracle in place of paged KV-cache attention, so it is not an
 end-to-end serving/performance test. Separate tests cover native physical shard
 replacement and exact weight recovery, unsupported structures, and rejection of

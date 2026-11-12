@@ -24,7 +24,7 @@ from specforge.checkpoint.tensors import TensorStore
 from specforge.cli import main
 from specforge.config.draft.logits import NoLogitTransformSpec
 from specforge.config.draft.norm import RMSNormSpec
-from specforge.config.draft.registry import register_component_schema
+from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.config.draft.rope import LinearRoPESpec
 from specforge.export.to_sglang import export_to_sglang
 from specforge.loading import read_draft
@@ -56,10 +56,11 @@ class SGLangExportTest(unittest.TestCase):
         class CustomLogits(NoLogitTransformSpec):
             type: ClassVar[str] = "test_serving_logits"
 
-        register_component_schema("logits", CustomLogits)
-        config = replace(draft_config(), target_logit_transform=CustomLogits())
-        with self.assertRaisesRegex(ValueError, "target logit transform"):
-            convert_config(config)
+        with patch.dict(_SCHEMAS):
+            register_component_schema("logits", CustomLogits)
+            config = replace(draft_config(), target_logit_transform=CustomLogits())
+            with self.assertRaisesRegex(ValueError, "target logit transform"):
+                convert_config(config)
 
     def test_registry_and_artifact_boundary(self):
         workflow = Path(__file__).resolve().parents[2] / ".github/workflows/test.yaml"
@@ -77,6 +78,9 @@ class SGLangExportTest(unittest.TestCase):
                         t2d=torch.arange(config.vocab_size) < config.draft_vocab_size,
                         d2t=torch.zeros(config.draft_vocab_size, dtype=torch.long),
                     )
+                tokens = dict(bos_token_id=1, eos_token_id=[2, 3], pad_token_id=0)
+                for name, value in tokens.items():
+                    setattr(model.config, name, value)
                 save_draft(model, root / "draft")
                 before = model.config.to_dict()
                 self.assertEqual(
@@ -97,6 +101,7 @@ class SGLangExportTest(unittest.TestCase):
                     read_draft(root / "serving")
                 fields = json.loads((root / "serving" / "config.json").read_text())
                 self.assertEqual(fields["specforge_artifact"], artifact_metadata())
+                self.assertEqual({name: fields[name] for name in tokens}, tokens)
                 self.assertFalse((root / "serving" / "artifact.json").exists())
                 from transformers import AutoConfig
 
