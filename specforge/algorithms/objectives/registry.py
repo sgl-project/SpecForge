@@ -26,6 +26,9 @@ class TrainingRequirements:
     loss_mask_filter: Callable[[object], bool] | None = None
     attention_backends: frozenset[str] = frozenset({"eager"})
     window_statistic: WindowStatistic | None = None
+    host_inputs: Callable | None = (
+        None  # (batch tensors, draft config) -> extra tensors
+    )
 
 
 @dataclass(frozen=True)

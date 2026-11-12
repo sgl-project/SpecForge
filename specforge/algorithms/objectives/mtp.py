@@ -12,10 +12,30 @@ from .predictions import PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
 
+def supervision_weights(batch, spec):
+    ids = batch["input_ids"]
+    positions = torch.arange(1, ids.shape[1], device=ids.device).expand_as(ids[:, 1:])
+    labels = positions + spec.prediction_token_offset
+    padding = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.bool))
+    return (
+        gather(valid_tokens(batch), labels)
+        & (labels < ids.shape[1])
+        & padding[:, 1:].bool()
+    ).float()
+
+
+def prepare_supervised_rows(batch, config):
+    """Select projection rows before the strategy transfers the batch to CUDA."""
+    weights = supervision_weights(batch, config.spec_config)
+    return {"mtp_supervised_rows": weights.flatten().nonzero().flatten()}
+
+
 @register_protocol(
     "mtp",
     training=TrainingRequirements(
-        capture_method="dflash", attention_backends=frozenset({"eager", "sdpa"})
+        capture_method="dflash",
+        attention_backends=frozenset({"eager", "sdpa"}),
+        host_inputs=prepare_supervised_rows,
     ),
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
@@ -32,7 +52,7 @@ class MTPObjective:
 
     def __call__(self, runtime, batch, **context):
         model, spec = runtime.draft_model, runtime.draft_model.config.draft.spec_config
-        ids, supervised = batch["input_ids"], valid_tokens(batch)
+        ids = batch["input_ids"]
         positions = torch.arange(1, ids.shape[1], device=ids.device).expand(
             ids.shape[0], -1
         )
@@ -64,11 +84,7 @@ class MTPObjective:
         )
         label_positions = positions + spec.prediction_token_offset
         labels = gather(ids, label_positions)
-        weights = (
-            gather(supervised, label_positions)
-            & (label_positions < ids.shape[1])
-            & padding
-        ).float()
+        weights = supervision_weights(batch, spec)
         predictions = runtime.predictions(
             output.hidden_states,
             batch,
@@ -79,4 +95,12 @@ class MTPObjective:
             positions=torch.zeros_like(positions),
             chain_ids=torch.arange(positions.numel(), device=ids.device).reshape(-1, 1),
         )
+        rows = batch.get("mtp_supervised_rows")
+        if rows is None:
+            rows = prepare_supervised_rows(batch, model.config.draft)[
+                "mtp_supervised_rows"
+            ]
+        # An empty selection still projects an empty tensor, preserving the graph
+        # through every trained parameter on ranks with no supervised tokens.
+        predictions = predictions.select(rows)
         return PredictionBatch((predictions,), chunk_size=self.objective_chunk_size)

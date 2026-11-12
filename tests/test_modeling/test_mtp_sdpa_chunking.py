@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from specforge.algorithms.objectives import build_objective_model
+from specforge.algorithms.objectives.mtp import prepare_supervised_rows
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_checkpoint.test_native_presets import native_configs
@@ -40,9 +41,14 @@ class MTPBackendObjectiveTest(unittest.TestCase):
             }
             batch["position_ids"] = torch.arange(9, device=device)[None] + 17
             batch["attention_mask"][0, -2:] = 0
+            batch["loss_mask"][:, 3:5] = 0
+            selected = prepare_supervised_rows(batch, config)["mtp_supervised_rows"]
+            dense_batch = batch | {
+                "mtp_supervised_rows": torch.arange(8, device=device)
+            }
             expected = build_objective_model(
                 reference, options={"objective_chunk_size": 0}
-            )(batch, step=0, total_steps=None)
+            )(dense_batch, step=0, total_steps=None)
             expected.loss.backward()
             for chunk_size in (0, 1, 3, 4096):
                 with self.subTest(device=device, dtype=dtype, chunk_size=chunk_size):
@@ -53,15 +59,28 @@ class MTPBackendObjectiveTest(unittest.TestCase):
                     runtime = build_objective_model(
                         model, options={"objective_chunk_size": chunk_size}
                     )
-                    with patch.object(
-                        model.lm_head, "forward", wraps=model.lm_head.forward
-                    ) as head:
+                    with (
+                        patch.object(
+                            model.lm_head, "forward", wraps=model.lm_head.forward
+                        ) as head,
+                        patch.object(
+                            torch.nn.functional,
+                            "scaled_dot_product_attention",
+                            wraps=torch.nn.functional.scaled_dot_product_attention,
+                        ) as sdpa,
+                    ):
                         actual = runtime(batch, step=0, total_steps=None)
+                        self.assertTrue(sdpa.called)
+                        self.assertEqual(
+                            sum(c.args[0].shape[0] for c in head.call_args_list),
+                            selected.numel(),
+                        )
                         forward_calls = head.call_count
                         actual.loss.backward()
                         self.assertEqual(
                             head.call_count,
-                            forward_calls * (2 if 0 < chunk_size < 8 else 1),
+                            forward_calls
+                            * (2 if 0 < chunk_size < selected.numel() else 1),
                         )
                         self.assertLessEqual(
                             max(call.args[0].shape[0] for call in head.call_args_list),
@@ -84,6 +103,52 @@ class MTPBackendObjectiveTest(unittest.TestCase):
         self.assertIsNotNone(model.lm_head.weight.grad)
         batch["loss_mask"].zero_()
         self.assertEqual(runtime(batch, step=0, total_steps=None).loss.item(), 0)
+
+    def test_host_rows_and_empty_backward(self):
+        from specforge.runtime.contracts import TrainBatch
+        from specforge.training.strategies.base import StepContext
+        from specforge.training.strategies.canonical import CanonicalTrainStrategy
+
+        config = owned_mtp_config()
+        for empty in (False, True):
+            model = build_draft_model(config)
+            runtime = build_objective_model(model)
+            batch = training_batch(config)
+            batch["loss_mask"][:, ::2] = 0
+            if empty:
+                batch["loss_mask"].zero_()
+            host = prepare_supervised_rows(batch, config)
+            expected = runtime(batch, step=0, total_steps=None)
+            strategy = CanonicalTrainStrategy(
+                runtime, name="mtp", objective="mtp", required_features=batch
+            )
+            with patch.object(runtime, "forward", wraps=runtime.forward) as forward:
+                actual = strategy.forward_loss(
+                    TrainBatch(sample_ids=["test"], strategy="mtp", tensors=batch),
+                    StepContext(),
+                )
+            torch.testing.assert_close(
+                forward.call_args.args[0]["mtp_supervised_rows"],
+                host["mtp_supervised_rows"],
+            )
+            torch.testing.assert_close(actual.loss, expected.loss)
+            actual.loss.backward()
+            if empty:
+                for parameter in model.parameters():
+                    self.assertIsNotNone(parameter.grad)
+                    self.assertEqual(parameter.grad.count_nonzero().item(), 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_host_rows_avoid_device_nonzero(self):
+        config = owned_mtp_config()
+        batch = training_batch(config)
+        batch.update(prepare_supervised_rows(batch, config))
+        batch = {key: value.cuda() for key, value in batch.items()}
+        runtime = build_objective_model(build_draft_model(config, device="cuda"))
+        with patch.object(
+            torch.Tensor, "nonzero", side_effect=AssertionError("device row lookup")
+        ):
+            runtime(batch, step=0, total_steps=None).loss.backward()
 
     def test_chunk_sizes_validate(self):
         from specforge.algorithms.objectives.mtp import MTPObjective

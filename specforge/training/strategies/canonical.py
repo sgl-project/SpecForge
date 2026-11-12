@@ -19,6 +19,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self._duplicate_parameters = set()
         inner = model.module if isinstance(model, DistributedDataParallel) else model
         self.window_statistic = inner.registration.training.window_statistic
+        self.host_inputs = inner.registration.training.host_inputs
+        self.draft_config = inner.draft_model.config.draft
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
@@ -41,9 +43,11 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def _forward(self, batch, ctx, window_value=None):
         self.validate_batch(batch)
         device = next(self.model.parameters()).device
+        inputs = batch.tensors
+        if self.host_inputs is not None:
+            inputs = inputs | self.host_inputs(inputs, self.draft_config)
         tensors = {
-            key: value.to(device, non_blocking=True)
-            for key, value in batch.tensors.items()
+            key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }
         result = self.model(
             tensors,
