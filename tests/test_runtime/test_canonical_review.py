@@ -555,3 +555,20 @@ class CanonicalReviewTest(unittest.TestCase):
             head = load_file(target / "model.safetensors")["lm_head.weight"]
             embedding = bundle.draft_model.embed_tokens.weight.detach().cpu()
             self.assertTrue(torch.equal(embedding, head))
+
+    def test_offline_records_need_the_supervision_the_objective_trains_on(self):
+        """Legacy rejects these by name; canonical failed generically or skipped."""
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            resolved = resolve_run(run_config(target, draft_config()))
+            provider = resolved.algorithm.providers.offline_for("text")
+            normalize = provider.build_normalizer(16)
+            record = {
+                "input_ids": torch.arange(4),
+                "loss_mask": torch.tensor([1, 0, 1, 0]),
+                "hidden_states": torch.zeros(4, 32 * 5),
+            }
+            with self.assertRaisesRegex(ValueError, "loss-mask requirement"):
+                normalize(record)
+            record["loss_mask"] = torch.tensor([1, 1, 0, 0])
+            self.assertEqual(normalize(record)["loss_mask"].shape, (1, 4))

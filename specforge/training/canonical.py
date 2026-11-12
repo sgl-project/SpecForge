@@ -355,7 +355,11 @@ def resolve_run(cfg, *, target_config=None):
         modality="text",
         normalizer_id=normalizer,
         build_reader=partial(canonical_data.build_reader, strategy=family, keys=keys),
-        build_normalizer=partial(canonical_data.build_normalizer, keys=keys),
+        build_normalizer=partial(
+            canonical_data.build_normalizer,
+            keys=keys,
+            loss_mask_filter=requirements.loss_mask_filter,
+        ),
         build_collator=partial(canonical_data.build_collator, keys=keys),
         capture_layout=layout,
     )

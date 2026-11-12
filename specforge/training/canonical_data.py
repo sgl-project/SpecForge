@@ -3,7 +3,7 @@
 from functools import partial
 
 
-def normalize_sample(raw, *, keys, max_len):
+def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
     import torch
 
     result = {}
@@ -22,12 +22,19 @@ def normalize_sample(raw, *, keys, max_len):
             raise ValueError("capture tensors must have identical sequence lengths")
         length = value.shape[0]
         result[key] = value.unsqueeze(0)
+    if loss_mask_filter is not None and not loss_mask_filter(result["loss_mask"][0]):
+        raise ValueError(
+            "offline record fails the objective's loss-mask requirement "
+            f"({loss_mask_filter.__name__})"
+        )
     result["attention_mask"] = torch.ones_like(result["input_ids"], dtype=torch.bool)
     return result
 
 
-def build_normalizer(max_len, *, keys, **topology):
-    return partial(normalize_sample, keys=keys, max_len=max_len)
+def build_normalizer(max_len, *, keys, loss_mask_filter=None, **topology):
+    return partial(
+        normalize_sample, keys=keys, max_len=max_len, loss_mask_filter=loss_mask_filter
+    )
 
 
 def collate(features, *, keys):
