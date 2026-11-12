@@ -13,6 +13,22 @@ from specforge.modeling.draft.mtp.qwen3_5 import Qwen3_5RMSNorm
 
 
 class RMSNormTest(unittest.TestCase):
+    def test_liger_skips_weightless_norms(self):
+        """Liger RMSNorm needs a weight; a weightless norm keeps the PyTorch path."""
+        from specforge.modeling.draft.layers.kernels import configure_kernels
+
+        weightless = RMSNorm(
+            RMSNormSpec(eps=1e-6, weight_offset=0, has_weight=False), hidden_size=8
+        )
+        model = torch.nn.Sequential(weightless)
+        kernels = (object(), object())
+        with patch(
+            "specforge.modeling.draft.layers.kernels.load_liger_kernels",
+            return_value=kernels,
+        ):
+            configure_kernels(model, use_liger=True)
+        self.assertIsNone(weightless.liger_norm)
+
     def _assert_parity(self, device, dtypes):
         for reference_type, offset in (
             (Qwen3RMSNorm, 0),

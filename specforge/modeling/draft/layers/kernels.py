@@ -24,7 +24,8 @@ def configure_kernels(model, *, use_liger=False):
     rms_norm, swiglu = load_liger_kernels()
     for module in model.modules():
         if isinstance(module, RMSNorm):
-            module.liger_norm = rms_norm
+            # the Liger kernel scales by a weight; weightless norms stay on PyTorch
+            module.liger_norm = rms_norm if module.weight is not None else None
         elif isinstance(module, DenseFFN) and module.config.hidden_act in {
             "silu",
             "swish",
