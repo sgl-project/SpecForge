@@ -53,8 +53,8 @@ class DraftPreTrainedModel(PreTrainedModel):
         """Validate owned checkpoint tensors without loading them into the model.
 
         The model may be on meta and target bindings remain unmaterialized.
-        Components receive their local state keys; architecture overrides call
-        super() before checking model-owned state.
+        Components receive their local state keys; model-owned state is checked by
+        `validate_own_export_state`.
         """
         for name, module in self.named_modules():
             if not name:
@@ -69,6 +69,10 @@ class DraftPreTrainedModel(PreTrainedModel):
                         if key.startswith(prefix)
                     }
                 )
+        self.validate_own_export_state(state)
+
+    def validate_own_export_state(self, state) -> None:
+        """Check state the model itself owns; components are checked separately."""
 
     def finalize_initialization(self, *, loaded_keys: frozenset[str]) -> None:
         """Finish scratch/warm-start initialization after copying and binding weights.

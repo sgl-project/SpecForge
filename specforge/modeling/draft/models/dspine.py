@@ -72,8 +72,7 @@ class DSpineDraftModel(DraftPreTrainedModel):
         init.zeros_(self.transfer_codes)
         init.zeros_(self.transfer_ready)
 
-    def validate_export_state(self, state) -> None:
-        super().validate_export_state(state)
+    def validate_own_export_state(self, state) -> None:
         if not bool(state["transfer_ready"]):
             raise ValueError("transfer_ready: serving state is not initialized")
 
