@@ -455,3 +455,50 @@ class CanonicalReviewTest(unittest.TestCase):
                     target_config=store.config,
                     from_target={"embed_tokens.weight": "model.embed_tokens.weight"},
                 )
+
+    def test_legacy_import_settings_may_repeat_on_canonical_resume(self):
+        """The import YAML with initialization swapped for resume must still run."""
+        import shutil
+
+        from specforge.checkpoint import save_draft
+        from specforge.loading import load_draft
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            legacy = shutil.copytree(fixture, Path(temp) / "legacy")
+            model = load_draft(
+                legacy, target=target, legacy_settings={"mask_token_id": 63}
+            )
+            resumed = Path(temp) / "resumed"
+            save_draft(model, resumed)
+            torch.save({}, resumed / "training_state.pt")
+
+            def resolve(**settings):
+                raw = dict(
+                    model={
+                        "target_model_path": str(target),
+                        "torch_dtype": "float32",
+                        **settings,
+                    },
+                    resume=str(resumed),
+                    data={"hidden_states_path": str(Path(temp) / "features")},
+                    training={"attention_backend": "eager", "batch_size": 1},
+                )
+                return resolve_run(Config.model_validate(raw))
+
+            spec = resolve(mask_token_id=63).config.draft["spec_config"]
+            self.assertEqual(spec["mask_token_id"], 63)
+            with self.assertRaisesRegex(ValueError, "model.mask_token_id=62"):
+                resolve(mask_token_id=62)
+            raw = dict(
+                model={"target_model_path": str(target), "mask_token_id": 63},
+                resume=str(legacy),
+                data={"hidden_states_path": str(Path(temp) / "features")},
+                training={"attention_backend": "eager", "batch_size": 1},
+            )
+            torch.save({}, Path(legacy) / "training_state.pt")
+            with patch("specforge.loading.read_draft") as read:
+                with self.assertRaisesRegex(ValueError, "legacy full resume"):
+                    resolve_run(Config.model_validate(raw))
+                read.assert_not_called()

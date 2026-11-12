@@ -26,6 +26,13 @@ def enabled(cfg):
     return False
 
 
+_LEGACY_SETTING_FIELDS = {
+    "mask_token_id": "model.mask_token_id",
+    "norm_before_residual": "training.norm_before_residual",
+    "capture_layers": "model.aux_hidden_state_layer_ids",
+}
+
+
 def _legacy_settings(cfg):
     return {
         name: value
@@ -36,6 +43,41 @@ def _legacy_settings(cfg):
         }.items()
         if value is not None
     }
+
+
+def _is_canonical_checkpoint(cfg, source):
+    from specforge.checkpoint.resolve import read_json, resolve_directory
+
+    path = resolve_directory(source, cache_dir=cfg.model.cache_dir, config_only=True)
+    config = (path.parent if path.is_file() else path) / "config.json"
+    return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
+
+
+def _source_legacy_settings(cfg, source):
+    """Legacy imports apply the YAML settings; canonical sources already record them."""
+    return None if _is_canonical_checkpoint(cfg, source) else _legacy_settings(cfg)
+
+
+def _reject_changed_legacy_settings(config, settings):
+    spec = config.spec_config
+    features = spec.target_features
+    # each setting lives on the spec node of the architectures that have it
+    recorded = {
+        "mask_token_id": getattr(
+            spec, "mask_token_id", getattr(features, "mask_token_id", None)
+        ),
+        "norm_before_residual": getattr(spec, "norm_before_residual", None),
+        "capture_layers": getattr(features, "target_layer_ids", None),
+    }
+    for name, value in settings.items():
+        saved = recorded[name]
+        if name == "capture_layers" and saved is not None:
+            saved, value = list(saved), list(value)
+        if saved != value:
+            raise ValueError(
+                f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
+                f"checkpoint's recorded {saved!r}; remove it or make it match"
+            )
 
 
 def resolve_config(cfg, *, target_config=None):
@@ -58,28 +100,25 @@ def resolve_config(cfg, *, target_config=None):
     if source:
         from specforge.loading import read_draft
 
+        canonical = _is_canonical_checkpoint(cfg, source)
+        if cfg.resume_path and not canonical:
+            raise ValueError(
+                "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+            )
         loaded = read_draft(
             source,
             target=cfg.model.target_model_path,
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
             legacy_config=initialization.legacy_config if initialization else None,
-            legacy_settings=_legacy_settings(cfg),
+            legacy_settings=None if canonical else _legacy_settings(cfg),
         ).config
+        if canonical:
+            _reject_changed_legacy_settings(loaded, _legacy_settings(cfg))
         if supplied is not None and supplied != loaded:
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
-        if cfg.resume_path:
-            from specforge.checkpoint.resolve import read_json
-
-            if (
-                read_json(Path(source) / "config.json").get("model_type")
-                != "specforge_draft"
-            ):
-                raise ValueError(
-                    "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
-                )
         return loaded
     if _legacy_settings(cfg) and not (initialization and initialization.weights_from):
         raise ValueError(
@@ -451,7 +490,7 @@ def build_bundle(cfg, algorithm):
             **common,
             adapter=init.adapter if init else None,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_legacy_settings(cfg),
+            legacy_settings=_source_legacy_settings(cfg, source),
         ).train()
     else:
         weights = init.weights_from if init else None
