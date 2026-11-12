@@ -26,6 +26,53 @@ def native_fixture():
 
 
 class NativeContractTest(unittest.TestCase):
+    def test_native_prefix_spellings_share_preflight(self):
+        draft, target = native_fixture()
+        changed = replace(
+            draft, rope_parameters=replace(draft.rope_parameters, rope_theta=1e6)
+        )
+        for prefix in ("mtp", "mtp."):
+            for entry in (prefix, NATIVE_MAPPING[""] | {"from": prefix}):
+                with self.subTest(entry=entry):
+                    mapping = {"": entry}
+                    validate_target_initialization(draft, target, mapping)
+                    cfg = run_config(
+                        FIXTURE, changed, initialization={"from_target": mapping}
+                    )
+                    with self.assertRaisesRegex(ValueError, "disagrees with draft"):
+                        resolve_run(cfg, target_config=target["text_config"])
+
+    def test_shape_preserving_component_mismatches_are_rejected(self):
+        draft, target = native_fixture()
+        key = draft.layer_configs[draft.layer_types[0]].attention
+        attention = draft.attention_configs[key]
+        variants = {
+            "plain_rmsnorm": replace(
+                draft, norm_config=replace(draft.norm_config, weight_offset=0)
+            ),
+        }
+        for name, options in (
+            ("qk_after_rope", {"qk_norm_position": "after_rope"}),
+            ("qk_eps", {"qk_norm_config": replace(draft.norm_config, eps=1e-5)}),
+            ("sliding_window", {"sliding_window": 128}),
+        ):
+            variants[name] = replace(
+                draft,
+                attention_configs={
+                    **draft.attention_configs,
+                    key: replace(attention, **options),
+                },
+            )
+        for name, changed in variants.items():
+            with self.subTest(component=name):
+                cfg = run_config(
+                    FIXTURE, changed, initialization={"from_target": NATIVE_MAPPING}
+                )
+                with self.assertRaisesRegex(ValueError, "components disagree"):
+                    resolve_run(cfg, target_config=target["text_config"])
+                with self.assertRaisesRegex(ValueError, "components disagree"):
+                    export_native(changed, {}, FIXTURE, "unused")
+
     def test_native_preflight_and_capture(self):
         draft, target = native_fixture()
         validate_target_initialization(draft, target, NATIVE_MAPPING)

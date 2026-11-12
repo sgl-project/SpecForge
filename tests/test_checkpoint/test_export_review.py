@@ -87,6 +87,7 @@ class ExportReviewTest(unittest.TestCase):
         args = ["export", "--checkpoint", "checkpoint", "--output-dir", "out"]
         with patch("specforge.export.model.export_draft") as export:
             for options, error in (
+                (["--copy-target"], "requires native export"),
                 (["--converter", "sglang", "--to", "hf"], "mutually exclusive"),
                 (["--to", "hf", "--copy-target"], "cannot be combined"),
             ):

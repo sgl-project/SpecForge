@@ -64,16 +64,30 @@ class ExportModesTest(unittest.TestCase):
         args = ["export", "--checkpoint", "source", "--output-dir", "out"]
         for mode in ("standalone", "native"):
             with patch("specforge.export.model.export_draft") as export:
-                result = CliRunner().invoke(cli, args + ["--export-mode", mode])
+                result = CliRunner().invoke(
+                    cli, args + ["--export-mode", mode, "--target-model", "target"]
+                )
                 self.assertEqual(result.exit_code, 0, result.output)
                 self.assertEqual(export.call_args.kwargs["export_mode"], mode)
         for options, error in (
+            ({"copy_target": True}, "copy-target"),
             ({"export_mode": "native"}, "target-model"),
             ({"export_mode": "standalone", "copy_target": True}, "copy-target"),
             ({"export_mode": "native", "converter": "sglang"}, "omit --converter"),
         ):
             with self.assertRaisesRegex(ValueError, error):
                 export_draft("missing", None, "out", **options)
+            flags = []
+            for key, value in options.items():
+                flags.append("--" + key.replace("_", "-"))
+                if value is not True:
+                    flags.append(value)
+            with patch("specforge.export.model.read_export") as read:
+                result = CliRunner().invoke(cli, args + flags)
+                self.assertEqual(result.exit_code, 2, result.output)
+                self.assertIn(error, result.output)
+                self.assertNotIn("Traceback", result.output)
+                read.assert_not_called()
         result = CliRunner().invoke(
             cli, args + ["--to", "hf", "--export-mode", "native"]
         )

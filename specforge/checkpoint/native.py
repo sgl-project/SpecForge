@@ -42,6 +42,8 @@ def validate_target_initialization(config, target, from_target):
     # Only a root destination declares a complete native model initialization.
     entry = (from_target or {}).get("")
     source = entry.get("from") if isinstance(entry, dict) else entry
+    if isinstance(source, str):
+        source = source.rstrip(".")
     text = target.get("text_config", target)
     native = _TARGETS.get((text.get("model_type"), config.architecture))
     if native is not None and source == native.source_prefix:

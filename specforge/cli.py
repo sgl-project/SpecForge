@@ -360,16 +360,23 @@ def export(
                 "reads the vocabulary mapping from the checkpoint",
                 ctx,
             )
-        from specforge.export.model import export_draft
+        from specforge.export.model import check_export_options, export_draft
 
-        export_draft(
-            checkpoint,
-            draft_config,
-            output_dir,
+        options = dict(
             export_mode=export_mode,
             converter=converter,
             target_model=target_model,
             copy_target=copy_target,
+        )
+        try:
+            check_export_options(**options)
+        except ValueError as error:
+            raise click.UsageError(str(error), ctx) from error
+        export_draft(
+            checkpoint,
+            draft_config,
+            output_dir,
+            **options,
             vocab_mapping_path=vocab_mapping,
         )
         return 0
