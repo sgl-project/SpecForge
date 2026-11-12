@@ -1,13 +1,12 @@
 """Dense Qwen3.5 MTP configuration, validation and merge-back layout."""
 
+from specforge.checkpoint.native import register_native_target
 from specforge.config.draft.attention import GQASpec
 from specforge.config.draft.codec.components import decode_component
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, MultiAxisRoPESpec
-
-from ...native import register_native_target
 
 
 def validate_target(config, target):
@@ -98,7 +97,7 @@ def _fields(config):
 
 
 def export(config, state, source, payload, output, *, copy_target=False):
-    from .writer import write_native
+    from ..writer import write_native
 
     weights = {}
     for name, tensor in state.items():

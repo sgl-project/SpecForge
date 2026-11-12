@@ -64,7 +64,7 @@ def legacy_native_mode(config, target_model):
 
     if read_target_config(target_model).get("model_type") != "qwen3_5_text":
         return False
-    from specforge.checkpoint.formats.sglang.qwen3_5 import convert_config
+    from specforge.checkpoint.formats.sglang.models.qwen3_5 import convert_config
 
     convert_config(config)
     warnings.warn(

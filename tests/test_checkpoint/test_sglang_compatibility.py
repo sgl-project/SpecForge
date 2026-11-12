@@ -22,7 +22,7 @@ from transformers import AutoConfig, PretrainedConfig
 
 from specforge.checkpoint.formats.sglang import NON_COMPUTATIONAL_READS, convert_config
 from specforge.checkpoint.formats.sglang.converters import serving_weights
-from specforge.checkpoint.formats.sglang.qwen3_5 import (
+from specforge.checkpoint.formats.sglang.models.qwen3_5 import (
     convert_config as convert_qwen3_5_config,
 )
 from specforge.config.draft.attention import MLASpec

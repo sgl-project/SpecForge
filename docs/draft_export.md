@@ -164,3 +164,20 @@ SPECFORGE_SGLANG_EXPORT_TESTS=1 TORCHDYNAMO_DISABLE=1 \
   python -m unittest tests.test_checkpoint.test_sglang_export \
   tests.test_checkpoint.test_sglang_compatibility -v
 ```
+
+## Adding family adapters
+
+Keep family-specific code in `specforge/checkpoint/formats/native/models/` or
+`specforge/checkpoint/formats/sglang/models/`. Add an explicit import in that
+package's `__init__.py` so registration runs when the package loads.
+
+Native adapters call `register_native_target(model_type, architecture, ...)` and
+provide validation and export callbacks. They can reuse `native/writer.py` for
+weight checks and publication without changing the public exporter.
+Standalone serving converters use `register_converter(architecture)`; shared
+algorithm conversions remain in `sglang/converters.py`.
+
+The SGLang Qwen3.5 module is a compatibility helper for the historical native
+command and parity tests, not a standalone MTP converter. Do not register it
+under `MTPDraftModel`: that would incorrectly select Qwen3.5 for every target.
+Native registration never selects an export mode or adds standalone engine support.

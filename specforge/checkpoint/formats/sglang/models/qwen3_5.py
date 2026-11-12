@@ -4,7 +4,7 @@ from specforge.config.draft.rope import DefaultRoPESpec, MultiAxisRoPESpec
 
 
 def convert_config(config):
-    from .converters import common, require
+    from ..converters import common, require
 
     require(
         config.target_bindings == ("embed_tokens", "lm_head"),

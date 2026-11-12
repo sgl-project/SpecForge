@@ -49,4 +49,4 @@ def validate_target_initialization(config, target, from_target):
 
 
 # Family modules register after the registry is defined.
-from .formats.native import qwen3_5  # noqa: E402,F401
+from .formats.native import models  # noqa: E402,F401
