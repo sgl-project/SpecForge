@@ -174,3 +174,98 @@ class CanonicalExportTest(unittest.TestCase):
                 torch.testing.assert_close(
                     restored.fusion.fc.weight, old.fc.weight, rtol=0, atol=0
                 )
+
+    def test_legacy_bound_copy_must_match_the_target(self):
+        from safetensors.torch import save_file
+
+        from tests.test_checkpoint.test_loading import write_target
+        from tests.test_config.test_draft_legacy_mtp import mtp_payload
+
+        for offset, accepted in ((0, True), (1, False)):
+            with self.subTest(accepted=accepted), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                target, source = root / "target", root / "source"
+                weights = write_target(target)
+                source.mkdir()
+                payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
+                (source / "config.json").write_text(json.dumps(payload))
+                torch.save({}, source / "training_state.pt")
+                head = {"mtp.lm_head.weight": weights["lm_head.weight"]}
+                save_file(head, source / "model.safetensors")
+                model = build_draft_model(read_draft(source, target=target).config)
+                state = {
+                    "mtp."
+                    + key.replace("backbone.final_norm.", "norm.")
+                    .removeprefix("backbone.")
+                    .removeprefix("fusion."): value
+                    for key, value in model.state_dict().items()
+                }
+                state["mtp.lm_head.weight"] = weights["lm_head.weight"] + offset
+                save_file(state, source / "model.safetensors")
+                if accepted:
+                    export_to_hf(
+                        str(source), None, str(root / "hf"), target_model=str(target)
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "differs from bound target"
+                    ):
+                        export_to_hf(
+                            str(source),
+                            None,
+                            str(root / "hf"),
+                            target_model=str(target),
+                        )
+                    self.assertFalse((root / "hf").exists())
+
+    def test_draft_defects_fail_before_target_tables_are_read(self):
+        from safetensors.torch import save_file
+
+        from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
+        from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+        payload = eagle_payload() | dict(
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            draft_vocab_size=32,
+        )
+        payload.pop("rope_scaling", None)
+        renames = (
+            ("backbone.layers.0.", "midlayer."),
+            ("backbone.final_norm.", "norm."),
+            ("fusion.", ""),
+            ("vocabulary.", ""),
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target, source = root / "target", root / "source"
+            target.mkdir()
+            source.mkdir()
+            # config only: reading a target table would fail with FileNotFoundError
+            (target / "config.json").write_text(
+                json.dumps(
+                    {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 128}
+                )
+            )
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file({"x": torch.zeros(1)}, source / "model.safetensors")
+            model = build_draft_model(read_draft(source, target=target).config)
+            install_mapping(model)
+            state = {}
+            for key, value in model.state_dict().items():
+                for new, old in renames:
+                    if key.startswith(new):
+                        key = old + key.removeprefix(new)
+                        break
+                state[key] = value
+            state["embed_tokens.weight"] = torch.randn(64, 32)  # a bound copy
+            del state["fc.weight"]
+            save_file(state, source / "model.safetensors")
+            with self.assertRaisesRegex(ValueError, "missing draft tensors"):
+                export_to_hf(
+                    str(source), None, str(root / "hf"), target_model=str(target)
+                )

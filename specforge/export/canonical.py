@@ -1,4 +1,4 @@
-"""Export orchestration: validate owned state without materializing target tables."""
+"""Validate owned export state; target tables are read only to check legacy copies."""
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +7,7 @@ import torch
 
 from specforge.checkpoint import make_weight_plan
 from specforge.checkpoint.tensors import TensorInfo, TensorRef
-from specforge.loading import read_draft
+from specforge.loading import check_bound_copies, read_draft
 from specforge.modeling import build_draft_model
 
 
@@ -56,4 +56,6 @@ def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=Non
             state[name] = ref.read().contiguous()
             seen.add(ref)
     preview.validate_export_state(state)
+    # the artifact drops legacy copies of bound tables, so they must equal the target
+    check_bound_copies(checkpoint, target=target)
     return checkpoint, state, type(preview)
