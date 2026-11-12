@@ -80,8 +80,10 @@ loading rejects a serving artifact.
 Supported DFlash-family layers use uniform dense SiLU MLPs, standard residuals,
 GQA/MHA or MLA, and explicit supported RoPE settings. Layer-specific values are
 accepted only where SGLang can express them. In particular, mixed causality,
-different head geometry across layers, noncausal sliding windows and window=1
-fail instead of using SGLang defaults. Unsupported component kinds and binding
+different head geometry across layers and window=1 fail instead of using SGLang
+defaults. Noncausal sliding windows must cover at least one model block.
+The pinned converter rejects muP targets for DFlash2/Domino and offset RMSNorm
+for DSpark because their serving paths do not implement those computations. Unsupported component kinds and binding
 sets also fail. The pinned DSpark implementation chooses confidence-head use
 through its ragged-verification runtime mode; `cap-accept` exercises that head.
 

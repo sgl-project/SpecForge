@@ -55,8 +55,8 @@ def common(config, *, eagle=False, native=False):
     windows = {attention.sliding_window for attention in attentions} - {None}
     require(len(windows) <= 1, "per-layer sliding windows differ")
     require(
-        not windows or (a.is_causal and min(windows) > 1),
-        "sliding attention requires causal window > 1 in pinned SGLang",
+        not windows or min(windows) > 1,
+        "sliding window must exceed 1",
     )
     mlps = [config.mlp_configs[layer.mlp] for layer in layers]
     require(
@@ -114,8 +114,8 @@ def common(config, *, eagle=False, native=False):
         partial_rotary_factor=rope.partial_rotary_factor,
         rope_scaling=scaling,
         rope_parameters=dict(scaling),
-        rope_is_neox_style=True,
-        is_neox_style=True,
+        rope_is_neox_style=not rope.interleaved,
+        is_neox_style=not rope.interleaved,
         attention_sink_bias=False,
         pad_token_id=None,
         bos_token_id=None,
@@ -147,7 +147,7 @@ def common(config, *, eagle=False, native=False):
             not eagle and not native, "MLA is only supported for DFlash-family exports"
         )
         require(
-            not a.attention_bias and a.rope_interleave,
+            not a.attention_bias and rope.interleaved,
             "MLA requires no bias and interleaved rotary input",
         )
         require(
@@ -169,11 +169,14 @@ def common(config, *, eagle=False, native=False):
                     "qk_nope_head_dim",
                     "qk_rope_head_dim",
                     "v_head_dim",
-                    "rope_interleave",
                 )
             }
         )
-        result.update(num_key_value_heads=a.num_attention_heads, head_dim=a.qk_head_dim)
+        result.update(
+            num_key_value_heads=a.num_attention_heads,
+            head_dim=a.qk_head_dim,
+            rope_interleave=rope.interleaved,
+        )
     convs = [
         config.conv_configs[layer.sublayer_conv] if layer.sublayer_conv else None
         for layer in layers
@@ -203,6 +206,11 @@ def context(config):
     result, a, conv = common(config)
     spec = config.spec_config
     protocol = spec.protocol
+    window = result["sliding_window"]
+    require(
+        a.is_causal or window is None or window >= protocol.num_model_slots,
+        "a non-causal sliding window must be at least the block size",
+    )
     result["block_size"] = protocol.num_model_slots
     result["num_target_layers"] = None
     result["has_embed_tokens"] = False
@@ -211,7 +219,7 @@ def context(config):
         target_layer_ids=list(spec.target_features.target_layer_ids),
         num_target_layers=None,
         mask_token_id=spec.target_features.mask_token_id,
-        mask_token="[MASK]",
+        mask_token="<|MASK|>",
         attention_mode=a.type,
         conv_kernel_size=conv.kernel_size if conv else 0,
         conv_group_size=conv.group_size if conv else 0,
@@ -227,7 +235,7 @@ def context(config):
     result.update(
         target_layer_ids=list(spec.target_features.target_layer_ids),
         mask_token_id=spec.target_features.mask_token_id,
-        mask_token="[MASK]",
+        mask_token="<|MASK|>",
         projector_type=None,
     )
     return result
@@ -242,6 +250,10 @@ def dflash(config):
 
 @register_converter("DFlash2DraftModel")
 def dflash2(config):
+    require(
+        type(config.target_logit_transform) is not MuPLogitTransformSpec,
+        f"pinned SGLang does not apply the target muP multiplier to {config.architecture} logits",
+    )
     result = context(config)
     result["architectures"] = ["DFlash2DraftModel"]
     spec = config.spec_config
@@ -261,6 +273,10 @@ def dflash2(config):
 
 @register_converter("DominoDraftModel")
 def domino(config):
+    require(
+        type(config.target_logit_transform) is not MuPLogitTransformSpec,
+        f"pinned SGLang does not apply the target muP multiplier to {config.architecture} logits",
+    )
     result = context(config)
     spec = config.spec_config
     result["architectures"] = ["DFlashDraftModel"]
@@ -278,6 +294,10 @@ def domino(config):
 
 @register_converter("DSparkDraftModel")
 def dspark(config):
+    require(
+        config.norm_config.weight_offset == 0,
+        "pinned SGLang DSpark does not support offset (1 + w) RMSNorm",
+    )
     result = context(config)
     spec = config.spec_config
     require(spec.markov is not None, "pinned DSpark requires a Markov head")
