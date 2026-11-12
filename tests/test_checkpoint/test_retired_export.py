@@ -46,6 +46,14 @@ class RetiredExportTest(unittest.TestCase):
         )
 
     def test_mtp_recipes_use_canonical_sdpa(self):
+        from tests.test_checkpoint.test_native_contracts import FIXTURE
+
+        target = json.loads((FIXTURE / "config.json").read_text())["text_config"]
+        target_config = patch(
+            "specforge.checkpoint.resolve.read_target_config", return_value=target
+        )
+        target_config.start()
+        self.addCleanup(target_config.stop)
         for recipe in (
             "offline/colocated/qwen3.5-4b-native-mtp.yaml",
             "online/disaggregated/managed-local/qwen3.5-4b-mtp-npu.yaml",

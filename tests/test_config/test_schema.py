@@ -200,7 +200,7 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(payload)
 
     def test_explicit_liger_kernel_is_rejected_for_strategies_that_ignore_it(self):
-        for strategy in ("dflash", "domino", "dspark"):
+        for strategy in ("dflash", "domino", "dspark", "mtp"):
             payload = _online_payload(strategy)
             payload["model"]["use_liger_kernel"] = True
             self.assertIs(
@@ -210,14 +210,12 @@ class ConfigSchemaTest(unittest.TestCase):
                 True,
             )
 
-        for strategy in ("eagle3", "mtp", "peagle"):
+        for strategy in ("eagle3", "peagle"):
             for value in (None, False, True):
                 with self.subTest(strategy=strategy, use_liger_kernel=value):
                     payload = _online_payload(strategy)
                     if value is not None:
                         payload["model"]["use_liger_kernel"] = value
-                    if strategy == "mtp":
-                        payload["training"]["attention_backend"] = "sdpa"
                     cfg = Config.model_validate(payload)
                     if value is not True:
                         resolve_run(cfg)

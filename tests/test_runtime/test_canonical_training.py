@@ -438,8 +438,11 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
-            self.assertEqual(state["canonical_loss"]["kind"], "kl")
-            self.assertEqual(state["canonical_weighting"]["alpha"], 0.3)
+            self.assertEqual(state["canonical_loss"]["kind"], "ce" if mtp else "kl")
+            if mtp:
+                self.assertEqual(state["canonical_weighting"]["kind"], "uniform")
+            else:
+                self.assertEqual(state["canonical_weighting"]["alpha"], 0.3)
             if tied:
                 self.assertNotIn("lm_head.weight", state["draft_state_dict"])
                 self.assertIs(model.embed_tokens.weight, model.lm_head.weight)
@@ -449,10 +452,10 @@ class CanonicalTrainingTest(unittest.TestCase):
                     for name, tensor in state["draft_state_dict"].items()
                 )
             )
-            for key, changed in (
-                ("loss", {"kind": "tv"}),
-                ("weighting", {"kind": "uniform"}),
-            ):
+            changes = [("loss", {"kind": "tv"})]
+            if not mtp:
+                changes.append(("weighting", {"kind": "uniform"}))
+            for key, changed in changes:
                 with self.subTest(changed=key):
                     incompatible = Config.model_validate(raw)
                     setattr(incompatible.training, key, changed)

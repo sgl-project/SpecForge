@@ -423,12 +423,17 @@ class LoadingTest(unittest.TestCase):
                 path.mkdir()
                 target_weights = write_target(target)
                 with torch.no_grad():
-                    if factory is eagle_payload or factory is mtp_payload:
+                    if factory is eagle_payload:
                         old.embed_tokens.weight.copy_(
                             target_weights["model.embed_tokens.weight"]
                         )
                     if factory is mtp_payload:
-                        old.mtp.lm_head.weight.copy_(target_weights["lm_head.weight"])
+                        state["embed_tokens.weight"].copy_(
+                            target_weights["model.embed_tokens.weight"]
+                        )
+                        state["mtp.lm_head.weight"].copy_(
+                            target_weights["lm_head.weight"]
+                        )
                 (path / "config.json").write_text(json.dumps(payload))
                 state = old.state_dict()
                 if factory in (domino_payload, dspark_payload):
