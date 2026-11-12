@@ -25,8 +25,9 @@ built-in adapter; other combinations can register their own implementation.
 format, with `specforge_artifact: {format: native, version: 1}`; reload the canonical
 draft checkpoint to continue draft training.
 
-Native export checks target computation fields against the draft, adds missing
-fields, and rejects conflicting values. It rewrites shards containing old `mtp.*`
+Native export requires explicit target computation fields and checks them against
+the draft without changing the target configuration. Missing or conflicting fields
+are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
 tensors and links unaffected shards. `--copy-target` copies unaffected shards for
 a self-contained directory. Embedding/head copies are written under native names;
 The target is not modified.
@@ -140,13 +141,6 @@ rotary settings and block quantities are now written explicitly. Canonical modul
 prefixes are removed for serving, vocabulary readiness is validated rather than
 serialized, and Domino uses SGLang's registered DFlash architecture name. These
 are format changes; tensors are not cast or transformed.
-
-Native export requires explicit target computation fields, checks them against
-the draft, and preserves the target configuration. Missing or conflicting fields
-are rejected; target RoPE parameters never inherit draft defaults. It rewrites shards containing old `mtp.*`
-tensors and links unaffected shards. `--copy-target` copies unaffected shards for
-a self-contained directory. Embedding/head copies are written under native names;
-SGLang's worker also attaches the target token modules. The target is not modified.
 
 The pinned compatibility gate constructs real SGLang models and loads converted
 weights, records top-level and nested configuration reads for non-native models, and compares

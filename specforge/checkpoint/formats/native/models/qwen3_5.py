@@ -43,9 +43,13 @@ def validate_target(config, target):
     for name, value in fields.items():
         if name in ("rope_theta", "partial_rotary_factor"):
             continue  # These may be recorded inside the target's RoPE node.
-        actual = target.get(name, {"is_causal": True, "attention_dropout": 0.0}.get(name))
+        actual = target.get(
+            name, {"is_causal": True, "attention_dropout": 0.0}.get(name)
+        )
+        if actual is None:
+            raise ValueError(f"target {name} must be explicit")
         if actual != value:
-            raise ValueError(f"target {name} must be explicit and match draft")
+            raise ValueError(f"target {name} disagrees with draft")
     if target.get("rope_parameters") is None and target.get("rope_scaling") is None:
         raise ValueError("target must state rope_parameters or rope_scaling")
     for key in ("rope_parameters", "rope_scaling"):
