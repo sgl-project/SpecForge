@@ -32,6 +32,7 @@ class Eagle3Objective:
     depth_decay: float = 0.8
 
     default_loss = TokenLoss(kind="soft_ce")
+    default_weighting_options = ("depth_decay",)
 
     def __post_init__(self):
         check_options(
@@ -106,7 +107,7 @@ class Eagle3Objective:
                 draft_to_target=model.vocabulary.d2t,
                 requires=frozenset({"teacher_logits"}),
                 default_loss=self.default_loss,
-                denominator=hidden.new_tensor(ids.numel()),
+                denominator=torch.tensor(float(ids.numel()), device=ids.device),
                 accuracy_name=f"position_{depth}_accuracy",
                 report_accuracy=depth == 0,
             )

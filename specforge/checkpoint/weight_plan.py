@@ -56,6 +56,19 @@ def _validate_unquantized(name, ref):
         )
 
 
+def _require_unwrapped(model):
+    if not torch.distributed.is_available():
+        return
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    # FSDP1 state dicts are temporary full views, gathered collectively
+    if any(isinstance(module, FullyShardedDataParallel) for module in model.modules()):
+        raise TypeError(
+            "FSDP1-wrapped drafts are not supported: load before wrapping, "
+            "and save an unwrapped, gathered copy"
+        )
+
+
 def make_weight_plan(
     model, weights, *, bindings=None, allow_new=(), strict_copies=(), unused=()
 ):
@@ -65,6 +78,7 @@ def make_weight_plan(
     exact tensor names; format adapters and initialization mappings expand their
     prefixes before calling it. No missing key is silently initialized.
     """
+    _require_unwrapped(model)
     state = model.state_dict(keep_vars=True)
     weights, bindings = dict(weights), dict(bindings or {})
     # Check selected sources before reporting their scale tensors as unexpected.

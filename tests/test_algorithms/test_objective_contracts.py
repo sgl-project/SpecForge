@@ -10,11 +10,15 @@ from torch import nn
 from specforge.algorithms.objectives import build_objective_model
 from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
 from specforge.algorithms.objectives.dflash2 import DFlash2Objective
+from specforge.algorithms.objectives.dspark import DSparkObjective
+from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
-from specforge.algorithms.objectives.losses import PositionWeighting
+from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.predictions import Predictions
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import (
     capture_projections,
+    configurations,
     dflash2_config,
     dspark_config,
     dspine_config,
@@ -23,6 +27,23 @@ from tests.test_algorithms.test_objectives import (
     training_batch,
 )
 from tests.test_modeling.test_canonical_eagle3 import install_mapping
+
+
+def build_runtime(architecture, *, dtype=None, **selection):
+    config = next(c for c in configurations() if c.architecture == architecture)
+    torch.manual_seed(0)
+    model = build_draft_model(config, **({"dtype": dtype} if dtype else {}))
+    if hasattr(model, "vocabulary"):
+        install_mapping(model)
+    for name in config.target_bindings:
+        model.get_submodule(name).load_target_weight(
+            torch.randn(config.vocab_size, config.hidden_size)
+        )
+    if hasattr(model, "initialize_transfer_space"):
+        model.initialize_transfer_space()
+    width = training_batch(config)["target_last_hidden_states"].shape[-1]
+    head = nn.Linear(width, config.vocab_size, bias=False)
+    return config, build_objective_model(model, target_head=head, **selection)
 
 
 class ObjectiveContractTest(unittest.TestCase):
@@ -91,10 +112,15 @@ class ObjectiveContractTest(unittest.TestCase):
             captured = objective.call_args.args[1]
             self.assertEqual(captured["hidden_states"].dtype, torch.bfloat16)
             self.assertEqual(captured["target_last_hidden_states"].dtype, torch.float32)
-            self.assertEqual(
-                runtime.teacher_logits(captured, torch.tensor([[1]])).dtype,
-                torch.float32,
-            )
+            teacher = runtime.predictions(
+                torch.zeros(1, 1, 32, dtype=torch.bfloat16),
+                captured,
+                torch.tensor([[1]]),
+                mask=torch.ones(1, 1),
+                labels=torch.zeros(1, 1, dtype=torch.long),
+            ).teacher
+            self.assertEqual(teacher.values.dtype, torch.float32)
+            self.assertEqual(teacher.logits().dtype, torch.float32)
 
     def test_dspark_stops_at_unsupervised_gap(self):
         config = dspark_config()
@@ -333,3 +359,174 @@ class ObjectiveContractTest(unittest.TestCase):
                 torch.testing.assert_close(
                     result.loss, (torch.stack(expected) * factors).sum()
                 )
+
+    def test_mtp_rejects_position_weightings(self):
+        """MTP proposes one token per position; decay or D-PACE has nothing to act on."""
+        for weighting in (
+            {"kind": "exponential", "gamma": 1.0},
+            {"kind": "geometric", "factor": 0.5},
+            {"kind": "dpace"},
+        ):
+            with self.subTest(weighting=weighting["kind"]):
+                with self.assertRaisesRegex(ValueError, "capabilities"):
+                    build_runtime("MTPDraftModel", weighting=weighting)
+        config, default = build_runtime("MTPDraftModel")
+        _, uniform = build_runtime("MTPDraftModel", weighting={"kind": "uniform"})
+        batch = training_batch(config)
+        torch.testing.assert_close(
+            uniform(batch, step=0, total_steps=1).loss,
+            default(batch, step=0, total_steps=1).loss,
+        )
+
+    def test_eagle_legacy_denominator_is_fp32_under_a_bf16_draft(self):
+        config, runtime = build_runtime("Eagle3DraftModel", dtype=torch.bfloat16)
+        batch = training_batch(config)
+        del batch["mtp_hidden_states"]
+        length = 257  # not representable in bf16
+        batch["input_ids"] = torch.arange(length)[None] % config.vocab_size
+        for key in ("loss_mask", "attention_mask"):
+            batch[key] = torch.ones(1, length, dtype=torch.long)
+        for key in ("hidden_states", "target_last_hidden_states"):
+            batch[key] = torch.randn(1, length, batch[key].shape[-1])
+        batch["hidden_states"] = batch["hidden_states"].to(torch.bfloat16)
+        predictions = next(runtime.objective.rollout(runtime, batch))
+        self.assertEqual(predictions.denominator.dtype, torch.float32)
+        self.assertEqual(predictions.denominator.item(), length)
+
+    def test_accuracy_counts_supervised_positions_unweighted(self):
+        """Position weights shape the loss, not acc, which picks the best checkpoint."""
+        logits = torch.full((1, 3, 5), -5.0)
+        logits[0, 0, 4] = logits[0, 1, 1] = logits[0, 2, 2] = 5.0
+        predictions = Predictions(
+            hidden=torch.zeros(1, 3, 2),
+            projector=lambda hidden: {"logits": logits},
+            mask=torch.ones(1, 3),
+            positions=torch.tensor([[0, 1, 2]]),
+            labels=torch.tensor([[3, 1, 2]]),
+        )
+        for weighting in (
+            PositionWeighting(kind="uniform"),
+            PositionWeighting(kind="exponential", gamma=1.0),
+            PositionWeighting(kind="geometric", factor=0.5),
+        ):
+            with self.subTest(weighting=weighting.kind):
+                correct, total = evaluate_predictions(
+                    predictions, TokenLoss(), weighting
+                ).ratios["acc"]
+                self.assertEqual((correct.item(), total.item()), (2.0, 3.0))
+
+    def test_explicit_selection_rejects_options_it_would_ignore(self):
+        build_runtime("DSpineDraftModel", weighting={"kind": "uniform"})
+        build_runtime("DSparkDraftModel", loss={"kind": "kl"})
+        build_runtime(
+            "DSpineDraftModel", options={"ce_weight": 0.2}, loss={"kind": "kl"}
+        )
+        build_runtime(
+            "DFlashDraftModel",
+            options={"loss_decay_gamma": None},
+            weighting={"kind": "uniform"},
+        )
+        uniform, kl = {"weighting": {"kind": "uniform"}}, {"loss": {"kind": "kl"}}
+        for architecture, options, selection in (
+            ("DFlashDraftModel", {"loss_decay_gamma": 7.0}, uniform),
+            ("DSpineDraftModel", {"loss_decay_gamma": 7.0}, uniform),
+            ("Eagle3DraftModel", {"depth_decay": 0.1}, uniform),
+            ("DSparkDraftModel", {"ce_loss_alpha": 0.1}, kl),
+        ):
+            with self.subTest(architecture=architecture, options=options):
+                with self.assertRaisesRegex(ValueError, next(iter(options))):
+                    build_runtime(architecture, options=options, **selection)
+
+    def test_dspark_zero_confidence_weight_freezes_the_head(self):
+        _, runtime = build_runtime(
+            "DSparkDraftModel", options={"confidence_loss_alpha": 0.0}
+        )
+        head = runtime.draft_model.confidence_head
+        self.assertFalse(any(p.requires_grad for p in head.parameters()))
+        self.assertEqual(runtime.frozen_parameters, ("confidence_head",))
+        config = dspark_config(confidence=False)
+        model = build_draft_model(config)
+        for name in config.target_bindings:
+            model.get_submodule(name).load_target_weight(
+                torch.randn(config.vocab_size, config.hidden_size)
+            )
+        runtime = build_objective_model(model, options={"confidence_loss_alpha": 0.0})
+        self.assertEqual(runtime.frozen_parameters, ())
+        misspelled = property(lambda objective: ("confidence_haed",))
+        with patch.object(DSparkObjective, "frozen_parameters", misspelled):
+            with self.assertRaisesRegex(ValueError, "confidence_haed"):
+                build_runtime("DSparkDraftModel")
+
+    def test_dspark_projection_requires_integer_predecessors(self):
+        config = dspark_config()
+        model = build_draft_model(config)
+        slots = config.spec_config.protocol.num_model_slots
+        hidden = torch.zeros(1, slots, config.hidden_size)
+        for predecessors in (None, torch.zeros(1, slots)):
+            with self.assertRaisesRegex(ValueError, "predecessor_ids"):
+                model.project(hidden, predecessor_ids=predecessors)
+
+    def test_peagle_accepts_two_dimensional_document_lengths(self):
+        config = peagle_config()
+        losses = []
+        for lengths in (torch.tensor([3, 3]), torch.tensor([[3, 3]])):
+            torch.manual_seed(0)
+            model = build_draft_model(config)
+            install_mapping(model)
+            batch = {k: v[:, :6] for k, v in training_batch(config).items()}
+            batch.update(
+                loss_mask=torch.ones(1, 6),
+                attention_mask=torch.ones(1, 6),
+                lengths=lengths,
+                target_logits=torch.randn(1, 6, config.vocab_size),
+            )
+            runtime = build_objective_model(model, options={"num_depths": 1})
+            losses.append(runtime(batch, step=0, total_steps=None).loss)
+        torch.testing.assert_close(losses[0], losses[1])
+
+    def test_peagle_dpace_balances_each_packed_document(self):
+        config = peagle_config()
+        model = build_draft_model(config)
+        install_mapping(model)
+        batch = {k: v[:, :6] for k, v in training_batch(config).items()}
+        teacher = torch.zeros(1, 6, config.vocab_size)
+        teacher[..., 2] = 10
+        batch.update(
+            loss_mask=torch.ones(1, 6),
+            attention_mask=torch.ones(1, 6),
+            lengths=torch.tensor([3, 3]),
+            target_logits=teacher,
+        )
+        runtime = build_objective_model(
+            model, options={"num_depths": 1}, weighting={"kind": "dpace"}
+        )
+        result = runtime(batch, step=0, total_steps=None)
+        self.assertEqual(result.denominator.item(), 2)
+
+    def test_runtime_keeps_the_resolved_default_loss(self):
+        _, dspark = build_runtime("DSparkDraftModel", options={"ce_loss_alpha": 0.3})
+        self.assertEqual(
+            dspark.token_loss,
+            TokenLoss(kind="ce_l1", options={"ce_weight": 0.3, "l1_weight": 0.9}),
+        )
+        _, eagle = build_runtime("Eagle3DraftModel")
+        self.assertEqual(eagle.token_loss, TokenLoss(kind="soft_ce"))
+
+    def test_protocols_declare_their_default_weighting(self):
+        _, dflash = build_runtime("DFlashDraftModel", options={"loss_decay_gamma": 2.0})
+        self.assertEqual(
+            dflash.weighting, PositionWeighting(kind="exponential", gamma=2.0)
+        )
+        _, dspine = build_runtime("DSpineDraftModel")
+        self.assertEqual(
+            dspine.weighting, PositionWeighting(kind="exponential", gamma=7.0)
+        )
+        _, mtp = build_runtime("MTPDraftModel")
+        self.assertEqual(mtp.weighting, PositionWeighting())
+
+    def test_dspark_returns_a_per_microbatch_mean(self):
+        """Microbatches are averaged as means, like main, not pooled by token."""
+        config, runtime = build_runtime("DSparkDraftModel")
+        result = runtime(training_batch(config), step=0, total_steps=1)
+        self.assertEqual(result.denominator.item(), 1)
+        torch.testing.assert_close(result.loss, result.numerator)

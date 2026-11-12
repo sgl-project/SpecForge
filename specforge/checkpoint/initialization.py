@@ -135,16 +135,20 @@ def make_initialization_plan(
         ):
             raise ValueError(f"allow_new selects no draft tensor: {pattern}")
     if weights_from is not None:
+        # a legacy source's stored bound tables are ordinary source tensors here
+        source = dict(weights_from.weights) | {
+            f"{name}.weight": ref for name, ref in weights_from.bound_copies.items()
+        }
         if mapping is None:
             weights = {
                 name: ref
-                for name, ref in weights_from.weights.items()
+                for name, ref in source.items()
                 if name in state and name not in allowed
             }
             used = weights.keys()
         else:
-            weights, used = _expand(weights_from.weights, mapping)
-        unused = weights_from.weights.keys() - used
+            weights, used = _expand(source, mapping)
+        unused = source.keys() - used
     copies = {}
     if from_target is not None:
         if target_store is None:
@@ -159,20 +163,28 @@ def make_initialization_plan(
             raise ValueError(
                 f"target copy missing tensors: {sorted(covered - copies.keys())}"
             )
-        if (covered | copies.keys()) & (weights.keys() | allowed):
-            raise ValueError("from_target overlaps weights_from or allow_new")
-        if any(
-            target_store.files[ref.key].suffix != ".safetensors"
+        overlap = (covered | copies.keys()) & (weights.keys() | allowed)
+        if overlap:
+            raise ValueError(
+                f"from_target overlaps weights_from or allow_new: {sorted(overlap)}"
+            )
+        unchecked = sorted(
+            ref.key
             for ref in copies.values()
-        ):
-            raise ValueError("strict target copies require safetensors header metadata")
+            if target_store.files[ref.key].suffix != ".safetensors"
+        )
+        if unchecked:
+            raise ValueError(
+                f"strict target copies require safetensors header metadata: {unchecked}"
+            )
         logger.info(
             "Target weight mapping: %s", {k: v.key for k, v in sorted(copies.items())}
         )
     weights.update(copies)
     if weights_from is None:
-        copied = {id(state[name]) for name in weights if name in state}
-        allowed = {name for name, value in state.items() if id(value) not in copied}
+        # by identity: the tied alias of a copied tensor is not new
+        assigned = {id(state[name]) for name in weights if name in state}
+        allowed = {name for name in state if id(state[name]) not in assigned}
     if unused:
         logger.warning("Unused source draft tensors: %s", sorted(unused))
     return make_weight_plan(

@@ -48,9 +48,11 @@ def resolve_target_tensor(store, config, name):
     refs = store.refs()
     overrides = store.keys if isinstance(store, TargetWeights) else {}
 
+    def keys_for(module):
+        return (overrides[module],) if module in overrides else _TARGET_KEYS[module]
+
     def candidates(module):
-        keys = (overrides[module],) if module in overrides else _TARGET_KEYS[module]
-        return [key for key in keys if key in refs]
+        return [key for key in keys_for(module) if key in refs]
 
     found = candidates(name)
     if (
@@ -61,7 +63,10 @@ def resolve_target_tensor(store, config, name):
     ):
         found = candidates("embed_tokens")
     if len(found) != 1:
-        raise ValueError(f"{name}: expected one target key, found {found}")
+        raise ValueError(
+            f"{name}: expected one target key of {list(keys_for(name))}, "
+            f"found {found}"
+        )
     ref = refs[found[0]]
     _validate_unquantized(name, ref)
     return ref

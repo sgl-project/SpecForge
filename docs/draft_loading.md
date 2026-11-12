@@ -48,7 +48,8 @@ model = initialize_draft(
 Omitting `mapping` selects matching canonical names, excluding `allow_new`.
 Every owned tensor must be assigned or explicitly new; unused source tensors
 are reported. A warm-start source supplies weights only and is not checked
-against the new target configuration. Mapping keys are draft
+against the new target configuration; a legacy source's stored copies of
+target-bound tables count as source tensors. Mapping keys are draft
 prefixes and values are source prefixes. A `*` matches one path segment.
 
 Target copies are declared separately:
@@ -73,7 +74,8 @@ fused parameters must supply its layout rather than relying on family guesses.
 Legacy draft imports use the existing configuration codec and format-owned
 weight renames. They require the target configuration. A `training_state.pt`
 without `config.json` additionally needs `legacy_config` (a dictionary or JSON
-file); only `draft_state_dict` is used, via PyTorch's restricted unpickler.
+file); tensors come only from `draft_state_dict`, via PyTorch's restricted
+unpickler, and recorded settings are checked as described below.
 Continuing a reduced-vocabulary EAGLE checkpoint requires its saved `t2d` and
 `d2t` mapping. A weights-only warm start can explicitly allow a new `vocabulary`;
 the caller must install its mapping before using logits.
@@ -81,12 +83,16 @@ Native drafts inside target checkpoints use an explicit preset and
 `from_target`, rather than an import adapter. SGLang artifacts are rejected.
 
 For distributed construction, use the same `make_initialization_plan` or
-`make_weight_plan` on each rank, then `apply_weight_plan` after materialization.
+`make_weight_plan` on each rank, then `apply_weight_plan` after materialization;
+a scratch or warm-start model then needs `finalize_initialization` as in
+`initialize_draft`.
 Plans validate global metadata; Shard/Replicate DTensor destinations read only
 their local slices. Partial placements are rejected. CLI/training orchestration
 and export conversion will adopt these APIs in subsequent integration steps.
 
-Legacy imports check recorded capture, mask, residual and binding settings.
+Legacy imports check recorded capture, mask, residual and binding settings,
+including the DFlash-family `*_target_layer_ids`, `*_mask_token_id` and
+`*_block_size` records.
 A saved copy of a target-bound table must match the supplied target; importing
 must not silently replace trained weights. Hub imports also fetch
 `training_state.pt` for these structural records, without restoring training state.

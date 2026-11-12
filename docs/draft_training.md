@@ -10,8 +10,9 @@ explicitly frozen parameters and target bindings are excluded.
 
 The default objectives cover EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino,
 DSpine, MTP and DMTP. They reuse explicit-label CE/L1 loss primitives and functional
-sampling/mask construction. EAGLE3 replays its recurrent tree with explicit dense
-visibility; it does not add algorithm hooks or mutable KV caches to the backbone.
+sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiable
+KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
+KV caches to the backbone.
 This is an eager reference path, including dense vocabulary projections; fused
 losses, sparse attention and sequence parallel execution are not implemented here.
 The legacy training path retains the optimized kernels. MTP/DMTP CE is evaluated
@@ -26,7 +27,9 @@ runtime = build_objective_model(
 result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
-`loss.kind` accepts `default`, `ce` (explicit labels), `soft_ce`, `kl`, `reverse_kl`,
+`loss.kind` accepts `default`, `ce` (the protocol's labels: data tokens for block and
+MTP protocols, the teacher's top-1 within the draft vocabulary for EAGLE3/P-EAGLE),
+`soft_ce`, `kl`, `reverse_kl`,
 `js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
 plus a frozen head. `default` preserves each algorithm's base loss. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
@@ -35,7 +38,9 @@ Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
 (alpha, default 0.5).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
-factor. EAGLE/P-EAGLE apply weighting to rollout depth. DFlash2 selector warmup
+factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, as are
+DSpark's `ce_loss_alpha`/`l1_loss_alpha` with an explicit loss. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
+position and accepts only uniform weighting. DFlash2 selector warmup
 and ramp accept either absolute steps or ratios of total optimizer steps.
 
 Input batches use **unshifted** `input_ids`, `loss_mask` and teacher features at the
@@ -88,11 +93,14 @@ sequence. Credit weights are detached; the denominator counts valid sequences,
 not credit mass. This applies to explicit D-PACE selection, including protocols
 whose default loss uses a microbatch mean. The eager executor materializes complete
 chains before weighting; future chunked executors must preserve this normalization.
+On a reduced-vocabulary draft, a supervised depth whose teacher top-1 is outside the
+draft vocabulary carries no loss and ends its chain, since the draft cannot propose it.
 
 Legacy LK modes use `lk_alpha`, `lk_tv` and `lk_lambda`. Their `options.target` is
 `labels` by default (one-hot acceptance), or `teacher` for distribution overlap.
-`kl_scale` and `kl_decay` default to 1.0; lambda uses detached mean acceptance over
-supervised positions. Teacher LK preserves the target probability mass outside a
+`lk_lambda` also takes `kl_scale` and `kl_decay` (default 1.0) and uses detached mean
+acceptance over supervised positions; the other modes reject them. Unknown loss
+options fail when the loss is built. Teacher LK preserves the target probability mass outside a
 reduced draft vocabulary, and uses soft cross-entropy for its legacy KL term.
 The existing `lk` remains the per-token KL/TV hybrid, with configurable `eta`.
 

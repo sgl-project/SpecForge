@@ -1,24 +1,31 @@
 """Weight names for supported historical draft checkpoints, not native targets."""
 
+import logging
+
 import torch
 
 from specforge.config.draft.codec import decode_legacy_config
 
-ARCHITECTURES = {
-    "DFlashDraftModel",
-    "DFlash2DraftModel",
-    "DSparkDraftModel",
-    "DSpineDraftModel",
-    "DominoDraftModel",
-    "PEagleDraftModel",
-    "LlamaForCausalLMEagle3",
-    "Qwen3_5MTPDraftModel",
+logger = logging.getLogger(__name__)
+
+# main's DataFlow strategies record context-draft semantics under these prefixes.
+_CONTEXT_RECORD_PREFIXES = {
+    "DFlashDraftModel": "dflash",
+    "DFlash2DraftModel": "dflash",
+    "DSparkDraftModel": "dspark",
+    "DominoDraftModel": "domino",
+    "DSpineDraftModel": "dspine",
 }
 
 
 def _recorded_settings(directory):
     path = directory / "training_state.pt"
     if not path.is_file():
+        return {}, {}
+    unsafe = set(torch.serialization.get_unsafe_globals_in_checkpoint(path))
+    if unsafe and unsafe <= {"argparse.Namespace"}:
+        # pre-DataFlow scripts pickled argparse args beside HF weights; no records
+        logger.warning("Ignoring %s: pre-DataFlow training state", path)
         return {}, {}
     # Inspect structural provenance, never restore optimizer or trainer state.
     state = torch.load(path, map_location="meta", weights_only=True, mmap=True)
@@ -58,7 +65,8 @@ def read_legacy(payload, store, target_config, *, check_target=True, settings=No
         payload, target_config=target_config, check_target=check_target, **settings
     )
     checks = {}
-    if "embed_tokens" in config.target_bindings:
+    if architecture == "LlamaForCausalLMEagle3":
+        # main reads this flag only for EAGLE-family drafts
         checks["load_target_embedding"] = (
             provenance.get("load_target_embedding"),
             True,
@@ -72,7 +80,28 @@ def read_legacy(payload, store, target_config, *, check_target=True, settings=No
         if recorded is not None and (
             type(recorded) is not bool or recorded != expected
         ):
-            raise ValueError(f"recorded {name} conflicts with legacy configuration")
+            raise ValueError(
+                f"recorded {name}={recorded!r} conflicts with the draft config; "
+                "use the config of the run that wrote training_state.pt"
+            )
+    prefix = _CONTEXT_RECORD_PREFIXES.get(architecture)
+    if prefix is not None:
+        spec = config.spec_config
+        decoded = {
+            "target_layer_ids": tuple(spec.target_features.target_layer_ids),
+            "mask_token_id": spec.target_features.mask_token_id,
+            "block_size": spec.block.block_size,
+        }
+        for field, value in decoded.items():
+            recorded = state.get(f"{prefix}_{field}")
+            if field == "target_layer_ids" and recorded is not None:
+                recorded = tuple(recorded)
+            if recorded is not None and recorded != value:
+                raise ValueError(
+                    f"recorded {prefix}_{field}={recorded!r} conflicts with the draft "
+                    f"config ({value!r}); use the config of the run that wrote "
+                    "training_state.pt"
+                )
     if architecture == "DFlashDraftModel":
         architecture = config.architecture
     weights = {}
@@ -114,6 +143,4 @@ def read_legacy(payload, store, target_config, *, check_target=True, settings=No
         if name in weights:
             raise ValueError(f"legacy tensors collide at {name}")
         weights[name] = ref
-    # A weights-only warm start may explicitly allow a new vocabulary mapping.
-    # Continuation still rejects missing buffers through ordinary plan validation.
     return config, weights, {}

@@ -26,7 +26,36 @@ from tests.test_config.test_draft_legacy_dspine import dspine_payload
 from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
 from tests.test_config.test_draft_legacy_peagle import peagle_payload
+from tests.test_modeling import test_canonical_dflash as _dflash
+from tests.test_modeling import test_canonical_domino as _domino
+from tests.test_modeling import test_canonical_eagle3 as _eagle3
+from tests.test_modeling import test_canonical_peagle as _peagle
 from tests.test_modeling.test_canonical_dflash import inputs_for
+
+
+def _mtp_legacy_name(name):
+    # the MTP forward-parity map, inlined: its test module is retired later in the stack
+    for prefix, legacy in (
+        ("fusion.", ""),
+        ("backbone.layers.", "layers."),
+        ("backbone.final_norm.", "norm."),
+    ):
+        if name.startswith(prefix):
+            return legacy + name[len(prefix) :]
+    return name
+
+
+# canonical -> legacy names, as the forward-parity tests prove them
+_LEGACY_NAMES = {
+    "legacy_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dflash2_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dspark_payload": lambda name: _dflash.legacy_name(name) or name,
+    "dspine_payload": lambda name: _dflash.legacy_name(name) or name,
+    "domino_payload": _domino.reference_name,
+    "eagle_payload": _eagle3.legacy_name,
+    "peagle_payload": _peagle.legacy_name,
+    "mtp_payload": _mtp_legacy_name,
+}
 
 
 def dflash2_payload():
@@ -107,6 +136,69 @@ class LoadingTest(unittest.TestCase):
                 read_draft(
                     path, target=target, legacy_config=payload, legacy_settings=settings
                 )
+
+    def test_legacy_dflash_records_must_match_supplied_config(self):
+        """A config-less DFlash run imported with a stale JSON must not load silently."""
+        payload = dflash2_payload()
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "source"
+            target.mkdir()
+            (target / "config.json").write_text(
+                json.dumps(
+                    {
+                        "hidden_size": payload["hidden_size"],
+                        "vocab_size": payload["vocab_size"],
+                        "num_hidden_layers": payload["num_target_layers"],
+                    }
+                )
+            )
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
+            spec = read_draft(source, target=target).config.spec_config
+            matching = {
+                "dflash_target_layer_ids": spec.target_features.target_layer_ids,
+                "dflash_mask_token_id": spec.target_features.mask_token_id,
+                "dflash_block_size": spec.block.block_size,
+            }
+            torch.save(matching, source / "training_state.pt")
+            read_draft(source, target=target)
+            for key, value in (
+                ("dflash_mask_token_id", spec.target_features.mask_token_id + 1),
+                ("dflash_block_size", spec.block.block_size + 1),
+                (
+                    "dflash_target_layer_ids",
+                    spec.target_features.target_layer_ids[::-1],
+                ),
+            ):
+                with self.subTest(key=key):
+                    torch.save(matching | {key: value}, source / "training_state.pt")
+                    with self.assertRaisesRegex(ValueError, key):
+                        read_draft(source, target=target)
+
+    def test_legacy_peagle_residual_order_comes_from_resume_contract(self):
+        """main's YAML may override norm_before_residual; the JSON can omit it."""
+        payload = peagle_payload() | dict(
+            hidden_size=32, vocab_size=64, draft_vocab_size=64
+        )
+        payload.pop("norm_before_residual", None)
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "source"
+            write_target(target)
+            source.mkdir()
+            (source / "config.json").write_text(json.dumps(payload))
+            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
+            for recorded in (True, False):
+                with self.subTest(recorded=recorded):
+                    torch.save(
+                        {
+                            "peagle_mask_token_id": 63,
+                            "peagle_norm_before_residual": recorded,
+                        },
+                        source / "training_state.pt",
+                    )
+                    spec = read_draft(source, target=target).config.spec_config
+                    self.assertIs(spec.norm_before_residual, recorded)
 
     def test_legacy_capture_layers_come_from_training_provenance(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
@@ -358,11 +450,18 @@ class LoadingTest(unittest.TestCase):
                 self.assertEqual(
                     restored.config.draft, read_draft(path, target=target).config
                 )
-                # Every persisted destination is backed by the actual old model.
                 artifact = read_draft(path, target=target)
-                for key, ref in artifact.weights.items():
+                # by value, through the maps the forward-parity tests prove
+                old_state = old.state_dict()
+                to_legacy = _LEGACY_NAMES[factory.__name__]
+                for key, value in restored.state_dict().items():
+                    if key == "vocabulary.ready":
+                        continue
+                    legacy = to_legacy(key)
+                    if legacy not in old_state:
+                        legacy = "mtp." + legacy
                     torch.testing.assert_close(
-                        restored.state_dict()[key], ref.read(), rtol=0, atol=0
+                        value, old_state[legacy], rtol=0, atol=0, msg=key
                     )
                 if factory is eagle_payload:
                     self.assertTrue(restored.vocabulary.ready)

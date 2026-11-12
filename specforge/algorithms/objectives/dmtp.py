@@ -7,7 +7,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import gather, prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -36,6 +36,11 @@ class DMTPObjective:
     loss_decay_gamma: float | None = None
 
     default_loss = TokenLoss(kind="ce")
+    default_weighting_options = ("loss_decay_gamma",)
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
         check_options(

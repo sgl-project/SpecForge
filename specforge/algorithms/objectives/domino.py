@@ -7,7 +7,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss
+from .losses import TokenLoss, decay_weighting
 from .predictions import LossTerm, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -38,6 +38,11 @@ class DominoObjective:
     lambda_base_decay_ratio: float = 0.5
 
     default_loss = TokenLoss(kind="ce")
+    default_weighting_options = ("loss_decay_gamma",)
+
+    @property
+    def default_weighting(self):
+        return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
         check_options(
@@ -55,7 +60,7 @@ class DominoObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
-            label_offset=int(spec.block.shift_label),
+            label_offset=spec.block.label_offset,
         )
         output = model(
             blocks.input_ids,

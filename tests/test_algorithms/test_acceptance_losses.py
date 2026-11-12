@@ -1,17 +1,28 @@
 """Acceptance losses preserve legacy reduction and complete-chain weighting."""
 
+import functools
 import unittest
 from dataclasses import replace
 
 import torch
 
-from specforge.algorithms.objectives.execution import execute_batch
+from specforge.algorithms.objectives import losses
+from specforge.algorithms.objectives.execution import (
+    chain_weights,
+    execute_batch,
+    project_predictions,
+)
 from specforge.algorithms.objectives.losses import (
     LossContext,
     PositionWeighting,
     TokenLoss,
+    register_loss,
 )
-from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
+from specforge.algorithms.objectives.predictions import (
+    PredictionBatch,
+    Predictions,
+    Teacher,
+)
 from specforge.core.lk_loss import compute_lk_loss
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objective_legacy_parity import (
@@ -31,7 +42,12 @@ class AcceptanceLossTest(unittest.TestCase):
                     torch.manual_seed(7)
                     runtime, legacy, names = block_pair("dflash")
                     runtime.token_loss = TokenLoss(
-                        kind=f"lk_{mode}", options={"kl_scale": 0.7, "kl_decay": 1.3}
+                        kind=f"lk_{mode}",
+                        options=(
+                            {"kl_scale": 0.7, "kl_decay": 1.3}
+                            if mode == "lambda"
+                            else {}
+                        ),
                     )
                     runtime.weighting = PositionWeighting(kind=weighting)
                     legacy.lk_loss_type, legacy.kl_scale, legacy.kl_decay = (
@@ -69,7 +85,8 @@ class AcceptanceLossTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 loss = TokenLoss(
                     kind=f"lk_{mode}",
-                    options={"target": "teacher", "kl_scale": 0.7, "kl_decay": 1.3},
+                    options={"target": "teacher"}
+                    | ({"kl_scale": 0.7, "kl_decay": 1.3} if mode == "lambda" else {}),
                 )
                 actual = (
                     loss(
@@ -159,6 +176,8 @@ class AcceptanceLossTest(unittest.TestCase):
         from tests.test_algorithms.test_objectives import configurations
 
         for config in configurations():
+            if config.architecture == "MTPDraftModel":
+                continue  # one proposal per position: D-PACE is rejected at build
             with self.subTest(architecture=config.architecture):
                 torch.manual_seed(11)
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -216,3 +235,112 @@ class AcceptanceLossTest(unittest.TestCase):
             logits, teacher.argmax(-1), teacher=teacher
         )
         self.assertTrue(torch.isfinite(result).all())
+
+    def test_loss_options_are_checked_when_the_loss_is_built(self):
+        TokenLoss(kind="lk", options={"eta": 2.0})
+        TokenLoss(kind="ce_l1", options={"ce_weight": 0.2, "l1_weight": 0.8})
+        TokenLoss(kind="lk_lambda", options={"kl_scale": 0.5, "kl_decay": 2.0})
+        for kind, options in (
+            ("ce_l1", {"ce_wieght": 0.2}),
+            ("kl", {"eta": 2.0}),
+            ("default", {"ce_weight": 0.2}),
+            ("lk_tv", {"kl_scale": 0.5}),
+            ("lk_alpha", {"kl_decay": 2.0}),
+        ):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                TokenLoss(kind=kind, options=options)
+
+    def test_registered_losses_keep_their_own_options(self):
+        def temperature_ce(logits, labels, teacher=None, **options):
+            return logits.new_zeros(labels.shape) + options["temperature"]
+
+        def scaled(compute):
+            @functools.wraps(compute)
+            def loss(logits, labels, teacher=None, *, scale=1.0):
+                return scale * compute(logits, labels, teacher, temperature=1.0)
+
+            return loss
+
+        register_loss("test_temperature_ce")(temperature_ce)
+        register_loss("test_scaled_ce")(scaled(temperature_ce))
+        try:
+            labels = torch.zeros(1, 2, dtype=torch.long)
+            for kind, options, expected in (
+                ("test_temperature_ce", {"temperature": 2.0}, 2.0),
+                ("test_scaled_ce", {"scale": 3.0}, 3.0),
+            ):
+                with self.subTest(kind=kind):
+                    loss = TokenLoss(kind=kind, options=options)
+                    values = loss(torch.zeros(1, 2, 3), labels)
+                    self.assertTrue(bool((values == expected).all()))
+            with self.assertRaises(ValueError):
+                TokenLoss(kind="test_scaled_ce", options={"scael": 3.0})
+        finally:
+            losses._LOSSES.pop("test_temperature_ce")
+            losses._LOSSES.pop("test_scaled_ce")
+
+    def test_label_acceptance_is_normalized_by_supervised_positions(self):
+        logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0], [1.0, 1.0], [0.0, 0.0]]])
+        labels = torch.tensor([[0, 1, 0, 0]])
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+        acceptance = logits.softmax(-1).gather(-1, labels[..., None]).squeeze(-1)
+        context = LossContext(mask, None, torch.tensor(4.0))
+        tv = TokenLoss(kind="lk_tv")(logits, labels, context=context)
+        torch.testing.assert_close(tv, (1 - acceptance) * 2)
+
+    def test_geometric_zero_factor_keeps_the_anchor_slot_finite(self):
+        weights = PositionWeighting(kind="geometric", factor=0.0)(
+            torch.tensor([0.0, 1.0, 1.0]), torch.tensor([-1, 0, 1])
+        )
+        self.assertTrue(torch.isfinite(weights).all())
+
+    def test_dpace_ends_chains_at_targets_outside_the_draft_vocabulary(self):
+        """A teacher top-1 the draft cannot propose stops the acceptance chain."""
+        teacher = torch.full((1, 3, 4), -5.0)
+        teacher[0, 0, 0] = teacher[0, 1, 3] = teacher[0, 2, 1] = 5.0
+        prediction = Predictions(
+            hidden=torch.zeros(1, 3, 3),
+            projector=lambda hidden: {"logits": hidden},
+            mask=torch.ones(1, 3),
+            positions=torch.arange(3)[None],
+            chain_ids=torch.zeros(1, 3, dtype=torch.long),
+            sequence_ids=torch.zeros(1, 3, dtype=torch.long),
+            teacher=Teacher(teacher),
+            vocab_mask=torch.tensor([True, True, True, False]),
+            requires=frozenset({"teacher_logits"}),
+            default_loss=TokenLoss(kind="soft_ce"),
+        )
+        for kind in DPACE_LOSS_TYPES:
+            with self.subTest(kind=kind):
+                weighting = PositionWeighting(kind=kind, alpha=0.0)
+                projected = project_predictions(prediction, TokenLoss(), weighting)
+                [(weights, _)] = chain_weights([prediction], [projected], weighting)
+                self.assertGreater(weights[0].item(), 0)
+                self.assertEqual(weights[1:].tolist(), [0.0, 0.0])
+
+    def test_dpace_orders_each_chain_by_position(self):
+        torch.manual_seed(13)
+        prediction = Predictions(
+            hidden=torch.randn(3, 3, 5),
+            projector=lambda x: {"logits": x},
+            mask=torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]]),
+            positions=torch.arange(3).expand(3, 3),
+            labels=torch.arange(9).reshape(3, 3) % 5,
+            chain_ids=torch.arange(3)[:, None].expand(3, 3),
+            sequence_ids=torch.tensor([0, 0, 1])[:, None].expand(3, 3),
+        )
+        fields = ("hidden", "labels", "mask", "positions", "chain_ids", "sequence_ids")
+        depths = [
+            replace(
+                prediction, **{n: getattr(prediction, n)[:, d : d + 1] for n in fields}
+            )
+            for d in range(3)
+        ]
+        weighting = PositionWeighting(kind="dpace", alpha=0.3)
+        results = [
+            execute_batch(
+                PredictionBatch(sets), TokenLoss(kind="ce"), weighting, training=False
+            )
+            for sets in (depths, depths[::-1])
+        ]
+        torch.testing.assert_close(results[1].loss, results[0].loss)

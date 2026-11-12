@@ -103,13 +103,20 @@ def resolve_objective(
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
     token_loss = TokenLoss(**(loss or {}))
+    _reject_shadowed_options(
+        options,
+        weighting is not None,
+        getattr(objective, "default_weighting_options", ()),
+        "weighting",
+    )
+    _reject_shadowed_options(
+        options,
+        token_loss.kind != "default",
+        getattr(objective, "default_loss_options", ()),
+        "loss",
+    )
     if weighting is None:
-        gamma = getattr(objective, "loss_decay_gamma", None)
-        weighting = getattr(objective, "default_weighting", None)
-        if weighting is None:
-            weighting = (
-                {"kind": "exponential", "gamma": gamma} if gamma is not None else {}
-            )
+        weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
@@ -145,19 +152,30 @@ def build_objective_model(
         weighting=weighting,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
-    frozen = tuple(frozen) + getattr(objective, "frozen_parameters", ())
-    to_freeze = []
-    for prefix in frozen:
+    requested = tuple(frozen)
+    # a protocol may freeze an optional head this draft disables (set to None)
+    declared = getattr(objective, "frozen_parameters", ())
+    frozen, to_freeze = [], []
+    for prefix in requested + tuple(declared):
         try:
             try:
                 module = draft_model.get_submodule(prefix)
             except AttributeError:
                 module = draft_model.get_parameter(prefix)
         except AttributeError as error:
+            if (
+                prefix in declared
+                and prefix not in requested
+                and hasattr(draft_model, prefix)
+                and getattr(draft_model, prefix) is None
+            ):
+                continue
             raise ValueError(
                 f"unknown frozen parameter or module: {prefix!r}"
             ) from error
+        frozen.append(prefix)
         to_freeze.append(module)
+    frozen = tuple(frozen)
     uncovered = [
         key
         for key, parameter in draft_model.named_parameters()
@@ -181,7 +199,18 @@ def build_objective_model(
         name=name,
         token_loss=resolved.loss,
         weighting=resolved.weighting,
+        frozen_parameters=frozen,
     )
+
+
+def _reject_shadowed_options(options, replaced, names, selection):
+    given = {key for key, value in (options or {}).items() if value is not None}
+    shadowed = sorted(given & set(names)) if replaced else []
+    if shadowed:
+        raise ValueError(
+            f"{shadowed} only configure the default {selection}; "
+            f"set them in the explicit {selection} instead"
+        )
 
 
 def protocol_registrations():

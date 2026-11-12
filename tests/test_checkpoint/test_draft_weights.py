@@ -73,6 +73,51 @@ def _sharded_load(rank, directory):
         dist.destroy_process_group()
 
 
+def _fsdp1_refusal(rank, directory):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    dist.init_process_group(
+        "gloo",
+        init_method="file://" + directory + "/rendezvous",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        config = draft_config(target_bindings=(), target_logit_transform=None)
+        wrapped = FullyShardedDataParallel(
+            build_draft_model(config),
+            use_orig_params=True,
+            device_id=torch.device("cpu"),
+        )
+        # The trainer's layout: one FSDP1 root above a draft with no unit of its own.
+        inner = build_draft_model(config)
+        FullyShardedDataParallel(
+            torch.nn.ModuleDict({"draft_model": inner}),
+            use_orig_params=True,
+            device_id=torch.device("cpu"),
+        )
+        calls = [
+            (lambda: save_draft(inner, Path(directory) / f"inner-{rank}"), "match")
+        ]
+        if rank == 0:
+            # Alone, so a refusal after FSDP1's state_dict all-gather times out.
+            calls += [
+                (lambda: make_weight_plan(wrapped, {}), "FSDP1"),
+                (lambda: save_draft(wrapped, Path(directory) / "draft"), "FSDP1"),
+            ]
+        for call, message in calls:
+            with unittest.TestCase().assertRaisesRegex(TypeError, message):
+                call()
+        written = [p.name for p in Path(directory).iterdir() if p.name != "rendezvous"]
+        assert not written, f"a refused save wrote {written}"
+    finally:
+        dist.destroy_process_group()
+
+
 class DraftWeightsTest(unittest.TestCase):
     def test_sharded_round_trip_ties_bindings_and_slices(self):
         for tied, bound in ((False, False), (True, False), (False, True)):
@@ -143,6 +188,13 @@ class DraftWeightsTest(unittest.TestCase):
                 Path(tmp) / "target.safetensors",
             )
             torch.multiprocessing.spawn(_sharded_load, args=(tmp,), nprocs=2, join=True)
+
+    def test_fsdp1_sharded_draft_is_refused_on_every_rank(self):
+        """Otherwise saves hang or publish shard views, and loads copy into nothing."""
+        with TemporaryDirectory() as tmp:
+            torch.multiprocessing.spawn(
+                _fsdp1_refusal, args=(tmp,), nprocs=2, join=True
+            )
 
     def test_preflight_rejects_without_reading_or_mutating(self):
         model = build_draft_model(

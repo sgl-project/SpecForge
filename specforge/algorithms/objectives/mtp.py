@@ -16,13 +16,7 @@ from .registry import TrainingRequirements, register_protocol
     training=TrainingRequirements(capture_method="dflash"),
     architectures=("MTPDraftModel",),
     inputs=("input_ids", "target_last_hidden_states", "loss_mask"),
-    provides=(
-        "logits",
-        "labels",
-        "teacher_logits",
-        "chain_positions",
-        "acceptance_chain",
-    ),
+    provides=("logits", "labels", "teacher_logits"),
     trains=COMMON_MODULES,
 )
 @dataclass
@@ -67,9 +61,8 @@ class MTPObjective:
             label_positions - 1,
             labels=labels,
             mask=weights,
-            positions=positions - positions[:, :1],
-            chain_ids=torch.arange(ids.shape[0], device=ids.device)[:, None]
-            .expand_as(positions)
-            .reshape(-1, 1),
+            # one proposal per position: no depth for position weights to act on
+            positions=torch.zeros_like(positions),
+            chain_ids=torch.arange(positions.numel(), device=ids.device).reshape(-1, 1),
         )
         return PredictionBatch((predictions,))

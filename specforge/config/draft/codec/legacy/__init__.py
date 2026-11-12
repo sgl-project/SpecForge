@@ -21,6 +21,7 @@ _DECODERS = {
     "LlamaForCausalLMEagle3": decode_eagle3,
     "Qwen3_5MTPDraftModel": decode_mtp,
 }
+LEGACY_ARCHITECTURES = frozenset(_DECODERS)
 
 
 def decode_legacy_config(
