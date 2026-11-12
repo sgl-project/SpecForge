@@ -11,7 +11,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5TextRotaryEmbedding,
 )
 
-from specforge.checkpoint.formats.sglang.native import export_native
+from specforge.checkpoint.formats.native.writer import export_native
 from specforge.checkpoint.initialization import make_initialization_plan
 from specforge.checkpoint.tensors import TensorInfo, TensorStore
 from specforge.modeling import build_draft_model
@@ -53,7 +53,7 @@ class NativeReferenceTest(unittest.TestCase):
         store.read.assert_not_called()
         # Export validates the independent names/shapes before its first data read.
         with patch(
-            "specforge.checkpoint.formats.sglang.native.TensorStore", return_value=store
+            "specforge.checkpoint.formats.native.writer.TensorStore", return_value=store
         ):
             with self.assertRaisesRegex(AssertionError, "tensor read"):
                 export_native(

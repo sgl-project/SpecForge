@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import yaml
 
-from specforge.checkpoint.formats.sglang.native import export_native
+from specforge.checkpoint.formats.native.writer import export_native
 from specforge.checkpoint.native import validate_target_initialization
 from specforge.config.draft.codec import parse_draft
 from specforge.loading import initialize_draft

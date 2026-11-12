@@ -12,13 +12,13 @@ import yaml
 from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.formats.native.qwen3_5 import (
+from specforge.checkpoint.formats.sglang.converters import serving_weights
+from specforge.checkpoint.formats.sglang.qwen3_5 import (
     convert_config as convert_qwen3_5_config,
 )
-from specforge.checkpoint.formats.sglang.converters import serving_weights
 from specforge.checkpoint.tensors import TensorStore
 from specforge.config.draft.codec import parse_draft
-from specforge.export.to_sglang import export_to_sglang
+from specforge.export import export_draft
 from specforge.loading import initialize_draft
 from specforge.modeling import build_draft_model
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
@@ -107,12 +107,21 @@ class NativePresetTest(unittest.TestCase):
                 self.assertFalse(copied.embed_tokens.weight.requires_grad)
                 self.assertTrue(copied.fusion.fc.weight.requires_grad)
                 save_draft(copied, root / "draft")
-                export_to_sglang(
-                    str(root / "draft"),
-                    None,
-                    str(root / "export"),
-                    target_model=str(target),
-                )
+                with patch(
+                    "specforge.checkpoint.formats.sglang.converters.common",
+                    side_effect=AssertionError("serving conversion"),
+                ):
+                    export_draft(
+                        str(root / "draft"),
+                        None,
+                        str(root / "export"),
+                        target_model=str(target),
+                        export_mode="native",
+                    )
+                metadata = json.loads((root / "export/config.json").read_text())[
+                    "specforge_artifact"
+                ]
+                self.assertEqual(metadata, {"format": "native", "version": 1})
                 restored = initialize_draft(
                     config, target=root / "export", from_target=NATIVE_MAPPING
                 )
@@ -140,11 +149,12 @@ class NativePresetTest(unittest.TestCase):
                     {k: v for k, v in weights.items() if k.startswith("mtp.")},
                     legacy / "model.safetensors",
                 )
-                export_to_sglang(
+                export_draft(
                     str(legacy),
                     None,
                     str(root / "legacy-export"),
                     target_model=str(target),
+                    export_mode="native",
                 )
                 exported = json.loads((root / "legacy-export/config.json").read_text())
                 self.assertEqual(

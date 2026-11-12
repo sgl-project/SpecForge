@@ -12,9 +12,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.formats.native.qwen3_5 import (
-    convert_config as convert_qwen3_5_config,
-)
+from specforge.checkpoint.formats.native.writer import export_native
 from specforge.checkpoint.formats.sglang import (
     _CONVERTERS,
     SGLANG_COMMIT,
@@ -22,8 +20,9 @@ from specforge.checkpoint.formats.sglang import (
     convert_config,
 )
 from specforge.checkpoint.formats.sglang.converters import serving_weights
-from specforge.checkpoint.formats.sglang.native import export_native
-from specforge.checkpoint.native import is_native_architecture
+from specforge.checkpoint.formats.sglang.qwen3_5 import (
+    convert_config as convert_qwen3_5_config,
+)
 from specforge.checkpoint.tensors import TensorStore
 from specforge.cli import main
 from specforge.config.draft.logits import NoLogitTransformSpec
@@ -74,7 +73,7 @@ class SGLangExportTest(unittest.TestCase):
             {
                 c.architecture
                 for c in configurations()
-                if not is_native_architecture(c.architecture)
+                if c.architecture != "MTPDraftModel"
             },
         )
         for config in serving_configs():
@@ -262,13 +261,14 @@ class SGLangExportTest(unittest.TestCase):
                     json.dumps({"weight_map": index})
                 )
                 save_draft(model, root / "draft")
-                export_to_sglang(
-                    str(root / "draft"),
-                    None,
-                    str(root / "served"),
-                    target_model=str(target),
-                    copy_target=copy,
-                )
+                with self.assertWarnsRegex(FutureWarning, "export-mode native"):
+                    export_to_sglang(
+                        str(root / "draft"),
+                        None,
+                        str(root / "served"),
+                        target_model=str(target),
+                        copy_target=copy,
+                    )
                 restored = TensorStore(root / "served")
                 exported = json.loads((root / "served" / "config.json").read_text())
                 self.assertEqual(exported["specforge_artifact"], artifact_metadata())
@@ -341,7 +341,7 @@ class SGLangExportTest(unittest.TestCase):
                         ),
                         (
                             state | {"renamed.weight": state["fusion.fc.weight"]},
-                            "coverage",
+                            "unexpected",
                         ),
                         (state | {"fusion.fc.weight": torch.zeros(1)}, "shape"),
                     ):

@@ -10,15 +10,15 @@ from unittest.mock import Mock, patch
 import torch
 from safetensors.torch import save_file
 
+from specforge.checkpoint.formats.native.writer import export_native, write_native
 from specforge.checkpoint.formats.sglang import convert_config
-from specforge.checkpoint.formats.sglang.native import export_native, write_native
 from specforge.checkpoint.native import (
     _TARGETS,
     register_native_target,
     validate_target_initialization,
 )
 from specforge.checkpoint.tensors import TensorStore
-from specforge.export.to_sglang import export_to_sglang
+from specforge.export import export_draft
 
 
 class NativeRegistryTest(unittest.TestCase):
@@ -44,7 +44,7 @@ class NativeRegistryTest(unittest.TestCase):
                 config,
                 {},
                 source,
-                payload,
+                payload | {"specforge_artifact": {"format": "native", "version": 1}},
                 source / "output",
                 copy_target=False,
             )
@@ -87,7 +87,7 @@ class NativeRegistryTest(unittest.TestCase):
             checkpoint = SimpleNamespace(config=config)
             with (
                 patch(
-                    "specforge.export.to_sglang.read_export",
+                    "specforge.export.model.read_export",
                     return_value=(checkpoint, state, None),
                 ),
                 patch(
@@ -96,8 +96,13 @@ class NativeRegistryTest(unittest.TestCase):
                 ),
             ):
                 output = Path(tmp) / "output"
-                export_to_sglang(
-                    "checkpoint", None, output, target_model=target, copy_target=True
+                export_draft(
+                    "checkpoint",
+                    None,
+                    output,
+                    export_mode="native",
+                    target_model=target,
+                    copy_target=True,
                 )
             self.assertEqual(validate.call_count, 2)
             store = TensorStore(output)

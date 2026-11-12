@@ -30,10 +30,6 @@ def register_native_target(
     _TARGETS[key] = NativeTarget(source_prefix, validate, export)
 
 
-def is_native_architecture(architecture):
-    return any(registered == architecture for _, registered in _TARGETS)
-
-
 def resolve_native_target(config, target):
     key = (target.get("model_type"), config.architecture)
     try:

@@ -65,7 +65,7 @@ class ExportReviewTest(unittest.TestCase):
 
     def test_cli_defaults_to_canonical_and_rejects_legacy_options_early(self):
         args = ["export", "--checkpoint", "missing", "--output-dir", "out"]
-        with patch("specforge.export.to_hf.export_to_hf") as export:
+        with patch("specforge.export.model.export_draft") as export:
             result = CliRunner().invoke(cli, args)
             self.assertEqual(result.exit_code, 0, result.output)
             export.assert_called_once()

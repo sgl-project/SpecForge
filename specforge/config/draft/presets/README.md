@@ -37,7 +37,7 @@ For continuation use `initialization.checkpoint`; for full training resume use
 separate target directory:
 
 ```bash
-specforge export --converter sglang --checkpoint CHECKPOINT_PATH \
+specforge export --export-mode native --checkpoint CHECKPOINT_PATH \
   --target-model TARGET_PATH --output-dir OUTPUT_DIR
 ```
 

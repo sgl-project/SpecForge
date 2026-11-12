@@ -5,10 +5,10 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from specforge.checkpoint.formats.native.qwen3_5 import (
+from specforge.checkpoint.formats.sglang import convert_config
+from specforge.checkpoint.formats.sglang.qwen3_5 import (
     convert_config as convert_qwen3_5_config,
 )
-from specforge.checkpoint.formats.sglang import convert_config
 from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.logits import MuPLogitTransformSpec
