@@ -320,6 +320,12 @@ def export(
             )
         if embedding_key != "model.embed_tokens.weight":
             raise click.UsageError("--embedding-key belongs to legacy --to hf", ctx)
+        if vocab_mapping is not None:
+            raise click.UsageError(
+                "--vocab-mapping belongs to legacy --to exports; canonical export "
+                "reads the vocabulary mapping from the checkpoint",
+                ctx,
+            )
         from specforge.export.to_hf import export_to_hf
 
         export_to_hf(

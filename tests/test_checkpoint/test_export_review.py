@@ -73,6 +73,9 @@ class ExportReviewTest(unittest.TestCase):
             result = CliRunner().invoke(cli, args + ["--embedding-source", "target"])
             self.assertEqual(result.exit_code, 2)
             self.assertIn("--target-model", result.output)
+            result = CliRunner().invoke(cli, args + ["--vocab-mapping", "map.pt"])
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("--vocab-mapping belongs to legacy --to", result.output)
             export.assert_not_called()
         with patch("specforge.export.to_sglang.export_to_sglang") as export:
             result = CliRunner().invoke(cli, args + ["--to", "sglang"])
