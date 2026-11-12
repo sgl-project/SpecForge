@@ -9,6 +9,8 @@ from .dense import SUPPORTED_ACTIVATIONS
 
 # Router affinity functions. softmax is Qwen3.5-MoE; sigmoid is DeepSeek-V3/V4.
 ROUTER_SCORINGS = frozenset({"softmax", "sigmoid"})
+# Shared-expert activations: the dense set plus relu2 for Nemotron's non-gated MLP.
+SHARED_EXPERT_ACTIVATIONS = SUPPORTED_ACTIVATIONS | {"relu2"}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -36,9 +38,30 @@ class MoERouterSpec:
 
 
 @dataclass(frozen=True, kw_only=True)
+class MoESharedExpertSpec:
+    """One always-on FFN of width `intermediate_size` (DeepSeek merges n shared into n×I).
+    `gated` is act(gate_proj)·up_proj as Qwen/DeepSeek, else act(up_proj) as Nemotron relu2.
+    """
+
+    intermediate_size: int
+    hidden_act: str
+    gated: bool
+
+    def __post_init__(self):
+        positive_int("intermediate_size", self.intermediate_size)
+        nonempty_string("hidden_act", self.hidden_act)
+        if self.hidden_act not in SHARED_EXPERT_ACTIVATIONS:
+            raise ValueError(
+                f"unsupported shared expert hidden_act {self.hidden_act!r}; "
+                f"supported: {sorted(SHARED_EXPERT_ACTIVATIONS)}"
+            )
+        boolean("gated", self.gated)
+
+
+@dataclass(frozen=True, kw_only=True)
 class MoEFFNSpec(FFNSpec):
     """Routed gated experts of per-expert width `intermediate_size`, plus an optional
-    shared expert (`null` width = none) with a sigmoid gate when `shared_expert_gate`.
+    `shared_expert` whose output a sigmoid gate scales when `shared_expert_gate` (Qwen).
     """
 
     type: ClassVar[str] = "moe"
@@ -47,7 +70,7 @@ class MoEFFNSpec(FFNSpec):
     num_experts_per_tok: int
     intermediate_size: int
     hidden_act: str
-    shared_expert_intermediate_size: int | None
+    shared_expert: MoESharedExpertSpec | None
     shared_expert_gate: bool
     router: MoERouterSpec
 
@@ -66,13 +89,12 @@ class MoEFFNSpec(FFNSpec):
                 f"unsupported moe hidden_act {self.hidden_act!r}; "
                 f"supported: {sorted(SUPPORTED_ACTIVATIONS)}"
             )
-        if self.shared_expert_intermediate_size is not None:
-            positive_int(
-                "shared_expert_intermediate_size",
-                self.shared_expert_intermediate_size,
-            )
+        if self.shared_expert is not None and not isinstance(
+            self.shared_expert, MoESharedExpertSpec
+        ):
+            raise TypeError("shared_expert must be MoESharedExpertSpec or None")
         boolean("shared_expert_gate", self.shared_expert_gate)
-        if self.shared_expert_gate and self.shared_expert_intermediate_size is None:
+        if self.shared_expert_gate and self.shared_expert is None:
             raise ValueError("shared_expert_gate requires a shared expert")
         if not isinstance(self.router, MoERouterSpec):
             raise TypeError("router must be MoERouterSpec")
