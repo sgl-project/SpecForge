@@ -12,8 +12,11 @@ from . import (  # noqa: F401
     peagle,
 )
 from .base import ObjectiveModel, ObjectiveResult
+from .implementations import register_implementation
 from .losses import register_loss
-from .predictions import LossTerm, PredictionBatch, Predictions
+from .plan import LossPlan, LossTerm
+from .predictions import PredictionBatch, Predictions
+from .projection import CorrectedProjection, LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
     WindowStatistic,
@@ -26,6 +29,7 @@ from .registry import (
     register_protocol,
     resolve_objective,
 )
+from .token_kernels import register_token_kernel
 
 __all__ = [
     "TrainingRequirements",
@@ -37,6 +41,8 @@ __all__ = [
     "objective_registrations",
     "register_objective",
     "register_loss",
+    "register_implementation",
+    "register_token_kernel",
     "register_protocol",
     "resolve_objective",
     "protocol_registrations",
@@ -44,4 +50,8 @@ __all__ = [
     "Predictions",
     "PredictionBatch",
     "LossTerm",
+    "LossPlan",
+    "Projection",
+    "LinearProjection",
+    "CorrectedProjection",
 ]

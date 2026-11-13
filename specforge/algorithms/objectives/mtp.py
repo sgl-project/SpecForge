@@ -9,6 +9,7 @@ from .dflash import COMMON_MODULES
 from .inputs import gather, sequence_inputs, valid_tokens
 from .losses import TokenLoss
 from .predictions import PredictionBatch
+from .projection import LinearProjection
 from .registry import TrainingRequirements, register_protocol
 
 
@@ -91,6 +92,7 @@ class MTPObjective:
             batch,
             label_positions - 1,
             labels=labels,
+            projection=LinearProjection(model.project, model.lm_head),
             mask=weights,
             # one proposal per position: no depth for position weights to act on
             positions=torch.zeros_like(positions),

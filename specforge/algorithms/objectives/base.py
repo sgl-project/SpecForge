@@ -87,10 +87,12 @@ class ObjectiveModel(nn.Module):
         sequence_ids=None,
         projection_inputs=None,
         auxiliary_inputs=None,
+        projection=None,
         **options,
     ):
         from .inputs import gather
         from .predictions import Predictions, Teacher
+        from .projection import Projection
 
         def align(value):
             return value.reshape(-1, unit_size, *value.shape[mask.ndim :])
@@ -118,7 +120,7 @@ class ObjectiveModel(nn.Module):
             )
         return Predictions(
             hidden=hidden,
-            projector=self.draft_model.project,
+            projection=projection or Projection(self.draft_model.project),
             mask=mask.reshape(-1, unit_size),
             chain_ids=torch.broadcast_to(chain_ids, hidden.shape[:2]),
             sequence_ids=torch.broadcast_to(sequence_ids, mask.shape).reshape(

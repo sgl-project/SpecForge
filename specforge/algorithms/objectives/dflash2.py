@@ -7,9 +7,10 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss, ce_l1_terms, decay_weighting
+from .losses import TokenLoss, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
+from .token_kernels import ce_l1_terms
 
 
 @register_protocol(

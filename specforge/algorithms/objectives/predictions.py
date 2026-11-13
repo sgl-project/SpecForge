@@ -7,6 +7,8 @@ import torch
 from torch import Tensor
 
 from .losses import TokenLoss
+from .plan import LossPlan
+from .projection import Projection
 
 
 @dataclass(frozen=True)
@@ -46,12 +48,6 @@ class Teacher:
         return replace(self, values=self.values[units])
 
 
-@dataclass(frozen=True)
-class LossTerm:
-    output: str = "logits"
-    coefficient: float = 1.0
-
-
 @dataclass
 class AuxiliaryLoss:
     values: Tensor
@@ -68,7 +64,7 @@ class Predictions:
     """
 
     hidden: Tensor
-    projector: Callable
+    projection: Projection
     mask: Tensor
     positions: Tensor
     chain_ids: Tensor | None = None
@@ -78,10 +74,9 @@ class Predictions:
     projection_inputs: dict[str, Tensor] = field(default_factory=dict)
     auxiliary_inputs: dict[str, Tensor] = field(default_factory=dict)
     auxiliary: Callable | None = None
-    fused_evaluator: Callable | None = None
     requires: frozenset[str] = frozenset()
     default_loss: TokenLoss = field(default_factory=lambda: TokenLoss(kind="ce"))
-    terms: tuple[LossTerm, ...] = (LossTerm(),)
+    plan: LossPlan = field(default_factory=LossPlan)
     vocab_mask: Tensor | None = None
     draft_to_target: Tensor | None = None
     denominator: Tensor | None = None
@@ -106,6 +101,9 @@ class Predictions:
                 value.shape != shape or value.dtype != torch.long
             ):
                 raise ValueError("chain and sequence IDs must be aligned int64 tensors")
+        for term in self.plan.terms:
+            if term.mask is not None and term.mask.shape != shape:
+                raise ValueError("Loss masks must align with prediction units")
         aligned = [*self.projection_inputs.values(), *self.auxiliary_inputs.values()]
         if self.teacher is not None:
             aligned.append(self.teacher.values)
@@ -124,12 +122,13 @@ class Predictions:
         return frozenset(flags)
 
     def project(self):
-        return self.projector(self.hidden, **self.projection_inputs)
+        return self.projection.project(self.hidden, **self.projection_inputs)
 
     def select(self, units: slice):
         return replace(
             self,
             hidden=self.hidden[units],
+            plan=self.plan.select(units),
             mask=self.mask[units],
             positions=self.positions[units],
             chain_ids=None if self.chain_ids is None else self.chain_ids[units],

@@ -9,8 +9,14 @@ from torch import nn
 
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
-from specforge.algorithms.objectives.losses import _LOSSES, PositionWeighting, TokenLoss
-from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
+from specforge.algorithms.objectives.implementations import _IMPLEMENTATIONS
+from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.predictions import (
+    PredictionBatch,
+    Predictions,
+    Teacher,
+)
+from specforge.algorithms.objectives.projection import Projection
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
 
@@ -131,7 +137,7 @@ class LossExecutionTest(unittest.TestCase):
         ):
             predictions = Predictions(
                 hidden=hidden,
-                projector=lambda h: {"logits": head(h)},
+                projection=Projection(lambda h: {"logits": head(h)}),
                 mask=mask,
                 positions=torch.zeros(5, 1, dtype=torch.long),
                 labels=torch.zeros(5, 1, dtype=torch.long),
@@ -190,21 +196,34 @@ class LossExecutionTest(unittest.TestCase):
                     context = LossContext(torch.ones_like(labels))
                     reference = loss(logits, labels, teacher=teacher, context=context)
                     (expected_grad,) = torch.autograd.grad(reference.sum(), logits)
-                    compute = loss.registration.fused_compute
+                    entry = _IMPLEMENTATIONS["token_" + kind]
+                    compute = entry.compute
                     optimized = Mock(wraps=compute)
+                    prediction = Predictions(
+                        hidden=logits,
+                        projection=Projection(lambda x: {"logits": x}),
+                        mask=torch.ones_like(labels),
+                        positions=torch.zeros_like(labels),
+                        labels=labels,
+                        teacher=Teacher(teacher),
+                    )
                     with patch.dict(
-                        _LOSSES,
-                        {kind: replace(loss.registration, fused_compute=optimized)},
+                        _IMPLEMENTATIONS,
+                        {entry.name: replace(entry, compute=optimized)},
                     ):
-                        actual = loss(
-                            logits, labels, teacher=teacher, context=context, fused=True
-                        )
+                        actual = execute_batch(
+                            PredictionBatch((prediction,)),
+                            loss,
+                            PositionWeighting(),
+                            training=True,
+                            execution=LossExecution(fused=True),
+                        ).numerator
                     optimized.assert_called_once()
                     (actual_grad,) = torch.autograd.grad(actual.sum(), logits)
                     self.assertIsNotNone(compute)
                     tolerance = 0.02 if dtype == torch.bfloat16 else 2e-4
                     torch.testing.assert_close(
-                        actual, reference, rtol=tolerance, atol=2e-5
+                        actual, reference.sum(), rtol=tolerance, atol=2e-5
                     )
                     torch.testing.assert_close(
                         actual_grad,

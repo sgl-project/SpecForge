@@ -6,9 +6,11 @@ import torch
 
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 
-from .base import ObjectiveResult, microbatch_mean
+from .base import ObjectiveResult
 from .execution_options import LossExecution
+from .implementations import ExecutionRequest, TermInputs, select_implementation
 from .losses import LossContext
+from .reductions import PlanResult, combine_results
 
 
 @dataclass
@@ -21,13 +23,24 @@ class Projected:
     teacher_mass: torch.Tensor | None
 
 
-def project_predictions(predictions, loss, weighting, execution=LossExecution()):
-    selected = predictions.default_loss if loss.kind == "default" else loss
-    required = selected.requires | weighting.requires | predictions.requires
+def selected_losses(predictions, loss):
+    default = predictions.default_loss if loss.kind == "default" else loss
+    return tuple(
+        term.loss if term.loss is not None and term.loss.kind != "default" else default
+        for term in predictions.plan.terms
+    )
+
+
+def prepare_supervision(predictions, loss, weighting, execution):
+    losses = selected_losses(predictions, loss)
+    required = weighting.requires | predictions.requires
+    for term, selected in zip(predictions.plan.terms, losses):
+        required |= selected.requires
+        if term.weighting is not None:
+            required |= term.weighting.requires
     missing = required - predictions.capabilities
     if missing:
         raise ValueError(f"predictions lack required capabilities: {sorted(missing)}")
-    output = predictions.project()
     teacher = teacher_ids = mass = None
     labels, mask = predictions.labels, predictions.mask
     if "teacher_logits" in required:
@@ -39,7 +52,7 @@ def project_predictions(predictions, loss, weighting, execution=LossExecution())
             teacher = predictions.teacher.logits()
             teacher_ids = teacher.argmax(-1)
             if predictions.vocab_mask is not None:
-                if selected.registration.contextual:
+                if any(selected.registration.contextual for selected in losses):
                     mass = (
                         teacher.float().softmax(-1)[..., predictions.vocab_mask].sum(-1)
                     )
@@ -47,7 +60,13 @@ def project_predictions(predictions, loss, weighting, execution=LossExecution())
     if predictions.vocab_mask is not None:
         mask = mask * predictions.vocab_mask[teacher_ids]
         labels = teacher.argmax(-1)
-    return Projected(output, teacher, teacher_ids, labels, mask, mass)
+    return Projected({}, teacher, teacher_ids, labels, mask, mass)
+
+
+def project_predictions(predictions, loss, weighting, execution=LossExecution()):
+    projected = prepare_supervision(predictions, loss, weighting, execution)
+    projected.output = predictions.project()
+    return projected
 
 
 def evaluate_predictions(
@@ -60,68 +79,112 @@ def evaluate_predictions(
     denominator=None,
     execution=LossExecution(),
 ):
-    selected = predictions.default_loss if loss.kind == "default" else loss
-    if (
-        execution.fused
-        and projected is None
-        and predictions.fused_evaluator is not None
-    ):
-        result = predictions.fused_evaluator(
-            predictions, selected, weighting, weights=weights, denominator=denominator
-        )
-        if result is not None:
-            return result
-    projected = projected or project_predictions(
-        predictions, loss, weighting, execution
-    )
-    output, teacher = projected.output, projected.teacher
-    logits, labels, mask = output["logits"], projected.labels, projected.mask
-    if weights is None:
-        weights = weighting(mask.float(), predictions.positions)
-    per_token = sum(
-        term.coefficient
-        * selected(
-            output[term.output],
-            labels,
-            teacher=teacher,
-            fused=execution.fused,
-            context=LossContext(
+    p = predictions
+    projected = projected or prepare_supervision(p, loss, weighting, execution)
+    losses = selected_losses(p, loss)
+    inputs = []
+    for term, selected in zip(p.plan.terms, losses):
+        mask = projected.mask
+        if term.mask is not None:
+            mask = term.mask
+            if p.vocab_mask is not None:
+                mask = mask * p.vocab_mask[projected.teacher_ids]
+        term_weights = weights
+        if term_weights is None:
+            term_weights = (term.weighting or weighting)(mask.float(), p.positions)
+        fixed = term.denominator if term.denominator is not None else p.denominator
+        term_denominator = denominator if denominator is not None else fixed
+        if term_denominator is None:
+            term_denominator = term_weights.sum().detach()
+        inputs.append(
+            TermInputs(
+                selected,
                 mask,
-                projected.teacher_mass,
-                predictions.denominator if denominator is None else None,
-            ),
+                term_weights,
+                term_denominator,
+                LossContext(
+                    mask, projected.teacher_mass, fixed if denominator is None else None
+                ),
+            )
         )
-        for term in predictions.terms
+    numerators, predicted = {}, {}
+
+    def outputs():
+        if not projected.output:
+            projected.output.update(p.project())
+        return projected.output
+
+    request = ExecutionRequest(
+        p, tuple(inputs), projected.labels, projected.teacher, outputs, projected.output
     )
+
+    def reference(index):
+        term, item = p.plan.terms[index], inputs[index]
+        values = item.loss(
+            outputs()[term.output],
+            projected.labels,
+            teacher=projected.teacher,
+            context=item.context,
+        )
+        numerators[index] = (values * item.weights).sum()
+
+    def execute(group):
+        entry = select_implementation(request, group) if execution.fused else None
+        if entry is None:
+            return False
+        result = entry.compute(request, group)
+        if set(result.numerators) != set(group):
+            raise ValueError(
+                f"{entry.name} did not return exactly the requested loss terms"
+            )
+        numerators.update(result.numerators)
+        predicted.update(result.predictions)
+        return True
+
+    for group in p.plan.groups:
+        if not execute(group):
+            for index in group:
+                if len(group) == 1 or not execute((index,)):
+                    reference(index)
+
     ratios = {}
-    if predictions.auxiliary is not None:
-        auxiliary = predictions.auxiliary(predictions, output, teacher, weights)
-        per_token = per_token + auxiliary.values
+    if p.auxiliary is not None:
+        if not p.plan.shared_reduction:
+            raise ValueError(
+                "Algorithm auxiliary callbacks require shared supervision and reduction"
+            )
+        auxiliary = p.auxiliary(p, outputs(), projected.teacher, inputs[0].weights)
+        # Auxiliary values already include their own coefficients.
+        auxiliary_result = ObjectiveResult(
+            (auxiliary.values * inputs[0].weights).sum(), inputs[0].denominator
+        )
         ratios.update(auxiliary.ratios)
-    prediction = logits.argmax(-1)
-    metric_weights = mask.float()
-    target = labels
-    if predictions.draft_to_target is not None:
-        prediction = prediction + predictions.draft_to_target[prediction]
-        target = projected.teacher_ids
-        metric_weights = predictions.mask
+    else:
+        auxiliary_result = None
+
+    prediction = predicted.get("logits")
+    if prediction is None:
+        prediction = outputs()["logits"].argmax(-1)
+    metric_weights, target = projected.mask.float(), projected.labels
+    if p.draft_to_target is not None:
+        prediction = prediction + p.draft_to_target[prediction]
+        target, metric_weights = projected.teacher_ids, p.mask
     accuracy = (
         ((prediction == target) * metric_weights).sum().detach(),
         metric_weights.sum().detach(),
     )
-    ratios[predictions.accuracy_name] = accuracy
-    if predictions.report_accuracy:
+    ratios[p.accuracy_name] = accuracy
+    if p.report_accuracy:
         ratios["acc"] = accuracy
-    denominator = (
-        denominator
-        if denominator is not None
-        else (
-            weights.sum().detach()
-            if predictions.denominator is None
-            else predictions.denominator
-        )
+    terms = tuple(
+        ObjectiveResult(numerators[i], item.denominator)
+        for i, item in enumerate(inputs)
     )
-    return ObjectiveResult((per_token * weights).sum(), denominator, ratios)
+    coefficients = tuple(term.coefficient for term in p.plan.terms)
+    if auxiliary_result is not None:
+        terms += (auxiliary_result,)
+        coefficients += (1.0,)
+    return PlanResult(terms, coefficients, p.plan.shared_reduction, ratios)
 
 
 @dataclass
@@ -202,20 +265,6 @@ def chain_weights(predictions, projected, weighting):
     return list(zip(weights.split(sizes), denominator.split(sizes)))
 
 
-def combine_results(results):
-    ratios = {}
-    for result in results:
-        for key, pair in result.ratios.items():
-            ratios[key] = (
-                tuple(a + b for a, b in zip(ratios[key], pair))
-                if key in ratios
-                else pair
-            )
-    return ObjectiveResult(
-        sum(r.numerator for r in results), sum(r.denominator for r in results), ratios
-    )
-
-
 def prediction_slices(predictions, chunk_size):
     length = predictions.hidden.shape[0]
     size = chunk_size or max(length, 1)
@@ -233,16 +282,23 @@ def evaluate_chunks(
     weights=None,
     denominator=None,
 ):
-    selected = predictions.default_loss if loss.kind == "default" else loss
+    contextual = any(
+        selected.registration.contextual
+        for selected in selected_losses(predictions, loss)
+    )
     # Contextual losses and local DSpine alignment need whole-set statistics.
-    if selected.registration.contextual or not predictions.chunk_safe:
-        chunk_size = 0
     if (
-        execution.trim
-        and weighting.kind not in DPACE_LOSS_TYPES
-        and not selected.registration.contextual
+        contextual
+        or not predictions.chunk_safe
+        or not predictions.projection.chunk_safe
     ):
-        predictions = predictions.select(predictions.mask.any(-1).nonzero().flatten())
+        chunk_size = 0
+    if execution.trim and weighting.kind not in DPACE_LOSS_TYPES and not contextual:
+        keep = predictions.mask.any(-1)
+        for term in predictions.plan.terms:
+            if term.mask is not None:
+                keep |= term.mask.any(-1)
+        predictions = predictions.select(keep.nonzero().flatten())
     from torch.utils.checkpoint import checkpoint
 
     results = []
@@ -253,7 +309,12 @@ def evaluate_chunks(
             weights=None if weights is None else weights[part],
             denominator=None if denominator is None else denominator[part].sum(),
         )
-        if chunk_size and execution.checkpoint and torch.is_grad_enabled():
+        if (
+            chunk_size
+            and execution.checkpoint
+            and predictions.projection.recompute_safe
+            and torch.is_grad_enabled()
+        ):
             result = checkpoint(
                 evaluate_predictions,
                 item,
@@ -266,8 +327,17 @@ def evaluate_chunks(
             result = evaluate_predictions(item, loss, weighting, **kwargs)
         results.append(result)
     result = combine_results(results)
-    if predictions.denominator is not None and denominator is None:
-        result.denominator = predictions.denominator
+    if denominator is None:
+        for index, term in enumerate(predictions.plan.terms):
+            fixed = (
+                term.denominator
+                if term.denominator is not None
+                else predictions.denominator
+            )
+            if fixed is not None:
+                result.terms[index].denominator = fixed
+        if predictions.auxiliary is not None and predictions.denominator is not None:
+            result.terms[-1].denominator = predictions.denominator
     return result
 
 
@@ -279,6 +349,15 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
         predictions = list(batch.predictions)
         if not predictions:
             raise ValueError("protocol must produce at least one prediction set")
+        if any(not p.plan.shared_reduction for p in predictions):
+            raise ValueError(
+                "D-PACE currently requires shared loss masks and weighting"
+            )
+        if any(
+            not p.projection.chunk_safe or not p.projection.recompute_safe
+            for p in predictions
+        ):
+            chunk_size = 0
         if not chunk_size:
             projected = [
                 project_predictions(p, loss, weighting, execution) for p in predictions
@@ -338,15 +417,28 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")
-    result = combine_results(results)
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
+        # Prediction sets can have distinct plans; only their metrics are additive.
+        ratios = {}
+        for item in results:
+            for name, pair in item.ratios.items():
+                ratios[name] = (
+                    tuple(a + b for a, b in zip(ratios[name], pair))
+                    if name in ratios
+                    else pair
+                )
         return ObjectiveResult(
             sum(item.loss for item in results),
-            results[0].denominator.new_ones(()),
-            result.ratios,
+            results[0].terms[0].denominator.new_ones(()),
+            ratios,
         )
+    result = combine_results(results)
     if batch.reduction == "global_microbatch":
-        return microbatch_mean(result, global_denominator=training)
+        return result.objective_result(global_denominator=training, normalize=True)
     if batch.reduction not in ("tokens", "sum_means"):
         raise ValueError(f"unknown protocol reduction: {batch.reduction!r}")
-    return result
+    if not result.shared_reduction:
+        raise ValueError(
+            "Independent term reductions require sum_means or global_microbatch"
+        )
+    return result.objective_result()

@@ -8,6 +8,7 @@ from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss, decay_weighting
 from .predictions import PredictionBatch
+from .projection import LinearProjection
 from .registry import TrainingRequirements, register_protocol
 
 COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
@@ -62,4 +63,13 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        return PredictionBatch((runtime.block_predictions(output, blocks, batch),))
+        return PredictionBatch(
+            (
+                runtime.block_predictions(
+                    output,
+                    blocks,
+                    batch,
+                    projection=LinearProjection(model.project, model.lm_head),
+                ),
+            )
+        )

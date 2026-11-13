@@ -266,6 +266,11 @@ training:
   teacher. It preserves full-vocabulary argmax and retained probability mass
   while projecting vocabulary tiles; no full-vocabulary logits are retained.
 
+For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
+retaining full logits. It requires a compatible Liger kernel that also returns
+predicted tokens. Wrapped/transformed heads, unavailable kernels and unsupported
+inputs retain ordinary projection; losses may still use a token kernel.
+
 Chunked D-PACE first collects detached chain statistics, then recomputes projection
 chunks with the complete-chain weights. Contextual LK losses retain whole-set
 execution, and DSpine retains it when no window alignment statistic is supplied.
@@ -294,6 +299,50 @@ path. Neither is copied into the other. A canonical checkpoint supplied through
 imports through `initialization.checkpoint` must explicitly match saved training
 settings in `training.objective_options`; `weights_from` copies weights only.
 
+
+### Extending loss execution
+
+Objectives describe supervision and return `Predictions` carrying a `Projection`
+and an immutable `LossPlan`. The projection exposes ordinary named outputs and,
+optionally, a typed optimization contract. It references existing model parameters
+and must not bypass wrapping, sharding or head transforms.
+
+`LossPlan.terms` declares outputs, coefficients and optional per-term loss, mask,
+weighting and fixed denominator. Omitted settings inherit the prediction/runtime
+defaults. `joint_groups` contains non-overlapping tuples of term indices that
+**may** execute together; it does not select a kernel or combine their denominators.
+Without a matching joint implementation, the executor selects an implementation
+for each term. Removing a joint range preserves the mathematical objective.
+
+Domino declares its existing `lambda * base_CE + (1 - lambda) * final_CE` schedule
+and a corrected-projection contract. The registered `corrected_ce` implementation
+uses compact corrections; the reference path computes both outputs normally.
+There is no algorithm-name branch in the executor.
+
+Register mathematical formulas with `register_loss`. Register optimized group
+implementations with `register_implementation`, or use `register_token_kernel`
+for a per-token kernel. Implementations declare applicability and return weighted
+numerators by term index, plus any predicted tokens needed for metrics. They do
+not apply coefficients or normalization. Selection uses explicit priority and
+stable names; DEBUG logs report selection and fallback reasons. Kernel execution
+errors propagate rather than silently changing implementation.
+
+Term statistics are combined across chunks before normalization. Independent
+masks/denominators require `sum_means` (normalize each prediction set) or
+`global_microbatch` (normalize each term across ranks during training). The existing
+`tokens` contract and D-PACE require shared term reduction. Differentiable
+denominators and arbitrary accumulation-window normalization are not implemented.
+Existing trainer accumulation and protocol semantics are unchanged.
+
+Reference outputs are reused only within the current evaluation. No logits cache
+is stored on the model. Contextual losses retain whole-set execution; algorithms
+must disable chunking when their projection/auxiliary computation requires it.
+The existing algorithm auxiliary computations remain in their objectives and
+require shared supervision; the specialized fused execution callback is removed.
+
+Functionality and optimization support are separate: a method can use its ordinary
+projection without supporting linear/corrected fusion. TP, LoRA and quantized heads
+need explicit compatible projection implementations before using these fused paths.
 
 ### Canonical training requirements
 

@@ -1,0 +1,329 @@
+"""Joint ranges are optional; term reductions and gradients are not."""
+
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch import nn
+
+from specforge.algorithms.objectives.execution import execute_batch
+from specforge.algorithms.objectives.execution_options import LossExecution
+from specforge.algorithms.objectives.implementations import (
+    _IMPLEMENTATIONS,
+    GroupResult,
+    _linear_kernel,
+    register_implementation,
+)
+from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
+from specforge.algorithms.objectives.projection import LinearProjection, Projection
+from tests.test_algorithms.test_objective_contracts import build_runtime
+from tests.test_algorithms.test_objectives import training_batch
+
+
+def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
+    return execute_batch(
+        PredictionBatch((prediction,), reduction=reduction),
+        TokenLoss(kind="ce"),
+        PositionWeighting(),
+        training=True,
+        execution=LossExecution(fused=fused, chunk_size=chunk, trim=True),
+    )
+
+
+class DistributedPlan(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.head = nn.Linear(4, 9).double()
+
+    def forward(self, hidden, labels, mask, other):
+        prediction = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": self.head(x)}),
+            labels=labels,
+            positions=torch.zeros_like(labels),
+            mask=mask,
+            plan=LossPlan((LossTerm(), LossTerm(coefficient=0.3, mask=other))),
+        )
+        return run(prediction, chunk=1, reduction="global_microbatch").loss
+
+
+def distributed_reduction(rank, rendezvous):
+    from torch.nn.parallel import DistributedDataParallel
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        torch.manual_seed(19)
+        model = DistributedPlan()
+        reference = nn.Linear(4, 9).double()
+        reference.load_state_dict(model.head.state_dict())
+        wrapped = DistributedDataParallel(model)
+        expected = 0
+        for step in range(2):
+            hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
+                10 + step
+            )
+            labels = (torch.arange(6) + step).reshape(6, 1)
+            mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
+            other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
+            part = slice(rank * 3, (rank + 1) * 3)
+            (
+                wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
+            ).backward()
+            values = TokenLoss(kind="ce")(reference(hidden), labels)
+            expected = (
+                expected
+                + (
+                    (values * mask).sum() / mask.sum()
+                    + 0.3 * (values * other).sum() / other.sum()
+                )
+                / 2
+            )
+        expected.backward()
+        torch.testing.assert_close(
+            tuple(p.grad for p in model.head.parameters()),
+            tuple(p.grad for p in reference.parameters()),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+class LossPlanTest(unittest.TestCase):
+    @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
+    def test_distributed_term_reduction_and_accumulation(self):
+        with TemporaryDirectory() as tmp:
+            mp.spawn(
+                distributed_reduction,
+                args=((Path(tmp) / "rendezvous").as_uri(),),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_joint_range_and_independent_denominator(self):
+        torch.manual_seed(31)
+        head = nn.Linear(4, 9).double()
+        hidden = torch.randn(5, 1, 4, dtype=torch.float64, requires_grad=True)
+        mask = torch.tensor([[1.0], [0.5], [0.0], [1.0], [0.0]])
+        other = torch.tensor([[0.0], [1.0], [1.0], [0.0], [0.0]])
+        labels = torch.randint(9, (5, 1))
+
+        def project(x):
+            logits = head(x)
+            return {"logits": logits, "base_logits": logits * 0.5}
+
+        terms = (
+            LossTerm("logits", 0.6),
+            LossTerm("base_logits", 0.4),
+            LossTerm("base_logits", 0.2, mask=other, denominator=torch.tensor(7.0)),
+        )
+        p = Predictions(
+            hidden=hidden,
+            projection=Projection(project),
+            mask=mask,
+            positions=torch.zeros_like(labels),
+            labels=labels,
+            plan=LossPlan(terms, ((0, 1),)),
+        )
+        output = project(hidden)
+        ce = TokenLoss(kind="ce")
+        expected = (
+            0.6 * (ce(output["logits"], labels) * mask).sum() / mask.sum()
+            + 0.4 * (ce(output["base_logits"], labels) * mask).sum() / mask.sum()
+            + 0.2 * (ce(output["base_logits"], labels) * other).sum() / 7
+        )
+        parameters = (hidden, *head.parameters())
+        expected_grad = torch.autograd.grad(expected, parameters, retain_graph=True)
+        with patch.dict(_IMPLEMENTATIONS, clear=True):
+            calls = []
+
+            @register_implementation(
+                "test_joint",
+                supports=lambda req, group: None if group == (0, 1) else "pair only",
+            )
+            def joint(req, group):
+                calls.append(group)
+                values = req.outputs()
+                return GroupResult(
+                    {
+                        i: (
+                            req.terms[i].loss(
+                                values[req.predictions.plan.terms[i].output], req.labels
+                            )
+                            * req.terms[i].weights
+                        ).sum()
+                        for i in group
+                    }
+                )
+
+            for chunk in (0, 1, 3):
+                for groups in (((0, 1),), ()):
+                    with self.subTest(chunk=chunk, groups=groups):
+                        calls.clear()
+                        actual = run(
+                            replace(p, plan=replace(p.plan, joint_groups=groups)),
+                            fused=True,
+                            chunk=chunk,
+                        )
+                        gradients = torch.autograd.grad(actual.loss, parameters)
+                        torch.testing.assert_close(actual.loss, expected)
+                        torch.testing.assert_close(gradients, expected_grad)
+                        self.assertEqual(bool(calls), bool(groups))
+            with self.assertRaisesRegex(ValueError, "Independent term reductions"):
+                run(p, reduction="tokens")
+
+    def test_projection_execution_constraints(self):
+        head = nn.Linear(4, 9)
+        for options, expected_calls in (
+            ({"chunk_safe": False}, [4]),
+            ({"recompute_safe": False}, [1, 1, 1, 1]),
+        ):
+            with self.subTest(options=options):
+                project = Mock(side_effect=lambda x: {"logits": head(x)})
+                p = Predictions(
+                    hidden=torch.randn(4, 1, 4, requires_grad=True),
+                    projection=Projection(project, **options),
+                    labels=torch.zeros(4, 1, dtype=torch.long),
+                    positions=torch.zeros(4, 1, dtype=torch.long),
+                    mask=torch.ones(4, 1),
+                )
+                run(p, chunk=1).loss.backward()
+                self.assertEqual(
+                    [call.args[0].shape[0] for call in project.call_args_list],
+                    expected_calls,
+                )
+
+                project.reset_mock()
+                p = replace(
+                    p,
+                    chain_ids=torch.arange(4)[:, None],
+                    sequence_ids=torch.zeros(4, 1, dtype=torch.long),
+                )
+                result = execute_batch(
+                    PredictionBatch((p,)),
+                    TokenLoss(kind="ce"),
+                    PositionWeighting(kind="dpace"),
+                    training=True,
+                    execution=LossExecution(chunk_size=1),
+                )
+                result.loss.backward()
+                self.assertEqual(
+                    [call.args[0].shape[0] for call in project.call_args_list], [4]
+                )
+
+    def test_invalid_groups_and_kernel_errors(self):
+        for groups in (((0, 0),), ((0, 2),), ((0, 1), (1, 0))):
+            with self.subTest(groups=groups), self.assertRaises(ValueError):
+                LossPlan((LossTerm(), LossTerm()), groups)
+        hidden = torch.randn(2, 1, 4, requires_grad=True)
+        p = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            mask=torch.ones(2, 1),
+            labels=torch.zeros(2, 1, dtype=torch.long),
+            positions=torch.zeros(2, 1, dtype=torch.long),
+        )
+        with patch.dict(_IMPLEMENTATIONS, clear=True):
+
+            @register_implementation("broken", supports=lambda req, group: None)
+            def broken(req, group):
+                raise RuntimeError("kernel failed")
+
+            with self.assertRaisesRegex(RuntimeError, "kernel failed"):
+                run(p, fused=True)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_linear_ce_avoids_projection_and_preserves_gradients(self):
+        if _linear_kernel() is None:
+            self.skipTest("Liger linear CE with predicted tokens is unavailable")
+        for dtype in (torch.float32, torch.bfloat16):
+            torch.manual_seed(9)
+            head = nn.Linear(32, 97, device="cuda", dtype=dtype)
+            hidden = torch.randn(
+                7, 1, 32, device="cuda", dtype=dtype, requires_grad=True
+            )
+            project = Mock(side_effect=lambda x: {"logits": head(x)})
+            labels = torch.randint(97, (7, 1), device="cuda")
+            p = Predictions(
+                hidden=hidden,
+                projection=LinearProjection(project, head),
+                labels=labels,
+                positions=torch.zeros_like(labels),
+                mask=torch.tensor([1, 0.5, 0, 1, 0.2, 1, 0], device="cuda")[:, None],
+            )
+            parameters = (hidden, *head.parameters())
+            expected = run(p, chunk=2)
+            gradients = torch.autograd.grad(expected.loss, parameters)
+            project.reset_mock()
+            entry = _IMPLEMENTATIONS["linear_ce"]
+            optimized = Mock(wraps=entry.compute)
+            with patch.dict(
+                _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
+            ):
+                actual = run(p, fused=True, chunk=2)
+                actual_grad = torch.autograd.grad(actual.loss, parameters)
+            self.assertGreater(optimized.call_count, 0)
+            project.assert_not_called()
+            tolerance = 0.02 if dtype == torch.bfloat16 else 3e-4
+            torch.testing.assert_close(
+                actual.loss, expected.loss, rtol=tolerance, atol=2e-5
+            )
+            torch.testing.assert_close(
+                actual_grad, gradients, rtol=tolerance, atol=tolerance * 0.02
+            )
+            torch.testing.assert_close(actual.ratios, expected.ratios)
+            with patch(
+                "specforge.algorithms.objectives.implementations._linear_kernel",
+                return_value=None,
+            ):
+                fallback = run(p, fused=True)
+            self.assertGreater(project.call_count, 0)
+            torch.testing.assert_close(
+                fallback.loss, expected.loss, rtol=tolerance, atol=2e-5
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_corrected_ce_with_an_independent_term(self):
+        config, runtime = build_runtime("DominoDraftModel", options={"num_anchors": 3})
+        runtime.cuda()
+        for name in config.target_bindings:
+            module = runtime.draft_model.get_submodule(name)
+            module.load_target_weight(torch.randn_like(module.weight))
+        batch = {key: value.cuda() for key, value in training_batch(config).items()}
+        torch.manual_seed(21)
+        p = next(
+            iter(runtime.objective(runtime, batch, step=1, total_steps=10).predictions)
+        )
+        # A synthetic extension, not an additional Domino training objective.
+        extra = LossTerm(
+            "base_logits", 0.2, mask=p.mask * 0.5, denominator=p.mask.new_tensor(7.0)
+        )
+        p = replace(p, plan=replace(p.plan, terms=p.plan.terms + (extra,)))
+        parameters = tuple(v for v in runtime.parameters() if v.requires_grad)
+        expected = run(p, chunk=1)
+        gradients = torch.autograd.grad(
+            expected.loss, parameters, retain_graph=True, allow_unused=True
+        )
+        for groups in (p.plan.joint_groups, ()):
+            entry = _IMPLEMENTATIONS["corrected_ce"]
+            optimized = Mock(wraps=entry.compute)
+            with patch.dict(
+                _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
+            ):
+                actual = run(
+                    replace(p, plan=replace(p.plan, joint_groups=groups)),
+                    fused=True,
+                    chunk=1,
+                )
+                actual_grad = torch.autograd.grad(
+                    actual.loss, parameters, retain_graph=True, allow_unused=True
+                )
+            self.assertEqual(bool(optimized.call_count), bool(groups))
+            torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
+            torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
+            torch.testing.assert_close(actual.ratios, expected.ratios)
