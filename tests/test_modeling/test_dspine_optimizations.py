@@ -25,7 +25,7 @@ class DSpineRefinementLossTest(unittest.TestCase):
         hidden = torch.zeros_like(refined)
         hidden[..., :3] = hidden.new_tensor([3, 2, 1])
         with patch.object(self.model.draft_model, "refine", return_value=refined):
-            return self.model._objective_terms(
+            terms = self.model._objective_terms(
                 hidden,
                 refined,
                 refined.new_ones(1, 3, 3, 8),
@@ -34,7 +34,9 @@ class DSpineRefinementLossTest(unittest.TestCase):
                 teacher,
                 weights,
                 weights > 0,
-            )[2]
+            )
+            alpha = self.model.dspine_config.ce_weight
+            return alpha * terms[2] + (1 - alpha) * terms[4]
 
     def test_identical_candidate_logits_have_zero_l1_and_gradient(self):
         devices = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
@@ -162,7 +164,7 @@ class DSpineOptimizationsTest(unittest.TestCase):
                             weights,
                             supervised,
                         )
-                        loss, correct = terms[0] + terms[1], terms[4]
+                        loss, correct = terms[0] + terms[1], terms[7]
                         if identical_teacher:
                             # Equal distributions use the zero subgradient of abs.
                             torch.testing.assert_close(

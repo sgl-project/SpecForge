@@ -1,0 +1,73 @@
+# Four trainer ranks; Mooncake and the capture server are managed externally.
+# Give the trainers GPUs that do not overlap the capture server's allocation.
+# Patched SGLang must use the dspark capture method with auxiliary layers
+# 1,9,17,25,33 and retain the final target hidden state required by DSpine.
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-dspine.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  trust_remote_code: true
+  mask_token_id: 151669
+
+data:
+  train_data_path: ./cache/dataset/sharegpt_train.jsonl
+  max_length: 3072
+  chat_template: qwen
+  build_dataset_num_proc: 32
+  cache_dir: ./cache/qwen3-8b-dspine
+
+training:
+  strategy: dspine
+  num_epochs: 6
+  # Leave max_steps and total_steps unset: the finite online prompt plan
+  # determines the optimizer horizon from the data and trainer topology.
+  # Global batch = 4 ranks x 2 sequences x 4 accumulation steps = 32.
+  batch_size: 2
+  accumulation_steps: 4
+  fsdp_sharding: NO_SHARD
+  learning_rate: 6.0e-4
+  lr_scheduler: cosine
+  # Also controls the alignment-loss ramp when alignment_warmup_steps is null.
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 16
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+runtime:
+  producer_lease: 16
+  producer_concurrency: 2
+  in_flight_high_watermark: 96
+  in_flight_low_watermark: 64
+
+tracking:
+  report_to: wandb
+  wandb_project: specforge-qwen3-8b-dspine
+  wandb_name: qwen3-8b-dspine-online
+  wandb_dir: ./outputs/qwen3-8b-dspine-online/wandb
+
+run_id: qwen3-8b-dspine-online
+output_dir: ./outputs/qwen3-8b-dspine-online
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 4
+  disaggregated:
+    control_dir: outputs/qwen3-8b-dspine-online/control
+    consumer_state_dir: outputs/qwen3-8b-dspine-online/consumer-state
+    backend: mooncake
+    client_buffer_size: 1073741824
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp

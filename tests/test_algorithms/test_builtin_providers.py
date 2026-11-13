@@ -39,6 +39,52 @@ class BuiltinProviderContractTest(unittest.TestCase):
         self.assertEqual(BUILTINS, self.registry.names)
         self.assertIsNot(builtin_algorithm_registry(), self.registry)
 
+    def test_dspine_builder_passes_lr_warmup_to_the_training_model(self):
+        from unittest import mock
+
+        import torch
+        from torch import nn
+
+        from specforge.config import Config
+        from tests.test_modeling.test_dspine import initialized_model
+
+        config = Config(
+            model={"target_model_path": "unused", "torch_dtype": "float32"},
+            data={"hidden_states_path": "unused"},
+            training={
+                "strategy": "dspine",
+                "warmup_ratio": 0.2,
+                "fused_logits_loss": False,
+            },
+        )
+        draft, head_weight = initialized_model()
+        self.assertIsNone(draft.dspine_config.alignment_warmup_steps)
+        head = nn.Linear(16, 32, bias=False)
+        with torch.no_grad():
+            head.weight.copy_(head_weight)
+        target = SimpleNamespace(lm_head=head, embed_tokens=nn.Embedding(32, 16))
+        provider = self.registry.resolve("dspine").providers.model
+        with (
+            mock.patch(
+                "specforge.algorithms.model_providers._device",
+                return_value=torch.device("cpu"),
+            ),
+            mock.patch(
+                "specforge.modeling.target.target_utils.TargetEmbeddingsAndHead.from_pretrained",
+                return_value=target,
+            ),
+        ):
+            parts = provider.build_training_model(
+                config, draft, draft.config, None, None
+            )
+
+        self.assertEqual(parts.model.warmup_ratio, config.training.warmup_ratio)
+        self.assertFalse(parts.model.fused_logits_loss)
+        beta, _ = parts.model.dspine_config.schedule(
+            100, 1000, parts.model.warmup_ratio
+        )
+        self.assertEqual(beta, 0.25)
+
     def test_every_registration_pairs_contract_and_providers(self):
         for registration in self.registry:
             with self.subTest(algorithm=registration.name):
