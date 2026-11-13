@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from transformers import Qwen3Config
 
+from specforge.algorithms.objectives.moe_balance import BALANCING_OPTIONS
 from specforge.application.composition import build_application_run, resolve_run
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
@@ -104,7 +105,7 @@ def moe_draft_config(intermediate_size=16):
     )
 
 
-def moe_run_config(target, draft, kernel):
+def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
     return run_config(
         target,
         draft,
@@ -119,7 +120,10 @@ def moe_run_config(target, draft, kernel):
             "total_steps": 2,
             "save_interval": 1,
             "log_interval": 1,
-            "objective_options": {"num_anchors": 2},
+            "objective_options": {
+                "num_anchors": 2,
+                "bias_update_rate": bias_update_rate,
+            },
         },
     )
 
@@ -533,19 +537,25 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
 
-    def _train_and_resume_moe(self, root, kernel):
+    def _train_and_resume_moe(self, root, kernel, bias_update_rate=0.0):
         self._init_group(root)
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel)
+        cfg = moe_run_config(target, draft, kernel, bias_update_rate)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
         (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
         bias = layer.gate.expert_bias
         self.assertEqual(bias.dtype, torch.float32)
-        self.assertEqual(torch.count_nonzero(bias).item(), 0)
+        if bias_update_rate:
+            # One zero-mean sign step moved and saved the bias (at most 1.5 x rate).
+            self.assertGreater(torch.count_nonzero(bias).item(), 0)
+            self.assertLessEqual(bias.abs().max().item(), 1.5 * bias_update_rate + 1e-9)
+            torch.testing.assert_close(bias.sum(), torch.zeros(()), atol=1e-6, rtol=0)
+        else:
+            self.assertEqual(torch.count_nonzero(bias).item(), 0)
         before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
         raw = cfg.model_dump()
         raw.update(draft=None, resume=str(checkpoint))
@@ -563,16 +573,29 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertFalse(torch.equal(before[name], trained[name]), name)
             self.assertTrue(torch.isfinite(trained[name]).all(), name)
         bias_key = next(key for key in trained if key.endswith("gate.expert_bias"))
-        self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
+        if bias_update_rate:
+            # The resumed step moved the restored bias again.
+            self.assertFalse(torch.equal(before[bias_key], trained[bias_key]))
+            self.assertEqual(trained[bias_key].dtype, torch.float32)
+        else:
+            self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
         # The kernel is part of the resume contract, like the Liger choice.
         other = next(name for name in EXPERT_KERNELS if name != kernel)
         raw["model"]["moe_experts_kernel"] = other
         raw["training"]["max_steps"] = 3
         with self.assertRaisesRegex(ValueError, "canonical_moe_experts_kernel"):
             build_application_run(Config.model_validate(raw)).run()
+        # Balancing joins the contract only while on; switching it either way is a change.
+        raw["model"]["moe_experts_kernel"] = kernel
+        raw["training"]["objective_options"]["bias_update_rate"] = (
+            0.0 if bias_update_rate else 0.001
+        )
+        with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+            build_application_run(Config.model_validate(raw)).run()
 
-    def test_dense_drafts_record_no_expert_kernel_and_resume_with_either_name(self):
-        """Dense drafts write the contract pre-MoE runs wrote, so their checkpoints still resume."""
+    @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
+    def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
+        """A dense run's contract is what pre-MoE runs wrote, whatever kernel or off balancing it names."""
         with TemporaryDirectory() as temp:
             root = Path(temp)
             self._init_group(root)
@@ -598,10 +621,14 @@ class CanonicalTrainingTest(unittest.TestCase):
                 checkpoint / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertNotIn("canonical_moe_experts_kernel", state)
+            self.assertTrue(
+                set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
+            )
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(checkpoint))
             raw["model"]["moe_experts_kernel"] = "loop"
             raw["training"]["max_steps"] = 2
+            raw["training"]["objective_options"]["bias_update_rate"] = 0.0
             build_application_run(Config.model_validate(raw)).run()
             final = torch.load(
                 root / "output" / "specforge-run-step2" / "training_state.pt",
@@ -613,9 +640,13 @@ class CanonicalTrainingTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
+        # grouped_mm also balances: the bias moves, is saved and moves again after resume.
+        balancing = {"grouped_mm": dict(bias_update_rate=0.001)}
         for kernel in sorted(EXPERT_KERNELS):
             with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
-                self._train_and_resume_moe(Path(temp), kernel)
+                self._train_and_resume_moe(
+                    Path(temp), kernel, **balancing.get(kernel, {})
+                )
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model

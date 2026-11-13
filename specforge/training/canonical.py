@@ -672,10 +672,14 @@ def build_bundle(cfg, algorithm):
         )
     )
     runtime.fsdp_param_dtype = dtype
+    options = asdict(runtime.objective)
+    if runtime.statistics is not None:
+        # Statistics settings join the contract only while on; earlier runs wrote none.
+        options.update(runtime.statistics.settings)
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
-        "canonical_objective_options": asdict(runtime.objective),
+        "canonical_objective_options": options,
         "canonical_use_liger_kernel": use_liger,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": asdict(runtime.token_loss),
