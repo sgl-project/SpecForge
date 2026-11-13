@@ -9,9 +9,9 @@ from specforge.config.draft.codec.components import decode_component, encode_com
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import (
     DenseFFNSpec,
+    MoEExpertSpec,
     MoEFFNSpec,
     MoERouterSpec,
-    MoESharedExpertSpec,
 )
 from specforge.config.draft.registry import component_schema
 from tests.test_config.draft_fixtures import draft_config
@@ -26,8 +26,7 @@ MOE = {
     "type": "moe",
     "num_experts": 8,
     "num_experts_per_tok": 1,
-    "intermediate_size": 96,
-    "hidden_act": "silu",
+    "experts": {"intermediate_size": 96, "hidden_act": "silu", "gated": True},
     "shared_expert": None,
     "shared_expert_gate": False,
     "router": ROUTER,
@@ -43,7 +42,10 @@ def moe_fields():
 
 def moe_spec(**overrides):
     router = MoERouterSpec(**{**ROUTER, **overrides.pop("router", {})})
-    return MoEFFNSpec(**{**moe_fields(), "router": router, **overrides})
+    experts = MoEExpertSpec(**{**MOE["experts"], **overrides.pop("experts", {})})
+    return MoEFFNSpec(
+        **{**moe_fields(), "experts": experts, "router": router, **overrides}
+    )
 
 
 def moe_draft_config(**overrides):
@@ -78,8 +80,8 @@ class MoESpecTest(unittest.TestCase):
             ({"num_experts_per_tok": 9}, "exceeds num_experts"),
             ({"num_experts": 0}, "num_experts must be a positive integer"),
             ({"num_experts_per_tok": True}, "num_experts_per_tok"),
-            ({"intermediate_size": -1}, "intermediate_size"),
-            ({"hidden_act": "gelu_new"}, "hidden_act"),
+            ({"experts": {"intermediate_size": -1}}, "intermediate_size"),
+            ({"experts": {"hidden_act": "gelu_new"}}, "hidden_act"),
             ({"shared_expert_gate": True}, "requires a shared expert"),
             ({"router": {"scoring": "relu"}}, "scoring"),
             ({"router": {"route_scale": 0}}, "route_scale"),
@@ -91,18 +93,28 @@ class MoESpecTest(unittest.TestCase):
                     moe_spec(**changes)
         for changes, message in (
             ({"intermediate_size": 0}, "intermediate_size"),
-            ({"hidden_act": "gelu_new"}, "shared expert hidden_act"),
+            ({"hidden_act": "gelu_new"}, "expert hidden_act"),
             ({"gated": 1}, "gated"),
         ):
             with self.subTest(shared_expert=changes):
                 with self.assertRaisesRegex(ValueError, message):
-                    MoESharedExpertSpec(**{**GATED, **changes})
+                    MoEExpertSpec(**{**GATED, **changes})
         for router in (None, ROUTER):
             with self.subTest(router=router):
                 with self.assertRaisesRegex(TypeError, "router"):
-                    MoEFFNSpec(**{**moe_fields(), "router": router})
+                    MoEFFNSpec(
+                        **{
+                            **moe_fields(),
+                            "experts": MoEExpertSpec(**MOE["experts"]),
+                            "router": router,
+                        }
+                    )
         with self.assertRaisesRegex(TypeError, "shared_expert"):
             moe_spec(shared_expert=GATED)
+        with self.assertRaisesRegex(TypeError, "experts"):
+            MoEFFNSpec(
+                **{**moe_fields(), "experts": GATED, "router": MoERouterSpec(**ROUTER)}
+            )
 
     def test_component_codec_round_trips_and_stays_strict(self):
         qwen = {
@@ -121,10 +133,11 @@ class MoESpecTest(unittest.TestCase):
             with self.subTest(shared_expert=payload["shared_expert"]):
                 node = decode_component("mlp", payload)
                 self.assertIsInstance(node, MoEFFNSpec)
+                self.assertEqual(node.experts, MoEExpertSpec(**payload["experts"]))
                 if payload["shared_expert"] is not None:
                     self.assertEqual(
                         node.shared_expert,
-                        MoESharedExpertSpec(**payload["shared_expert"]),
+                        MoEExpertSpec(**payload["shared_expert"]),
                     )
                 self.assertEqual(encode_component("mlp", node), payload)
                 restored = decode_component("mlp", json.loads(json.dumps(payload)))
@@ -135,6 +148,7 @@ class MoESpecTest(unittest.TestCase):
             ({**MOE, "router": {**ROUTER, "top_k": 1}}, "router: unknown fields"),
             ({k: v for k, v in MOE.items() if k != "router"}, "missing fields"),
             ({**MOE, "router": {**ROUTER, "route_scale": "1"}}, "expected a number"),
+            ({**MOE, "experts": {"intermediate_size": 96}}, "experts: missing"),
             ({**MOE, "shared_expert": {"intermediate_size": 48}}, "shared_expert"),
             (
                 {**MOE, "shared_expert": {**GATED, "gated": "yes"}},

@@ -9,7 +9,7 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 
 from specforge.config.draft._validation import positive_int
-from specforge.config.draft.mlp import MoESharedExpertSpec
+from specforge.config.draft.mlp import MoEExpertSpec
 
 # Routed-expert kernels over one parameter layout, picked by name once at startup.
 EXPERT_KERNELS: dict[str, Callable[..., Tensor]] = {}
@@ -73,23 +73,24 @@ class RoutedExperts(nn.Module):
 
     def __init__(
         self,
+        config: MoEExpertSpec,
         *,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        for name, value in (
-            ("num_experts", num_experts),
-            ("hidden_size", hidden_size),
-            ("intermediate_size", intermediate_size),
-        ):
-            positive_int(name, value)
+        if type(config) is not MoEExpertSpec:
+            raise TypeError("RoutedExperts requires MoEExpertSpec")
+        if not config.gated:
+            raise ValueError("routed experts support gated FFNs only")
+        positive_int("num_experts", num_experts)
+        positive_int("hidden_size", hidden_size)
+        self.config = config
         self.num_experts = num_experts
-        self.act_fn = ACT2FN[hidden_act]
+        self.act_fn = ACT2FN[config.hidden_act]
+        intermediate_size = config.intermediate_size
         self.gate_up_proj = nn.Parameter(
             torch.empty(
                 num_experts,
@@ -162,15 +163,15 @@ class SharedExpert(nn.Module):
 
     def __init__(
         self,
-        config: MoESharedExpertSpec,
+        config: MoEExpertSpec,
         *,
         hidden_size: int,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        if type(config) is not MoESharedExpertSpec:
-            raise TypeError("SharedExpert requires MoESharedExpertSpec")
+        if type(config) is not MoEExpertSpec:
+            raise TypeError("SharedExpert requires MoEExpertSpec")
         positive_int("hidden_size", hidden_size)
         self.config = config
         # Set by configure_kernels; fuses act(gate)·up, so the gated branch only.

@@ -58,7 +58,7 @@ class TestFFN(nn.Module):
 
 class ComponentLayoutTest(unittest.TestCase):
     def test_join_and_split_are_exact_inverses(self):
-        config = moe_spec(num_experts=3, intermediate_size=5)
+        config = moe_spec(num_experts=3, experts={"intermediate_size": 5})
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 parts = expert_tensors(3, 8, 5, dtype)
@@ -75,14 +75,14 @@ class ComponentLayoutTest(unittest.TestCase):
                 for name, tensor in fused.items():
                     self.assertTrue(torch.equal(rejoined[name], tensor), name)
         self.assertEqual(
-            EXPERTS.part_names(moe_spec(num_experts=2, intermediate_size=5))[
-                "experts.down_proj"
-            ],
+            EXPERTS.part_names(
+                moe_spec(num_experts=2, experts={"intermediate_size": 5})
+            )["experts.down_proj"],
             (("experts.0.down_proj.weight",), ("experts.1.down_proj.weight",)),
         )
 
     def test_incomplete_or_mismatched_tensors_are_rejected(self):
-        config = moe_spec(num_experts=2, intermediate_size=5)
+        config = moe_spec(num_experts=2, experts={"intermediate_size": 5})
         parts = expert_tensors(2, 8, 5)
         with self.assertRaisesRegex(ValueError, "missing checkpoint tensors"):
             join(

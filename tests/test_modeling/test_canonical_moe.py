@@ -14,22 +14,20 @@ import torch
 
 from specforge.checkpoint import save_draft
 from specforge.config.draft.layer import LayerSpec
-from specforge.config.draft.mlp import DenseFFNSpec, MoESharedExpertSpec
+from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.export.to_hf import export_to_hf
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.modeling.draft.models import DSparkDraftModel
 from tests.test_modeling.test_canonical_dspark import model_config, model_inputs
-from tests.test_modeling.test_draft_moe_ffn import moe_spec, router_spec
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 
 def moe_model_config():
     """A dense layer followed by a MoE layer, as drafts of DeepSeek-style targets."""
     node = moe_spec(
-        intermediate_size=16,
-        shared_expert=MoESharedExpertSpec(
-            intermediate_size=16, hidden_act="silu", gated=True
-        ),
+        experts=expert_spec(16),
+        shared_expert=expert_spec(16),
         shared_expert_gate=True,
         router=router_spec(expert_bias=True),
     )

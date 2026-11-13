@@ -18,9 +18,9 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 
 from specforge.config.draft.mlp import (
     DenseFFNSpec,
+    MoEExpertSpec,
     MoEFFNSpec,
     MoERouterSpec,
-    MoESharedExpertSpec,
 )
 from specforge.modeling.draft.layers import build_component, component_layout
 from specforge.modeling.draft.layers.kernels import configure_kernels
@@ -51,12 +51,17 @@ def router_spec(**overrides):
     return MoERouterSpec(**{**values, **overrides})
 
 
+def expert_spec(intermediate_size=32, hidden_act="silu", gated=True):
+    return MoEExpertSpec(
+        intermediate_size=intermediate_size, hidden_act=hidden_act, gated=gated
+    )
+
+
 def moe_spec(**overrides):
     values = {
         "num_experts": 4,
         "num_experts_per_tok": 2,
-        "intermediate_size": 32,
-        "hidden_act": "silu",
+        "experts": expert_spec(),
         "shared_expert": None,
         "shared_expert_gate": False,
         "router": router_spec(),
@@ -67,9 +72,7 @@ def moe_spec(**overrides):
 def qwen_spec(**overrides):
     """Qwen3.5-MoE's block: renormalized softmax top-k, a sigmoid-gated shared expert."""
     return moe_spec(
-        shared_expert=MoESharedExpertSpec(
-            intermediate_size=32, hidden_act="silu", gated=True
-        ),
+        shared_expert=expert_spec(),
         shared_expert_gate=True,
         **overrides,
     )
@@ -153,10 +156,9 @@ class MoEFFNTest(unittest.TestCase):
 
     def _assert_kernels_agree(self, device, dtype):
         experts = RoutedExperts(
+            expert_spec(intermediate_size=16),
             num_experts=3,
             hidden_size=H,
-            intermediate_size=16,
-            hidden_act="silu",
             device=device,
             dtype=dtype,
         )
@@ -253,10 +255,8 @@ class MoEFFNTest(unittest.TestCase):
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
     def test_shared_expert_settings_match_transformers(self):
-        gated = MoESharedExpertSpec(intermediate_size=48, hidden_act="silu", gated=True)
-        relu2 = MoESharedExpertSpec(
-            intermediate_size=48, hidden_act="relu2", gated=False
-        )
+        gated = expert_spec(48)
+        relu2 = expert_spec(48, "relu2", gated=False)
         deepseek = DeepseekV3Config(
             hidden_size=H,
             hidden_act="silu",
@@ -302,9 +302,7 @@ class MoEFFNTest(unittest.TestCase):
             return F.silu(gate) * up
 
         def shared(hidden_act, gated):
-            spec = MoESharedExpertSpec(
-                intermediate_size=48, hidden_act=hidden_act, gated=gated
-            )
+            spec = expert_spec(48, hidden_act, gated)
             return SharedExpert(spec, hidden_size=H, device="cuda")
 
         model = torch.nn.ModuleDict(
@@ -357,7 +355,7 @@ class MoEFFNTest(unittest.TestCase):
         ):
             with self.subTest(dtype=dtype, widths=(hidden_size, intermediate_size)):
                 misaligned = MoEFFN(
-                    moe_spec(intermediate_size=intermediate_size),
+                    moe_spec(experts=expert_spec(intermediate_size)),
                     hidden_size=hidden_size,
                     dtype=dtype,
                 )
@@ -427,6 +425,8 @@ class MoEFFNTest(unittest.TestCase):
                 )
             with self.assertRaises(TypeError):
                 TopKRouter({}, num_experts=4, hidden_size=H, top_k=2)
+            with self.assertRaisesRegex(ValueError, "gated"):
+                RoutedExperts(expert_spec(gated=False), num_experts=2, hidden_size=H)
             for width in (0, True, 1.5):
                 with self.assertRaises(ValueError):
                     MoEFFN(moe_spec(), hidden_size=width)

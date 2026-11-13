@@ -238,9 +238,10 @@ device. Startup probes the chosen kernel on every MoE layer and fails rather
 than falling back; the choice is recorded in the training resume contract.
 
 A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
-holds the expert count, top-k, per-expert `intermediate_size`, an optional
-`shared_expert` (gated as in Qwen and DeepSeek, or a non-gated `relu2` MLP) with
-an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
+holds the expert count, top-k, an `experts` sub-node (per-expert
+`intermediate_size`, `hidden_act`, `gated`), an optional `shared_expert` sub-node
+of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
+MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
 `sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
 that shifts the choice only. Experts are stored fused (`experts.gate_up_proj`,
 `experts.down_proj`) and export under Transformers' per-expert tensor names.

@@ -9,8 +9,8 @@ from .dense import SUPPORTED_ACTIVATIONS
 
 # Router affinity functions. softmax is Qwen3.5-MoE; sigmoid is DeepSeek-V3/V4.
 ROUTER_SCORINGS = frozenset({"softmax", "sigmoid"})
-# Shared-expert activations: the dense set plus relu2 for Nemotron's non-gated MLP.
-SHARED_EXPERT_ACTIVATIONS = SUPPORTED_ACTIVATIONS | {"relu2"}
+# Expert activations: the dense set plus relu2 for Nemotron's non-gated MLP.
+EXPERT_ACTIVATIONS = SUPPORTED_ACTIVATIONS | {"relu2"}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -38,9 +38,10 @@ class MoERouterSpec:
 
 
 @dataclass(frozen=True, kw_only=True)
-class MoESharedExpertSpec:
-    """One always-on FFN of width `intermediate_size` (DeepSeek merges n shared into n×I).
-    `gated` is act(gate_proj)·up_proj as Qwen/DeepSeek, else act(up_proj) as Nemotron relu2.
+class MoEExpertSpec:
+    """One expert FFN of width `intermediate_size`; `gated` is act(gate_proj)·up_proj as in
+    Qwen and DeepSeek, else act(up_proj) as in Nemotron's relu2 MLP. The routed experts
+    and the shared expert use it alike (DeepSeek merges n shared experts into n×I).
     """
 
     intermediate_size: int
@@ -50,17 +51,17 @@ class MoESharedExpertSpec:
     def __post_init__(self):
         positive_int("intermediate_size", self.intermediate_size)
         nonempty_string("hidden_act", self.hidden_act)
-        if self.hidden_act not in SHARED_EXPERT_ACTIVATIONS:
+        if self.hidden_act not in EXPERT_ACTIVATIONS:
             raise ValueError(
-                f"unsupported shared expert hidden_act {self.hidden_act!r}; "
-                f"supported: {sorted(SHARED_EXPERT_ACTIVATIONS)}"
+                f"unsupported expert hidden_act {self.hidden_act!r}; "
+                f"supported: {sorted(EXPERT_ACTIVATIONS)}"
             )
         boolean("gated", self.gated)
 
 
 @dataclass(frozen=True, kw_only=True)
 class MoEFFNSpec(FFNSpec):
-    """Routed gated experts of per-expert width `intermediate_size`, plus an optional
+    """`num_experts_per_tok` of `num_experts` routed `experts` per token, plus an optional
     `shared_expert` whose output a sigmoid gate scales when `shared_expert_gate` (Qwen).
     """
 
@@ -68,9 +69,8 @@ class MoEFFNSpec(FFNSpec):
 
     num_experts: int
     num_experts_per_tok: int
-    intermediate_size: int
-    hidden_act: str
-    shared_expert: MoESharedExpertSpec | None
+    experts: MoEExpertSpec
+    shared_expert: MoEExpertSpec | None
     shared_expert_gate: bool
     router: MoERouterSpec
 
@@ -82,17 +82,12 @@ class MoEFFNSpec(FFNSpec):
                 f"num_experts_per_tok {self.num_experts_per_tok} exceeds "
                 f"num_experts {self.num_experts}"
             )
-        positive_int("intermediate_size", self.intermediate_size)
-        nonempty_string("hidden_act", self.hidden_act)
-        if self.hidden_act not in SUPPORTED_ACTIVATIONS:
-            raise ValueError(
-                f"unsupported moe hidden_act {self.hidden_act!r}; "
-                f"supported: {sorted(SUPPORTED_ACTIVATIONS)}"
-            )
+        if not isinstance(self.experts, MoEExpertSpec):
+            raise TypeError("experts must be MoEExpertSpec")
         if self.shared_expert is not None and not isinstance(
-            self.shared_expert, MoESharedExpertSpec
+            self.shared_expert, MoEExpertSpec
         ):
-            raise TypeError("shared_expert must be MoESharedExpertSpec or None")
+            raise TypeError("shared_expert must be MoEExpertSpec or None")
         boolean("shared_expert_gate", self.shared_expert_gate)
         if self.shared_expert_gate and self.shared_expert is None:
             raise ValueError("shared_expert_gate requires a shared expert")

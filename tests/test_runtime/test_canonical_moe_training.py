@@ -9,21 +9,19 @@ import torch
 from specforge.application.composition import build_application_run
 from specforge.config import Config
 from specforge.config.draft.layer import LayerSpec
-from specforge.config.draft.mlp import DenseFFNSpec, MoESharedExpertSpec
+from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.loading import load_draft
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_modeling.test_draft_moe_ffn import moe_spec, router_spec
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 from tests.test_runtime.test_canonical_training import run_config, target_directory
 
 
 def moe_draft_config(intermediate_size=16):
     node = moe_spec(
-        intermediate_size=intermediate_size,
-        shared_expert=MoESharedExpertSpec(
-            intermediate_size=16, hidden_act="silu", gated=True
-        ),
+        experts=expert_spec(intermediate_size),
+        shared_expert=expert_spec(16),
         shared_expert_gate=True,
         router=router_spec(expert_bias=True),
     )

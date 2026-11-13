@@ -2,12 +2,12 @@
 
 from .base import FFNSpec
 from .dense import DenseFFNSpec
-from .moe import MoEFFNSpec, MoERouterSpec, MoESharedExpertSpec
+from .moe import MoEExpertSpec, MoEFFNSpec, MoERouterSpec
 
 __all__ = [
     "FFNSpec",
     "DenseFFNSpec",
+    "MoEExpertSpec",
     "MoEFFNSpec",
     "MoERouterSpec",
-    "MoESharedExpertSpec",
 ]

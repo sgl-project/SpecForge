@@ -48,10 +48,9 @@ class MoEFFN(nn.Module):
             dtype=dtype,
         )
         self.experts = RoutedExperts(
+            config.experts,
             num_experts=config.num_experts,
             hidden_size=hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
             device=device,
             dtype=dtype,
         )

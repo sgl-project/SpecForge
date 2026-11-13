@@ -34,7 +34,7 @@ def configure_kernels(model, *, use_liger=False, moe_experts_kernel="grouped_mm"
             raise ValueError(
                 f"moe_experts_kernel {moe_experts_kernel!r} cannot run a MoE layer "
                 f"(hidden_size {weight.shape[-1]}, intermediate_size "
-                f"{module.config.intermediate_size}, {weight.dtype} on "
+                f"{module.config.experts.intermediate_size}, {weight.dtype} on "
                 f"{weight.device.type}): {error}{hint}"
             ) from error
         module.experts_kernel = moe_experts_kernel
