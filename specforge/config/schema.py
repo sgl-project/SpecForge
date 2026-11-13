@@ -1584,7 +1584,9 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         # null clears a section, e.g. a recipe's initialization when resuming
         if untyped or (
             structured
-            and (value.lstrip().startswith(("[", "{")) or value.strip() in ("null", "~"))
+            and (
+                value.lstrip().startswith(("[", "{")) or value.strip() in ("null", "~")
+            )
         ):
             try:
                 value = yaml.safe_load(value)

@@ -71,7 +71,10 @@ class RetiredExportTest(unittest.TestCase):
                 ),
                 canonical,
             )
-            for initialization in ({}, {"weights_from": {"checkpoint": str(canonical)}}):
+            for initialization in (
+                {},
+                {"weights_from": {"checkpoint": str(canonical)}},
+            ):
                 with self.subTest(initialization=initialization):
                     cfg = Config.model_validate(
                         dict(

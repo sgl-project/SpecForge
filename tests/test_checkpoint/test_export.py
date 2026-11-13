@@ -20,8 +20,8 @@ from tests.test_modeling.test_canonical_dflash import inputs_for
 
 class CanonicalExportTest(unittest.TestCase):
     def test_run_paths_agree_for_loading_export_and_initialization(self):
-        from specforge.export.canonical import read_export
         from specforge.application.composition import resolve_run
+        from specforge.export.canonical import read_export
         from specforge.training.canonical import resolve_config
         from specforge.training.checkpoint import CheckpointManager
         from tests.test_runtime.test_canonical_training import (
