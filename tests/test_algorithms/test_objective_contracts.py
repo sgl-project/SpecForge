@@ -9,13 +9,13 @@ from torch import nn
 
 from specforge.algorithms.objectives import build_objective_model
 from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
-from specforge.algorithms.objectives.dflash2 import DFlash2Objective
-from specforge.algorithms.objectives.dspark import DSparkObjective
 from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.predictions import Predictions
 from specforge.algorithms.objectives.projection import Projection
+from specforge.algorithms.objectives.protocols.dflash2 import DFlash2Objective
+from specforge.algorithms.objectives.protocols.dspark import DSparkObjective
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import (
     capture_projections,
@@ -154,7 +154,8 @@ class ObjectiveContractTest(unittest.TestCase):
             return blocks
 
         with patch(
-            "specforge.algorithms.objectives.dspark.prepare_blocks", side_effect=prepare
+            "specforge.algorithms.objectives.protocols.dspark.prepare_blocks",
+            side_effect=prepare,
         ):
             result = runtime(batch, step=0, total_steps=None)
         self.assertEqual(captured[0].weights.flatten().tolist(), [1.0, 0.0, 0.0, 0.0])

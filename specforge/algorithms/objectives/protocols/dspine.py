@@ -7,12 +7,12 @@ import torch.nn.functional as F
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
-from .base import check_options
-from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
-from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import TrainingRequirements, WindowStatistic, register_protocol
-from .token_kernels import ce_l1_terms
+from ..base import check_options
+from ..inputs import prepare_blocks
+from ..losses import TokenLoss, decay_weighting
+from ..predictions import AuxiliaryLoss, PredictionBatch
+from ..registry import TrainingRequirements, WindowStatistic, register_protocol
+from ..token_kernels import ce_l1_terms
 
 
 @register_protocol(

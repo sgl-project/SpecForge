@@ -1,16 +1,6 @@
 """Canonical objectives, independent of launch topology and file formats."""
 
-from . import (  # noqa: F401
-    dflash,
-    dflash2,
-    dmtp,
-    domino,
-    dspark,
-    dspine,
-    eagle3,
-    mtp,
-    peagle,
-)
+from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
 from .implementations import register_implementation
 from .losses import register_loss

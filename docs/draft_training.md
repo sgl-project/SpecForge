@@ -302,6 +302,14 @@ settings in `training.objective_options`; `weights_from` copies weights only.
 
 ### Extending loss execution
 
+Algorithm implementations live in `specforge/algorithms/objectives/protocols/`:
+one module per algorithm, imported by that package to register the built-in
+protocols. The parent `objectives/` package holds shared contracts, registration,
+loss definitions and execution. New algorithms belong in `protocols/`; they reuse
+the public registration and execution interfaces without adding algorithm branches
+to shared modules.
+
+
 Objectives describe supervision and return `Predictions` carrying a `Projection`
 and an immutable `LossPlan`. The projection exposes ordinary named outputs and,
 optionally, a typed optimization contract. It references existing model parameters

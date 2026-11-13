@@ -4,13 +4,13 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from .base import check_options
+from ..base import check_options
+from ..inputs import gather, sequence_inputs, valid_tokens
+from ..losses import TokenLoss
+from ..predictions import PredictionBatch
+from ..projection import LinearProjection
+from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
-from .inputs import gather, sequence_inputs, valid_tokens
-from .losses import TokenLoss
-from .predictions import PredictionBatch
-from .projection import LinearProjection
-from .registry import TrainingRequirements, register_protocol
 
 
 def supervision_weights(batch, spec):

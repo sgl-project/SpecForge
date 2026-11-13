@@ -4,14 +4,14 @@ from dataclasses import dataclass
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
-from .base import check_options
+from ..base import check_options
+from ..inputs import prepare_blocks
+from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
+from ..predictions import PredictionBatch
+from ..projection import CorrectedProjection
+from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
-from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
-from .plan import LossPlan, LossTerm
-from .predictions import PredictionBatch
-from .projection import CorrectedProjection
-from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(

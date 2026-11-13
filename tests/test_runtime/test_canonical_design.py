@@ -13,7 +13,7 @@ from specforge.algorithms.objectives import (
     register_protocol,
     registry,
 )
-from specforge.algorithms.objectives.dflash import DFlashObjective
+from specforge.algorithms.objectives.protocols.dflash import DFlashObjective
 from specforge.application.composition import resolve_run
 from specforge.checkpoint.resolve import read_target_config
 from specforge.loading import initialize_draft
