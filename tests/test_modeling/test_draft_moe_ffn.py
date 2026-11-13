@@ -214,6 +214,13 @@ class MoEFFNTest(unittest.TestCase):
         self.assertEqual(router.weight.dtype, torch.bfloat16)
         self.assertEqual(router.expert_bias.dtype, torch.float32)
         router.validate_draft_state()
+        # One DeepSeek-V3 step: under-used experts move up, the delta is zero-mean.
+        before = router.expert_bias.clone()
+        router.update_expert_bias(torch.tensor([10.0, 0.0, 0.0, 0.0]), rate=0.01)
+        delta = router.expert_bias - before
+        torch.testing.assert_close(delta, torch.tensor([-0.015, 0.005, 0.005, 0.005]))
+        router.update_expert_bias(torch.tensor([10.0, 0.0, 0.0, 0.0]), rate=0.0)
+        torch.testing.assert_close(router.expert_bias, before + delta)
         router.expert_bias = None
         with self.assertRaisesRegex(ValueError, "disagrees"):
             router.validate_draft_state()

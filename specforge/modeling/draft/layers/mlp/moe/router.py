@@ -69,6 +69,15 @@ class Router(nn.Module):
         """`x` [T, H] -> fp32 scores [T, E], indices [T, K], fp32 weights [T, K]."""
         raise NotImplementedError
 
+    @torch.no_grad()
+    def update_expert_bias(self, tokens_per_expert: Tensor, *, rate: float) -> None:
+        """One DeepSeek-V3 step: nudge under-used experts up by `rate`, zero-mean overall."""
+        if self.expert_bias is None or rate == 0:
+            return
+        load = tokens_per_expert.to(self.expert_bias.device, torch.float32)
+        delta = rate * torch.sign(load.mean() - load)
+        self.expert_bias += delta - delta.mean()
+
 
 class TopKRouter(Router):
     """Linear gate `weight` [E, H] as Qwen's `gate`; biased top-k over `scoring` affinities."""
