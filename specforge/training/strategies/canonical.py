@@ -33,6 +33,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.host_inputs = inner.registration.training.host_inputs
         self.evaluation_diagnostics = inner.registration.training.evaluation_diagnostics
         self.draft_config = inner.draft_model.config.draft
+        # Stepped (and later pooled) here in the training layer, never inside the objective.
+        self.statistics = inner.statistics
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
@@ -43,12 +45,10 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def trainable_module(self):
         return self.model
 
-    def before_checkpoint(self):
-        # What rank 0 records for resume has to hold for every rank.
-        model = self.model
-        if isinstance(model, DistributedDataParallel):
-            model = model.module
-        model.loss_implementations.agree()
+    def after_step(self, *, process_group=None):
+        if self.statistics is None:
+            return {}
+        return self.statistics.step(process_group=process_group)
 
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
