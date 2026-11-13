@@ -82,24 +82,32 @@ def _reject_changed_legacy_settings(config, settings):
             )
 
 
-def resolve_config(cfg, *, target_config=None):
-    from specforge.config.draft.codec import parse_draft
+def _read_draft_payload(draft):
+    if not isinstance(draft, str):
+        return draft
+    import json
 
-    draft = cfg.draft
-    if isinstance(draft, str):
-        import json
+    import yaml
 
-        import yaml
+    text = Path(draft).read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return yaml.safe_load(text)
 
-        text = Path(draft).read_text()
-        try:
-            draft = json.loads(text)
-        except json.JSONDecodeError:
-            draft = yaml.safe_load(text)
-    legacy_draft = isinstance(draft, dict) and draft.get("model_type") not in (
+
+def _is_legacy_payload(payload):
+    return isinstance(payload, dict) and payload.get("model_type") not in (
         None,
         "specforge_draft",
     )
+
+
+def resolve_config(cfg, *, target_config=None):
+    from specforge.config.draft.codec import parse_draft
+
+    draft = _read_draft_payload(cfg.draft)
+    legacy_draft = _is_legacy_payload(draft)
     if legacy_draft:
         from specforge.config.draft.codec import decode_legacy_config
 
@@ -205,28 +213,32 @@ def _objective_settings(cfg):
 
 
 def _validate_imported_objective(cfg, resolved):
-    init = cfg.initialization
-    if init is None or init.checkpoint is None:
-        return
     from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
     from specforge.config.draft.codec.legacy.dspine import (
         extract_dspine_training_settings,
     )
 
-    source = resolve_checkpoint_path(
-        init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    directory = source.parent if source.is_file() else source
-    payload = read_json(init.legacy_config or directory / "config.json")
-    if payload.get("model_type") == "specforge_draft" or payload.get(
-        "architectures"
-    ) != ["DSpineDraftModel"]:
-        return
-    for name, saved in extract_dspine_training_settings(payload).items():
-        if getattr(resolved.objective, name) != saved:
-            raise ValueError(
-                f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
-            )
+    payloads = []
+    draft = _read_draft_payload(cfg.draft)
+    if _is_legacy_payload(draft):
+        payloads.append(draft)
+    init = cfg.initialization
+    if init is not None and init.checkpoint is not None:
+        source = resolve_checkpoint_path(
+            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
+        )
+        directory = source.parent if source.is_file() else source
+        payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    for payload in payloads:
+        if payload.get("model_type") == "specforge_draft" or payload.get(
+            "architectures"
+        ) != ["DSpineDraftModel"]:
+            continue
+        for name, saved in extract_dspine_training_settings(payload).items():
+            if getattr(resolved.objective, name) != saved:
+                raise ValueError(
+                    f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
+                )
 
 
 def resolve_run(cfg, *, target_config=None):

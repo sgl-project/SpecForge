@@ -196,6 +196,17 @@ class CanonicalReviewTest(unittest.TestCase):
             _validate_imported_objective(
                 cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
             )
+            # the same JSON given as `draft:` must not drop its settings either
+            legacy = source / "old_dspine.json"
+            legacy.write_text(json.dumps(payload))
+            cfg = run_config(source, draft_config(), initialization={}).model_copy(
+                update={"draft": str(legacy)}
+            )
+            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
+                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            _validate_imported_objective(
+                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+            )
 
     def test_scratch_embedding_key_survives_resume(self):
         """A scratch run that needed model.embedding_key must resume with it."""
