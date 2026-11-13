@@ -193,7 +193,7 @@ server capture adapters now supply unshifted canonical records. DMTP currently
 accepts offline records with `mtp_hidden_states`; the generic capture service
 cannot produce frozen-MTP features and DMTP streaming fails validation.
 
-The new route supports eager attention (EAGLE3 also SDPA) and data parallel
+The new route supports eager attention (EAGLE3 and MTP also SDPA) and data parallel
 training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
 FSDP, matching the existing training backend's frozen-table policy. The canonical
 model's requested dtype also controls FSDP computation. Other optimized backends and
@@ -209,7 +209,7 @@ its alignment statistics across ranks. Transfer-space initialization and
 restoration remain owned by the public model loader.
 
 Legacy checkpoints keep their original full-resume path (`model.draft_*` plus
-`training.resume_from`). Importing one through `initialization.checkpoint` or
+`training.resume_from`), except MTP, whose legacy training path was removed. Importing one through `initialization.checkpoint` or
 `weights_from` reads weights and effective settings only; it does not translate
 optimizer shards, scheduler state or RNG. For legacy imports, explicit
 `model.mask_token_id`, `model.aux_hidden_state_layer_ids` and
@@ -248,8 +248,11 @@ settings in `training.objective_options`; `weights_from` copies weights only.
 
 `register_protocol(..., training=TrainingRequirements(...))` declares capture
 method, vocabulary mapping, batch-size constraints, `attention_backends` and an
-optional `loss_mask_filter` callable. EAGLE3 also accepts `sdpa`; the other objectives keep eager attention;
-block objectives register the shared consecutive-supervision filter. Canonical
+optional `loss_mask_filter` callable. EAGLE3 and MTP also accept `sdpa`; the other objectives keep
+eager attention; block objectives register the shared consecutive-supervision filter.
+`explicit_initialization=True` makes training refuse to start without an
+initialization choice or resume, and `host_inputs` computes extra batch tensors on
+the host before the device copy (MTP precomputes its supervised rows there). Canonical
 composition builds providers directly from these requirements; it does not resolve
 a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
 requests accumulation-window reduction and replay, passing the result to the

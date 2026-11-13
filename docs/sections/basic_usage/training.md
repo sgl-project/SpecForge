@@ -729,7 +729,8 @@ specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 Historical checkpoints without `config.json` additionally require
 `--draft-config OLD.json --target-model TARGET` for canonical export. Legacy
 `--to hf` and `--to sglang` retain their original exporters and require
-`--draft-config`; they are not aliases for canonical export. Default HF exports
+`--draft-config`; they are not aliases for canonical export. They no longer
+export MTP, whose legacy model was removed; use the canonical command for it. Default HF exports
 contain canonical configuration and bundled code for
 Transformers, and cannot be served directly by SGLang. Except for native merge-back,
 both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
@@ -816,7 +817,8 @@ MTP migration changes:
 The canonical MTP trainer supports eager and SDPA attention. Set
 `training.objective_options.objective_chunk_size` (default 4096; 0 disables
 chunking) to bound the number of token positions passed through LM head and loss
-at once. Chunked training recomputes these intermediates during backward. The
+at once. Chunked training recomputes these intermediates during backward.
+Contextual losses (the `lk_*` kinds) need the whole set and are not chunked. The
 old `training.mtp_objective_chunk_size` option remains a compatibility alias;
 conflicting non-default settings are rejected. The online NPU MTP recipe now
 uses this canonical path and the native preset.
