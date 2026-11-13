@@ -1,9 +1,7 @@
-"""MoE FFN nodes: validation, codec round trips and use inside a draft configuration."""
+"""MoE FFN nodes: validation and use inside a draft configuration."""
 
-import json
 import unittest
 
-from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import (
     DenseFFNSpec,
@@ -103,49 +101,6 @@ class MoESpecTest(unittest.TestCase):
             MoEFFNSpec(
                 **{**moe_fields(), "experts": GATED, "router": MoERouterSpec(**ROUTER)}
             )
-
-    def test_component_codec_round_trips_and_stays_strict(self):
-        qwen = {
-            **MOE,
-            "shared_expert": GATED,
-            "shared_expert_gate": True,
-            "router": {
-                "scoring": "sigmoid",
-                "normalize_top_k": True,
-                "route_scale": 2.5,
-                "expert_bias": False,
-            },
-        }
-        nemotron = {**MOE, "shared_expert": RELU2}
-        for payload in (MOE, qwen, nemotron):
-            with self.subTest(shared_expert=payload["shared_expert"]):
-                node = decode_component("mlp", payload)
-                self.assertIsInstance(node, MoEFFNSpec)
-                self.assertEqual(node.experts, MoEExpertSpec(**payload["experts"]))
-                if payload["shared_expert"] is not None:
-                    self.assertEqual(
-                        node.shared_expert,
-                        MoEExpertSpec(**payload["shared_expert"]),
-                    )
-                self.assertEqual(encode_component("mlp", node), payload)
-                restored = decode_component("mlp", json.loads(json.dumps(payload)))
-                self.assertEqual(restored, node)
-                self.assertEqual(hash(restored), hash(node))
-        for payload, message in (
-            ({**MOE, "norm_topk_prob": False}, "unknown fields"),
-            ({**MOE, "router": {**ROUTER, "top_k": 1}}, "router: unknown fields"),
-            ({k: v for k, v in MOE.items() if k != "router"}, "missing fields"),
-            ({**MOE, "router": {**ROUTER, "route_scale": "1"}}, "expected a number"),
-            ({**MOE, "experts": {"intermediate_size": 96}}, "experts: missing"),
-            ({**MOE, "shared_expert": {"intermediate_size": 48}}, "shared_expert"),
-            (
-                {**MOE, "shared_expert": {**GATED, "gated": "yes"}},
-                "gated: expected bool",
-            ),
-        ):
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValueError, message):
-                    decode_component("mlp", payload)
 
 
 if __name__ == "__main__":

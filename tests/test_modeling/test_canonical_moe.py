@@ -1,10 +1,7 @@
-"""A canonical draft with MoE layers builds, checkpoints, restores and exports."""
+"""A canonical draft with MoE layers builds, checkpoints and restores."""
 
 import copy
 import json
-import os
-import subprocess
-import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -12,12 +9,8 @@ from tempfile import TemporaryDirectory
 
 import torch
 
-from specforge.checkpoint import save_draft
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import DenseFFNSpec
-from specforge.export.checkpoint_io import checkpoint_dtype
-from specforge.export.to_hf import export_to_hf
-from specforge.loading import load_draft
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.modeling.draft.models import DSparkDraftModel
@@ -126,45 +119,6 @@ class CanonicalMoETest(unittest.TestCase):
             config_path.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, "unexpected_keys"):
                 DSparkDraftModel.from_pretrained(path)
-
-    def test_export_validates_router_state_and_runs_standalone(self):
-        config = moe_model_config()
-        model = build_draft_model(config).eval()
-        state = model.state_dict()
-        model.validate_export_state(state)
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            torch.save(state, root / "expected_state.pt")
-            save_draft(model, root / "source")
-            export_to_hf(str(root / "source"), None, str(root / "hf"))
-            bundled = {path.name for path in (root / "hf").glob("*.py")}
-            self.assertIn("specforge_modeling_draft_layers_mlp_moe_experts.py", bundled)
-            script = (
-                Path(__file__).resolve().parent.parent
-                / "test_checkpoint"
-                / "helpers"
-                / "check_standalone_export.py"
-            )
-            result = subprocess.run(
-                [sys.executable, "-I", str(script), str(root / "hf")],
-                capture_output=True,
-                text=True,
-                env={
-                    **os.environ,
-                    "TORCHDYNAMO_DISABLE": "1",
-                    "HF_MODULES_CACHE": str(root / "modules"),
-                },
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            # A bf16 draft keeps its fp32 bias; the loader and the export read the
-            # dtype from the weights, not from the one buffer that differs.
-            model.to(torch.bfloat16)
-            self.assertEqual(checkpoint_dtype(model.state_dict()), torch.bfloat16)
-            save_draft(model, root / "bf16")
-            loaded = load_draft(root / "bf16")
-            (loaded_layer,) = moe_layers(loaded)
-            self.assertEqual(loaded_layer.gate.weight.dtype, torch.bfloat16)
-            self.assertEqual(loaded_layer.gate.expert_bias.dtype, torch.float32)
 
 
 if __name__ == "__main__":

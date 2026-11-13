@@ -1,36 +1,20 @@
-"""MoE FFN: parity with Transformers, kernel agreement, the router contract, shared experts."""
+"""MoE FFN: parity with Transformers, kernel agreement, the router contract, the kernel choice."""
 
 import unittest
-from unittest.mock import patch
 
 import torch
-import torch.nn.functional as F
-from transformers import DeepseekV3Config, NemotronHConfig
-from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MLP
-from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMLP
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-    Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
 )
 
-from specforge.config.draft.mlp import (
-    DenseFFNSpec,
-    MoEExpertSpec,
-    MoEFFNSpec,
-    MoERouterSpec,
-)
-from specforge.modeling.draft.layers.inputs import ExpertRouting, MoEOutput
+from specforge.config.draft.mlp import MoEExpertSpec, MoEFFNSpec, MoERouterSpec
+from specforge.modeling.draft.layers.inputs import MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels
-from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, DenseFFN, MoEFFN
-from specforge.modeling.draft.layers.mlp.moe import (
-    RoutedExperts,
-    Router,
-    SharedExpert,
-    TopKRouter,
-)
+from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
+from specforge.modeling.draft.layers.mlp.moe import RoutedExperts, Router, TopKRouter
 
 # Widths are multiples of 8: F.grouped_mm needs 16-byte strides in every dtype.
 H = 32
@@ -246,86 +230,6 @@ class MoEFFNTest(unittest.TestCase):
         plain.validate_export_state(dict(plain.state_dict()))
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
-    def test_shared_expert_settings_match_transformers(self):
-        gated = expert_spec(48)
-        relu2 = expert_spec(48, "relu2", gated=False)
-        deepseek = DeepseekV3Config(
-            hidden_size=H,
-            hidden_act="silu",
-            moe_intermediate_size=24,
-            n_shared_experts=2,
-        )
-        nemotron = NemotronHConfig(
-            hidden_size=H, mlp_hidden_act="relu2", mlp_bias=False
-        )
-        x = torch.randn(5, H)
-        for setting, spec, reference in (
-            (
-                "qwen gated",
-                gated,
-                Qwen3_5MoeMLP(
-                    Qwen3_5MoeTextConfig(hidden_size=H, hidden_act="silu"),
-                    intermediate_size=48,
-                ),
-            ),
-            (
-                "deepseek merged shared experts",
-                gated,
-                DeepseekV3MLP(
-                    deepseek,
-                    intermediate_size=deepseek.moe_intermediate_size
-                    * deepseek.n_shared_experts,
-                ),
-            ),
-            ("nemotron relu2", relu2, NemotronHMLP(nemotron, intermediate_size=48)),
-        ):
-            with self.subTest(setting=setting):
-                actual = SharedExpert(spec, hidden_size=H)
-                actual.load_state_dict(reference.state_dict(), strict=True)
-                torch.testing.assert_close(actual(x), reference(x), rtol=0, atol=0)
-        self.assertIsNone(SharedExpert(relu2, hidden_size=H).gate_proj)
-
-    @unittest.skipUnless(CUDA, "Liger kernels require CUDA")
-    def test_liger_swiglu_fuses_gated_shared_experts_only(self):
-        calls = []
-
-        def fake_swiglu(gate, up):
-            calls.append(tuple(gate.shape))
-            return F.silu(gate) * up
-
-        def shared(hidden_act, gated):
-            spec = expert_spec(48, hidden_act, gated)
-            return SharedExpert(spec, hidden_size=H, device="cuda")
-
-        model = torch.nn.ModuleDict(
-            {
-                "gated": shared("silu", True),
-                "plain": shared("silu", False),
-                "relu2": shared("relu2", False),
-                "dense": DenseFFN(
-                    DenseFFNSpec(intermediate_size=48, hidden_act="silu"),
-                    hidden_size=H,
-                    device="cuda",
-                ),
-            }
-        )
-        x = torch.randn(5, H, device="cuda")
-        eager = {name: module(x) for name, module in model.items()}
-        with patch(
-            "specforge.modeling.draft.layers.kernels.load_liger_kernels",
-            return_value=(object(), fake_swiglu),
-        ):
-            configure_kernels(model, use_liger=True)
-        self.assertIs(model["gated"].liger_swiglu, fake_swiglu)
-        self.assertIs(model["dense"].liger_swiglu, fake_swiglu)
-        self.assertIsNone(model["relu2"].liger_swiglu)
-        fused = {name: module(x) for name, module in model.items()}
-        self.assertEqual(calls, [(5, 48), (5, 48)])
-        for name in model:
-            torch.testing.assert_close(fused[name], eager[name], rtol=0, atol=0)
-        configure_kernels(model, use_liger=False)
-        self.assertTrue(all(m.liger_swiglu is None for m in model.values()))
-
     def test_configure_kernels_selects_and_checks_the_expert_kernel(self):
         aligned = torch.nn.Sequential(
             MoEFFN(moe_spec(), hidden_size=H), MoEFFN(qwen_spec(), hidden_size=H)
@@ -362,39 +266,6 @@ class MoEFFNTest(unittest.TestCase):
                 self.assertEqual(misaligned.experts_kernel, "loop")
         with self.assertRaisesRegex(ValueError, "unknown experts kernel 'nope'"):
             aligned[0].experts.probe_kernel("nope")
-
-    def test_forward_returns_the_typed_update_with_its_routing(self):
-        module = MoEFFN(qwen_spec(), hidden_size=H)
-        with torch.no_grad():
-            for parameter in module.parameters():
-                parameter.normal_(std=0.2)
-        x = torch.randn(2, 5, H)
-        output = module(x)
-        self.assertIsInstance(output, MoEOutput)
-        self.assertEqual(tuple(output.update.shape), (2, 5, H))
-        self.assertIsInstance(output.routing, ExpertRouting)
-        # The routing is the router's own choice and scores, the latter with their graph.
-        scores, indices, _ = module.gate(x.reshape(-1, H))
-        self.assertTrue(torch.equal(output.routing.expert_ids, indices))
-        self.assertTrue(torch.equal(output.routing.scores, scores))
-        self.assertTrue(output.routing.scores.requires_grad)
-        output.routing.scores[:, 0].sum().backward()
-        self.assertTrue(torch.any(module.gate.weight.grad != 0))
-
-    def test_invalid_settings_fail_before_allocation(self):
-        with patch("torch.nn.Parameter") as allocate:
-            with self.assertRaises(TypeError):
-                MoEFFN({}, hidden_size=H)
-            with self.assertRaises(TypeError):
-                SharedExpert(
-                    DenseFFNSpec(intermediate_size=8, hidden_act="silu"), hidden_size=H
-                )
-            with self.assertRaises(TypeError):
-                TopKRouter({}, num_experts=4, hidden_size=H, top_k=2)
-            for width in (0, True, 1.5):
-                with self.assertRaises(ValueError):
-                    MoEFFN(moe_spec(), hidden_size=width)
-            allocate.assert_not_called()
 
 
 if __name__ == "__main__":

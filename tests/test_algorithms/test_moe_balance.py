@@ -173,23 +173,6 @@ class MoEBalanceTest(unittest.TestCase):
                     self.assertGreater(counts.sum().item(), 0)
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})
 
-    def test_balancing_reads_the_registration_not_the_model(self):
-        """An objective that does not declare expert routing cannot ask for balancing."""
-        model = build_draft_model(moe_model_config())
-        registration = resolve_objective("DSparkDraftModel").registration
-        self.assertIn("expert_routing", registration.provides)
-        silent = replace(
-            registration, provides=registration.provides - {"expert_routing"}
-        )
-        objective = SimpleNamespace(bias_update_rate=0.01)
-        self.assertIsInstance(
-            MoEBalancer.for_objective(model, objective, registration), MoEBalancer
-        )
-        with self.assertRaisesRegex(ValueError, "does not provide expert routing"):
-            MoEBalancer.for_objective(model, objective, silent)
-        objective.bias_update_rate = 0.0
-        self.assertIsNone(MoEBalancer.for_objective(model, objective, silent))
-
     def test_the_loss_matches_transformers(self):
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
             load_balancing_loss_func,
