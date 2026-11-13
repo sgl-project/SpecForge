@@ -81,19 +81,14 @@ class DecoderLayer(nn.Module):
         hidden = self.attention_connection(
             hidden, lambda stream: self._attention_update(stream, inputs)
         )
-        routing: ExpertRouting | None = None
-
-        def mlp_update(stream: Tensor) -> Tensor:
-            nonlocal routing
-            update, routing = self._mlp_update(stream)
-            return update
-
-        hidden = self.mlp_connection(hidden, mlp_update)
-        return (
-            hidden
-            if routing is None
-            else MoELayerOutput(hidden=hidden, routing=routing)
+        # A MoE FFN hands its routing out past the connection; a dense FFN adds nothing.
+        routing_out: list[ExpertRouting] = []
+        hidden = self.mlp_connection(
+            hidden, lambda stream: self._mlp_update(stream, routing_out)
         )
+        if not routing_out:
+            return hidden
+        return MoELayerOutput(hidden=hidden, routing=routing_out[0])
 
     def _check_stream(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
@@ -124,14 +119,16 @@ class DecoderLayer(nn.Module):
             update = self.attention_conv.finish(update, coefficients)
         return self._check_update(update, hidden, "attention")
 
-    def _mlp_update(self, hidden: Tensor) -> tuple[Tensor, ExpertRouting | None]:
+    def _mlp_update(self, hidden: Tensor, routing_out: list[ExpertRouting]) -> Tensor:
+        """The FFN sublayer's update; a MoE FFN puts its routing into `routing_out` (at most one)."""
         self._check_stream(hidden)
         update = self.post_attention_layernorm(hidden)
         if self.mlp_conv is not None:
             update, coefficients = self.mlp_conv.prepare(update)
-        result = self.mlp(update)
-        routing = result.routing if isinstance(result, MoEOutput) else None
-        update = result.update if routing is not None else result
+        update = self.mlp(update)
+        if isinstance(update, MoEOutput):
+            routing_out.append(update.routing)
+            update = update.update
         if self.mlp_conv is not None:
             update = self.mlp_conv.finish(update, coefficients)
-        return self._check_update(update, hidden, "mlp"), routing
+        return self._check_update(update, hidden, "mlp")
