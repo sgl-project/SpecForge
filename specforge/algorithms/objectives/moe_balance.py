@@ -9,6 +9,8 @@ from torch import Tensor, nn
 
 from specforge.modeling.draft.layers.mlp import MoEFFN
 
+from .base import check_options
+
 # The load the auxiliary loss balances: this forward's, or the step's so far over ranks.
 AUX_LOSS_TYPES = ("microbatch_wise", "batch_wise")
 # The options that join a resume contract only while balancing is on.
@@ -20,6 +22,21 @@ def check_aux_loss_type(value: str) -> None:
         raise ValueError(
             f"invalid aux_loss_type: {value!r}; expected one of {AUX_LOSS_TYPES}"
         )
+
+
+def balancing_settings(options: dict) -> dict:
+    """The balancing options with defaults filled in and checked; off when rate and coef are 0."""
+    settings = {
+        "bias_update_rate": 0.0,
+        "aux_loss_coef": 0.0,
+        "aux_loss_type": "batch_wise",
+        **options,
+    }
+    check_options(
+        nonnegative={k: settings[k] for k in ("bias_update_rate", "aux_loss_coef")}
+    )
+    check_aux_loss_type(settings["aux_loss_type"])
+    return settings
 
 
 def count_tokens_per_expert(
@@ -89,25 +106,25 @@ class MoEBalancer:
         self.pooled: tuple[Tensor, ...] | None = None
 
     @classmethod
-    def for_objective(
-        cls, model: nn.Module, objective, registration
-    ) -> "MoEBalancer | None":
-        """A balancer when the objective asks for one and declares expert routing."""
-        rate = getattr(objective, "bias_update_rate", 0.0)
-        coef = getattr(objective, "aux_loss_coef", 0.0)
-        if not rate and not coef:
+    def from_settings(cls, model: nn.Module, settings: dict) -> "MoEBalancer | None":
+        """A balancer from balancing_settings; None while balancing is off."""
+        if not settings.get("bias_update_rate") and not settings.get("aux_loss_coef"):
             return None
-        if "expert_routing" not in registration.provides:
-            raise ValueError(
-                f"objective {type(objective).__name__} does not provide expert "
-                "routing, so it cannot balance MoE layers"
-            )
         return cls(
             model,
-            rate=rate,
-            aux_loss_coef=coef,
-            aux_loss_type=getattr(objective, "aux_loss_type", "batch_wise"),
+            rate=settings["bias_update_rate"],
+            aux_loss_coef=settings["aux_loss_coef"],
+            aux_loss_type=settings["aux_loss_type"],
         )
+
+    @property
+    def settings(self) -> dict:
+        """The StepStatistics contract: the options that built this balancer."""
+        return {
+            "bias_update_rate": self.rate,
+            "aux_loss_coef": self.aux_loss_coef,
+            "aux_loss_type": self.aux_loss_type,
+        }
 
     def _routings(self, output):
         routings = output.expert_routing or ()

@@ -526,7 +526,6 @@ def build_bundle(cfg, algorithm):
         StepRuntimeConfig,
     )
     from specforge.algorithms.objectives import build_objective_model, resolve_objective
-    from specforge.algorithms.objectives.moe_balance import BALANCING_OPTIONS
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import (
@@ -674,9 +673,9 @@ def build_bundle(cfg, algorithm):
     )
     runtime.fsdp_param_dtype = dtype
     options = asdict(runtime.objective)
-    if not options.get("bias_update_rate") and not options.get("aux_loss_coef"):
-        # Balancing off: the options match what pre-MoE runs wrote.
-        options = {k: v for k, v in options.items() if k not in BALANCING_OPTIONS}
+    if runtime.statistics is not None:
+        # Statistics settings join the contract only while on; earlier runs wrote none.
+        options.update(runtime.statistics.settings)
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,

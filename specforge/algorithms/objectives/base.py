@@ -19,6 +19,11 @@ class DeferredTerm(Protocol):
 class StepStatistics(Protocol):
     """Per-forward statistics an objective observes; the training layer applies them each optimizer step."""
 
+    @property
+    def settings(
+        self,
+    ) -> dict[str, object]: ...  # what built them; the resume contract records it
+
     def observe(self, output, *, keep: Tensor) -> DeferredTerm | None: ...
 
     def step(self, *, process_group=None) -> dict[str, Tensor]: ...

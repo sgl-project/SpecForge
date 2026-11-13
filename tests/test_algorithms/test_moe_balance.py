@@ -46,7 +46,16 @@ class MoEBalanceTest(unittest.TestCase):
     def test_option_is_validated_and_needs_a_biased_moe_draft(self):
         options = {"num_anchors": 2, "bias_update_rate": 0.001}
         resolved = resolve_objective("DSparkDraftModel", options=options)
-        self.assertEqual(resolved.objective.bias_update_rate, 0.001)
+        # The registry takes the balancing options for objectives that provide routing.
+        self.assertFalse(hasattr(resolved.objective, "bias_update_rate"))
+        self.assertEqual(
+            resolved.statistics_settings,
+            {
+                "bias_update_rate": 0.001,
+                "aux_loss_coef": 0.0,
+                "aux_loss_type": "batch_wise",
+            },
+        )
         resolve_objective("DFlashDraftModel", options={"bias_update_rate": 0.5})
         for architecture in ("DFlash2DraftModel", "DominoDraftModel"):
             # Their models do not carry expert routing out yet, so no option either.
@@ -76,7 +85,7 @@ class MoEBalanceTest(unittest.TestCase):
             options={"num_anchors": 2, "aux_loss_coef": 0.01},
         )
         self.assertEqual(runtime.statistics.rate, 0.0)
-        self.assertEqual(runtime.statistics.aux_loss_type, "batch_wise")
+        self.assertEqual(runtime.statistics.settings["aux_loss_type"], "batch_wise")
 
     def test_a_step_pools_the_window_and_moves_each_bias_zero_mean(self):
         config = moe_model_config()
