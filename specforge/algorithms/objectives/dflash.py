@@ -28,7 +28,7 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
         "teacher_logits",
         "chain_positions",
         "acceptance_chain",
-        "expert_choices",
+        "expert_routing",
     ),
     trains=COMMON_MODULES,
 )

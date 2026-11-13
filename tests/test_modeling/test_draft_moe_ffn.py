@@ -23,7 +23,7 @@ from specforge.config.draft.mlp import (
     MoERouterSpec,
 )
 from specforge.modeling.draft.layers import build_component, component_layout
-from specforge.modeling.draft.layers.inputs import ExpertChoice, MoEOutput
+from specforge.modeling.draft.layers.inputs import ExpertRouting, MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels
 from specforge.modeling.draft.layers.layout import join, split
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, DenseFFN, MoEFFN
@@ -374,7 +374,7 @@ class MoEFFNTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown experts kernel 'nope'"):
             aligned[0].experts.probe_kernel("nope")
 
-    def test_forward_returns_the_typed_update_with_its_expert_choice(self):
+    def test_forward_returns_the_typed_update_with_its_routing(self):
         module = MoEFFN(qwen_spec(), hidden_size=H)
         with torch.no_grad():
             for parameter in module.parameters():
@@ -387,8 +387,8 @@ class MoEFFNTest(unittest.TestCase):
                 self.assertIsInstance(output, MoEOutput)
                 self.assertEqual(tuple(output.update.shape), (2, 5, H))
                 self.assertEqual(output.update.dtype, torch.float32)
-                self.assertIsInstance(output.expert_choice, ExpertChoice)
-                indices = output.expert_choice.expert_ids
+                self.assertIsInstance(output.routing, ExpertRouting)
+                indices = output.routing.expert_ids
                 self.assertEqual(tuple(indices.shape), (10, 2))
                 self.assertEqual(indices.dtype, torch.long)
                 self.assertFalse(indices.requires_grad)

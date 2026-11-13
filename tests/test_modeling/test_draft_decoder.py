@@ -370,7 +370,7 @@ class DecoderTest(unittest.TestCase):
                     all(entry.position_embeddings is None for entry in entries)
                 )
 
-    def test_moe_layers_return_their_expert_choice_through_the_backbone(self):
+    def test_moe_layers_return_their_routing_through_the_backbone(self):
         from tests.test_modeling.test_draft_moe_ffn import moe_spec
 
         layers = [
@@ -402,7 +402,7 @@ class DecoderTest(unittest.TestCase):
                 parameter.normal_(std=0.1)
         hidden_base = torch.randn(1, 3, 16)
         context_base = torch.randn(1, 2, 16)
-        expected, choices = None, []
+        expected, routed = None, []
         for mode, checkpointed in (
             ("forward", False),
             ("outputs", False),
@@ -436,13 +436,11 @@ class DecoderTest(unittest.TestCase):
             else:
                 output, outputs = model(hidden, entries), None
             if outputs is not None:
-                # The MoE layer hands its choice up typed; the dense layer adds none.
+                # The MoE layer hands its routing up typed; the dense layer adds none.
                 self.assertIsInstance(outputs[0], MoELayerOutput)
                 self.assertIsNone(outputs[1])
-                self.assertEqual(
-                    tuple(outputs[0].expert_choice.expert_ids.shape), (3, 2)
-                )
-                choices.append(outputs[0].expert_choice.expert_ids)
+                self.assertEqual(tuple(outputs[0].routing.expert_ids.shape), (3, 2))
+                routed.append(outputs[0].routing.expert_ids)
             output.square().sum().backward()
             result = [
                 output.detach(),
@@ -455,7 +453,7 @@ class DecoderTest(unittest.TestCase):
                 expected = result
             else:
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
-        self.assertTrue(all(torch.equal(first, choices[0]) for first in choices))
+        self.assertTrue(all(torch.equal(first, routed[0]) for first in routed))
 
     def test_connections_own_stream_reads_writes_and_checkpoint_gradients(self):
         from torch.utils.checkpoint import checkpoint

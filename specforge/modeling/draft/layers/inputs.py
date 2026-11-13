@@ -44,22 +44,22 @@ class LayerOutput:
 
 
 @dataclass(frozen=True, eq=False)
-class ExpertChoice:
-    """One MoE layer's expert choice, carried out of the forward for balancing."""
+class ExpertRouting:
+    """One MoE layer's routing, carried out of the forward for load balancing."""
 
     expert_ids: Tensor  # [tokens, top_k] chosen experts
 
 
 @dataclass(frozen=True, eq=False)
 class MoEOutput:
-    """A MoE FFN's stream update together with its expert choice."""
+    """A MoE FFN's stream update together with its routing."""
 
     update: Tensor
-    expert_choice: ExpertChoice
+    routing: ExpertRouting
 
 
 @dataclass(frozen=True, eq=False)
 class MoELayerOutput(LayerOutput):
-    """A decoder layer whose FFN routed: the hidden result plus its expert choice."""
+    """A decoder layer whose FFN routed: the hidden result plus its routing."""
 
-    expert_choice: ExpertChoice
+    routing: ExpertRouting

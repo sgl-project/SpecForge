@@ -10,7 +10,7 @@ from specforge.modeling.draft.layers.mlp import MoEFFN
 def count_tokens_per_expert(
     expert_ids: Tensor, keep: Tensor, num_experts: int
 ) -> Tensor:
-    """[T, K] choices and a [T] keep mask -> int64 [E] counts over the kept tokens."""
+    """[T, K] expert ids and a [T] keep mask -> int64 [E] counts over the kept tokens."""
     return torch.bincount(expert_ids[keep].reshape(-1), minlength=num_experts)
 
 
@@ -39,14 +39,14 @@ class MoEBalancer:
     def for_objective(
         cls, model: nn.Module, objective, registration
     ) -> "MoEBalancer | None":
-        """A balancer when the objective asks for one and declares expert choices."""
+        """A balancer when the objective asks for one and declares expert routing."""
         rate = getattr(objective, "bias_update_rate", 0.0)
         if not rate:
             return None
-        if "expert_choices" not in registration.provides:
+        if "expert_routing" not in registration.provides:
             raise ValueError(
                 f"objective {type(objective).__name__} does not provide expert "
-                "choices, so bias_update_rate cannot balance it"
+                "routing, so bias_update_rate cannot balance it"
             )
         return cls(model, rate=rate)
 
@@ -54,15 +54,15 @@ class MoEBalancer:
         """Count one training forward; forwards without gradients (eval, prepass) count nothing."""
         if not torch.is_grad_enabled():
             return
-        choices = output.expert_choices or ()
-        if len(choices) != len(self.layers):
+        routings = output.expert_routing or ()
+        if len(routings) != len(self.layers):
             raise ValueError(
-                f"expected {len(self.layers)} expert choices, got {len(choices)}"
+                f"expected routing from {len(self.layers)} MoE layers, got {len(routings)}"
             )
-        for index, (layer, choice) in enumerate(zip(self.layers, choices)):
+        for index, (layer, routing) in enumerate(zip(self.layers, routings)):
             counts = count_tokens_per_expert(
-                choice.expert_ids,
-                keep.to(choice.expert_ids.device),
+                routing.expert_ids,
+                keep.to(routing.expert_ids.device),
                 layer.config.num_experts,
             )
             previous = self.counts[index]

@@ -7,7 +7,7 @@ from torch import Tensor
 from transformers.utils import ModelOutput
 
 from ..hf_config import SpecForgeDraftConfig
-from ..layers.inputs import ExpertChoice, LayerInputs
+from ..layers.inputs import ExpertRouting, LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .assembly import build_target_context_modules
 from .context import prepare_context_inputs, run_backbone
@@ -18,7 +18,7 @@ from .registry import register_draft_model
 class DFlashOutput(ModelOutput):
     hidden_states: Tensor | None = None
     logits: Tensor | None = None
-    expert_choices: tuple[ExpertChoice, ...] | None = None  # one per MoE layer
+    expert_routing: tuple[ExpertRouting, ...] | None = None  # one per MoE layer
 
 
 @register_draft_model
@@ -71,11 +71,11 @@ class DFlashDraftModel(DraftPreTrainedModel):
             layer_inputs,
             num_layers=self.backbone.num_layers,
         )
-        hidden, expert_choices = run_backbone(
+        hidden, expert_routing = run_backbone(
             self.backbone, self.embed_tokens(input_ids), prepared
         )
         return DFlashOutput(
             hidden_states=hidden,
             logits=self.compute_logits(hidden) if output_logits else None,
-            expert_choices=expert_choices,
+            expert_routing=expert_routing,
         )
