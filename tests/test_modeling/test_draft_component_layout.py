@@ -95,6 +95,10 @@ class ComponentLayoutTest(unittest.TestCase):
                 parts
                 | {"experts.2.gate_proj.weight": parts["experts.0.gate_proj.weight"]},
             )
+        with self.assertRaisesRegex(ValueError, "parts must share one shape"):
+            join(
+                EXPERTS, config, parts | {"experts.0.up_proj.weight": torch.randn(3, 8)}
+            )
         fused = join(EXPERTS, config, parts)
         with self.assertRaisesRegex(ValueError, "expected 2 stacked entries"):
             split(

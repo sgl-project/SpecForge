@@ -57,7 +57,7 @@ class ComponentLayout:
 
 
 def join(layout: ComponentLayout, config, parts: Mapping[str, Tensor]) -> dict:
-    """Assemble fused tensors from per-entry tensors; every part is used exactly once."""
+    """Assemble fused tensors from equal-shaped per-entry parts; every part is used once."""
     unused = set(parts)
     fused = {}
     for name, entries in layout.part_names(config).items():
@@ -68,6 +68,10 @@ def join(layout: ComponentLayout, config, parts: Mapping[str, Tensor]) -> dict:
             if missing:
                 raise ValueError(f"{name}: missing checkpoint tensors {missing}")
             pieces = [parts[n] for n in names]
+            # split divides an entry into equal parts, so join takes equal shapes only.
+            if any(piece.shape != pieces[0].shape for piece in pieces):
+                shapes = [tuple(piece.shape) for piece in pieces]
+                raise ValueError(f"{name}: parts must share one shape, got {shapes}")
             unused.difference_update(names)
             stacked.append(
                 pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=rule.dim)
