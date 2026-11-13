@@ -13,15 +13,36 @@ from .projection import Projection
 
 @dataclass(frozen=True)
 class Teacher:
+    """Detached teacher input, projected only when supervision needs it.
+
+    Attributes:
+        values: Hidden states when head is set; otherwise already-computed logits.
+        head: Optional callable mapping values to full-vocabulary logits.
+    """
+
     values: Tensor
     head: Callable | None = None
 
     def logits(self):
+        """Return teacher logits, evaluating the optional head under no_grad."""
         with torch.no_grad():
             return self.head(self.values) if self.head is not None else self.values
 
     def compact(self, vocab_mask, chunk_size):
-        """Project a frozen linear teacher in vocabulary tiles."""
+        """Project a linear teacher in vocabulary tiles.
+
+        Args:
+            vocab_mask: Boolean mask of selected tokens in the full target vocabulary.
+            chunk_size: Positive number of vocabulary columns per tile.
+
+        Returns:
+            (selected_logits, full_vocabulary_argmax, retained_probability_mass),
+            preserving full-vocabulary normalization without retaining full logits.
+
+        Raises:
+            ValueError: The head is not a supported linear projection or the
+                vocabulary mask does not match its weight rows.
+        """
         from specforge.core.compact_teacher import _tiled_logsumexp_argmax
         from specforge.modeling.draft.bindings import BoundLMHead
 
@@ -45,11 +66,18 @@ class Teacher:
         return logits, argmax, mass
 
     def select(self, units):
+        """Return teacher input indexed by a slice/tensor of complete units."""
         return replace(self, values=self.values[units])
 
 
 @dataclass
 class AuxiliaryLoss:
+    """Per-position algorithm auxiliary values and additive metric pairs.
+
+    Values already include algorithm-specific coefficients. The executor applies
+    the prediction's common position weights and denominator.
+    """
+
     values: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
 
@@ -112,6 +140,7 @@ class Predictions:
 
     @property
     def capabilities(self):
+        """Return the supervision/chain capabilities provided by these inputs."""
         flags = {"logits", "chain_positions"}
         if self.chain_ids is not None and self.sequence_ids is not None:
             flags.add("acceptance_chain")
@@ -122,9 +151,19 @@ class Predictions:
         return frozenset(flags)
 
     def project(self):
+        """Return named tensors from the ordinary projection without rerunning the backbone."""
         return self.projection.project(self.hidden, **self.projection_inputs)
 
     def select(self, units: slice):
+        """Select complete projection units and all aligned supervision tensors.
+
+        Args:
+            units: Slice or tensor index along the first dimension.
+
+        Returns:
+            A new Predictions object with the selected hidden states, term masks,
+            teacher/context inputs and chain IDs. Fixed denominators are unchanged.
+        """
         return replace(
             self,
             hidden=self.hidden[units],
@@ -148,6 +187,15 @@ class Predictions:
 
 @dataclass(frozen=True)
 class PredictionBatch:
+    """Protocol output consumed by the shared executor.
+
+    Attributes:
+        predictions: Iterable of deferred prediction sets, possibly a rollout.
+        reduction: "tokens", "sum_means" or "global_microbatch".
+        chunk_size: Protocol's default unit chunk size; zero means unsplit.
+            An explicit runtime chunk_size overrides this value.
+    """
+
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
     chunk_size: int = 0

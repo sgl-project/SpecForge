@@ -15,6 +15,15 @@ from .base import check_options
 
 @dataclass(frozen=True)
 class LossRegistration:
+    """Mathematical loss definition and its data requirements.
+
+    Attributes:
+        compute: Reference per-position loss callable.
+        requires: Capabilities the prediction set must provide.
+        inputs: Additional batch/capture fields needed by the loss.
+        contextual: Whether evaluation needs whole-set statistics and context.
+    """
+
     compute: Callable
     requires: frozenset[str]
     inputs: tuple[str, ...] = ()
@@ -31,7 +40,23 @@ def register_loss(
     inputs=(),
     contextual=False,
 ):
-    """Register a per-token loss; algorithm-specific auxiliary terms stay separate."""
+    """Register a mathematical per-position loss and its reference formula.
+
+    Args:
+        name: Unique loss identifier; "default" is reserved.
+        requires: Prediction capabilities required by this formula.
+        inputs: Additional batch fields required for supervision/capture.
+        contextual: Whether compute also accepts a LossContext and needs
+            whole-set evaluation rather than independent chunks.
+
+    Returns:
+        A decorator preserving the callable. It must accept
+        (logits, labels, teacher, **options), plus context when contextual, and
+        return losses aligned with labels. Optimized kernels register separately.
+
+    Raises:
+        ValueError: The identifier is reserved or already registered.
+    """
 
     def register(compute):
         if name == "default" or name in _LOSSES:
@@ -230,6 +255,21 @@ class TokenLoss:
         return "teacher_logits" in self.requires
 
     def __call__(self, logits, labels, *, teacher=None, default=None, context=None):
+        """Evaluate the mathematical reference loss without weighting or reduction.
+
+        Args:
+            logits: Draft scores with vocabulary in the final dimension.
+            labels: Token IDs aligned with the scores' leading dimensions.
+            teacher: Optional aligned teacher logits required by distillation.
+            default: Optional precomputed value returned for the "default" selection.
+            context: Optional supervision/normalization context for contextual losses.
+
+        Returns:
+            Per-position loss values, or the supplied default value.
+
+        Raises:
+            ValueError: Distillation teacher logits are absent or misaligned.
+        """
         if self.kind == "default" and default is not None:
             return default
         if self.requires_teacher and (teacher is None or teacher.shape != logits.shape):

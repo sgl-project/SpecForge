@@ -10,6 +10,18 @@ from .losses import PositionWeighting, TokenLoss
 
 @dataclass(frozen=True)
 class LossTerm:
+    """One mathematical loss with optional supervision/reduction overrides.
+
+    Attributes:
+        output: Name of the projection output consumed by this term.
+        coefficient: Multiplier applied after the term's statistics are reduced.
+        loss: Explicit loss, or None/default to inherit the runtime selection.
+        mask: Optional [units, positions] supervision mask.
+        weighting: Optional position-weighting rule.
+        denominator: Optional fixed scalar denominator for the whole prediction
+            set, not each chunk. It must not require gradients.
+    """
+
     output: str = "logits"
     coefficient: float = 1.0
     loss: TokenLoss | None = None
@@ -29,11 +41,28 @@ class LossTerm:
                 )
 
     def select(self, units):
+        """Return a term with its mask indexed along the unit dimension.
+
+        Args:
+            units: A slice or tensor index selecting complete projection units.
+
+        Returns:
+            A new LossTerm; scalar coefficients and the fixed denominator are kept.
+        """
         return replace(self, mask=None if self.mask is None else self.mask[units])
 
 
 @dataclass(frozen=True)
 class LossPlan:
+    """Loss definitions and optional ranges permitted to execute jointly.
+
+    Attributes:
+        terms: Nonempty ordered tuple of loss terms.
+        joint_groups: Non-overlapping tuples of at least two term indices.
+            These permit joint execution but do not require a particular kernel
+            or imply shared masks/denominators. Unlisted terms run independently.
+    """
+
     terms: tuple[LossTerm, ...] = (LossTerm(),)
     joint_groups: tuple[tuple[int, ...], ...] = ()
 
@@ -53,6 +82,7 @@ class LossPlan:
 
     @property
     def groups(self):
+        """Return declared joint ranges followed by ungrouped singleton tuples."""
         grouped = {index for group in self.joint_groups for index in group}
         return self.joint_groups + tuple(
             (index,) for index in range(len(self.terms)) if index not in grouped
@@ -60,10 +90,19 @@ class LossPlan:
 
     @property
     def shared_reduction(self):
+        """Return whether every term inherits the prediction's reduction inputs."""
         return all(
             term.mask is None and term.weighting is None and term.denominator is None
             for term in self.terms
         )
 
     def select(self, units):
+        """Return a plan whose per-term masks select the given complete units.
+
+        Args:
+            units: Slice or tensor index applied along the unit dimension.
+
+        Returns:
+            A new LossPlan preserving coefficients, denominators and joint ranges.
+        """
         return replace(self, terms=tuple(term.select(units) for term in self.terms))

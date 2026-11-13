@@ -15,6 +15,18 @@ from .reductions import PlanResult, combine_results
 
 @dataclass
 class Projected:
+    """Prepared supervision and a per-evaluation projection cache.
+
+    Attributes:
+        output: Named draft outputs, initially empty for lazy projection.
+        teacher: Optional teacher logits, restricted to the draft vocabulary.
+        teacher_ids: Optional teacher argmax IDs in the full target vocabulary.
+        labels: Effective loss targets, shaped [units, positions].
+        mask: Effective supervision mask, including vocabulary eligibility.
+        teacher_mass: Optional teacher probability mass retained by the draft
+            vocabulary, needed by contextual losses.
+    """
+
     output: dict
     teacher: torch.Tensor | None
     teacher_ids: torch.Tensor | None
@@ -24,6 +36,15 @@ class Projected:
 
 
 def selected_losses(predictions, loss):
+    """Resolve each term's loss against prediction and runtime defaults.
+
+    Args:
+        predictions: Prediction set containing the plan and algorithm default.
+        loss: Runtime TokenLoss selection; kind="default" uses the algorithm default.
+
+    Returns:
+        A tuple of concrete TokenLoss selections in plan term order.
+    """
     default = predictions.default_loss if loss.kind == "default" else loss
     return tuple(
         term.loss if term.loss is not None and term.loss.kind != "default" else default
@@ -32,6 +53,21 @@ def selected_losses(predictions, loss):
 
 
 def prepare_supervision(predictions, loss, weighting, execution):
+    """Resolve targets and teacher data without projecting draft logits.
+
+    Args:
+        predictions: Deferred prediction set and its supervision inputs.
+        loss: Runtime loss selection, overridden by explicit per-term losses.
+        weighting: Runtime position-weighting rule.
+        execution: Execution options, including optional tiled teacher projection.
+
+    Returns:
+        Projected supervision with an empty draft output cache. Teacher logits
+        are computed only when required; vocabulary mapping adjusts labels/masks.
+
+    Raises:
+        ValueError: Required capabilities or compact-teacher inputs are missing.
+    """
     losses = selected_losses(predictions, loss)
     required = weighting.requires | predictions.requires
     for term, selected in zip(predictions.plan.terms, losses):
@@ -64,6 +100,18 @@ def prepare_supervision(predictions, loss, weighting, execution):
 
 
 def project_predictions(predictions, loss, weighting, execution=LossExecution()):
+    """Prepare supervision and materialize the ordinary draft outputs.
+
+    Args:
+        predictions: Deferred prediction set to evaluate.
+        loss: Runtime mathematical loss selection.
+        weighting: Runtime position-weighting rule.
+        execution: Teacher-projection and execution options.
+
+    Returns:
+        Projected data containing both resolved supervision and draft outputs.
+        This path is also used to obtain complete-chain weighting statistics.
+    """
     projected = prepare_supervision(predictions, loss, weighting, execution)
     projected.output = predictions.project()
     return projected
@@ -79,6 +127,28 @@ def evaluate_predictions(
     denominator=None,
     execution=LossExecution(),
 ):
+    """Execute a prediction set and retain separate statistics per term.
+
+    Args:
+        predictions: One complete set or chunk of aligned prediction units.
+        loss: Runtime loss selection; explicit term losses take precedence.
+        weighting: Default position-weighting rule.
+        projected: Optional previously prepared/projected data to reuse.
+        weights: Optional externally prepared weights aligned with the mask,
+            used by complete-chain weighting.
+        denominator: Optional scalar contribution overriding local denominators.
+        execution: Options controlling optimized implementation selection.
+
+    Returns:
+        PlanResult with weighted, unnormalized term sums and metric counts.
+        Joint ranges may fall back to independent execution. No chunk means
+        or term coefficients are combined here.
+
+    Raises:
+        ValueError: Inputs lack required capabilities, a kernel returns the
+            wrong term indices, or auxiliary reduction contracts are unsupported.
+        RuntimeError: A selected kernel fails; errors are not silently retried.
+    """
     p = predictions
     projected = projected or prepare_supervision(p, loss, weighting, execution)
     losses = selected_losses(p, loss)
@@ -189,12 +259,15 @@ def evaluate_predictions(
 
 @dataclass
 class ChainStatistics:
+    """Detached per-position masks and acceptance probabilities."""
+
     mask: torch.Tensor
     probability: torch.Tensor
 
 
 @torch.no_grad()
 def chain_statistics(projected):
+    """Return detached chain masks/probabilities from resolved logits and labels."""
     probability = (
         projected.output["logits"]
         .float()
@@ -207,7 +280,20 @@ def chain_statistics(projected):
 
 @torch.no_grad()
 def chain_weights(predictions, projected, weighting):
-    """Balance full acceptance chains without retaining vocabulary-sized tensors."""
+    """Compute complete-chain weights before any differentiable chunk pass.
+
+    Args:
+        predictions: Aligned prediction sets with chain, sequence and position IDs.
+        projected: Matching Projected objects or detached ChainStatistics.
+        weighting: D-PACE weighting configuration.
+
+    Returns:
+        One pair of flattened (weights, denominator contributions) per set.
+        Chain contributions sum to the valid-sequence denominator.
+
+    Raises:
+        ValueError: Chain positions repeat or a chain spans multiple sequences.
+    """
     statistics = [
         value if isinstance(value, ChainStatistics) else chain_statistics(value)
         for value in projected
@@ -266,6 +352,15 @@ def chain_weights(predictions, projected, weighting):
 
 
 def prediction_slices(predictions, chunk_size):
+    """Return unit-axis slices, including one slice for an empty input.
+
+    Args:
+        predictions: Prediction set whose hidden first dimension counts units.
+        chunk_size: Maximum units per slice; zero means the entire set.
+
+    Returns:
+        A list of slices preserving whole blocks/tokens and empty gradient paths.
+    """
     length = predictions.hidden.shape[0]
     size = chunk_size or max(length, 1)
     # An empty projection keeps zero gradients connected to the model.
@@ -282,6 +377,23 @@ def evaluate_chunks(
     weights=None,
     denominator=None,
 ):
+    """Evaluate chunks and merge each term before denominator normalization.
+
+    Args:
+        predictions: Aligned prediction set and optional per-term overrides.
+        loss: Runtime loss selection.
+        weighting: Default weighting rule.
+        chunk_size: Requested units per chunk; zero disables splitting.
+        execution: Trimming, checkpointing and kernel-selection options.
+        weights: Optional externally computed per-position weights.
+        denominator: Optional per-position denominator contributions, summed
+            within each chunk and then merged across chunks.
+
+    Returns:
+        PlanResult with additive chunk statistics merged and fixed whole-set
+        denominators restored once. Contextual/unsafe projections stay unsplit;
+        unsafe replay disables checkpointing.
+    """
     contextual = any(
         selected.registration.contextual
         for selected in selected_losses(predictions, loss)
@@ -342,6 +454,23 @@ def evaluate_chunks(
 
 
 def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()):
+    """Execute a protocol's prediction batch under its reduction contract.
+
+    Args:
+        batch: PredictionBatch with prediction sets, reduction and chunk default.
+        loss: Runtime mathematical loss selection.
+        weighting: Runtime position weights or complete-chain weighting policy.
+        training: Whether global_microbatch synchronizes denominators across ranks.
+        execution: Overrides for chunking, checkpointing and optimized execution.
+
+    Returns:
+        ObjectiveResult containing the trainer loss numerator/denominator and
+        metric counts. D-PACE weights are prepared over complete chains.
+
+    Raises:
+        ValueError: The batch is empty, its reduction is unknown, or independent
+            term reductions are requested with an unsupported batch contract.
+    """
     chunk_size = (
         batch.chunk_size if execution.chunk_size is None else execution.chunk_size
     )

@@ -9,6 +9,20 @@ from .losses import _distillation, _lk
 
 
 def ce_l1_terms(logits, labels, *, fused=False, **options):
+    """Compute CE/L1 quantities used by algorithm auxiliary objectives.
+
+    Args:
+        logits: Prediction logits with vocabulary in the last dimension.
+        labels: Token IDs aligned with the logits' leading dimensions.
+        fused: Request the optimized path for nonempty supported CUDA tensors.
+        **options: Options forwarded to the CE/L1 primitive, including optional
+            teacher_logits and top_k.
+
+    Returns:
+        The CE/L1 primitive's structured result: per-position losses and any
+        requested candidate information. Unsupported inputs use its reference
+        implementation; failures of a selected fused kernel propagate.
+    """
     optimized = (
         fused
         and logits.is_cuda
@@ -29,6 +43,22 @@ def _ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
 
 
 def register_token_kernel(kind, compute):
+    """Adapt a per-position kernel to the group execution registry.
+
+    Args:
+        kind: Mathematical loss name matched by this implementation.
+        compute: Callable(logits, labels, teacher, **options) returning losses
+            shaped like labels. Contextual losses additionally receive context.
+
+    Returns:
+        The registered group executor under the name "token_" + kind. It lazily
+        projects outputs and applies position weights, but not coefficients or
+        denominator normalization.
+
+    Raises:
+        ValueError: The execution implementation name is already registered.
+    """
+
     def supports(request, group):
         p = request.predictions
         if len(group) != 1 or request.terms[group[0]].loss.kind != kind:

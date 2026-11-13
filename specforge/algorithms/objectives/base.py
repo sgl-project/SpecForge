@@ -90,6 +90,27 @@ class ObjectiveModel(nn.Module):
         projection=None,
         **options,
     ):
+        """Align algorithm output and supervision into deferred prediction units.
+
+        Args:
+            hidden: Backbone hidden states, with hidden size in the last dimension.
+            batch: Captured batch tensors; teacher logits or hidden states are optional.
+            teacher_positions: Indices used to gather teacher supervision.
+            mask: Supervision weights/eligibility aligned with the prediction positions.
+            labels: Optional hard token targets aligned with mask.
+            positions: Optional position/depth values used by weighting.
+            unit_size: Number of positions in each indivisible projection unit.
+            chain_ids: Optional acceptance-chain IDs broadcastable to the unit layout.
+            sequence_ids: Optional source-sequence IDs broadcastable to mask.
+            projection_inputs: Extra aligned tensors passed to the projection.
+            auxiliary_inputs: Extra aligned tensors consumed by algorithm auxiliaries.
+            projection: Optional adapter; defaults to the draft's ordinary project.
+            **options: Remaining Predictions fields, such as plan and denominator.
+
+        Returns:
+            Predictions with tensors aligned to [units, positions, ...]. Draft
+            projection is deferred; teacher data is gathered but not projected.
+        """
         from .inputs import gather
         from .predictions import Predictions, Teacher
         from .projection import Projection
@@ -139,6 +160,17 @@ class ObjectiveModel(nn.Module):
         )
 
     def block_predictions(self, output, blocks, batch, **options):
+        """Build deferred predictions for complete algorithm proposal blocks.
+
+        Args:
+            output: Draft forward output containing hidden_states.
+            blocks: Prepared tokens, labels, masks and teacher positions.
+            batch: Captured batch inputs used to gather teacher data.
+            **options: Projection, loss plan and other prediction overrides.
+
+        Returns:
+            Predictions preserving the configured number of model slots per block.
+        """
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
         return self.predictions(
