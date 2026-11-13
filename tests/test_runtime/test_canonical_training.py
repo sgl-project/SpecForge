@@ -13,7 +13,10 @@ from transformers import Qwen3Config
 from specforge.application.composition import build_application_run, resolve_run
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
+from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.loading import load_draft
+from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
 from specforge.training.strategies.base import StepContext
@@ -22,6 +25,7 @@ from tests.test_algorithms.test_objectives import configurations, training_batch
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
 from tests.test_modeling.test_canonical_peagle import model_config as peagle_config
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 
 def target_directory(root):
@@ -60,7 +64,77 @@ def run_config(target, draft, **updates):
     return Config.model_validate(raw)
 
 
+def write_features(root, draft):
+    torch.manual_seed(0)
+    features = root / "features"
+    features.mkdir()
+    for index in range(2):
+        batch = training_batch(draft)
+        torch.save(
+            {
+                key: batch[key][0].detach()
+                for key in (
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                    "target_last_hidden_states",
+                )
+            },
+            features / f"{index}.ckpt",
+        )
+
+
+def moe_draft_config(intermediate_size=16):
+    node = moe_spec(
+        experts=expert_spec(intermediate_size),
+        shared_expert=expert_spec(16),
+        shared_expert_gate=True,
+        router=router_spec(expert_bias=True),
+    )
+    return draft_config(
+        mlp_configs={
+            "dense": DenseFFNSpec(intermediate_size=64, hidden_act="silu"),
+            "moe": node,
+        },
+        layer_configs={
+            "full_dense": LayerSpec(attention="full", mlp="dense"),
+            "full_moe": LayerSpec(attention="full", mlp="moe"),
+        },
+        layer_types=("full_dense", "full_moe"),
+    )
+
+
+def moe_run_config(target, draft, kernel):
+    return run_config(
+        target,
+        draft,
+        model={
+            "target_model_path": str(target),
+            "torch_dtype": "float32",
+            "moe_experts_kernel": kernel,
+        },
+        training={
+            "attention_backend": "eager",
+            "max_steps": 1,
+            "total_steps": 2,
+            "save_interval": 1,
+            "log_interval": 1,
+            "objective_options": {"num_anchors": 2},
+        },
+    )
+
+
 class CanonicalTrainingTest(unittest.TestCase):
+    def _init_group(self, root):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "nccl" if torch.cuda.is_available() else "gloo",
+                init_method=f"file://{root / 'rendezvous'}",
+                rank=0,
+                world_size=1,
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
     def test_mtp_training_requires_explicit_initialization(self):
         from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
 
@@ -355,15 +429,7 @@ class CanonicalTrainingTest(unittest.TestCase):
     def _train_and_resume(self, tied, mtp=False):
         with TemporaryDirectory() as temp:
             root = Path(temp)
-            owns_group = not torch.distributed.is_initialized()
-            if owns_group:
-                torch.distributed.init_process_group(
-                    "nccl" if torch.cuda.is_available() else "gloo",
-                    init_method=f"file://{root / 'rendezvous'}",
-                    rank=0,
-                    world_size=1,
-                )
-                self.addCleanup(torch.distributed.destroy_process_group)
+            self._init_group(root)
             target = target_directory(root)
             draft = draft_config(
                 tie_word_embeddings=tied,
@@ -391,22 +457,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 }
                 tables = load_file(target / "model.safetensors")
                 save_file(tables | native, target / "model.safetensors")
-            features = root / "features"
-            features.mkdir()
-            for index in range(2):
-                batch = training_batch(draft)
-                torch.save(
-                    {
-                        key: batch[key][0].detach()
-                        for key in (
-                            "input_ids",
-                            "loss_mask",
-                            "hidden_states",
-                            "target_last_hidden_states",
-                        )
-                    },
-                    features / f"{index}.ckpt",
-                )
+            write_features(root, draft)
             cfg = run_config(
                 target,
                 draft,
@@ -481,6 +532,90 @@ class CanonicalTrainingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
+
+    def _train_and_resume_moe(self, root, kernel):
+        self._init_group(root)
+        target = target_directory(root)
+        draft = moe_draft_config()
+        write_features(root, draft)
+        cfg = moe_run_config(target, draft, kernel)
+        build_application_run(cfg).run()
+        checkpoint = root / "output" / "specforge-run-step1"
+        model = load_draft(checkpoint, target=target, dtype=torch.float32)
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        bias = layer.gate.expert_bias
+        self.assertEqual(bias.dtype, torch.float32)
+        self.assertEqual(torch.count_nonzero(bias).item(), 0)
+        before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        raw = cfg.model_dump()
+        raw.update(draft=None, resume=str(checkpoint))
+        raw["training"]["max_steps"] = 2
+        build_application_run(Config.model_validate(raw)).run()
+        final = root / "output" / "specforge-run-step2"
+        state = torch.load(
+            final / "training_state.pt", map_location="cpu", weights_only=True
+        )
+        self.assertEqual(state["global_step"], 2)
+        self.assertEqual(state["canonical_moe_experts_kernel"], kernel)
+        trained = state["draft_state_dict"]
+        for suffix in ("gate.weight", "experts.gate_up_proj", "experts.down_proj"):
+            name = next(key for key in trained if key.endswith(suffix))
+            self.assertFalse(torch.equal(before[name], trained[name]), name)
+            self.assertTrue(torch.isfinite(trained[name]).all(), name)
+        bias_key = next(key for key in trained if key.endswith("gate.expert_bias"))
+        self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
+        # The kernel is part of the resume contract, like the Liger choice.
+        other = next(name for name in EXPERT_KERNELS if name != kernel)
+        raw["model"]["moe_experts_kernel"] = other
+        raw["training"]["max_steps"] = 3
+        with self.assertRaisesRegex(ValueError, "canonical_moe_experts_kernel"):
+            build_application_run(Config.model_validate(raw)).run()
+
+    def test_dense_drafts_record_no_expert_kernel_and_resume_with_either_name(self):
+        """Dense drafts write the contract pre-MoE runs wrote, so their checkpoints still resume."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_group(root)
+            target = target_directory(root)
+            draft = draft_config()
+            write_features(root, draft)
+            cfg = run_config(
+                target,
+                draft,
+                model={"target_model_path": str(target), "torch_dtype": "float32"},
+                training={
+                    "attention_backend": "eager",
+                    "max_steps": 1,
+                    "total_steps": 2,
+                    "save_interval": 1,
+                    "log_interval": 1,
+                    "objective_options": {"num_anchors": 2},
+                },
+            )
+            build_application_run(cfg).run()
+            checkpoint = root / "output" / "specforge-run-step1"
+            state = torch.load(
+                checkpoint / "training_state.pt", map_location="cpu", weights_only=True
+            )
+            self.assertNotIn("canonical_moe_experts_kernel", state)
+            raw = cfg.model_dump()
+            raw.update(draft=None, resume=str(checkpoint))
+            raw["model"]["moe_experts_kernel"] = "loop"
+            raw["training"]["max_steps"] = 2
+            build_application_run(Config.model_validate(raw)).run()
+            final = torch.load(
+                root / "output" / "specforge-run-step2" / "training_state.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertEqual(final["global_step"], 2)
+            self.assertNotIn("canonical_moe_experts_kernel", final)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
+    def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
+        for kernel in sorted(EXPERT_KERNELS):
+            with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
+                self._train_and_resume_moe(Path(temp), kernel)
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model
