@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -9,6 +11,9 @@ import torch.nn.functional as F
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.fused_loss import ce_l1_loss
+
+if TYPE_CHECKING:
+    from specforge.modeling.draft.dspine import DSpineConfig
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
@@ -21,9 +26,16 @@ class OnlineDSpineModel(OnlineDFlashModel):
         self.embed_tokens.requires_grad_(False)
         if self.block_size != self.draft_model.block_size:
             raise ValueError("DSpine training block_size must match the draft")
-        self.dspine_config = self.draft_model.dspine_config
         if not self.draft_model.transfer_ready.item():
             self.draft_model.initialize_transfer_space(self.lm_head.weight)
+
+    @property
+    def dspine_config(self) -> DSpineConfig:
+        return self.draft_model.dspine_config
+
+    @dspine_config.setter
+    def dspine_config(self, value: DSpineConfig) -> None:
+        self.draft_model.dspine_config = value
 
     def _ce_terms(
         self,
