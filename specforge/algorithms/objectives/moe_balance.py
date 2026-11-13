@@ -11,6 +11,8 @@ from specforge.modeling.draft.layers.mlp import MoEFFN
 
 # The load the auxiliary loss balances: this forward's, or the step's so far over ranks.
 AUX_LOSS_TYPES = ("microbatch_wise", "batch_wise")
+# The options that join a resume contract only while balancing is on.
+BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_coef", "aux_loss_type")
 
 
 def check_aux_loss_type(value: str) -> None:
@@ -18,6 +20,15 @@ def check_aux_loss_type(value: str) -> None:
         raise ValueError(
             f"invalid aux_loss_type: {value!r}; expected one of {AUX_LOSS_TYPES}"
         )
+
+
+def contract_options(options: dict) -> dict:
+    """The objective options a resume contract records; off balancing writes what pre-MoE runs wrote."""
+    if options.get("bias_update_rate") or options.get("aux_loss_coef"):
+        return options
+    return {
+        key: value for key, value in options.items() if key not in BALANCING_OPTIONS
+    }
 
 
 def count_tokens_per_expert(

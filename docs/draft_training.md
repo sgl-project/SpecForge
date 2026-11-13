@@ -235,7 +235,7 @@ configuration and is recorded in the training resume contract.
 accepts only when `hidden_size` and the expert `intermediate_size` are multiples
 of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
 device. Startup probes the chosen kernel on every MoE layer and fails rather
-than falling back; the choice is recorded in the training resume contract.
+than falling back; MoE drafts record the choice in the training resume contract.
 
 A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
 holds the expert count, top-k, an `experts` sub-node (per-expert

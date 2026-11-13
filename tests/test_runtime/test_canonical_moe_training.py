@@ -1,4 +1,4 @@
-"""A MoE draft trains through the canonical trainer, checkpoints its bias, and resumes."""
+"""MoE drafts train, checkpoint and resume; dense checkpoints from before stay resumable."""
 
 import unittest
 from pathlib import Path
@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 
+from specforge.algorithms.objectives.moe_balance import BALANCING_OPTIONS
 from specforge.application.composition import build_application_run
 from specforge.config import Config
 from specforge.config.draft.layer import LayerSpec
@@ -142,6 +143,58 @@ class CanonicalMoETrainingTest(unittest.TestCase):
         raw["training"]["max_steps"] = 3
         with self.assertRaisesRegex(ValueError, "canonical_moe_experts_kernel"):
             build_application_run(Config.model_validate(raw)).run()
+        # Balancing joins the contract only while on; switching it either way is a change.
+        raw["model"]["moe_experts_kernel"] = kernel
+        raw["training"]["objective_options"].update(
+            bias_update_rate=0.0 if bias_update_rate else 0.001, aux_loss_coef=0.0
+        )
+        with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+            build_application_run(Config.model_validate(raw)).run()
+
+    def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
+        """A dense run's contract is what pre-MoE runs wrote, whatever kernel or off balancing it names."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            draft = draft_config()
+            write_features(root, draft)
+            cfg = run_config(
+                target,
+                draft,
+                model={"target_model_path": str(target), "torch_dtype": "float32"},
+                training={
+                    "attention_backend": "eager",
+                    "max_steps": 1,
+                    "total_steps": 2,
+                    "save_interval": 1,
+                    "log_interval": 1,
+                    "objective_options": {"num_anchors": 2},
+                },
+            )
+            build_application_run(cfg).run()
+            checkpoint = root / "output" / "specforge-run-step1"
+            state = torch.load(
+                checkpoint / "training_state.pt", map_location="cpu", weights_only=True
+            )
+            self.assertNotIn("canonical_moe_experts_kernel", state)
+            self.assertTrue(
+                set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
+            )
+            raw = cfg.model_dump()
+            raw.update(draft=None, resume=str(checkpoint))
+            raw["model"]["moe_experts_kernel"] = "loop"
+            raw["training"]["max_steps"] = 2
+            raw["training"]["objective_options"].update(
+                aux_loss_coef=0.0, aux_loss_type="microbatch_wise"
+            )
+            build_application_run(Config.model_validate(raw)).run()
+            final = torch.load(
+                root / "output" / "specforge-run-step2" / "training_state.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertEqual(final["global_step"], 2)
+            self.assertNotIn("canonical_moe_experts_kernel", final)
 
     def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
         # grouped_mm also balances: the bias moves, is saved and moves again after resume.
