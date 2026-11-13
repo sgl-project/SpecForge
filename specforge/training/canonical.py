@@ -536,6 +536,7 @@ def build_bundle(cfg, algorithm):
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
     from specforge.modeling.draft.layers.kernels import configure_kernels
+    from specforge.modeling.draft.layers.mlp import MoEFFN
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
 
@@ -642,7 +643,9 @@ def build_bundle(cfg, algorithm):
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
     use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(model, use_liger=use_liger)
+    configure_kernels(
+        model, use_liger=use_liger, moe_experts_kernel=cfg.model.moe_experts_kernel
+    )
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -678,6 +681,9 @@ def build_bundle(cfg, algorithm):
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),
     }
+    if any(isinstance(module, MoEFFN) for module in model.modules()):
+        # Dense drafts never record the kernel, so their earlier checkpoints still resume.
+        contract["canonical_moe_experts_kernel"] = cfg.model.moe_experts_kernel
     from specforge.training.provenance import model_resume_provenance
 
     provenance = model_resume_provenance(

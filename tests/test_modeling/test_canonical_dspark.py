@@ -1,8 +1,10 @@
 """Full DSpark composition preserves head math and recurrent block boundaries."""
 
 import copy
+import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
@@ -13,9 +15,12 @@ from specforge.config.draft.architecture.dspark import (
     ConfidenceHeadSpec,
     MarkovHeadSpec,
 )
+from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.dspark import DSparkDraftModel as LegacyDSparkDraftModel
 from specforge.modeling.draft.layers.inputs import LayerInputs
+from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.modeling.draft.models import DSparkDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_dspark_spec import dspark_spec
@@ -23,6 +28,7 @@ from tests.test_modeling.legacy_fixtures import legacy_dflash_config
 from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 from tests.test_modeling.test_draft_gqa import layout_for
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 
 def model_config(kind="rnn", *, confidence=True, with_markov=True, bound=False):
@@ -48,6 +54,32 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
         for _ in config.layer_types
     ]
     return (ids, features, entries), torch.randint(64, (2, 8), device=device)
+
+
+def moe_model_config(expert_bias=True):
+    """A dense layer followed by a MoE layer, as drafts of DeepSeek-style targets."""
+    node = moe_spec(
+        experts=expert_spec(16),
+        shared_expert=expert_spec(16),
+        shared_expert_gate=True,
+        router=router_spec(expert_bias=expert_bias),
+    )
+    return replace(
+        model_config(),
+        mlp_configs={
+            "dense": DenseFFNSpec(intermediate_size=64, hidden_act="silu"),
+            "moe": node,
+        },
+        layer_configs={
+            "full_dense": LayerSpec(attention="full", mlp="dense"),
+            "full_moe": LayerSpec(attention="full", mlp="moe"),
+        },
+        layer_types=("full_dense", "full_moe"),
+    )
+
+
+def moe_layers(model):
+    return [module for module in model.modules() if isinstance(module, MoEFFN)]
 
 
 class CanonicalDSparkTest(unittest.TestCase):
@@ -245,6 +277,68 @@ class CanonicalDSparkTest(unittest.TestCase):
         )
         tied = build_draft_model(replace(config, tie_word_embeddings=True))
         self.assertIs(tied.embed_tokens.weight, tied.lm_head.weight)
+
+    def test_moe_layer_build_forward_backward_and_activation_checkpointing(self):
+        config = moe_model_config()
+        model = build_draft_model(config)
+        (layer,) = moe_layers(model)
+        self.assertIs(layer.config, config.mlp_configs["moe"])
+        checkpointed = copy.deepcopy(model)
+        checkpointed.gradient_checkpointing_enable()
+        args, previous = model_inputs(config)
+        output = model(*args, predecessor_ids=previous)
+        expected = checkpointed(*args, predecessor_ids=previous)
+        torch.testing.assert_close(
+            (expected.logits, expected.confidence_scores),
+            (output.logits, output.confidence_scores),
+            rtol=0,
+            atol=0,
+        )
+        (output.logits.sum() + output.confidence_scores.sum()).backward()
+        (expected.logits.sum() + expected.confidence_scores.sum()).backward()
+        others = dict(checkpointed.named_parameters())
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            self.assertIsNotNone(parameter.grad, name)
+            torch.testing.assert_close(
+                parameter.grad, others[name].grad, rtol=0, atol=0
+            )
+
+    def test_moe_restore_keeps_the_fp32_expert_bias_and_checks_the_node(self):
+        config = moe_model_config()
+        model = build_draft_model(config)
+        (layer,) = moe_layers(model)
+        with torch.no_grad():
+            layer.gate.expert_bias.copy_(torch.tensor([0.5, -0.25, 0.0, 0.125]))
+        args, previous = model_inputs(config)
+        output = model(*args, predecessor_ids=previous).logits
+        with TemporaryDirectory() as path:
+            model.save_pretrained(path)
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(dtype=dtype):
+                    restored = DSparkDraftModel.from_pretrained(path, dtype=dtype)
+                    (restored_layer,) = moe_layers(restored)
+                    self.assertEqual(restored_layer.gate.weight.dtype, dtype)
+                    self.assertEqual(
+                        restored_layer.gate.expert_bias.dtype, torch.float32
+                    )
+                    torch.testing.assert_close(
+                        restored_layer.gate.expert_bias,
+                        layer.gate.expert_bias,
+                        rtol=0,
+                        atol=0,
+                    )
+                    if dtype == torch.float32:
+                        result = restored(*args, predecessor_ids=previous).logits
+                        torch.testing.assert_close(result, output, rtol=0, atol=0)
+            # A node without the bias rejects a checkpoint that carries one.
+            config_path = Path(path, "config.json")
+            payload = json.loads(config_path.read_text())
+            payload["mlp_configs"]["moe"]["router"]["expert_bias"] = False
+            config_path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, "unexpected_keys"):
+                DSparkDraftModel.from_pretrained(path)
 
 
 if __name__ == "__main__":

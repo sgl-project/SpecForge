@@ -243,7 +243,7 @@ def resolve_draft_config(
 def preflight_draft_kernels(
     cfg: "Config", *, algorithm: "AlgorithmRegistration"
 ) -> None:
-    """Import the Liger kernels this host's trainer draft build will resolve.
+    """Check the kernels this host's trainer draft build will resolve.
 
     A supervisor about to start services or workers, and a disaggregated
     consumer about to wait on its producer, call this so a missing install
@@ -253,6 +253,13 @@ def preflight_draft_kernels(
     from specforge.training.canonical import enabled
 
     if enabled(cfg):
+        from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS
+
+        if cfg.model.moe_experts_kernel not in EXPERT_KERNELS:
+            raise ValueError(
+                f"unknown model.moe_experts_kernel {cfg.model.moe_experts_kernel!r}; "
+                f"expected one of {sorted(EXPERT_KERNELS)}"
+            )
         if cfg.model.use_liger_kernel is True:
             from specforge.modeling.draft.layers.kernels import load_liger_kernels
 
