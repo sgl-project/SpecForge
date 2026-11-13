@@ -1,4 +1,4 @@
-"""MoEFFN composing the router and experts; its checkpoint layout and registration."""
+"""MoEFFN composing the router and experts, and its registration."""
 
 import torch
 from torch import Tensor, nn
@@ -7,24 +7,9 @@ from specforge.config.draft._validation import positive_int
 from specforge.config.draft.mlp import MoEFFNSpec
 
 from ...inputs import ExpertRouting, MoEOutput
-from ...layout import ComponentLayout, StackedParameter
-from ...registry import register_component_builder, register_component_layout
+from ...registry import register_component_builder
 from .experts import RoutedExperts, SharedExpert
 from .router import TopKRouter
-
-# Checkpoint layout: fused experts split into Transformers' per-expert tensor names.
-MOE_LAYOUT = ComponentLayout(
-    fused={
-        "experts.gate_up_proj": StackedParameter(
-            parts=("experts.{e}.gate_proj.weight", "experts.{e}.up_proj.weight"),
-            dim=0,
-        ),
-        "experts.down_proj": StackedParameter(
-            parts=("experts.{e}.down_proj.weight",), dim=0
-        ),
-    },
-    count="num_experts",
-)
 
 
 class MoEFFN(nn.Module):
@@ -87,4 +72,3 @@ class MoEFFN(nn.Module):
 
 
 register_component_builder("mlp", MoEFFNSpec, MoEFFN)
-register_component_layout("mlp", MoEFFNSpec, MOE_LAYOUT)

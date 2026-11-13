@@ -1,16 +1,12 @@
 """Computational builders, separate from configuration schema registration."""
 
 from collections.abc import Callable
-from dataclasses import fields
 
 from torch import nn
 
 from specforge.config.draft.registry import component_schema, component_type
 
-from .layout import ComponentLayout
-
 _BUILDERS: dict[tuple[str, str], Callable[..., nn.Module]] = {}
-_LAYOUTS: dict[tuple[str, str], ComponentLayout] = {}
 
 
 def register_component_builder(
@@ -38,29 +34,6 @@ def component_builder(kind: str, name: str) -> Callable[..., nn.Module]:
         return _BUILDERS[kind, name]
     except KeyError:
         raise ValueError(f"no modeling builder registered for {kind}/{name}") from None
-
-
-def register_component_layout(kind: str, schema: type, layout: ComponentLayout) -> None:
-    """Declare a built component's fused-parameter layout; `count` must be a node field."""
-    name = component_type(kind, schema)
-    if component_schema(kind, name) is not schema:
-        raise ValueError(f"{kind}/{name}: layout must use the registered node schema")
-    component_builder(kind, name)
-    if not isinstance(layout, ComponentLayout):
-        raise TypeError("component layout must be a ComponentLayout")
-    if layout.count not in {field.name for field in fields(schema)}:
-        raise ValueError(f"{kind}/{name}: {layout.count!r} is not a node field")
-    key = (kind, name)
-    existing = _LAYOUTS.get(key)
-    if existing is not None and existing != layout:
-        raise ValueError(f"component layout {kind}/{name} is already registered")
-    _LAYOUTS[key] = layout
-
-
-def component_layout(kind: str, name: str) -> ComponentLayout | None:
-    """The declared layout, or None for components stored tensor for tensor."""
-    component_schema(kind, name)
-    return _LAYOUTS.get((kind, name))
 
 
 def build_component(kind: str, config, **dimensions) -> nn.Module:
