@@ -49,7 +49,11 @@ class CheckpointManager:
         self.best_min_delta = best_min_delta
         self.best_score: Optional[float] = None
         self.best_step: Optional[int] = None
+        # Steps pinned as permanent milestones (e.g. epoch-end): rotation never
+        # deletes them. Persisted so a restart keeps honoring them.
+        self._pinned_steps: set[int] = set()
         self._load_best_meta()
+        self._load_pinned()
 
     # -- layout ------------------------------------------------------------
     def checkpoint_dir(self, step: int) -> str:
@@ -66,6 +70,10 @@ class CheckpointManager:
     def _best_meta_path(self) -> str:
         return os.path.join(self.output_dir, f"{self.run_id}.best_meta.json")
 
+    @property
+    def _pinned_meta_path(self) -> str:
+        return os.path.join(self.output_dir, f"{self.run_id}.pinned_steps.json")
+
     # -- save --------------------------------------------------------------
     def save(
         self,
@@ -73,11 +81,14 @@ class CheckpointManager:
         step: int,
         *,
         rank_state: Optional[Dict[str, Any]] = None,
+        pin: bool = False,
     ) -> str:
         """Write ``step``'s checkpoint, first deleting any on-disk steps >= step
         (fork/rollback semantics), then repoint ``{run_id}-latest`` and rotate.
         ``state`` is the shared payload (rank0 writes it); ``rank_state`` is
         written by every rank. Collective: any rank's failure raises on all ranks.
+        ``pin=True`` marks ``step`` a permanent milestone that rotation never
+        deletes (recorded before rotate so it survives this and future passes).
         """
         ckpt_dir = self.checkpoint_dir(step)
         err = ""
@@ -114,9 +125,19 @@ class CheckpointManager:
         self._all_ok(err)
         if self.is_rank0():
             self._point(f"{self.run_id}-latest", ckpt_dir)
+            if pin:
+                self._pin(step)
             self._rotate(keep_step=step)
         self._barrier()  # no rank proceeds before the checkpoint is complete
         return ckpt_dir
+
+    def _pin(self, step: int) -> None:
+        """Record ``step`` as a permanent milestone (rank0); persist so rotation
+        keeps honoring it across restarts."""
+        if step in self._pinned_steps:
+            return
+        self._pinned_steps.add(step)
+        self._save_pinned()
 
     def _rewind(self, step: int) -> None:
         # Fork semantics: saving step S invalidates on-disk steps >= S, including
@@ -139,6 +160,11 @@ class CheckpointManager:
                     os.remove(path)
                 except OSError:
                     pass  # best-effort: reload ignores meta whose step dir is gone
+        # Pinned milestones inside the rewound range are gone with their dirs.
+        dropped = {s for s in self._pinned_steps if s >= step}
+        if dropped:
+            self._pinned_steps -= dropped
+            self._save_pinned()
 
     def _all_ok(self, err: str) -> None:
         # Barrier replacement: every rank learns every rank's outcome, so one
@@ -458,13 +484,53 @@ class CheckpointManager:
             return
         dirs = sorted(self._all_checkpoints())
         for step, path in dirs[: -self.max_checkpoints]:
-            if step == self.best_step or step == keep_step:
+            if (
+                step == self.best_step
+                or step == keep_step
+                or step in self._pinned_steps
+            ):
                 continue
             try:
                 shutil.rmtree(path)
             except OSError as exc:
                 # Never raise between collectives; a leftover dir is harmless.
                 logger.warning("rotation could not remove %s: %s", path, exc)
+
+    # -- pinned milestones -------------------------------------------------
+    def _save_pinned(self) -> None:
+        if not self._pinned_steps:
+            try:
+                os.remove(self._pinned_meta_path)
+            except OSError:
+                pass
+            return
+        self._atomic_json(
+            {"run_id": self.run_id, "steps": sorted(self._pinned_steps)},
+            self._pinned_meta_path,
+        )
+
+    def _load_pinned(self) -> None:
+        # Rehydrate pins so a restart does not rotate away epoch milestones.
+        # Keep only steps whose checkpoint is still complete on disk.
+        try:
+            with open(self._pinned_meta_path) as fh:
+                meta = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "ignoring unreadable pinned meta %s: %s", self._pinned_meta_path, exc
+            )
+            return
+        if meta.get("run_id") != self.run_id or not isinstance(meta.get("steps"), list):
+            logger.warning("ignoring pinned meta %s: malformed", self._pinned_meta_path)
+            return
+        self._pinned_steps = {
+            int(s)
+            for s in meta["steps"]
+            if isinstance(s, int)
+            and os.path.isfile(self._state_path(self.checkpoint_dir(int(s))))
+        }
 
     def _step_dirs(self) -> Iterator[Tuple[int, str]]:
         # Raw {run_id}-step{N} dirs, complete or not (rewind must see both).
