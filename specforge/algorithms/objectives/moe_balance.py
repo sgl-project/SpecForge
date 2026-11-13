@@ -50,14 +50,19 @@ def balance_from_terms(mean_probs, load) -> Tensor:
 
 @dataclass(frozen=True)
 class MoEBalanceTerm:
-    """A forward's halves of the load-balance loss per layer; the trainer adds the load."""
+    """A forward's halves of the load-balance loss per layer; its balancer adds the load."""
 
     mean_probs: tuple[Tensor, ...]  # per layer [num_experts] P_e, differentiable
     counts: tuple[Tensor, ...]  # per layer [num_experts] int64 kept tokens per expert
+    balancer: "MoEBalancer"
+
+    def finish(self, result, *, pooled: bool, process_group=None):
+        """The DeferredTerm contract: the balancer folds this term into the loss."""
+        return self.balancer.finish(result, pooled=pooled, process_group=process_group)
 
 
 class MoEBalancer:
-    """Per-step routed-token counts, the bias update at the step, and the auxiliary loss."""
+    """The objectives' StepStatistics for MoE drafts: counts, the bias step, the aux loss."""
 
     def __init__(
         self,
@@ -139,11 +144,11 @@ class MoEBalancer:
                 counts.append(tokens)
         if not self.aux_loss_coef:
             return None
-        return MoEBalanceTerm(tuple(mean_probs), tuple(counts))
+        return MoEBalanceTerm(tuple(mean_probs), tuple(counts), self)
 
     def finish(self, result, *, pooled: bool, process_group=None):
         """Fold the term into the loss (moe/aux_loss); `pooled` lets batch_wise sum over ranks."""
-        term = result.balance
+        term = result.deferred
         if term is None:
             return result
         load = term.counts
@@ -158,7 +163,7 @@ class MoEBalancer:
             **result.ratios,
             "moe/aux_loss": (value.detach(), result.denominator.new_ones(())),
         }
-        return replace(result, numerator=numerator, ratios=ratios, balance=None)
+        return replace(result, numerator=numerator, ratios=ratios, deferred=None)
 
     def step(self, *, process_group=None) -> dict[str, Tensor]:
         """At the optimizer step: pool the window's counts over ranks, move the biases, reset."""

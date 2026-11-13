@@ -237,5 +237,5 @@ def execute_batch(batch, loss, weighting, *, training):
         result = microbatch_mean(result, global_denominator=training)
     elif batch.reduction not in ("tokens", "sum_means"):
         raise ValueError(f"unknown protocol reduction: {batch.reduction!r}")
-    result.balance = batch.balance
+    result.deferred = batch.deferred
     return result

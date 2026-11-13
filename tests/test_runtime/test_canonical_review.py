@@ -43,7 +43,7 @@ class CanonicalReviewTest(unittest.TestCase):
 
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
-        runtime.balancer = None  # no MoE balancing in this fake
+        runtime.statistics = None  # no per-forward statistics in this fake
         runtime.draft_model = torch.nn.Linear(1, 1)
         runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
@@ -51,6 +51,7 @@ class CanonicalReviewTest(unittest.TestCase):
             "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
         }
         result = SimpleNamespace(
+            deferred=None,  # nothing left for the strategy to finish
             loss=torch.tensor(1.0),
             ratios=ratios,
             numerator=torch.tensor(1.0),

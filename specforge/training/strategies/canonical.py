@@ -21,7 +21,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.window_statistic = inner.registration.training.window_statistic
         self.host_inputs = inner.registration.training.host_inputs
         self.draft_config = inner.draft_model.config.draft
-        self.balancer = inner.balancer  # MoE load balancing, when the options enable it
+        self.statistics = (
+            inner.statistics
+        )  # stepped and pooled here, not in the objective
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
@@ -33,9 +35,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         return self.model
 
     def after_step(self, *, process_group=None):
-        if self.balancer is None:
+        if self.statistics is None:
             return {}
-        return self.balancer.step(process_group=process_group)
+        return self.statistics.step(process_group=process_group)
 
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
@@ -72,9 +74,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
                 else {}
             ),
         )
-        if self.balancer is not None:
+        if result.deferred is not None:
             # The objective's term is unfinished: pooling over ranks is the strategy's, as above.
-            result = self.balancer.finish(
+            result = result.deferred.finish(
                 result,
                 pooled=self.model.training and torch.is_grad_enabled(),
                 process_group=ctx.process_group,

@@ -78,5 +78,5 @@ class DFlashObjective:
         )
         predictions = runtime.block_predictions(output, blocks, batch)
         return PredictionBatch(
-            (predictions,), balance=runtime.balance_term(output, blocks)
+            (predictions,), deferred=runtime.deferred_term(output, blocks)
         )

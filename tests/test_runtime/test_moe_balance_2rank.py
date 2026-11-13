@@ -43,18 +43,18 @@ def _worker(rank, world_size):
     torch.manual_seed(100 + rank)  # different tokens on each rank
     batch = training_batch(config, device="cuda")
     runtime(batch, step=0, total_steps=2).loss.backward()
-    (counts,) = runtime.balancer.counts
+    (counts,) = runtime.statistics.counts
     gathered = [torch.empty_like(counts) for _ in range(world_size)]
     dist.all_gather(gathered, counts)
     assert not torch.equal(gathered[0], gathered[1]), "ranks routed alike"
     pooled = torch.stack(gathered).sum(0)
 
-    metrics = runtime.balancer.step(process_group=dist.group.WORLD)  # one all-reduce
+    metrics = runtime.statistics.step(process_group=dist.group.WORLD)  # one all-reduce
     load = pooled.float()
     delta = RATE * torch.sign(load.mean() - load)
     torch.testing.assert_close(layer.gate.expert_bias, delta - delta.mean())
     torch.testing.assert_close(metrics["moe/step_balance"], dispatch_balance(pooled))
-    assert runtime.balancer.counts == [None]
+    assert runtime.statistics.counts == [None]
     biases = [torch.empty_like(layer.gate.expert_bias) for _ in range(world_size)]
     dist.all_gather(biases, layer.gate.expert_bias)
     for other in biases:
@@ -75,7 +75,7 @@ def _worker(rank, world_size):
             },
             target_head=head,
         )
-        balancer, seen = balanced.balancer, []
+        balancer, seen = balanced.statistics, []
         observe = balancer.observe
 
         def record(output, *, keep):  # the routing and keep mask each forward hands in
@@ -97,7 +97,7 @@ def _worker(rank, world_size):
                 )
             result = balanced(batch, step=0, total_steps=2)
             finished = balancer.finish(
-                ObjectiveResult(zero, one, {}, result.balance),
+                ObjectiveResult(zero, one, {}, result.deferred),
                 pooled=True,
                 process_group=dist.group.WORLD,
             )

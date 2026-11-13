@@ -133,5 +133,5 @@ class DSparkObjective:
         return PredictionBatch(
             (predictions,),
             reduction="global_microbatch",
-            balance=runtime.balance_term(output, blocks),
+            deferred=runtime.deferred_term(output, blocks),
         )

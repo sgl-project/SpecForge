@@ -69,14 +69,14 @@ class MoEBalanceTest(unittest.TestCase):
         runtime = build_objective_model(
             build_draft_model(moe_model_config()), options={"num_anchors": 2}
         )
-        self.assertIsNone(runtime.balancer)
+        self.assertIsNone(runtime.statistics)
         # The auxiliary loss alone needs no expert bias.
         runtime = build_objective_model(
             build_draft_model(moe_model_config(expert_bias=False)),
             options={"num_anchors": 2, "aux_loss_coef": 0.01},
         )
-        self.assertEqual(runtime.balancer.rate, 0.0)
-        self.assertEqual(runtime.balancer.aux_loss_type, "batch_wise")
+        self.assertEqual(runtime.statistics.rate, 0.0)
+        self.assertEqual(runtime.statistics.aux_loss_type, "batch_wise")
 
     def test_a_step_pools_the_window_and_moves_each_bias_zero_mean(self):
         config = moe_model_config()
@@ -88,7 +88,7 @@ class MoEBalanceTest(unittest.TestCase):
                 32, config.vocab_size, bias=False
             ),  # DSpark's teacher
         )
-        balancer = runtime.balancer
+        balancer = runtime.statistics
         self.assertIsInstance(balancer, MoEBalancer)
         self.assertEqual(balancer.step(), {})  # nothing observed yet
         (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
@@ -149,9 +149,9 @@ class MoEBalanceTest(unittest.TestCase):
                     },
                     target_head=head,
                 )
-                self.assertIsNone(plain.balancer)
+                self.assertIsNone(plain.statistics)
                 self.assertIn("expert_routing", runtime.registration.provides)
-                balancer = runtime.balancer
+                balancer = runtime.statistics
                 self.assertEqual(len(balancer.layers), len(config.layer_types))
                 torch.manual_seed(1)
                 base = plain(batch, step=1, total_steps=10)
@@ -160,7 +160,7 @@ class MoEBalanceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unfinished"):
                     result.loss
                 self.assertEqual(
-                    [tuple(c.shape) for c in result.balance.counts],
+                    [tuple(c.shape) for c in result.deferred.counts],
                     [(4,)] * len(config.layer_types),
                 )
                 finished = balancer.finish(result, pooled=True)
@@ -197,10 +197,10 @@ class MoEBalanceTest(unittest.TestCase):
         )
         torch.manual_seed(0)
         result = runtime(training_batch(config), step=0, total_steps=2)
-        term = result.balance
+        term = result.deferred
         self.assertEqual([tuple(c.shape) for c in term.counts], [(8,), (4,)])
         self.assertEqual([tuple(p.shape) for p in term.mean_probs], [(8,), (4,)])
-        finished = runtime.balancer.finish(result, pooled=True)
+        finished = runtime.statistics.finish(result, pooled=True)
         # Each layer is normalized by its own expert count; the loss is their mean.
         per_layer = [
             balance_from_terms((p,), (c,)) for p, c in zip(term.mean_probs, term.counts)
@@ -210,7 +210,7 @@ class MoEBalanceTest(unittest.TestCase):
         )
         finished.loss.backward()
         before = [layer.gate.expert_bias.clone() for layer in layers]
-        metrics = runtime.balancer.step()
+        metrics = runtime.statistics.step()
         for layer, old, counts in zip(layers, before, term.counts):
             load = counts.float()
             delta = 0.01 * torch.sign(load.mean() - load)
@@ -301,7 +301,7 @@ class MoEBalanceTest(unittest.TestCase):
                     terms.append(term)
                     finished.append(balancer.finish(result, pooled=True))
                 first, second = finished
-                self.assertIsNone(second.balance)
+                self.assertIsNone(second.deferred)
                 # A step's first forward balances against its own load either way.
                 aux = first.ratios["moe/aux_loss"][0]
                 torch.testing.assert_close(
@@ -363,15 +363,15 @@ class MoEBalanceTest(unittest.TestCase):
         out = strategy.forward_loss(batch)
         aux = out.ratio_metrics["moe/aux_loss"][0]
         self.assertGreater(aux.item(), 0.0)
-        self.assertIsNotNone(runtime.balancer.pooled)  # training: this step's load
+        self.assertIsNotNone(runtime.statistics.pooled)  # training: this step's load
         numerator, denominator = out.loss_terms
         torch.testing.assert_close(out.loss, numerator / denominator)
-        runtime.balancer.step()
+        runtime.statistics.step()
         runtime.eval()
         with torch.no_grad():
             out = strategy.forward_loss(batch)
         self.assertIn("moe/aux_loss", out.ratio_metrics)
-        self.assertIsNone(runtime.balancer.pooled)  # evaluation: its own load
+        self.assertIsNone(runtime.statistics.pooled)  # evaluation: its own load
 
 
 if __name__ == "__main__":
