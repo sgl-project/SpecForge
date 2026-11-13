@@ -12,9 +12,15 @@ class ObjectiveResult:
     numerator: Tensor
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    # A MoE load-balance term the trainer finishes (MoEBalancer.finish) before use.
+    balance: object = None
 
     @property
     def loss(self):
+        if self.balance is not None:
+            raise ValueError(
+                "the MoE balance term is unfinished; call MoEBalancer.finish"
+            )
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
@@ -28,7 +34,9 @@ def microbatch_mean(result, *, global_denominator=False):
         world_size = dist.get_world_size()
         dist.all_reduce(denominator)
     loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
+    return ObjectiveResult(
+        loss, denominator.new_ones(()), result.ratios, result.balance
+    )
 
 
 class ObjectiveModel(nn.Module):
@@ -134,13 +142,22 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
+    def _routed_tokens(self, blocks):
+        """[tokens] mask: every token of a kept block was routed; padded blocks were not."""
+        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
+        return blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+
+    def balance_term(self, output, blocks):
+        """This forward's MoE load-balance term, for the trainer to finish; None without."""
+        if self.balancer is None:
+            return None
+        return self.balancer.term(output, keep=self._routed_tokens(blocks))
+
     def block_predictions(self, output, blocks, batch, **options):
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
         if self.balancer is not None:
-            # Every token of a kept block was routed; padded blocks do not count.
-            keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
-            self.balancer.observe(output, keep=keep)
+            self.balancer.observe(output, keep=self._routed_tokens(blocks))
         return self.predictions(
             output.hidden_states,
             batch,

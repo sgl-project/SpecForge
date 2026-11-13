@@ -7,6 +7,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from .base import check_options
 from .inputs import prepare_blocks
 from .losses import TokenLoss, decay_weighting
+from .moe_balance import check_aux_loss_type
 from .predictions import PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -39,6 +40,10 @@ class DFlashObjective:
     bias_update_rate: float = (
         0.0  # expert_bias step per optimizer step; 0 keeps it fixed
     )
+    aux_loss_coef: float = 0.0  # weight of the load-balance loss; 0 skips it
+    aux_loss_type: str = (
+        "batch_wise"  # its load: this step's so far, or microbatch_wise
+    )
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -51,8 +56,12 @@ class DFlashObjective:
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
-            nonnegative={"bias_update_rate": self.bias_update_rate},
+            nonnegative={
+                "bias_update_rate": self.bias_update_rate,
+                "aux_loss_coef": self.aux_loss_coef,
+            },
         )
+        check_aux_loss_type(self.aux_loss_type)
 
     def __call__(self, runtime, batch, **context):
         model = runtime.draft_model
@@ -67,4 +76,7 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        return PredictionBatch((runtime.block_predictions(output, blocks, batch),))
+        predictions = runtime.block_predictions(output, blocks, batch)
+        return PredictionBatch(
+            (predictions,), balance=runtime.balance_term(output, blocks)
+        )

@@ -126,3 +126,5 @@ class PredictionBatch:
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
     chunk_size: int = 0
+    # A MoE load-balance term (MoEBalanceTerm) the trainer finishes; None without one.
+    balance: object = None

@@ -256,7 +256,17 @@ each MoE layer routed to each expert, then moves every router's `expert_bias` by
 that rate toward the under-loaded experts with a zero-mean sign step; the bias
 shifts which experts are chosen, not their weights. `moe/step_balance` reports
 the dispatch's balance: 1 when uniform, E / K when the same K experts take every
-token. The auxiliary loss is not wired yet.
+token.
+
+The auxiliary loss is DeepSeek-V3's load-balance loss on the router scores,
+E × Σ_e share_e × P_e (1 when balanced), weighted by `aux_loss_coef` (`0` skips
+it; the recipe uses `0.005`) and reported as `moe/aux_loss`. `aux_loss_type`
+picks the load behind share_e: `microbatch_wise` is this forward's own,
+`batch_wise` (the default) this optimizer step's so far, pooled over
+micro-batches and ranks, as in torchtitan and Megatron. The objective hands the
+loss out as a typed term holding its P_e and counts; the strategy pools the
+counts and finishes it, so objective evaluation still performs no collectives,
+and evaluation forwards balance against their own load.
 
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.

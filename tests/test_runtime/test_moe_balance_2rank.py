@@ -19,7 +19,10 @@ def _worker(rank, world_size):
     from torch import nn
 
     from specforge.algorithms.objectives import build_objective_model
-    from specforge.algorithms.objectives.moe_balance import dispatch_balance
+    from specforge.algorithms.objectives.moe_balance import (
+        balance_from_terms,
+        dispatch_balance,
+    )
     from specforge.modeling import build_draft_model
     from specforge.modeling.draft.layers.mlp import MoEFFN
     from tests.test_algorithms.test_objectives import training_batch
@@ -53,6 +56,25 @@ def _worker(rank, world_size):
     dist.all_gather(biases, layer.gate.expert_bias)
     for other in biases:
         assert torch.equal(other, layer.gate.expert_bias), "ranks disagree on the bias"
+
+    # batch_wise: the strategy pools this step's counts over ranks before finishing.
+    balanced = build_objective_model(
+        model,
+        options={"num_anchors": 2, "aux_loss_coef": 0.5, "aux_loss_type": "batch_wise"},
+        target_head=nn.Linear(32, config.vocab_size, bias=False).cuda(),
+    )
+    result = balanced(batch, step=0, total_steps=2)
+    term = result.balance
+    finished = balanced.balancer.finish(
+        result, pooled=True, process_group=dist.group.WORLD
+    )
+    load = term.counts.clone()
+    dist.all_reduce(load)
+    assert torch.equal(balanced.balancer.pooled, load), "pooled load differs"
+    torch.testing.assert_close(
+        finished.ratios["moe/aux_loss"][0],
+        balance_from_terms(term.mean_probs, load).detach(),
+    )
     dist.barrier()
     dist.destroy_process_group()
 

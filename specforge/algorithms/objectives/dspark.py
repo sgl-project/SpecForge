@@ -11,6 +11,7 @@ from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .losses import TokenLoss, decay_weighting
+from .moe_balance import check_aux_loss_type
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -41,6 +42,10 @@ class DSparkObjective:
     loss_decay_gamma: float | None = None
     bias_update_rate: float = (
         0.0  # expert_bias step per optimizer step; 0 keeps it fixed
+    )
+    aux_loss_coef: float = 0.0  # weight of the load-balance loss; 0 skips it
+    aux_loss_type: str = (
+        "batch_wise"  # its load: this step's so far, or microbatch_wise
     )
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9
@@ -73,8 +78,10 @@ class DSparkObjective:
                 "l1_loss_alpha": self.l1_loss_alpha,
                 "confidence_loss_alpha": self.confidence_loss_alpha,
                 "bias_update_rate": self.bias_update_rate,
+                "aux_loss_coef": self.aux_loss_coef,
             },
         )
+        check_aux_loss_type(self.aux_loss_type)
 
     def __call__(self, runtime, batch, **context):
         model = runtime.draft_model
@@ -123,4 +130,8 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            balance=runtime.balance_term(output, blocks),
+        )

@@ -57,7 +57,7 @@ def write_features(root, draft):
         )
 
 
-def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
+def moe_run_config(target, draft, kernel, bias_update_rate=0.0, aux_loss_coef=0.0):
     return run_config(
         target,
         draft,
@@ -75,6 +75,8 @@ def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
             "objective_options": {
                 "num_anchors": 2,
                 "bias_update_rate": bias_update_rate,
+                "aux_loss_coef": aux_loss_coef,
+                "aux_loss_type": "batch_wise",
             },
         },
     )
@@ -92,11 +94,11 @@ class CanonicalMoETrainingTest(unittest.TestCase):
             )
             self.addCleanup(torch.distributed.destroy_process_group)
 
-    def _train_and_resume(self, root, kernel, bias_update_rate=0.0):
+    def _train_and_resume(self, root, kernel, bias_update_rate=0.0, aux_loss_coef=0.0):
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel, bias_update_rate)
+        cfg = moe_run_config(target, draft, kernel, bias_update_rate, aux_loss_coef)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
@@ -146,7 +148,9 @@ class CanonicalMoETrainingTest(unittest.TestCase):
 
     def test_bias_update_rate_moves_the_bias_across_steps_and_resume(self):
         with TemporaryDirectory() as temp:
-            self._train_and_resume(Path(temp), "grouped_mm", bias_update_rate=0.001)
+            self._train_and_resume(
+                Path(temp), "grouped_mm", bias_update_rate=0.001, aux_loss_coef=0.01
+            )
 
     def test_misaligned_widths_fail_at_startup_unless_the_loop_kernel_is_chosen(self):
         with TemporaryDirectory() as temp:
