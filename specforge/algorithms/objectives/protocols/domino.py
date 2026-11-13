@@ -9,9 +9,9 @@ from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch
-from ..projection import CorrectedProjection
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
+from .domino_execution import DominoSuffixProjection
 
 
 @register_protocol(
@@ -84,7 +84,7 @@ class DominoObjective:
                 terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
                 joint_groups=((0, 1),),
             ),
-            projection=CorrectedProjection(
+            projection=DominoSuffixProjection(
                 model.project,
                 model.project_parts,
                 spec.protocol.num_model_slots,

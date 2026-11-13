@@ -288,7 +288,7 @@ class LossPlanTest(unittest.TestCase):
             )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-    def test_corrected_ce_with_an_independent_term(self):
+    def test_domino_suffix_ce_with_an_independent_term(self):
         config, runtime = build_runtime("DominoDraftModel", options={"num_anchors": 3})
         runtime.cuda()
         for name in config.target_bindings:
@@ -309,21 +309,35 @@ class LossPlanTest(unittest.TestCase):
         gradients = torch.autograd.grad(
             expected.loss, parameters, retain_graph=True, allow_unused=True
         )
-        for groups in (p.plan.joint_groups, ()):
-            entry = _IMPLEMENTATIONS["corrected_ce"]
+        cases = (
+            (p, True),
+            (replace(p, plan=replace(p.plan, joint_groups=())), False),
+            (replace(p, projection=Projection(p.projection.project)), False),
+            (
+                replace(
+                    p,
+                    projection=replace(
+                        p.projection, block_size=p.projection.block_size + 1
+                    ),
+                ),
+                False,
+            ),
+        )
+        for prediction, fused in cases:
+            entry = _IMPLEMENTATIONS["domino_suffix_ce"]
             optimized = Mock(wraps=entry.compute)
             with patch.dict(
                 _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
             ):
                 actual = run(
-                    replace(p, plan=replace(p.plan, joint_groups=groups)),
+                    prediction,
                     fused=True,
                     chunk=1,
                 )
                 actual_grad = torch.autograd.grad(
                     actual.loss, parameters, retain_graph=True, allow_unused=True
                 )
-            self.assertEqual(bool(optimized.call_count), bool(groups))
+            self.assertEqual(bool(optimized.call_count), fused)
             torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
             torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
             torch.testing.assert_close(actual.ratios, expected.ratios)

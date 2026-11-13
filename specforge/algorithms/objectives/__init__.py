@@ -6,7 +6,7 @@ from .implementations import register_implementation
 from .losses import register_loss
 from .plan import LossPlan, LossTerm
 from .predictions import PredictionBatch, Predictions
-from .projection import CorrectedProjection, LinearProjection, Projection
+from .projection import LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
     WindowStatistic,
@@ -43,5 +43,4 @@ __all__ = [
     "LossPlan",
     "Projection",
     "LinearProjection",
-    "CorrectedProjection",
 ]

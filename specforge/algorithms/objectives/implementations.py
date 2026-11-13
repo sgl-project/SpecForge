@@ -10,7 +10,7 @@ import torch
 
 from .losses import LossContext, TokenLoss
 from .predictions import Predictions
-from .projection import CorrectedProjection, LinearProjection
+from .projection import LinearProjection
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ def select_implementation(request, group, *, name="auto"):
     return None
 
 
-def _ce_support(request, group):
+def projection_ce_support(request, group):
     """Return None or a rejection reason for the requested fused CE group."""
     p = request.predictions
     if not p.hidden.is_cuda or p.hidden.dtype not in (
@@ -185,56 +185,6 @@ def _ce_support(request, group):
     ):
         return "requires ordinary hard-label CE"
     return None
-
-
-def _corrected_support(request, group):
-    """Return None or a reason the base/final CE pair cannot be fused."""
-    p = request.predictions
-    if not isinstance(p.projection, CorrectedProjection):
-        return "requires a compact corrected projection"
-    if len(group) != 2 or {p.plan.terms[i].output for i in group} != {
-        "logits",
-        "base_logits",
-    }:
-        return "requires the base/final CE pair"
-    if any(
-        p.plan.terms[i].mask is not None or p.plan.terms[i].weighting is not None
-        for i in group
-    ):
-        return "joint CE requires shared supervision weights"
-    return _ce_support(request, group)
-
-
-@register_implementation("corrected_ce", supports=_corrected_support, priority=20)
-def corrected_ce(request, group):
-    """Compute base and corrected CE without materializing final logits.
-
-    Args:
-        request: Validated CorrectedProjection with labels and shared weights.
-        group: Two term indices naming base_logits and logits.
-
-    Returns:
-        GroupResult containing each weighted CE sum and final predicted IDs.
-        Coefficients and normalization are applied later by the executor.
-    """
-    from specforge.core.domino_loss import domino_weighted_cross_entropy
-
-    p, projection = request.predictions, request.predictions.projection
-    base, correction = projection.project_parts(p.hidden, **p.projection_inputs)
-    final, original, predicted, _ = domino_weighted_cross_entropy(
-        base.flatten(0, 1),
-        correction.reshape(-1, correction.shape[-1]),
-        request.labels.flatten(),
-        request.terms[group[0]].weights.flatten(),
-        projection.block_size,
-        projection.suffix_start,
-        use_fused=True,
-    )
-    values = {"logits": final, "base_logits": original}
-    return GroupResult(
-        {i: values[p.plan.terms[i].output] for i in group},
-        {"logits": predicted.reshape_as(request.labels)},
-    )
 
 
 @lru_cache
@@ -274,7 +224,7 @@ def _linear_support(request, group):
         or p.projection_inputs
     ):
         return "requires one ordinary linear output"
-    reason = _ce_support(request, group)
+    reason = projection_ce_support(request, group)
     if reason:
         return reason
     from torch import nn

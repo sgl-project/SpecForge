@@ -54,20 +54,3 @@ class LinearProjection(Projection):
         if type(self.head) is BoundLMHead:
             return self.head.bound_weight(), None
         raise TypeError("Linear projection requires a plain linear or bound head")
-
-
-@dataclass(frozen=True)
-class CorrectedProjection(Projection):
-    """Capability for base logits plus compact block-suffix corrections.
-
-    Attributes:
-        project_parts: Callable(hidden, **inputs) returning base logits and
-            compact corrections without constructing full corrected logits.
-        block_size: Number of positions in each complete recurrence block.
-        suffix_start: First block position receiving a correction.
-        project: Ordinary projection returning base_logits and logits.
-    """
-
-    project_parts: Callable
-    block_size: int
-    suffix_start: int

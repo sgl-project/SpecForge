@@ -323,9 +323,14 @@ Without a matching joint implementation, the executor selects an implementation
 for each term. Removing a joint range preserves the mathematical objective.
 
 Domino declares its existing `lambda * base_CE + (1 - lambda) * final_CE` schedule
-and a corrected-projection contract. The registered `corrected_ce` implementation
+and a `DominoSuffixProjection` contract. Its `domino_suffix_ce` implementation
 uses compact corrections; the reference path computes both outputs normally.
 There is no algorithm-name branch in the executor.
+
+The Domino projection contract and joint CE adapter live in
+`objectives/protocols/domino_execution.py`. Fusion requires one complete block per
+projection unit, additive corrections on a contiguous suffix, and base/final CE
+terms with shared supervision weights. Other layouts use ordinary projection.
 
 Register mathematical formulas with `register_loss`. Register optimized group
 implementations with `register_implementation`, or use `register_token_kernel`
@@ -349,7 +354,7 @@ The existing algorithm auxiliary computations remain in their objectives and
 require shared supervision; the specialized fused execution callback is removed.
 
 Functionality and optimization support are separate: a method can use its ordinary
-projection without supporting linear/corrected fusion. TP, LoRA and quantized heads
+projection without supporting linear/Domino suffix fusion. TP, LoRA and quantized heads
 need explicit compatible projection implementations before using these fused paths.
 
 ### Canonical training requirements
