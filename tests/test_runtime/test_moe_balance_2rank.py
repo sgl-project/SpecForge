@@ -29,7 +29,7 @@ def _worker(rank, world_size):
     from specforge.modeling import build_draft_model
     from specforge.modeling.draft.layers.mlp import MoEFFN
     from tests.test_algorithms.test_objectives import training_batch
-    from tests.test_modeling.test_canonical_moe import moe_model_config
+    from tests.test_modeling.test_canonical_dspark import moe_model_config
 
     config = moe_model_config()
     torch.manual_seed(0)  # the same weights on every rank

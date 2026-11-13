@@ -1,4 +1,4 @@
-"""MoE load balancing: counts per expert over a step and the expert-bias update."""
+"""MoE load balancing: counts per expert over a step, the expert-bias update, and the aux loss."""
 
 import unittest
 from dataclasses import replace
@@ -24,7 +24,7 @@ from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_algorithms.test_objectives import configurations, training_batch
 from tests.test_modeling.test_canonical_dspark import model_config as dense_config
-from tests.test_modeling.test_canonical_moe import moe_model_config
+from tests.test_modeling.test_canonical_dspark import moe_model_config
 from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 # The objectives whose models carry expert routing out of the forward today.

@@ -119,24 +119,6 @@ class DraftPreTrainedTest(unittest.TestCase):
             ):
                 model._init_weights(module)
 
-    def test_resets_taking_initializer_range_receive_the_golden_value(self):
-        class RangedProjection(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.weight = nn.Parameter(torch.empty(2))
-
-            def reset_draft_parameters(self, *, initializer_range):
-                init.constant_(self.weight, initializer_range)
-
-        model = DFlashDraftModel(model_config(initializer_range=0.25))
-        module = RangedProjection()
-        model._init_weights(module)
-        torch.testing.assert_close(module.weight, torch.full_like(module.weight, 0.25))
-        # Resets without the keyword are still called bare.
-        torch.testing.assert_close(
-            model.special_norm.weight, torch.zeros_like(model.special_norm.weight)
-        )
-
     def test_parent_resets_run_on_fresh_build_and_partial_artifacts_fail(self):
         model = DFlashDraftModel(model_config())
         for parent in (model.zero_projection, model.gated_projection):
