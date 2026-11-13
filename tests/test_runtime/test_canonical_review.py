@@ -43,6 +43,7 @@ class CanonicalReviewTest(unittest.TestCase):
 
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
+        runtime.statistics = None  # no per-forward statistics in this fake
         runtime.draft_model = torch.nn.Linear(1, 1)
         runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {

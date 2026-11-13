@@ -252,6 +252,33 @@ class TestTrainerCore(unittest.TestCase):
         # boundary known BEFORE backward so the backend can no_sync micro-steps
         self.assertEqual(backend.boundaries, [False, True])
 
+    def test_after_step_runs_once_per_optimizer_step_and_its_metrics_join(self):
+        class SteppingStrategy(FakeStrategy):
+            def __init__(self):
+                super().__init__()
+                self.groups = []
+
+            def after_step(self, *, process_group=None):
+                self.groups.append(process_group)
+                return {"moe/step_balance": torch.tensor(1.5)}
+
+        strat = SteppingStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
+        first = core.train_step(_batch())
+        self.assertFalse(first.optimizer_stepped)
+        self.assertNotIn("moe/step_balance", first.metrics)
+        self.assertEqual(strat.groups, [])
+        second = core.train_step(_batch())
+        self.assertTrue(second.optimizer_stepped)
+        self.assertEqual(second.metrics["moe/step_balance"], 1.5)
+        self.assertEqual(strat.groups, [None])
+        # The default after_step reports nothing.
+        plain = FakeStrategy()
+        core = TrainerCore(plain, FakeBackend(plain.model), accumulation_steps=1)
+        result = core.train_step(_batch())
+        self.assertTrue(result.optimizer_stepped)
+        self.assertNotIn("moe/step_balance", result.metrics)
+
     def test_metrics_reduce_once_at_accumulation_boundary(self):
         strat = FakeStrategy()
         core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
