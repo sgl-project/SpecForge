@@ -1,7 +1,7 @@
 """Training-only registry; no checkpoint, data-provider or launch registrations."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from .base import ObjectiveModel
 from .configuration import (
@@ -11,6 +11,7 @@ from .configuration import (
 )
 from .execution_options import LossExecution
 from .losses import PositionWeighting
+from .moe_balance import BALANCING_OPTIONS, MoEBalancer, balancing_settings
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ class ResolvedObjective:
     weighting: PositionWeighting
     execution: LossExecution
     losses: LossConfiguration
+    statistics_settings: dict = field(default_factory=dict)
 
     @property
     def frozen_parameters(self):
@@ -196,6 +198,11 @@ def resolve_objective(
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     options = dict(options or {})
+    # Balancing options go with the registration that provides routing, not the protocol.
+    statistics = {}
+    if "expert_routing" in entry.provides:
+        taken = {key: options.pop(key) for key in BALANCING_OPTIONS if key in options}
+        statistics = balancing_settings(taken)
     if training is not None:
         options = _training_options(entry.factory, options, training)
     objective = entry.factory(**options)
@@ -245,6 +252,7 @@ def resolve_objective(
         position_weighting,
         execution,
         loss_configuration,
+        statistics,
     )
 
 
@@ -341,6 +349,7 @@ def build_objective_model(
         )
     for module in to_freeze:
         module.requires_grad_(False)
+
     return ObjectiveModel(
         draft_model,
         objective,
@@ -351,6 +360,7 @@ def build_objective_model(
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,
+        statistics=MoEBalancer.from_settings(draft_model, resolved.statistics_settings),
     )
 
 
