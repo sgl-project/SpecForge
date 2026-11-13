@@ -1169,5 +1169,203 @@ class TestDSparkFusedLoss(unittest.TestCase):
         )
 
 
+class DFlashProjectionLayoutTest(unittest.TestCase):
+    def setUp(self):
+        self.rng = torch.random.fork_rng(devices=[])
+        self.rng.__enter__()
+        torch.manual_seed(7)
+
+    def tearDown(self):
+        self.rng.__exit__(None, None, None)
+
+    def test_strided_projection_preserves_output_and_parent_gradients(self):
+        for dtype in (torch.float64, torch.float32):
+            for blocks in (1, 3):
+                for trainable in (False, True):
+                    with self.subTest(dtype=dtype, blocks=blocks, trainable=trainable):
+                        source = torch.randn(
+                            2, 7, 3, 8, dtype=dtype, requires_grad=True
+                        )
+                        reference = source.detach().clone().requires_grad_(True)
+                        hidden = source[:, 2 : 2 + blocks]
+                        self.assertFalse(hidden.is_contiguous())
+                        head = nn.Linear(8, 13, bias=trainable).to(dtype)
+                        head.requires_grad_(trainable)
+                        reference_head = copy.deepcopy(head)
+                        before = head.weight.detach().clone()
+                        expected = reference_head(
+                            reference[:, 2 : 2 + blocks].reshape(2, blocks * 3, 8)
+                        ).reshape(2, blocks, 3, 13)
+                        actual = OnlineDFlashModel._project_logits(
+                            types.SimpleNamespace(lm_head=head), hidden
+                        )
+                        rtol, atol = (
+                            (1e-12, 1e-12) if dtype == torch.float64 else (1e-5, 1e-6)
+                        )
+                        torch.testing.assert_close(
+                            actual, expected, rtol=rtol, atol=atol
+                        )
+                        probe = torch.randn_like(expected)
+                        actual.backward(probe)
+                        expected.backward(probe)
+                        torch.testing.assert_close(
+                            source.grad, reference.grad, rtol=rtol, atol=atol
+                        )
+                        self.assertEqual(torch.count_nonzero(source.grad[:, :2]), 0)
+                        self.assertEqual(
+                            torch.count_nonzero(source.grad[:, 2 + blocks :]), 0
+                        )
+                        torch.testing.assert_close(head.weight, before, rtol=0, atol=0)
+                        if trainable:
+                            torch.testing.assert_close(
+                                head.weight.grad,
+                                reference_head.weight.grad,
+                                rtol=rtol,
+                                atol=atol,
+                            )
+                            torch.testing.assert_close(
+                                head.bias.grad,
+                                reference_head.bias.grad,
+                                rtol=rtol,
+                                atol=atol,
+                            )
+                        else:
+                            self.assertIsNone(head.weight.grad)
+
+    def test_contiguous_and_batch_one_inputs_do_not_copy(self):
+        for batch, start, blocks in ((2, 0, 7), (1, 2, 3)):
+            with self.subTest(batch=batch, start=start):
+                hidden = torch.randn(batch, 7, 3, 8)[:, start : start + blocks]
+                head = nn.Linear(8, 13, bias=False)
+                seen = []
+                handle = head.register_forward_pre_hook(
+                    lambda module, args: seen.append(args[0])
+                )
+                try:
+                    OnlineDFlashModel._project_logits(
+                        types.SimpleNamespace(lm_head=head), hidden
+                    )
+                finally:
+                    handle.remove()
+                self.assertEqual(len(seen), 1)
+                self.assertTrue(seen[0].is_contiguous())
+                self.assertEqual(seen[0].shape, (batch, blocks * 3, 8))
+                self.assertEqual(seen[0].data_ptr(), hidden.data_ptr())
+
+    def test_module_forward_and_hooks_keep_three_dimensional_call(self):
+        class CustomHead(nn.Linear):
+            def forward(self, value):
+                if value.ndim != 3 or not value.is_contiguous():
+                    raise AssertionError("expected a contiguous 3D head input")
+                return super().forward(value) + 0.125
+
+        source = torch.randn(2, 7, 3, 8, requires_grad=True)
+        hidden = source[:, 1:4]
+        head = CustomHead(8, 13, bias=True)
+        seen = []
+        handles = [
+            head.register_forward_pre_hook(
+                lambda module, args: seen.append(("pre", tuple(args[0].shape)))
+            ),
+            head.register_forward_hook(lambda module, args, output: output + 0.25),
+            head.register_full_backward_hook(
+                lambda module, grad_in, grad_out: seen.append(
+                    ("backward", tuple(grad_in[0].shape), tuple(grad_out[0].shape))
+                )
+            ),
+        ]
+        try:
+            actual = OnlineDFlashModel._project_logits(
+                types.SimpleNamespace(lm_head=head), hidden
+            )
+            expected = F.linear(hidden, head.weight, head.bias) + 0.375
+            torch.testing.assert_close(actual, expected)
+            actual.sum().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(
+            seen, [("pre", (2, 9, 8)), ("backward", (2, 9, 8), (2, 9, 13))]
+        )
+        self.assertIsNotNone(source.grad)
+
+    def test_teacher_no_grad_and_projection_rng(self):
+        hidden = torch.randn(2, 7, 3, 8, requires_grad=True)[:, 2:5]
+        head = nn.Linear(8, 13, bias=False).requires_grad_(False)
+        rng = torch.get_rng_state().clone()
+        with torch.no_grad():
+            actual = OnlineDFlashModel._project_logits(
+                types.SimpleNamespace(lm_head=head), hidden
+            )
+        self.assertFalse(actual.requires_grad)
+        self.assertIsNone(head.weight.grad)
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
+    def test_cpu_autocast_preserves_output_dtype_and_gradients(self):
+        source = torch.randn(2, 7, 3, 8, requires_grad=True)
+        reference = source.detach().clone().requires_grad_(True)
+        head = nn.Linear(8, 13, bias=False).requires_grad_(False)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = OnlineDFlashModel._project_logits(
+                types.SimpleNamespace(lm_head=head), source[:, 2:5]
+            )
+            expected = head(reference[:, 2:5].reshape(2, 9, 8)).reshape(2, 3, 3, 13)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+        probe = torch.randn_like(expected)
+        actual.backward(probe)
+        expected.backward(probe)
+        torch.testing.assert_close(source.grad, reference.grad, rtol=0.02, atol=0.002)
+
+    def test_dspark_draft_teacher_chunks_and_checkpoint_use_contiguous_inputs(self):
+        logits, ids, mask, target_features, anchors, keep = _sample_tensors()
+        for checkpoint in (False, True):
+            with self.subTest(checkpoint=checkpoint):
+                model = _make_dspark_model(
+                    logits,
+                    anchors,
+                    keep,
+                    draft_model=_LearnableDSparkDraft(4).double(),
+                    lm_head=nn.Linear(4, 13, bias=False).double().requires_grad_(False),
+                    dspark_ce_loss_alpha=0.1,
+                    dspark_l1_loss_alpha=0.9,
+                    dspark_confidence_head_alpha=1.0,
+                    objective_chunk_blocks=1,
+                    objective_checkpointing=checkpoint,
+                )
+                seen = []
+                handle = model.lm_head.register_forward_pre_hook(
+                    lambda module, args: seen.append(
+                        (
+                            torch.is_grad_enabled(),
+                            tuple(args[0].shape),
+                            args[0].is_contiguous(),
+                        )
+                    )
+                )
+                try:
+                    loss, _acc, _metrics = model(
+                        input_ids=ids,
+                        hidden_states=target_features,
+                        loss_mask=mask,
+                        target_last_hidden_states=torch.randn_like(target_features),
+                    )
+                    loss.backward()
+                finally:
+                    handle.remove()
+                self.assertTrue(
+                    all(
+                        shape == (2, 5, 4) and contiguous
+                        for _, shape, contiguous in seen
+                    )
+                )
+                self.assertEqual({enabled for enabled, _, _ in seen}, {False, True})
+                self.assertGreaterEqual(len(seen), 4)
+                if checkpoint:
+                    self.assertGreater(len(seen), 4)
+                self.assertTrue(torch.isfinite(model.draft_model.signal.grad).all())
+                self.assertIsNone(model.lm_head.weight.grad)
+
+
 if __name__ == "__main__":
     unittest.main()

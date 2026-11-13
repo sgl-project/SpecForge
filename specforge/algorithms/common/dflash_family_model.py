@@ -727,7 +727,9 @@ class OnlineDFlashModel(nn.Module):
         """Apply the LM head to block states without choosing loss or memory policy."""
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
         return self.lm_head(
-            hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+            hidden.reshape(
+                batch_size, num_blocks * block_size, hidden_size
+            ).contiguous()
         ).reshape(batch_size, num_blocks, block_size, -1)
 
     def _dflash_logits(self, hidden: torch.Tensor) -> torch.Tensor:
