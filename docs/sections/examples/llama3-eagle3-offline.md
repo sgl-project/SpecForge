@@ -16,7 +16,7 @@ Feature preparation is a data-processing step, not a second training entry
 point:
 
 Start the plugin server and Mooncake as described in the
-[offline capture guide](../../../examples/offline/README.md), using the same
+[offline capture guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), using the same
 Llama target and EAGLE3 layer IDs. Then run the CPU preparation client:
 
 ```bash

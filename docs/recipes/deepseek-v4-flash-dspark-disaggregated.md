@@ -11,7 +11,7 @@ The flow is the standard disaggregated setup
 (`docs/basic_usage/disaggregated_training.md`); what is DeepSeek-V4-specific:
 
 - **Capture hook**: a compatible SGLang build with the
-  [capture plugin](../../plugins/sglang-spec-capture/README.md), launched
+  [capture plugin](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md), launched
   with `--enable-return-aux-hidden-states --speculative-algorithm DSPARK`. The generic DFlash capture is not
   equivalent for V4: the inter-layer residual is the widened mHC tensor, so
   capture must use the model's own `set_dspark_layers_to_capture` hook.
