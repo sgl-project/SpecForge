@@ -45,7 +45,14 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         device = next(self.model.parameters()).device
         inputs = batch.tensors
         if self.host_inputs is not None:
-            inputs = inputs | self.host_inputs(inputs, self.draft_config)
+            prepared = self.host_inputs(inputs, self.draft_config)
+            if device.type != "cpu":
+                # a pageable source makes the non_blocking copy wait for the host
+                prepared = {
+                    key: value.pin_memory() if value.device.type == "cpu" else value
+                    for key, value in prepared.items()
+                }
+            inputs = inputs | prepared
         tensors = {
             key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }
