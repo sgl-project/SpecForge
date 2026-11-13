@@ -1,4 +1,4 @@
-"""MoE FFN: parity with Transformers, the router contract, the width probe."""
+"""MoE FFN: parity with Transformers, kernel agreement, the router contract, the kernel choice."""
 
 import unittest
 
@@ -11,8 +11,9 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from specforge.config.draft.mlp import MoEExpertSpec, MoEFFNSpec, MoERouterSpec
+from specforge.modeling.draft.layers.inputs import MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels, liger_hidden_act
-from specforge.modeling.draft.layers.mlp import MoEFFN
+from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
 from specforge.modeling.draft.layers.mlp.moe import RoutedExperts, Router, TopKRouter
 
 # Widths are multiples of 8: F.grouped_mm needs 16-byte strides in every dtype.
@@ -62,6 +63,8 @@ class MoEFFNTest(unittest.TestCase):
     def _run(module, x, upstream):
         inputs = x.detach().clone().requires_grad_()
         output = module(inputs)
+        if isinstance(output, MoEOutput):
+            output = output.update
         output.backward(upstream)
         grads = {name: p.grad for name, p in module.named_parameters()}
         return output.detach(), inputs.grad, grads
@@ -85,38 +88,46 @@ class MoEFFNTest(unittest.TestCase):
         upstream = torch.randn(2, 5, H, device=device)
         truth = self._run(reference, x, upstream)
         for dtype in dtypes:
-            with self.subTest(dtype=dtype):
-                expected = Qwen3_5MoeSparseMoeBlock(config).to(device, dtype)
-                expected.load_state_dict({k: v.to(dtype) for k, v in weights.items()})
-                actual = MoEFFN(qwen_spec(), hidden_size=H, device=device, dtype=dtype)
-                actual.load_state_dict(expected.state_dict(), strict=True)
-                self.assertEqual(set(actual.state_dict()), set(expected.state_dict()))
-                left = self._run(expected, x.to(dtype), upstream.to(dtype))
-                right = self._run(actual, x.to(dtype), upstream.to(dtype))
-                for name, theirs, ours, exact in (
-                    ("output", left[0], right[0], truth[0]),
-                    ("input grad", left[1], right[1], truth[1]),
-                    *(
-                        (key, left[2][key], right[2][key], truth[2][key])
-                        for key in left[2]
-                    ),
-                ):
-                    self.assertEqual(ours.dtype, theirs.dtype, name)
-                    if dtype == torch.float32:
-                        # Measured 7e-7 on outputs and 4e-6 on parameter gradients:
-                        # Transformers weights each expert after its down projection
-                        # and accumulates per expert; the fused path weights before
-                        # it and sums once.
-                        torch.testing.assert_close(
-                            ours, theirs, rtol=1e-5, atol=1e-5, msg=name
-                        )
-                        continue
-                    # In bf16 the two also differ by where they round, so compare
-                    # each to the fp32 computation: the fused path must stay as
-                    # close as Transformers' own bf16 result (measured 1.2x at most).
-                    gap = (ours.float() - exact).abs().max().item()
-                    bound = (theirs.float() - exact).abs().max().item()
-                    self.assertLessEqual(gap, 2 * bound + 1e-6, name)
+            for kernel in sorted(EXPERT_KERNELS):
+                with self.subTest(dtype=dtype, kernel=kernel):
+                    expected = Qwen3_5MoeSparseMoeBlock(config).to(device, dtype)
+                    expected.load_state_dict(
+                        {k: v.to(dtype) for k, v in weights.items()}
+                    )
+                    actual = MoEFFN(
+                        qwen_spec(), hidden_size=H, device=device, dtype=dtype
+                    )
+                    actual.experts_kernel = kernel
+                    actual.load_state_dict(expected.state_dict(), strict=True)
+                    self.assertEqual(
+                        set(actual.state_dict()), set(expected.state_dict())
+                    )
+                    left = self._run(expected, x.to(dtype), upstream.to(dtype))
+                    right = self._run(actual, x.to(dtype), upstream.to(dtype))
+                    for name, theirs, ours, exact in (
+                        ("output", left[0], right[0], truth[0]),
+                        ("input grad", left[1], right[1], truth[1]),
+                        *(
+                            (key, left[2][key], right[2][key], truth[2][key])
+                            for key in left[2]
+                        ),
+                    ):
+                        self.assertEqual(ours.dtype, theirs.dtype, name)
+                        if dtype == torch.float32:
+                            # Measured 7e-7 on outputs and 4e-6 on parameter gradients:
+                            # Transformers weights each expert after its down projection
+                            # and accumulates per expert; the fused path weights before
+                            # it and sums once.
+                            torch.testing.assert_close(
+                                ours, theirs, rtol=1e-5, atol=1e-5, msg=name
+                            )
+                            continue
+                        # In bf16 the two also differ by where they round, so compare
+                        # each to the fp32 computation: the fused path must stay as
+                        # close as Transformers' own bf16 result (measured 1.2x at most).
+                        gap = (ours.float() - exact).abs().max().item()
+                        bound = (theirs.float() - exact).abs().max().item()
+                        self.assertLessEqual(gap, 2 * bound + 1e-6, name)
 
     def test_cpu_parity_with_qwen3_5_moe(self):
         self._assert_qwen_parity("cpu", (torch.float32, torch.bfloat16))
@@ -125,7 +136,7 @@ class MoEFFNTest(unittest.TestCase):
     def test_cuda_parity_with_qwen3_5_moe(self):
         self._assert_qwen_parity("cuda", (torch.float32, torch.bfloat16))
 
-    def _assert_empty_expert_gets_no_gradient(self, device, dtype):
+    def _assert_kernels_agree(self, device, dtype):
         experts = RoutedExperts(
             expert_spec(intermediate_size=16),
             num_experts=3,
@@ -134,23 +145,37 @@ class MoEFFNTest(unittest.TestCase):
             dtype=dtype,
         )
         experts.reset_draft_parameters(initializer_range=0.2)
-        x = torch.randn(6, H, device=device, dtype=dtype, requires_grad=True)
+        x = torch.randn(6, H, device=device, dtype=dtype)
         indices = torch.tensor([[0, 2]] * 6, device=device)  # expert 1 is empty
         weights = torch.rand(6, 2, device=device)
-        output = experts(x, indices, weights)
-        output.square().sum().backward()
-        self.assertEqual(output.dtype, torch.float32)
-        self.assertEqual(tuple(x.grad.shape), (6, H))
+        results = {}
+        for kernel in EXPERT_KERNELS:
+            experts.zero_grad()
+            inputs = x.clone().requires_grad_()
+            output = experts(inputs, indices, weights, kernel=kernel)
+            output.square().sum().backward()
+            results[kernel] = (
+                output,
+                inputs.grad,
+                experts.gate_up_proj.grad.clone(),
+                experts.down_proj.grad.clone(),
+            )
+        # Measured 0.0 on CPU fp32 and on H200 bf16 with torch 2.13: the same
+        # operations in the same order; the tolerance covers other GEMM backends.
+        tolerance = 1e-6 if dtype == torch.float32 else 1e-2
+        for left, right in zip(results["grouped_mm"], results["loop"]):
+            torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+        self.assertEqual(results["loop"][0].dtype, torch.float32)
         self.assertEqual(experts.gate_up_proj.grad[1].abs().sum().item(), 0.0)
-        self.assertEqual(experts.down_proj.grad[1].abs().sum().item(), 0.0)
-        self.assertGreater(experts.gate_up_proj.grad[0].abs().sum().item(), 0.0)
+        with self.assertRaisesRegex(ValueError, "unknown experts kernel 'triton'"):
+            experts(x, indices, weights, kernel="triton")
 
-    def test_cpu_empty_expert_gets_no_gradient(self):
-        self._assert_empty_expert_gets_no_gradient("cpu", torch.float32)
+    def test_cpu_expert_kernels_agree(self):
+        self._assert_kernels_agree("cpu", torch.float32)
 
     @unittest.skipUnless(CUDA, "CUDA is required")
-    def test_cuda_empty_expert_gets_no_gradient(self):
-        self._assert_empty_expert_gets_no_gradient("cuda", torch.bfloat16)
+    def test_cuda_expert_kernels_agree(self):
+        self._assert_kernels_agree("cuda", torch.bfloat16)
 
     def test_router_contract(self):
         spec = router_spec(scoring="sigmoid", route_scale=2.0, expert_bias=True)
@@ -198,37 +223,45 @@ class MoEFFNTest(unittest.TestCase):
         plain.validate_export_state(dict(plain.state_dict()))
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
-    def test_empty_input_runs_forward_and_backward(self):
-        """Zero tokens: a [0, H] update and zero gradients on every weight."""
+    def test_empty_input_runs_forward_and_backward_with_each_kernel(self):
+        """Zero tokens: a [0, H] update, [0, K] routing, and zero gradients on every weight."""
         for device in ("cpu", "cuda") if CUDA else ("cpu",):
-            with self.subTest(device=device):
-                module = MoEFFN(qwen_spec(), hidden_size=H, device=device)
-                x = torch.empty(0, H, device=device, requires_grad=True)
-                output = module(x)
-                self.assertEqual(tuple(output.shape), (0, H))
-                output.sum().backward()
-                self.assertEqual(tuple(x.grad.shape), (0, H))
-                for name, parameter in module.named_parameters():
-                    self.assertIsNotNone(parameter.grad, name)
-                    self.assertEqual(parameter.grad.abs().sum().item(), 0.0, name)
+            for kernel in sorted(EXPERT_KERNELS):
+                with self.subTest(device=device, kernel=kernel):
+                    module = MoEFFN(qwen_spec(), hidden_size=H, device=device)
+                    module.experts_kernel = kernel
+                    x = torch.empty(0, H, device=device, requires_grad=True)
+                    output = module(x)
+                    self.assertEqual(tuple(output.update.shape), (0, H))
+                    self.assertEqual(tuple(output.routing.expert_ids.shape), (0, 2))
+                    output.update.sum().backward()
+                    self.assertEqual(tuple(x.grad.shape), (0, H))
+                    for name, parameter in module.named_parameters():
+                        self.assertIsNotNone(parameter.grad, name)
+                        self.assertEqual(parameter.grad.abs().sum().item(), 0.0, name)
 
-    def test_configure_kernels_probes_the_expert_widths(self):
+    def test_configure_kernels_selects_and_checks_the_expert_kernel(self):
         aligned = torch.nn.Sequential(
             MoEFFN(moe_spec(), hidden_size=H), MoEFFN(qwen_spec(), hidden_size=H)
         )
-        configure_kernels(aligned)  # F.grouped_mm accepts multiples of 8
-        # Liger's SwiGLU sees gated shared experts only; routed-only FFNs and
-        # non-gated shared experts (act(up), never SwiGLU) leave Liger its RMSNorm.
+        for module in aligned:
+            module.experts_kernel = "loop"
+        configure_kernels(aligned)  # the default resolves to grouped_mm
+        self.assertEqual([m.experts_kernel for m in aligned], ["grouped_mm"] * 2)
+        configure_kernels(aligned, moe_experts_kernel="loop")
+        self.assertEqual([m.experts_kernel for m in aligned], ["loop"] * 2)
+        with self.assertRaisesRegex(ValueError, "unknown moe_experts_kernel 'triton'"):
+            configure_kernels(aligned, moe_experts_kernel="triton")
+        # Liger's SwiGLU sees the shared expert; routed-only FFNs leave it the RMSNorm.
         self.assertEqual(liger_hidden_act(aligned), "silu")
-        self.assertIsNone(liger_hidden_act(aligned[0]))
-        for hidden_act in ("relu2", "silu"):
-            ungated = MoEFFN(
-                moe_spec(shared_expert=expert_spec(hidden_act=hidden_act, gated=False)),
-                hidden_size=H,
-            )
-            self.assertIsNone(liger_hidden_act(ungated), hidden_act)
+        self.assertEqual(liger_hidden_act(aligned[0]), "silu")
+        relu2 = MoEFFN(
+            moe_spec(shared_expert=expert_spec(hidden_act="relu2", gated=False)),
+            hidden_size=H,
+        )
+        self.assertEqual(liger_hidden_act(relu2), "relu2")
         # torch accepts F.grouped_mm only with 16-byte strides; the probe reports
-        # the layer, torch's reason and the width rule.
+        # the layer and torch's reason, and points at the loop kernel.
         for dtype, hidden_size, intermediate_size in (
             (torch.float32, 18, 32),
             (torch.float32, 32, 18),
@@ -242,11 +275,15 @@ class MoEFFNTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     ValueError,
-                    rf"F.grouped_mm cannot run a MoE layer \(hidden_size {hidden_size}, "
+                    rf"'grouped_mm' cannot run a MoE layer \(hidden_size {hidden_size}, "
                     rf"intermediate_size {intermediate_size}, {dtype} on cpu\): .*"
-                    r"multiples of 8 \(bf16/fp16\) or 4 \(fp32\)",
+                    r"set model.moe_experts_kernel: loop",
                 ):
                     configure_kernels(misaligned)
+                configure_kernels(misaligned, moe_experts_kernel="loop")
+                self.assertEqual(misaligned.experts_kernel, "loop")
+        with self.assertRaisesRegex(ValueError, "unknown experts kernel 'nope'"):
+            aligned[0].experts.probe_kernel("nope")
 
 
 if __name__ == "__main__":

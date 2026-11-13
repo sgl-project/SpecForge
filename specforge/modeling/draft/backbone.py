@@ -141,8 +141,20 @@ class DraftBackbone(nn.Module):
             raise ValueError("finalize requires every layer to have run")
         return self.final_norm(self.residual.reduce(state.hidden))
 
-    def forward(self, hidden: Tensor, layer_inputs: Sequence[LayerInputs]) -> Tensor:
+    def forward(
+        self,
+        hidden: Tensor,
+        layer_inputs: Sequence[LayerInputs],
+        *,
+        with_layer_outputs: bool = False,
+    ) -> Tensor | tuple[Tensor, tuple[LayerOutput | None, ...]]:
+        """The layer loop; `with_layer_outputs` also returns each layer's LayerOutput, e.g. MoELayerOutput(hidden, routing), None for a plain layer."""
         state = self.begin(hidden, layer_inputs)
+        outputs = []
         for _ in self.layers:
             state = self.run_next_layer(state)
-        return self.finalize(state)
+            # Each layer's output (a MoE layer: its hidden and expert routing) is overwritten by the next layer, so keep it here as it lands.
+            if with_layer_outputs:
+                outputs.append(state.layer_output)
+        hidden = self.finalize(state)
+        return (hidden, tuple(outputs)) if with_layer_outputs else hidden
