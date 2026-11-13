@@ -432,7 +432,7 @@ class DecoderTest(unittest.TestCase):
                     outputs.append(state.layer_output)
                 output = model.finalize(state)
             elif mode == "outputs":
-                output, outputs = model.forward_with_layer_outputs(hidden, entries)
+                output, outputs = model(hidden, entries, with_layer_outputs=True)
             else:
                 output, outputs = model(hidden, entries), None
             if outputs is not None:

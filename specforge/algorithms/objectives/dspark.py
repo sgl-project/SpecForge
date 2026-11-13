@@ -31,6 +31,7 @@ from .registry import TrainingRequirements, register_protocol
         "teacher_logits",
         "chain_positions",
         "acceptance_chain",
+        "expert_choices",
     ),
     trains=COMMON_MODULES + ("markov_head", "confidence_head"),
 )

@@ -36,9 +36,19 @@ class MoEBalancer:
         self.counts: list[Tensor | None] = [None] * len(self.layers)
 
     @classmethod
-    def for_objective(cls, model: nn.Module, objective) -> "MoEBalancer | None":
+    def for_objective(
+        cls, model: nn.Module, objective, registration
+    ) -> "MoEBalancer | None":
+        """A balancer when the objective asks for one and declares expert choices."""
         rate = getattr(objective, "bias_update_rate", 0.0)
-        return cls(model, rate=rate) if rate else None
+        if not rate:
+            return None
+        if "expert_choices" not in registration.provides:
+            raise ValueError(
+                f"objective {type(objective).__name__} does not provide expert "
+                "choices, so bias_update_rate cannot balance it"
+            )
+        return cls(model, rate=rate)
 
     def observe(self, output, *, keep: Tensor) -> None:
         """Count one training forward; forwards without gradients (eval, prepass) count nothing."""

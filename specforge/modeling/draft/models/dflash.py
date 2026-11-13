@@ -7,10 +7,10 @@ from torch import Tensor
 from transformers.utils import ModelOutput
 
 from ..hf_config import SpecForgeDraftConfig
-from ..layers.inputs import ExpertChoice, LayerInputs, MoELayerOutput
+from ..layers.inputs import ExpertChoice, LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .assembly import build_target_context_modules
-from .context import prepare_context_inputs
+from .context import prepare_context_inputs, run_backbone
 from .registry import register_draft_model
 
 
@@ -71,14 +71,11 @@ class DFlashDraftModel(DraftPreTrainedModel):
             layer_inputs,
             num_layers=self.backbone.num_layers,
         )
-        hidden, outputs = self.backbone.forward_with_layer_outputs(
-            self.embed_tokens(input_ids), prepared
-        )
-        choices = tuple(
-            o.expert_choice for o in outputs if isinstance(o, MoELayerOutput)
+        hidden, expert_choices = run_backbone(
+            self.backbone, self.embed_tokens(input_ids), prepared
         )
         return DFlashOutput(
             hidden_states=hidden,
             logits=self.compute_logits(hidden) if output_logits else None,
-            expert_choices=choices or None,
+            expert_choices=expert_choices,
         )

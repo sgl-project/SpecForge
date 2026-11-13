@@ -5,7 +5,7 @@ from dataclasses import replace
 
 from torch import Tensor
 
-from ..layers.inputs import LayerInputs
+from ..layers.inputs import ExpertChoice, LayerInputs, LayerOutput, MoELayerOutput
 from .target_features import TargetFeatureFusion
 
 
@@ -27,3 +27,17 @@ def prepare_context_inputs(
             )
     context = fusion(features)
     return [replace(entry, target_context=context) for entry in inputs]
+
+
+def collect_expert_choices(
+    outputs: Sequence[LayerOutput | None],
+) -> tuple[ExpertChoice, ...] | None:
+    """The expert choices among typed layer outputs, in layer order; None without MoE."""
+    choices = tuple(o.expert_choice for o in outputs if isinstance(o, MoELayerOutput))
+    return choices or None
+
+
+def run_backbone(backbone, hidden: Tensor, layer_inputs: Sequence[LayerInputs]):
+    """The backbone's forward, through its hooks, and its MoE layers' expert choices."""
+    hidden, outputs = backbone(hidden, layer_inputs, with_layer_outputs=True)
+    return hidden, collect_expert_choices(outputs)

@@ -10,10 +10,10 @@ from transformers.utils import ModelOutput
 from ..heads.confidence import AcceptRatePredictor
 from ..heads.markov import build_markov_head
 from ..hf_config import SpecForgeDraftConfig
-from ..layers.inputs import ExpertChoice, LayerInputs, MoELayerOutput
+from ..layers.inputs import ExpertChoice, LayerInputs
 from ..pretrained import DraftPreTrainedModel
 from .assembly import build_target_context_modules
-from .context import prepare_context_inputs
+from .context import prepare_context_inputs, run_backbone
 from .registry import register_draft_model
 
 
@@ -93,17 +93,14 @@ class DSparkDraftModel(DraftPreTrainedModel):
             layer_inputs,
             num_layers=self.backbone.num_layers,
         )
-        hidden, outputs = self.backbone.forward_with_layer_outputs(
-            self.embed_tokens(input_ids), prepared
-        )
-        choices = tuple(
-            o.expert_choice for o in outputs if isinstance(o, MoELayerOutput)
+        hidden, expert_choices = run_backbone(
+            self.backbone, self.embed_tokens(input_ids), prepared
         )
         if not output_logits:
-            return DSparkOutput(hidden_states=hidden, expert_choices=choices or None)
+            return DSparkOutput(hidden_states=hidden, expert_choices=expert_choices)
         return DSparkOutput(
             hidden_states=hidden,
-            expert_choices=choices or None,
+            expert_choices=expert_choices,
             **self.project(hidden, predecessor_ids=predecessor_ids),
         )
 
