@@ -246,9 +246,17 @@ MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `so
 that shifts the choice only. Experts are stored fused (`experts.gate_up_proj`,
 `experts.down_proj`) and export under Transformers' per-expert tensor names.
 `configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
-whose every FFN is a MoE of 8 experts with top-1 routing. Load balancing
-(expert-bias updates and the auxiliary loss) is not wired yet, so the bias stays
-zero.
+whose every FFN is a MoE of 8 experts with top-1 routing.
+
+Load balancing is DeepSeek-V3's aux-loss-free bias update. The DFlash and DSpark
+objectives take `bias_update_rate` in `training.objective_options` (`0`, the
+default, keeps the bias fixed; the recipe uses `0.001`). Over one optimizer step
+the trainer counts, across micro-batches and ranks, the tokens of kept blocks
+each MoE layer routed to each expert, then moves every router's `expert_bias` by
+that rate toward the under-loaded experts with a zero-mean sign step; the bias
+shifts which experts are chosen, not their weights. `moe/step_balance` reports
+the dispatch's balance: 1 when uniform, E / K when the same K experts take every
+token. The auxiliary loss is not wired yet.
 
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.

@@ -39,6 +39,8 @@ training:
   objective_options:
     num_anchors: 512
     confidence_loss_alpha: 0.0
+    # Expert-bias load balancing: zero-mean sign step per optimizer step.
+    bias_update_rate: 0.001
   weighting:
     kind: exponential
     gamma: 7.0
