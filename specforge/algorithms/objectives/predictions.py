@@ -72,13 +72,13 @@ class Teacher:
 
 @dataclass
 class AuxiliaryLoss:
-    """Per-position algorithm auxiliary values and additive metric pairs.
+    """Named per-position auxiliary values and additive metric pairs.
 
-    Values already include algorithm-specific coefficients. The executor applies
-    the prediction's common position weights and denominator.
+    Values match LossPlan.auxiliary_terms by name and have shape [units, positions].
+    The executor applies each term's coefficient, weights and denominator.
     """
 
-    values: Tensor
+    values: dict[str, Tensor]
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
 
 
@@ -89,6 +89,12 @@ class Predictions:
     All aligned tensors have [units, positions, ...] shape. select() preserves
     whole units, including recurrent head inputs. No full-vocabulary projection
     is retained here; project() can be invoked by an eager or chunked executor.
+
+    The optional auxiliary callback accepts (predictions, projected_outputs,
+    teacher_logits, default_weights, statistics) and returns AuxiliaryLoss.
+    Statistics map main-term indices to detached named tensors from this
+    evaluation only. Missing optional statistics must have a reference fallback.
+    Auxiliary terms and their reduction rules are declared in plan.
     """
 
     hidden: Tensor
@@ -129,9 +135,13 @@ class Predictions:
                 value.shape != shape or value.dtype != torch.long
             ):
                 raise ValueError("chain and sequence IDs must be aligned int64 tensors")
-        for term in self.plan.terms:
+        for term in self.plan.all_terms:
             if term.mask is not None and term.mask.shape != shape:
                 raise ValueError("Loss masks must align with prediction units")
+        if bool(self.plan.auxiliary_terms) != (self.auxiliary is not None):
+            raise ValueError(
+                "Auxiliary callback and auxiliary terms must be declared together"
+            )
         aligned = [*self.projection_inputs.values(), *self.auxiliary_inputs.values()]
         if self.teacher is not None:
             aligned.append(self.teacher.values)

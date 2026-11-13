@@ -2,10 +2,11 @@
 
 from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
-from .implementations import register_implementation
-from .losses import register_loss
+from .implementations.registry import register_implementation
+from .implementations.token_kernels import register_token_kernel
+from .losses import LossOutput, register_loss
 from .plan import LossPlan, LossTerm
-from .predictions import PredictionBatch, Predictions
+from .predictions import AuxiliaryLoss, PredictionBatch, Predictions
 from .projection import LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
@@ -19,7 +20,6 @@ from .registry import (
     register_protocol,
     resolve_objective,
 )
-from .token_kernels import register_token_kernel
 
 __all__ = [
     "TrainingRequirements",
@@ -39,6 +39,8 @@ __all__ = [
     "default_protocol",
     "Predictions",
     "PredictionBatch",
+    "AuxiliaryLoss",
+    "LossOutput",
     "LossTerm",
     "LossPlan",
     "Projection",

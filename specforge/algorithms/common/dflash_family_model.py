@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
-from specforge.core import fused_loss
+from specforge.algorithms.objectives.implementations import fused_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from specforge.modeling.draft.dflash import DFlashDraftModel

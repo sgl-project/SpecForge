@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
 from ..predictions import AuxiliaryLoss, PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
-from ..token_kernels import ce_l1_terms
 from .dflash import COMMON_MODULES
 
 
@@ -104,7 +105,7 @@ class DFlash2Objective:
         )
         scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
 
-        def auxiliary(predictions, projected, teacher, weights):
+        def auxiliary(predictions, projected, teacher, weights, statistics):
             labels = predictions.labels
             terms = ce_l1_terms(
                 projected["logits"],
@@ -125,13 +126,14 @@ class DFlash2Objective:
             selector = ce_l1_terms(
                 scores, covered.long().argmax(-1), fused=runtime.execution.fused
             ).cross_entropy * covered.any(-1)
-            return AuxiliaryLoss(scale * selector)
+            return AuxiliaryLoss({"selector": selector})
 
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             auxiliary=auxiliary,
+            plan=LossPlan(auxiliary_terms=(LossTerm("selector", scale),)),
             auxiliary_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))

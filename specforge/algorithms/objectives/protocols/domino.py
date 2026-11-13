@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..implementations.domino_ce import DominoSuffixProjection
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
-from .domino_execution import DominoSuffixProjection
 
 
 @register_protocol(

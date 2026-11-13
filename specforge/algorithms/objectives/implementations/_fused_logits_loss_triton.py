@@ -1,4 +1,4 @@
-"""Internal CUDA kernels for core.fused_loss.fused_ce_l1_loss.
+"""Internal CUDA kernels for implementations.fused_loss.fused_ce_l1_loss.
 
 The public loss contract, validation and eager reference live in fused_loss.py.
 This module is imported lazily only when the fused CE/L1 backend is selected.

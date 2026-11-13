@@ -2,10 +2,9 @@
 
 import torch
 
-from specforge.core import fused_loss
-
-from .implementations import GroupResult, register_implementation
-from .losses import _distillation, _lk
+from ..losses import LossOutput, _distillation, _lk
+from . import fused_loss
+from .registry import GroupResult, register_implementation
 
 
 def ce_l1_terms(logits, labels, *, fused=False, **options):
@@ -39,7 +38,10 @@ def _ce(logits, labels, teacher=None):
 
 def _ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
     terms = ce_l1_terms(logits, labels, teacher_logits=teacher, fused=True)
-    return ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1
+    return LossOutput(
+        ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1,
+        {"teacher_l1": terms.teacher_l1},
+    )
 
 
 def register_token_kernel(kind, compute):
@@ -48,7 +50,8 @@ def register_token_kernel(kind, compute):
     Args:
         kind: Mathematical loss name matched by this implementation.
         compute: Callable(logits, labels, teacher, **options) returning losses
-            shaped like labels. Contextual losses additionally receive context.
+            shaped like labels, or a LossOutput with reusable statistics.
+            Contextual losses additionally receive context.
 
     Returns:
         The registered group executor under the name "token_" + kind. It lazily
@@ -82,15 +85,20 @@ def register_token_kernel(kind, compute):
         # A projection may promote dtype. Preserve the loss reference outside
         # the kernel's supported dtype domain.
         if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            values = loss(
+            result = loss.evaluate(
                 logits, request.labels, teacher=request.teacher, context=inputs.context
             )
         else:
             kwargs = {"context": inputs.context} if loss.registration.contextual else {}
-            values = compute(
+            result = compute(
                 logits, request.labels, request.teacher, **kwargs, **loss.options
             )
-        return GroupResult({index: (values * inputs.weights).sum()})
+        if not isinstance(result, LossOutput):
+            result = LossOutput(result)
+        return GroupResult(
+            {index: (result.values * inputs.weights).sum()},
+            statistics={index: result.statistics},
+        )
 
     return execute
 

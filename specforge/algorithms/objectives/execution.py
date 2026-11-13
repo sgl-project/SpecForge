@@ -8,7 +8,11 @@ from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 
 from .base import ObjectiveResult
 from .execution_options import LossExecution
-from .implementations import ExecutionRequest, TermInputs, select_implementation
+from .implementations.registry import (
+    ExecutionRequest,
+    TermInputs,
+    select_implementation,
+)
 from .losses import LossContext
 from .reductions import PlanResult, combine_results
 
@@ -72,6 +76,9 @@ def prepare_supervision(predictions, loss, weighting, execution):
     required = weighting.requires | predictions.requires
     for term, selected in zip(predictions.plan.terms, losses):
         required |= selected.requires
+        if term.weighting is not None:
+            required |= term.weighting.requires
+    for term in predictions.plan.auxiliary_terms:
         if term.weighting is not None:
             required |= term.weighting.requires
     missing = required - predictions.capabilities
@@ -152,15 +159,20 @@ def evaluate_predictions(
     p = predictions
     projected = projected or prepare_supervision(p, loss, weighting, execution)
     losses = selected_losses(p, loss)
+    default_weights = (
+        weighting(projected.mask.float(), p.positions) if weights is None else weights
+    )
     inputs = []
-    for term, selected in zip(p.plan.terms, losses):
+    for term, selected in zip(
+        p.plan.all_terms, losses + (None,) * len(p.plan.auxiliary_terms)
+    ):
         mask = projected.mask
         if term.mask is not None:
             mask = term.mask
             if p.vocab_mask is not None:
                 mask = mask * p.vocab_mask[projected.teacher_ids]
-        term_weights = weights
-        if term_weights is None:
+        term_weights = default_weights
+        if term.mask is not None or term.weighting is not None:
             term_weights = (term.weighting or weighting)(mask.float(), p.positions)
         fixed = term.denominator if term.denominator is not None else p.denominator
         term_denominator = denominator if denominator is not None else fixed
@@ -177,7 +189,7 @@ def evaluate_predictions(
                 ),
             )
         )
-    numerators, predicted = {}, {}
+    numerators, predicted, statistics = {}, {}, {}
 
     def outputs():
         if not projected.output:
@@ -190,13 +202,17 @@ def evaluate_predictions(
 
     def reference(index):
         term, item = p.plan.terms[index], inputs[index]
-        values = item.loss(
+        result = item.loss.evaluate(
             outputs()[term.output],
             projected.labels,
             teacher=projected.teacher,
             context=item.context,
         )
-        numerators[index] = (values * item.weights).sum()
+        numerators[index] = (result.values * item.weights).sum()
+        if p.auxiliary is not None:
+            statistics[index] = {
+                name: value.detach() for name, value in result.statistics.items()
+            }
 
     def execute(group):
         entry = select_implementation(request, group) if execution.fused else None
@@ -209,6 +225,15 @@ def evaluate_predictions(
             )
         numerators.update(result.numerators)
         predicted.update(result.predictions)
+        if not result.statistics.keys() <= set(group):
+            raise ValueError("Implementation statistics reference an unexecuted term")
+        if p.auxiliary is not None:
+            statistics.update(
+                {
+                    index: {name: value.detach() for name, value in values.items()}
+                    for index, values in result.statistics.items()
+                }
+            )
         return True
 
     for group in p.plan.groups:
@@ -219,18 +244,18 @@ def evaluate_predictions(
 
     ratios = {}
     if p.auxiliary is not None:
-        if not p.plan.shared_reduction:
-            raise ValueError(
-                "Algorithm auxiliary callbacks require shared supervision and reduction"
-            )
-        auxiliary = p.auxiliary(p, outputs(), projected.teacher, inputs[0].weights)
-        # Auxiliary values already include their own coefficients.
-        auxiliary_result = ObjectiveResult(
-            (auxiliary.values * inputs[0].weights).sum(), inputs[0].denominator
+        auxiliary = p.auxiliary(
+            p, outputs(), projected.teacher, default_weights, statistics
         )
+        names = {term.output for term in p.plan.auxiliary_terms}
+        if auxiliary.values.keys() != names:
+            raise ValueError("Auxiliary results must match the declared term names")
+        for index, term in enumerate(p.plan.auxiliary_terms, len(p.plan.terms)):
+            values = auxiliary.values[term.output]
+            if values.shape != p.mask.shape:
+                raise ValueError("Auxiliary values must align with prediction units")
+            numerators[index] = (values * inputs[index].weights).sum()
         ratios.update(auxiliary.ratios)
-    else:
-        auxiliary_result = None
 
     prediction = predicted.get("logits")
     if prediction is None:
@@ -250,10 +275,7 @@ def evaluate_predictions(
         ObjectiveResult(numerators[i], item.denominator)
         for i, item in enumerate(inputs)
     )
-    coefficients = tuple(term.coefficient for term in p.plan.terms)
-    if auxiliary_result is not None:
-        terms += (auxiliary_result,)
-        coefficients += (1.0,)
+    coefficients = tuple(term.coefficient for term in p.plan.all_terms)
     return PlanResult(terms, coefficients, p.plan.shared_reduction, ratios)
 
 
@@ -407,7 +429,7 @@ def evaluate_chunks(
         chunk_size = 0
     if execution.trim and weighting.kind not in DPACE_LOSS_TYPES and not contextual:
         keep = predictions.mask.any(-1)
-        for term in predictions.plan.terms:
+        for term in predictions.plan.all_terms:
             if term.mask is not None:
                 keep |= term.mask.any(-1)
         predictions = predictions.select(keep.nonzero().flatten())
@@ -440,7 +462,7 @@ def evaluate_chunks(
         results.append(result)
     result = combine_results(results)
     if denominator is None:
-        for index, term in enumerate(predictions.plan.terms):
+        for index, term in enumerate(predictions.plan.all_terms):
             fixed = (
                 term.denominator
                 if term.denominator is not None
@@ -448,8 +470,6 @@ def evaluate_chunks(
             )
             if fixed is not None:
                 result.terms[index].denominator = fixed
-        if predictions.auxiliary is not None and predictions.denominator is not None:
-            result.terms[-1].denominator = predictions.denominator
     return result
 
 

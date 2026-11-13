@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
 from ..predictions import AuxiliaryLoss, PredictionBatch
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
-from ..token_kernels import ce_l1_terms
 
 
 @register_protocol(
@@ -136,7 +137,7 @@ class DSpineObjective:
             else 1
         )
 
-        def auxiliary(predictions, projected, teacher, weights):
+        def auxiliary(predictions, projected, teacher, weights, statistics):
             labels = predictions.labels
             terms = ce_l1_terms(
                 projected["logits"],
@@ -180,7 +181,10 @@ class DSpineObjective:
                 totals = torch.stack((ce_num.detach(), denominator))
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
             return AuxiliaryLoss(
-                refined_loss + beta * coefficient.detach() * alignment,
+                {
+                    "refinement": refined_loss,
+                    "alignment": coefficient.detach() * alignment,
+                },
                 {"dspine/backbone_ce": (ce_num.detach(), denominator)},
             )
 
@@ -189,6 +193,9 @@ class DSpineObjective:
             blocks,
             batch,
             auxiliary=auxiliary,
+            plan=LossPlan(
+                auxiliary_terms=(LossTerm("refinement"), LossTerm("alignment", beta))
+            ),
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
             chunk_safe=alignment_ce is not None,

@@ -327,8 +327,13 @@ and a `DominoSuffixProjection` contract. Its `domino_suffix_ce` implementation
 uses compact corrections; the reference path computes both outputs normally.
 There is no algorithm-name branch in the executor.
 
+Execution adapters live in `objectives/implementations/`: `registry.py` owns
+registration and selection, `linear_ce.py` implements linear fusion, and `ce.py`
+contains shared CE applicability checks. `token_kernels.py` registers token-loss
+adapters; `fused_loss.py` provides their numerical reference and fused kernels,
+with CE/L1 Triton details in `_fused_logits_loss_triton.py`.
 The Domino projection contract and joint CE adapter live in
-`objectives/protocols/domino_execution.py`. Fusion requires one complete block per
+`objectives/implementations/domino_ce.py`. Fusion requires one complete block per
 projection unit, additive corrections on a contiguous suffix, and base/final CE
 terms with shared supervision weights. Other layouts use ordinary projection.
 
@@ -350,8 +355,21 @@ Existing trainer accumulation and protocol semantics are unchanged.
 Reference outputs are reused only within the current evaluation. No logits cache
 is stored on the model. Contextual losses retain whole-set execution; algorithms
 must disable chunking when their projection/auxiliary computation requires it.
-The existing algorithm auxiliary computations remain in their objectives and
-require shared supervision; the specialized fused execution callback is removed.
+Auxiliary computations remain in their protocols. `LossPlan.auxiliary_terms`
+uses the same `LossTerm` coefficients, masks, position weights and denominators
+as main losses. Its `loss` field must be unset because the callback returns
+already-computed values, named by `output`, in `AuxiliaryLoss.values`.
+Names and shapes must match the declaration. Auxiliary masks participate in
+trimming, and fixed denominators are restored once after chunk reduction.
+
+Reference losses may return `LossOutput(values, statistics)` instead of a tensor.
+Token kernels support the same result; group implementations return statistics
+by main-term index. The executor passes detached statistics to auxiliary callbacks,
+scoped to the current evaluation/chunk rather than stored on the model.
+DSpark reuses the main CE/L1 result's `teacher_l1` for confidence supervision;
+if another main loss supplies no L1, its callback computes the reference target.
+DFlash2 selector and DSpine refinement/alignment are separate named auxiliary terms.
+Existing auxiliary formulas and training coefficients are preserved.
 
 Functionality and optimization support are separate: a method can use its ordinary
 projection without supporting linear/Domino suffix fusion. TP, LoRA and quantized heads

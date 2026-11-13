@@ -1,16 +1,13 @@
 """Execution implementations selected by projection and loss contracts."""
 
-import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from functools import lru_cache
 
 import torch
 
-from .losses import LossContext, TokenLoss
-from .predictions import Predictions
-from .projection import LinearProjection
+from ..losses import LossContext, TokenLoss
+from ..predictions import Predictions
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +17,14 @@ class TermInputs:
     """Resolved inputs for one loss term.
 
     Attributes:
-        loss: Mathematical loss and its options.
+        loss: Mathematical loss and its options; None for already-computed auxiliary terms.
         mask: Supervised positions, shaped [units, positions].
         weights: Effective per-position weights, aligned with mask.
         denominator: Scalar used after additive chunk statistics are merged.
         context: Teacher-mass and normalization inputs for contextual losses.
     """
 
-    loss: TokenLoss
+    loss: TokenLoss | None
     mask: torch.Tensor
     weights: torch.Tensor
     denominator: torch.Tensor
@@ -43,10 +40,13 @@ class GroupResult:
             must not include the term coefficient or division by its denominator.
         predictions: Optional output names mapped to predicted token IDs,
             shaped [units, positions], for metric computation.
+        statistics: Term indices mapped to reusable named tensors. The executor
+            detaches these before passing them to auxiliary callbacks.
     """
 
     numerators: dict[int, torch.Tensor]
     predictions: dict[str, torch.Tensor] = field(default_factory=dict)
+    statistics: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -139,7 +139,7 @@ def select_implementation(request, group, *, name="auto"):
         ValueError: An explicitly named implementation is unknown or rejects
             the request. Exceptions raised by applicability checks propagate.
     """
-    from . import token_kernels  # noqa: F401
+    from . import domino_ce, linear_ce, token_kernels  # noqa: F401
 
     candidates = sorted(
         _IMPLEMENTATIONS.values(), key=lambda item: (-item.priority, item.name)
@@ -158,130 +158,3 @@ def select_implementation(request, group, *, name="auto"):
             raise ValueError(f"{name} cannot execute this loss group: {reason}")
     logger.debug("Loss group %s uses reference execution", group)
     return None
-
-
-def projection_ce_support(request, group):
-    """Return None or a rejection reason for the requested fused CE group."""
-    p = request.predictions
-    if not p.hidden.is_cuda or p.hidden.dtype not in (
-        torch.float16,
-        torch.bfloat16,
-        torch.float32,
-    ):
-        return "requires CUDA FP16/BF16/FP32"
-    if p.hidden.numel() == 0:
-        return "empty projection uses the reference path"
-    if not p.projection.chunk_safe or not p.projection.recompute_safe:
-        return "projection does not permit chunked/recomputed fusion"
-    if request.materialized:
-        return "projection is already materialized"
-    if p.auxiliary is not None:
-        return "auxiliary computation consumes full projection outputs"
-    if p.vocab_mask is not None:
-        return "vocabulary mapping requires a different projection implementation"
-    if any(
-        request.terms[i].loss.kind != "ce" or request.terms[i].loss.options
-        for i in group
-    ):
-        return "requires ordinary hard-label CE"
-    return None
-
-
-@lru_cache
-def _linear_kernel():
-    """Return the compatible Liger kernel class, or None if unavailable.
-
-    The result is cached. Missing optional packages and an unsupported kernel
-    signature disable this optimization; unrelated import errors propagate.
-    """
-    try:
-        from liger_kernel.ops.fused_linear_cross_entropy import (
-            LigerFusedLinearCrossEntropyFunction,
-        )
-    except ModuleNotFoundError as exc:
-        if exc.name and exc.name.split(".")[0] in ("liger_kernel", "triton"):
-            return None
-        raise
-    # Older kernels cannot provide accuracy without materializing logits.
-    if (
-        "return_predicted_tokens"
-        not in inspect.signature(
-            LigerFusedLinearCrossEntropyFunction.forward
-        ).parameters
-    ):
-        return None
-    return LigerFusedLinearCrossEntropyFunction
-
-
-def _linear_support(request, group):
-    """Return None or a reason the requested linear CE cannot be fused."""
-    p = request.predictions
-    if not isinstance(p.projection, LinearProjection):
-        return "requires an explicit linear projection"
-    if (
-        len(group) != 1
-        or p.plan.terms[group[0]].output != "logits"
-        or p.projection_inputs
-    ):
-        return "requires one ordinary linear output"
-    reason = projection_ce_support(request, group)
-    if reason:
-        return reason
-    from torch import nn
-
-    from specforge.modeling.draft.bindings import BoundLMHead
-
-    head = p.projection.head
-    if type(head) not in (nn.Linear, BoundLMHead):
-        return "wrapped or transformed heads use their normal forward"
-    if head._forward_hooks or head._forward_pre_hooks:
-        return "head hooks require normal module execution"
-    if type(head.weight) not in (torch.Tensor, nn.Parameter) or head.weight.ndim != 2:
-        return "requires an unsharded matrix"
-    if head.weight.device != p.hidden.device or head.weight.dtype != p.hidden.dtype:
-        return "requires matching activation and weight device/dtype"
-    if _linear_kernel() is None:
-        return "Liger linear CE with predicted-token output is unavailable"
-    return None
-
-
-@register_implementation("linear_ce", supports=_linear_support, priority=10)
-def linear_ce(request, group):
-    """Fuse a plain linear projection with hard-label cross entropy.
-
-    Args:
-        request: Validated LinearProjection, token labels and position weights.
-        group: One term index naming the logits output.
-
-    Returns:
-        GroupResult with a weighted CE sum and predicted token IDs, without
-        retaining the full vocabulary logits. Supports must be checked first.
-    """
-    p = request.predictions
-    weight, bias = p.projection.weight_and_bias()
-    losses, _, _, predicted = _linear_kernel().apply(
-        p.hidden.flatten(0, 1),
-        weight,
-        request.labels.flatten(),
-        bias,
-        None,
-        -100,
-        0.0,
-        0.0,
-        "none",
-        None,
-        False,
-        None,
-        False,
-        False,
-        True,
-    )
-    index = group[0]
-    return GroupResult(
-        {
-            index: (
-                losses.reshape_as(request.labels) * request.terms[index].weights
-            ).sum()
-        },
-        {"logits": predicted.reshape_as(request.labels)},
-    )

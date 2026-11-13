@@ -3,12 +3,9 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..implementations import (
-    GroupResult,
-    projection_ce_support,
-    register_implementation,
-)
 from ..projection import Projection
+from .ce import projection_ce_support
+from .registry import GroupResult, register_implementation
 
 
 @dataclass(frozen=True)

@@ -203,7 +203,7 @@ model-specific constraints or allocate model weights.
 
 ## Fused token losses
 
-Import losses from `specforge.core.fused_loss`. Unprefixed functions are eager.
+Import losses from `specforge.algorithms.objectives.implementations.fused_loss`. Unprefixed functions are eager.
 
 | API pair (eager / fused) | Label input | Per-token objective |
 | --- | --- | --- |
@@ -218,7 +218,7 @@ draft normalization and combines both loss gradients before casting to the
 input dtype. This is useful when CE and teacher L1/TV train the same logits.
 
 ```python
-from specforge.core.fused_loss import fused_ce_l1_loss
+from specforge.algorithms.objectives.implementations.fused_loss import fused_ce_l1_loss
 
 logits = lm_head(hidden)                    # [..., V], BF16/FP16/FP32 on CUDA
 terms = fused_ce_l1_loss(

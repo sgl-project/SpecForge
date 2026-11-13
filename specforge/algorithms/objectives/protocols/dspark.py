@@ -8,11 +8,12 @@ import torch.nn.functional as F
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
 from ..predictions import AuxiliaryLoss, PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
-from ..token_kernels import ce_l1_terms
 from .dflash import COMMON_MODULES
 
 
@@ -89,23 +90,26 @@ class DSparkObjective:
             output_logits=False,
         )
 
-        def auxiliary(predictions, projected, teacher, weights):
+        def auxiliary(predictions, projected, teacher, weights, statistics):
             confidence = projected["confidence_scores"]
             if confidence is None:
-                return AuxiliaryLoss(weights.new_zeros(weights.shape))
+                return AuxiliaryLoss({"confidence": weights.new_zeros(weights.shape)})
             with torch.no_grad():
-                distance = ce_l1_terms(
-                    projected["logits"],
-                    predictions.labels,
-                    teacher_logits=teacher,
-                    fused=runtime.execution.fused,
-                ).teacher_l1
+                distance = statistics.get(0, {}).get("teacher_l1")
+                if distance is None:
+                    distance = ce_l1_terms(
+                        projected["logits"],
+                        predictions.labels,
+                        teacher_logits=teacher,
+                        fused=runtime.execution.fused,
+                    ).teacher_l1
                 acceptance = (1 - distance / 2).clamp(0, 1)
             return AuxiliaryLoss(
-                self.confidence_loss_alpha
-                * F.binary_cross_entropy_with_logits(
-                    confidence, acceptance, reduction="none"
-                )
+                {
+                    "confidence": F.binary_cross_entropy_with_logits(
+                        confidence, acceptance, reduction="none"
+                    )
+                }
             )
 
         predictions = runtime.block_predictions(
@@ -114,6 +118,9 @@ class DSparkObjective:
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
             auxiliary=auxiliary,
+            plan=LossPlan(
+                auxiliary_terms=(LossTerm("confidence", self.confidence_loss_alpha),)
+            ),
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )

@@ -316,7 +316,7 @@ def _require_triton():
         import triton.language as tl
     except ImportError as exc:
         raise RuntimeError(
-            "The fused losses in specforge.core.fused_loss require Triton "
+            "The fused losses in specforge.algorithms.objectives.implementations.fused_loss require Triton "
             "with a compatible backend, which is not importable on this host. "
             "Use the eager reference losses in this module instead."
         ) from exc
@@ -533,7 +533,7 @@ def fused_ce_l1_loss(
     ):
         raise ValueError("fused_ce_l1_loss requires FP16/BF16/FP32 CUDA logits")
     try:
-        from specforge.core._fused_logits_loss_triton import _FusedCEL1Loss
+        from ._fused_logits_loss_triton import _FusedCEL1Loss
     except ImportError as exc:
         raise RuntimeError(
             "fused_ce_l1_loss requires Triton; use ce_l1_loss instead"

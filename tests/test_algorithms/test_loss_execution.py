@@ -9,7 +9,7 @@ from torch import nn
 
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
-from specforge.algorithms.objectives.implementations import _IMPLEMENTATIONS
+from specforge.algorithms.objectives.implementations.registry import _IMPLEMENTATIONS
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.predictions import (
     PredictionBatch,
