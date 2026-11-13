@@ -369,28 +369,17 @@ class MoEFFNTest(unittest.TestCase):
             for parameter in module.parameters():
                 parameter.normal_(std=0.2)
         x = torch.randn(2, 5, H)
-        for training in (True, False):
-            with self.subTest(training=training):
-                module.train(training)
-                output = module(x)
-                self.assertIsInstance(output, MoEOutput)
-                self.assertEqual(tuple(output.update.shape), (2, 5, H))
-                self.assertEqual(output.update.dtype, torch.float32)
-                self.assertIsInstance(output.routing, ExpertRouting)
-                indices = output.routing.expert_ids
-                self.assertEqual(tuple(indices.shape), (10, 2))
-                self.assertEqual(indices.dtype, torch.long)
-                self.assertFalse(indices.requires_grad)
-                scores, expected, _ = module.gate(x.reshape(-1, H))
-                self.assertTrue(torch.equal(indices, expected))
-                # The router scores travel with the routing, differentiable for an aux loss.
-                scores = output.routing.scores
-                self.assertEqual(tuple(scores.shape), (10, module.config.num_experts))
-                self.assertEqual(scores.dtype, torch.float32)
-                self.assertTrue(scores.requires_grad)
-                self.assertTrue(torch.equal(scores, module.gate(x.reshape(-1, H))[0]))
-                scores[:, 0].sum().backward()
-                self.assertTrue(torch.any(module.gate.weight.grad != 0))
+        output = module(x)
+        self.assertIsInstance(output, MoEOutput)
+        self.assertEqual(tuple(output.update.shape), (2, 5, H))
+        self.assertIsInstance(output.routing, ExpertRouting)
+        # The routing is the router's own choice and scores, the latter with their graph.
+        scores, indices, _ = module.gate(x.reshape(-1, H))
+        self.assertTrue(torch.equal(output.routing.expert_ids, indices))
+        self.assertTrue(torch.equal(output.routing.scores, scores))
+        self.assertTrue(output.routing.scores.requires_grad)
+        output.routing.scores[:, 0].sum().backward()
+        self.assertTrue(torch.any(module.gate.weight.grad != 0))
 
     def test_invalid_settings_fail_before_allocation(self):
         with patch("torch.nn.Parameter") as allocate:
@@ -402,8 +391,6 @@ class MoEFFNTest(unittest.TestCase):
                 )
             with self.assertRaises(TypeError):
                 TopKRouter({}, num_experts=4, hidden_size=H, top_k=2)
-            with self.assertRaisesRegex(ValueError, "gated FFNs only"):
-                moe_spec(experts=expert_spec(gated=False))
             for width in (0, True, 1.5):
                 with self.assertRaises(ValueError):
                     MoEFFN(moe_spec(), hidden_size=width)

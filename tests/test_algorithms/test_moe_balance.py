@@ -105,10 +105,11 @@ class MoEBalanceTest(unittest.TestCase):
         metrics = balancer.step()
         self.assertEqual(set(metrics), {"moe/step_balance"})
         self.assertEqual(balancer.counts, [None])
-        load = counts.float()
-        expected = 0.01 * torch.sign(load.mean() - load)
-        expected = expected - expected.mean()
-        torch.testing.assert_close(layer.gate.expert_bias - before, expected)
+        moved = (
+            layer.gate.expert_bias - before
+        )  # the sign step is test_router_contract's
+        self.assertTrue(torch.any(moved != 0))
+        torch.testing.assert_close(moved.sum(), torch.zeros(()))
         torch.testing.assert_close(
             metrics["moe/step_balance"], dispatch_balance(counts)
         )

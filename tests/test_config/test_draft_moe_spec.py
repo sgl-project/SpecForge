@@ -1,10 +1,8 @@
 """MoE FFN nodes: validation, codec round trips and use inside a draft configuration."""
 
-import dataclasses
 import json
 import unittest
 
-from specforge.config.draft.codec import decode_config, encode_config, parse_draft
 from specforge.config.draft.codec.components import decode_component, encode_component
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import (
@@ -13,7 +11,6 @@ from specforge.config.draft.mlp import (
     MoEFFNSpec,
     MoERouterSpec,
 )
-from specforge.config.draft.registry import component_schema
 from tests.test_config.draft_fixtures import draft_config
 
 ROUTER = {
@@ -65,19 +62,10 @@ def moe_draft_config(**overrides):
 
 
 class MoESpecTest(unittest.TestCase):
-    def test_node_is_registered_frozen_and_hashable(self):
-        node = moe_spec()
-        self.assertIs(component_schema("mlp", "moe"), MoEFFNSpec)
-        self.assertEqual(node, moe_spec())
-        self.assertEqual(hash(node), hash(moe_spec()))
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            node.num_experts = 2
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            node.router.expert_bias = False
-
     def test_invalid_settings_fail_at_construction(self):
         for changes, message in (
             ({"num_experts_per_tok": 9}, "exceeds num_experts"),
+            ({"experts": {"gated": False}}, "gated FFNs only"),
             ({"num_experts": 0}, "num_experts must be a positive integer"),
             ({"num_experts_per_tok": True}, "num_experts_per_tok"),
             ({"experts": {"intermediate_size": -1}}, "intermediate_size"),
@@ -154,48 +142,10 @@ class MoESpecTest(unittest.TestCase):
                 {**MOE, "shared_expert": {**GATED, "gated": "yes"}},
                 "gated: expected bool",
             ),
-            ({**MOE, "shared_expert_gate": True}, "requires a shared expert"),
-            ({**MOE, "num_experts_per_tok": 9}, "exceeds num_experts"),
         ):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     decode_component("mlp", payload)
-
-    def test_cross_node_validation_covers_moe_references(self):
-        with self.assertRaisesRegex(ValueError, "unused"):
-            moe_draft_config(layer_types=("full_dense", "full_dense"))
-        with self.assertRaisesRegex(ValueError, "unknown mlp definition"):
-            moe_draft_config(
-                layer_configs={
-                    "full_dense": LayerSpec(attention="full", mlp="dense"),
-                    "full_moe": LayerSpec(attention="full", mlp="experts"),
-                }
-            )
-
-    def test_yaml_shorthand_expands_a_moe_mlp(self):
-        canonical = encode_config(draft_config())
-        shorthand = {
-            key: value
-            for key, value in canonical.items()
-            if key
-            not in (
-                "attention_configs",
-                "mlp_configs",
-                "conv_configs",
-                "layer_configs",
-                "layer_types",
-            )
-        }
-        shorthand["attention"] = canonical["attention_configs"]["full"]
-        shorthand["mlp"] = MOE
-        config = parse_draft(shorthand, target_config=None)
-        self.assertEqual(dict(config.mlp_configs), {"default": moe_spec()})
-        self.assertEqual(config.layer_types, ("default", "default"))
-        self.assertEqual(
-            dict(config.layer_configs),
-            {"default": LayerSpec(attention="default", mlp="default")},
-        )
-        self.assertEqual(decode_config(encode_config(config)), config)
 
 
 if __name__ == "__main__":

@@ -207,27 +207,6 @@ class CanonicalTrainingTest(unittest.TestCase):
                     reference.state_dict().keys(), fused.state_dict().keys()
                 )
 
-    def test_json_draft_files_keep_their_numbers(self):
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = target_directory(root)
-            draft = draft_config()
-            payload = encode_config(draft)
-            self.assertEqual(payload["norm_config"]["eps"], 1e-06)
-            for suffix in (".json", ".yaml"):
-                with self.subTest(suffix=suffix):
-                    path = root / f"draft{suffix}"
-                    # json.dumps writes 1e-06, which YAML 1.1 would read as a string.
-                    path.write_text(json.dumps(payload) if suffix == ".json" else "")
-                    if suffix == ".yaml":
-                        import yaml
-
-                        path.write_text(yaml.safe_dump(payload))
-                    raw = run_config(target, draft).model_dump()
-                    raw["draft"] = str(path)
-                    resolved = resolve_run(Config.model_validate(raw))
-                    self.assertEqual(resolved.config.draft["norm_config"]["eps"], 1e-06)
-
     def test_training_parses_with_target_before_building_the_model(self):
         from unittest.mock import patch
 

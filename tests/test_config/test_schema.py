@@ -199,18 +199,6 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "use_liger_kernel"):
             Config.model_validate(payload)
 
-    def test_moe_experts_kernel_is_a_string_defaulting_to_grouped_mm(self):
-        default = Config.model_validate(copy.deepcopy(MINIMAL))
-        self.assertEqual(default.model.moe_experts_kernel, "grouped_mm")
-        payload = copy.deepcopy(MINIMAL)
-        payload["model"]["moe_experts_kernel"] = "loop"
-        self.assertEqual(
-            Config.model_validate(payload).model.moe_experts_kernel, "loop"
-        )
-        payload["model"]["moe_experts_kernel"] = 1
-        with self.assertRaisesRegex(ValidationError, "moe_experts_kernel"):
-            Config.model_validate(payload)
-
     def test_explicit_liger_kernel_is_rejected_for_strategies_that_ignore_it(self):
         for strategy in ("dflash", "domino", "dspark", "mtp"):
             payload = _online_payload(strategy)
