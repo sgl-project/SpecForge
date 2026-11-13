@@ -5,7 +5,7 @@ from dataclasses import replace
 
 from torch import Tensor
 
-from ..layers.inputs import LayerInputs, MoELayerOutput
+from ..layers.inputs import LayerInputs
 from .target_features import TargetFeatureFusion
 
 
@@ -27,10 +27,3 @@ def prepare_context_inputs(
             )
     context = fusion(features)
     return [replace(entry, target_context=context) for entry in inputs]
-
-
-def run_backbone(backbone, hidden: Tensor, layer_inputs: Sequence[LayerInputs]):
-    """The backbone's forward through its hooks, and each MoE layer's routing (or None)."""
-    hidden, outputs = backbone(hidden, layer_inputs, with_layer_outputs=True)
-    routings = tuple(o.routing for o in outputs if isinstance(o, MoELayerOutput))
-    return hidden, routings or None

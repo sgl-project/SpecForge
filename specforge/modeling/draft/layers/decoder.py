@@ -6,7 +6,7 @@ from specforge.config.draft._validation import positive_int
 from specforge.config.draft.norm import NormSpec
 
 from .attention.backends import PreparedAttention
-from .inputs import ExpertRouting, LayerInputs, MoELayerOutput, MoEOutput
+from .inputs import LayerInputs
 from .registry import build_component
 from .residual import ResidualConnection
 
@@ -72,8 +72,7 @@ class DecoderLayer(nn.Module):
             "norm", norm, hidden_size=hidden_size, device=device, dtype=dtype
         )
 
-    def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor | MoELayerOutput:
-        """The stream, or with a MoE FFN the typed layer output with its expert routing."""
+    def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
         if not isinstance(inputs, LayerInputs):
             raise TypeError("DecoderLayer requires LayerInputs")
         if not isinstance(inputs.attention, PreparedAttention):
@@ -81,19 +80,7 @@ class DecoderLayer(nn.Module):
         hidden = self.attention_connection(
             hidden, lambda stream: self._attention_update(stream, inputs)
         )
-        routing: ExpertRouting | None = None
-
-        def mlp_update(stream: Tensor) -> Tensor:
-            nonlocal routing
-            update, routing = self._mlp_update(stream)
-            return update
-
-        hidden = self.mlp_connection(hidden, mlp_update)
-        return (
-            hidden
-            if routing is None
-            else MoELayerOutput(hidden=hidden, routing=routing)
-        )
+        return self.mlp_connection(hidden, self._mlp_update)
 
     def _check_stream(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
@@ -124,14 +111,12 @@ class DecoderLayer(nn.Module):
             update = self.attention_conv.finish(update, coefficients)
         return self._check_update(update, hidden, "attention")
 
-    def _mlp_update(self, hidden: Tensor) -> tuple[Tensor, ExpertRouting | None]:
+    def _mlp_update(self, hidden: Tensor) -> Tensor:
         self._check_stream(hidden)
         update = self.post_attention_layernorm(hidden)
         if self.mlp_conv is not None:
             update, coefficients = self.mlp_conv.prepare(update)
-        result = self.mlp(update)
-        routing = result.routing if isinstance(result, MoEOutput) else None
-        update = result.update if routing is not None else result
+        update = self.mlp(update)
         if self.mlp_conv is not None:
             update = self.mlp_conv.finish(update, coefficients)
-        return self._check_update(update, hidden, "mlp"), routing
+        return self._check_update(update, hidden, "mlp")
