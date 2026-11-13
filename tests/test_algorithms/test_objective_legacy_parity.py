@@ -357,14 +357,9 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(pooled, torch.stack(expected_losses).mean())
 
-    def test_mtp_matches_legacy_wrapper_with_native_layers(self):
-        from types import SimpleNamespace
-
-        from torch import nn
-
+    def test_mtp_matches_explicit_shifted_loss_with_native_layers(self):
         from specforge.config.draft.norm import RMSNormSpec
         from specforge.config.draft.rope import DefaultRoPESpec
-        from specforge.core.mtp import OnlineMTPModel
         from tests.test_config.test_draft_mtp_spec import mtp_config
         from tests.test_modeling.test_canonical_mtp import (
             reference_forward,
@@ -383,32 +378,31 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             ),
         )
         model = build_draft_model(config)
-        adapter = nn.Module()
-        adapter.mtp = reference_model(config)
-        adapter.mtp.load_state_dict(model.state_dict())
-        adapter.config = SimpleNamespace(pad_token_id=0)
-        adapter.forward_hidden = lambda input_ids, hidden_states, attention_mask, position_ids: reference_forward(
-            adapter.mtp, input_ids, hidden_states, position_ids
-        )[
-            0
-        ]
-        old = OnlineMTPModel(adapter, objective_chunk_size=0)
+        reference = reference_model(config)
+        reference.load_state_dict(model.state_dict())
         new = build_objective_model(model)
         batch = training_batch(config)
         batch["attention_mask"].fill_(1)
         actual = new(batch, step=0, total_steps=None).loss
-        expected = old(
-            input_ids=batch["input_ids"],
-            hidden_states=batch["target_last_hidden_states"].detach(),
-            loss_mask=batch["loss_mask"],
-            attention_mask=batch["attention_mask"],
-        )[0]
+        # Historical MTP alignment: h[t-1] and token[t] predict token[t+1].
+        ids = batch["input_ids"]
+        _, logits = reference_forward(
+            reference,
+            ids[:, 1:],
+            batch["target_last_hidden_states"][:, :-1].detach(),
+            torch.arange(1, ids.shape[1]).expand_as(ids[:, 1:]),
+        )
+        losses = torch.nn.functional.cross_entropy(
+            logits[:, :-1].flatten(0, 1), ids[:, 2:].flatten(), reduction="none"
+        )
+        mask = batch["loss_mask"][:, 2:].flatten().float()
+        expected = (losses * mask).sum() / mask.sum()
         assert_loss_and_gradients(
             new,
-            old,
+            reference,
             actual,
             expected,
-            {n: "draft_model.mtp." + n for n, _ in model.named_parameters()},
+            {n: n for n, _ in model.named_parameters()},
         )
 
     def test_dmtp_matches_explicit_suffix_loss(self):

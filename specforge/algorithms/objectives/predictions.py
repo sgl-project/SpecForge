@@ -125,3 +125,4 @@ class Predictions:
 class PredictionBatch:
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
+    chunk_size: int = 0

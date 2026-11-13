@@ -19,6 +19,51 @@ from tests.test_modeling.test_canonical_dflash import inputs_for
 
 
 class CanonicalExportTest(unittest.TestCase):
+    def test_run_paths_agree_for_loading_export_and_initialization(self):
+        from specforge.application.composition import resolve_run
+        from specforge.export.canonical import read_export
+        from specforge.training.canonical import resolve_config
+        from specforge.training.checkpoint import CheckpointManager
+        from tests.test_runtime.test_canonical_training import (
+            run_config,
+            target_directory,
+        )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "run"
+            step = run / "draft-step2"
+            config = draft_config(target_bindings=(), target_logit_transform=None)
+            model = build_draft_model(config)
+            save_draft(model, step)
+            torch.save(
+                {"draft_state_dict": model.state_dict()}, step / "training_state.pt"
+            )
+            target = target_directory(root)
+            for linked in (False, True):
+                if linked:
+                    (run / "draft-latest").symlink_to(step, target_is_directory=True)
+                for path in (
+                    step,
+                    step / "training_state.pt",
+                    run,
+                    "file://" + str(run),
+                ):
+                    with self.subTest(linked=linked, path=path):
+                        self.assertEqual(
+                            Path(CheckpointManager.resolve_resume_dir(path)).resolve(),
+                            step.resolve(),
+                        )
+                        self.assertEqual(read_draft(path).config, config)
+                        self.assertEqual(read_export(path)[0].config, config)
+                        cfg = run_config(
+                            target,
+                            config,
+                            initialization={"checkpoint": str(path)},
+                        ).model_copy(update={"draft": None})
+                        self.assertEqual(resolve_config(cfg), config)
+                        resolve_run(cfg)
+
     def test_owned_and_bound_export(self):
         for bound in (False, True):
             with self.subTest(bound=bound), TemporaryDirectory() as tmp:

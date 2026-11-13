@@ -1,7 +1,6 @@
 """Validate owned export state; target tables are read only to check legacy copies."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
@@ -17,13 +16,9 @@ class _BindingMetadata:
 
 
 def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=None):
-    path = Path(str(checkpoint).removeprefix("file://"))
-    if path.is_dir() and not any(
-        (path / name).exists() for name in ("config.json", "training_state.pt")
-    ):
-        from specforge.training.checkpoint import CheckpointManager
+    from specforge.checkpoint.resolve import resolve_checkpoint_path
 
-        path = Path(CheckpointManager.resolve_resume_dir(str(path)))
+    path = resolve_checkpoint_path(checkpoint)
     directory = path.parent if path.is_file() else path
     supplementary = draft_config if not (directory / "config.json").exists() else None
     checkpoint = read_draft(

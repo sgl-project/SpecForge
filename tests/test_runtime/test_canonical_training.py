@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import Qwen3Config
 
 from specforge.application.composition import build_application_run, resolve_run
@@ -61,6 +61,21 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_mtp_training_requires_explicit_initialization(self):
+        from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
+
+        with TemporaryDirectory() as tmp:
+            target = target_directory(Path(tmp))
+            cfg = run_config(target, owned_mtp_config())
+            resolved = resolve_run(cfg)  # Capture planning does not initialize weights.
+            with self.assertRaisesRegex(ValueError, "initialization: {}"):
+                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            raw = cfg.model_dump()
+            raw["initialization"] = {}
+            resolved = resolve_run(Config.model_validate(raw))
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertIsNotNone(bundle.draft_model)
+
     def test_target_tables_are_reused_and_owned_embedding_is_initialized(self):
         from safetensors.torch import load_file
 
@@ -238,7 +253,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             ]
             for draft in configs:
                 with self.subTest(architecture=draft.architecture):
-                    cfg = run_config(target, draft)
+                    cfg = run_config(target, draft, initialization={})
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
                         resolved.config, algorithm=resolved.algorithm
@@ -333,7 +348,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.subTest(tied=tied):
                 self._train_and_resume(tied)
 
-    def _train_and_resume(self, tied):
+    @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
+    def test_mtp_native_copy_sdpa_chunking_and_resume(self):
+        self._train_and_resume(False, mtp=True)
+
+    def _train_and_resume(self, tied, mtp=False):
         with TemporaryDirectory() as temp:
             root = Path(temp)
             owns_group = not torch.distributed.is_initialized()
@@ -354,6 +373,24 @@ class CanonicalTrainingTest(unittest.TestCase):
                     else {}
                 ),
             )
+            if mtp:
+                from specforge.checkpoint.formats.sglang.converters import (
+                    serving_weights,
+                )
+                from specforge.modeling import build_draft_model
+                from tests.test_checkpoint.test_native_presets import (
+                    NATIVE_MAPPING,
+                    native_configs,
+                )
+
+                draft = next(native_configs(small=True))
+                original = build_draft_model(draft)
+                native = {
+                    "mtp." + k: v
+                    for k, v in serving_weights(draft, original.state_dict()).items()
+                }
+                tables = load_file(target / "model.safetensors")
+                save_file(tables | native, target / "model.safetensors")
             features = root / "features"
             features.mkdir()
             for index in range(2):
@@ -374,17 +411,25 @@ class CanonicalTrainingTest(unittest.TestCase):
                 target,
                 draft,
                 training={
-                    "attention_backend": "eager",
+                    "attention_backend": "sdpa" if mtp else "eager",
                     "max_steps": 1,
                     "total_steps": 2,
                     "save_interval": 1,
                     "log_interval": 1,
-                    "objective_options": {"num_anchors": 2},
-                    "loss": {"kind": "kl"},
-                    "weighting": {"kind": "dpace", "alpha": 0.3},
+                    "objective_options": (
+                        {"objective_chunk_size": 2} if mtp else {"num_anchors": 2}
+                    ),
+                    "loss": {"kind": "ce" if mtp else "kl"},
+                    "weighting": (
+                        {"kind": "uniform"} if mtp else {"kind": "dpace", "alpha": 0.3}
+                    ),
                 },
             )
             cfg.model.use_liger_kernel = tied
+            if mtp:
+                raw = cfg.model_dump()
+                raw["initialization"] = {"from_target": NATIVE_MAPPING}
+                cfg = Config.model_validate(raw)
             first = build_application_run(cfg)
             first.run()
             checkpoint = root / "output" / "specforge-run-step1"
@@ -399,7 +444,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 name: tensor.clone() for name, tensor in model.state_dict().items()
             }
             raw = cfg.model_dump()
-            raw.update(draft=None, resume=str(checkpoint))
+            raw.update(draft=None, initialization=None, resume=str(checkpoint))
             raw["training"]["max_steps"] = 2
             second = build_application_run(Config.model_validate(raw))
             second.run()
@@ -408,8 +453,11 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
-            self.assertEqual(state["canonical_loss"]["kind"], "kl")
-            self.assertEqual(state["canonical_weighting"]["alpha"], 0.3)
+            self.assertEqual(state["canonical_loss"]["kind"], "ce" if mtp else "kl")
+            if mtp:
+                self.assertEqual(state["canonical_weighting"]["kind"], "uniform")
+            else:
+                self.assertEqual(state["canonical_weighting"]["alpha"], 0.3)
             if tied:
                 self.assertNotIn("lm_head.weight", state["draft_state_dict"])
                 self.assertIs(model.embed_tokens.weight, model.lm_head.weight)
@@ -419,10 +467,10 @@ class CanonicalTrainingTest(unittest.TestCase):
                     for name, tensor in state["draft_state_dict"].items()
                 )
             )
-            for key, changed in (
-                ("loss", {"kind": "tv"}),
-                ("weighting", {"kind": "uniform"}),
-            ):
+            changes = [("loss", {"kind": "tv"})]
+            if not mtp:
+                changes.append(("weighting", {"kind": "uniform"}))
+            for key, changed in changes:
                 with self.subTest(changed=key):
                     incompatible = Config.model_validate(raw)
                     setattr(incompatible.training, key, changed)

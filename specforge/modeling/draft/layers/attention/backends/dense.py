@@ -58,6 +58,11 @@ class EagerAttentionBackend(DenseAttentionBackend):
 
 
 class SDPAAttentionBackend(DenseAttentionBackend):
+    def prepare(self, layout, **options):
+        mask, active = super().prepare(layout, **options)
+        # Prepare once per forward. Avoid undefined softmax/backward on empty rows.
+        return DenseMask(mask.visibility | mask.empty_rows, mask.empty_rows), active
+
     def attend(
         self,
         query,
@@ -83,4 +88,4 @@ class SDPAAttentionBackend(DenseAttentionBackend):
             dropout_p=dropout_p if training else 0.0,
             enable_gqa=query.shape[1] != key.shape[1],
         )
-        return output, None
+        return output.masked_fill(mask.empty_rows, 0), None

@@ -1,0 +1,34 @@
+"""Compatibility exports for training paths not yet replaced by canonical models."""
+
+from .base import Eagle3DraftModel
+from .dflash import (
+    DFlashDraftModel,
+    build_target_layer_ids,
+    extract_context_feature,
+    sample,
+)
+from .dflash2 import DFlash2DraftModel
+from .domino import DominoDraftModel
+from .dspark import DSparkDraftModel
+from .dspine import DSpineDraftModel
+from .llama3_eagle import LlamaForCausalLMEagle3
+from .peagle import PEagleDraftModel
+from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
+
+__all__ = [
+    "Eagle3DraftModel",
+    "DFlashDraftModel",
+    "DFlash2DraftModel",
+    "DominoDraftModel",
+    "DSparkDraftModel",
+    "DSpineDraftModel",
+    "LlamaForCausalLMEagle3",
+    "PEagleDraftModel",
+    "build_target_layer_ids",
+    "extract_context_feature",
+    "sample",
+    "DRAFT_REGISTRY",
+    "register_draft",
+    "resolve_draft",
+    "available_drafts",
+]

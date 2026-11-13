@@ -44,6 +44,7 @@ class CanonicalReviewTest(unittest.TestCase):
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
         runtime.draft_model = torch.nn.Linear(1, 1)
+        runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
             "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
             "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
@@ -189,6 +190,17 @@ class CanonicalReviewTest(unittest.TestCase):
             (source / "config.json").write_text(json.dumps(payload))
             cfg = run_config(
                 source, draft_config(), initialization={"checkpoint": temp}
+            )
+            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
+                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            _validate_imported_objective(
+                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+            )
+            # the same JSON given as `draft:` must not drop its settings either
+            legacy = source / "old_dspine.json"
+            legacy.write_text(json.dumps(payload))
+            cfg = run_config(source, draft_config(), initialization={}).model_copy(
+                update={"draft": str(legacy)}
             )
             with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
                 _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
@@ -506,6 +518,23 @@ class CanonicalReviewTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "legacy full resume"):
                     resolve_run(Config.model_validate(raw))
                 read.assert_not_called()
+
+    def test_resume_override_can_clear_a_recipe_initialization(self):
+        """The native MTP recipe sets initialization; resuming it needs no YAML copy."""
+        from specforge.config import load_config
+
+        recipe = Path(__file__).resolve().parents[2] / (
+            "examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml"
+        )
+        cfg = load_config(str(recipe))
+        self.assertIsNotNone(cfg.initialization)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            apply_overrides(cfg, ["training.resume_from=out/run-latest"])
+        resumed = apply_overrides(
+            cfg, ["training.resume_from=out/run-latest", "initialization=null"]
+        )
+        self.assertIsNone(resumed.initialization)
+        self.assertEqual(resumed.resume_path, "out/run-latest")
 
     def test_cli_overrides_do_not_warn_about_unset_legacy_options(self):
         """apply_overrides marks every field set; only YAML values may warn."""

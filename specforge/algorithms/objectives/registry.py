@@ -20,12 +20,16 @@ class TrainingRequirements:
     """Data and execution requirements used by canonical training composition."""
 
     capture_method: str | None = None
+    explicit_initialization: bool = False
     supports_vocab_mapping: bool = False
     required_batch_size: int | None = None
     minimum_loss_tokens: int = 1
     loss_mask_filter: Callable[[object], bool] | None = None
     attention_backends: frozenset[str] = frozenset({"eager"})
     window_statistic: WindowStatistic | None = None
+    host_inputs: Callable | None = (
+        None  # (batch tensors, draft config) -> extra tensors
+    )
 
 
 @dataclass(frozen=True)

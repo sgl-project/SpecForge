@@ -729,7 +729,8 @@ specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 Historical checkpoints without `config.json` additionally require
 `--draft-config OLD.json --target-model TARGET` for canonical export. Legacy
 `--to hf` and `--to sglang` retain their original exporters and require
-`--draft-config`; they are not aliases for canonical export. Default HF exports
+`--draft-config`; they are not aliases for canonical export. They no longer
+export MTP, whose legacy model was removed; use the canonical command for it. Default HF exports
 contain canonical configuration and bundled code for
 Transformers, and cannot be served directly by SGLang. Except for native merge-back,
 both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
@@ -740,7 +741,7 @@ SGLang conversion supports DFlash, DFlash2, Domino, DSpark and EAGLE3 within
 the pinned serving format's representable structures. Dense Qwen3.5 MTP uses
 `--export-mode native --target-model TARGET` for native merge-back.
 DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
-exported. Mixed per-layer causality is also rejected by the current pin.
+exported. Mixed causality supports causal sliding layers with bidirectional full layers.
 See [draft export](../../draft_export.md) for restrictions and validation.
 
 Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
@@ -748,31 +749,91 @@ saved precision when tensors share one floating-point dtype; SGLang casts to
 its serving dtype. Mixed-dtype HF artifacts retain the original tensors, but
 public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
-For canonical native MTP, use `--export-mode native --target-model TARGET`. It rewrites
+For native MTP merge-back, use `--export-mode native --target-model TARGET`. It rewrites
 shards containing old native tensors and links unchanged shards; add
-`--copy-target` for a self-contained directory. The following legacy merge
-script remains available for historical training outputs.
+`--copy-target` for a self-contained directory.
 
 MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
 and attention computations. Do not resume those runs; retrain from native MTP
 weights under the corrected model. The legacy codec follows the corrected model.
 
-MTP is deployed by merging its trained native head back into the target model.
-The merge command accepts the same runtime checkpoint shapes as the generic
-exporter (`training_state.pt`, a step/latest directory, or the run output
-directory):
+For native MTP, use the ordinary YAML preset and explicit target mapping in
+[the preset guide](../../../specforge/config/draft/presets/README.md). A complete
+text-only offline recipe is available at
+`examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
 ```bash
-python scripts/merge_mtp_to_base.py \
-  --base-model-path Qwen/Qwen3.5-4B \
-  --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
-  --draft-config configs/qwen3.5-4b-mtp.json \
-  --output-path ./exports/Qwen3.5-4B-MTP
+specforge export --export-mode native \
+  --checkpoint ./outputs/native-mtp/native-mtp-latest \
+  --target-model Qwen/Qwen3.5-4B \
+  --output-dir ./exports/Qwen3.5-4B-MTP
 ```
 
-An already-exported HF MTP draft directory can also be passed as
-`--mtp-checkpoint-path`; in that case its own `config.json` is used and
-`--draft-config` may be omitted.
+Native export rewrites shards containing old MTP tensors and links unchanged
+shards; add `--copy-target` for a self-contained directory. Historical checkpoints
+use the same importer, with `--draft-config OLD.json` when configuration is absent.
+The `scripts/merge_mtp_to_base.py` CLI copies target shards by default for a
+self-contained directory; `--no-copy-target` opts into links. It is a compatibility
+wrapper for this exporter;
+there is no separate legacy merge implementation. Target computation mismatches
+fail instead of rewriting the target's settings to fit a draft.
+
+Prepare records with the same run configuration, against a capture server configured
+for its resolved capture contract:
+
+```bash
+python scripts/prepare_hidden_states.py \
+  -c examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml \
+  --chat-template qwen3.5 --max-length 512 \
+  --server-urls http://localhost:30000 \
+  --data-path /data/train.jsonl --output-path /data/mtp-features
+```
+
+MTP migration changes:
+
+- Replace old `model.draft_*` recipes with `draft` and `initialization`. Training
+  requires an explicit initialization choice; use `initialization: {}` for random
+  weights, `from_target` for native weights, or `checkpoint` for an existing draft.
+  Capture planning does not require weight initialization.
+- The former MTP JSON is retained at `tests/fixtures/legacy_mtp/original_config.json`
+  for compatibility tests. New runs should use the ordinary native YAML preset.
+- `model.embedding_key` and `model.lm_head_key` still select target binding tensors;
+  they do not replace explicit `from_target` mappings for owned parameters.
+- An owned LM head can be saved and exported as a standalone canonical draft.
+  Native Qwen3.5 merge-back requires the matching native structure and target bindings;
+  standalone SGLang MTP serving is not implemented.
+- CE computes in FP32 rather than the old BF16 reduction. Small loss/gradient
+  differences are intentional. Only supervised rows are projected, in bounded chunks.
+- Old optimizer state cannot resume under the canonical implementation. Import
+  model weights instead. Canonical resume rejects a changed `objective_chunk_size`.
+  Canonical MTP checkpoints written before this change recorded no objective
+  options and cannot resume either; import their weights the same way.
+- `initialization` and resume are mutually exclusive. To resume a run started from
+  a recipe that sets `initialization`, clear it in the same command:
+  `specforge train -c RECIPE training.resume_from=OUTPUT/RUN-latest initialization=null`.
+- `draft: OLD.json` uses the registered legacy codecs for all supported architectures,
+  not only MTP; required recorded settings such as P-EAGLE's mask token stay explicit.
+
+The canonical MTP trainer supports eager and SDPA attention. Set
+`training.objective_options.objective_chunk_size` (default 4096; 0 disables
+chunking) to bound the number of token positions passed through LM head and loss
+at once. Chunked training recomputes these intermediates during backward.
+Contextual losses (the `lk_*` kinds) need the whole set and are not chunked. The
+old `training.mtp_objective_chunk_size` option remains a compatibility alias;
+conflicting non-default settings are rejected. The online NPU MTP recipe now
+uses this canonical path and the native preset.
+
+Trainer TP/SP sizes remain one on the canonical path. Legacy implementations
+remain for other algorithms' unsupported backends and sequence parallelism;
+the old Qwen3.5 MTP model and its training wrapper have been removed.
+Use `draft: OLD.json` to decode a historical configuration into the canonical trainer, or `initialization.checkpoint`
+for an existing draft; neither path constructs a legacy model. Legacy MTP decoding
+uses the declared RoPE theta and the corrected #1014 computation. Use the native preset when initializing
+from the target's own MTP weights. Old MTP recipes using `model.draft_*` must
+switch to `draft`/`initialization` as shown in the native example. Historical
+MTP model weights remain importable; optimizer-state resume across the old/new
+training implementations is not supported. Use `resume` for checkpoints saved
+by the canonical trainer.
 
 ## Troubleshooting
 

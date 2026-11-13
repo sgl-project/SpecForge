@@ -46,9 +46,11 @@ def _legacy_settings(cfg):
 
 
 def _is_canonical_checkpoint(cfg, source):
-    from specforge.checkpoint.resolve import read_json, resolve_directory
+    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
 
-    path = resolve_directory(source, cache_dir=cfg.model.cache_dir, config_only=True)
+    path = resolve_checkpoint_path(
+        source, cache_dir=cfg.model.cache_dir, config_only=True
+    )
     config = (path.parent if path.is_file() else path) / "config.json"
     return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
 
@@ -76,21 +78,54 @@ def _reject_changed_legacy_settings(config, settings):
         if saved != value:
             raise ValueError(
                 f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"checkpoint's recorded {saved!r}; remove it or make it match"
+                f"draft's recorded {saved!r}; remove it or make it match"
             )
+
+
+def _read_draft_payload(draft):
+    if not isinstance(draft, str):
+        return draft
+    import json
+
+    import yaml
+
+    text = Path(draft).read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return yaml.safe_load(text)
+
+
+def _is_legacy_payload(payload):
+    return isinstance(payload, dict) and payload.get("model_type") not in (
+        None,
+        "specforge_draft",
+    )
 
 
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
-    draft = cfg.draft
-    if isinstance(draft, str):
-        import yaml
+    draft = _read_draft_payload(cfg.draft)
+    legacy_draft = _is_legacy_payload(draft)
+    if legacy_draft:
+        from specforge.config.draft.codec import decode_legacy_config
 
-        draft = yaml.safe_load(Path(draft).read_text())
-    supplied = (
-        parse_draft(draft, target_config=target_config) if draft is not None else None
-    )
+        if target_config is None:
+            from specforge.checkpoint.resolve import read_target_config
+
+            target_config = read_target_config(
+                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
+            )
+        supplied = decode_legacy_config(
+            draft, target_config=target_config, **_legacy_settings(cfg)
+        )
+    else:
+        supplied = (
+            parse_draft(draft, target_config=target_config)
+            if draft is not None
+            else None
+        )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.resume_path:
@@ -103,7 +138,7 @@ def resolve_config(cfg, *, target_config=None):
         canonical = _is_canonical_checkpoint(cfg, source)
         if cfg.resume_path and not canonical:
             raise ValueError(
-                "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+                "legacy full resume uses the legacy training path, which MTP no longer has; use initialization.checkpoint for canonical weight import"
             )
         loaded = read_draft(
             source,
@@ -120,10 +155,18 @@ def resolve_config(cfg, *, target_config=None):
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
-    if _legacy_settings(cfg) and not (initialization and initialization.weights_from):
-        raise ValueError(
-            "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-        )
+    settings = _legacy_settings(cfg)
+    if (
+        settings
+        and not legacy_draft
+        and not (initialization and initialization.weights_from)
+    ):
+        if supplied is None:
+            raise ValueError(
+                "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
+            )
+        # a decoded legacy draft records them; resolve_run re-resolves that draft
+        _reject_changed_legacy_settings(supplied, settings)
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -170,28 +213,32 @@ def _objective_settings(cfg):
 
 
 def _validate_imported_objective(cfg, resolved):
-    init = cfg.initialization
-    if init is None or init.checkpoint is None:
-        return
-    from specforge.checkpoint.resolve import read_json, resolve_directory
+    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
     from specforge.config.draft.codec.legacy.dspine import (
         extract_dspine_training_settings,
     )
 
-    source = resolve_directory(
-        init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    directory = source.parent if source.is_file() else source
-    payload = read_json(init.legacy_config or directory / "config.json")
-    if payload.get("model_type") == "specforge_draft" or payload.get(
-        "architectures"
-    ) != ["DSpineDraftModel"]:
-        return
-    for name, saved in extract_dspine_training_settings(payload).items():
-        if getattr(resolved.objective, name) != saved:
-            raise ValueError(
-                f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
-            )
+    payloads = []
+    draft = _read_draft_payload(cfg.draft)
+    if _is_legacy_payload(draft):
+        payloads.append(draft)
+    init = cfg.initialization
+    if init is not None and init.checkpoint is not None:
+        source = resolve_checkpoint_path(
+            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
+        )
+        directory = source.parent if source.is_file() else source
+        payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    for payload in payloads:
+        if payload.get("model_type") == "specforge_draft" or payload.get(
+            "architectures"
+        ) != ["DSpineDraftModel"]:
+            continue
+        for name, saved in extract_dspine_training_settings(payload).items():
+            if getattr(resolved.objective, name) != saved:
+                raise ValueError(
+                    f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
+                )
 
 
 def resolve_run(cfg, *, target_config=None):
@@ -277,6 +324,28 @@ def resolve_run(cfg, *, target_config=None):
     from specforge.config.schema import TrainingConfig
 
     defaults = TrainingConfig()
+    if draft.architecture == "MTPDraftModel":
+        legacy_options.remove("mtp_objective_chunk_size")
+        optimization_options.discard("mtp_objective_chunk_size")
+        chunk = cfg.training.mtp_objective_chunk_size
+        if chunk != defaults.mtp_objective_chunk_size:
+            options = dict(cfg.training.objective_options)
+            if (
+                "objective_chunk_size" in options
+                and options["objective_chunk_size"] != chunk
+            ):
+                raise ValueError("conflicting MTP objective_chunk_size settings")
+            options["objective_chunk_size"] = chunk
+            cfg = cfg.model_copy(
+                update={
+                    "training": cfg.training.model_copy(
+                        update={
+                            "objective_options": options,
+                            "mtp_objective_chunk_size": defaults.mtp_objective_chunk_size,
+                        }
+                    )
+                }
+            )
     present = {
         name
         for name in legacy_options
@@ -475,6 +544,15 @@ def build_bundle(cfg, algorithm):
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     dtype, device = getattr(torch, cfg.model.torch_dtype), _device()
     init = cfg.initialization
+    if (
+        resolved.registration.training.explicit_initialization
+        and init is None
+        and not cfg.resume_path
+    ):
+        raise ValueError(
+            f"{resolved.name} requires an explicit initialization source; "
+            "set initialization: {} to train from scratch, or use resume"
+        )
     source = init.checkpoint if init else None
     if cfg.resume_path:
         from specforge.training.checkpoint import CheckpointManager
@@ -537,7 +615,9 @@ def build_bundle(cfg, algorithm):
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_legacy_settings(cfg),
+            legacy_settings=(
+                _source_legacy_settings(cfg, weights.checkpoint) if weights else None
+            ),
         )
     teacher = None
     if resolved.requires_teacher:
