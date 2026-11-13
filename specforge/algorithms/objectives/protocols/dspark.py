@@ -36,6 +36,7 @@ from .dflash import COMMON_MODULES
         "teacher_logits",
         "chain_positions",
         "acceptance_chain",
+        "expert_routing",
     ),
     trains=COMMON_MODULES + ("markov_head", "confidence_head"),
 )
@@ -83,6 +84,7 @@ class DSparkObjective:
             predecessor_ids=blocks.predecessors.flatten(1),
             output_logits=False,
         )
+        runtime.observe_statistics(output, blocks)
 
         def compute(calc):
             calc.run((0,))

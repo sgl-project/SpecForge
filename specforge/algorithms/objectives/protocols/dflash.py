@@ -34,6 +34,7 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
         "teacher_logits",
         "chain_positions",
         "acceptance_chain",
+        "expert_routing",
     ),
     trains=COMMON_MODULES,
 )
@@ -72,6 +73,7 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
+        runtime.observe_statistics(output, blocks)
 
         def compute(calc):
             calc.run()
