@@ -60,10 +60,13 @@ jobs:
       # checkout@v4 whitelists the workspace only in its own temporary git
       # config; later steps that build the package with --no-build-isolation
       # invoke git again (setuptools-scm's file finder) and fail with
-      # "detected dubious ownership" on this self-hosted container.
+      # "detected dubious ownership" on this self-hosted container. HOME
+      # persists across jobs here, so add the entry only once.
       - name: Trust the workspace for later git calls
         shell: bash
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: |
+          git config --global --fixed-value --get safe.directory "$GITHUB_WORKSPACE" >/dev/null ||
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # Cancelled or timed-out runs can leave processes behind which keep GPU
       # memory allocated and make this run OOM. --pid=host above is what makes
