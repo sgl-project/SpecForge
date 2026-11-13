@@ -57,7 +57,7 @@ def write_features(root, draft):
         )
 
 
-def moe_run_config(target, draft, kernel):
+def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
     return run_config(
         target,
         draft,
@@ -72,7 +72,10 @@ def moe_run_config(target, draft, kernel):
             "total_steps": 2,
             "save_interval": 1,
             "log_interval": 1,
-            "objective_options": {"num_anchors": 2},
+            "objective_options": {
+                "num_anchors": 2,
+                "bias_update_rate": bias_update_rate,
+            },
         },
     )
 
@@ -89,18 +92,23 @@ class CanonicalMoETrainingTest(unittest.TestCase):
             )
             self.addCleanup(torch.distributed.destroy_process_group)
 
-    def _train_and_resume(self, root, kernel):
+    def _train_and_resume(self, root, kernel, bias_update_rate=0.0):
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel)
+        cfg = moe_run_config(target, draft, kernel, bias_update_rate)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
         (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
-        self.assertEqual(layer.gate.expert_bias.dtype, torch.float32)
-        # No balancing hook yet: the bias is saved, restored and still zero.
-        self.assertEqual(torch.count_nonzero(layer.gate.expert_bias).item(), 0)
+        bias = layer.gate.expert_bias
+        self.assertEqual(bias.dtype, torch.float32)
+        if bias_update_rate:
+            # One optimizer step moved the bias by a zero-mean sign step; it is saved.
+            self.assertAlmostEqual(bias.abs().max().item(), bias_update_rate, places=7)
+            torch.testing.assert_close(bias.sum(), torch.zeros(()), atol=1e-6, rtol=0)
+        else:
+            self.assertEqual(torch.count_nonzero(bias).item(), 0)
         before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
         raw = cfg.model_dump()
         raw.update(draft=None, resume=str(checkpoint))
@@ -117,6 +125,13 @@ class CanonicalMoETrainingTest(unittest.TestCase):
             name = next(key for key in trained if key.endswith(suffix))
             self.assertFalse(torch.equal(before[name], trained[name]), name)
             self.assertTrue(torch.isfinite(trained[name]).all(), name)
+        bias_key = next(key for key in trained if key.endswith("gate.expert_bias"))
+        if bias_update_rate:
+            # The resumed step moved the restored bias again.
+            self.assertFalse(torch.equal(before[bias_key], trained[bias_key]))
+            self.assertEqual(trained[bias_key].dtype, torch.float32)
+        else:
+            self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
         # The kernel is part of the resume contract, like the Liger choice.
         other = next(name for name in EXPERT_KERNELS if name != kernel)
         raw["model"]["moe_experts_kernel"] = other
@@ -128,6 +143,10 @@ class CanonicalMoETrainingTest(unittest.TestCase):
         for kernel in sorted(EXPERT_KERNELS):
             with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
                 self._train_and_resume(Path(temp), kernel)
+
+    def test_bias_update_rate_moves_the_bias_across_steps_and_resume(self):
+        with TemporaryDirectory() as temp:
+            self._train_and_resume(Path(temp), "grouped_mm", bias_update_rate=0.001)
 
     def test_misaligned_widths_fail_at_startup_unless_the_loop_kernel_is_chosen(self):
         with TemporaryDirectory() as temp:

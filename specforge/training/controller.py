@@ -490,7 +490,7 @@ class TrainerCore:
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
         self.backend.backward(loss, is_boundary=stepped)
-        grad_norm = None
+        grad_norm, step_metrics = None, None
         if stepped:
             loss_denominator = None
             if out.loss_terms is not None:
@@ -504,6 +504,10 @@ class TrainerCore:
                 grad_norm = self.backend.step()
             else:
                 grad_norm = self.backend.step(loss_denominator=loss_denominator)
+            parallel_config = getattr(self.backend, "parallel_config", None)
+            step_metrics = self.strategy.after_step(
+                process_group=getattr(parallel_config, "fsdp_process_group", None)
+            )
         result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
         result = self._result(
             out,
@@ -511,6 +515,7 @@ class TrainerCore:
             stepped,
             ratio_metrics=result_ratio_metrics,
             sum_metrics=self._sum_totals if stepped else out.sum_metrics,
+            step_metrics=step_metrics,
         )
         if stepped:
             self._ratio_totals = {}
@@ -570,6 +575,7 @@ class TrainerCore:
         *,
         ratio_metrics: Optional[Dict[str, Any]] = None,
         sum_metrics: Optional[Dict[str, Any]] = None,
+        step_metrics: Optional[Dict[str, Any]] = None,
     ) -> StepResult:
         # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
         # positions and reduce counts before ratios; scalarizing its lists here
@@ -648,6 +654,8 @@ class TrainerCore:
                 process_group=process_group,
             )
         metrics.update(scalar_metrics)
+        # Strategy step metrics are already identical on every rank.
+        metrics.update(step_metrics or {})
         if grad_norm is not None:
             if isinstance(grad_norm, torch.Tensor):
                 grad_norm_metric = grad_norm.detach().float().mean()

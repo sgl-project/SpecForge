@@ -58,13 +58,13 @@ class MoEBalancer:
             previous = self.counts[index]
             self.counts[index] = counts if previous is None else previous + counts
 
-    def step(self) -> dict[str, Tensor]:
+    def step(self, *, process_group=None) -> dict[str, Tensor]:
         """At the optimizer step: pool the window's counts over ranks, move the biases, reset."""
         if any(counts is None for counts in self.counts):
             return {}
         pooled = torch.stack(self.counts)
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(pooled)
+            dist.all_reduce(pooled, group=process_group)
         self.counts = [None] * len(self.layers)
         pooled = pooled.float()
         for layer, load in zip(self.layers, pooled):

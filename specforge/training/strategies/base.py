@@ -121,6 +121,10 @@ class DraftTrainStrategy(abc.ABC):
         """Select the keys this strategy persists as draft weights."""
         return state_dict
 
+    def after_step(self, *, process_group=None) -> Dict[str, Any]:
+        """Run after each optimizer step; returned scalars join that step's metrics."""
+        return {}
+
 
 def _prepare_eagle_target(
     *,
