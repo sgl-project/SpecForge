@@ -230,6 +230,24 @@ class MoEFFNTest(unittest.TestCase):
         plain.validate_export_state(dict(plain.state_dict()))
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
+    def test_empty_input_runs_forward_and_backward_with_each_kernel(self):
+        """Zero tokens: a [0, H] update, [0, ...] routing, and zero gradients on every weight."""
+        for device in ("cpu", "cuda") if CUDA else ("cpu",):
+            for kernel in sorted(EXPERT_KERNELS):
+                with self.subTest(device=device, kernel=kernel):
+                    module = MoEFFN(qwen_spec(), hidden_size=H, device=device)
+                    module.experts_kernel = kernel
+                    x = torch.empty(0, H, device=device, requires_grad=True)
+                    output = module(x)
+                    self.assertEqual(tuple(output.update.shape), (0, H))
+                    self.assertEqual(tuple(output.routing.expert_ids.shape), (0, 2))
+                    self.assertEqual(tuple(output.routing.scores.shape), (0, 4))
+                    (output.update.sum() + output.routing.scores.sum()).backward()
+                    self.assertEqual(tuple(x.grad.shape), (0, H))
+                    for name, parameter in module.named_parameters():
+                        self.assertIsNotNone(parameter.grad, name)
+                        self.assertEqual(parameter.grad.abs().sum().item(), 0.0, name)
+
     def test_configure_kernels_selects_and_checks_the_expert_kernel(self):
         aligned = torch.nn.Sequential(
             MoEFFN(moe_spec(), hidden_size=H), MoEFFN(qwen_spec(), hidden_size=H)

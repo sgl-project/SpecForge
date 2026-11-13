@@ -143,7 +143,8 @@ class RoutedExperts(nn.Module):
         )
         # index_copy_ is deterministic where index_add_ is not; sum the k slots in fp32.
         out = torch.empty_like(out).index_copy_(0, order, out)
-        return out.view(num_tokens, top_k, -1).sum(dim=1, dtype=torch.float32)
+        # The explicit width lets zero tokens through, where -1 cannot be inferred.
+        return out.view(num_tokens, top_k, x.shape[-1]).sum(dim=1, dtype=torch.float32)
 
     @torch.no_grad()
     def probe_kernel(self, kernel: str) -> None:
