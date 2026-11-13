@@ -21,9 +21,14 @@ host stream, which keeps the result deterministic.
 """
 
 import torch
-import triton
-import triton.language as tl
 from torch.autograd.function import once_differentiable
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    # Optional for HF exports; importing this fused-only module still requires it.
+    raise
 
 __all__ = ["dflash2_grouped_conv_fused", "supports_group_size"]
 
