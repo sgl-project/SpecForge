@@ -78,7 +78,7 @@ def _reject_changed_legacy_settings(config, settings):
         if saved != value:
             raise ValueError(
                 f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"checkpoint's recorded {saved!r}; remove it or make it match"
+                f"draft's recorded {saved!r}; remove it or make it match"
             )
 
 
@@ -147,14 +147,18 @@ def resolve_config(cfg, *, target_config=None):
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
+    settings = _legacy_settings(cfg)
     if (
-        _legacy_settings(cfg)
+        settings
         and not legacy_draft
         and not (initialization and initialization.weights_from)
     ):
-        raise ValueError(
-            "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-        )
+        if supplied is None:
+            raise ValueError(
+                "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
+            )
+        # a decoded legacy draft records them; resolve_run re-resolves that draft
+        _reject_changed_legacy_settings(supplied, settings)
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -599,7 +603,9 @@ def build_bundle(cfg, algorithm):
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_legacy_settings(cfg),
+            legacy_settings=(
+                _source_legacy_settings(cfg, weights.checkpoint) if weights else None
+            ),
         )
     teacher = None
     if resolved.requires_teacher:

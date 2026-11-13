@@ -43,6 +43,59 @@ class RetiredExportTest(unittest.TestCase):
                     cfg.model.mask_token_id = options["mask_token_id"]
                 self.assertEqual(resolve_config(cfg, target_config=target), expected)
 
+    def test_legacy_peagle_draft_builds_after_resolution(self):
+        """The mask token decodes the draft once; later resolves must accept it."""
+        import torch
+
+        from specforge.checkpoint import save_draft
+        from specforge.config import Config
+        from specforge.modeling import build_draft_model
+        from specforge.training.assembly import build_model_bundle
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "legacy_peagle"
+        payload = json.loads((fixture / "config.json").read_text())
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = target_directory(root)
+            (root / "features").mkdir()
+            old = root / "old.json"
+            old.write_text(json.dumps(payload))
+            target_config = json.loads((target / "config.json").read_text())
+            canonical = root / "canonical"
+            save_draft(
+                build_draft_model(
+                    decode_legacy_config(
+                        payload, target_config=target_config, mask_token_id=63
+                    ),
+                    dtype=torch.float32,
+                ),
+                canonical,
+            )
+            for initialization in ({}, {"weights_from": {"checkpoint": str(canonical)}}):
+                with self.subTest(initialization=initialization):
+                    cfg = Config.model_validate(
+                        dict(
+                            model={
+                                "target_model_path": str(target),
+                                "torch_dtype": "float32",
+                                "mask_token_id": 63,
+                            },
+                            data={
+                                "hidden_states_path": str(root / "features"),
+                                "dataloader_num_workers": 0,
+                            },
+                            training={"attention_backend": "eager", "max_steps": 1},
+                            draft=str(old),
+                            initialization=initialization,
+                            output_dir=str(root / "output"),
+                        )
+                    )
+                    resolved = resolve_run(cfg)
+                    bundle = build_model_bundle(
+                        resolved.config, algorithm=resolved.algorithm
+                    )
+                    self.assertEqual(bundle.draft_config.spec_config.mask_token_id, 63)
+
     def test_old_merge_cli_delegates_to_checked_native_export(self):
         with patch("scripts.merge_mtp_to_base.export_draft") as export:
             main(
