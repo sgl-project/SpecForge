@@ -140,6 +140,31 @@ The response's `meta_info["spec_capture"]` holds `[result]`, where `result` is
 or `{sample_id, error}`. Objects are stored at
 `{store_id}/{sample_id}/g{gen}/{name}`.
 
+## Ascend NPU notes
+
+The plugin follows the model runner's actual device instead of CUDA-only
+detection; see the
+[Ascend NPU tutorial](https://github.com/sgl-project/SpecForge/blob/main/docs/sections/basic_usage/Ascend/ascend_npu.md#native-plugin-capture-route-patch-free)
+for a complete launch recipe.
+
+- Publication on NPU is **host staging + TCP** in auto mode. An explicit
+  `SGLANG_SPEC_CAPTURE_GPU_PUT=1` or `MOONCAKE_PROTOCOL=nvlink` is rejected at
+  install time on a non-CUDA runner instead of failing inside the first
+  capture. Explicit `GPU_PUT=1` on CUDA-type devices (ROCm included) keeps its
+  previous behavior.
+- The Ascend CPU-segment mount (`setup(0, 0)` +
+  `allocate_and_mount_segment(size, protocol, "cpu")`) is built into the sink;
+  no source patch is needed.
+- The sink writer thread binds its NPU device context before Mooncake
+  `setup()`. The device comes from the model runner; when its device string
+  has no index (e.g. `device="npu"` with a separate `gpu_id`), the logical
+  card is filled from `gpu_id`, never defaulted to card 0.
+- On 910B3, GDN hybrid models need `SGLANG_MAMBA_SSM_DTYPE=bfloat16`. Keep the
+  Ascend toolkit paths on `PYTHONPATH` (prepend, never overwrite) when graph
+  paths import the CANN `acl` module.
+- Validated on 8x 910B3 with Qwen3.5-4B + DFlash at TP1/TP2; EAGLE3/DSPARK
+  routes are not yet gated on NPU.
+
 ## Multi-node NVLink
 
 On GB200/GB300 NVL72 systems, `MOONCAKE_PROTOCOL=nvlink` moves captures from
