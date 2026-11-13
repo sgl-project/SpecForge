@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
 from .losses import PositionWeighting, TokenLoss
+from .moe_balance import MoEBalancer
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,6 @@ def build_objective_model(
         )
     for module in to_freeze:
         module.requires_grad_(False)
-    from .moe_balance import MoEBalancer
 
     return ObjectiveModel(
         draft_model,

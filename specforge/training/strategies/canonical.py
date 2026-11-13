@@ -76,7 +76,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             # The objective hands its load-balance term out unfinished: pooling the
             # load over ranks is the strategy's, like the window statistic above.
             result = self.balancer.finish(
-                result, pooled=self.model.training and torch.is_grad_enabled()
+                result,
+                pooled=self.model.training and torch.is_grad_enabled(),
+                process_group=ctx.process_group,
             )
         positions = sorted(
             int(name.split("_")[1])

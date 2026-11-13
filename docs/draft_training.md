@@ -243,8 +243,10 @@ holds the expert count, top-k, an `experts` sub-node (per-expert
 of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
 MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
 `sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
-that shifts the choice only. Experts are stored fused (`experts.gate_up_proj`,
-`experts.down_proj`) and export under Transformers' per-expert tensor names.
+that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
+`experts.down_proj`); their layout declares how they assemble from and split
+into Transformers' per-expert tensors for target-weight copies and the SGLang
+converter.
 `configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
 whose every FFN is a MoE of 8 experts with top-1 routing.
 

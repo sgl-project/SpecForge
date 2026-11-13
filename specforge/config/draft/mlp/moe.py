@@ -84,6 +84,8 @@ class MoEFFNSpec(FFNSpec):
             )
         if not isinstance(self.experts, MoEExpertSpec):
             raise TypeError("experts must be MoEExpertSpec")
+        if not self.experts.gated:
+            raise ValueError("routed experts support gated FFNs only")
         if self.shared_expert is not None and not isinstance(
             self.shared_expert, MoEExpertSpec
         ):

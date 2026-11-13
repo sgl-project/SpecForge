@@ -26,7 +26,11 @@ def count_tokens_per_expert(
     expert_ids: Tensor, keep: Tensor, num_experts: int
 ) -> Tensor:
     """[T, K] expert ids and a [T] keep mask -> int64 [E] counts over the kept tokens."""
-    return torch.bincount(expert_ids[keep].reshape(-1), minlength=num_experts)
+    kept = keep.to(expert_ids.dtype)[:, None].expand_as(expert_ids).reshape(-1)
+    # scatter_add_, not bincount: bincount reads the index range on the host.
+    return expert_ids.new_zeros(num_experts).scatter_add_(
+        0, expert_ids.reshape(-1), kept
+    )
 
 
 def dispatch_balance(counts: Tensor) -> Tensor:
@@ -66,7 +70,6 @@ class MoEBalancer:
         aux_loss_coef: float = 0.0,
         aux_loss_type: str = "batch_wise",
     ):
-        check_aux_loss_type(aux_loss_type)
         self.rate = rate
         self.aux_loss_coef = aux_loss_coef
         self.aux_loss_type = aux_loss_type
@@ -110,37 +113,30 @@ class MoEBalancer:
             )
         return routings
 
-    def observe(self, output, *, keep: Tensor) -> None:
-        """Count one training forward; forwards without gradients (eval, prepass) count nothing."""
-        if not torch.is_grad_enabled():
-            return
+    def observe(self, output, *, keep: Tensor) -> MoEBalanceTerm | None:
+        """Count one forward's routing per layer. Training forwards (with gradients)
+        add to this step's counts; the auxiliary loss's term comes back when the loss
+        is on, else None."""
+        counting = torch.is_grad_enabled()
+        mean_probs, counts = [], []
         for index, (layer, routing) in enumerate(
             zip(self.layers, self._routings(output))
         ):
-            counts = count_tokens_per_expert(
-                routing.expert_ids,
-                keep.to(routing.expert_ids.device),
-                layer.config.num_experts,
+            kept = keep.to(routing.expert_ids.device)
+            tokens = count_tokens_per_expert(
+                routing.expert_ids, kept, layer.config.num_experts
             )
-            previous = self.counts[index]
-            self.counts[index] = counts if previous is None else previous + counts
-
-    def term(self, output, *, keep: Tensor) -> MoEBalanceTerm | None:
-        """This forward's halves of the auxiliary loss; None when the loss is off."""
+            if counting:
+                previous = self.counts[index]
+                self.counts[index] = tokens if previous is None else previous + tokens
+            if self.aux_loss_coef:
+                # P_e over the kept tokens; the per-token L1 normalization is a no-op
+                # for softmax scores and needed for sigmoid ones.
+                probs = F.normalize(routing.scores, p=1, dim=-1) * kept[:, None]
+                mean_probs.append(probs.sum(dim=0) / kept.sum().clamp(min=1))
+                counts.append(tokens)
         if not self.aux_loss_coef:
             return None
-        mean_probs, counts = [], []
-        for layer, routing in zip(self.layers, self._routings(output)):
-            kept = keep.to(routing.expert_ids.device)
-            # P_e over the kept tokens; the per-token L1 normalization is a no-op for
-            # softmax scores and needed for sigmoid ones.
-            probs = F.normalize(routing.scores, p=1, dim=-1) * kept[:, None]
-            mean_probs.append(probs.sum(dim=0) / kept.sum().clamp(min=1))
-            counts.append(
-                count_tokens_per_expert(
-                    routing.expert_ids, kept, layer.config.num_experts
-                )
-            )
         return MoEBalanceTerm(torch.stack(mean_probs), torch.stack(counts))
 
     def finish(self, result, *, pooled: bool, process_group=None):

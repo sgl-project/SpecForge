@@ -15,7 +15,9 @@ import torch
 from specforge.checkpoint import save_draft
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import DenseFFNSpec
+from specforge.export.checkpoint_io import checkpoint_dtype
 from specforge.export.to_hf import export_to_hf
+from specforge.loading import load_draft
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.modeling.draft.models import DSparkDraftModel
@@ -161,6 +163,15 @@ class CanonicalMoETest(unittest.TestCase):
                 },
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            # A bf16 draft keeps its fp32 bias; the loader and the export read the
+            # dtype from the weights, not from the one buffer that differs.
+            model.to(torch.bfloat16)
+            self.assertEqual(checkpoint_dtype(model.state_dict()), torch.bfloat16)
+            save_draft(model, root / "bf16")
+            loaded = load_draft(root / "bf16")
+            (loaded_layer,) = moe_layers(loaded)
+            self.assertEqual(loaded_layer.gate.weight.dtype, torch.bfloat16)
+            self.assertEqual(loaded_layer.gate.expert_bias.dtype, torch.float32)
 
 
 if __name__ == "__main__":

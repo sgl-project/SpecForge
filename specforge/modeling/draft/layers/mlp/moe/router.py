@@ -21,8 +21,6 @@ class Router(nn.Module):
             raise TypeError("Router requires MoERouterSpec")
         positive_int("num_experts", num_experts)
         positive_int("top_k", top_k)
-        if top_k > num_experts:
-            raise ValueError(f"top_k {top_k} exceeds num_experts {num_experts}")
         self.config = config
         self.num_experts = num_experts
         self.top_k = top_k

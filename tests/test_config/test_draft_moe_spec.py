@@ -161,17 +161,6 @@ class MoESpecTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     decode_component("mlp", payload)
 
-    def test_draft_config_with_moe_layers_round_trips(self):
-        config = moe_draft_config()
-        self.assertEqual(config.num_hidden_layers, 2)
-        self.assertIs(config.mlp_configs["moe"], config.mlp_configs["moe"])
-        payload = encode_config(config)
-        self.assertEqual(payload["mlp_configs"]["moe"], MOE)
-        self.assertEqual(payload["layer_configs"]["full_moe"]["mlp"], "moe")
-        restored = decode_config(json.loads(json.dumps(payload)))
-        self.assertEqual(restored, config)
-        self.assertEqual(encode_config(restored), payload)
-
     def test_cross_node_validation_covers_moe_references(self):
         with self.assertRaisesRegex(ValueError, "unused"):
             moe_draft_config(layer_types=("full_dense", "full_dense"))

@@ -142,22 +142,19 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def _routed_tokens(self, blocks):
-        """[tokens] mask: every token of a kept block was routed; padded blocks were not."""
-        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
-        return blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
-
     def balance_term(self, output, blocks):
-        """This forward's MoE load-balance term, for the trainer to finish; None without."""
+        """Count this forward's routing for MoE balancing and return its load-balance
+        term for the trainer to finish; None without a balancer or with the loss off."""
         if self.balancer is None:
             return None
-        return self.balancer.term(output, keep=self._routed_tokens(blocks))
+        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
+        # Every token of a kept block was routed; padded blocks were not.
+        keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+        return self.balancer.observe(output, keep=keep)
 
     def block_predictions(self, output, blocks, batch, **options):
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
-        if self.balancer is not None:
-            self.balancer.observe(output, keep=self._routed_tokens(blocks))
         return self.predictions(
             output.hidden_states,
             batch,

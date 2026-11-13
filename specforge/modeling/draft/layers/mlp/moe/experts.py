@@ -83,8 +83,6 @@ class RoutedExperts(nn.Module):
         super().__init__()
         if type(config) is not MoEExpertSpec:
             raise TypeError("RoutedExperts requires MoEExpertSpec")
-        if not config.gated:
-            raise ValueError("routed experts support gated FFNs only")
         positive_int("num_experts", num_experts)
         positive_int("hidden_size", hidden_size)
         self.config = config

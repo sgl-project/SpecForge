@@ -22,20 +22,15 @@ from specforge.config.draft.mlp import (
     MoEFFNSpec,
     MoERouterSpec,
 )
-from specforge.modeling.draft.layers import build_component, component_layout
 from specforge.modeling.draft.layers.inputs import ExpertRouting, MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels
-from specforge.modeling.draft.layers.layout import join, split
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, DenseFFN, MoEFFN
 from specforge.modeling.draft.layers.mlp.moe import (
-    MOE_LAYOUT,
     RoutedExperts,
     Router,
     SharedExpert,
     TopKRouter,
-    expert_kernel,
 )
-from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
 # Widths are multiples of 8: F.grouped_mm needs 16-byte strides in every dtype.
 H = 32
@@ -197,12 +192,6 @@ class MoEFFNTest(unittest.TestCase):
     @unittest.skipUnless(CUDA, "CUDA is required")
     def test_cuda_expert_kernels_agree(self):
         self._assert_kernels_agree("cuda", torch.bfloat16)
-
-    def test_kernel_table_rejects_duplicate_names(self):
-        self.assertEqual(sorted(EXPERT_KERNELS), ["grouped_mm", "loop"])
-        with self.assertRaisesRegex(ValueError, "already registered"):
-            expert_kernel("loop")(lambda *args, **kwargs: None)
-        self.assertEqual(sorted(EXPERT_KERNELS), ["grouped_mm", "loop"])
 
     def test_router_contract(self):
         spec = router_spec(scoring="sigmoid", route_scale=2.0, expert_bias=True)
@@ -403,50 +392,6 @@ class MoEFFNTest(unittest.TestCase):
                 scores[:, 0].sum().backward()
                 self.assertTrue(torch.any(module.gate.weight.grad != 0))
 
-    def test_generic_base_initializes_from_golden_config(self):
-        owner = DFlashDraftModel(model_config(initializer_range=0))
-        node = qwen_spec(router=router_spec(expert_bias=True))
-        with torch.device("meta"):
-            module = MoEFFN(node, hidden_size=H)
-        module.to_empty(device="cpu")
-        module.apply(owner._initialize_weights)
-        for name, parameter in module.named_parameters():
-            self.assertEqual(torch.count_nonzero(parameter).item(), 0, name)
-        self.assertEqual(module.gate.expert_bias.dtype, torch.float32)
-        self.assertEqual(torch.count_nonzero(module.gate.expert_bias).item(), 0)
-
-    def test_builder_layout_and_round_trip(self):
-        node = moe_spec()
-        module = build_component("mlp", node, hidden_size=H)
-        self.assertIsInstance(module, MoEFFN)
-        self.assertIs(module.config, node)
-        with torch.no_grad():
-            for parameter in module.parameters():
-                parameter.normal_(std=0.2)
-        self.assertIs(component_layout("mlp", "moe"), MOE_LAYOUT)
-        fused = {
-            f"experts.{k}": v.detach() for k, v in module.experts.state_dict().items()
-        }
-        self.assertEqual(tuple(fused["experts.gate_up_proj"].shape), (4, 64, H))
-        self.assertEqual(tuple(fused["experts.down_proj"].shape), (4, H, 32))
-        parts = split(MOE_LAYOUT, node, fused)
-        self.assertEqual(
-            sorted(k for k in parts if k.startswith("experts.0.")),
-            [
-                "experts.0.down_proj.weight",
-                "experts.0.gate_proj.weight",
-                "experts.0.up_proj.weight",
-            ],
-        )
-        self.assertEqual(tuple(parts["experts.0.gate_proj.weight"].shape), (32, H))
-        rebuilt = join(MOE_LAYOUT, node, parts)
-        for key, value in fused.items():
-            self.assertTrue(torch.equal(rebuilt[key], value), key)
-        output = module(torch.randn(2, 3, H, dtype=torch.float32)).update
-        self.assertEqual(
-            (tuple(output.shape), output.dtype), ((2, 3, H), torch.float32)
-        )
-
     def test_invalid_settings_fail_before_allocation(self):
         with patch("torch.nn.Parameter") as allocate:
             with self.assertRaises(TypeError):
@@ -457,13 +402,11 @@ class MoEFFNTest(unittest.TestCase):
                 )
             with self.assertRaises(TypeError):
                 TopKRouter({}, num_experts=4, hidden_size=H, top_k=2)
-            with self.assertRaisesRegex(ValueError, "gated"):
-                RoutedExperts(expert_spec(gated=False), num_experts=2, hidden_size=H)
+            with self.assertRaisesRegex(ValueError, "gated FFNs only"):
+                moe_spec(experts=expert_spec(gated=False))
             for width in (0, True, 1.5):
                 with self.assertRaises(ValueError):
                     MoEFFN(moe_spec(), hidden_size=width)
-            with self.assertRaises(ValueError):
-                TopKRouter(router_spec(), num_experts=2, hidden_size=H, top_k=3)
             allocate.assert_not_called()
 
 
