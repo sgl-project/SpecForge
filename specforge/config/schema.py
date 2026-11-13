@@ -293,6 +293,7 @@ class ModelConfig(StrictConfigModel):
     #: fails when they cannot be used; ``false`` disables them. Resolved kernels
     #: that cannot be imported are an error in both the auto and explicit cases.
     use_liger_kernel: Optional[bool] = None
+    use_fused_conv: bool = False
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -1000,6 +1001,7 @@ class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
     loss: dict = Field(default_factory=dict)
+    loss_execution: dict = Field(default_factory=dict)
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
@@ -1262,10 +1264,13 @@ class Config(StrictConfigModel):
             or self.training.objective_options
             or self.training.frozen
             or self.training.loss
+            or self.training.loss_execution
+            or self.model.use_fused_conv
             or self.training.weighting is not None
         ):
             raise ValueError(
-                "objective/options/frozen/loss/weighting require the canonical draft loading path"
+                "objective/options/frozen/loss/weighting/loss_execution/use_fused_conv "
+                "require the canonical draft loading path"
             )
         mode = self.mode
         deployment = self.deployment.mode

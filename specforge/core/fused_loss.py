@@ -47,6 +47,7 @@ import torch
 __all__ = [
     # Fused Triton losses (require a compatible Triton backend)
     "fused_kl_div_loss",
+    "fused_soft_ce_loss",
     "fused_reverse_kl_div_loss",
     "fused_js_div_loss",
     "fused_ce_loss",
@@ -88,6 +89,7 @@ _OP_RKL = 1
 _OP_JSD = 2
 _OP_CE = 3
 _OP_TV = 4
+_OP_SOFT_CE = 5
 
 # stats [_N_STATS, n_rows]: [0]/[1] draft row max / sum-exp, [2]/[3] same for
 # targets (unused by ce), [4] per-OP -- kl_div/rkl: row loss L | jsd:
@@ -214,6 +216,8 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
             tp = tl.exp(ltp)
             if OP == _OP_KL:
                 acc += tl.sum(tl.where(mask, tp * (ltp - ldp), 0.0))
+            elif OP == _OP_SOFT_CE:
+                acc += tl.sum(tl.where(mask, -tp * ldp, 0.0))
             elif OP == _OP_RKL:
                 acc += tl.sum(tl.where(mask, dp * (ldp - ltp), 0.0))
             elif OP == _OP_JSD:
@@ -225,7 +229,7 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
                 extra += tl.sum(tl.where(mask & (dp <= tp), dp, 0.0))
 
         # Lint exemptions: `in`/merged compares aren't constexpr-foldable here.
-        if OP == _OP_KL or OP == _OP_RKL:  # noqa: PLR1714, SIM109
+        if OP == _OP_KL or OP == _OP_RKL or OP == _OP_SOFT_CE:  # noqa: PLR1714, SIM109
             tl.store(loss_ptr + pid, acc)
             tl.store(stats_ptr + 4 * stats_row + pid, acc)
         elif OP == _OP_JSD:
@@ -285,7 +289,7 @@ def loss_backward_kernel(
             y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
             ltp = y - lse_t
             tp = tl.exp(ltp)
-            if OP == _OP_KL:
+            if OP == _OP_KL or OP == _OP_SOFT_CE:
                 grad = dp - tp
             elif OP == _OP_RKL:
                 grad = dp * (ldp - ltp - extra)
@@ -327,6 +331,7 @@ def _require_triton():
     module_globals["_OP_JSD"] = tl.constexpr(_OP_JSD)
     module_globals["_OP_CE"] = tl.constexpr(_OP_CE)
     module_globals["_OP_TV"] = tl.constexpr(_OP_TV)
+    module_globals["_OP_SOFT_CE"] = tl.constexpr(_OP_SOFT_CE)
     module_globals["_online_stats"] = triton.jit(_online_stats)
     module_globals["_log_mix"] = triton.jit(_log_mix)
     module_globals["loss_forward_kernel"] = triton.jit(loss_forward_kernel)
@@ -394,6 +399,12 @@ def fused_kl_div_loss(logits, targets):
     """Per-position forward KL ``[1, T]``; fused twin of ``kl_div_loss``."""
     _require_triton()
     return _FusedLoss.apply(logits, targets, _OP_KL.value)
+
+
+def fused_soft_ce_loss(logits, targets):
+    """Per-position soft cross entropy; teacher logits are stop-gradient."""
+    _require_triton()
+    return _FusedLoss.apply(logits, targets, _OP_SOFT_CE.value)
 
 
 def fused_reverse_kl_div_loss(logits, targets):

@@ -18,6 +18,30 @@ class Teacher:
         with torch.no_grad():
             return self.head(self.values) if self.head is not None else self.values
 
+    def compact(self, vocab_mask, chunk_size):
+        """Project a frozen linear teacher in vocabulary tiles."""
+        from specforge.core.compact_teacher import _tiled_logsumexp_argmax
+        from specforge.modeling.draft.bindings import BoundLMHead
+
+        if isinstance(self.head, BoundLMHead):
+            weight = self.head.bound_weight()
+        elif isinstance(self.head, torch.nn.Linear) and self.head.bias is None:
+            weight = self.head.weight
+        else:
+            raise ValueError(
+                "compact teacher requires hidden states and a linear teacher head"
+            )
+        if vocab_mask is None or vocab_mask.shape != (weight.shape[0],):
+            raise ValueError(
+                "compact teacher requires a matching draft vocabulary mask"
+            )
+        ids = vocab_mask.nonzero().flatten()
+        log_z, argmax, logits = _tiled_logsumexp_argmax(
+            self.values, weight, chunk_size=chunk_size, selected_token_ids=ids
+        )
+        mass = (logits - log_z).exp().sum(-1)
+        return logits, argmax, mass
+
     def select(self, units):
         return replace(self, values=self.values[units])
 
@@ -54,6 +78,7 @@ class Predictions:
     projection_inputs: dict[str, Tensor] = field(default_factory=dict)
     auxiliary_inputs: dict[str, Tensor] = field(default_factory=dict)
     auxiliary: Callable | None = None
+    fused_evaluator: Callable | None = None
     requires: frozenset[str] = frozenset()
     default_loss: TokenLoss = field(default_factory=lambda: TokenLoss(kind="ce"))
     terms: tuple[LossTerm, ...] = (LossTerm(),)
@@ -62,6 +87,7 @@ class Predictions:
     denominator: Tensor | None = None
     accuracy_name: str = "acc"
     report_accuracy: bool = True
+    chunk_safe: bool = True
 
     def __post_init__(self):
         shape = self.hidden.shape[:2]

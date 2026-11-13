@@ -49,8 +49,12 @@ class ObjectiveModel(nn.Module):
         token_loss=None,
         weighting=None,
         frozen_parameters=(),
+        execution=None,
     ):
         super().__init__()
+        from .execution_options import LossExecution
+
+        self.execution = execution or LossExecution()
         self.draft_model = draft_model
         self.objective = objective
         self.registration = registration
@@ -175,6 +179,7 @@ class ObjectiveModel(nn.Module):
             self.token_loss,
             self.weighting,
             training=self.draft_model.training,
+            execution=self.execution,
         )
 
 

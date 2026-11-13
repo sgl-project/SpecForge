@@ -1,15 +1,72 @@
 """Domino schedules base and GRU-corrected token cross entropy."""
 
 from dataclasses import dataclass
+from functools import partial
+
+import torch
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
-from .base import check_options
+from .base import ObjectiveResult, check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
 from .losses import TokenLoss, decay_weighting
 from .predictions import LossTerm, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
+
+
+def fused_domino_loss(
+    model, predictions, loss, weighting, *, weights=None, denominator=None
+):
+    """Use compact GRU corrections when the selected loss is ordinary CE."""
+    if (
+        loss.kind != "ce"
+        or loss.options
+        or not predictions.hidden.is_cuda
+        or predictions.hidden.dtype
+        not in (torch.float16, torch.bfloat16, torch.float32)
+        or predictions.hidden.numel() == 0
+    ):
+        return None
+    from specforge.core.domino_loss import domino_weighted_cross_entropy
+
+    spec = model.config.draft.spec_config
+    base, correction = model.project_parts(
+        predictions.hidden, **predictions.projection_inputs
+    )
+    if weights is None:
+        weights = weighting(predictions.mask.float(), predictions.positions)
+    final_loss, base_loss, predicted, _ = domino_weighted_cross_entropy(
+        base.flatten(0, 1),
+        correction.reshape(-1, correction.shape[-1]),
+        predictions.labels.flatten(),
+        weights.flatten(),
+        spec.protocol.num_model_slots,
+        spec.suffix_start,
+        use_fused=True,
+    )
+    terms = {"logits": final_loss, "base_logits": base_loss}
+    numerator = sum(term.coefficient * terms[term.output] for term in predictions.terms)
+    metric_weights = predictions.mask.float()
+    accuracy = (
+        (
+            (predicted.reshape_as(predictions.labels) == predictions.labels)
+            * metric_weights
+        )
+        .sum()
+        .detach(),
+        metric_weights.sum().detach(),
+    )
+    ratios = {predictions.accuracy_name: accuracy}
+    if predictions.report_accuracy:
+        ratios["acc"] = accuracy
+    if denominator is None:
+        denominator = (
+            weights.sum().detach()
+            if predictions.denominator is None
+            else predictions.denominator
+        )
+    return ObjectiveResult(numerator, denominator, ratios)
 
 
 @register_protocol(
@@ -79,5 +136,6 @@ class DominoObjective:
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
             terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
+            fused_evaluator=partial(fused_domino_loss, model),
         )
         return PredictionBatch((predictions,))

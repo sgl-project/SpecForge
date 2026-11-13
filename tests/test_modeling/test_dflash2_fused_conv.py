@@ -132,6 +132,7 @@ class DFlash2FusedConvDispatchTest(unittest.TestCase):
                 mock.patch("builtins.__import__", guarded_import),
             ):
                 sys.modules.pop("specforge.modeling.draft.dflash2_conv_triton", None)
+                sys.modules.pop("specforge.modeling.draft.layers.conv.triton", None)
                 self.assertIsNone(dflash2._load_fused_grouped_conv())
         finally:
             dflash2._load_fused_grouped_conv.cache_clear()

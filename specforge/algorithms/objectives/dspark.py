@@ -10,7 +10,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
+from .losses import TokenLoss, ce_l1_terms, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -93,14 +93,12 @@ class DSparkObjective:
             if confidence is None:
                 return AuxiliaryLoss(weights.new_zeros(weights.shape))
             with torch.no_grad():
-                distance = (
-                    (
-                        projected["logits"].float().softmax(-1)
-                        - teacher.float().softmax(-1)
-                    )
-                    .abs()
-                    .sum(-1)
-                )
+                distance = ce_l1_terms(
+                    projected["logits"],
+                    predictions.labels,
+                    teacher_logits=teacher,
+                    fused=runtime.execution.fused,
+                ).teacher_l1
                 acceptance = (1 - distance / 2).clamp(0, 1)
             return AuxiliaryLoss(
                 self.confidence_loss_alpha

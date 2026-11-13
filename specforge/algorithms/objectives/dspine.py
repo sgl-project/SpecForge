@@ -5,12 +5,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from specforge.core.fused_loss import ce_l1_loss
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from .base import check_options
 from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
+from .losses import TokenLoss, ce_l1_terms, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import TrainingRequirements, WindowStatistic, register_protocol
 
@@ -138,8 +137,12 @@ class DSpineObjective:
 
         def auxiliary(predictions, projected, teacher, weights):
             labels = predictions.labels
-            terms = ce_l1_loss(
-                projected["logits"], labels, teacher_logits=teacher, top_k=self.top_k
+            terms = ce_l1_terms(
+                projected["logits"],
+                labels,
+                teacher_logits=teacher,
+                top_k=self.top_k,
+                fused=runtime.execution.fused,
             )
             refined = model.refine(
                 predictions.auxiliary_inputs["pre_injection"],
@@ -148,10 +151,11 @@ class DSpineObjective:
             candidates = model.lm_head.candidate_weights(terms.topk_ids)
             scores = torch.einsum("...h,...kh->...k", refined, candidates).float()
             covered = terms.topk_ids == labels[..., None]
-            refinement = ce_l1_loss(
+            refinement = ce_l1_terms(
                 scores,
                 covered.long().argmax(-1),
                 teacher_logits=teacher.gather(-1, terms.topk_ids),
+                fused=runtime.execution.fused,
             )
             mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
             refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(
@@ -186,6 +190,7 @@ class DSpineObjective:
             auxiliary=auxiliary,
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
+            chunk_safe=alignment_ce is not None,
             auxiliary_inputs={
                 "pre_injection": output.pre_injection,
                 "predecessors": blocks.predecessors,

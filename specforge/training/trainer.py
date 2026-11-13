@@ -338,7 +338,24 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if not persisted_available and key in (
+                    "canonical_loss_execution",
+                    "canonical_use_fused_conv",
+                ):
+                    from dataclasses import asdict
+
+                    from specforge.algorithms.objectives.execution_options import (
+                        LossExecution,
+                    )
+
+                    # Older canonical runs used exactly these execution defaults.
+                    comparison_persisted = (
+                        asdict(LossExecution())
+                        if key == "canonical_loss_execution"
+                        else False
+                    )
+                    persisted_available = True
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

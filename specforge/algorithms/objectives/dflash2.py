@@ -2,13 +2,12 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from .base import check_options
 from .dflash import COMMON_MODULES
 from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
+from .losses import TokenLoss, ce_l1_terms, decay_weighting
 from .predictions import AuxiliaryLoss, PredictionBatch
 from .registry import TrainingRequirements, register_protocol
 
@@ -106,9 +105,10 @@ class DFlash2Objective:
 
         def auxiliary(predictions, projected, teacher, weights):
             labels = predictions.labels
-            terms = ce_l1_loss(
+            terms = ce_l1_terms(
                 projected["logits"],
                 labels,
+                fused=runtime.execution.fused,
                 top_k=model.config.draft.spec_config.selector_top_k,
             )
             unary, hidden = terms.topk_values, predictions.hidden
@@ -121,8 +121,8 @@ class DFlash2Objective:
                 predecessor_ids=predictions.auxiliary_inputs["predecessors"],
             )
             covered = terms.topk_ids == labels[..., None]
-            selector = ce_l1_loss(
-                scores, covered.long().argmax(-1)
+            selector = ce_l1_terms(
+                scores, covered.long().argmax(-1), fused=runtime.execution.fused
             ).cross_entropy * covered.any(-1)
             return AuxiliaryLoss(scale * selector)
 

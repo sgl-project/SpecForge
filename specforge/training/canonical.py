@@ -197,6 +197,7 @@ def _objective_settings(cfg):
         options=cfg.training.objective_options,
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
+        execution=cfg.training.loss_execution,
     )
 
 
@@ -349,6 +350,8 @@ def resolve_run(cfg, *, target_config=None):
         )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     _validate_imported_objective(cfg, resolved)
+    if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
+        raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
 
     init = cfg.initialization
@@ -624,7 +627,9 @@ def build_bundle(cfg, algorithm):
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
     use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(model, use_liger=use_liger)
+    configure_kernels(
+        model, use_liger=use_liger, use_fused_conv=cfg.model.use_fused_conv
+    )
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -656,9 +661,11 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_use_liger_kernel": use_liger,
+        "canonical_use_fused_conv": cfg.model.use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),
+        "canonical_loss_execution": asdict(runtime.execution),
     }
     from specforge.training.provenance import model_resume_provenance
 

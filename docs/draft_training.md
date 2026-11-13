@@ -230,6 +230,57 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
+### Loss execution
+
+Execution controls are separate from the objective, token loss and weighting:
+
+```yaml
+model:
+  use_fused_conv: true
+training:
+  loss_execution:
+    chunk_size: 128
+    checkpoint: true
+    fused: true
+    trim: true
+    # Vocabulary tile size for offline EAGLE/P-EAGLE teacher projection:
+    # teacher_chunk_size: 32768
+```
+
+- `chunk_size` counts complete prediction units (blocks for block protocols,
+  independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
+  default; zero disables chunking. Recurrent heads always keep whole blocks.
+- `checkpoint` controls recomputation of chunk projections and losses during
+  backward. It defaults to true and is independent of `fused`.
+- `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
+  soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
+  use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
+  corrections without constructing full corrected logits. CPU, FP64, empty
+  inputs and losses without a fused implementation use the eager reference.
+  Missing Triton on a selected CUDA fused path raises; it is not silently ignored.
+- `trim` defaults to false and skips prediction units with no supervised positions.
+  It preserves explicit denominators and does not truncate recurrent blocks.
+  D-PACE keeps complete chains, and contextual LK losses keep all rows.
+- `teacher_chunk_size` enables compact teacher projection for offline
+  vocabulary-aware protocols with a reduced vocabulary and a frozen linear
+  teacher. It preserves full-vocabulary argmax and retained probability mass
+  while projecting vocabulary tiles; no full-vocabulary logits are retained.
+
+Chunked D-PACE first collects detached chain statistics, then recomputes projection
+chunks with the complete-chain weights. Contextual LK losses retain whole-set
+execution, and DSpine retains it when no window alignment statistic is supplied.
+Thus requesting chunking does not promise bounded loss memory for those paths.
+
+`model.use_fused_conv` opts canonical grouped convolution into its existing Triton
+kernel. Unsupported devices, dtypes, group sizes and compiled execution retain the
+eager implementation. The fused kernel accumulates in FP32 and rounds once, so
+BF16 results need not be bit-identical to eager per-tap rounding. Parameter names
+and checkpoint tensors do not change. Liger selection remains independent.
+
+Execution settings are saved and checked on full resume. Older canonical
+checkpoints without these fields are interpreted using the previous defaults.
+Existing recipes keep their previous defaults until explicitly migrated.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,

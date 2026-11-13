@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
+from .execution_options import LossExecution
 from .losses import PositionWeighting, TokenLoss
 
 
@@ -89,6 +90,7 @@ class ResolvedObjective:
     objective: object
     loss: TokenLoss
     weighting: PositionWeighting
+    execution: LossExecution
 
     @property
     def requires_teacher(self):
@@ -96,7 +98,7 @@ class ResolvedObjective:
 
 
 def resolve_objective(
-    architecture, *, name=None, options=None, loss=None, weighting=None
+    architecture, *, name=None, options=None, loss=None, weighting=None, execution=None
 ):
     """Resolve defaults and capture requirements without constructing a model."""
     name = name or default_protocol(architecture)
@@ -107,6 +109,7 @@ def resolve_objective(
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
     token_loss = TokenLoss(**(loss or {}))
+    execution = LossExecution(**(execution or {}))
     _reject_shadowed_options(
         options,
         weighting is not None,
@@ -125,6 +128,8 @@ def resolve_objective(
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
     )
+    if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
+        raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
         entry.requires | selected_loss.requires | position_weighting.requires
     ) - entry.provides
@@ -135,7 +140,9 @@ def resolve_objective(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
-    return ResolvedObjective(name, entry, objective, selected_loss, position_weighting)
+    return ResolvedObjective(
+        name, entry, objective, selected_loss, position_weighting, execution
+    )
 
 
 def build_objective_model(
@@ -147,6 +154,7 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
+    execution=None,
 ):
     resolved = resolve_objective(
         draft_model.config.draft.architecture,
@@ -154,8 +162,23 @@ def build_objective_model(
         options=options,
         loss=loss,
         weighting=weighting,
+        execution=execution,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    if resolved.execution.teacher_chunk_size:
+        from torch import nn
+
+        from specforge.modeling.draft.bindings import BoundLMHead
+
+        if not (
+            isinstance(target_head, BoundLMHead)
+            or isinstance(target_head, nn.Linear)
+            and target_head.bias is None
+        ):
+            raise ValueError("compact teacher requires a linear teacher head")
+        draft = draft_model.config.draft
+        if draft.draft_vocab_size >= draft.vocab_size:
+            raise ValueError("compact teacher requires a reduced draft vocabulary")
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
     declared = getattr(objective, "frozen_parameters", ())
@@ -204,6 +227,7 @@ def build_objective_model(
         token_loss=resolved.loss,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
+        execution=resolved.execution,
     )
 
 

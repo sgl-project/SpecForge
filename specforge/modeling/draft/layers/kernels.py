@@ -1,5 +1,6 @@
 """Opt-in Liger RMSNorm and SwiGLU without changing checkpoint parameters."""
 
+from .conv.grouped_causal import GroupedCausalConv
 from .mlp.dense import DenseFFN
 from .norm.rms import RMSNorm
 
@@ -11,7 +12,11 @@ def load_liger_kernels():
     return LigerRMSNormFunction.apply, LigerSiLUMulFunction.apply
 
 
-def configure_kernels(model, *, use_liger=False):
+def configure_kernels(model, *, use_liger=False, use_fused_conv=False):
+    for module in model.modules():
+        if isinstance(module, GroupedCausalConv):
+            module.use_fused = use_fused_conv
+
     if not use_liger:
         for module in model.modules():
             if isinstance(module, RMSNorm):

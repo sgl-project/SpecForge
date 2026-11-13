@@ -19,12 +19,20 @@ class LossRegistration:
     requires: frozenset[str]
     inputs: tuple[str, ...] = ()
     contextual: bool = False
+    fused_compute: Callable | None = None
 
 
 _LOSSES = {}
 
 
-def register_loss(name, *, requires=("logits", "labels"), inputs=(), contextual=False):
+def register_loss(
+    name,
+    *,
+    requires=("logits", "labels"),
+    inputs=(),
+    contextual=False,
+    fused_compute=None,
+):
     """Register a per-token loss; algorithm-specific auxiliary terms stay separate."""
 
     def register(compute):
@@ -37,13 +45,36 @@ def register_loss(name, *, requires=("logits", "labels"), inputs=(), contextual=
             and "target_last_hidden_states" not in capture_inputs
         ):
             capture_inputs += ("target_last_hidden_states",)
-        _LOSSES[name] = LossRegistration(compute, required, capture_inputs, contextual)
+        _LOSSES[name] = LossRegistration(
+            compute, required, capture_inputs, contextual, fused_compute
+        )
         return compute
 
     return register
 
 
-@register_loss("ce")
+def ce_l1_terms(logits, labels, *, fused=False, **options):
+    # CPU, FP64 and empty batches retain the reference implementation.
+    optimized = (
+        fused
+        and logits.is_cuda
+        and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and logits.numel() > 0
+    )
+    compute = fused_loss.fused_ce_l1_loss if optimized else fused_loss.ce_l1_loss
+    return compute(logits, labels, **options)
+
+
+def _fused_ce(logits, labels, teacher):
+    return ce_l1_terms(logits, labels, fused=True).cross_entropy
+
+
+def _fused_ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
+    terms = ce_l1_terms(logits, labels, teacher_logits=teacher, fused=True)
+    return ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1
+
+
+@register_loss("ce", fused_compute=_fused_ce)
 def cross_entropy(logits, labels, teacher=None):
     return F.cross_entropy(
         logits.to(torch.promote_types(logits.dtype, torch.float32)).reshape(
@@ -54,12 +85,20 @@ def cross_entropy(logits, labels, teacher=None):
     ).reshape(labels.shape)
 
 
-@register_loss("soft_ce", requires=("logits", "labels", "teacher_logits"))
+@register_loss(
+    "soft_ce",
+    requires=("logits", "labels", "teacher_logits"),
+    fused_compute=lambda logits, labels, teacher: fused_loss.fused_soft_ce_loss(
+        logits, teacher
+    ),
+)
 def soft_cross_entropy(logits, labels, teacher):
     return -(teacher.float().softmax(-1) * logits.float().log_softmax(-1)).sum(-1)
 
 
-@register_loss("ce_l1", requires=("logits", "labels", "teacher_logits"))
+@register_loss(
+    "ce_l1", requires=("logits", "labels", "teacher_logits"), fused_compute=_fused_ce_l1
+)
 def ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
     terms = fused_loss.ce_l1_loss(logits, labels, teacher_logits=teacher)
     return ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1
@@ -73,17 +112,22 @@ def _distillation(compute):
     return loss
 
 
-for _name, _compute in {
-    "kl": fused_loss.kl_div_loss,
-    "reverse_kl": fused_loss.reverse_kl_div_loss,
-    "js": fused_loss.js_div_loss,
-    "tv": fused_loss.tv_loss,
-    "nla": fused_loss.neg_log_acceptance_loss,
-    "lk": fused_loss.lk_hybrid_loss,
+for _name, (_compute, _fused) in {
+    "kl": (fused_loss.kl_div_loss, fused_loss.fused_kl_div_loss),
+    "reverse_kl": (
+        fused_loss.reverse_kl_div_loss,
+        fused_loss.fused_reverse_kl_div_loss,
+    ),
+    "js": (fused_loss.js_div_loss, fused_loss.fused_js_div_loss),
+    "tv": (fused_loss.tv_loss, fused_loss.fused_tv_loss),
+    "nla": (fused_loss.neg_log_acceptance_loss, fused_loss.fused_nla_loss),
+    "lk": (fused_loss.lk_hybrid_loss, fused_loss.fused_lk_hybrid_loss),
 }.items():
-    register_loss(_name, requires=("logits", "labels", "teacher_logits"))(
-        _distillation(_compute)
-    )
+    register_loss(
+        _name,
+        requires=("logits", "labels", "teacher_logits"),
+        fused_compute=_distillation(_fused),
+    )(_distillation(_compute))
 
 
 @dataclass(frozen=True)
@@ -93,15 +137,22 @@ class LossContext:
     denominator: torch.Tensor | None = None
 
 
-def _lk(mode):
+def _lk(mode, *, fused=False):
     def compute(
         logits, labels, teacher, *, context, target="labels", kl_scale=1.0, kl_decay=1.0
     ):
-        log_q = logits.float().log_softmax(-1)
         if target == "labels":
-            ce = -log_q.gather(-1, labels[..., None]).squeeze(-1)
+            ce = (
+                ce_l1_terms(logits, labels, fused=True).cross_entropy
+                if fused
+                else -logits.float()
+                .log_softmax(-1)
+                .gather(-1, labels[..., None])
+                .squeeze(-1)
+            )
             acceptance = (-ce).exp()
         else:
+            log_q = logits.float().log_softmax(-1)
             p = teacher.float().softmax(-1)
             ce = -(p * log_q).sum(-1)
             if context.teacher_mass is not None:
@@ -130,7 +181,9 @@ def _lk(mode):
 
 
 for _mode in ("alpha", "tv", "lambda"):
-    register_loss(f"lk_{_mode}", contextual=True)(_lk(_mode))
+    register_loss(f"lk_{_mode}", contextual=True, fused_compute=_lk(_mode, fused=True))(
+        _lk(_mode)
+    )
 
 
 def _accepted_options(compute):
@@ -213,15 +266,24 @@ class TokenLoss:
     def requires_teacher(self):
         return "teacher_logits" in self.requires
 
-    def __call__(self, logits, labels, *, teacher=None, default=None, context=None):
+    def __call__(
+        self, logits, labels, *, teacher=None, default=None, context=None, fused=False
+    ):
         if self.kind == "default" and default is not None:
             return default
         if self.requires_teacher and (teacher is None or teacher.shape != logits.shape):
             raise ValueError("distillation requires aligned teacher and draft logits")
         kwargs = {"context": context} if self.registration.contextual else {}
-        return self.registration.compute(
-            logits, labels, teacher, **kwargs, **self.options
-        )
+        compute = self.registration.compute
+        if (
+            fused
+            and self.registration.fused_compute is not None
+            and logits.is_cuda
+            and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and logits.numel() > 0
+        ):
+            compute = self.registration.fused_compute
+        return compute(logits, labels, teacher, **kwargs, **self.options)
 
 
 @dataclass(frozen=True)
