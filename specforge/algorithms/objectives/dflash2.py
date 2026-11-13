@@ -36,6 +36,9 @@ from .registry import TrainingRequirements, register_protocol
 class DFlash2Objective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+    bias_update_rate: float = (
+        0.0  # expert_bias step per optimizer step; 0 keeps it fixed
+    )
     selector_loss_alpha: float = 1.0
     selector_warmup_steps: int | None = None
     selector_ramp_steps: int | None = None
@@ -54,7 +57,10 @@ class DFlash2Objective:
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
-            nonnegative={"selector_loss_alpha": self.selector_loss_alpha},
+            nonnegative={
+                "selector_loss_alpha": self.selector_loss_alpha,
+                "bias_update_rate": self.bias_update_rate,
+            },
             probabilities={
                 "selector_warmup_ratio": self.selector_warmup_ratio,
                 "selector_ramp_ratio": self.selector_ramp_ratio,

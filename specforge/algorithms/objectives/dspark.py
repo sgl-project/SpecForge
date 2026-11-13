@@ -38,6 +38,9 @@ from .registry import TrainingRequirements, register_protocol
 class DSparkObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+    bias_update_rate: float = (
+        0.0  # expert_bias step per optimizer step; 0 keeps it fixed
+    )
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9
     confidence_loss_alpha: float = 1.0
@@ -68,6 +71,7 @@ class DSparkObjective:
                 "ce_loss_alpha": self.ce_loss_alpha,
                 "l1_loss_alpha": self.l1_loss_alpha,
                 "confidence_loss_alpha": self.confidence_loss_alpha,
+                "bias_update_rate": self.bias_update_rate,
             },
         )
 

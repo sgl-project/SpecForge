@@ -49,9 +49,11 @@ class ObjectiveModel(nn.Module):
         token_loss=None,
         weighting=None,
         frozen_parameters=(),
+        balancer=None,
     ):
         super().__init__()
         self.draft_model = draft_model
+        self.balancer = balancer  # MoE load balancing, when the options enable it
         self.objective = objective
         self.registration = registration
         self.objective_name = name
@@ -135,6 +137,10 @@ class ObjectiveModel(nn.Module):
     def block_predictions(self, output, blocks, batch, **options):
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
+        if self.balancer is not None:
+            # Every token of a kept block was routed; padded blocks do not count.
+            keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+            self.balancer.observe(output, keep=keep)
         return self.predictions(
             output.hidden_states,
             batch,

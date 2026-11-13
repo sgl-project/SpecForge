@@ -34,6 +34,9 @@ from .registry import TrainingRequirements, register_protocol
 class DominoObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+    bias_update_rate: float = (
+        0.0  # expert_bias step per optimizer step; 0 keeps it fixed
+    )
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
 
@@ -48,6 +51,7 @@ class DominoObjective:
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
+            nonnegative={"bias_update_rate": self.bias_update_rate},
             probabilities={
                 "lambda_base_start": self.lambda_base_start,
                 "lambda_base_decay_ratio": self.lambda_base_decay_ratio,

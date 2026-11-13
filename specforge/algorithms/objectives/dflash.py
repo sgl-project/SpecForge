@@ -35,6 +35,9 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 class DFlashObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
+    bias_update_rate: float = (
+        0.0  # expert_bias step per optimizer step; 0 keeps it fixed
+    )
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -47,6 +50,7 @@ class DFlashObjective:
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
+            nonnegative={"bias_update_rate": self.bias_update_rate},
         )
 
     def __call__(self, runtime, batch, **context):

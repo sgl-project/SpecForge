@@ -195,6 +195,8 @@ def build_objective_model(
         )
     for module in to_freeze:
         module.requires_grad_(False)
+    from .moe_balance import MoEBalancer
+
     return ObjectiveModel(
         draft_model,
         objective,
@@ -204,6 +206,7 @@ def build_objective_model(
         token_loss=resolved.loss,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
+        balancer=MoEBalancer.for_objective(draft_model, objective),
     )
 
 

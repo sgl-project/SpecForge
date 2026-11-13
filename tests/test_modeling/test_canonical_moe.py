@@ -23,13 +23,13 @@ from tests.test_modeling.test_canonical_dspark import model_config, model_inputs
 from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 
-def moe_model_config():
+def moe_model_config(expert_bias=True):
     """A dense layer followed by a MoE layer, as drafts of DeepSeek-style targets."""
     node = moe_spec(
         experts=expert_spec(16),
         shared_expert=expert_spec(16),
         shared_expert_gate=True,
-        router=router_spec(expert_bias=True),
+        router=router_spec(expert_bias=expert_bias),
     )
     return replace(
         model_config(),
