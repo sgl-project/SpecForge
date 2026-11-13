@@ -49,9 +49,17 @@ class AutoDraftConfig:
 
         architecture = architectures[0]
         if architecture not in DRAFT_REGISTRY:
+            from specforge.config.draft.codec.legacy import LEGACY_ARCHITECTURES
+
+            canonical_only = (
+                "; it now loads only through the canonical path (draft: OLD.json, "
+                "initialization.legacy_config, or specforge export --draft-config)"
+                if architecture in LEGACY_ARCHITECTURES
+                else ""
+            )
             raise ValueError(
                 f"draft architecture {architecture!r} is not registered; "
-                f"available: {available_drafts()}"
+                f"available: {available_drafts()}{canonical_only}"
             )
         payload["architectures"] = [architecture]
         payload["tie_word_embeddings"] = False

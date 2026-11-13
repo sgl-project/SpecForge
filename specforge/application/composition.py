@@ -69,9 +69,10 @@ def resolve_run(
         registry = builtin_algorithm_registry()
     if cfg.training.strategy == "mtp":
         raise ValueError(
-            "MTP now requires draft and initialization (or resume); "
-            "use the native preset for target initialization, or "
-            "initialization.checkpoint to import historical draft weights"
+            "MTP now requires draft and initialization (or resume of a canonical "
+            "checkpoint); use the native preset for target initialization, or "
+            "initialization.checkpoint to import historical draft weights; legacy "
+            "MTP optimizer state cannot resume"
         )
     try:
         algorithm = registry.resolve(cfg.training.strategy)

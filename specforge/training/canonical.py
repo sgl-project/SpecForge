@@ -138,7 +138,7 @@ def resolve_config(cfg, *, target_config=None):
         canonical = _is_canonical_checkpoint(cfg, source)
         if cfg.resume_path and not canonical:
             raise ValueError(
-                "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+                "legacy full resume uses the legacy training path, which MTP no longer has; use initialization.checkpoint for canonical weight import"
             )
         loaded = read_draft(
             source,
