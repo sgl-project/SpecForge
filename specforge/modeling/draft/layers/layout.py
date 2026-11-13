@@ -1,5 +1,4 @@
-"""Checkpoint layouts: how fused parameters assemble from per-tensor checkpoint entries.
-`join` and `split` only stack and concatenate, so they are exact inverses."""
+"""Checkpoint layouts: fused parameters from per-tensor entries; join/split are inverses."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass

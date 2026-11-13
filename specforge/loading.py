@@ -99,8 +99,7 @@ def _dtype(requested, checkpoint):
         if not isinstance(requested, torch.dtype) or not requested.is_floating_point:
             raise ValueError("dtype must be a floating-point torch.dtype")
         return requested
-    # The dtype holding most floating elements: fp32 buffers such as a router's
-    # expert_bias ride along with the weights without deciding the model's dtype.
+    # The dtype holding most elements: an fp32 expert_bias rides along with bf16 weights.
     elements = {}
     for ref in checkpoint.weights.values():
         dtype = ref.info.dtype

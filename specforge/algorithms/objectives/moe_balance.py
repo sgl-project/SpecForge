@@ -1,5 +1,4 @@
-"""Expert load balancing for MoE drafts: DeepSeek-V3's aux-loss-free bias update and
-its load-balance auxiliary loss on the router scores."""
+"""MoE load balancing: DeepSeek-V3's aux-loss-free bias update and its auxiliary loss."""
 
 from dataclasses import dataclass, replace
 
@@ -10,8 +9,7 @@ from torch import Tensor, nn
 
 from specforge.modeling.draft.layers.mlp import MoEFFN
 
-# The load the auxiliary loss balances: this forward's own, or this optimizer step's
-# so far, pooled over micro-batches and ranks.
+# The load the auxiliary loss balances: this forward's, or the step's so far over ranks.
 AUX_LOSS_TYPES = ("microbatch_wise", "batch_wise")
 
 
@@ -40,27 +38,21 @@ def dispatch_balance(counts: Tensor) -> Tensor:
 
 
 def balance_from_terms(mean_probs: Tensor, load: Tensor) -> Tensor:
-    """E * sum_e share_e * P_e per layer, averaged over the layers: share_e is expert e's
-    part of `load` [L, E] and P_e its mean routing probability [L, E]; 1 when balanced.
-    The gradient reaches the routers through P_e only."""
+    """E * sum_e share_e * P_e per layer, averaged; 1 when balanced; gradient through P_e."""
     share = load.float() / load.sum(dim=-1, keepdim=True).clamp(min=1)
     return (mean_probs.shape[-1] * (share * mean_probs).sum(dim=-1)).mean()
 
 
 @dataclass(frozen=True)
 class MoEBalanceTerm:
-    """One forward's halves of the load-balance loss, per MoE layer: the trainer supplies
-    the load and finishes it, so the objective performs no collective."""
+    """A forward's halves of the load-balance loss per layer; the trainer adds the load."""
 
     mean_probs: Tensor  # [layers, num_experts] P_e, differentiable
     counts: Tensor  # [layers, num_experts] int64 kept tokens routed to each expert
 
 
 class MoEBalancer:
-    """Counts the kept tokens each MoE layer routes over an optimizer step and, at the
-    step, pools them over ranks and moves every router's expert bias by `rate`. For the
-    auxiliary loss it turns a forward's routing into a MoEBalanceTerm and later finishes
-    it with the load: the forward's own, or the step's so far pooled over ranks."""
+    """Per-step routed-token counts, the bias update at the step, and the auxiliary loss."""
 
     def __init__(
         self,
@@ -114,15 +106,12 @@ class MoEBalancer:
         return routings
 
     def observe(self, output, *, keep: Tensor) -> MoEBalanceTerm | None:
-        """Count one forward's routing per layer. Training forwards (with gradients)
-        add to this step's counts; the auxiliary loss's term comes back when the loss
-        is on, else None."""
-        counting = torch.is_grad_enabled()
+        """Count one forward per layer (training forwards accumulate); the aux term, or None."""
+        counting = torch.is_grad_enabled() and self.layers[0].training
+        routings = self._routings(output)
+        kept = keep.to(routings[0].expert_ids.device)
         mean_probs, counts = [], []
-        for index, (layer, routing) in enumerate(
-            zip(self.layers, self._routings(output))
-        ):
-            kept = keep.to(routing.expert_ids.device)
+        for index, (layer, routing) in enumerate(zip(self.layers, routings)):
             tokens = count_tokens_per_expert(
                 routing.expert_ids, kept, layer.config.num_experts
             )
@@ -130,8 +119,7 @@ class MoEBalancer:
                 previous = self.counts[index]
                 self.counts[index] = tokens if previous is None else previous + tokens
             if self.aux_loss_coef:
-                # P_e over the kept tokens; the per-token L1 normalization is a no-op
-                # for softmax scores and needed for sigmoid ones.
+                # P_e over the kept tokens; the L1 normalization matters for sigmoid scores only.
                 probs = F.normalize(routing.scores, p=1, dim=-1) * kept[:, None]
                 mean_probs.append(probs.sum(dim=0) / kept.sum().clamp(min=1))
                 counts.append(tokens)
@@ -140,9 +128,7 @@ class MoEBalancer:
         return MoEBalanceTerm(torch.stack(mean_probs), torch.stack(counts))
 
     def finish(self, result, *, pooled: bool, process_group=None):
-        """Fold the result's balance term into its loss and report it as moe/aux_loss.
-        `pooled` (training forwards) lets batch_wise add the forward's counts, summed
-        over ranks, to this step's load; otherwise the forward balances its own."""
+        """Fold the term into the loss (moe/aux_loss); `pooled` lets batch_wise sum over ranks."""
         term = result.balance
         if term is None:
             return result

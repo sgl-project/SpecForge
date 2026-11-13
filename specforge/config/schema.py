@@ -293,11 +293,7 @@ class ModelConfig(StrictConfigModel):
     #: fails when they cannot be used; ``false`` disables them. Resolved kernels
     #: that cannot be imported are an error in both the auto and explicit cases.
     use_liger_kernel: Optional[bool] = None
-    #: Routed-expert kernel of MoE drafts on canonical training. ``grouped_mm``
-    #: runs every expert in one F.grouped_mm call (torch needs hidden_size and
-    #: the expert intermediate_size to be multiples of 8 for bf16/fp16, 4 for
-    #: fp32); ``loop`` runs one matmul pair per expert on any device. Startup
-    #: probes the chosen kernel and fails instead of falling back.
+    #: MoE routed-expert kernel, grouped_mm or loop; probed at startup, no fallback.
     moe_experts_kernel: str = "grouped_mm"
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"

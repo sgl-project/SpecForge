@@ -34,9 +34,7 @@ def microbatch_mean(result, *, global_denominator=False):
         world_size = dist.get_world_size()
         dist.all_reduce(denominator)
     loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(
-        loss, denominator.new_ones(()), result.ratios, result.balance
-    )
+    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
 
 
 class ObjectiveModel(nn.Module):
@@ -143,8 +141,7 @@ class ObjectiveModel(nn.Module):
         )
 
     def balance_term(self, output, blocks):
-        """Count this forward's routing for MoE balancing and return its load-balance
-        term for the trainer to finish; None without a balancer or with the loss off."""
+        """Count this forward's routing for balancing; its load-balance term, or None."""
         if self.balancer is None:
             return None
         slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots

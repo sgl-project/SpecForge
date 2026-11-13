@@ -105,12 +105,7 @@ def resolve_training_state(checkpoint_path: str) -> Dict[str, Any]:
 
 
 def checkpoint_dtype(state_dict: Dict[str, Any]) -> Optional[torch.dtype]:
-    """The floating-point dtype holding most of the checkpoint's draft elements.
-
-    Buffers kept in another dtype, such as a MoE router's fp32 expert bias, do
-    not decide it. Returns ``None`` when the checkpoint holds no floating-point
-    tensor, in which case callers keep their own default.
-    """
+    """The dtype holding most floating draft elements, or None without any."""
     elements = {}
     for value in state_dict.values():
         if torch.is_tensor(value) and value.is_floating_point():

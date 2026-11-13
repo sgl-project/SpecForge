@@ -45,7 +45,6 @@ def make_layer(
     dtype=torch.float32,
     convolution=False,
     connections=None,
-    mlp_node=None,
 ):
     conv_node = GroupedCausalConvSpec(kernel_size=3, group_size=4)
     convolutions = (
@@ -67,7 +66,7 @@ def make_layer(
         build(node, rotary_dim=rotary_dim, offset=offset, device=device, dtype=dtype),
         build_component(
             "mlp",
-            mlp_node or DenseFFNSpec(intermediate_size=32, hidden_act="silu"),
+            DenseFFNSpec(intermediate_size=32, hidden_act="silu"),
             hidden_size=16,
             device=device,
             dtype=dtype,

@@ -73,8 +73,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             ),
         )
         if self.balancer is not None:
-            # The objective hands its load-balance term out unfinished: pooling the
-            # load over ranks is the strategy's, like the window statistic above.
+            # The objective's term is unfinished: pooling over ranks is the strategy's, as above.
             result = self.balancer.finish(
                 result,
                 pooled=self.model.training and torch.is_grad_enabled(),

@@ -147,8 +147,7 @@ class RoutedExperts(nn.Module):
 
     @torch.no_grad()
     def probe_kernel(self, kernel: str) -> None:
-        """Run `kernel` once on zeros routed to expert 0, so a kernel the installed
-        torch cannot run on this device, dtype or width fails at startup."""
+        """Run `kernel` on zeros routed to expert 0, so an unusable kernel fails at startup."""
         x = self.gate_up_proj.new_zeros(16, self.gate_up_proj.shape[-1])
         indices = torch.zeros(16, 1, dtype=torch.long, device=x.device)
         weights = torch.ones(16, 1, dtype=torch.float32, device=x.device)
@@ -156,8 +155,7 @@ class RoutedExperts(nn.Module):
 
 
 class SharedExpert(nn.Module):
-    """Always-on FFN added to the routed output: `gated` is act(gate_proj)·up_proj as in
-    Qwen and DeepSeek, otherwise act(up_proj) as in Nemotron's relu2 MLP."""
+    """Always-on FFN added to the routed output; gated (Qwen) or act(up) only (Nemotron)."""
 
     def __init__(
         self,

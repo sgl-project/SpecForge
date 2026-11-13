@@ -10,8 +10,7 @@ from specforge.config.draft.mlp import MoERouterSpec
 
 
 class Router(nn.Module):
-    """Contract for MoEFFN and balancing: `forward`, and the fp32 `expert_bias` that
-    shifts the top-k choice. Subclasses add their parameters and implement `forward`."""
+    """Router contract: `forward`, and the fp32 `expert_bias` that shifts the top-k choice."""
 
     def __init__(
         self, config: MoERouterSpec, *, num_experts: int, top_k: int, device=None

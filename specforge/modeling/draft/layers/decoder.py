@@ -81,20 +81,19 @@ class DecoderLayer(nn.Module):
         hidden = self.attention_connection(
             hidden, lambda stream: self._attention_update(stream, inputs)
         )
-        routings: list[ExpertRouting] = []
+        routing: ExpertRouting | None = None
 
         def mlp_update(stream: Tensor) -> Tensor:
+            nonlocal routing
             update, routing = self._mlp_update(stream)
-            if routing is not None:
-                routings.append(routing)
             return update
 
         hidden = self.mlp_connection(hidden, mlp_update)
-        if not routings:
-            return hidden
-        if len(routings) > 1:
-            raise ValueError("a MoE FFN needs a residual connection that calls it once")
-        return MoELayerOutput(hidden=hidden, routing=routings[0])
+        return (
+            hidden
+            if routing is None
+            else MoELayerOutput(hidden=hidden, routing=routing)
+        )
 
     def _check_stream(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:

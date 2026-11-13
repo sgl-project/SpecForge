@@ -15,10 +15,7 @@ EXPERT_ACTIVATIONS = SUPPORTED_ACTIVATIONS | {"relu2"}
 
 @dataclass(frozen=True, kw_only=True)
 class MoERouterSpec:
-    """Top-k routing on `scoring` affinities; `expert_bias` shifts the choice only.
-
-    Weights are the unshifted affinities, renormalized if `normalize_top_k`, times `route_scale`.
-    """
+    """Top-k routing on `scoring` affinities; `expert_bias` shifts the choice only."""
 
     scoring: str
     normalize_top_k: bool
@@ -39,10 +36,7 @@ class MoERouterSpec:
 
 @dataclass(frozen=True, kw_only=True)
 class MoEExpertSpec:
-    """One expert FFN of width `intermediate_size`; `gated` is act(gate_proj)·up_proj as in
-    Qwen and DeepSeek, else act(up_proj) as in Nemotron's relu2 MLP. The routed experts
-    and the shared expert use it alike (DeepSeek merges n shared experts into n×I).
-    """
+    """One expert FFN; `gated` is act(gate)·up as in Qwen, else act(up) as in Nemotron."""
 
     intermediate_size: int
     hidden_act: str
@@ -61,9 +55,7 @@ class MoEExpertSpec:
 
 @dataclass(frozen=True, kw_only=True)
 class MoEFFNSpec(FFNSpec):
-    """`num_experts_per_tok` of `num_experts` routed `experts` per token, plus an optional
-    `shared_expert` whose output a sigmoid gate scales when `shared_expert_gate` (Qwen).
-    """
+    """Top-k of `num_experts` routed experts plus an optional (sigmoid-gated) shared expert."""
 
     type: ClassVar[str] = "moe"
 
