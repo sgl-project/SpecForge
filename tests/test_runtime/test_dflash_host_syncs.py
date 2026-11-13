@@ -18,7 +18,11 @@ import torch
 from torch import nn
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import StepContext, StepOutput
+from specforge.training.strategies.base import (
+    DraftTrainStrategy,
+    StepContext,
+    StepOutput,
+)
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_runtime._fixtures import build_strategy
 
@@ -125,6 +129,7 @@ class _RecordingModel(nn.Module):
         self.registration = SimpleNamespace(
             training=TrainingRequirements(host_inputs=prepare_anchor_capacity)
         )
+        self.statistics = None  # no per-forward statistics in this fake
         self.kwargs = None
 
     def forward(self, batch, **kwargs):
@@ -240,10 +245,11 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
             torch.cuda.set_sync_debug_mode("default")
 
 
-class _WeightedStrategy:
+class _WeightedStrategy(DraftTrainStrategy):
     """Scalar-loss strategy with ``loss_terms`` and a host schedule metric."""
 
     name = "weighted"
+    required_features = set()
 
     def __init__(self, model, denominator):
         self.model = model
