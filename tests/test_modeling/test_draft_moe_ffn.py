@@ -11,6 +11,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from specforge.config.draft.mlp import MoEExpertSpec, MoEFFNSpec, MoERouterSpec
+from specforge.modeling.draft.layers.inputs import MoEOutput
 from specforge.modeling.draft.layers.kernels import configure_kernels
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
 from specforge.modeling.draft.layers.mlp.moe import RoutedExperts, Router, TopKRouter
@@ -62,6 +63,8 @@ class MoEFFNTest(unittest.TestCase):
     def _run(module, x, upstream):
         inputs = x.detach().clone().requires_grad_()
         output = module(inputs)
+        if isinstance(output, MoEOutput):
+            output = output.update
         output.backward(upstream)
         grads = {name: p.grad for name, p in module.named_parameters()}
         return output.detach(), inputs.grad, grads
@@ -221,7 +224,7 @@ class MoEFFNTest(unittest.TestCase):
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
     def test_empty_input_runs_forward_and_backward_with_each_kernel(self):
-        """Zero tokens: a [0, H] update and zero gradients on every weight."""
+        """Zero tokens: a [0, H] update, [0, K] routing, and zero gradients on every weight."""
         for device in ("cpu", "cuda") if CUDA else ("cpu",):
             for kernel in sorted(EXPERT_KERNELS):
                 with self.subTest(device=device, kernel=kernel):
@@ -229,8 +232,9 @@ class MoEFFNTest(unittest.TestCase):
                     module.experts_kernel = kernel
                     x = torch.empty(0, H, device=device, requires_grad=True)
                     output = module(x)
-                    self.assertEqual(tuple(output.shape), (0, H))
-                    output.sum().backward()
+                    self.assertEqual(tuple(output.update.shape), (0, H))
+                    self.assertEqual(tuple(output.routing.expert_ids.shape), (0, 2))
+                    output.update.sum().backward()
                     self.assertEqual(tuple(x.grad.shape), (0, H))
                     for name, parameter in module.named_parameters():
                         self.assertIsNotNone(parameter.grad, name)

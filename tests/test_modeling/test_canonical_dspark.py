@@ -296,6 +296,14 @@ class CanonicalDSparkTest(unittest.TestCase):
         )
         (output.logits.sum() + output.confidence_scores.sum()).backward()
         (expected.logits.sum() + expected.confidence_scores.sum()).backward()
+        # The MoE layer's routing travels out as a typed output; dense layers add none.
+        (routing,) = output.expert_routing
+        self.assertEqual(tuple(routing.expert_ids.shape), (16, 2))
+        self.assertTrue(
+            torch.equal(routing.expert_ids, expected.expert_routing[0].expert_ids)
+        )
+        dense = build_draft_model(model_config())
+        self.assertIsNone(dense(*args, predecessor_ids=previous).expert_routing)
         others = dict(checkpointed.named_parameters())
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
