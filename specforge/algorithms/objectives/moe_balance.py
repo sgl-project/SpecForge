@@ -39,18 +39,21 @@ def dispatch_balance(counts: Tensor) -> Tensor:
     return share.numel() * share.square().sum()
 
 
-def balance_from_terms(mean_probs: Tensor, load: Tensor) -> Tensor:
-    """E * sum_e share_e * P_e per layer, averaged; 1 when balanced; gradient through P_e."""
-    share = load.float() / load.sum(dim=-1, keepdim=True).clamp(min=1)
-    return (mean_probs.shape[-1] * (share * mean_probs).sum(dim=-1)).mean()
+def balance_from_terms(mean_probs, load) -> Tensor:
+    """E * sum_e share_e * P_e per layer with its own E, averaged; 1 when balanced; gradient through P_e."""
+    values = []
+    for probs, counts in zip(mean_probs, load):
+        share = counts.float() / counts.sum().clamp(min=1)
+        values.append(probs.numel() * (share * probs).sum())
+    return torch.stack(values).mean()
 
 
 @dataclass(frozen=True)
 class MoEBalanceTerm:
     """A forward's halves of the load-balance loss per layer; the trainer adds the load."""
 
-    mean_probs: Tensor  # [layers, num_experts] P_e, differentiable
-    counts: Tensor  # [layers, num_experts] int64 kept tokens routed to each expert
+    mean_probs: tuple[Tensor, ...]  # per layer [num_experts] P_e, differentiable
+    counts: tuple[Tensor, ...]  # per layer [num_experts] int64 kept tokens per expert
 
 
 class MoEBalancer:
@@ -74,9 +77,11 @@ class MoEBalancer:
             raise ValueError(
                 "bias_update_rate needs router nodes with expert_bias: true"
             )
+        # Statistics stay per layer: the layers' expert counts may differ.
+        self.sizes = [layer.config.num_experts for layer in self.layers]
         self.counts: list[Tensor | None] = [None] * len(self.layers)
-        # [layers, num_experts]: this step's counts so far, pooled over ranks (batch_wise).
-        self.pooled: Tensor | None = None
+        # Per layer: this step's counts so far, pooled over ranks (batch_wise).
+        self.pooled: tuple[Tensor, ...] | None = None
 
     @classmethod
     def for_objective(
@@ -107,6 +112,13 @@ class MoEBalancer:
             )
         return routings
 
+    def _sum_over_ranks(self, counts, process_group) -> tuple[Tensor, ...]:
+        """Sum per-layer counts over ranks with one collective: cat, all-reduce, split."""
+        flat = torch.cat(tuple(counts))
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flat, group=process_group)
+        return flat.split(self.sizes)
+
     def observe(self, output, *, keep: Tensor) -> MoEBalanceTerm | None:
         """Count one forward per layer (training forwards accumulate); the aux term, or None."""
         counting = torch.is_grad_enabled() and self.layers[0].training
@@ -127,7 +139,7 @@ class MoEBalancer:
                 counts.append(tokens)
         if not self.aux_loss_coef:
             return None
-        return MoEBalanceTerm(torch.stack(mean_probs), torch.stack(counts))
+        return MoEBalanceTerm(tuple(mean_probs), tuple(counts))
 
     def finish(self, result, *, pooled: bool, process_group=None):
         """Fold the term into the loss (moe/aux_loss); `pooled` lets batch_wise sum over ranks."""
@@ -136,11 +148,10 @@ class MoEBalancer:
             return result
         load = term.counts
         if pooled and self.aux_loss_type == "batch_wise":
-            load = load.clone()
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(load, group=process_group)
-            self.pooled = load if self.pooled is None else self.pooled + load
-            load = self.pooled
+            load = self._sum_over_ranks(term.counts, process_group)
+            if self.pooled is not None:
+                load = tuple(a + b for a, b in zip(self.pooled, load))
+            self.pooled = load
         value = balance_from_terms(term.mean_probs, load)
         numerator = result.numerator + self.aux_loss_coef * value * result.denominator
         ratios = {
@@ -153,13 +164,12 @@ class MoEBalancer:
         """At the optimizer step: pool the window's counts over ranks, move the biases, reset."""
         if any(counts is None for counts in self.counts):
             return {}
-        pooled = torch.stack(self.counts)
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(pooled, group=process_group)
+        loads = [
+            load.float() for load in self._sum_over_ranks(self.counts, process_group)
+        ]
         self.counts, self.pooled = [None] * len(self.layers), None
-        pooled = pooled.float()
         if self.rate:
-            for layer, load in zip(self.layers, pooled):
+            for layer, load in zip(self.layers, loads):
                 layer.gate.update_expert_bias(load, rate=self.rate)
-        balance = torch.stack([dispatch_balance(load) for load in pooled]).mean()
+        balance = torch.stack([dispatch_balance(load) for load in loads]).mean()
         return {"moe/step_balance": balance}

@@ -259,7 +259,8 @@ the dispatch's balance: 1 when uniform, E / K when the same K experts take every
 token.
 
 The auxiliary loss is DeepSeek-V3's load-balance loss on the router scores,
-E × Σ_e share_e × P_e (1 when balanced), weighted by `aux_loss_coef` (`0` skips
+E × Σ_e share_e × P_e per MoE layer with its own expert count, averaged (1 when
+balanced), weighted by `aux_loss_coef` (`0` skips
 it; the recipe uses `0.005`) and reported as `moe/aux_loss`. `aux_loss_type`
 picks the load behind share_e: `microbatch_wise` is this forward's own,
 `batch_wise` (the default) this optimizer step's so far, pooled over

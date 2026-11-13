@@ -160,7 +160,8 @@ class MoEBalanceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "unfinished"):
                     result.loss
                 self.assertEqual(
-                    tuple(result.balance.counts.shape), (len(config.layer_types), 4)
+                    [tuple(c.shape) for c in result.balance.counts],
+                    [(4,)] * len(config.layer_types),
                 )
                 finished = balancer.finish(result, pooled=True)
                 aux, one = finished.ratios["moe/aux_loss"]
@@ -172,6 +173,54 @@ class MoEBalanceTest(unittest.TestCase):
                 for counts in balancer.counts:
                     self.assertGreater(counts.sum().item(), 0)
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})
+
+    def test_layers_with_different_expert_counts_keep_their_own_statistics(self):
+        """An 8-expert and a 4-expert layer each balance and move their bias on their own load."""
+        config = moe_model_config()
+        wide = replace(config.mlp_configs["moe"], num_experts=8)
+        config = replace(
+            config,
+            mlp_configs={"moe8": wide, "moe4": config.mlp_configs["moe"]},
+            layer_configs={
+                "wide": replace(config.layer_configs["full_moe"], mlp="moe8"),
+                "narrow": replace(config.layer_configs["full_moe"], mlp="moe4"),
+            },
+            layer_types=("wide", "narrow"),
+        )
+        model = build_draft_model(config)
+        layers = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        self.assertEqual([layer.config.num_experts for layer in layers], [8, 4])
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "bias_update_rate": 0.01, "aux_loss_coef": 0.5},
+            target_head=nn.Linear(32, config.vocab_size, bias=False),
+        )
+        torch.manual_seed(0)
+        result = runtime(training_batch(config), step=0, total_steps=2)
+        term = result.balance
+        self.assertEqual([tuple(c.shape) for c in term.counts], [(8,), (4,)])
+        self.assertEqual([tuple(p.shape) for p in term.mean_probs], [(8,), (4,)])
+        finished = runtime.balancer.finish(result, pooled=True)
+        # Each layer is normalized by its own expert count; the loss is their mean.
+        per_layer = [
+            balance_from_terms((p,), (c,)) for p, c in zip(term.mean_probs, term.counts)
+        ]
+        torch.testing.assert_close(
+            finished.ratios["moe/aux_loss"][0], torch.stack(per_layer).mean().detach()
+        )
+        finished.loss.backward()
+        before = [layer.gate.expert_bias.clone() for layer in layers]
+        metrics = runtime.balancer.step()
+        for layer, old, counts in zip(layers, before, term.counts):
+            load = counts.float()
+            delta = 0.01 * torch.sign(load.mean() - load)
+            torch.testing.assert_close(
+                layer.gate.expert_bias - old, delta - delta.mean()
+            )
+        torch.testing.assert_close(
+            metrics["moe/step_balance"],
+            torch.stack([dispatch_balance(c) for c in term.counts]).mean(),
+        )
 
     def test_the_loss_matches_transformers(self):
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
@@ -205,9 +254,9 @@ class MoEBalanceTest(unittest.TestCase):
                 torch.testing.assert_close(
                     K * balance_from_terms(term.mean_probs, term.counts), want
                 )
-        uniform = torch.full((1, E), 1.0 / E)
+        uniform = (torch.full((E,), 1.0 / E),)
         torch.testing.assert_close(
-            balance_from_terms(uniform, torch.full((1, E), 2)), torch.tensor(1.0)
+            balance_from_terms(uniform, (torch.full((E,), 2),)), torch.tensor(1.0)
         )
         none = torch.zeros(B * S, dtype=torch.bool)
         term = balancer.observe(output, keep=none)
@@ -241,8 +290,8 @@ class MoEBalanceTest(unittest.TestCase):
                 terms, finished = [], []
                 for output, own in zip(outputs, counts):
                     term = balancer.observe(output, keep=keep)
-                    self.assertEqual(tuple(term.mean_probs.shape), (1, E))
-                    self.assertTrue(term.mean_probs.requires_grad)
+                    self.assertEqual([tuple(p.shape) for p in term.mean_probs], [(E,)])
+                    self.assertTrue(term.mean_probs[0].requires_grad)
                     self.assertTrue(torch.equal(term.counts[0], own))
                     result = ObjectiveResult(
                         torch.tensor(6.0), torch.tensor(2.0), {}, term
@@ -257,7 +306,7 @@ class MoEBalanceTest(unittest.TestCase):
                 aux = first.ratios["moe/aux_loss"][0]
                 torch.testing.assert_close(
                     aux,
-                    balance_from_terms(terms[0].mean_probs, counts[0][None]).detach(),
+                    balance_from_terms(terms[0].mean_probs, (counts[0],)).detach(),
                 )
                 torch.testing.assert_close(first.loss, 3.0 + 0.5 * aux)
                 load = (
@@ -267,7 +316,7 @@ class MoEBalanceTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     second.ratios["moe/aux_loss"][0],
-                    balance_from_terms(terms[1].mean_probs, load[None]).detach(),
+                    balance_from_terms(terms[1].mean_probs, (load,)).detach(),
                 )
                 if aux_loss_type == "batch_wise":
                     self.assertTrue(
@@ -287,7 +336,7 @@ class MoEBalanceTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     again.ratios["moe/aux_loss"][0],
-                    balance_from_terms(terms[1].mean_probs, counts[1][None]).detach(),
+                    balance_from_terms(terms[1].mean_probs, (counts[1],)).detach(),
                 )
                 # The optimizer step resets the pooled load; rate 0 moves no bias.
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})

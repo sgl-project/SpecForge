@@ -68,12 +68,12 @@ def _worker(rank, world_size):
     finished = balanced.balancer.finish(
         result, pooled=True, process_group=dist.group.WORLD
     )
-    load = term.counts.clone()
+    load = term.counts[0].clone()
     dist.all_reduce(load)
-    assert torch.equal(balanced.balancer.pooled, load), "pooled load differs"
+    assert torch.equal(balanced.balancer.pooled[0], load), "pooled load differs"
     torch.testing.assert_close(
         finished.ratios["moe/aux_loss"][0],
-        balance_from_terms(term.mean_probs, load).detach(),
+        balance_from_terms(term.mean_probs, (load,)).detach(),
     )
     dist.barrier()
     dist.destroy_process_group()
