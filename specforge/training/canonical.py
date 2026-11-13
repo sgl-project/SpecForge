@@ -171,6 +171,8 @@ def resolve_run(cfg, *, target_config=None):
             )
     # Retain the established strategy name for data/rendezvous identifiers.
     options = asdict(resolved.objective)
+    # The balancing options sit beside the objective's; build_bundle reads them back.
+    options.update(resolved.statistics_settings)
     if cfg.training.weighting is not None:
         # An explicit weighting replaces these. build_bundle resolves this
         # config again and must not read the objective's defaults as user input.
@@ -588,6 +590,9 @@ def build_bundle(cfg, algorithm):
     )
     runtime.fsdp_param_dtype = dtype
     options = objective_record(runtime.objective_name, asdict(runtime.objective))
+    if runtime.statistics is not None:
+        # Statistics settings join the contract only while on; earlier runs wrote none.
+        options.update(runtime.statistics.settings)
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
