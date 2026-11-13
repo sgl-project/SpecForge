@@ -83,7 +83,7 @@ class MoEFFN(nn.Module):
             out = out + shared
         # The routed sum is fp32; cast back once, after adding the shared expert.
         update = out.to(hidden.dtype).view(hidden.shape)
-        return MoEOutput(update=update, routing=ExpertRouting(indices))
+        return MoEOutput(update=update, routing=ExpertRouting(indices, scores))
 
 
 register_component_builder("mlp", MoEFFNSpec, MoEFFN)

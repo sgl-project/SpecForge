@@ -392,7 +392,16 @@ class MoEFFNTest(unittest.TestCase):
                 self.assertEqual(tuple(indices.shape), (10, 2))
                 self.assertEqual(indices.dtype, torch.long)
                 self.assertFalse(indices.requires_grad)
-                self.assertTrue(torch.equal(indices, module.gate(x.reshape(-1, H))[1]))
+                scores, expected, _ = module.gate(x.reshape(-1, H))
+                self.assertTrue(torch.equal(indices, expected))
+                # The router scores travel with the routing, differentiable for an aux loss.
+                scores = output.routing.scores
+                self.assertEqual(tuple(scores.shape), (10, module.config.num_experts))
+                self.assertEqual(scores.dtype, torch.float32)
+                self.assertTrue(scores.requires_grad)
+                self.assertTrue(torch.equal(scores, module.gate(x.reshape(-1, H))[0]))
+                scores[:, 0].sum().backward()
+                self.assertTrue(torch.any(module.gate.weight.grad != 0))
 
     def test_generic_base_initializes_from_golden_config(self):
         owner = DFlashDraftModel(model_config(initializer_range=0))

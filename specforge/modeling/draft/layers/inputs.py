@@ -48,6 +48,7 @@ class ExpertRouting:
     """One MoE layer's routing, carried out of the forward for load balancing."""
 
     expert_ids: Tensor  # [tokens, top_k] chosen experts
+    scores: Tensor  # [tokens, num_experts] fp32 router scores, differentiable
 
 
 @dataclass(frozen=True, eq=False)
