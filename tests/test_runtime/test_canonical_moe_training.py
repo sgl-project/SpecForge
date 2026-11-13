@@ -142,15 +142,11 @@ class CanonicalMoETrainingTest(unittest.TestCase):
             build_application_run(Config.model_validate(raw)).run()
 
     def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
+        # grouped_mm also balances: the bias moves, is saved and moves again after resume.
+        balancing = {"grouped_mm": dict(bias_update_rate=0.001, aux_loss_coef=0.01)}
         for kernel in sorted(EXPERT_KERNELS):
             with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
-                self._train_and_resume(Path(temp), kernel)
-
-    def test_bias_update_rate_moves_the_bias_across_steps_and_resume(self):
-        with TemporaryDirectory() as temp:
-            self._train_and_resume(
-                Path(temp), "grouped_mm", bias_update_rate=0.001, aux_loss_coef=0.01
-            )
+                self._train_and_resume(Path(temp), kernel, **balancing.get(kernel, {}))
 
     def test_misaligned_widths_fail_at_startup_unless_the_loop_kernel_is_chosen(self):
         with TemporaryDirectory() as temp:

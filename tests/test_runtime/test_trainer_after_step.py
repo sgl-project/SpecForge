@@ -66,8 +66,7 @@ class TrainerAfterStepTest(unittest.TestCase):
         self.assertTrue(second.optimizer_stepped)
         self.assertEqual(second.metrics["moe/step_balance"], 1.5)
         self.assertEqual(strategy.groups, [None])
-
-    def test_the_default_after_step_reports_nothing(self):
+        # The default after_step reports nothing.
         core = TrainerCore(_PlainStrategy(), _Backend(), accumulation_steps=1)
         result = core.train_step(self._batch())
         self.assertTrue(result.optimizer_stepped)
