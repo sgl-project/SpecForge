@@ -1556,7 +1556,7 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
 
     Only the file's own fields and the overridden ones count as set afterwards.
     Keys under an untyped mapping (``training.objective_options`` and the like)
-    may be new, and their values are parsed as YAML.
+    may be new, and their values are parsed as YAML. ``null`` clears a section.
     """
     import yaml
 
@@ -1580,8 +1580,12 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             node = node[key]
         current = _override_field(owner, keys[-1], path)
         untyped = isinstance(owner, dict)
-        structured = isinstance(current, (dict, list)) or current is None
-        if untyped or (structured and value.lstrip().startswith(("[", "{"))):
+        structured = isinstance(current, (BaseModel, dict, list)) or current is None
+        # null clears a section, e.g. a recipe's initialization when resuming
+        if untyped or (
+            structured
+            and (value.lstrip().startswith(("[", "{")) or value.strip() in ("null", "~"))
+        ):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:

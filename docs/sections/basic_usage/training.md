@@ -805,6 +805,11 @@ MTP migration changes:
   differences are intentional. Only supervised rows are projected, in bounded chunks.
 - Old optimizer state cannot resume under the canonical implementation. Import
   model weights instead. Canonical resume rejects a changed `objective_chunk_size`.
+  Canonical MTP checkpoints written before this change recorded no objective
+  options and cannot resume either; import their weights the same way.
+- `initialization` and resume are mutually exclusive. To resume a run started from
+  a recipe that sets `initialization`, clear it in the same command:
+  `specforge train -c RECIPE training.resume_from=OUTPUT/RUN-latest initialization=null`.
 - `draft: OLD.json` uses the registered legacy codecs for all supported architectures,
   not only MTP; required recorded settings such as P-EAGLE's mask token stay explicit.
 

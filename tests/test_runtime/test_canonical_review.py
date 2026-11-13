@@ -519,6 +519,23 @@ class CanonicalReviewTest(unittest.TestCase):
                     resolve_run(Config.model_validate(raw))
                 read.assert_not_called()
 
+    def test_resume_override_can_clear_a_recipe_initialization(self):
+        """The native MTP recipe sets initialization; resuming it needs no YAML copy."""
+        from specforge.config import load_config
+
+        recipe = Path(__file__).resolve().parents[2] / (
+            "examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml"
+        )
+        cfg = load_config(str(recipe))
+        self.assertIsNotNone(cfg.initialization)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            apply_overrides(cfg, ["training.resume_from=out/run-latest"])
+        resumed = apply_overrides(
+            cfg, ["training.resume_from=out/run-latest", "initialization=null"]
+        )
+        self.assertIsNone(resumed.initialization)
+        self.assertEqual(resumed.resume_path, "out/run-latest")
+
     def test_cli_overrides_do_not_warn_about_unset_legacy_options(self):
         """apply_overrides marks every field set; only YAML values may warn."""
         with TemporaryDirectory() as temp:
