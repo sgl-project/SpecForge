@@ -783,6 +783,7 @@ for its resolved capture contract:
 ```bash
 python scripts/prepare_hidden_states.py \
   -c examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml \
+  --chat-template qwen3.5 --max-length 512 \
   --server-urls http://localhost:30000 \
   --data-path /data/train.jsonl --output-path /data/mtp-features
 ```
