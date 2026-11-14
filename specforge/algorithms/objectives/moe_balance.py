@@ -11,16 +11,31 @@ from specforge.modeling.draft.layers.mlp import MoEFFN
 
 from .base import check_options
 
+# The load the auxiliary loss balances: this forward's, or the step's so far over ranks.
+AUX_LOSS_TYPES = ("microbatch_wise", "batch_wise")
 # The options that join a resume contract only while balancing is on.
-BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_coef")
+BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_coef", "aux_loss_type")
+
+
+def check_aux_loss_type(value: str) -> None:
+    if value not in AUX_LOSS_TYPES:
+        raise ValueError(
+            f"invalid aux_loss_type: {value!r}; expected one of {AUX_LOSS_TYPES}"
+        )
 
 
 def balancing_settings(options: dict) -> dict:
     """The balancing options with defaults filled in and checked; off when rate and coef are 0."""
-    settings = {"bias_update_rate": 0.0, "aux_loss_coef": 0.0, **options}
+    settings = {
+        "bias_update_rate": 0.0,
+        "aux_loss_coef": 0.0,
+        "aux_loss_type": "batch_wise",
+        **options,
+    }
     check_options(
         nonnegative={k: settings[k] for k in ("bias_update_rate", "aux_loss_coef")}
     )
+    check_aux_loss_type(settings["aux_loss_type"])
     return settings
 
 
@@ -52,23 +67,31 @@ def balance_from_terms(mean_probs, load) -> Tensor:
 
 @dataclass(frozen=True)
 class MoEBalanceTerm:
-    """A forward's halves of the load-balance loss per layer; its balancer folds them."""
+    """A forward's halves of the load-balance loss per layer; its balancer adds the load."""
 
     mean_probs: tuple[Tensor, ...]  # per layer [num_experts] P_e, differentiable
     counts: tuple[Tensor, ...]  # per layer [num_experts] int64 kept tokens per expert
     balancer: "MoEBalancer"
 
-    def finish(self, result):
+    def finish(self, result, *, pooled: bool, process_group=None):
         """The DeferredTerm contract: the balancer folds this term into the loss."""
-        return self.balancer.finish(result)
+        return self.balancer.finish(result, pooled=pooled, process_group=process_group)
 
 
 class MoEBalancer:
     """The objectives' StepStatistics for MoE drafts: counts, the bias step, the aux loss."""
 
-    def __init__(self, model: nn.Module, *, rate: float, aux_loss_coef: float = 0.0):
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        rate: float,
+        aux_loss_coef: float = 0.0,
+        aux_loss_type: str = "batch_wise",
+    ):
         self.rate = rate
         self.aux_loss_coef = aux_loss_coef
+        self.aux_loss_type = aux_loss_type
         self.layers = [m for m in model.modules() if isinstance(m, MoEFFN)]
         if not self.layers:
             raise ValueError("MoE load balancing needs a draft with MoE layers")
@@ -79,6 +102,8 @@ class MoEBalancer:
         # Statistics stay per layer: the layers' expert counts may differ.
         self.sizes = [layer.config.num_experts for layer in self.layers]
         self.counts: list[Tensor | None] = [None] * len(self.layers)
+        # Per layer: this step's counts so far, pooled over ranks (batch_wise).
+        self.pooled: tuple[Tensor, ...] | None = None
 
     @classmethod
     def from_settings(cls, model: nn.Module, settings: dict) -> "MoEBalancer | None":
@@ -89,12 +114,17 @@ class MoEBalancer:
             model,
             rate=settings["bias_update_rate"],
             aux_loss_coef=settings["aux_loss_coef"],
+            aux_loss_type=settings["aux_loss_type"],
         )
 
     @property
     def settings(self) -> dict:
         """The StepStatistics contract: the options that built this balancer."""
-        return {"bias_update_rate": self.rate, "aux_loss_coef": self.aux_loss_coef}
+        return {
+            "bias_update_rate": self.rate,
+            "aux_loss_coef": self.aux_loss_coef,
+            "aux_loss_type": self.aux_loss_type,
+        }
 
     def _routings(self, output):
         routings = output.expert_routing or ()
@@ -133,12 +163,18 @@ class MoEBalancer:
             return None
         return MoEBalanceTerm(tuple(mean_probs), tuple(counts), self)
 
-    def finish(self, result):
-        """Fold the term into the loss (moe/aux_loss) against this forward's own load."""
+    def finish(self, result, *, pooled: bool, process_group=None):
+        """Fold the term into the loss (moe/aux_loss); `pooled` lets batch_wise sum over ranks."""
         term = result.deferred
         if term is None:
             return result
-        value = balance_from_terms(term.mean_probs, term.counts)
+        load = term.counts
+        if pooled and self.aux_loss_type == "batch_wise":
+            load = self._sum_over_ranks(term.counts, process_group)
+            if self.pooled is not None:
+                load = tuple(a + b for a, b in zip(self.pooled, load))
+            self.pooled = load
+        value = balance_from_terms(term.mean_probs, load)
         numerator = result.numerator + self.aux_loss_coef * value * result.denominator
         ratios = {
             **result.ratios,
@@ -153,7 +189,7 @@ class MoEBalancer:
         loads = [
             load.float() for load in self._sum_over_ranks(self.counts, process_group)
         ]
-        self.counts = [None] * len(self.layers)
+        self.counts, self.pooled = [None] * len(self.layers), None
         if self.rate:
             for layer, load in zip(self.layers, loads):
                 layer.gate.update_expert_bias(load, rate=self.rate)

@@ -43,7 +43,11 @@ class MoEBalanceTest(unittest.TestCase):
         self.assertFalse(hasattr(resolved.objective, "bias_update_rate"))
         self.assertEqual(
             resolved.statistics_settings,
-            {"bias_update_rate": 0.001, "aux_loss_coef": 0.0},
+            {
+                "bias_update_rate": 0.001,
+                "aux_loss_coef": 0.0,
+                "aux_loss_type": "batch_wise",
+            },
         )
         resolve_objective("DFlashDraftModel", options={"bias_update_rate": 0.5})
         for architecture in ("DFlash2DraftModel", "DominoDraftModel"):
@@ -52,6 +56,10 @@ class MoEBalanceTest(unittest.TestCase):
                 resolve_objective(architecture, options={"bias_update_rate": 0.5})
         with self.assertRaises(ValueError):
             resolve_objective("DSparkDraftModel", options={"bias_update_rate": -1.0})
+        with self.assertRaisesRegex(ValueError, "aux_loss_type"):
+            resolve_objective(
+                "DSparkDraftModel", options={"aux_loss_type": "sequence_wise"}
+            )
         with self.assertRaises(ValueError):
             resolve_objective("DFlashDraftModel", options={"aux_loss_coef": -0.1})
         with self.assertRaisesRegex(ValueError, "MoE layers"):
@@ -70,7 +78,7 @@ class MoEBalanceTest(unittest.TestCase):
             options={"num_anchors": 2, "aux_loss_coef": 0.01},
         )
         self.assertEqual(runtime.statistics.rate, 0.0)
-        self.assertEqual(runtime.statistics.settings["aux_loss_coef"], 0.01)
+        self.assertEqual(runtime.statistics.settings["aux_loss_type"], "batch_wise")
 
     def test_a_step_pools_the_window_and_moves_each_bias_zero_mean(self):
         config = moe_model_config()

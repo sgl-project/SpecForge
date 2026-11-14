@@ -59,6 +59,8 @@ class StepContext:
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
     accumulation_steps: int = 1
+    # The data-parallel group the trainer reduces over; None is the default group.
+    process_group: Any = None
 
 
 def linear_lambda_base(

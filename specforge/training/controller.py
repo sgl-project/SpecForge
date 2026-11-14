@@ -428,7 +428,11 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        ctx = replace(ctx or StepContext(), accumulation_steps=self.accumulation_steps)
+        ctx = replace(
+            ctx or StepContext(),
+            accumulation_steps=self.accumulation_steps,
+            process_group=self._process_group(),
+        )
         is_boundary = (self._micro + 1) % self.accumulation_steps == 0
         with ExitStack() as accumulation:
             accumulation.enter_context(

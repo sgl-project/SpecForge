@@ -9,9 +9,11 @@ from torch import Tensor, nn
 
 
 class DeferredTerm(Protocol):
-    """A loss term the objective hands out unfinished; the training layer finishes it."""
+    """A loss term the training layer finishes, since finishing may pool statistics over ranks."""
 
-    def finish(self, result: "ObjectiveResult") -> "ObjectiveResult": ...
+    def finish(
+        self, result: "ObjectiveResult", *, pooled: bool, process_group=None
+    ) -> "ObjectiveResult": ...
 
 
 class StepStatistics(Protocol):

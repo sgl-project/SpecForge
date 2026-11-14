@@ -74,8 +74,12 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             ),
         )
         if result.deferred is not None:
-            # The objective hands the term out unfinished; the training layer finishes it.
-            result = result.deferred.finish(result)
+            # The objective's term is unfinished: pooling over ranks is the strategy's, as above.
+            result = result.deferred.finish(
+                result,
+                pooled=self.model.training and torch.is_grad_enabled(),
+                process_group=ctx.process_group,
+            )
         positions = sorted(
             int(name.split("_")[1])
             for name in result.ratios
