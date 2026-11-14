@@ -1,10 +1,11 @@
 """Training-only registry; no checkpoint, data-provider or launch registrations."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from .base import ObjectiveModel
 from .losses import PositionWeighting, TokenLoss
+from .moe_balance import BALANCING_OPTIONS, MoEBalancer, balancing_settings
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class ResolvedObjective:
     objective: object
     loss: TokenLoss
     weighting: PositionWeighting
+    statistics_settings: dict = field(default_factory=dict)
 
     @property
     def requires_teacher(self):
@@ -105,7 +107,13 @@ def resolve_objective(
     entry = _PROTOCOLS[name]
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
-    objective = entry.factory(**(options or {}))
+    options = dict(options or {})
+    # Balancing options go with the registration that provides routing, not the protocol.
+    statistics = {}
+    if "expert_routing" in entry.provides:
+        taken = {key: options.pop(key) for key in BALANCING_OPTIONS if key in options}
+        statistics = balancing_settings(taken)
+    objective = entry.factory(**options)
     token_loss = TokenLoss(**(loss or {}))
     _reject_shadowed_options(
         options,
@@ -135,7 +143,9 @@ def resolve_objective(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
-    return ResolvedObjective(name, entry, objective, selected_loss, position_weighting)
+    return ResolvedObjective(
+        name, entry, objective, selected_loss, position_weighting, statistics
+    )
 
 
 def build_objective_model(
@@ -195,6 +205,7 @@ def build_objective_model(
         )
     for module in to_freeze:
         module.requires_grad_(False)
+
     return ObjectiveModel(
         draft_model,
         objective,
@@ -204,6 +215,7 @@ def build_objective_model(
         token_loss=resolved.loss,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
+        statistics=MoEBalancer.from_settings(draft_model, resolved.statistics_settings),
     )
 
 

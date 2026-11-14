@@ -1,5 +1,6 @@
 """Family-independent HF base; legacy base.py remains during migration."""
 
+import inspect
 from itertools import chain
 
 import torch
@@ -119,14 +120,18 @@ class DraftPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         """Own basic initialization without HF family defaults or name matching.
 
-        Components with special parameters or buffers implement reset_draft_parameters().
+        Components with special parameters or buffers implement reset_draft_parameters();
+        one that scales by the model's initializer_range takes it as a keyword.
         They must respect HF's initialized-tensor flags when restoring partial
         weights, for example by using transformers.initialization primitives.
         HF's module flags prevent repeated post_init from overwriting weights.
         """
         custom = getattr(module, "reset_draft_parameters", None)
         if custom is not None:
-            custom()
+            if "initializer_range" in inspect.signature(custom).parameters:
+                custom(initializer_range=self.config.draft.initializer_range)
+            else:
+                custom()
         elif isinstance(module, (nn.Linear, nn.Embedding)):
             init.normal_(
                 module.weight, mean=0.0, std=self.config.draft.initializer_range

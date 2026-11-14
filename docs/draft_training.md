@@ -230,6 +230,34 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
+`model.moe_experts_kernel` selects the routed-expert kernel of MoE drafts:
+`grouped_mm` (default) runs every expert in one `F.grouped_mm` call, which torch
+accepts only when `hidden_size` and the expert `intermediate_size` are multiples
+of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
+device. Startup probes the chosen kernel on every MoE layer and fails rather
+than falling back; MoE drafts record the choice in the training resume contract.
+
+A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
+holds the expert count, top-k, an `experts` sub-node (per-expert
+`intermediate_size`, `hidden_act`, `gated`), an optional `shared_expert` sub-node
+of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
+MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
+`sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
+that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
+`experts.down_proj`).
+`configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
+whose every FFN is a MoE of 8 experts with top-1 routing.
+
+Load balancing is DeepSeek-V3's aux-loss-free bias update. The DFlash and DSpark
+objectives take `bias_update_rate` in `training.objective_options` (`0`, the
+default, keeps the bias fixed; the recipe uses `0.001`). Over one optimizer step
+the trainer counts, across micro-batches and ranks, the tokens of kept blocks
+each MoE layer routed to each expert, then moves every router's `expert_bias` by
+that rate toward the under-loaded experts with a zero-mean sign step; the bias
+shifts which experts are chosen, not their weights. `moe/step_balance` reports
+the dispatch's balance: 1 when uniform, E / K when the same K experts take every
+token.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,

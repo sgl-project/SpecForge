@@ -2,9 +2,23 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch
 from torch import Tensor, nn
+
+
+class StepStatistics(Protocol):
+    """Per-forward statistics an objective observes; the training layer applies them each optimizer step."""
+
+    @property
+    def settings(
+        self,
+    ) -> dict[str, object]: ...  # what built them; the resume contract records it
+
+    def observe(self, output, *, keep: Tensor) -> None: ...
+
+    def step(self, *, process_group=None) -> dict[str, Tensor]: ...
 
 
 @dataclass
@@ -49,9 +63,13 @@ class ObjectiveModel(nn.Module):
         token_loss=None,
         weighting=None,
         frozen_parameters=(),
+        statistics: StepStatistics | None = None,
     ):
         super().__init__()
         self.draft_model = draft_model
+        self.statistics = (
+            statistics  # observed per forward, stepped by the training layer
+        )
         self.objective = objective
         self.registration = registration
         self.objective_name = name
@@ -131,6 +149,15 @@ class ObjectiveModel(nn.Module):
             },
             **options,
         )
+
+    def observe_statistics(self, output, blocks) -> None:
+        """Hand this forward and its kept slots to the statistics, when there are any."""
+        if self.statistics is None:
+            return
+        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
+        # Every token of a kept block went through the model; padded blocks did not.
+        keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+        self.statistics.observe(output, keep=keep)
 
     def block_predictions(self, output, blocks, batch, **options):
         protocol = self.draft_model.config.draft.spec_config.protocol
