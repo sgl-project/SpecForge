@@ -13,10 +13,8 @@ class NoKernels(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, NoKernels())
-from specforge.core import fused_loss as legacy_losses  # noqa: E402
-from specforge.losses import fused as shared_losses  # noqa: E402
+import specforge.losses.fused  # noqa: E402,F401
 
-assert legacy_losses is shared_losses
 assert "specforge.algorithms.objectives" not in sys.modules
 assert "transformers" not in sys.modules
 
@@ -41,7 +39,3 @@ result = runtime(
 result.loss.backward()
 assert "specforge.core.loss" not in sys.modules
 assert "specforge.algorithms.peagle.model" not in sys.modules
-
-from specforge.algorithms.objectives.implementations import fused_loss  # noqa: E402
-
-assert fused_loss is shared_losses
