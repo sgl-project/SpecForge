@@ -46,6 +46,21 @@ COMPONENTS = {
     "rope": {"rope_type": "none"},
     "logits": {"type": "mup", "multiplier": 8.0},
 }
+# A MoE FFN node nests expert and router nodes; the shared expert may be gated or relu2.
+MOE = {
+    "type": "moe",
+    "num_experts": 8,
+    "num_experts_per_tok": 1,
+    "experts": {"intermediate_size": 96, "hidden_act": "silu", "gated": True},
+    "shared_expert": None,
+    "shared_expert_gate": False,
+    "router": {
+        "scoring": "softmax",
+        "normalize_top_k": False,
+        "route_scale": 1.0,
+        "expert_bias": True,
+    },
+}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -116,6 +131,29 @@ class ComponentCodecTest(unittest.TestCase):
         self.assertEqual(
             encode_component("attention", decode_component("attention", mha)), mha
         )
+
+    def test_moe_mlp_round_trips_with_its_nested_nodes(self):
+        gated = {"intermediate_size": 48, "hidden_act": "silu", "gated": True}
+        relu2 = {"intermediate_size": 48, "hidden_act": "relu2", "gated": False}
+        qwen = {**MOE, "shared_expert": gated, "shared_expert_gate": True}
+        for payload in (MOE, qwen, {**MOE, "shared_expert": relu2}):
+            with self.subTest(shared_expert=payload["shared_expert"]):
+                node = decode_component("mlp", payload)
+                self.assertEqual(encode_component("mlp", node), payload)
+                restored = decode_component("mlp", json.loads(json.dumps(payload)))
+                self.assertEqual((restored, hash(restored)), (node, hash(node)))
+        for payload, message in (
+            ({**MOE, "norm_topk_prob": False}, "unknown fields"),
+            ({**MOE, "router": {**MOE["router"], "top_k": 1}}, "router: unknown"),
+            ({**MOE, "experts": {"intermediate_size": 96}}, "experts: missing"),
+            (
+                {**MOE, "shared_expert": {**gated, "gated": "yes"}},
+                "gated: expected bool",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    decode_component("mlp", payload)
 
     def test_missing_unknown_and_malformed_fields(self):
         for kind, payload in COMPONENTS.items():
