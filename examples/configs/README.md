@@ -289,7 +289,7 @@ Common fields:
 | `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
-| `training.loss_execution` | `{}` | Canonical projection/loss execution: `chunk_size`, `checkpoint`, `fused`, `trim`, and offline `teacher_chunk_size`. See [loss execution](../../docs/draft_training.md#loss-execution). |
+| `training.loss_execution` | `{}` | Legacy flat-loss compatibility; new configurations use `training.loss.scheduling` and each term/group execution. Canonical projection/loss execution: `chunk_size`, `checkpoint`, `fused`, `trim`, and offline `teacher_chunk_size`. See [loss execution](../../docs/draft_training.md#loss-execution). |
 | `training.loss` | `{}` | Canonical token loss, for example `{kind: kl}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |

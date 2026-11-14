@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -39,6 +40,16 @@ class DominoObjective:
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     impl: str | None = None
+
+    legacy_loss_options = ("impl",)
+    joint_loss_groups = (("base", "final"),)
+
+    @property
+    def loss_terms(self):
+        return {
+            "base": LossDefinition(self.default_loss),
+            "final": LossDefinition(self.default_loss),
+        }
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -84,7 +95,9 @@ class DominoObjective:
         def compute(calc):
             # Preserve the existing fused flag while resolving this group to an
             # explicit specialized mode. Other losses keep their ordinary path.
-            if self.impl is not None:
+            if runtime.loss_configuration is not None:
+                calc.run()
+            elif self.impl is not None:
                 calc.run((0, 1), impl=self.impl, fused=False)
             elif (
                 runtime.execution.fused
@@ -105,7 +118,10 @@ class DominoObjective:
             projection_inputs={"predecessor_ids": blocks.predecessors},
             compute=compute,
             plan=LossPlan(
-                terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
+                terms=(
+                    LossTerm("base_logits", weight, name="base"),
+                    LossTerm("logits", 1 - weight, name="final"),
+                ),
                 joint_groups=((0, 1),),
             ),
             projection=DominoSuffixProjection(

@@ -7,6 +7,7 @@ import torch
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -41,6 +42,17 @@ class DSparkObjective:
     ce_loss_alpha: float = 0.1
     l1_loss_alpha: float = 0.9
     confidence_loss_alpha: float = 1.0
+
+    legacy_loss_options = ("confidence_loss_alpha",)
+
+    @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            "confidence": LossDefinition(
+                TokenLoss("bce"), self.confidence_loss_alpha, ("confidence_head",)
+            ),
+        }
 
     default_weighting_options = ("loss_decay_gamma",)
     default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
@@ -104,14 +116,10 @@ class DSparkObjective:
                         calc.labels,
                         teacher=calc.teacher,
                         return_teacher_l1=True,
+                        term_index=0,
                     ).statistics["teacher_l1"]
                 acceptance = (1 - distance / 2).clamp(0, 1)
-            values = calc.evaluate(
-                "confidence",
-                TokenLoss("bce"),
-                confidence,
-                acceptance,
-            ).values
+            values = calc.evaluate_term(1, confidence, acceptance).values
             calc.add(1, values)
 
         predictions = runtime.block_predictions(
@@ -124,7 +132,13 @@ class DSparkObjective:
                 (
                     LossTerm(),
                     LossTerm(
-                        "confidence", self.confidence_loss_alpha, TokenLoss("value")
+                        "confidence",
+                        (
+                            self.confidence_loss_alpha
+                            if runtime.loss_configuration is None
+                            else 1.0
+                        ),
+                        TokenLoss("bce"),
                     ),
                 )
             ),

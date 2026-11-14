@@ -1000,8 +1000,12 @@ class InitializationConfig(StrictConfigModel):
 class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
-    loss: dict = Field(default_factory=dict)
-    loss_execution: dict = Field(default_factory=dict)
+    loss: dict = Field(
+        default_factory=dict
+    )  # Named terms/groups and shared scheduling.
+    loss_execution: dict = Field(
+        default_factory=dict
+    )  # Legacy flat-loss compatibility.
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 

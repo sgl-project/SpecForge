@@ -86,6 +86,30 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertTrue(contract["trim"])
             self.assertEqual(contract["chunk_size"], 2)
 
+    def test_named_loss_settings_reach_capture_and_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = run_config(
+                target,
+                draft_config(),
+                training={
+                    "attention_backend": "eager",
+                    "loss": {
+                        "terms": {"token": {"kind": "kl"}},
+                        "scheduling": {"chunk_size": 2},
+                    },
+                },
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertIsNotNone(bundle.model.target_head)
+            term = bundle.model.loss_configuration.terms["token"]
+            self.assertEqual(term.loss.kind, "kl")
+            self.assertFalse(term.execution.fused)
+            saved = bundle.strategy_kwargs.resume_contract
+            self.assertEqual(saved["canonical_loss"]["terms"]["token"]["kind"], "kl")
+            self.assertEqual(saved["canonical_loss_execution"]["chunk_size"], 2)
+
     def test_mtp_training_requires_explicit_initialization(self):
         from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
 

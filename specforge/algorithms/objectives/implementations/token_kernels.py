@@ -8,6 +8,7 @@ from ..losses import (
     LossOutput,
     ce_output_options,
     ce_outputs,
+    combine_ce_l1,
     distillation_loss,
     lk_loss,
 )
@@ -25,11 +26,10 @@ def _ce(logits, labels, teacher=None, **requested_outputs):
     )
 
 
-def _ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
+def _ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
     terms = fused_loss.fused_ce_l1_loss(logits, labels, teacher_logits=teacher)
-    return LossOutput(
-        ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1,
-        {"teacher_l1": terms.teacher_l1},
+    return combine_ce_l1(
+        terms.cross_entropy, terms.teacher_l1, context, ce_weight, l1_weight
     )
 
 

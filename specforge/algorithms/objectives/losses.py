@@ -43,6 +43,8 @@ class LossRegistration:
     contextual: bool = False
     outputs: Callable | None = None
     scope: str = "positions"
+    input_kind: str = "categorical"
+    capabilities: frozenset[str] = frozenset()
 
 
 _LOSSES = {}
@@ -61,6 +63,8 @@ def register_loss(
     contextual=False,
     outputs=None,
     scope=None,
+    input_kind="categorical",
+    capabilities=(),
 ):
     """Register a mathematical per-position loss and its reference formula.
 
@@ -100,7 +104,14 @@ def register_loss(
         ):
             capture_inputs += ("target_last_hidden_states",)
         _LOSSES[name] = LossRegistration(
-            compute, required, capture_inputs, contextual, outputs, resolved_scope
+            compute,
+            required,
+            capture_inputs,
+            contextual,
+            outputs,
+            resolved_scope,
+            input_kind,
+            frozenset(capabilities),
         )
         return compute
 
@@ -150,13 +161,13 @@ def ce_reference_outputs(logits, labels, teacher, options, requested_outputs, co
     )
 
 
-@register_loss("value", requires=())
+@register_loss("value", requires=(), input_kind="value")
 def computed_value(values, labels, teacher=None):
     """Accept an already-computed per-position loss, preserving its gradient."""
     return values
 
 
-@register_loss("bce")
+@register_loss("bce", input_kind="binary")
 def binary_cross_entropy(logits, labels, teacher=None):
     """Binary CE with soft targets, without position weighting or reduction."""
     return F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
@@ -181,13 +192,35 @@ def soft_cross_entropy(logits, labels, teacher):
     return -(teacher.float().softmax(-1) * logits.float().log_softmax(-1)).sum(-1)
 
 
-@register_loss("ce_l1", requires=("logits", "labels", "teacher_logits"))
-def ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
+@register_loss(
+    "ce_l1",
+    requires=("logits", "labels", "teacher_logits"),
+    contextual=True,
+    scope="positions",
+    capabilities=("component_masks",),
+)
+def ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
     terms = fused_loss.ce_l1_loss(logits, labels, teacher_logits=teacher)
-    return LossOutput(
-        ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1,
-        {"teacher_l1": terms.teacher_l1},
+    return combine_ce_l1(
+        terms.cross_entropy, terms.teacher_l1, context, ce_weight, l1_weight
     )
+
+
+def combine_ce_l1(ce, l1, context, ce_weight, l1_weight):
+    """Apply optional component supervision before combining CE and teacher L1."""
+    raw_l1 = l1
+    if context is not None:
+        if context.ce_mask is not None:
+            ce = ce * context.ce_mask
+        if context.l1_mask is not None:
+            l1 = l1 * context.l1_mask
+    return LossOutput(ce_weight * ce + l1_weight * l1, {"teacher_l1": raw_l1})
+
+
+@register_loss("cosine", input_kind="features")
+def cosine_alignment(logits, labels, teacher=None):
+    """Sum cosine distances across feature groups, returning one value per position."""
+    return (1 - F.cosine_similarity(logits.float(), labels.float(), dim=-1)).sum(-1)
 
 
 def distillation_loss(compute):
@@ -219,6 +252,8 @@ class LossContext:
     teacher_mass: torch.Tensor | None = None
     denominator: torch.Tensor | None = None
     supervised_count: torch.Tensor | None = None
+    ce_mask: torch.Tensor | None = None
+    l1_mask: torch.Tensor | None = None
 
 
 def lk_loss(mode, *, ce_compute=None):
@@ -313,7 +348,7 @@ class TokenLoss:
             raise ValueError(f"unknown token loss: {self.kind!r}")
         if self.kind == "default" and self.options:
             raise ValueError("loss options require an explicit loss kind")
-        if self.options and not self.registration.contextual:
+        if self.options:
             accepted = _accepted_options(self.registration.compute)
             unknown = set() if accepted is None else self.options.keys() - accepted
             if unknown:

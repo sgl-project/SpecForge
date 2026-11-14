@@ -47,6 +47,7 @@ class ObjectiveModel(nn.Module):
         registration=None,
         name=None,
         token_loss=None,
+        loss_configuration=None,
         weighting=None,
         frozen_parameters=(),
         execution=None,
@@ -63,6 +64,7 @@ class ObjectiveModel(nn.Module):
         self.objective_name = name
         self.target_head = target_head
         self.token_loss = token_loss
+        self.loss_configuration = loss_configuration
         self.weighting = weighting
         self.frozen_parameters = tuple(frozen_parameters)
         if target_head is not None:
@@ -140,6 +142,12 @@ class ObjectiveModel(nn.Module):
         if sequence_ids is None:
             sequence_ids = torch.arange(mask.shape[0], device=hidden.device).reshape(
                 -1, *([1] * (mask.ndim - 1))
+            )
+        if self.loss_configuration is not None:
+            from .plan import LossPlan
+
+            options["plan"] = self.loss_configuration.bind(
+                options.get("plan", LossPlan())
             )
         return Predictions(
             hidden=hidden,

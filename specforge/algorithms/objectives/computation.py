@@ -3,7 +3,7 @@
 from dataclasses import replace
 
 from .implementations.registry import ExecutionRequest, compute_loss
-from .losses import LossContext, LossOutput
+from .losses import LossOutput, TokenLoss
 
 
 class LossComputation:
@@ -53,18 +53,49 @@ class LossComputation:
             key=key,
         )
 
+    def mode(self, index):
+        """Configured execution for a term, or None for a legacy caller."""
+        return self.predictions.plan.terms[index].execution
+
+    def evaluate_term(
+        self, index, logits, labels, *, teacher=None, context=None, fused=None
+    ):
+        """Evaluate the declared formula on algorithm-prepared inputs."""
+        term = self.predictions.plan.terms[index]
+        return self.evaluate(
+            term.name or term.output,
+            self.request.terms[index].loss,
+            logits,
+            labels,
+            teacher=teacher,
+            context=context,
+            term_index=index,
+            fused=fused,
+        )
+
     def run(self, group=None, *, impl=None, fused=None):
         """Execute declared terms once.
 
         impl selects a specialized implementation and requires fused=False.
-        Otherwise fused inherits the runtime default and selects generic kernels.
+        Otherwise the term/group owns its execution mode. Only legacy plans
+        without a mode inherit the runtime fused setting.
         """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
         for indices in groups:
             if any(i in self.numerators for i in indices):
                 raise ValueError("Loss terms must execute exactly once")
+            mode = self.predictions.plan.group_execution.get(indices)
+            if mode is None and len(indices) == 1:
+                mode = self.mode(indices[0])
+            chosen_impl, chosen_fused = impl, fused
+            if mode is not None and impl is None and fused is None:
+                chosen_impl, chosen_fused = mode.impl, mode.fused
             result = self._execute(
-                self.request, indices, self.prediction_index, impl=impl, fused=fused
+                self.request,
+                indices,
+                self.prediction_index,
+                impl=chosen_impl,
+                fused=chosen_fused,
             )
             self._collect(result, indices)
 
@@ -79,17 +110,17 @@ class LossComputation:
         self.statistics.update(result.statistics)
 
     def add(self, index, values):
-        """Supply per-position model loss values to a declared 'value' term.
+        """Submit computed values for a declared term without recomputing its formula.
 
         Values retain gradients. The same registry and term weights/denominator
         apply, including explicit masks for router or other model regularizers.
         Scalar terms run once over the full prediction set without token weighting.
         """
-        if self.request.terms[index].loss.kind != "value":
-            raise ValueError("Computed values require a value loss term")
         if index in self.numerators:
             raise ValueError("Loss terms must execute exactly once")
-        request = replace(self.request, tensors={index: values})
+        terms = list(self.request.terms)
+        terms[index] = replace(terms[index], loss=TokenLoss("value"))
+        request = replace(self.request, terms=tuple(terms), tensors={index: values})
         result = self._execute(request, (index,), self.prediction_index)
         if result is None:
             raise ValueError("No implementation for computed loss")
@@ -106,6 +137,7 @@ class LossComputation:
         context=None,
         impl=None,
         fused=None,
+        term_index=None,
         **requested_outputs,
     ):
         """Return unreduced LossOutput through the ordinary implementation registry.
@@ -119,6 +151,7 @@ class LossComputation:
             context: Optional normalization context for whole-set losses.
             impl: Optional specialized implementation.
             fused: Override automatic optimization; must be False with impl.
+            term_index: Optional owner of the input context and execution mode.
             **requested_outputs: Extra results validated and computed by the
                 selected implementation, e.g. return_teacher_l1=True or top_k=8.
 
@@ -128,20 +161,29 @@ class LossComputation:
         if key in self._calls:
             raise ValueError(f"Repeated computation key: {key}")
         self._calls.add(key)
-        if labels.shape != self.predictions.mask.shape:
+        if (
+            loss.registration.input_kind != "features"
+            and labels.shape != self.predictions.mask.shape
+        ):
             raise ValueError("Computation labels must align with prediction units")
-        if loss.registration.scope == "prediction" and (
-            self.predictions.chunk_safe and self.predictions.projection.chunk_safe
+        if (
+            term_index is None
+            and loss.registration.scope == "prediction"
+            and (self.predictions.chunk_safe and self.predictions.projection.chunk_safe)
         ):
             raise ValueError("Contextual intermediate losses require chunk_safe=False")
+        if term_index is not None:
+            mode = self.mode(term_index)
+            if mode is not None and impl is None and fused is None:
+                impl, fused = mode.impl, mode.fused
         inputs = replace(
-            self.request.terms[0],
+            self.request.terms[0 if term_index is None else term_index],
             loss=loss,
             reduction="positions",
             context=(
                 context
                 if context is not None
-                else LossContext(self.request.terms[0].mask)
+                else self.request.terms[0 if term_index is None else term_index].context
             ),
         )
         request = ExecutionRequest(

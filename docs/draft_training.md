@@ -232,6 +232,85 @@ configuration and is recorded in the training resume contract.
 
 ### Loss execution
 
+The preferred configuration names every mathematical term. Each term owns its
+implementation choice; omitting execution means reference calculation.
+
+```yaml
+training:
+  objective: dspark
+  objective_options:
+    num_anchors: 512
+  loss:
+    terms:
+      token:
+        kind: ce_l1
+        options:
+          ce_weight: 0.1
+          l1_weight: 0.9
+        execution:
+          fused: true
+      confidence:
+        kind: bce
+        coefficient: 1.0
+    scheduling:
+      chunk_size: 128
+      checkpoint: true
+```
+
+Algorithms declare stable input names and defaults through `LossDefinition`.
+The resolver rejects unknown names or incompatible mathematical input contracts.
+DSpark confidence uses binary scores and soft targets; DSpine alignment uses
+feature groups. DSpine refinement additionally requires independently masked
+CE/L1 components. Omitted terms retain algorithm defaults, with reference execution.
+
+| Algorithm | Terms |
+| --- | --- |
+| DFlash, EAGLE3, P-EAGLE, MTP, DMTP | token |
+| DSpark | token, confidence |
+| DFlash2 | token, selector |
+| DSpine | token, refinement, alignment |
+| Domino | base, final |
+
+A term's coefficient multiplies its algorithm-supplied schedule factor. Sampling
+and input construction stay in objective_options. Mathematical parameters,
+coefficients and execution choices belong to loss.terms. Dependent auxiliary
+calculations call `calc.evaluate_term()` using those resolved settings.
+
+Joint computation belongs to a group, and members cannot also set execution:
+
+```yaml
+training:
+  objective: domino
+  loss:
+    terms:
+      base: {kind: ce}
+      final: {kind: ce}
+    groups:
+      joint_ce:
+        terms: [base, final]
+        execution:
+          impl: domino_suffix_ce
+    scheduling:
+      chunk_size: 128
+      checkpoint: true
+```
+
+Only algorithm-declared joint inputs can be grouped. Groups must not overlap.
+Within one execution setting, impl and fused=True are mutually exclusive; generic
+kernels cannot be selected by name. Scheduling accepts chunk_size, checkpoint,
+trim and teacher_chunk_size, but no fused/impl. There is no global fused inheritance
+in the named configuration.
+
+`LossConfiguration.bind()` installs formulas, coefficients and term/group modes
+on each runtime plan. The effective configuration is stored in the resume contract;
+group members are not serialized with duplicate execution settings.
+
+#### Legacy flat configuration
+
+The flat loss and loss_execution fields below remain a compatibility input.
+They cannot be combined with named terms/groups/scheduling. New configurations
+should use the layout above.
+
 Execution controls are separate from the objective, token loss and weighting:
 
 ```yaml
@@ -500,7 +579,7 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 canonical YAML selects the architecture, capture layers and output schema.
 
 
-### Explicit specialized loss execution
+### Explicit specialized loss execution (legacy configuration)
 
 An algorithm may call `calc.run(group, impl="name", fused=False)` or
 `calc.evaluate(..., impl="name", fused=False)`. The same arguments are accepted by

@@ -663,7 +663,11 @@ def build_bundle(cfg, algorithm):
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": cfg.model.use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
-        "canonical_loss": asdict(runtime.token_loss),
+        "canonical_loss": (
+            runtime.loss_configuration.to_dict()
+            if runtime.loss_configuration is not None
+            else asdict(runtime.token_loss)
+        ),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,

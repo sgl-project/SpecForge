@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -42,6 +43,17 @@ class DFlash2Objective:
     selector_warmup_ratio: float = 0.0
     selector_ramp_ratio: float = 0.0
     selector_stop_gradient: bool = False
+
+    legacy_loss_options = ("selector_loss_alpha",)
+
+    @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            "selector": LossDefinition(
+                TokenLoss("ce"), self.selector_loss_alpha, ("candidate_selector",)
+            ),
+        }
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -102,7 +114,9 @@ class DFlash2Objective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
+        scale = self.selector_scale(step, total_steps)
+        if runtime.loss_configuration is None:
+            scale *= self.selector_loss_alpha
 
         def compute(calc):
             calc.run((0,))
@@ -113,6 +127,7 @@ class DFlash2Objective:
                 calc.outputs()["logits"],
                 labels,
                 top_k=model.config.draft.spec_config.selector_top_k,
+                term_index=0,
             )
             ids = terms.statistics["topk_ids"]
             unary, hidden = terms.statistics["topk_values"], predictions.hidden
@@ -125,8 +140,13 @@ class DFlash2Objective:
                 predecessor_ids=predictions.context_inputs["predecessors"],
             )
             covered = ids == labels[..., None]
-            selector = calc.evaluate(
-                "selector", TokenLoss("ce"), scores, covered.long().argmax(-1)
+            selector = calc.evaluate_term(
+                1,
+                scores,
+                covered.long().argmax(-1),
+                teacher=(
+                    calc.teacher.gather(-1, ids) if calc.teacher is not None else None
+                ),
             ).values * covered.any(-1)
             calc.add(1, selector)
 
@@ -135,9 +155,7 @@ class DFlash2Objective:
             blocks,
             batch,
             compute=compute,
-            plan=LossPlan(
-                (LossTerm(), LossTerm("selector", scale, TokenLoss("value")))
-            ),
+            plan=LossPlan((LossTerm(), LossTerm("selector", scale, TokenLoss("ce")))),
             context_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))

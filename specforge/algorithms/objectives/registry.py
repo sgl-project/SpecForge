@@ -4,6 +4,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
+from .configuration import (
+    LossConfiguration,
+    loss_definitions,
+    resolve_loss_configuration,
+)
 from .execution_options import LossExecution
 from .losses import PositionWeighting, TokenLoss
 
@@ -111,10 +116,13 @@ class ResolvedObjective:
     loss: TokenLoss
     weighting: PositionWeighting
     execution: LossExecution
+    losses: LossConfiguration | None = None
 
     @property
     def requires_teacher(self):
-        return "teacher_logits" in self.registration.requires | self.loss.requires
+        return "teacher_logits" in self.registration.requires | (
+            self.losses.requires if self.losses else self.loss.requires
+        )
 
 
 def resolve_objective(
@@ -145,8 +153,25 @@ def resolve_objective(
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
-    token_loss = TokenLoss(**(loss or {}))
-    execution = LossExecution(**(execution or {}))
+    named = loss is not None and bool({"terms", "groups", "scheduling"} & loss.keys())
+    loss_configuration = None
+    if named:
+        if execution:
+            raise ValueError(
+                "Use loss.scheduling and per-term execution instead of loss_execution"
+            )
+        legacy_options = set(getattr(objective, "legacy_loss_options", ())) | set(
+            getattr(objective, "default_loss_options", ())
+        )
+        if legacy_options.intersection(options or {}):
+            raise ValueError(
+                "Configure loss definitions and coefficients under loss.terms/groups"
+            )
+        loss_configuration, execution = resolve_loss_configuration(objective, loss)
+        token_loss = TokenLoss()
+    else:
+        token_loss = TokenLoss(**(loss or {}))
+        execution = LossExecution(**(execution or {}))
     _reject_shadowed_options(
         options,
         weighting is not None,
@@ -168,17 +193,39 @@ def resolve_objective(
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
-        entry.requires | selected_loss.requires | position_weighting.requires
+        entry.requires
+        | (
+            loss_configuration.requires
+            if loss_configuration
+            else selected_loss.requires
+        )
+        | position_weighting.requires
     ) - entry.provides
     if missing:
         raise ValueError(
             f"protocol {name!r} lacks required capabilities: {sorted(missing)}"
         )
     entry = replace(
-        entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
+        entry,
+        inputs=tuple(
+            dict.fromkeys(
+                entry.inputs
+                + (
+                    loss_configuration.inputs
+                    if loss_configuration
+                    else selected_loss.inputs
+                )
+            )
+        ),
     )
     return ResolvedObjective(
-        name, entry, objective, selected_loss, position_weighting, execution
+        name,
+        entry,
+        objective,
+        selected_loss,
+        position_weighting,
+        execution,
+        loss_configuration,
     )
 
 
@@ -239,6 +286,14 @@ def build_objective_model(
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
     declared = getattr(objective, "frozen_parameters", ())
+    if resolved.losses is not None:
+        definitions = loss_definitions(objective)
+        declared = tuple(
+            module
+            for key, definition in definitions.items()
+            if resolved.losses.terms[key].coefficient == 0
+            for module in definition.modules
+        )
     frozen, to_freeze = [], []
     for prefix in requested + tuple(declared):
         try:
@@ -282,6 +337,7 @@ def build_objective_model(
         registration=entry,
         name=name,
         token_loss=resolved.loss,
+        loss_configuration=resolved.losses,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,

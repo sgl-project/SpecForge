@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
-from ..losses import TokenLoss, decay_weighting
+from ..losses import LossContext, TokenLoss, combine_ce_l1, decay_weighting
 from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
@@ -50,6 +51,18 @@ class DSpineObjective:
     replacement_hold_ratio: float = 1 / 6
     replacement_end_ratio: float = 1 / 3
     candidate_mass_threshold: float = 1e-4
+
+    legacy_loss_options = ("ce_weight", "alignment_weight")
+
+    @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            "refinement": LossDefinition(
+                self.default_loss, capabilities=frozenset({"component_masks"})
+            ),
+            "alignment": LossDefinition(TokenLoss("cosine"), self.alignment_weight),
+        }
 
     default_weighting_options = ("loss_decay_gamma",)
 
@@ -130,11 +143,14 @@ class DSpineObjective:
             replace_masks=masks,
             output_logits=False,
         )
-        beta = self.alignment_weight * (
+        beta = (
             min(step / self.alignment_warmup_steps, 1)
             if self.alignment_warmup_steps
             else 1
         )
+
+        if runtime.loss_configuration is None:
+            beta *= self.alignment_weight
 
         def compute(calc):
             calc.run((0,))
@@ -147,6 +163,7 @@ class DSpineObjective:
                 teacher=teacher,
                 return_teacher_l1=True,
                 top_k=self.top_k,
+                term_index=0,
             )
             ids = terms.statistics["topk_ids"]
             refined = model.refine(
@@ -156,36 +173,52 @@ class DSpineObjective:
             candidates = model.lm_head.candidate_weights(ids)
             scores = torch.einsum("...h,...kh->...k", refined, candidates).float()
             covered = ids == labels[..., None]
-            refinement = calc.evaluate(
-                "refinement",
-                TokenLoss(kind="ce"),
-                scores,
-                covered.long().argmax(-1),
-                teacher=teacher.gather(-1, ids),
-                return_teacher_l1=True,
-            )
             mass = teacher.float().softmax(-1).gather(-1, ids).sum(-1)
-            refined_loss = self.ce_weight * refinement.values * covered.any(-1) + (
-                1 - self.ce_weight
-            ) * refinement.statistics["teacher_l1"] * (
-                mass > self.candidate_mass_threshold
+            refinement_context = LossContext(
+                calc.request.terms[1].mask,
+                ce_mask=covered.any(-1),
+                l1_mask=mass > self.candidate_mass_threshold,
             )
-            codes = F.embedding(labels, model.transfer_codes).float()
-            alignment = (
-                1
-                - F.cosine_similarity(
-                    predictions.context_inputs["layer_features"].float(),
-                    codes[:, :, None],
-                    dim=-1,
+            if runtime.loss_configuration is None:
+                # Keep old checkpoint implementation identities. The mathematical
+                # combination is shared with the configured CE/L1 formula.
+                values = calc.evaluate(
+                    "refinement",
+                    TokenLoss("ce"),
+                    scores,
+                    covered.long().argmax(-1),
+                    teacher=teacher.gather(-1, ids),
+                    return_teacher_l1=True,
                 )
-            ).sum(-1)
+                refinement = combine_ce_l1(
+                    values.values,
+                    values.statistics["teacher_l1"],
+                    refinement_context,
+                    self.ce_weight,
+                    1 - self.ce_weight,
+                )
+            else:
+                refinement = calc.evaluate_term(
+                    1,
+                    scores,
+                    covered.long().argmax(-1),
+                    teacher=teacher.gather(-1, ids),
+                    context=refinement_context,
+                )
+            codes = F.embedding(labels, model.transfer_codes).float()
+            alignment = calc.evaluate_term(
+                2,
+                predictions.context_inputs["layer_features"],
+                codes[:, :, None],
+                fused=False if runtime.loss_configuration is None else None,
+            ).values
             ce_num = (terms.values * calc.weights).sum()
             denominator = calc.weights.sum().detach()
             coefficient = alignment_ce
             if coefficient is None:
                 totals = torch.stack((ce_num.detach(), denominator))
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
-            calc.add(1, refined_loss)
+            calc.add(1, refinement.values)
             calc.add(2, coefficient.detach() * alignment)
             calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
 
@@ -197,8 +230,8 @@ class DSpineObjective:
             plan=LossPlan(
                 (
                     LossTerm(),
-                    LossTerm("refinement", loss=TokenLoss("value")),
-                    LossTerm("alignment", beta, TokenLoss("value")),
+                    LossTerm("refinement", loss=self.default_loss),
+                    LossTerm("alignment", beta, TokenLoss("cosine")),
                 )
             ),
             requires=frozenset({"teacher_logits"}),
