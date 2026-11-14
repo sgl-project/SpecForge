@@ -12,6 +12,7 @@ class ObjectiveResult:
     numerator: Tensor
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    sums: dict[str, Tensor] = field(default_factory=dict)
 
     @property
     def loss(self):
@@ -28,7 +29,7 @@ def microbatch_mean(result, *, global_denominator=False):
         world_size = dist.get_world_size()
         dist.all_reduce(denominator)
     loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
+    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios, result.sums)
 
 
 class ObjectiveModel(nn.Module):
@@ -215,7 +216,7 @@ class ObjectiveModel(nn.Module):
         prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, **context
         )
-        return execute_batch(
+        result = execute_batch(
             prepared,
             self.token_loss,
             self.weighting,
@@ -223,6 +224,12 @@ class ObjectiveModel(nn.Module):
             execution=self.execution,
             selection=self.loss_implementations,
         )
+        if prepared.diagnostics is not None:
+            with torch.no_grad():
+                ratios, sums = prepared.diagnostics()
+            result.ratios.update(ratios)
+            result.sums.update(sums)
+        return result
 
 
 def check_options(**groups):

@@ -1183,7 +1183,7 @@ class TestCheckpointResume(unittest.TestCase):
         def build_model():
             return fx.load_eagle3(
                 cfg, target_dir, vocab_path, ttt=TTT, backend="flex_attention"
-            )[0]
+            )
 
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
         loader = fx.build_offline_eagle3_loader(
@@ -1258,20 +1258,18 @@ class TestCheckpointResume(unittest.TestCase):
         self.assertIsInstance(rng["cuda"], torch.Tensor)
         self.assertIsNone(rng["npu"])
 
-        # Filter contract, checked against the LIVE trained module (not by
-        # re-applying the filter): frozen-embed keys and nothing else dropped.
+        # Canonical checkpoints retain frozen embeddings as well as trainable
+        # parameters, so reload does not depend on a separate target directory.
         trained_sd = {
             k: v.detach().cpu() for k, v in model.draft_model.state_dict().items()
         }
-        embed_keys = {k for k in trained_sd if "embed" in k.lower()}
-        self.assertTrue(embed_keys)  # the fixture freezes a real embedding
         persisted = ckpt["draft_state_dict"]
-        self.assertEqual(set(persisted), set(trained_sd) - embed_keys)
+        self.assertEqual(set(persisted), set(trained_sd))
 
         fresh = build_model()
-        missing, unexpected = fresh.draft_model.load_state_dict(persisted, strict=False)
+        missing, unexpected = fresh.draft_model.load_state_dict(persisted, strict=True)
         self.assertEqual(unexpected, [])
-        self.assertEqual(set(missing), embed_keys)
+        self.assertEqual(missing, [])
         fresh_sd = fresh.draft_model.state_dict()
         for k, v in persisted.items():
             self.assertTrue(

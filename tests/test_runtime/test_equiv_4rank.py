@@ -4,7 +4,7 @@
 The distributed leg uses the current offline builder and no-argument
 ``Trainer.fit()`` with trainer TP1, Ulysses-SP2 and world-sized FSDP groups. Its
 logged boundary loss is compared with the same initial model and samples on the
-canonical full-sequence flex-attention reference.  This replaces the deleted
+canonical full-sequence SDPA reference.  This replaces the deleted
 legacy-script differential while retaining the scale-out numerical gate.
 """
 
@@ -68,14 +68,14 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
 
-        reference_model = _build_model(workdir, "flex_attention")
+        reference_model = _build_model(workdir, "sdpa")
         usp_model = _build_model(workdir, "usp")
         usp_model.load_state_dict(reference_model.state_dict())
         target_head = TargetHead.from_pretrained(
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
         )
 
-        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        algorithm = builtin_algorithm_registry(ttt_length=3).resolve("eagle3")
         provider = algorithm.providers.offline_for("text")
         source_refs = provider.build_reader(
             os.path.join(workdir, "features"),

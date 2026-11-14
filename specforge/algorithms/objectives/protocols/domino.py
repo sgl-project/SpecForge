@@ -1,11 +1,14 @@
 """Domino schedules base and GRU-corrected token cross entropy."""
 
 from dataclasses import dataclass
+from functools import partial
 
+from specforge.algorithms.metrics.domino import measure
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
+from ..diagnostics import prediction_diagnostics
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -104,4 +107,14 @@ class DominoObjective:
                 spec.suffix_start,
             ),
         )
-        return PredictionBatch((predictions,))
+        return PredictionBatch(
+            (predictions,),
+            diagnostics=prediction_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                partial(measure, base_weight=weight),
+                enabled=context.get("collect_detailed_metrics", True),
+                slots=slice(None, -1) if spec.block.shift_label else slice(1, None),
+            ),
+        )

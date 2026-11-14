@@ -4,10 +4,12 @@ from dataclasses import dataclass
 
 import torch
 
+from specforge.algorithms.metrics.dspark import measure
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
+from ..diagnostics import prediction_diagnostics
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -121,4 +123,14 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            diagnostics=prediction_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                measure,
+                enabled=context.get("collect_detailed_metrics", True),
+            ),
+        )

@@ -12,7 +12,7 @@ from tests.test_config.test_draft_mtp_spec import mtp_config
 PRESETS = Path(__file__).resolve().parents[2] / "specforge/config/draft/presets"
 
 
-def builtin_algorithm_registry(*, teacher_metrics=False):
+def builtin_algorithm_registry(*, teacher_metrics=False, ttt_length=7):
     registrations = []
     for name in ("eagle3", "peagle", "dflash", "domino", "dspark", "dspine", "mtp"):
         if name == "mtp":
@@ -34,7 +34,9 @@ def builtin_algorithm_registry(*, teacher_metrics=False):
                 model=dict(target_model_path="target"),
                 data=dict(hidden_states_path="features"),
                 training=dict(
-                    objective_options={},
+                    objective_options=(
+                        {"ttt_length": ttt_length} if name == "eagle3" else {}
+                    ),
                     loss=(
                         {"terms": {"token": {"kind": "lk"}}}
                         if teacher_metrics and name == "dflash"

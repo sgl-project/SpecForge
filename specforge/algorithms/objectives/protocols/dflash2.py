@@ -6,6 +6,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
+from ..diagnostics import block_diagnostics, diagnostic_requirements
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -16,6 +17,7 @@ from .dflash import COMMON_MODULES
 
 @register_protocol(
     "dflash2",
+    resolve_requires=diagnostic_requirements,
     runtime_name="dflash",
     training=TrainingRequirements(
         host_inputs=prepare_anchor_capacity,
@@ -37,6 +39,7 @@ from .dflash import COMMON_MODULES
 @dataclass
 class DFlash2Objective:
     num_anchors: int = 512
+    teacher_metrics: bool = False
     loss_decay_gamma: float | None = None
     selector_warmup_steps: int | None = None
     selector_ramp_steps: int | None = None
@@ -149,4 +152,14 @@ class DFlash2Objective:
             plan=LossPlan((LossTerm(), LossTerm("selector", scale, TokenLoss("ce")))),
             context_inputs={"predecessors": blocks.predecessors},
         )
-        return PredictionBatch((predictions,))
+        return PredictionBatch(
+            (predictions,),
+            diagnostics=block_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                enabled=context.get("collect_detailed_metrics", True),
+                teacher_metrics=self.teacher_metrics,
+                selector=model.candidate_selector,
+            ),
+        )
