@@ -20,6 +20,8 @@ data:
   cache_dir: ./cache
 
 training:
+  loss:
+    fused: true
   strategy: dspark
   num_epochs: 20
   batch_size: 1

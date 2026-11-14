@@ -13,6 +13,11 @@ data:
   cache_dir: ./cache
 
 training:
+  loss:
+    fused: true
+  weighting:
+    kind: dpace
+    alpha: 0.5
   strategy: dflash
   num_epochs: 6
   max_steps: 10000
@@ -22,8 +27,6 @@ training:
   max_grad_norm: 1.0
   attention_backend: flex_attention
   num_anchors: 512
-  loss_type: dpace
-  dpace_alpha: 0.5
   save_interval: 1000
   log_interval: 50
   dist_timeout: 30
