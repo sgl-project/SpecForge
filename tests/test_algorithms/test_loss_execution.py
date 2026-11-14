@@ -292,11 +292,20 @@ class LossExecutionTest(unittest.TestCase):
                 )
             batch = {k: v.cuda() for k, v in training_batch(config).items()}
             expected = None
-            for fused in (False, True):
+            modes = (
+                (False, True, "specialized")
+                if architecture == "DominoDraftModel"
+                else (False, True)
+            )
+            for fused in modes:
                 with self.subTest(architecture=architecture, fused=fused):
                     runtime.execution = LossExecution(
-                        chunk_size=1, checkpoint=True, fused=fused
+                        chunk_size=1, checkpoint=True, fused=fused is True
                     )
+                    if fused == "specialized":
+                        runtime.objective = replace(
+                            runtime.objective, impl="domino_suffix_ce"
+                        )
                     runtime.zero_grad(set_to_none=True)
                     torch.manual_seed(31)
                     with patch.object(
@@ -343,6 +352,11 @@ class LossExecutionTest(unittest.TestCase):
                             ):
                                 runtime(batch, step=1, total_steps=10)
 
+            if architecture == "DominoDraftModel":
+                runtime.execution = LossExecution(fused=True)
+                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                    runtime(batch, step=1, total_steps=10)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_soft_ce_matches_legacy_real_vocabulary(self):
         from specforge.losses.fused import fused_soft_ce_loss
@@ -364,11 +378,14 @@ class LossExecutionTest(unittest.TestCase):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0.02, atol=2e-8)
         self.assertEqual(torch.count_nonzero(actual_grad[mask == 0]), 0)
 
-    def test_fused_loss_rejects_cpu(self):
+    def test_fused_loss_uses_reference_on_cpu(self):
         config, runtime = build_runtime("DSparkDraftModel", options={"num_anchors": 2})
         runtime.execution = LossExecution(fused=True)
-        with self.assertRaisesRegex(ValueError, "requires CUDA"):
-            runtime(training_batch(config), step=0, total_steps=1)
+        result = runtime(training_batch(config), step=0, total_steps=1)
+        self.assertTrue(torch.isfinite(result.loss))
+        self.assertEqual(
+            set(runtime.loss_implementations.names.values()), {"reference", "value"}
+        )
 
     def test_checkpoint_false_does_not_recompute(self):
         from torch.utils.checkpoint import checkpoint
@@ -473,7 +490,11 @@ class LossExecutionTest(unittest.TestCase):
         with (
             patch.dict(
                 _IMPLEMENTATIONS,
-                {k: v for k, v in _IMPLEMENTATIONS.items() if not v.optimized},
+                {
+                    k: v
+                    for k, v in _IMPLEMENTATIONS.items()
+                    if v.category == "reference"
+                },
                 clear=True,
             ),
             self.assertLogs(

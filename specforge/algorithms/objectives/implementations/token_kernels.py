@@ -4,19 +4,24 @@ import torch
 
 from specforge.losses import fused as fused_loss
 
-from ..losses import LossOutput, ce_outputs, distillation_loss, lk_loss
+from ..losses import (
+    LossOutput,
+    ce_output_options,
+    ce_outputs,
+    distillation_loss,
+    lk_loss,
+)
 from .reference import result_group
 from .registry import register_implementation
 
 
-def _ce(logits, labels, teacher=None, *, top_k=None, teacher_l1=False):
+def _ce(logits, labels, teacher=None, **requested_outputs):
     return ce_outputs(
         fused_loss.fused_ce_l1_loss,
         logits,
         labels,
         teacher,
-        top_k=top_k,
-        teacher_l1=teacher_l1,
+        **ce_output_options(requested_outputs),
     )
 
 
@@ -47,24 +52,31 @@ def register_token_kernel(kind, compute):
     """
 
     def supports(request, group):
-        p = request.predictions
+        tensor = request.input_tensor
         if len(group) != 1 or request.terms[group[0]].loss.kind != kind:
             return "requires one matching token loss"
-        if not p.hidden.is_cuda:
-            return "requires CUDA inputs"
-        if p.hidden.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            return "requires FP16/BF16/FP32"
-        if kind in ("ce", "ce_l1") and not fused_loss.supports_fused_ce_l1_loss(
-            p.hidden
+        if request.requested_outputs:
+            if kind != "ce":
+                return "token kernel does not provide requested extra outputs"
+            ce_output_options(request.requested_outputs)
+        if (
+            kind in ("lk_alpha", "lk_tv", "lk_lambda")
+            and request.terms[group[0]].loss.options.get("target") == "teacher"
         ):
+            return "teacher LK uses the reference formula"
+        if not tensor.is_cuda:
+            return "requires CUDA inputs"
+        if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            return "requires FP16/BF16/FP32"
+        if kind in ("ce", "ce_l1") and not fused_loss.supports_fused_ce_l1_loss(tensor):
             raise ValueError("fused CE/L1 requires Triton")
         return None
 
-    @register_implementation("token_" + kind, supports=supports)
+    @register_implementation("token_" + kind, supports=supports, losses=(kind,))
     def execute(request, group):
         index = group[0]
-        term, inputs = request.predictions.plan.terms[index], request.terms[index]
-        logits = request.outputs()[term.output]
+        inputs = request.terms[index]
+        logits = request.tensor(index)
         loss = inputs.loss
         if loss.requires_teacher and (
             request.teacher is None or request.teacher.shape != logits.shape

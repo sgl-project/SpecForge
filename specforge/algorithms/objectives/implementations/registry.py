@@ -29,6 +29,7 @@ class TermInputs:
     weights: torch.Tensor
     denominator: torch.Tensor
     context: LossContext
+    reduction: str = "positions"
 
 
 @dataclass
@@ -56,7 +57,8 @@ class ExecutionRequest:
     """Data shared by applicability checks and kernel execution.
 
     Attributes:
-        predictions: Deferred projection, aligned inputs and the loss plan.
+        predictions: Deferred model predictions, or None for direct tensor requests.
+        tensors: Supplied tensors by term index; reading them never projects the model.
         terms: Resolved inputs in the same order as LossPlan.terms.
         labels: Token targets shaped [units, positions].
         teacher: Optional teacher logits aligned with the selected vocabulary.
@@ -67,15 +69,31 @@ class ExecutionRequest:
             whether it is populated without triggering projection.
     """
 
-    predictions: Predictions
+    predictions: Predictions | None
     terms: tuple[TermInputs, ...]
     labels: torch.Tensor
     teacher: torch.Tensor | None
-    outputs: Callable
+    outputs: Callable | None
     materialized: dict
     # Intermediate requests require differentiable per-position results.
     unreduced: bool = False
     requested_outputs: dict = field(default_factory=dict)
+    tensors: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def tensor(self, index):
+        """Get a supplied tensor or lazily project the named model output."""
+        if index in self.tensors:
+            return self.tensors[index]
+        return self.outputs()[self.predictions.plan.terms[index].output]
+
+    @property
+    def input_tensor(self):
+        """Tensor describing the actual execution device, dtype and emptiness."""
+        return (
+            next(iter(self.tensors.values()))
+            if self.tensors
+            else self.predictions.hidden
+        )
 
 
 @dataclass(frozen=True)
@@ -87,6 +105,8 @@ class Implementation:
         priority: Selection priority; larger values are considered first.
         supports: Callable(request, group) returning None when applicable,
             otherwise a human-readable rejection reason. It must not project.
+        category: Reference, generic optimization, or explicit specialization.
+        losses: Mathematical definitions accepted by this implementation.
         compute: Callable(request, group) returning a GroupResult. Runtime
             failures propagate; they are not treated as applicability failures.
     """
@@ -95,13 +115,16 @@ class Implementation:
     priority: int
     supports: Callable
     compute: Callable
-    optimized: bool = True
+    category: str = "generic"
+    losses: tuple[str, ...] = ()
 
 
 _IMPLEMENTATIONS = {}
 
 
-def register_implementation(name, *, supports, priority=0, optimized=True):
+def register_implementation(
+    name, *, supports, priority=0, category="generic", losses=()
+):
     """Register an optimized implementation for one or more loss terms.
 
     Args:
@@ -109,7 +132,9 @@ def register_implementation(name, *, supports, priority=0, optimized=True):
         supports: Callable(request, group) returning None if supported or a
             rejection-reason string. It checks capabilities without projection.
         priority: Selection priority; higher values take precedence.
-        optimized: False for implementations available without fused execution.
+        category: "generic" for automatic optimization, "specialized" for explicit
+            selection, or "reference" for portable mathematical evaluation.
+        losses: Supported mathematical loss names; empty for the generic reference.
 
     Returns:
         A decorator that registers and returns the compute callable unchanged.
@@ -119,65 +144,127 @@ def register_implementation(name, *, supports, priority=0, optimized=True):
         ValueError: The decorated implementation's name is already registered.
     """
 
+    if category not in ("generic", "specialized", "reference"):
+        raise ValueError(f"Unknown implementation category: {category!r}")
+
     def register(compute):
         if name in _IMPLEMENTATIONS:
             raise ValueError(f"Execution implementation {name!r} is already registered")
         _IMPLEMENTATIONS[name] = Implementation(
-            name, priority, supports, compute, optimized
+            name, priority, supports, compute, category, tuple(losses)
         )
         return compute
 
     return register
 
 
-def select_implementation(request, group, *, name="auto", rejections=None, fused=True):
-    """Select an applicable implementation without executing its kernel.
-
-    Args:
-        request: Projection, resolved term inputs and lazy output access.
-        group: Tuple of indices into request.predictions.plan.terms to execute
-            together. A one-element tuple requests independent execution.
-        rejections: Optional list receiving rejection reasons for diagnostics.
-        fused: Whether optimized implementations are eligible.
-        name: "auto" checks priority order, breaking ties by ascending name.
-            Any other value requires that specific registered implementation.
-
-    Returns:
-        The first applicable Implementation, or None when auto mode finds no
-        match. The caller decides whether to split the group or use reference
-        execution. Applicability checks may load optional kernel dependencies.
-
-    Raises:
-        ValueError: An explicitly named implementation is unknown or rejects
-            the request. Exceptions raised by applicability checks propagate.
-    """
+def implementation_registrations():
+    """Return registered contracts for inspection and generated documentation."""
     from . import domino_ce, linear_ce, reference, token_kernels  # noqa: F401
 
-    candidates = sorted(
-        _IMPLEMENTATIONS.values(), key=lambda item: (-item.priority, item.name)
-    )
-    if name != "auto":
-        if name not in _IMPLEMENTATIONS:
-            raise ValueError(f"Unknown execution implementation: {name!r}")
-        candidates = [_IMPLEMENTATIONS[name]]
+    return dict(_IMPLEMENTATIONS)
+
+
+def select_implementation(
+    request, group=(0,), *, impl=None, rejections=None, fused=False
+):
+    """Choose a reference, generic optimization, or explicitly named specialization.
+
+    Explicit implementations and automatic fusion are mutually exclusive.
+    Inapplicable generic kernels fall back; explicit selection never does.
+    Support checks must not materialize predictions.
+    """
+    if impl is not None and fused:
+        raise ValueError("impl and fused=True are mutually exclusive")
+    entries = implementation_registrations()
+    if impl is not None:
+        if impl not in entries:
+            raise ValueError(f"Unknown execution implementation: {impl!r}")
+        entry = entries[impl]
+        if entry.category != "specialized":
+            raise ValueError(
+                f"{impl} is not a specialized implementation; use fused=True"
+            )
+        candidates = [entry]
+    else:
+        candidates = sorted(
+            (
+                entry
+                for entry in entries.values()
+                if entry.category == "reference"
+                or (fused and entry.category == "generic")
+            ),
+            key=lambda entry: (
+                entry.category == "reference",
+                -entry.priority,
+                entry.name,
+            ),
+        )
     for entry in candidates:
-        if entry.optimized and not fused:
-            continue
-        reason = entry.supports(request, group)
+        reason = (
+            "mathematical loss does not match"
+            if entry.losses
+            and any(request.terms[i].loss.kind not in entry.losses for i in group)
+            else entry.supports(request, group)
+        )
         if reason is None:
-            logger.debug("Loss group %s uses %s", group, entry.name)
             return entry
+        if impl is not None:
+            raise ValueError(f"{impl} cannot execute this loss group: {reason}")
         if rejections is not None:
             rejections.append(f"{entry.name}: {reason}")
-        logger.debug("Loss group %s skips %s: %s", group, entry.name, reason)
-        if name != "auto":
-            raise ValueError(f"{name} cannot execute this loss group: {reason}")
-    logger.debug("Loss group %s uses reference execution", group)
     return None
 
 
+def compute_loss(request, group=(0,), *, impl=None, fused=False, selection=None, key=0):
+    """Execute declared terms through the common loss entry point.
+
+    Args:
+        request: Resolved supervision and direct or deferred prediction inputs.
+        group: Term indices to compute together.
+        impl: Explicit specialized implementation; cannot accompany fused=True.
+        fused: Automatically select a compatible generic optimization.
+        selection: Optional distributed/resume selection tracker.
+        key: Stable request identity within the algorithm.
+
+    Returns:
+        GroupResult with values or weighted numerators and requested statistics.
+        Joint reference groups are evaluated independently without changing weights.
+    """
+    entry = (
+        selection.resolve(request, group, key, impl=impl, fused=fused)
+        if selection is not None
+        else select_implementation(request, group, impl=impl, fused=fused)
+    )
+    if entry is not None and request.input_tensor.numel():
+        return entry.compute(request, group)
+    # Empty ranks still resolve the same kernel, but avoid zero-sized GPU launches.
+    if len(group) == 1:
+        reference = select_implementation(request, group)
+        if reference is None:
+            raise ValueError(
+                "No reference implementation for the requested loss outputs"
+            )
+        return reference.compute(request, group)
+    empty_fallback = entry is not None and not request.input_tensor.numel()
+    result = GroupResult({})
+    for index in group:
+        item = compute_loss(
+            request,
+            (index,),
+            fused=False if empty_fallback else fused,
+            selection=None if empty_fallback else selection,
+            key=key,
+        )
+        result.numerators.update(item.numerators)
+        result.predictions.update(item.predictions)
+        result.statistics.update(item.statistics)
+        result.values.update(item.values)
+    return result
+
+
 class ExecutionSelection:
-    """Resolve kernels once per prediction/group and retain their resume identity.
+    """Validate group selections and retain their distributed/resume identity.
 
     The names dict is a live checkpoint mapping. Empty batches use the same
     selection, but the executor evaluates their zero-gradient reference path.
@@ -185,41 +272,31 @@ class ExecutionSelection:
 
     def __init__(self):
         self.names = {}
-        self._entries = {}
         self._expected = None
 
     def restore(self, names):
         """Set the saved selections to check when real prediction inputs arrive."""
-        self._expected = dict(names)
+        # These previous names differed only by CE's requested output capability.
+        aliases = {"ce_statistics": "reference", "fused_ce_statistics": "token_ce"}
+        self._expected = {key: aliases.get(name, name) for key, name in names.items()}
         self.names.clear()
-        self._entries.clear()
 
-    def resolve(self, request, group, prediction_index, *, fused=True):
+    def resolve(self, request, group, prediction_index, *, impl=None, fused=True):
         """Select and log a group once; reject rank or resume disagreement."""
-        if not fused:
-            return select_implementation(request, group, fused=False)
+        if impl is not None and fused:
+            raise ValueError("impl and fused=True are mutually exclusive")
+        if not fused and impl is None:
+            return select_implementation(request, group)
         key = f"{prediction_index}:" + ",".join(map(str, group))
-        if key in self._entries:
-            return self._entries[key]
         reasons, error, entry = [], None, None
         try:
-            entry = select_implementation(request, group, rejections=reasons)
-            hidden = request.predictions.hidden
-            if (
-                (entry is None or entry.name == "reference")
-                and len(group) == 1
-                and (
-                    not hidden.is_cuda
-                    or hidden.dtype
-                    not in (torch.float16, torch.bfloat16, torch.float32)
-                )
-            ):
-                raise ValueError("fused loss requires CUDA/ROCm FP16/BF16/FP32 inputs")
+            entry = select_implementation(
+                request, group, impl=impl, fused=fused, rejections=reasons
+            )
         except (ImportError, ValueError, RuntimeError) as exc:
             error = str(exc)
         name = entry.name if entry else ("split" if len(group) > 1 else "reference")
         self.record(key, name, error=error, reasons=reasons)
-        self._entries[key] = entry
         return entry
 
     def record(self, key, name, *, error=None, reasons=()):

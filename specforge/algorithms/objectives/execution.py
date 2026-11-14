@@ -129,6 +129,7 @@ def evaluate_predictions(
     execution=LossExecution(),
     selection=None,
     prediction_index=0,
+    context_counts=None,
 ):
     """Execute a prediction set and retain separate statistics per term.
 
@@ -162,7 +163,7 @@ def evaluate_predictions(
         weighting(projected.mask.float(), p.positions) if weights is None else weights
     )
     inputs = []
-    for term, selected in zip(p.plan.terms, losses):
+    for index, (term, selected) in enumerate(zip(p.plan.terms, losses)):
         mask = projected.mask
         if term.mask is not None:
             mask = term.mask
@@ -175,6 +176,8 @@ def evaluate_predictions(
         term_denominator = denominator if denominator is not None else fixed
         if term_denominator is None:
             term_denominator = term_weights.sum().detach()
+        if term.reduction == "scalar":
+            term_denominator = term_weights.new_ones(())
         inputs.append(
             TermInputs(
                 selected,
@@ -182,8 +185,12 @@ def evaluate_predictions(
                 term_weights,
                 term_denominator,
                 LossContext(
-                    mask, projected.teacher_mass, fixed if denominator is None else None
+                    mask,
+                    projected.teacher_mass,
+                    fixed if denominator is None else None,
+                    None if context_counts is None else context_counts[index],
                 ),
+                term.reduction,
             )
         )
 
@@ -371,21 +378,16 @@ def evaluate_chunks(
         unsafe replay disables checkpointing.
     """
     selection = selection or ExecutionSelection()
-    contextual = any(
-        selected.registration.contextual
-        for selected in selected_losses(predictions, loss)
-    )
-    # Contextual losses and local DSpine alignment need whole-set statistics.
-    if (
-        contextual
-        or not predictions.chunk_safe
-        or not predictions.projection.chunk_safe
-    ):
+    losses = selected_losses(predictions, loss)
+    whole_set = any(
+        selected.registration.scope == "prediction" for selected in losses
+    ) or any(term.reduction == "scalar" for term in predictions.plan.terms)
+    if whole_set or not predictions.chunk_safe or not predictions.projection.chunk_safe:
         chunk_size = 0
     if (
         execution.trim
         and weighting.kind not in DPACE_LOSS_TYPES
-        and not contextual
+        and not whole_set
         and predictions.chunk_safe
         and predictions.projection.chunk_safe
     ):
@@ -394,6 +396,26 @@ def evaluate_chunks(
             if term.mask is not None:
                 keep |= term.mask.any(-1)
         predictions = predictions.select(keep.nonzero().flatten())
+    # Contextual per-position formulas keep the whole-set supervised count,
+    # even when their values are evaluated in smaller chunks.
+    context_counts = None
+    if chunk_size and any(
+        selected.registration.contextual
+        and (term.denominator is not None or predictions.denominator is not None)
+        for term, selected in zip(predictions.plan.terms, losses)
+    ):
+        context_counts = [
+            predictions.hidden.new_zeros((), dtype=torch.float32) for _ in losses
+        ]
+        with torch.no_grad():
+            for part in prediction_slices(predictions, chunk_size):
+                item = predictions.select(part)
+                supervision = prepare_supervision(item, loss, weighting, execution)
+                for index, term in enumerate(item.plan.terms):
+                    mask = supervision.mask if term.mask is None else term.mask
+                    if term.mask is not None and item.vocab_mask is not None:
+                        mask = mask * item.vocab_mask[supervision.teacher_ids]
+                    context_counts[index] += mask.float().sum()
     from torch.utils.checkpoint import checkpoint
 
     results = []
@@ -403,6 +425,7 @@ def evaluate_chunks(
             execution=execution,
             selection=selection,
             prediction_index=prediction_index,
+            context_counts=context_counts,
             weights=None if weights is None else weights[part],
             denominator=None if denominator is None else denominator[part].sum(),
         )
@@ -431,7 +454,11 @@ def evaluate_chunks(
                 if term.denominator is not None
                 else predictions.denominator
             )
-            if fixed is not None:
+            if term.reduction == "scalar":
+                result.terms[index].denominator = result.terms[
+                    index
+                ].denominator.new_ones(())
+            elif fixed is not None:
                 result.terms[index].denominator = fixed
     return result
 

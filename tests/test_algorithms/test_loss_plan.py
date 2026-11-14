@@ -42,8 +42,9 @@ def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
 
 
 class DistributedPlan(nn.Module):
-    def __init__(self):
+    def __init__(self, scalar=False):
         super().__init__()
+        self.scalar = scalar
         self.head = nn.Linear(4, 9).double()
 
     def forward(self, hidden, labels, mask, other):
@@ -51,6 +52,8 @@ class DistributedPlan(nn.Module):
             calc.run((0,))
             calc.run((1,))
             calc.add(2, calc.outputs()["logits"].square().mean(-1))
+            if self.scalar:
+                calc.add(3, calc.outputs()["logits"].square().mean())
 
         prediction = Predictions(
             hidden=hidden,
@@ -64,6 +67,11 @@ class DistributedPlan(nn.Module):
                     LossTerm(),
                     LossTerm(coefficient=0.3, mask=other),
                     LossTerm("square", 0.2, TokenLoss("value"), mask=other),
+                )
+                + (
+                    (LossTerm("router", 0.1, TokenLoss("value"), reduction="scalar"),)
+                    if self.scalar
+                    else ()
                 ),
             ),
         )
@@ -75,40 +83,42 @@ def distributed_reduction(rank, rendezvous):
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     try:
-        torch.manual_seed(19)
-        model = DistributedPlan()
-        reference = nn.Linear(4, 9).double()
-        reference.load_state_dict(model.head.state_dict())
-        wrapped = DistributedDataParallel(model)
-        expected = 0
-        for step in range(2):
-            hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
-                10 + step
-            )
-            labels = (torch.arange(6) + step).reshape(6, 1)
-            mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
-            other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
-            part = slice(rank * 3, (rank + 1) * 3)
-            (
-                wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
-            ).backward()
-            values = TokenLoss(kind="ce")(reference(hidden), labels)
-            expected = (
-                expected
-                + (
-                    (values * mask).sum() / mask.sum()
-                    + 0.3 * (values * other).sum() / other.sum()
-                    + 0.2
-                    * (reference(hidden).square().mean(-1) * other).sum()
-                    / other.sum()
+        for scalar in (False, True):
+            torch.manual_seed(19)
+            model = DistributedPlan(scalar=scalar)
+            reference = nn.Linear(4, 9).double()
+            reference.load_state_dict(model.head.state_dict())
+            wrapped = DistributedDataParallel(model)
+            expected = 0
+            for step in range(2):
+                hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
+                    10 + step
                 )
-                / 2
+                labels = (torch.arange(6) + step).reshape(6, 1)
+                mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
+                other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
+                part = slice(rank * 3, (rank + 1) * 3)
+                (
+                    wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
+                ).backward()
+                values = TokenLoss(kind="ce")(reference(hidden), labels)
+                expected = (
+                    expected
+                    + (
+                        (values * mask).sum() / mask.sum()
+                        + 0.3 * (values * other).sum() / other.sum()
+                        + 0.2
+                        * (reference(hidden).square().mean(-1) * other).sum()
+                        / other.sum()
+                        + (0.1 * reference(hidden).square().mean() if scalar else 0)
+                    )
+                    / 2
+                )
+            expected.backward()
+            torch.testing.assert_close(
+                tuple(p.grad for p in model.head.parameters()),
+                tuple(p.grad for p in reference.parameters()),
             )
-        expected.backward()
-        torch.testing.assert_close(
-            tuple(p.grad for p in model.head.parameters()),
-            tuple(p.grad for p in reference.parameters()),
-        )
         # Resolve before compute: every rank sees mismatches and dependency errors.
 
         from specforge.algorithms.objectives.implementations.registry import (
@@ -116,7 +126,7 @@ def distributed_reduction(rank, rendezvous):
             Implementation,
         )
 
-        request = SimpleNamespace(predictions=SimpleNamespace(hidden=hidden))
+        request = SimpleNamespace(input_tensor=hidden)
         for mismatch in (False, True):
             entry = Implementation(f"kernel_{rank if mismatch else 0}", 0, None, None)
             with patch(
@@ -194,7 +204,7 @@ class LossPlanTest(unittest.TestCase):
         expected_grad = torch.autograd.grad(expected, parameters, retain_graph=True)
         with patch.dict(
             _IMPLEMENTATIONS,
-            {k: v for k, v in _IMPLEMENTATIONS.items() if not v.optimized},
+            {k: v for k, v in _IMPLEMENTATIONS.items() if v.category == "reference"},
             clear=True,
         ):
             calls = []
@@ -507,6 +517,55 @@ class LossPlanTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown ce options"):
             TokenLoss(kind="ce", options={"teacher_l1": True})
 
+    def test_new_statistics_belong_to_the_mathematical_loss(self):
+        from specforge.algorithms.objectives.losses import _LOSSES, LossOutput
+
+        def outputs(logits, labels, teacher, options, requested, context):
+            self.assertEqual(requested, {"return_entropy": True})
+            logp = logits.log_softmax(-1)
+            return LossOutput(
+                TokenLoss("ce")(logits, labels),
+                {"entropy": -(logp.exp() * logp).sum(-1)},
+            )
+
+        def compute(calc):
+            calc.run((0,))
+            result = calc.evaluate(
+                "entropy",
+                TokenLoss("ce"),
+                calc.outputs()["logits"],
+                calc.labels,
+                return_entropy=True,
+            )
+            calc.add(1, result.statistics["entropy"])
+
+        with patch.dict(_LOSSES, {"ce": replace(_LOSSES["ce"], outputs=outputs)}):
+            for length in (0, 3):
+                hidden = torch.randn(length, 1, 5, requires_grad=True)
+                labels = torch.zeros(length, 1, dtype=torch.long)
+                p = Predictions(
+                    hidden=hidden,
+                    projection=Projection(lambda x: {"logits": x}),
+                    labels=labels,
+                    mask=torch.ones_like(labels),
+                    positions=torch.zeros_like(labels),
+                    compute=compute,
+                    plan=LossPlan(
+                        (LossTerm(), LossTerm("entropy", 0.2, TokenLoss("value")))
+                    ),
+                )
+                actual = run(p, chunk=1)
+                logp = hidden.log_softmax(-1)
+                expected = (
+                    TokenLoss("ce")(hidden, labels).sum()
+                    - 0.2 * (logp.exp() * logp).sum()
+                ) / max(length, 1)
+                torch.testing.assert_close(actual.loss, expected)
+                torch.testing.assert_close(
+                    torch.autograd.grad(actual.loss, hidden)[0],
+                    torch.autograd.grad(expected, hidden)[0],
+                )
+
     def test_intermediate_and_final_losses_use_the_same_registry(self):
         hidden = torch.randn(3, 1, 5, requires_grad=True)
         labels = torch.zeros(3, 1, dtype=torch.long)
@@ -631,7 +690,7 @@ class LossPlanTest(unittest.TestCase):
         )
         with patch.dict(
             _IMPLEMENTATIONS,
-            {k: v for k, v in _IMPLEMENTATIONS.items() if not v.optimized},
+            {k: v for k, v in _IMPLEMENTATIONS.items() if v.category == "reference"},
             clear=True,
         ):
 
@@ -712,6 +771,33 @@ class LossPlanTest(unittest.TestCase):
                 actual_grad, gradients, rtol=tolerance, atol=tolerance * 0.02
             )
             torch.testing.assert_close(actual.ratios, expected.ratios)
+
+            def compute(calc):
+                calc.run((0,))
+                calc.add(1, calc.predictions.hidden.square().mean(-1))
+
+            regularized = replace(
+                p,
+                compute=compute,
+                plan=LossPlan(
+                    (LossTerm(), LossTerm("router", 0.1, TokenLoss("value")))
+                ),
+            )
+            reference = run(regularized, chunk=2)
+            reference_grad = torch.autograd.grad(reference.loss, parameters)
+            project.reset_mock()
+            actual = run(regularized, fused=True, chunk=2)
+            project.assert_not_called()
+            torch.testing.assert_close(
+                actual.loss, reference.loss, rtol=tolerance, atol=2e-5
+            )
+            torch.testing.assert_close(
+                torch.autograd.grad(actual.loss, parameters),
+                reference_grad,
+                rtol=tolerance,
+                atol=tolerance * 0.02,
+            )
+
             with patch(
                 "specforge.algorithms.objectives.implementations.linear_ce._linear_kernel",
                 return_value=None,
@@ -741,35 +827,28 @@ class LossPlanTest(unittest.TestCase):
         gradients = torch.autograd.grad(
             expected.loss, parameters, retain_graph=True, allow_unused=True
         )
-        cases = (
-            (p, True),
-            (replace(p, plan=replace(p.plan, joint_groups=())), False),
-            (replace(p, projection=Projection(p.projection.project)), False),
-            (
-                replace(
-                    p,
-                    projection=replace(
-                        p.projection, block_size=p.projection.block_size + 1
-                    ),
-                ),
-                False,
-            ),
-        )
-        for prediction, fused in cases:
-            entry = _IMPLEMENTATIONS["domino_suffix_ce"]
-            optimized = Mock(wraps=entry.compute)
-            with patch.dict(
-                _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
-            ):
-                actual = run(
-                    prediction,
-                    fused=True,
-                    chunk=1,
-                )
-                actual_grad = torch.autograd.grad(
-                    actual.loss, parameters, retain_graph=True, allow_unused=True
-                )
-            self.assertEqual(bool(optimized.call_count), fused)
-            torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
-            torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
-            torch.testing.assert_close(actual.ratios, expected.ratios)
+
+        def compute(calc):
+            calc.run((0, 1), impl="domino_suffix_ce", fused=False)
+            calc.run((2,))
+
+        prediction = replace(p, compute=compute)
+        entry = _IMPLEMENTATIONS["domino_suffix_ce"]
+        optimized = Mock(wraps=entry.compute)
+        with patch.dict(
+            _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
+        ):
+            actual = run(prediction, fused=True, chunk=1)
+            actual_grad = torch.autograd.grad(
+                actual.loss, parameters, retain_graph=True, allow_unused=True
+            )
+        self.assertGreater(optimized.call_count, 0)
+        torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
+        torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
+        torch.testing.assert_close(actual.ratios, expected.ratios)
+        for projection in (
+            Projection(p.projection.project),
+            replace(p.projection, block_size=p.projection.block_size + 1),
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot execute"):
+                run(replace(prediction, projection=projection), fused=True, chunk=1)

@@ -1,14 +1,18 @@
 """Reference and precomputed values use the same execution result contract."""
 
-from specforge.losses import fused
-
-from ..losses import ce_outputs
 from .registry import GroupResult, register_implementation
 
 
 def result_group(request, index, result):
     """Keep per-position values when requested; otherwise return a weighted sum."""
-    if result.values.shape != request.terms[index].weights.shape:
+    term = request.terms[index]
+    if term.reduction == "scalar":
+        if result.values.ndim != 0:
+            raise ValueError("Scalar loss must return a scalar tensor")
+        return GroupResult(
+            {index: result.values}, statistics={index: result.statistics}
+        )
+    if result.values.shape != term.weights.shape:
         raise ValueError("Loss values must align with prediction units")
     return GroupResult(
         (
@@ -22,42 +26,37 @@ def result_group(request, index, result):
 
 
 def singleton(request, group):
-    return None if len(group) == 1 else "reference executes one term at a time"
+    if len(group) != 1:
+        return "reference executes one term at a time"
+    return None
 
 
 @register_implementation(
-    "reference", supports=singleton, priority=-100, optimized=False
+    "reference", supports=singleton, priority=-100, category="reference"
 )
 def reference(request, group):
     """Evaluate a registered mathematical loss without an optimized kernel."""
     (index,) = group
-    term = request.predictions.plan.terms[index]
     inputs = request.terms[index]
-    logits = request.outputs()[term.output]
-    if request.requested_outputs:
-        result = ce_outputs(
-            fused.ce_l1_loss,
-            logits,
-            request.labels,
-            request.teacher,
-            **request.requested_outputs,
-        )
-    else:
-        result = inputs.loss.evaluate(
-            logits,
-            request.labels,
-            teacher=request.teacher,
-            context=inputs.context,
-        )
+    result = inputs.loss.evaluate(
+        request.tensor(index),
+        request.labels,
+        teacher=request.teacher,
+        context=inputs.context,
+        requested_outputs=request.requested_outputs,
+    )
     return result_group(request, index, result)
 
 
 @register_implementation(
     "value",
-    optimized=False,
+    losses=("value",),
+    category="reference",
     supports=lambda request, group: (
         None
-        if len(group) == 1 and request.terms[group[0]].loss.kind == "value"
+        if not request.requested_outputs
+        and len(group) == 1
+        and request.terms[group[0]].loss.kind == "value"
         else "requires one precomputed term"
     ),
 )

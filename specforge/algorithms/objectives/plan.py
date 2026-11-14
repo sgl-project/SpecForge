@@ -18,6 +18,8 @@ class LossTerm:
         loss: Explicit loss, or None/default to inherit the runtime selection.
         mask: Optional [units, positions] supervision mask.
         weighting: Optional position-weighting rule.
+        reduction: "positions" applies token weights; "scalar" adds one already
+            normalized scalar per prediction set, without token weighting.
         denominator: Optional fixed scalar denominator for the whole prediction
             set, not each chunk. It must not require gradients.
     """
@@ -28,8 +30,17 @@ class LossTerm:
     mask: Tensor | None = None
     weighting: PositionWeighting | None = None
     denominator: Tensor | None = None
+    reduction: str = "positions"
 
     def __post_init__(self):
+        if self.reduction not in ("positions", "scalar"):
+            raise ValueError(f"Unknown term reduction: {self.reduction!r}")
+        if self.reduction == "scalar" and any(
+            item is not None for item in (self.mask, self.weighting, self.denominator)
+        ):
+            raise ValueError(
+                "Scalar losses must declare their normalization in the formula"
+            )
         if not self.output or not math.isfinite(self.coefficient):
             raise ValueError("Loss term requires an output and a finite coefficient")
         if self.denominator is not None:
@@ -92,7 +103,10 @@ class LossPlan:
     def shared_reduction(self):
         """Return whether every term inherits the prediction's reduction inputs."""
         return all(
-            term.mask is None and term.weighting is None and term.denominator is None
+            term.reduction == "positions"
+            and term.mask is None
+            and term.weighting is None
+            and term.denominator is None
             for term in self.terms
         )
 

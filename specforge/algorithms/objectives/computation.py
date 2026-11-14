@@ -2,12 +2,8 @@
 
 from dataclasses import replace
 
-from .implementations.reference import reference
-from .implementations.registry import ExecutionRequest, GroupResult
+from .implementations.registry import ExecutionRequest, compute_loss
 from .losses import LossContext, LossOutput
-from .plan import LossPlan, LossTerm
-from .predictions import Teacher
-from .projection import Projection
 
 
 class LossComputation:
@@ -47,61 +43,57 @@ class LossComputation:
         """Materialize the projection once within this chunk."""
         return self.request.outputs()
 
-    def _execute(self, request, group, key):
-        entry = self.selection.resolve(request, group, key, fused=self.execution.fused)
-        if entry is None:
-            return None
-        # Empty inputs retain zero gradients without launching zero-sized kernels.
-        if not request.predictions.hidden.numel():
-            result = GroupResult({})
-            for index in group:
-                item = reference(request, (index,))
-                result.numerators.update(item.numerators)
-                result.statistics.update(item.statistics)
-                result.values.update(item.values)
-            return result
-        return entry.compute(request, group)
+    def _execute(self, request, group, key, *, impl=None, fused=None):
+        return compute_loss(
+            request,
+            group,
+            impl=impl,
+            fused=self.execution.fused if fused is None else fused,
+            selection=self.selection,
+            key=key,
+        )
 
-    def run(self, group=None):
-        """Execute declared terms once, preserving joint-kernel opportunities."""
+    def run(self, group=None, *, impl=None, fused=None):
+        """Execute declared terms once.
+
+        impl selects a specialized implementation and requires fused=False.
+        Otherwise fused inherits the runtime default and selects generic kernels.
+        """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
         for indices in groups:
             if any(i in self.numerators for i in indices):
                 raise ValueError("Loss terms must execute exactly once")
-            result = self._execute(self.request, indices, self.prediction_index)
-            if result is None:
-                if len(indices) == 1:
-                    raise ValueError("No implementation for loss term")
-                for index in indices:
-                    self.run((index,))
-                continue
-            if set(result.numerators) != set(indices):
-                raise ValueError(
-                    "Implementation did not return the requested loss terms"
-                )
-            if not result.statistics.keys() <= set(indices):
-                raise ValueError(
-                    "Implementation statistics reference an unexecuted term"
-                )
-            self.numerators.update(result.numerators)
-            self.predicted.update(result.predictions)
-            self.statistics.update(result.statistics)
+            result = self._execute(
+                self.request, indices, self.prediction_index, impl=impl, fused=fused
+            )
+            self._collect(result, indices)
+
+    def _collect(self, result, indices):
+        """Merge one implementation result into this chunk's loss plan."""
+        if set(result.numerators) != set(indices):
+            raise ValueError("Implementation did not return the requested loss terms")
+        if not result.statistics.keys() <= set(indices):
+            raise ValueError("Implementation statistics reference an unexecuted term")
+        self.numerators.update(result.numerators)
+        self.predicted.update(result.predictions)
+        self.statistics.update(result.statistics)
 
     def add(self, index, values):
         """Supply per-position model loss values to a declared 'value' term.
 
         Values retain gradients. The same registry and term weights/denominator
         apply, including explicit masks for router or other model regularizers.
-        Cross-token model losses must disable chunking and trimming.
+        Scalar terms run once over the full prediction set without token weighting.
         """
         if self.request.terms[index].loss.kind != "value":
             raise ValueError("Computed values require a value loss term")
-        outputs = self.outputs()
-        name = self.predictions.plan.terms[index].output
-        if name in outputs:
-            raise ValueError(f"Computed loss would overwrite projection output: {name}")
-        outputs[name] = values
-        self.run((index,))
+        if index in self.numerators:
+            raise ValueError("Loss terms must execute exactly once")
+        request = replace(self.request, tensors={index: values})
+        result = self._execute(request, (index,), self.prediction_index)
+        if result is None:
+            raise ValueError("No implementation for computed loss")
+        self._collect(result, (index,))
 
     def evaluate(
         self,
@@ -112,8 +104,9 @@ class LossComputation:
         *,
         teacher=None,
         context=None,
-        return_teacher_l1=False,
-        top_k=None,
+        impl=None,
+        fused=None,
+        **requested_outputs,
     ):
         """Return unreduced LossOutput through the ordinary implementation registry.
 
@@ -124,52 +117,27 @@ class LossComputation:
             labels: Hard or soft targets aligned with this chunk's positions.
             teacher: Optional aligned teacher logits.
             context: Optional normalization context for whole-set losses.
-            return_teacher_l1: Also return draft/teacher L1 in statistics, not in the loss.
-            top_k: Also return this many candidate IDs and logits in statistics.
-                These extra outputs currently accompany CE.
+            impl: Optional specialized implementation.
+            fused: Override automatic optimization; must be False with impl.
+            **requested_outputs: Extra results validated and computed by the
+                selected implementation, e.g. return_teacher_l1=True or top_k=8.
 
         The algorithm controls gradient truncation and how results are consumed.
         These values are not added to the objective until a declared term runs.
         """
-        if type(return_teacher_l1) is not bool:
-            raise ValueError("return_teacher_l1 must be boolean")
-        if top_k is not None and (type(top_k) is not int or top_k < 1):
-            raise ValueError("top_k must be a positive integer")
-        requested_outputs = {}
-        if return_teacher_l1:
-            requested_outputs["teacher_l1"] = True
-        if top_k is not None:
-            requested_outputs["top_k"] = top_k
-        if requested_outputs and loss.kind != "ce":
-            raise ValueError("L1/top-k output requests currently require CE")
-        if return_teacher_l1 and (teacher is None or teacher.shape != logits.shape):
-            raise ValueError("return_teacher_l1 requires aligned teacher logits")
         if key in self._calls:
             raise ValueError(f"Repeated computation key: {key}")
         self._calls.add(key)
         if labels.shape != self.predictions.mask.shape:
             raise ValueError("Computation labels must align with prediction units")
-        if loss.registration.contextual and (
+        if loss.registration.scope == "prediction" and (
             self.predictions.chunk_safe and self.predictions.projection.chunk_safe
         ):
             raise ValueError("Contextual intermediate losses require chunk_safe=False")
-        outputs = {"logits": logits}
-        predictions = replace(
-            self.predictions,
-            hidden=logits if logits.ndim == 3 else logits[..., None],
-            labels=labels,
-            teacher=None if teacher is None else Teacher(teacher),
-            vocab_mask=None,
-            draft_to_target=None,
-            context_inputs={},
-            projection=Projection(lambda hidden: outputs),
-            projection_inputs={},
-            plan=LossPlan((LossTerm(loss=loss),)),
-            compute=None,
-        )
         inputs = replace(
             self.request.terms[0],
             loss=loss,
+            reduction="positions",
             context=(
                 context
                 if context is not None
@@ -177,16 +145,23 @@ class LossComputation:
             ),
         )
         request = ExecutionRequest(
-            predictions,
-            (inputs,),
-            labels,
-            teacher,
-            lambda: outputs,
-            outputs,
+            predictions=None,
+            terms=(inputs,),
+            labels=labels,
+            teacher=teacher,
+            outputs=None,
+            materialized={},
+            tensors={0: logits},
             unreduced=True,
             requested_outputs=requested_outputs,
         )
-        result = self._execute(request, (0,), f"{self.prediction_index}/compute/{key}")
+        result = self._execute(
+            request,
+            (0,),
+            f"{self.prediction_index}/compute/{key}",
+            impl=impl,
+            fused=fused,
+        )
         if result is None or set(result.values) != {0}:
             raise ValueError(
                 "Implementation must return the requested per-position values"

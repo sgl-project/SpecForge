@@ -38,6 +38,7 @@ class DominoObjective:
     loss_decay_gamma: float | None = None
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+    impl: str | None = None
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -47,6 +48,8 @@ class DominoObjective:
         return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
+        if self.impl is not None and (not isinstance(self.impl, str) or not self.impl):
+            raise ValueError("impl must be a nonempty specialized implementation name")
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
@@ -57,6 +60,8 @@ class DominoObjective:
         )
 
     def __call__(self, runtime, batch, *, step, total_steps, **context):
+        if self.impl is not None and runtime.execution.fused:
+            raise ValueError("impl and fused=True are mutually exclusive")
         model, spec = runtime.draft_model, runtime.draft_model.config.draft.spec_config
         blocks = prepare_blocks(
             model.config.draft,
@@ -75,11 +80,30 @@ class DominoObjective:
             raise ValueError("Domino base-loss schedule requires total_steps")
         warmup = max(1, int((total_steps or 1) * self.lambda_base_decay_ratio))
         weight = self.lambda_base_start * max(0, 1 - step / warmup)
+
+        def compute(calc):
+            # Preserve the existing fused flag while resolving this group to an
+            # explicit specialized mode. Other losses keep their ordinary path.
+            if self.impl is not None:
+                calc.run((0, 1), impl=self.impl, fused=False)
+            elif (
+                runtime.execution.fused
+                and all(
+                    term.loss.kind == "ce" and not term.loss.options
+                    for term in calc.request.terms
+                )
+                and not calc.request.materialized
+            ):
+                calc.run((0, 1), impl="domino_suffix_ce", fused=False)
+            else:
+                calc.run()
+
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
+            compute=compute,
             plan=LossPlan(
                 terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
                 joint_groups=((0, 1),),
