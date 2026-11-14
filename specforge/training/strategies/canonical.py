@@ -21,9 +21,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.window_statistic = inner.registration.training.window_statistic
         self.host_inputs = inner.registration.training.host_inputs
         self.draft_config = inner.draft_model.config.draft
-        self.statistics = (
-            inner.statistics
-        )  # stepped and pooled here, not in the objective
+        # Stepped (and later pooled) here in the training layer, never inside the objective.
+        self.statistics = inner.statistics
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
