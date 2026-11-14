@@ -371,29 +371,46 @@ masks/denominators require `sum_means` (normalize each prediction set) or
 denominators and arbitrary accumulation-window normalization are not implemented.
 Existing trainer accumulation and protocol semantics are unchanged.
 
-Reference outputs are reused only within the current evaluation. No logits cache
-is stored on the model. Contextual losses retain whole-set execution; algorithms
-must disable chunking when their projection/auxiliary computation requires it.
-Auxiliary computations remain in their protocols. `LossPlan.auxiliary_terms`
-uses the same `LossTerm` coefficients, masks, position weights and denominators
-as main losses. Its `loss` field must be unset because the callback returns
-already-computed values, named by `output`, in `AuxiliaryLoss.values`.
-Names and shapes must match the declaration. Auxiliary masks participate in
-trimming, and fixed denominators are restored once after chunk reduction.
+Projection outputs and intermediate results are scoped to one chunk. No logits
+cache is stored on the model. Contextual losses retain whole-set execution;
+algorithms must set `chunk_safe=False` when their computation couples units.
 
-Reference losses may return `LossOutput(values, statistics)` instead of a tensor.
-Token kernels support the same result; group implementations return statistics
-by main-term index. The executor passes detached statistics to auxiliary callbacks,
-scoped to the current evaluation/chunk rather than stored on the model.
-The callback signature is `(predictions, outputs, teacher, weights, statistics, primitives)`.
-The executor supplies numerical callables through `primitives` (currently `ce_l1`).
-Protocols call them without selecting kernels or reading `execution.fused`.
-Auxiliary fused selections use the same logging, rank agreement and resume checks
-as main losses.
-DSpark reuses the main CE/L1 result's `teacher_l1` for confidence supervision;
-if another main loss supplies no L1, its callback computes the target through the supplied primitive.
-DFlash2 selector and DSpine refinement/alignment are separate named auxiliary terms.
-Existing auxiliary formulas and training coefficients are preserved.
+All objective terms live in `LossPlan.terms`. By default the executor runs its
+groups directly. Algorithms with dependent computations supply
+`Predictions.compute(calc)`, executed inside each chunk and checkpoint replay:
+
+- `calc.run((0,))` executes a declared term (or a joint group).
+- `calc.evaluate(key, loss, logits, labels, teacher=...)` requests per-position
+  values and statistics through the same implementation registry.
+- `calc.add(index, values)` supplies a computed tensor to a declared
+  `TokenLoss("value")` term. It uses the same weighting and denominator rules.
+- `calc.ratios` holds additive metric pairs.
+
+Every declared term executes exactly once. Intermediate keys must be unique and
+stable across ranks, steps and checkpoint replays. Reference and optimized
+implementations share the result contract: weighted numerators for final terms,
+or differentiable per-position values for intermediate requests. Projection-fused
+implementations can decline requests requiring intermediate values.
+Statistics retain gradients; algorithms explicitly detach supervision targets.
+
+For example, DSpark reuses `teacher_l1` from the main loss, constructs a detached
+acceptance target, and requests BCE through the registry. DFlash2 requests top-k
+CE statistics, runs its selector, then requests candidate CE. DSpine similarly
+keeps refinement and alignment logic in its protocol. There is no separate
+primitive registry or auxiliary-loss execution channel.
+
+A MoE model can expose per-token router z-loss through `context_inputs` and add
+it as a value term with its own coefficient and mask. This preserves gradients
+to router parameters and supports additive chunk reduction. Load-balancing losses
+that depend on whole-batch expert statistics require whole-set execution and
+explicit normalization; do not recompute them independently per chunk. Router
+statistics, cross-rank aggregation, and optimizer-step updates remain model/training
+responsibilities, not loss-kernel responsibilities. Scalar losses are not
+implicitly broadcast; the protocol must express their reduction deliberately.
+
+Fused resume contracts include stable implementation identities for intermediate
+calls as well as final terms. Checkpoints using the previous auxiliary primitive
+identities fail the existing resume check rather than silently changing execution.
 
 The fused soft CE kernel is new in this PR, rather than migrated from legacy.
 Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`

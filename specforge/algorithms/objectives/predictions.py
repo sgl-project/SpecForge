@@ -70,18 +70,6 @@ class Teacher:
         return replace(self, values=self.values[units])
 
 
-@dataclass
-class AuxiliaryLoss:
-    """Named per-position auxiliary values and additive metric pairs.
-
-    Values match LossPlan.auxiliary_terms by name and have shape [units, positions].
-    The executor applies each term's coefficient, weights and denominator.
-    """
-
-    values: dict[str, Tensor]
-    ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
-
-
 @dataclass(frozen=True, kw_only=True)
 class Predictions:
     """Each row is an indivisible projection unit: a block or independent token.
@@ -90,13 +78,11 @@ class Predictions:
     whole units, including recurrent head inputs. No full-vocabulary projection
     is retained here; project() can be invoked by an eager or chunked executor.
 
-    The optional auxiliary callback accepts (predictions, projected_outputs,
-    teacher_logits, default_weights, statistics, primitives) and returns AuxiliaryLoss.
-    Statistics map main-term indices to detached named tensors from this
-    evaluation only. Missing optional statistics must have a reference fallback.
-    Primitives maps names (currently "ce_l1") to executor-owned callables;
-    callbacks invoke them without choosing kernels or reading execution policy.
-    Auxiliary terms and their reduction rules are declared in plan.
+    An optional compute(LossComputation) procedure executes the plan inside each
+    chunk. It may call model heads, request intermediate loss values, and supply
+    computed terms. Every declared term must execute exactly once. Without a
+    procedure, all plan groups execute directly. Statistics retain gradients;
+    the algorithm decides where supervision must be detached.
     """
 
     hidden: Tensor
@@ -108,8 +94,8 @@ class Predictions:
     labels: Tensor | None = None
     teacher: Teacher | None = None
     projection_inputs: dict[str, Tensor] = field(default_factory=dict)
-    auxiliary_inputs: dict[str, Tensor] = field(default_factory=dict)
-    auxiliary: Callable | None = None
+    context_inputs: dict[str, Tensor] = field(default_factory=dict)
+    compute: Callable | None = None
     requires: frozenset[str] = frozenset()
     default_loss: TokenLoss = field(default_factory=lambda: TokenLoss(kind="ce"))
     plan: LossPlan = field(default_factory=LossPlan)
@@ -137,14 +123,10 @@ class Predictions:
                 value.shape != shape or value.dtype != torch.long
             ):
                 raise ValueError("chain and sequence IDs must be aligned int64 tensors")
-        for term in self.plan.all_terms:
+        for term in self.plan.terms:
             if term.mask is not None and term.mask.shape != shape:
                 raise ValueError("Loss masks must align with prediction units")
-        if bool(self.plan.auxiliary_terms) != (self.auxiliary is not None):
-            raise ValueError(
-                "Auxiliary callback and auxiliary terms must be declared together"
-            )
-        aligned = [*self.projection_inputs.values(), *self.auxiliary_inputs.values()]
+        aligned = [*self.projection_inputs.values(), *self.context_inputs.values()]
         if self.teacher is not None:
             aligned.append(self.teacher.values)
         if any(value.shape[:2] != shape for value in aligned):
@@ -191,8 +173,8 @@ class Predictions:
             projection_inputs={
                 key: value[units] for key, value in self.projection_inputs.items()
             },
-            auxiliary_inputs={
-                key: value[units] for key, value in self.auxiliary_inputs.items()
+            context_inputs={
+                key: value[units] for key, value in self.context_inputs.items()
             },
         )
 

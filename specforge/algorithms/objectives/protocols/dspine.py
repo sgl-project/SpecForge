@@ -11,7 +11,7 @@ from ..base import check_options
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import AuxiliaryLoss, PredictionBatch
+from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
 
 
@@ -136,67 +136,72 @@ class DSpineObjective:
             else 1
         )
 
-        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
-            labels = predictions.labels
-            terms = primitives["ce_l1"](
-                projected["logits"],
+        def compute(calc):
+            calc.run((0,))
+            predictions, labels, teacher = calc.predictions, calc.labels, calc.teacher
+            terms = calc.evaluate(
+                "candidates",
+                TokenLoss("ce", {"top_k": self.top_k, "teacher_l1": True}),
+                calc.outputs()["logits"],
                 labels,
-                teacher_logits=teacher,
-                top_k=self.top_k,
+                teacher=teacher,
             )
+            ids = terms.statistics["topk_ids"]
             refined = model.refine(
-                predictions.auxiliary_inputs["pre_injection"],
-                predictions.auxiliary_inputs["predecessors"],
+                predictions.context_inputs["pre_injection"],
+                predictions.context_inputs["predecessors"],
             )
-            candidates = model.lm_head.candidate_weights(terms.topk_ids)
+            candidates = model.lm_head.candidate_weights(ids)
             scores = torch.einsum("...h,...kh->...k", refined, candidates).float()
-            covered = terms.topk_ids == labels[..., None]
-            refinement = primitives["ce_l1"](
+            covered = ids == labels[..., None]
+            refinement = calc.evaluate(
+                "refinement",
+                TokenLoss("ce", {"teacher_l1": True}),
                 scores,
                 covered.long().argmax(-1),
-                teacher_logits=teacher.gather(-1, terms.topk_ids),
+                teacher=teacher.gather(-1, ids),
             )
-            mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
-            refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(
-                -1
-            ) + (1 - self.ce_weight) * refinement.teacher_l1 * (
+            mass = teacher.float().softmax(-1).gather(-1, ids).sum(-1)
+            refined_loss = self.ce_weight * refinement.values * covered.any(-1) + (
+                1 - self.ce_weight
+            ) * refinement.statistics["teacher_l1"] * (
                 mass > self.candidate_mass_threshold
             )
             codes = F.embedding(labels, model.transfer_codes).float()
             alignment = (
                 1
                 - F.cosine_similarity(
-                    predictions.auxiliary_inputs["layer_features"].float(),
+                    predictions.context_inputs["layer_features"].float(),
                     codes[:, :, None],
                     dim=-1,
                 )
             ).sum(-1)
-            ce_num = (terms.cross_entropy * weights).sum()
-            denominator = weights.sum().detach()
+            ce_num = (terms.values * calc.weights).sum()
+            denominator = calc.weights.sum().detach()
             coefficient = alignment_ce
             if coefficient is None:
                 totals = torch.stack((ce_num.detach(), denominator))
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
-            return AuxiliaryLoss(
-                {
-                    "refinement": refined_loss,
-                    "alignment": coefficient.detach() * alignment,
-                },
-                {"dspine/backbone_ce": (ce_num.detach(), denominator)},
-            )
+            calc.add(1, refined_loss)
+            calc.add(2, coefficient.detach() * alignment)
+            calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
 
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
-            auxiliary=auxiliary,
+            compute=compute,
             plan=LossPlan(
-                auxiliary_terms=(LossTerm("refinement"), LossTerm("alignment", beta))
+                (
+                    LossTerm(),
+                    LossTerm("refinement", loss=TokenLoss("value")),
+                    LossTerm("alignment", beta, TokenLoss("value")),
+                )
             ),
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
             chunk_safe=alignment_ce is not None,
-            auxiliary_inputs={
+            context_inputs={
                 "pre_injection": output.pre_injection,
                 "predecessors": blocks.predecessors,
                 "layer_features": output.layer_features.movedim(0, -2),

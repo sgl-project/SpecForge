@@ -16,8 +16,8 @@ def projection_ce_support(request, group):
         return "projection does not permit chunked/recomputed fusion"
     if request.materialized:
         return "projection is already materialized"
-    if p.auxiliary is not None:
-        return "auxiliary computation consumes full projection outputs"
+    if request.unreduced:
+        return "requires per-position results"
     if p.vocab_mask is not None:
         return "vocabulary mapping requires a different projection implementation"
     if any(

@@ -17,14 +17,14 @@ class TermInputs:
     """Resolved inputs for one loss term.
 
     Attributes:
-        loss: Mathematical loss and its options; None for already-computed auxiliary terms.
+        loss: Mathematical loss and its options, including precomputed values.
         mask: Supervised positions, shaped [units, positions].
         weights: Effective per-position weights, aligned with mask.
         denominator: Scalar used after additive chunk statistics are merged.
         context: Teacher-mass and normalization inputs for contextual losses.
     """
 
-    loss: TokenLoss | None
+    loss: TokenLoss
     mask: torch.Tensor
     weights: torch.Tensor
     denominator: torch.Tensor
@@ -40,13 +40,15 @@ class GroupResult:
             must not include the term coefficient or division by its denominator.
         predictions: Optional output names mapped to predicted token IDs,
             shaped [units, positions], for metric computation.
-        statistics: Term indices mapped to reusable named tensors. The executor
-            detaches these before passing them to auxiliary callbacks.
+        values: Per-position values by term, returned for unreduced requests.
+        statistics: Term indices mapped to reusable named tensors. They retain gradients;
+            algorithms detach supervision explicitly.
     """
 
     numerators: dict[int, torch.Tensor]
     predictions: dict[str, torch.Tensor] = field(default_factory=dict)
     statistics: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
+    values: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,8 @@ class ExecutionRequest:
     teacher: torch.Tensor | None
     outputs: Callable
     materialized: dict
+    # Intermediate requests require differentiable per-position results.
+    unreduced: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,12 +93,13 @@ class Implementation:
     priority: int
     supports: Callable
     compute: Callable
+    optimized: bool = True
 
 
 _IMPLEMENTATIONS = {}
 
 
-def register_implementation(name, *, supports, priority=0):
+def register_implementation(name, *, supports, priority=0, optimized=True):
     """Register an optimized implementation for one or more loss terms.
 
     Args:
@@ -102,6 +107,7 @@ def register_implementation(name, *, supports, priority=0):
         supports: Callable(request, group) returning None if supported or a
             rejection-reason string. It checks capabilities without projection.
         priority: Selection priority; higher values take precedence.
+        optimized: False for implementations available without fused execution.
 
     Returns:
         A decorator that registers and returns the compute callable unchanged.
@@ -114,13 +120,15 @@ def register_implementation(name, *, supports, priority=0):
     def register(compute):
         if name in _IMPLEMENTATIONS:
             raise ValueError(f"Execution implementation {name!r} is already registered")
-        _IMPLEMENTATIONS[name] = Implementation(name, priority, supports, compute)
+        _IMPLEMENTATIONS[name] = Implementation(
+            name, priority, supports, compute, optimized
+        )
         return compute
 
     return register
 
 
-def select_implementation(request, group, *, name="auto", rejections=None):
+def select_implementation(request, group, *, name="auto", rejections=None, fused=True):
     """Select an applicable implementation without executing its kernel.
 
     Args:
@@ -128,6 +136,7 @@ def select_implementation(request, group, *, name="auto", rejections=None):
         group: Tuple of indices into request.predictions.plan.terms to execute
             together. A one-element tuple requests independent execution.
         rejections: Optional list receiving rejection reasons for diagnostics.
+        fused: Whether optimized implementations are eligible.
         name: "auto" checks priority order, breaking ties by ascending name.
             Any other value requires that specific registered implementation.
 
@@ -140,7 +149,7 @@ def select_implementation(request, group, *, name="auto", rejections=None):
         ValueError: An explicitly named implementation is unknown or rejects
             the request. Exceptions raised by applicability checks propagate.
     """
-    from . import domino_ce, linear_ce, token_kernels  # noqa: F401
+    from . import domino_ce, linear_ce, reference, token_kernels  # noqa: F401
 
     candidates = sorted(
         _IMPLEMENTATIONS.values(), key=lambda item: (-item.priority, item.name)
@@ -150,6 +159,8 @@ def select_implementation(request, group, *, name="auto", rejections=None):
             raise ValueError(f"Unknown execution implementation: {name!r}")
         candidates = [_IMPLEMENTATIONS[name]]
     for entry in candidates:
+        if entry.optimized and not fused:
+            continue
         reason = entry.supports(request, group)
         if reason is None:
             logger.debug("Loss group %s uses %s", group, entry.name)
@@ -181,8 +192,10 @@ class ExecutionSelection:
         self.names.clear()
         self._entries.clear()
 
-    def resolve(self, request, group, prediction_index):
+    def resolve(self, request, group, prediction_index, *, fused=True):
         """Select and log a group once; reject rank or resume disagreement."""
+        if not fused:
+            return select_implementation(request, group, fused=False)
         key = f"{prediction_index}:" + ",".join(map(str, group))
         if key in self._entries:
             return self._entries[key]
@@ -191,7 +204,7 @@ class ExecutionSelection:
             entry = select_implementation(request, group, rejections=reasons)
             hidden = request.predictions.hidden
             if (
-                entry is None
+                (entry is None or entry.name == "reference")
                 and len(group) == 1
                 and (
                     not hidden.is_cuda

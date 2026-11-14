@@ -324,8 +324,10 @@ class LossExecutionTest(unittest.TestCase):
                     else:
                         if architecture in ("DFlash2DraftModel", "DSpineDraftModel"):
                             self.assertEqual(
-                                runtime.loss_implementations.names["0:aux:ce_l1"],
-                                "fused_ce_l1",
+                                runtime.loss_implementations.names[
+                                    "0/compute/candidates:0"
+                                ],
+                                "token_ce",
                             )
                         torch.testing.assert_close(
                             actual, expected, rtol=8e-4, atol=3e-5
@@ -334,7 +336,7 @@ class LossExecutionTest(unittest.TestCase):
                             self.assertGreater(kernel.call_count, 0)
                         if architecture == "DFlash2DraftModel":
                             saved = dict(runtime.loss_implementations.names)
-                            saved["0:aux:ce_l1"] = "reference"
+                            saved["0/compute/candidates:0"] = "reference"
                             runtime.loss_implementations.restore(saved)
                             with self.assertRaisesRegex(
                                 ValueError, "changed on resume"
@@ -469,7 +471,11 @@ class LossExecutionTest(unittest.TestCase):
             run(restored)
         # An unsupported loss contract is a visible reference fallback.
         with (
-            patch.dict(_IMPLEMENTATIONS, {}, clear=True),
+            patch.dict(
+                _IMPLEMENTATIONS,
+                {k: v for k, v in _IMPLEMENTATIONS.items() if not v.optimized},
+                clear=True,
+            ),
             self.assertLogs(
                 "specforge.algorithms.objectives.implementations.registry", level="INFO"
             ) as logs,

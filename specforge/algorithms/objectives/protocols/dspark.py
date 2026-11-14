@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
@@ -11,7 +10,7 @@ from ..base import check_options
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import AuxiliaryLoss, PredictionBatch
+from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
 
@@ -89,35 +88,44 @@ class DSparkObjective:
             output_logits=False,
         )
 
-        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
-            confidence = projected["confidence_scores"]
+        def compute(calc):
+            calc.run((0,))
+            confidence = calc.outputs()["confidence_scores"]
             if confidence is None:
-                return AuxiliaryLoss({"confidence": weights.new_zeros(weights.shape)})
+                calc.add(1, calc.weights.new_zeros(calc.weights.shape))
+                return
             with torch.no_grad():
-                distance = statistics.get(0, {}).get("teacher_l1")
+                distance = calc.statistics.get(0, {}).get("teacher_l1")
                 if distance is None:
-                    distance = primitives["ce_l1"](
-                        projected["logits"],
-                        predictions.labels,
-                        teacher_logits=teacher,
-                    ).teacher_l1
+                    distance = calc.evaluate(
+                        "distance",
+                        TokenLoss("ce", {"teacher_l1": True}),
+                        calc.outputs()["logits"],
+                        calc.labels,
+                        teacher=calc.teacher,
+                    ).statistics["teacher_l1"]
                 acceptance = (1 - distance / 2).clamp(0, 1)
-            return AuxiliaryLoss(
-                {
-                    "confidence": F.binary_cross_entropy_with_logits(
-                        confidence, acceptance, reduction="none"
-                    )
-                }
-            )
+            values = calc.evaluate(
+                "confidence",
+                TokenLoss("bce"),
+                confidence,
+                acceptance,
+            ).values
+            calc.add(1, values)
 
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
-            auxiliary=auxiliary,
+            compute=compute,
             plan=LossPlan(
-                auxiliary_terms=(LossTerm("confidence", self.confidence_loss_alpha),)
+                (
+                    LossTerm(),
+                    LossTerm(
+                        "confidence", self.confidence_loss_alpha, TokenLoss("value")
+                    ),
+                )
             ),
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
