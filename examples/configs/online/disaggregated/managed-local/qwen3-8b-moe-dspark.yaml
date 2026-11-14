@@ -36,6 +36,8 @@ training:
   attention_backend: eager
   objective_options:
     num_anchors: 512
+    # Expert-bias load balancing: zero-mean sign step per optimizer step.
+    bias_update_rate: 0.001
   loss:
     terms:
       # A zero confidence coefficient also freezes confidence_head.

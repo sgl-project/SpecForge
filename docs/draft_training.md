@@ -240,6 +240,16 @@ The preset `specforge/config/draft/presets/qwen3-8b-moe-dspark.yaml` with its
 recipe trains a DSpark draft whose every FFN is a MoE of 8 experts with top-1
 routing.
 
+Load balancing is DeepSeek-V3's aux-loss-free bias update. The DFlash and DSpark
+objectives take `bias_update_rate` in `training.objective_options` (`0`, the
+default, keeps the bias fixed; the recipe uses `0.001`). Over one optimizer step
+the trainer counts, across micro-batches and ranks, the tokens of kept blocks
+each MoE layer routed to each expert, then moves every router's `expert_bias` by
+that rate toward the under-loaded experts with a zero-mean sign step; the bias
+shifts which experts are chosen, not their weights. `moe/step_balance` reports
+the dispatch's balance: 1 when uniform, E / K when the same K experts take every
+token.
+
 ### Loss execution
 
 The preferred configuration names mathematical terms and uses one shared fusion
