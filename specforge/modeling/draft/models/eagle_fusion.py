@@ -115,8 +115,9 @@ class EagleDecoderStage(nn.Module):
     def forward(
         self,
         hidden: Tensor,
-        inputs: LayerInputs,
+        inputs: LayerInputs | None = None,
         *,
+        cached_step=None,
         kv_prefix: AttentionKV | None = None,
         output_kv: bool = False,
     ) -> Tensor | EagleStageOutput:
@@ -124,6 +125,17 @@ class EagleDecoderStage(nn.Module):
             raise ValueError(
                 "EAGLE first stage requires [batch, sequence, 2 * hidden_size]"
             )
+        if cached_step is not None:
+            from .eagle_rollout import EagleCachedStep
+
+            if (
+                not isinstance(cached_step, EagleCachedStep)
+                or inputs is not None
+                or kv_prefix is not None
+                or output_kv
+            ):
+                raise TypeError("cached execution requires only EagleCachedStep inputs")
+            return cached_step.forward(self, hidden)
         if not isinstance(inputs, LayerInputs):
             raise TypeError("EAGLE first stage requires LayerInputs")
         if not isinstance(inputs.attention, PreparedAttention):

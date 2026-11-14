@@ -330,14 +330,14 @@ def resolve_run(cfg, *, target_config=None):
     family = entry.legacy_strategy or objective
     if cfg.training.strategy not in (defaults.strategy, family, objective):
         raise ValueError("training.strategy conflicts with the objective")
-    if (
-        cfg.training.tp_size,
-        cfg.training.sp_ulysses_size,
-        cfg.training.sp_ring_size,
-    ) != (1, 1, 1):
-        raise ValueError(
-            "canonical objectives currently require trainer TP/SP sizes of one"
-        )
+    if cfg.training.tp_size != 1:
+        raise ValueError("canonical objectives require trainer TP size one")
+    sequence_parallel = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size > 1
+    if sequence_parallel and (
+        not requirements.supports_sequence_parallel
+        or cfg.training.attention_backend != "usp"
+    ):
+        raise ValueError("sequence parallelism requires an objective supporting USP")
     # Retain the established strategy name for data/rendezvous identifiers.
     training = cfg.training.model_copy(
         update={"strategy": family, "objective": objective}
@@ -383,6 +383,7 @@ def resolve_run(cfg, *, target_config=None):
             canonical_data.build_normalizer,
             keys=keys,
             loss_mask_filter=requirements.loss_mask_filter,
+            overlap=getattr(resolved.objective, "ttt_length", 1),
         ),
         build_collator=partial(canonical_data.build_collator, keys=keys),
         capture_layout=layout,
@@ -520,7 +521,11 @@ def build_bundle(cfg, algorithm):
         draft=draft,
         device=device,
         dtype=dtype,
-        backend=cfg.training.attention_backend,
+        backend=(
+            "eager"
+            if cfg.training.attention_backend == "usp"
+            else cfg.training.attention_backend
+        ),
         cache_dir=cfg.model.cache_dir,
     )
     if source:
@@ -606,6 +611,11 @@ def build_bundle(cfg, algorithm):
         frozen=cfg.training.frozen,
         target_head=teacher,
     )
+    runtime.attention_backend = cfg.training.attention_backend
+    if cfg.training.attention_backend == "usp":
+        from .sequence_parallel import configure_sequence_parallel
+
+        configure_sequence_parallel(runtime)
     runtime.frozen_target_modules = tuple(
         dict.fromkeys(
             [model.get_submodule(name) for name in draft.target_bindings]

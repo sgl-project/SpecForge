@@ -254,6 +254,7 @@ class LossContext:
     supervised_count: torch.Tensor | None = None
     ce_mask: torch.Tensor | None = None
     l1_mask: torch.Tensor | None = None
+    reduce_statistics: Callable | None = None
 
 
 def lk_loss(mode, *, ce_compute=None):
@@ -285,8 +286,14 @@ def lk_loss(mode, *, ce_compute=None):
         count = (
             mask.sum() if context.supervised_count is None else context.supervised_count
         )
-        if context.denominator is not None:
-            scale = context.denominator / count.where(count > 0, 1)
+        accepted = (acceptance.detach() * mask).sum()
+        denominator = context.denominator
+        if context.reduce_statistics is not None:
+            accepted, count, denominator = context.reduce_statistics(
+                accepted, count, denominator
+            )
+        if denominator is not None:
+            scale = denominator / count.where(count > 0, 1)
         if mode == "alpha":
             return (
                 ce
@@ -296,7 +303,7 @@ def lk_loss(mode, *, ce_compute=None):
         tv = (1 - acceptance) * scale
         if mode == "tv":
             return tv
-        mean_acceptance = (acceptance.detach() * mask).sum() / count.where(count > 0, 1)
+        mean_acceptance = accepted / count.where(count > 0, 1)
         weight = kl_scale * torch.exp(-kl_decay * mean_acceptance)
         return weight * ce + (1 - weight) * tv
 

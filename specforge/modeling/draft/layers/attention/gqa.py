@@ -162,17 +162,7 @@ class GQAAttention(nn.Module):
         )
         keys = context_length + length
         node = self.config
-        query = self.q_proj(hidden).view(
-            batch,
-            length,
-            node.num_attention_heads,
-            node.head_dim * (2 if node.output_gate else 1),
-        )
-        gate = None
-        if node.output_gate:
-            query, gate = query.chunk(2, dim=-1)
-            gate = gate.reshape(batch, length, node.num_attention_heads * node.head_dim)
-        query = query.transpose(1, 2)
+        query, gate = self.project_query(hidden)
         key, value = self.k_proj(hidden), self.v_proj(hidden)
         if target_context is not None:
             # Keep separate projections to preserve the existing context path's
@@ -186,9 +176,7 @@ class GQAAttention(nn.Module):
             batch, keys, node.num_key_value_heads, node.head_dim
         ).transpose(1, 2)
         if node.qk_norm_position == "before_rope":
-            query, key = self._normalize(query, self.q_norm), self._normalize(
-                key, self.k_norm
-            )
+            key = self._normalize(key, self.k_norm)
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query = apply_rotary(
@@ -216,7 +204,32 @@ class GQAAttention(nn.Module):
             dropout_p=node.attention_dropout,
             training=self.training,
         )
-        output = result.output
+        output = self.project_output(result.output, gate, result.active_queries)
+        return (output, current_kv) if output_kv else output
+
+    def project_query(self, hidden: Tensor):
+        """Project and normalize queries; return the optional output gate."""
+        batch, length = hidden.shape[:2]
+        node = self.config
+        query = self.q_proj(hidden).view(
+            batch,
+            length,
+            node.num_attention_heads,
+            node.head_dim * (2 if node.output_gate else 1),
+        )
+        gate = None
+        if node.output_gate:
+            query, gate = query.chunk(2, dim=-1)
+            gate = gate.reshape(batch, length, node.num_attention_heads * node.head_dim)
+        query = query.transpose(1, 2)
+        if node.qk_norm_position == "before_rope":
+            query = self._normalize(query, self.q_norm)
+        return query, gate
+
+    def project_output(self, output, gate, active_queries):
+        """Apply the shared output gate/projection and suppress inactive rows."""
+        batch, _, length, _ = output.shape
+        node = self.config
         output = output.transpose(1, 2).reshape(
             batch, length, node.num_attention_heads * node.head_dim
         )
@@ -224,8 +237,7 @@ class GQAAttention(nn.Module):
             output = output * gate.sigmoid()
         output = self.o_proj(output)
         # Inactive queries must stay zero even when the output projection has bias.
-        output = result.mask_output(output)
-        return (output, current_kv) if output_kv else output
+        return output.masked_fill(~active_queries.unsqueeze(-1), 0)
 
 
 register_component_builder("attention", GQASpec, GQAAttention)
