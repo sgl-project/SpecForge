@@ -1,5 +1,6 @@
 """Joint ranges are optional; term reductions and gradients are not."""
 
+import gc
 import sys
 import unittest
 from dataclasses import replace
@@ -119,6 +120,9 @@ def distributed_reduction(rank, rendezvous):
                 tuple(p.grad for p in model.head.parameters()),
                 tuple(p.grad for p in reference.parameters()),
             )
+            # Release DDP reducers and their autograd graphs while Gloo is alive.
+            del wrapped, model, expected
+            gc.collect()
         # Resolve before compute: every rank sees mismatches and dependency errors.
 
         from specforge.algorithms.objectives.implementations.registry import (
@@ -153,6 +157,7 @@ def distributed_reduction(rank, rendezvous):
             ),
         ):
             ExecutionSelection().resolve(request, (0,), 0)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
