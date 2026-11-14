@@ -1,9 +1,11 @@
 """Joint ranges are optional; term reductions and gradients are not."""
 
+import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -103,6 +105,40 @@ def distributed_reduction(rank, rendezvous):
             tuple(p.grad for p in model.head.parameters()),
             tuple(p.grad for p in reference.parameters()),
         )
+        # Resolve before compute: every rank sees mismatches and dependency errors.
+
+        from specforge.algorithms.objectives.implementations.registry import (
+            ExecutionSelection,
+            Implementation,
+        )
+
+        request = SimpleNamespace(predictions=SimpleNamespace(hidden=hidden))
+        for mismatch in (False, True):
+            entry = Implementation(f"kernel_{rank if mismatch else 0}", 0, None, None)
+            with patch(
+                "specforge.algorithms.objectives.implementations.registry.select_implementation",
+                return_value=entry,
+            ):
+                selection = ExecutionSelection()
+                if mismatch:
+                    with unittest.TestCase().assertRaisesRegex(
+                        ValueError, "differ across ranks"
+                    ):
+                        selection.resolve(request, (0,), 0)
+                else:
+                    selection.resolve(request, (0,), 0)
+                    assert selection.names == {"0:0": "kernel_0"}
+        with (
+            patch(
+                "specforge.algorithms.objectives.implementations.registry.select_implementation",
+                side_effect=ImportError("missing kernel dependency") if rank else None,
+                return_value=entry,
+            ),
+            unittest.TestCase().assertRaisesRegex(
+                ValueError, "missing kernel dependency"
+            ),
+        ):
+            ExecutionSelection().resolve(request, (0,), 0)
     finally:
         dist.destroy_process_group()
 
@@ -160,7 +196,8 @@ class LossPlanTest(unittest.TestCase):
                 supports=lambda req, group: None if group == (0, 1) else "pair only",
             )
             def joint(req, group):
-                calls.append(group)
+                if len(group) > 1:
+                    calls.append(group)
                 values = req.outputs()
                 return GroupResult(
                     {
@@ -173,6 +210,11 @@ class LossPlanTest(unittest.TestCase):
                         for i in group
                     }
                 )
+
+            register_implementation(
+                "test_single",
+                supports=lambda req, group: None if len(group) == 1 else "single only",
+            )(joint)
 
             for chunk in (0, 1, 3):
                 for groups in (((0, 1),), ()):
@@ -275,7 +317,7 @@ class LossPlanTest(unittest.TestCase):
             def without_statistics(prediction, outputs, teacher, weights, statistics):
                 return original(prediction, outputs, teacher, weights, {})
 
-            for fused in (False, True):
+            for fused in (False, True) if device == "cuda" else (False,):
                 execution = LossExecution(fused=fused, checkpoint=False)
                 with patch(
                     "specforge.algorithms.objectives.protocols.dspark.ce_l1_terms",
@@ -382,6 +424,36 @@ class LossPlanTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "kernel failed"):
                 run(p, fused=True)
 
+    def test_linear_ce_checks_installed_liger_version(self):
+        from importlib.metadata import PackageNotFoundError
+
+        kernel = SimpleNamespace(forward=lambda return_predicted_tokens=False: None)
+        module = SimpleNamespace(LigerFusedLinearCrossEntropyFunction=kernel)
+        with patch.dict(
+            sys.modules, {"liger_kernel.ops.fused_linear_cross_entropy": module}
+        ):
+            for version in ("0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.9.0"):
+                with (
+                    self.subTest(version=version),
+                    patch(
+                        "specforge.algorithms.objectives.implementations.linear_ce.metadata.version",
+                        return_value=version,
+                    ),
+                ):
+                    if version in ("0.8.3", "0.8.4"):
+                        self.assertIs(_linear_kernel.__wrapped__(), kernel)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            f"requires liger-kernel.*installed version is {version}",
+                        ):
+                            _linear_kernel.__wrapped__()
+        with patch(
+            "specforge.algorithms.objectives.implementations.linear_ce.metadata.version",
+            side_effect=PackageNotFoundError("liger-kernel"),
+        ):
+            self.assertIsNone(_linear_kernel.__wrapped__())
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_linear_ce_avoids_projection_and_preserves_gradients(self):
         if _linear_kernel() is None:
@@ -426,11 +498,8 @@ class LossPlanTest(unittest.TestCase):
                 "specforge.algorithms.objectives.implementations.linear_ce._linear_kernel",
                 return_value=None,
             ):
-                fallback = run(p, fused=True)
-            self.assertGreater(project.call_count, 0)
-            torch.testing.assert_close(
-                fallback.loss, expected.loss, rtol=tolerance, atol=2e-5
-            )
+                with self.assertRaisesRegex(ValueError, "requires Liger"):
+                    run(p, fused=True)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_domino_suffix_ce_with_an_independent_term(self):

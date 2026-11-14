@@ -666,6 +666,7 @@ def build_bundle(cfg, algorithm):
         "canonical_loss": asdict(runtime.token_loss),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
+        "canonical_loss_implementations": runtime.loss_implementations.names,
     }
     from specforge.training.provenance import model_resume_provenance
 

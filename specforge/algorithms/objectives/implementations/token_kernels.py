@@ -66,8 +66,8 @@ def register_token_kernel(kind, compute):
         p = request.predictions
         if len(group) != 1 or request.terms[group[0]].loss.kind != kind:
             return "requires one matching token loss"
-        if not p.hidden.is_cuda or p.hidden.numel() == 0:
-            return "requires nonempty CUDA inputs"
+        if not p.hidden.is_cuda:
+            return "requires CUDA inputs"
         if p.hidden.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             return "requires FP16/BF16/FP32"
         return None
@@ -82,17 +82,18 @@ def register_token_kernel(kind, compute):
             request.teacher is None or request.teacher.shape != logits.shape
         ):
             raise ValueError("distillation requires aligned teacher and draft logits")
-        # A projection may promote dtype. Preserve the loss reference outside
-        # the kernel's supported dtype domain.
-        if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            result = loss.evaluate(
-                logits, request.labels, teacher=request.teacher, context=inputs.context
+        if not logits.is_cuda or logits.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError(
+                "fused token loss requires CUDA/ROCm FP16/BF16/FP32 logits"
             )
-        else:
-            kwargs = {"context": inputs.context} if loss.registration.contextual else {}
-            result = compute(
-                logits, request.labels, request.teacher, **kwargs, **loss.options
-            )
+        kwargs = {"context": inputs.context} if loss.registration.contextual else {}
+        result = compute(
+            logits, request.labels, request.teacher, **kwargs, **loss.options
+        )
         if not isinstance(result, LossOutput):
             result = LossOutput(result)
         return GroupResult(

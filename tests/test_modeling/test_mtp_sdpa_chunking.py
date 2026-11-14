@@ -80,7 +80,12 @@ class MTPBackendObjectiveTest(unittest.TestCase):
                         self.assertEqual(
                             head.call_count,
                             forward_calls
-                            * (2 if chunk_size and runtime.execution.checkpoint else 1),
+                            * (
+                                2
+                                if 0 < chunk_size < selected.numel()
+                                and runtime.execution.checkpoint
+                                else 1
+                            ),
                         )
                         self.assertLessEqual(
                             max(call.args[0].shape[0] for call in head.call_args_list),

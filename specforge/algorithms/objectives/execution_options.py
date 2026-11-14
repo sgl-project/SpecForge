@@ -14,7 +14,8 @@ class LossExecution:
         chunk_size: Units per chunk. None inherits the protocol default;
             zero disables chunking.
         checkpoint: Recompute eligible chunk projections/losses during backward.
-        fused: Allow applicable registered optimized implementations.
+        fused: Request optimized execution on CUDA/ROCm. Missing required
+            dependencies fail; unsupported loss contracts use a logged reference.
         trim: Skip units without supervision when the loss contract permits it.
         teacher_chunk_size: Optional positive vocabulary tile size for compact
             offline teacher projection; None uses ordinary teacher projection.

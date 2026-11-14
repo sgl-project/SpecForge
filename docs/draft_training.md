@@ -251,13 +251,17 @@ training:
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
   default; zero disables chunking. Recurrent heads always keep whole blocks.
 - `checkpoint` controls recomputation of chunk projections and losses during
-  backward. It defaults to true and is independent of `fused`.
+  backward when the prediction set spans multiple chunks. A single chunk is
+  not recomputed. It defaults to true and is independent of fused execution.
 - `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
-  corrections without constructing full corrected logits. CPU, FP64, empty
-  inputs and losses without a fused implementation use the eager reference.
-  Missing Triton on a selected CUDA fused path raises; it is not silently ignored.
+  corrections without constructing full corrected logits. CPU, FP64 and missing
+  required dependencies raise rather than silently disabling the requested kernels.
+  Loss contracts without an optimized implementation use a logged reference.
+  Empty inputs use the reference only to preserve zero gradients.
+  The first selection for each prediction group is logged at INFO, checked across
+  ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
 - `trim` defaults to false and skips prediction units with no supervised positions.
   It preserves explicit denominators and does not truncate recurrent blocks.
   D-PACE keeps complete chains, and contextual LK losses keep all rows.
@@ -268,8 +272,11 @@ training:
 
 For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
 retaining full logits. It requires a compatible Liger kernel that also returns
-predicted tokens. Wrapped/transformed heads, unavailable kernels and unsupported
-inputs retain ordinary projection; losses may still use a token kernel.
+predicted tokens. Its installed version is checked against the project's Liger
+requirement before loading the kernel; an out-of-range version raises, including
+after a no-deps installation. An unavailable kernel also raises for an eligible
+linear head.
+Wrapped/transformed heads retain ordinary projection and may use a token kernel.
 
 Chunked D-PACE first collects detached chain statistics, then recomputes projection
 chunks with the complete-chain weights. Contextual LK losses retain whole-set
@@ -277,13 +284,19 @@ execution, and DSpine retains it when no window alignment statistic is supplied.
 Thus requesting chunking does not promise bounded loss memory for those paths.
 
 `model.use_fused_conv` opts canonical grouped convolution into its existing Triton
-kernel. Unsupported devices, dtypes, group sizes and compiled execution retain the
-eager implementation. The fused kernel accumulates in FP32 and rounds once, so
+kernel. Enabling it without grouped convolution, or with unsupported weights or
+group sizes, fails during setup. Incompatible runtime input dtypes and compiled
+execution also raise. The selected path is logged during setup. Ordinary loading
+through specforge.loading and exported models use eager convolution by default;
+this training option is not stored in the model architecture.
+The fused kernel accumulates in FP32 and rounds once, so
 BF16 results need not be bit-identical to eager per-tap rounding. Parameter names
 and checkpoint tensors do not change. Liger selection remains independent.
 
 Execution settings are saved and checked on full resume. Older canonical
 checkpoints without these fields are interpreted using the previous defaults.
+A checkpoint that enabled fused loss but did not record the selected implementations
+cannot prove kernel compatibility and is rejected for full resume.
 Existing recipes keep their previous defaults until explicitly migrated.
 
 MTP accepts `objective_chunk_size` through objective options and maps the legacy

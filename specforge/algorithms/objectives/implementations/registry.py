@@ -120,13 +120,14 @@ def register_implementation(name, *, supports, priority=0):
     return register
 
 
-def select_implementation(request, group, *, name="auto"):
+def select_implementation(request, group, *, name="auto", rejections=None):
     """Select an applicable implementation without executing its kernel.
 
     Args:
         request: Projection, resolved term inputs and lazy output access.
         group: Tuple of indices into request.predictions.plan.terms to execute
             together. A one-element tuple requests independent execution.
+        rejections: Optional list receiving rejection reasons for diagnostics.
         name: "auto" checks priority order, breaking ties by ascending name.
             Any other value requires that specific registered implementation.
 
@@ -153,8 +154,82 @@ def select_implementation(request, group, *, name="auto"):
         if reason is None:
             logger.debug("Loss group %s uses %s", group, entry.name)
             return entry
+        if rejections is not None:
+            rejections.append(f"{entry.name}: {reason}")
         logger.debug("Loss group %s skips %s: %s", group, entry.name, reason)
         if name != "auto":
             raise ValueError(f"{name} cannot execute this loss group: {reason}")
     logger.debug("Loss group %s uses reference execution", group)
     return None
+
+
+class ExecutionSelection:
+    """Resolve kernels once per prediction/group and retain their resume identity.
+
+    The names dict is a live checkpoint mapping. Empty batches use the same
+    selection, but the executor evaluates their zero-gradient reference path.
+    """
+
+    def __init__(self):
+        self.names = {}
+        self._entries = {}
+        self._expected = None
+
+    def restore(self, names):
+        """Set the saved selections to check when real prediction inputs arrive."""
+        self._expected = dict(names)
+        self.names.clear()
+        self._entries.clear()
+
+    def resolve(self, request, group, prediction_index):
+        """Select and log a group once; reject rank or resume disagreement."""
+        key = f"{prediction_index}:" + ",".join(map(str, group))
+        if key in self._entries:
+            return self._entries[key]
+        reasons, error, entry = [], None, None
+        try:
+            entry = select_implementation(request, group, rejections=reasons)
+            hidden = request.predictions.hidden
+            if (
+                entry is None
+                and len(group) == 1
+                and (
+                    not hidden.is_cuda
+                    or hidden.dtype
+                    not in (torch.float16, torch.bfloat16, torch.float32)
+                )
+            ):
+                raise ValueError("fused loss requires CUDA/ROCm FP16/BF16/FP32 inputs")
+        except (ImportError, ValueError, RuntimeError) as exc:
+            error = str(exc)
+        name = entry.name if entry else ("split" if len(group) > 1 else "reference")
+        if (
+            error is None
+            and self._expected is not None
+            and self._expected.get(key) != name
+        ):
+            error = (
+                f"loss implementation {key} changed on resume: "
+                f"{self._expected.get(key)!r} -> {name!r}"
+            )
+        # Agree before invoking a new kernel, including ranks missing a dependency.
+        import torch.distributed as dist
+
+        outcomes = [(key, name, error)]
+        if dist.is_initialized():
+            outcomes = [None] * dist.get_world_size()
+            dist.all_gather_object(outcomes, (key, name, error))
+        errors = [item[2] for item in outcomes if item[2] is not None]
+        if errors:
+            raise ValueError("; ".join(dict.fromkeys(errors)))
+        if any(item[:2] != (key, name) for item in outcomes):
+            raise ValueError(f"Loss implementations differ across ranks: {outcomes}")
+        self.names[key] = name
+        self._entries[key] = entry
+        logger.info(
+            "Loss group %s uses %s%s",
+            key,
+            name,
+            f"; skipped: {'; '.join(reasons)}" if reasons else "",
+        )
+        return entry

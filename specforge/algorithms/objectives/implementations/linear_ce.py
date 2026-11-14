@@ -2,8 +2,10 @@
 
 import inspect
 from functools import lru_cache
+from importlib import metadata
 
 import torch
+from packaging.requirements import Requirement
 
 from ..projection import LinearProjection
 from .ce import projection_ce_support
@@ -14,9 +16,21 @@ from .registry import GroupResult, register_implementation
 def _linear_kernel():
     """Return the compatible Liger kernel class, or None if unavailable.
 
-    The result is cached. Missing optional packages and an unsupported kernel
-    signature disable this optimization; unrelated import errors propagate.
+    The result is cached. Installed versions outside the project requirement
+    raise before importing the kernel. Missing packages or a missing output
+    capability return None; the caller reports that fused linear CE is unavailable.
     """
+    from specforge.modeling.draft.dflash_kernels import LIGER_REQUIREMENT
+
+    requirement = Requirement(LIGER_REQUIREMENT)
+    try:
+        installed = metadata.version(requirement.name)
+    except metadata.PackageNotFoundError:
+        return None
+    if installed not in requirement.specifier:
+        raise ValueError(
+            f"fused linear CE requires {LIGER_REQUIREMENT}; installed version is {installed}"
+        )
     try:
         from liger_kernel.ops.fused_linear_cross_entropy import (
             LigerFusedLinearCrossEntropyFunction,
@@ -64,7 +78,10 @@ def _linear_support(request, group):
     if head.weight.device != p.hidden.device or head.weight.dtype != p.hidden.dtype:
         return "requires matching activation and weight device/dtype"
     if _linear_kernel() is None:
-        return "Liger linear CE with predicted-token output is unavailable"
+        raise ValueError(
+            "fused linear CE requires Liger with predicted-token output; "
+            "install the supported Liger dependency or disable fused loss"
+        )
     return None
 
 

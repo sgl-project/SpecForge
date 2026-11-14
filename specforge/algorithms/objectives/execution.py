@@ -8,11 +8,7 @@ from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 
 from .base import ObjectiveResult
 from .execution_options import LossExecution
-from .implementations.registry import (
-    ExecutionRequest,
-    TermInputs,
-    select_implementation,
-)
+from .implementations.registry import ExecutionRequest, ExecutionSelection, TermInputs
 from .losses import LossContext
 from .reductions import PlanResult, combine_results
 
@@ -133,6 +129,8 @@ def evaluate_predictions(
     weights=None,
     denominator=None,
     execution=LossExecution(),
+    selection=None,
+    prediction_index=0,
 ):
     """Execute a prediction set and retain separate statistics per term.
 
@@ -145,6 +143,8 @@ def evaluate_predictions(
             used by complete-chain weighting.
         denominator: Optional scalar contribution overriding local denominators.
         execution: Options controlling optimized implementation selection.
+        selection: Run-local resolved implementations and resume checks.
+        prediction_index: Stable index of this set within the protocol batch.
 
     Returns:
         PlanResult with weighted, unnormalized term sums and metric counts.
@@ -157,6 +157,7 @@ def evaluate_predictions(
         RuntimeError: A selected kernel fails; errors are not silently retried.
     """
     p = predictions
+    selection = selection or ExecutionSelection()
     projected = projected or prepare_supervision(p, loss, weighting, execution)
     losses = selected_losses(p, loss)
     default_weights = (
@@ -215,9 +216,18 @@ def evaluate_predictions(
             }
 
     def execute(group):
-        entry = select_implementation(request, group) if execution.fused else None
+        entry = (
+            selection.resolve(request, group, prediction_index)
+            if execution.fused
+            else None
+        )
         if entry is None:
             return False
+        if not p.hidden.numel():
+            # Keep empty-rank gradients without launching a zero-sized kernel.
+            for index in group:
+                reference(index)
+            return True
         result = entry.compute(request, group)
         if set(result.numerators) != set(group):
             raise ValueError(
@@ -398,6 +408,8 @@ def evaluate_chunks(
     execution=LossExecution(),
     weights=None,
     denominator=None,
+    selection=None,
+    prediction_index=0,
 ):
     """Evaluate chunks and merge each term before denominator normalization.
 
@@ -410,12 +422,15 @@ def evaluate_chunks(
         weights: Optional externally computed per-position weights.
         denominator: Optional per-position denominator contributions, summed
             within each chunk and then merged across chunks.
+        selection: Run-local resolved implementations and resume checks.
+        prediction_index: Stable index of this set within the protocol batch.
 
     Returns:
         PlanResult with additive chunk statistics merged and fixed whole-set
         denominators restored once. Contextual/unsafe projections stay unsplit;
         unsafe replay disables checkpointing.
     """
+    selection = selection or ExecutionSelection()
     contextual = any(
         selected.registration.contextual
         for selected in selected_losses(predictions, loss)
@@ -440,11 +455,13 @@ def evaluate_chunks(
         item = predictions.select(part)
         kwargs = dict(
             execution=execution,
+            selection=selection,
+            prediction_index=prediction_index,
             weights=None if weights is None else weights[part],
             denominator=None if denominator is None else denominator[part].sum(),
         )
         if (
-            chunk_size
+            0 < chunk_size < predictions.hidden.shape[0]
             and execution.checkpoint
             and predictions.projection.recompute_safe
             and torch.is_grad_enabled()
@@ -473,7 +490,9 @@ def evaluate_chunks(
     return result
 
 
-def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()):
+def execute_batch(
+    batch, loss, weighting, *, training, execution=LossExecution(), selection=None
+):
     """Execute a protocol's prediction batch under its reduction contract.
 
     Args:
@@ -482,6 +501,7 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
         weighting: Runtime position weights or complete-chain weighting policy.
         training: Whether global_microbatch synchronizes denominators across ranks.
         execution: Overrides for chunking, checkpointing and optimized execution.
+        selection: Persistent implementation choices; standalone calls use a local selection.
 
     Returns:
         ObjectiveResult containing the trainer loss numerator/denominator and
@@ -491,6 +511,7 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
         ValueError: The batch is empty, its reduction is unknown, or independent
             term reductions are requested with an unsupported batch contract.
     """
+    selection = selection or ExecutionSelection()
     chunk_size = (
         batch.chunk_size if execution.chunk_size is None else execution.chunk_size
     )
@@ -519,10 +540,14 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
                     weighting,
                     projected=q,
                     execution=execution,
+                    selection=selection,
+                    prediction_index=index,
                     weights=w.reshape_as(p.mask),
                     denominator=d.sum(),
                 )
-                for p, q, (w, d) in zip(predictions, projected, weighted)
+                for index, (p, q, (w, d)) in enumerate(
+                    zip(predictions, projected, weighted)
+                )
             ]
         else:
             statistics = []
@@ -554,15 +579,25 @@ def execute_batch(batch, loss, weighting, *, training, execution=LossExecution()
                     weighting,
                     chunk_size,
                     execution=execution,
+                    selection=selection,
+                    prediction_index=index,
                     weights=w.reshape_as(p.mask),
                     denominator=d.reshape_as(p.mask),
                 )
-                for p, (w, d) in zip(predictions, weighted)
+                for index, (p, (w, d)) in enumerate(zip(predictions, weighted))
             ]
     else:
         results = [
-            evaluate_chunks(item, loss, weighting, chunk_size, execution=execution)
-            for item in batch.predictions
+            evaluate_chunks(
+                item,
+                loss,
+                weighting,
+                chunk_size,
+                execution=execution,
+                selection=selection,
+                prediction_index=index,
+            )
+            for index, item in enumerate(batch.predictions)
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")

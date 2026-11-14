@@ -53,8 +53,10 @@ class ObjectiveModel(nn.Module):
     ):
         super().__init__()
         from .execution_options import LossExecution
+        from .implementations.registry import ExecutionSelection
 
         self.execution = execution or LossExecution()
+        self.loss_implementations = ExecutionSelection()
         self.draft_model = draft_model
         self.objective = objective
         self.registration = registration
@@ -214,6 +216,7 @@ class ObjectiveModel(nn.Module):
             self.weighting,
             training=self.draft_model.training,
             execution=self.execution,
+            selection=self.loss_implementations,
         )
 
 

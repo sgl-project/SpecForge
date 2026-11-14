@@ -328,6 +328,123 @@ class LossExecutionTest(unittest.TestCase):
                         if architecture == "DominoDraftModel":
                             self.assertGreater(kernel.call_count, 0)
 
+    def test_fused_loss_rejects_cpu(self):
+        config, runtime = build_runtime("DSparkDraftModel", options={"num_anchors": 2})
+        runtime.execution = LossExecution(fused=True)
+        with self.assertRaisesRegex(ValueError, "requires CUDA"):
+            runtime(training_batch(config), step=0, total_steps=1)
+
+    def test_checkpoint_false_does_not_recompute(self):
+        from torch.utils.checkpoint import checkpoint
+
+        config, runtime = build_runtime("MTPDraftModel")
+        for enabled in (False, True):
+            runtime.execution = LossExecution(chunk_size=1, checkpoint=enabled)
+            with patch("torch.utils.checkpoint.checkpoint", wraps=checkpoint) as calls:
+                runtime(training_batch(config), step=0, total_steps=1).loss.backward()
+            self.assertEqual(calls.called, enabled)
+
+    def test_fused_conv_rejects_invalid_configuration(self):
+        from specforge.config.draft.conv import GroupedCausalConvSpec
+        from specforge.modeling.draft.layers.conv.grouped_causal import (
+            GroupedCausalConv,
+        )
+        from specforge.modeling.draft.layers.kernels import configure_kernels
+
+        with self.assertRaisesRegex(ValueError, "requires a grouped convolution"):
+            configure_kernels(nn.Linear(4, 4), use_fused_conv=True)
+        conv = GroupedCausalConv(
+            GroupedCausalConvSpec(kernel_size=2, group_size=4),
+            hidden_size=4,
+            block_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "CUDA"):
+            configure_kernels(conv, use_fused_conv=True)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_fused_conv_rejects_runtime_fallbacks(self):
+        from specforge.config.draft.conv import GroupedCausalConvSpec
+        from specforge.modeling.draft.layers.conv.grouped_causal import (
+            GroupedCausalConv,
+        )
+        from specforge.modeling.draft.layers.kernels import configure_kernels
+
+        conv = GroupedCausalConv(
+            GroupedCausalConvSpec(kernel_size=2, group_size=4),
+            hidden_size=8,
+            block_size=2,
+            device="cuda",
+        )
+        for group_size in (3, 2048):
+            invalid = GroupedCausalConv(
+                GroupedCausalConvSpec(kernel_size=2, group_size=group_size),
+                hidden_size=group_size,
+                block_size=2,
+                device="cuda",
+            )
+            with self.assertRaisesRegex(ValueError, "power-of-two"):
+                configure_kernels(invalid, use_fused_conv=True)
+        configure_kernels(conv, use_fused_conv=True)
+        hidden = torch.randn(1, 2, 8, device="cuda")
+        _, coefficients = conv.prepare(hidden)
+        with self.assertRaisesRegex(ValueError, "matching"):
+            conv.finish(hidden.to(torch.bfloat16), coefficients)
+        with patch("torch.compiler.is_compiling", return_value=True):
+            with self.assertRaisesRegex(ValueError, "torch.compile"):
+                conv.prepare(hidden)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_selection_is_logged_recorded_and_checked_on_resume(self):
+        from specforge.algorithms.objectives.implementations.registry import (
+            ExecutionSelection,
+        )
+
+        logits = torch.randn(3, 1, 17, device="cuda", requires_grad=True)
+        prediction = Predictions(
+            hidden=logits,
+            projection=Projection(lambda x: {"logits": x}),
+            mask=torch.ones(3, 1, device="cuda"),
+            positions=torch.zeros(3, 1, device="cuda", dtype=torch.long),
+            labels=torch.zeros(3, 1, device="cuda", dtype=torch.long),
+        )
+
+        def run(selection, p=prediction):
+            return execute_batch(
+                PredictionBatch((p,)),
+                TokenLoss(kind="ce"),
+                PositionWeighting(),
+                training=True,
+                execution=LossExecution(fused=True),
+                selection=selection,
+            )
+
+        selected = ExecutionSelection()
+        with self.assertLogs(
+            "specforge.algorithms.objectives.implementations.registry", level="INFO"
+        ) as logs:
+            run(selected, prediction.select(slice(0, 0))).loss.backward()
+            expected = run(selected).loss
+            run(selected)
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(selected.names, {"0:0": "token_ce"})
+        restored = ExecutionSelection()
+        restored.restore(selected.names)
+        torch.testing.assert_close(run(restored).loss, expected)
+        restored.restore({"0:0": "linear_ce"})
+        with self.assertRaisesRegex(ValueError, "changed on resume"):
+            run(restored)
+        # An unsupported loss contract is a visible reference fallback.
+        with (
+            patch.dict(_IMPLEMENTATIONS, {}, clear=True),
+            self.assertLogs(
+                "specforge.algorithms.objectives.implementations.registry", level="INFO"
+            ) as logs,
+        ):
+            fallback = ExecutionSelection()
+            torch.testing.assert_close(run(fallback).loss, expected)
+        self.assertEqual(fallback.names, {"0:0": "reference"})
+        self.assertIn("reference", logs.output[0])
+
     def test_execution_options_reject_invalid_values(self):
         for values in (
             {"chunk_size": -1},

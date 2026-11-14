@@ -310,6 +310,19 @@ class Trainer:
                 **persisted_contract,
             }
             for key, current in resume_contract.items():
+                if key == "canonical_loss_implementations":
+                    saved = state.get(key)
+                    if saved is None:
+                        if state.get("canonical_loss_execution", {}).get(
+                            "fused", False
+                        ):
+                            raise ValueError(
+                                "checkpoint does not record resolved fused loss implementations"
+                            )
+                        saved = {}
+                    # Compare on real inputs before the first kernel execution.
+                    model.loss_implementations.restore(saved)
+                    continue
                 persisted = state.get(key)
                 persisted_available = key in state
                 comparison_current = current

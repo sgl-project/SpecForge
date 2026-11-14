@@ -12,8 +12,6 @@ def projection_ce_support(request, group):
         torch.float32,
     ):
         return "requires CUDA FP16/BF16/FP32"
-    if p.hidden.numel() == 0:
-        return "empty projection uses the reference path"
     if not p.projection.chunk_safe or not p.projection.recompute_safe:
         return "projection does not permit chunked/recomputed fusion"
     if request.materialized:

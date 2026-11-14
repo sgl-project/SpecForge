@@ -80,17 +80,21 @@ class GroupedCausalConv(nn.Module):
             raise ValueError("sequence length must be divisible by block_size")
 
     def _convolve(self, hidden: Tensor, delta: Tensor, *, side: int) -> Tensor:
-        if (
-            self.use_fused
-            and hidden.is_cuda
-            and hidden.numel() > 0
-            and hidden.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and hidden.dtype == delta.dtype == self.base_kernel.dtype
-            and not torch.compiler.is_compiling()
-        ):
-            from .triton import dflash2_grouped_conv_fused, supports_group_size
+        if self.use_fused:
+            if torch.compiler.is_compiling():
+                raise ValueError("use_fused_conv does not support torch.compile")
+            if (
+                not hidden.is_cuda
+                or hidden.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                or hidden.dtype != delta.dtype
+                or hidden.dtype != self.base_kernel.dtype
+            ):
+                raise ValueError(
+                    "use_fused_conv requires matching CUDA/ROCm FP16/BF16/FP32 inputs and weights"
+                )
+            from .triton import dflash2_grouped_conv_fused
 
-            if supports_group_size(self.config.group_size):
+            if hidden.numel():
                 return dflash2_grouped_conv_fused(
                     hidden,
                     delta,
@@ -98,6 +102,7 @@ class GroupedCausalConv(nn.Module):
                     self.block_size,
                     self.config.group_size,
                 )
+            # Empty inputs use eager arithmetic only to preserve zero gradients.
         batch, length, width = hidden.shape
         blocks = hidden.reshape(
             batch,

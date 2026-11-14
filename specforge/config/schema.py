@@ -1233,6 +1233,22 @@ class Config(StrictConfigModel):
     def resume_path(self) -> Optional[str]:
         return self.resume or self.training.resume_from
 
+    def validate_legacy_training_options(self):
+        """Reject canonical-only options after the loading path is resolved."""
+        if (
+            self.training.objective
+            or self.training.objective_options
+            or self.training.frozen
+            or self.training.loss
+            or self.training.loss_execution
+            or self.model.use_fused_conv
+            or self.training.weighting is not None
+        ):
+            raise ValueError(
+                "objective/options/frozen/loss/weighting/loss_execution/use_fused_conv "
+                "require the canonical draft loading path"
+            )
+
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
@@ -1259,19 +1275,8 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "scratch/weights_from/from_target requires draft structure"
                 )
-        elif not self.resume_path and (
-            self.training.objective
-            or self.training.objective_options
-            or self.training.frozen
-            or self.training.loss
-            or self.training.loss_execution
-            or self.model.use_fused_conv
-            or self.training.weighting is not None
-        ):
-            raise ValueError(
-                "objective/options/frozen/loss/weighting/loss_execution/use_fused_conv "
-                "require the canonical draft loading path"
-            )
+        elif not self.resume_path:
+            self.validate_legacy_training_options()
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
