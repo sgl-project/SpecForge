@@ -167,7 +167,7 @@ class ServingBoundariesTest(unittest.TestCase):
             )
 
     def test_recipe_causality_tokens_and_auxiliary_layers(self):
-        root = Path(__file__).resolve().parents[2] / "configs"
+        root = Path(__file__).resolve().parents[2] / "tests/fixtures/legacy_drafts"
         for name in (
             "minimax-m3-dspark",
             "qwen3.6-27b-dflash",
@@ -230,7 +230,11 @@ class ServingBoundariesTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         for name in ("qwen3.8-27b-dflash2", "qwen3.6-27b-dflash2"):
             with self.subTest(recipe=name):
-                payload = json.loads((root / "configs" / (name + ".json")).read_text())
+                payload = json.loads(
+                    (
+                        root / "tests/fixtures/legacy_drafts" / (name + ".json")
+                    ).read_text()
+                )
                 config = decode_legacy_config(
                     payload,
                     target_config={

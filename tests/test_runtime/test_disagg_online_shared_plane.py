@@ -11,12 +11,12 @@ from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.checkpoint import STATE_FILE
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 

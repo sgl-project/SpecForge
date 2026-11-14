@@ -704,12 +704,15 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertNotIn("ModelRunner", source)
 
     def test_only_canonical_draft_configs_are_checked_in(self):
-        present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
+        present = {
+            path.name
+            for path in (REPO_ROOT / "tests/fixtures/legacy_drafts").glob("*.json")
+        }
         self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
 
     def test_dspark_configs_are_qwen3_family(self):
         dspark_configs = {}
-        for path in sorted((REPO_ROOT / "configs").glob("*.json")):
+        for path in sorted((REPO_ROOT / "tests/fixtures/legacy_drafts").glob("*.json")):
             payload = json.loads(path.read_text(encoding="utf-8"))
             if "DSparkDraftModel" in payload.get("architectures", []):
                 dspark_configs[path.name] = payload

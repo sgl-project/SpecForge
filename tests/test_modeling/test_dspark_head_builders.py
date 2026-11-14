@@ -1,7 +1,6 @@
 """Node-driven DSpark heads retain legacy initialization and explicit placement."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -9,43 +8,12 @@ from specforge.config.draft.architecture.dspark import (
     ConfidenceHeadSpec,
     MarkovHeadSpec,
 )
-from specforge.modeling.draft.dspark import build_markov_head as build_legacy_head
 from specforge.modeling.draft.heads.confidence import AcceptRatePredictor
 from specforge.modeling.draft.heads.markov import build_markov_head
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
 
 class DSparkHeadBuilderTest(unittest.TestCase):
-    def test_node_selection_preserves_legacy_initialization_and_math(self):
-        for kind in ("vanilla", "gated", "rnn"):
-            with self.subTest(kind=kind):
-                torch.manual_seed(83)
-                actual = build_markov_head(
-                    MarkovHeadSpec(type=kind, rank=4), vocab_size=16, hidden_size=8
-                )
-                torch.manual_seed(83)
-                reference = build_legacy_head(
-                    SimpleNamespace(vocab_size=16, hidden_size=8),
-                    {"markov_head_type": kind, "markov_rank": 4},
-                )
-                self.assertIs(type(actual), type(reference))
-                torch.testing.assert_close(
-                    actual.state_dict(), reference.state_dict(), rtol=0, atol=0
-                )
-                logits = torch.randn(2, 3, 16)
-                hidden = torch.randn(2, 3, 8)
-                ids = torch.randint(16, (2, 3))
-                torch.testing.assert_close(
-                    actual.apply_block_logits(
-                        logits, token_ids=ids, hidden_states=hidden
-                    ),
-                    reference.apply_block_logits(
-                        logits, token_ids=ids, hidden_states=hidden
-                    ),
-                    rtol=0,
-                    atol=0,
-                )
-
     def test_meta_materialization_and_generic_initialization(self):
         owner = DFlashDraftModel(model_config(initializer_range=0))
         for kind in ("vanilla", "gated", "rnn"):

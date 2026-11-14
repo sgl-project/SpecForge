@@ -37,41 +37,6 @@ def _validate_feature_provider(
         algorithm.providers.server_streaming_for(modality)
 
 
-def _validate_draft_options(
-    cfg: Config,
-    algorithm: AlgorithmRegistration,
-) -> None:
-    requirement = algorithm.spec.draft
-    provider = algorithm.providers.model.draft_config
-    if (
-        cfg.draft is None
-        and not cfg.model.draft_model_config
-        and not cfg.model.draft_checkpoint_path
-        and provider.target_defaults is None
-    ):
-        raise ValueError(
-            f"training.strategy={algorithm.name!r} requires "
-            "model.draft_model_config; automatic target-derived configs are "
-            "not registered for this algorithm"
-        )
-
-    overrides = {
-        "num_hidden_layers": cfg.model.draft_num_hidden_layers,
-        "block_size": cfg.model.draft_block_size,
-    }
-    fixed_values = dict(requirement.fixed_override_values)
-    for name, value in overrides.items():
-        if value is not None and name not in requirement.supported_overrides:
-            raise ValueError(
-                f"algorithm {algorithm.name!r} does not support " f"model.draft_{name}"
-            )
-        if value is not None and name in fixed_values and value != fixed_values[name]:
-            raise ValueError(
-                f"algorithm {algorithm.name!r} requires model.draft_{name}="
-                f"{fixed_values[name]} or no override"
-            )
-
-
 def _validate_algorithm_capabilities(
     cfg: Config,
     algorithm: AlgorithmRegistration,
@@ -94,23 +59,6 @@ def _validate_algorithm_capabilities(
             f"{capabilities.required_batch_size}"
         )
 
-    layers = cfg.model.aux_hidden_state_layer_ids
-    if layers is not None:
-        if not capabilities.allows_aux_layer_override:
-            raise ValueError(
-                f"algorithm {algorithm.name!r} gets capture layers from its draft "
-                "config; model.aux_hidden_state_layer_ids would be ignored"
-            )
-        if (
-            len(layers) != 3
-            or any(isinstance(layer, bool) or layer < 0 for layer in layers)
-            or len(set(layers)) != len(layers)
-        ):
-            raise ValueError(
-                "model.aux_hidden_state_layer_ids must contain exactly three "
-                "distinct non-negative layer ids"
-            )
-
     if training.loss.get("scheduling", {}).get("teacher_chunk_size") and (
         not capabilities.supports_compact_teacher
         or mode is not FeatureMode.OFFLINE
@@ -128,15 +76,6 @@ def _validate_algorithm_capabilities(
         raise ValueError(
             f"algorithm {algorithm.name!r} does not support "
             "training.loss.scheduling.trim"
-        )
-
-    if (
-        not training.dflash_teacher_metrics
-        and not capabilities.supports_teacher_metrics_opt_out
-    ):
-        raise ValueError(
-            f"algorithm {algorithm.name!r} does not support "
-            "training.dflash_teacher_metrics=false"
         )
 
     # Only an explicit true is an error; the default (None) is auto and is off
@@ -220,14 +159,8 @@ def validate_resolved_run(
 ) -> None:
     """Validate one config against its resolved pure contract and providers."""
 
-    if algorithm.name != cfg.training.strategy:
-        raise ValueError(
-            "resolved algorithm does not match training.strategy: "
-            f"{algorithm.name!r} != {cfg.training.strategy!r}"
-        )
     mode = _feature_mode(cfg)
     _validate_feature_provider(cfg, algorithm, mode)
-    _validate_draft_options(cfg, algorithm)
     _validate_algorithm_capabilities(cfg, algorithm, mode)
     _validate_training_topology(cfg, mode)
     _validate_vocab_mapping(cfg, algorithm, mode)

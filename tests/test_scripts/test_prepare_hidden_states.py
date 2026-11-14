@@ -14,13 +14,13 @@ from scripts.prepare_hidden_states import (
     parse_args,
     resolve_offline_capture_plan,
 )
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
-    def test_cli_defaults_to_legacy_eagle3_capture(self):
+    def test_cli_requires_explicit_draft(self):
         argv = [
             "prepare_hidden_states.py",
             "--server-urls",
@@ -30,65 +30,42 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             "--data-path",
             "data.jsonl",
         ]
-        with mock.patch("sys.argv", argv):
+        with mock.patch("sys.argv", argv), self.assertRaises(SystemExit):
+            parse_args()
+        preset = "specforge/config/draft/presets/qwen3-4b-dspark.yaml"
+        with mock.patch("sys.argv", argv + ["--draft", preset]):
             args = parse_args()
-
-        self.assertEqual("eagle3", args.strategy)
-        self.assertIsNone(args.draft_model_config)
-        self.assertEqual(args.server_urls, ["http://localhost:30000"])
-        self.assertFalse(hasattr(args, "tp_size"))
-        self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
-        self.assertFalse(hasattr(args, "draft_block_size"))
-        self.assertFalse(hasattr(args, "capture_layers"))
-
-    def test_cli_accepts_dflash_family_config(self):
-        argv = [
-            "prepare_hidden_states.py",
-            "--server-urls",
-            "http://localhost:30000",
-            "--target-model-path",
-            "target",
-            "--data-path",
-            "data.jsonl",
-            "--strategy",
-            "dspark",
-            "--draft-model-config",
-            "configs/qwen3-4b-dspark.json",
-        ]
-        with mock.patch("sys.argv", argv):
-            args = parse_args()
-
-        self.assertEqual("dspark", args.strategy)
-        self.assertEqual(
-            "configs/qwen3-4b-dspark.json",
-            args.draft_model_config,
-        )
-        self.assertFalse(hasattr(args, "capture_layers"))
+        self.assertEqual(args.draft, preset)
+        self.assertFalse(hasattr(args, "strategy"))
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
             "eagle3": (
-                "qwen3-8b-eagle3.json",
-                (1, 19, 36),
+                "qwen3-8b-eagle3.yaml",
+                (1, 17, 32),
                 {
                     "input_ids",
                     "loss_mask",
-                    "aux_hidden_state",
-                    "hidden_state",
+                    "hidden_states",
+                    "target_last_hidden_states",
                 },
             ),
             "dflash": (
-                "qwen3-8b-dflash.json",
+                "qwen3-8b-dflash.yaml",
                 (1, 9, 17, 25, 33),
-                {"input_ids", "loss_mask", "hidden_states"},
+                {
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                },
             ),
             "domino": (
-                "qwen3-8b-domino.json",
+                "qwen3-8b-domino.yaml",
                 (1, 9, 17, 25, 33),
                 {"input_ids", "loss_mask", "hidden_states"},
             ),
             "dspark": (
-                "qwen3-4b-dspark.json",
+                "qwen3-4b-dspark.yaml",
                 (1, 9, 17, 25, 33),
                 {
                     "input_ids",
@@ -98,17 +75,21 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 },
             ),
         }
-        target_config = SimpleNamespace(num_hidden_layers=40)
-
         for strategy, (config_name, layers, feature_names) in expected.items():
             args = SimpleNamespace(
-                strategy=strategy,
+                objective=None,
+                objective_options={},
                 target_model_path="target",
-                draft_model_config=str(REPO_ROOT / "configs" / config_name),
+                draft=str(REPO_ROOT / "specforge/config/draft/presets" / config_name),
                 trust_remote_code=False,
                 cache_dir=None,
                 output_path="offline-features",
                 max_length=128,
+            )
+            target_config = dict(
+                num_hidden_layers=40,
+                hidden_size=2560 if strategy == "dspark" else 4096,
+                vocab_size=151936,
             )
             with self.subTest(strategy=strategy):
                 plan = resolve_offline_capture_plan(args, target_config)
@@ -271,133 +252,3 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class CanonicalCaptureTest(unittest.TestCase):
-    def test_run_config_captures_what_its_loss_needs(self):
-        """--draft resolves the default loss; -c run.yaml carries training.loss."""
-        import yaml
-
-        from specforge.config.draft.codec import encode_config
-        from tests.test_config.draft_fixtures import draft_config
-        from tests.test_runtime.test_canonical_training import target_directory
-
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = target_directory(root)
-            draft = root / "draft.yaml"
-            draft.write_text(yaml.safe_dump(encode_config(draft_config())))
-            run = root / "run.yaml"
-            run.write_text(
-                yaml.safe_dump(
-                    {
-                        "model": {"target_model_path": str(target)},
-                        "draft": str(draft),
-                        "data": {"hidden_states_path": str(root / "features")},
-                        "training": {
-                            "attention_backend": "eager",
-                            "loss": {"kind": "kl"},
-                        },
-                    }
-                )
-            )
-            argv = [
-                "prepare_hidden_states.py",
-                "--server-urls",
-                "http://localhost:30000",
-                "--data-path",
-                "data.jsonl",
-            ]
-            selections = {
-                "draft": ["--draft", str(draft), "--target-model-path", str(target)],
-                "config": ["-c", str(run)],
-            }
-            plans = {}
-            for name, selection in selections.items():
-                with mock.patch("sys.argv", argv + selection):
-                    args = parse_args()
-                self.assertEqual(args.target_model_path, str(target))
-                plans[name] = resolve_offline_capture_plan(args)
-            self.assertIsNone(plans["draft"].layout.last_hidden_feature)
-            self.assertEqual(
-                plans["config"].layout.last_hidden_feature,
-                "target_last_hidden_states",
-            )
-            other = ["--target-model-path", str(root / "other")]
-            with (
-                mock.patch("sys.argv", argv + selections["config"] + other),
-                mock.patch("sys.stderr"),
-                self.assertRaises(SystemExit),
-            ):
-                parse_args()
-            legacy = root / "legacy.yaml"
-            legacy.write_text(
-                yaml.safe_dump(
-                    {
-                        "model": {"target_model_path": str(target)},
-                        "data": {"hidden_states_path": str(root / "features")},
-                    }
-                )
-            )
-            with mock.patch("sys.argv", argv + ["-c", str(legacy)]):
-                args = parse_args()
-            with self.assertRaisesRegex(ValueError, "not a canonical run"):
-                resolve_offline_capture_plan(args)
-
-    def test_eagle_yaml_capture_matches_training_inputs(self):
-        import yaml
-
-        from specforge.config.draft.codec import encode_config
-        from specforge.training.canonical_data import normalize_sample
-        from tests.test_modeling.test_canonical_eagle3 import model_config as eagle
-        from tests.test_modeling.test_canonical_peagle import model_config as peagle
-        from tests.test_runtime.test_canonical_training import target_directory
-
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = target_directory(root)
-            for factory in (eagle, peagle):
-                draft = factory(target_width=32)
-                path = root / "draft.yaml"
-                path.write_text(yaml.safe_dump(encode_config(draft)))
-                argv = [
-                    "prepare_hidden_states.py",
-                    "--draft",
-                    str(path),
-                    "--target-model-path",
-                    str(target),
-                    "--server-urls",
-                    "http://localhost:30000",
-                    "--data-path",
-                    "data.jsonl",
-                ]
-                with mock.patch("sys.argv", argv):
-                    args = parse_args()
-                plan = resolve_offline_capture_plan(args)
-                self.assertEqual(plan.capture_method, "eagle3")
-                self.assertEqual(
-                    plan.capture_layers,
-                    draft.spec_config.target_features.target_layer_ids,
-                )
-                record = plan.layout.materialize(
-                    {
-                        "input_ids": torch.tensor([1, 2, 3]),
-                        "loss_mask": torch.tensor([1, 1, 0]),
-                        "aux_hidden_states": torch.randn(
-                            1, 3, len(plan.capture_layers) * 32
-                        ),
-                        "last_hidden_states": torch.randn(1, 3, 32),
-                    }
-                )
-                self.assertEqual(
-                    set(record),
-                    {
-                        "input_ids",
-                        "loss_mask",
-                        "hidden_states",
-                        "target_last_hidden_states",
-                    },
-                )
-                sample = normalize_sample(record, keys=tuple(record), max_len=3)
-                self.assertEqual(sample["target_last_hidden_states"].shape, (1, 3, 32))
-                self.assertEqual(sample["input_ids"].tolist(), [[1, 2, 3]])

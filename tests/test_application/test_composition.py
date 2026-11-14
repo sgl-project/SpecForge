@@ -20,24 +20,25 @@ def _payload(
 ) -> dict:
     model = {
         "target_model_path": "target",
-        "draft_model_config": "draft.json",
         "input_modality": modality,
     }
     if algorithm in {"eagle3", "peagle"} and mode == "online":
         model["vocab_mapping_path"] = "mapping.pt"
     training = {
-        "strategy": algorithm,
         "max_steps": 1,
         "attention_backend": "flex_attention",
         "batch_size": 1,
     }
+    draft = f"specforge/config/draft/presets/qwen3-8b-{algorithm}.yaml"
     if mode == "offline":
         return {
+            "draft": draft,
             "model": model,
             "data": {"hidden_states_path": "features"},
             "training": training,
         }
     return {
+        "draft": draft,
         "model": model,
         "data": {"train_data_path": "prompts.jsonl"},
         "training": training,
@@ -54,39 +55,28 @@ def _payload(
 
 class ApplicationCompositionTest(unittest.TestCase):
     def test_legacy_execution_options_are_rejected_with_or_without_resume(self):
-        for section, key, value in (
-            ("training", "loss_execution", {"chunk_size": 7}),
-            ("model", "use_fused_conv", True),
-        ):
-            for resume in (False, True):
-                with self.subTest(key=key, resume=resume), TemporaryDirectory() as temp:
-                    payload = _payload("dflash", mode="offline")
-                    payload[section][key] = value
-                    if resume:
-                        payload["training"]["resume_from"] = temp
-                        config = Config.model_validate(payload)
-                        with self.assertRaisesRegex(
-                            ValueError, "canonical draft loading"
-                        ):
-                            resolve_run(config)
-                    else:
-                        with self.assertRaisesRegex(
-                            ValueError, "canonical draft loading"
-                        ):
-                            Config.model_validate(payload)
+        for resume in (False, True):
+            payload = _payload("dflash", mode="offline")
+            payload["training"]["loss_execution"] = {"chunk_size": 7}
+            if resume:
+                payload["resume"] = "checkpoint"
+            with self.assertRaisesRegex(ValueError, "loss_execution"):
+                Config.model_validate(payload)
 
     def test_resolve_run_pairs_config_with_one_registration(self):
         config = Config.model_validate(_payload())
 
         resolved = resolve_run(config)
 
-        self.assertIs(config, resolved.config)
+        self.assertEqual(config.model, resolved.config.model)
         self.assertEqual("eagle3", resolved.algorithm.name)
 
     def test_unknown_algorithm_fails_at_the_composition_root(self):
-        config = Config.model_validate(_payload("unknown"))
+        payload = _payload()
+        payload["training"]["objective"] = "unknown"
+        config = Config.model_validate(payload)
 
-        with self.assertRaisesRegex(ValueError, "registered algorithms"):
+        with self.assertRaisesRegex(ValueError, "unknown objective"):
             resolve_run(config)
 
     def test_training_domain_has_no_duplicate_deployment_fields(self):
@@ -105,11 +95,12 @@ class ApplicationCompositionTest(unittest.TestCase):
         ):
             resolve_run(config)
 
-    def test_peagle_offline_remains_unsupported(self):
+    def test_peagle_offline_is_supported(self):
         config = Config.model_validate(_payload("peagle", mode="offline"))
 
-        with self.assertRaisesRegex(ValueError, "no offline feature contract"):
-            resolve_run(config)
+        self.assertIsNotNone(
+            resolve_run(config).algorithm.providers.offline_for("text")
+        )
 
     def test_dspark_offline_resolves_its_registered_provider(self):
         resolved = resolve_run(
@@ -117,7 +108,7 @@ class ApplicationCompositionTest(unittest.TestCase):
         )
 
         provider = resolved.algorithm.providers.offline_for("text")
-        self.assertEqual("dspark_offline_v1", provider.normalizer_id)
+        self.assertEqual("canonical_unshifted_v1", provider.normalizer_id)
 
     def test_application_planning_defends_offline_data_parallelism(self):
         config = Config.model_validate(_payload(mode="offline"))
@@ -139,16 +130,12 @@ class ApplicationCompositionTest(unittest.TestCase):
         payload = _payload("eagle3")
         payload["model"]["draft_num_hidden_layers"] = 2
 
-        with self.assertRaisesRegex(
-            ValueError, "requires model.draft_num_hidden_layers=1"
-        ):
+        with self.assertRaisesRegex(ValueError, "draft_num_hidden_layers"):
             resolve_run(Config.model_validate(payload))
 
         domino = _payload("domino")
         domino["model"]["draft_block_size"] = 8
-        with self.assertRaisesRegex(
-            ValueError, "does not support model.draft_block_size"
-        ):
+        with self.assertRaisesRegex(ValueError, "draft_block_size"):
             resolve_run(Config.model_validate(domino))
 
     def test_disaggregated_vocab_mapping_is_provider_owned(self):
@@ -184,7 +171,9 @@ class ApplicationCompositionTest(unittest.TestCase):
         self.assertNotEqual(original, changed)
 
     def test_model_resume_provenance_records_resolved_capture_layers(self):
-        from specforge.training.assembly import _model_resume_provenance
+        from specforge.training.provenance import (
+            model_resume_provenance as _model_resume_provenance,
+        )
 
         config = Config.model_validate(_payload())
         provenance = _model_resume_provenance(

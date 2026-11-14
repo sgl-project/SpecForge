@@ -576,3 +576,18 @@ Generate the implementation inventory directly from the registry:
 ```bash
 python -m specforge.algorithms.objectives.implementations
 ```
+
+
+### Diagnostic metrics
+
+The trainer computes detailed block diagnostics only on logging steps. These
+reports run without gradients, in bounded projection chunks, and preserve
+additive counts and numerator/denominator pairs across accumulation and ranks.
+They do not participate in loss checkpoint recomputation.
+
+DFlash/DFlash2 retain hard-label, selector, prefix and sampled-anchor walk
+metrics. Set training.objective_options.teacher_metrics to true to request their
+teacher-distribution metrics and the required target features; the default is
+false. DFlash also accepts metric_top_k (default 16). Domino and DSpark retain
+sampled-anchor walk reports. DSpine reports backbone, refinement, alignment and
+candidate-coverage statistics from the objective's existing calculations.

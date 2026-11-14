@@ -41,7 +41,6 @@ training:
   warmup_ratio: 0.05
   max_grad_norm: 1.0
   attention_backend: flex_attention
-  dflash_teacher_metrics: false
   save_interval: 500
   log_interval: 10
   dist_timeout: 30

@@ -10,7 +10,6 @@ import types
 import unittest
 from unittest import mock
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.application import bind_run
 from specforge.cli import (
     _bootstrap_single_process_env,
@@ -21,6 +20,7 @@ from specforge.cli import (
     main,
 )
 from specforge.config import Config
+from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
@@ -29,6 +29,8 @@ from specforge.training.disaggregated import (
     _mooncake_store,
     build_disaggregated_run,
 )
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -64,9 +66,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_online_consumer_closes_its_store_after_fit_on_success_and_failure(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "prompts.jsonl"},
-                "training": {"strategy": "dflash", "role": "consumer", "max_steps": 1},
+                "training": {"role": "consumer", "max_steps": 1},
                 "deployment": _disaggregated_deployment(
                     "/shared/close-test", server_urls=["http://capture:30000"]
                 ),
@@ -79,7 +82,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 store.close.side_effect = lambda: events.append("store.close")
                 trainer = _FakeTrainer(error=error, events=events)
                 bundle = types.SimpleNamespace(
-                    model=object(), target_head=None, strategy_kwargs={}
+                    model=types.SimpleNamespace(
+                        objective=types.SimpleNamespace(num_anchors=512)
+                    ),
+                    target_head=None,
+                    strategy_kwargs={},
                 )
                 preflight = mock.Mock(
                     side_effect=lambda _cfg: events.append("preflight")
@@ -134,19 +141,26 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 root = tempfile.mkdtemp(prefix="producer_layout_")
                 cfg = Config.model_validate(
                     {
-                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "model": {"target_model_path": "t"},
+                        "draft": encode_config(draft_config()),
                         "data": {"prompts_path": "prompts.jsonl"},
                         "training": {
-                            "strategy": "dflash",
                             "role": "producer",
                             "max_steps": 1,
-                            "dflash_teacher_metrics": teacher_metrics,
+                            "loss": {
+                                "terms": {
+                                    "token": {"kind": "lk" if teacher_metrics else "ce"}
+                                }
+                            },
                         },
                         "deployment": _disaggregated_deployment(
                             root, server_urls=["http://capture:30000"]
                         ),
                     }
                 )
+                from specforge.application import resolve_run
+
+                resolved = resolve_run(cfg)
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
                 preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
                 with (
@@ -176,7 +190,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 ):
                     _build_online(
                         cfg,
-                        algorithm=ALGORITHM,
+                        algorithm=resolved.algorithm,
                         build_model_bundle=mock.Mock(),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
@@ -239,7 +253,8 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_mooncake_quarantine_budget_comes_from_typed_runtime(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
                 "runtime": {"feature_store_max_quarantined_bytes": 1234},
             }
@@ -300,13 +315,12 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 channel = os.path.join(root, "refs.jsonl")
                 cfg = Config.model_validate(
                     {
+                        "draft": "specforge/config/draft/presets/qwen3-8b-eagle3.yaml",
                         "model": {
                             "target_model_path": "t",
-                            "draft_model_config": "d",
                         },
                         "data": {"prompts_path": "/prompts.jsonl"},
                         "training": {
-                            "strategy": "dflash",
                             "role": role,
                             "max_steps": 1,
                         },
@@ -350,13 +364,14 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 control = os.path.join(root, "control")
                 cfg = Config.model_validate(
                     {
-                        "model": {"target_model_path": "t", "draft_model_config": "d"},
+                        "model": {"target_model_path": "t"},
+                        "draft": encode_config(draft_config()),
                         "data": (
                             {"hidden_states_path": "/features"}
                             if mode == "offline"
                             else {"prompts_path": "/prompts.jsonl"}
                         ),
-                        "training": {"strategy": "dflash", "role": "consumer"},
+                        "training": {"role": "consumer"},
                         "deployment": _disaggregated_deployment(root),
                     }
                 )
@@ -401,9 +416,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_disaggregated_run_preflights_the_resolved_draft_kernels(self):
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
-                "training": {"strategy": "dflash", "role": "consumer"},
+                "training": {"role": "consumer"},
                 "deployment": _disaggregated_deployment("/shared/attempt"),
             }
         )
@@ -430,10 +446,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
             stream.write("pid=999999\n")
         cfg = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "producer",
                     "max_steps": 1,
                 },
@@ -493,14 +509,13 @@ class TestCliLifecycle(unittest.TestCase):
     def test_capture_only_producer_does_not_import_distributed_cuda_runtime(self):
         cfg = Config.model_validate(
             {
+                "draft": "specforge/config/draft/presets/qwen3-8b-eagle3.yaml",
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft",
                     "target_backend": "sglang",
                 },
                 "data": {"train_data_path": "train.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "producer",
                     "total_steps": 1,
                 },
@@ -539,7 +554,8 @@ class TestCliLifecycle(unittest.TestCase):
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"hidden_states_path": "/features"},
                 "training": {
                     "attention_backend": "usp",
@@ -554,10 +570,10 @@ class TestCliLifecycle(unittest.TestCase):
 
         consumer = Config.model_validate(
             {
-                "model": {"target_model_path": "t", "draft_model_config": "d"},
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
                 "data": {"prompts_path": "/prompts.jsonl"},
                 "training": {
-                    "strategy": "dflash",
                     "role": "consumer",
                     "total_steps": 10,
                 },
@@ -588,60 +604,39 @@ class TestCliLifecycle(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "environment is incomplete"):
                 _bootstrap_single_process_env()
 
-    def test_legacy_hf_export_dispatches_through_shared_cli(self):
-        calls = []
-        module = types.ModuleType("specforge.export.legacy_hf")
-        module.export_to_hf = lambda *args, **kwargs: calls.append((args, kwargs))
-        with mock.patch.dict(sys.modules, {"specforge.export.legacy_hf": module}):
-            self.assertEqual(
-                main(
-                    [
-                        "export",
-                        "--to",
-                        "hf",
-                        "--checkpoint",
-                        "checkpoint",
-                        "--draft-config",
-                        "draft.json",
-                        "--output-dir",
-                        "exported",
-                        "--embedding-source",
-                        "target",
-                    ]
-                ),
-                0,
+    def test_export_dispatches_through_shared_cli(self):
+        with mock.patch("specforge.export.model.export_draft") as export:
+            status = main(
+                [
+                    "export",
+                    "--checkpoint",
+                    "checkpoint",
+                    "--output-dir",
+                    "exported",
+                    "--target-model",
+                    "target",
+                ]
             )
-        self.assertEqual(calls[0][0], ("checkpoint", "draft.json", "exported"))
-        self.assertEqual(calls[0][1]["embedding_source"], "target")
+        self.assertEqual(status, 0)
+        self.assertEqual(export.call_args.args, ("checkpoint", None, "exported"))
+        self.assertEqual(export.call_args.kwargs["target_model"], "target")
 
-    def test_sglang_export_rejects_embedding_source_as_usage_error(self):
-        module = types.ModuleType("specforge.export.legacy_sglang")
-        module.export_to_sglang = mock.Mock()
+    def test_retired_export_options_are_usage_errors(self):
         stderr = io.StringIO()
-        with (
-            mock.patch.dict(sys.modules, {"specforge.export.legacy_sglang": module}),
-            contextlib.redirect_stderr(stderr),
-        ):
+        with contextlib.redirect_stderr(stderr):
             status = main(
                 [
                     "export",
                     "--to",
-                    "sglang",
+                    "hf",
                     "--checkpoint",
                     "checkpoint",
-                    "--draft-config",
-                    "draft.json",
                     "--output-dir",
                     "exported",
-                    "--embedding-source",
-                    "target",
                 ]
             )
         self.assertEqual(status, 2)
-        self.assertIn(
-            "embedding options are only valid with --to hf", stderr.getvalue()
-        )
-        module.export_to_sglang.assert_not_called()
+        self.assertIn("No such option", stderr.getvalue())
 
     def test_main_returns_usage_status_instead_of_exiting(self):
         stderr = io.StringIO()

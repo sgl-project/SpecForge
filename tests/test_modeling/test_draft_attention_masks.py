@@ -5,12 +5,46 @@ import unittest
 
 import torch
 
-from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     PaddingMask,
     dense_attention_mask,
 )
+
+
+def create_dflash_sdpa_mask(
+    anchors, keep, context, size, device, *, is_causal, sliding_window=None
+):
+    batch, blocks = anchors.shape
+    result = torch.zeros(
+        batch,
+        1,
+        blocks * size,
+        context + blocks * size,
+        dtype=torch.bool,
+        device=device,
+    )
+    for b in range(batch):
+        for q in range(blocks * size):
+            position = int(anchors[b, q // size]) + q % size
+            for k in range(context + blocks * size):
+                key = (
+                    k
+                    if k < context
+                    else int(anchors[b, (k - context) // size]) + (k - context) % size
+                )
+                visible = (
+                    k < int(anchors[b, q // size])
+                    if k < context
+                    else (k - context) // size == q // size
+                )
+                visible = visible and bool(keep[b, q // size])
+                visible = visible and (not is_causal or key <= position)
+                visible = visible and (
+                    sliding_window is None or abs(key - position) < sliding_window
+                )
+                result[b, 0, q, k] = visible
+    return result
 
 
 class AttentionMaskTest(unittest.TestCase):

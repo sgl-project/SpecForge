@@ -1,7 +1,7 @@
 """Compare current DFlash-family losses with fusion and checkpointing on/off.
 
 Example: python -m specforge.benchmarks.benchmark_dflash_objective \
-    --method dflash --draft-config configs/qwen3-8b-dflash.json
+    --method dflash --draft-config specforge/config/draft/presets/qwen3-8b-dflash.yaml
 
 BF16 forward, FP32 losses, synthetic teacher features and frozen projections.
 Times the full draft forward/backward and FP32-master AdamW step (lr=0).
@@ -14,76 +14,56 @@ import json
 import math
 import statistics
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
-from torch import nn
-from transformers import Qwen3Config
+import yaml
 
-from specforge.algorithms.common import dflash_family_model as family
-from specforge.modeling.draft.dflash import DFlashDraftModel
-from specforge.modeling.draft.dflash2 import DFlash2DraftModel
-from specforge.modeling.draft.domino import DominoDraftModel
-from specforge.modeling.draft.dspark import DSparkDraftModel
+from specforge.algorithms.objectives import build_objective_model, default_objective
+from specforge.config.draft.codec import encode_config, parse_draft
+from specforge.modeling import build_draft_model
 from specforge.optimizer import BF16Optimizer
 
 
 def build_model(args):
     torch.manual_seed(17)
-    config = Qwen3Config.from_json_file(args.draft_config)
-    config._attn_implementation = "sdpa"
-    draft_class = {
-        "dflash": DFlashDraftModel,
-        "dspark": DSparkDraftModel,
-        "domino": DominoDraftModel,
-        "dflash2": DFlash2DraftModel,
-    }[args.method]
-    config.architectures = [draft_class.__name__]
-    draft = draft_class(config)
-    head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    embed = nn.Embedding(config.vocab_size, config.hidden_size)
-    head.requires_grad_(False)
-    embed.requires_grad_(False)
-    # Concentrate synthetic candidate hits and exercise nonzero selector gradients.
+    config = parse_draft(
+        yaml.safe_load(Path(args.draft_config).read_text()), target_config=None
+    )
+    if default_objective(config.architecture) != args.method:
+        raise ValueError("--method must match the draft architecture")
+    config = replace(config, target_bindings=(), target_logit_transform=None)
+    draft = build_draft_model(config, backend="sdpa")
+    draft.embed_tokens.requires_grad_(False)
+    draft.lm_head.requires_grad_(False)
     with torch.no_grad():
-        head.weight[:128].mul_(4)
+        draft.lm_head.weight[:128].mul_(4)
         if args.method == "dflash2":
             draft.candidate_selector.successor_codebook.normal_(std=0.02)
-    common = dict(
-        draft_model=draft,
-        target_lm_head=head,
-        target_embed_tokens=embed,
-        mask_token_id=config.dflash_config["mask_token_id"],
-        block_size=draft.block_size,
-        num_anchors=args.anchors,
-        objective_chunk_blocks=args.chunk,
-        objective_checkpointing=False,
-        attention_backend="sdpa",
+    model = build_objective_model(
+        draft,
+        options={"num_anchors": args.anchors},
+        target_head=draft.lm_head,
+        loss={"scheduling": {"chunk_size": args.chunk, "checkpoint": False}},
     )
-    if args.method == "dspark":
-        model = family.OnlineDSparkModel(**common, fused_logits_loss=False)
-    elif args.method == "domino":
-        model = family.OnlineDominoModel(
-            **common, shift_label=draft.shift_label, fused_logits_loss=False
-        )
-    else:
-        model = family.OnlineDFlashModel(**common, fused_logits_loss=False)
     model.to(device="cuda", dtype=torch.bfloat16).train()
-    assert not draft.is_gradient_checkpointing
     return model, config
 
 
 def set_policy(model, *, checkpoint, fused):
-    model.objective_checkpointing = checkpoint
-    model.fused_logits_loss = fused
-    probe = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
-    assert model._logits_loss_backend(probe) == ("fused" if fused else "eager")
+    from specforge.algorithms.objectives.implementations.registry import (
+        ExecutionSelection,
+    )
+
+    model.execution = replace(model.execution, checkpoint=checkpoint, fused=fused)
+    model.loss_implementations = ExecutionSelection()
 
 
 def forward_backward(model, batch):
     model.zero_grad(set_to_none=True)
     torch.manual_seed(23)
-    loss = model(**batch)[0]
+    loss = model(batch, step=1, total_steps=4, collect_detailed_metrics=False).loss
     loss.backward()
     return loss.detach()
 
@@ -167,7 +147,9 @@ def main():
     parser.add_argument(
         "--method", choices=["dflash", "dspark", "domino", "dflash2"], required=True
     )
-    parser.add_argument("--draft-config", required=True, help="Draft model JSON config")
+    parser.add_argument(
+        "--draft-config", required=True, help="Canonical draft YAML or JSON config"
+    )
     parser.add_argument("--sequence", type=int, default=4096)
     parser.add_argument("--anchors", type=int, default=512)
     parser.add_argument("--chunk", type=int, default=128)
@@ -192,7 +174,7 @@ def main():
         json.dumps(
             dict(
                 settings=vars(args),
-                config=config.to_dict(),
+                config=encode_config(config),
                 torch=torch.__version__,
                 cuda=torch.version.cuda,
                 gpu=torch.cuda.get_device_name(),
@@ -208,21 +190,18 @@ def main():
         hidden_states=torch.randn(
             1,
             args.sequence,
-            len(model.draft_model.target_layer_ids) * config.hidden_size,
+            len(config.spec_config.target_features.target_layer_ids)
+            * config.hidden_size,
             device="cuda",
             dtype=torch.bfloat16,
         ),
         loss_mask=torch.ones(1, args.sequence, device="cuda"),
         max_valid_anchors=args.sequence - 1,
-        collect_detailed_metrics=False,
     )
     if args.method == "dspark":
         batch["target_last_hidden_states"] = torch.randn(
             1, args.sequence, config.hidden_size, device="cuda", dtype=torch.bfloat16
         )
-    if args.method == "domino":
-        # Exercise both base and corrected CE gradients during the schedule.
-        batch["lambda_base"] = 0.5
     optimizer = BF16Optimizer(
         model, lr=0.0, max_grad_norm=1.0, warmup_ratio=0.0, lr_scheduler="constant"
     )
@@ -247,7 +226,7 @@ def main():
             sequence=args.sequence,
             anchors=args.anchors,
             chunk=args.chunk,
-            block=model.block_size,
+            block=config.spec_config.block.block_size,
             hidden=config.hidden_size,
             layers=config.num_hidden_layers,
             vocab=config.vocab_size,

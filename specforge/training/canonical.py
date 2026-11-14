@@ -5,45 +5,6 @@ from functools import partial
 from pathlib import Path
 
 
-def enabled(cfg):
-    if (
-        cfg.draft is not None
-        or cfg.initialization is not None
-        or cfg.resume is not None
-    ):
-        return True
-    if cfg.resume_path:
-        from specforge.checkpoint.resolve import read_json
-        from specforge.training.checkpoint import CheckpointManager
-
-        try:
-            directory = CheckpointManager.resolve_resume_dir(cfg.resume_path)
-        except FileNotFoundError:
-            return False  # Legacy launch planning need not have a local checkpoint.
-        path = Path(directory) / "config.json"
-        return path.is_file() and read_json(path).get("model_type") == "specforge_draft"
-    return False
-
-
-_LEGACY_SETTING_FIELDS = {
-    "mask_token_id": "model.mask_token_id",
-    "norm_before_residual": "training.norm_before_residual",
-    "capture_layers": "model.aux_hidden_state_layer_ids",
-}
-
-
-def _legacy_settings(cfg):
-    return {
-        name: value
-        for name, value in {
-            "mask_token_id": cfg.model.mask_token_id,
-            "norm_before_residual": cfg.training.norm_before_residual,
-            "capture_layers": cfg.model.aux_hidden_state_layer_ids,
-        }.items()
-        if value is not None
-    }
-
-
 def _is_canonical_checkpoint(cfg, source):
     from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
 
@@ -52,33 +13,6 @@ def _is_canonical_checkpoint(cfg, source):
     )
     config = (path.parent if path.is_file() else path) / "config.json"
     return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
-
-
-def _source_legacy_settings(cfg, source):
-    """Legacy imports apply the YAML settings; canonical sources already record them."""
-    return None if _is_canonical_checkpoint(cfg, source) else _legacy_settings(cfg)
-
-
-def _reject_changed_legacy_settings(config, settings):
-    spec = config.spec_config
-    features = spec.target_features
-    # each setting lives on the spec node of the architectures that have it
-    recorded = {
-        "mask_token_id": getattr(
-            spec, "mask_token_id", getattr(features, "mask_token_id", None)
-        ),
-        "norm_before_residual": getattr(spec, "norm_before_residual", None),
-        "capture_layers": getattr(features, "target_layer_ids", None),
-    }
-    for name, value in settings.items():
-        saved = recorded[name]
-        if name == "capture_layers" and saved is not None:
-            saved, value = list(saved), list(value)
-        if saved != value:
-            raise ValueError(
-                f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"checkpoint's recorded {saved!r}; remove it or make it match"
-            )
 
 
 def resolve_config(cfg, *, target_config=None):
@@ -95,28 +29,9 @@ def resolve_config(cfg, *, target_config=None):
             draft = json.loads(text)
         except json.JSONDecodeError:
             draft = yaml.safe_load(text)
-    legacy_draft = isinstance(draft, dict) and draft.get("model_type") not in (
-        None,
-        "specforge_draft",
+    supplied = (
+        parse_draft(draft, target_config=target_config) if draft is not None else None
     )
-    if legacy_draft:
-        from specforge.config.draft.codec import decode_legacy_config
-
-        if target_config is None:
-            from specforge.checkpoint.resolve import read_target_config
-
-            target_config = read_target_config(
-                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
-            )
-        supplied = decode_legacy_config(
-            draft, target_config=target_config, **_legacy_settings(cfg)
-        )
-    else:
-        supplied = (
-            parse_draft(draft, target_config=target_config)
-            if draft is not None
-            else None
-        )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.resume_path:
@@ -129,7 +44,7 @@ def resolve_config(cfg, *, target_config=None):
         canonical = _is_canonical_checkpoint(cfg, source)
         if cfg.resume_path and not canonical:
             raise ValueError(
-                "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+                "Historical optimizer states cannot resume after the training cutover; use initialization.checkpoint to import weights"
             )
         loaded = read_draft(
             source,
@@ -137,23 +52,12 @@ def resolve_config(cfg, *, target_config=None):
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
             legacy_config=initialization.legacy_config if initialization else None,
-            legacy_settings=None if canonical else _legacy_settings(cfg),
         ).config
-        if canonical:
-            _reject_changed_legacy_settings(loaded, _legacy_settings(cfg))
         if supplied is not None and supplied != loaded:
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
-    if (
-        _legacy_settings(cfg)
-        and not legacy_draft
-        and not (initialization and initialization.weights_from)
-    ):
-        raise ValueError(
-            "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-        )
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -261,10 +165,6 @@ def resolve_run(cfg, *, target_config=None):
 
     from . import canonical_data
 
-    if cfg.model.draft_model_config or cfg.model.draft_checkpoint_path:
-        raise ValueError(
-            "canonical checkpoint cannot mix with legacy model.draft_* sources"
-        )
     draft = resolve_config(cfg, target_config=target_config)
     if cfg.initialization and cfg.initialization.from_target:
         from specforge.checkpoint.native import validate_target_initialization
@@ -278,32 +178,6 @@ def resolve_run(cfg, *, target_config=None):
             )
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
-    # New objectives have their own options. Never silently consume legacy
-    # algorithm switches with a different meaning on the canonical path.
-    from specforge.config.schema import TrainingConfig
-
-    defaults = TrainingConfig()
-    legacy_options = {
-        "ttt_length",
-        "num_anchors",
-        "dflash2_selector_warmup_ratio",
-        "dflash2_selector_ramp_ratio",
-        "dflash2_selector_stop_gradient",
-        "lambda_base_start",
-        "lambda_base_decay_ratio",
-        "num_depths",
-        "down_sample_ratio",
-        "down_sample_ratio_min",
-    }
-    present = {
-        name
-        for name in legacy_options
-        if getattr(cfg.training, name) != getattr(defaults, name)
-    }
-    if present:
-        raise ValueError(
-            f"canonical training uses training.objective_options, not {sorted(present)}"
-        )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     _validate_imported_objective(cfg, resolved)
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
@@ -327,9 +201,7 @@ def resolve_run(cfg, *, target_config=None):
             raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
     requirements = entry.training
-    family = entry.legacy_strategy or objective
-    if cfg.training.strategy not in (defaults.strategy, family, objective):
-        raise ValueError("training.strategy conflicts with the objective")
+    family = entry.runtime_name or objective
     if cfg.training.tp_size != 1:
         raise ValueError("canonical objectives require trainer TP size one")
     sequence_parallel = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size > 1
@@ -340,7 +212,7 @@ def resolve_run(cfg, *, target_config=None):
         raise ValueError("sequence parallelism requires an objective supporting USP")
     # Retain the established strategy name for data/rendezvous identifiers.
     training = cfg.training.model_copy(
-        update={"strategy": family, "objective": objective}
+        update={"objective": objective, "objective_options": asdict(resolved.objective)}
     )
     cfg = cfg.model_copy(update={"draft": encode_config(draft), "training": training})
     keys = tuple(entry.inputs)
@@ -534,7 +406,6 @@ def build_bundle(cfg, algorithm):
             **common,
             adapter=init.adapter if init else None,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_source_legacy_settings(cfg, source),
         ).train()
     else:
         weights = init.weights_from if init else None
@@ -564,7 +435,6 @@ def build_bundle(cfg, algorithm):
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_legacy_settings(cfg),
         )
     teacher = None
     if resolved.requires_teacher:

@@ -6,21 +6,15 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import torch
-from torch import nn
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.block import ExternalFirstBlockSpec
 from specforge.config.draft.codec import decode_config, encode_config
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dflash import DFlashDraftModel as LegacyDFlashDraftModel
-from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DMTPDraftModel
 from tests.test_config.test_draft_dmtp_spec import dmtp_config
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
+from tests.test_modeling.test_draft_attention_masks import create_dflash_sdpa_mask
 
 
 def model_config(*, bound=False, causal=False):
@@ -73,120 +67,6 @@ def model_inputs(config, device="cpu", dtype=torch.float32, *, keep_all=False):
 
 
 class CanonicalDMTPTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        if device == "cpu":
-            tolerance = 0
-        torch.manual_seed(0)
-        for causal in (False, True):
-            with self.subTest(device=device, dtype=dtype, causal=causal):
-                config = model_config(causal=causal)
-                actual = build_draft_model(config, device=device, dtype=dtype)
-                legacy = legacy_dflash_config(
-                    block_size=4,
-                    is_causal=causal,
-                    dflash_config={"target_layer_ids": [1, 3], "mask_token_id": 63},
-                )
-                decoder = LegacyDFlashDraftModel(legacy).to(device=device, dtype=dtype)
-                with torch.device(device):
-                    decoder.rotary_emb = Qwen3RotaryEmbedding(legacy)
-                decoder.load_state_dict(
-                    {
-                        legacy_name(n): v
-                        for n, v in actual.state_dict().items()
-                        if legacy_name(n) is not None
-                    },
-                    strict=True,
-                )
-                fusion = nn.ModuleDict(
-                    {
-                        "pre_fc_norm_embedding": Qwen3RMSNorm(32),
-                        "pre_fc_norm_hidden": Qwen3RMSNorm(48),
-                        "fc": nn.Linear(80, 32, bias=False),
-                    }
-                ).to(device=device, dtype=dtype)
-                fusion.load_state_dict(actual.mtp_fusion.state_dict(), strict=True)
-                embedding, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-                    actual.lm_head
-                )
-                (ids, context, entries), mtp, keep = model_inputs(config, device, dtype)
-                other_context, other_mtp = (
-                    context.detach().clone().requires_grad_(),
-                    mtp.detach().clone().requires_grad_(),
-                )
-                output = actual(
-                    ids, context, entries, mtp_features=mtp, block_keep_mask=keep
-                )
-                blocks = embedding(ids).reshape(2, 2, 4, 32)
-                first = fusion["fc"](
-                    torch.cat(
-                        (
-                            fusion["pre_fc_norm_embedding"](blocks[..., 0, :]),
-                            fusion["pre_fc_norm_hidden"](other_mtp),
-                        ),
-                        dim=-1,
-                    )
-                )
-                first = torch.where(keep[..., None], first, blocks[..., 0, :])
-                noise = torch.cat(
-                    (first.unsqueeze(-2), blocks[..., 1:, :]), dim=-2
-                ).flatten(1, 2)
-                hidden = decoder(
-                    entries[0].position_ids,
-                    attention_mask=entries[0].attention_layout.visibility,
-                    noise_embedding=noise,
-                    target_hidden=other_context,
-                )
-                logits = head(hidden)
-                torch.testing.assert_close(
-                    output.hidden_states, hidden, rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    output.logits, logits, rtol=tolerance, atol=tolerance
-                )
-                upstream = torch.randn_like(logits)
-                output.logits.backward(upstream)
-                logits.backward(upstream)
-                for value, ref in ((context, other_context), (mtp, other_mtp)):
-                    torch.testing.assert_close(
-                        value.grad, ref.grad, rtol=tolerance, atol=tolerance
-                    )
-                self.assertEqual(torch.count_nonzero(mtp.grad[~keep]).item(), 0)
-                for name, parameter in actual.named_parameters():
-                    ref = (
-                        embedding.weight
-                        if name == "embed_tokens.weight"
-                        else (
-                            head.weight
-                            if name == "lm_head.weight"
-                            else (
-                                dict(fusion.named_parameters())[
-                                    name.removeprefix("mtp_fusion.")
-                                ]
-                                if name.startswith("mtp_fusion.")
-                                else dict(decoder.named_parameters())[legacy_name(name)]
-                            )
-                        )
-                    )
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-                    )
-
-    def test_cpu_reference_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_reference_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_inactive_nan_features_do_not_affect_gradients(self):
         for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):

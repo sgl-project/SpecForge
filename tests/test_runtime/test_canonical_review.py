@@ -52,6 +52,7 @@ class CanonicalReviewTest(unittest.TestCase):
         result = SimpleNamespace(
             loss=torch.tensor(1.0),
             ratios=ratios,
+            sums={},
             numerator=torch.tensor(1.0),
             denominator=torch.tensor(1.0),
         )
@@ -162,7 +163,10 @@ class CanonicalReviewTest(unittest.TestCase):
             self.assertEqual(cfg.resume_path, "second")
             self.assertIsNone(cfg.training.resume_from)
             self.assertIsNone(
-                Config.model_validate(cfg.model_dump() | {"resume": None}).resume_path
+                Config.model_validate(
+                    cfg.model_dump()
+                    | {"resume": None, "draft": encode_config(draft_config())}
+                ).resume_path
             )
             path = Path(temp) / "checkpoint"
             path.mkdir()
@@ -357,53 +361,35 @@ class CanonicalReviewTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "vocab_mapping_path disagrees"):
                 build_model_bundle(resolved.config, algorithm=resolved.algorithm)
 
-    def test_legacy_import_accepts_matching_aux_layer_override(self):
-        """The documented legacy override must reach the legacy reader."""
+    def test_legacy_import_preserves_recorded_capture_layers(self):
+        """The checkpoint, rather than obsolete YAML overrides, owns capture metadata."""
         import shutil
 
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))
-            legacy = shutil.copytree(fixture, Path(temp) / "legacy")
-
-            def resolve(layers):
-                raw = dict(
-                    model={
-                        "target_model_path": str(target),
-                        "torch_dtype": "float32",
-                        "mask_token_id": 63,
-                        "aux_hidden_state_layer_ids": layers,
-                    },
-                    initialization={"checkpoint": str(legacy)},
-                    data={"hidden_states_path": str(Path(temp) / "features")},
-                    training={"attention_backend": "eager", "batch_size": 1},
-                )
-                return resolve_run(Config.model_validate(raw))
-
-            features = resolve([1, 2, 3]).config.draft["spec_config"]["target_features"]
-            self.assertEqual(list(features["target_layer_ids"]), [1, 2, 3])
-            with self.assertRaisesRegex(ValueError, "capture_layers conflict"):
-                resolve([1, 2, 4])
-            # weights_from keeps the supplied draft's layers, so an override is refused
-            from specforge.loading import read_draft
-
-            imported = read_draft(
-                legacy, target=target, legacy_settings={"mask_token_id": 63}
-            ).config
-            raw = dict(
-                model={
-                    "target_model_path": str(target),
-                    "torch_dtype": "float32",
-                    "mask_token_id": 63,
-                    "aux_hidden_state_layer_ids": [1, 2, 3],
+            legacy = Path(shutil.copytree(fixture, Path(temp) / "legacy"))
+            torch.save(
+                {
+                    "peagle_mask_token_id": 63,
+                    "specforge_model_provenance": {"capture_layers": [1, 2, 3]},
                 },
-                draft=encode_config(imported),
-                initialization={"weights_from": {"checkpoint": str(legacy)}},
+                legacy / "training_state.pt",
+            )
+            raw = dict(
+                model={"target_model_path": str(target), "torch_dtype": "float32"},
+                initialization={"checkpoint": str(legacy)},
                 data={"hidden_states_path": str(Path(temp) / "features")},
                 training={"attention_backend": "eager", "batch_size": 1},
             )
-            with self.assertRaisesRegex(ValueError, "would be ignored"):
-                resolve_run(Config.model_validate(raw))
+            resolved = resolve_run(Config.model_validate(raw))
+            features = resolved.config.draft["spec_config"]["target_features"]
+            self.assertEqual(list(features["target_layer_ids"]), [1, 2, 3])
+            self.assertEqual(resolved.config.draft["spec_config"]["mask_token_id"], 63)
+            for name in ("mask_token_id", "aux_hidden_state_layer_ids"):
+                changed = {**raw, "model": {**raw["model"], name: 63}}
+                with self.subTest(field=name), self.assertRaisesRegex(ValueError, name):
+                    Config.model_validate(changed)
 
     def test_objective_frozen_head_that_the_draft_disables_needs_no_weights(self):
         """DSpark freezes its confidence head at alpha 0, which a draft may omit."""
@@ -471,8 +457,8 @@ class CanonicalReviewTest(unittest.TestCase):
                     from_target={"embed_tokens.weight": "model.embed_tokens.weight"},
                 )
 
-    def test_legacy_import_settings_may_repeat_on_canonical_resume(self):
-        """The import YAML with initialization swapped for resume must still run."""
+    def test_imported_structure_survives_canonical_resume(self):
+        """Canonical resume uses the structure saved after historical weight import."""
         import shutil
 
         from specforge.checkpoint import save_draft
@@ -502,19 +488,21 @@ class CanonicalReviewTest(unittest.TestCase):
                 )
                 return resolve_run(Config.model_validate(raw))
 
-            spec = resolve(mask_token_id=63).config.draft["spec_config"]
+            spec = resolve().config.draft["spec_config"]
             self.assertEqual(spec["mask_token_id"], 63)
-            with self.assertRaisesRegex(ValueError, "model.mask_token_id=62"):
+            with self.assertRaisesRegex(ValueError, "mask_token_id"):
                 resolve(mask_token_id=62)
             raw = dict(
-                model={"target_model_path": str(target), "mask_token_id": 63},
+                model={"target_model_path": str(target)},
                 resume=str(legacy),
                 data={"hidden_states_path": str(Path(temp) / "features")},
                 training={"attention_backend": "eager", "batch_size": 1},
             )
             torch.save({}, Path(legacy) / "training_state.pt")
             with patch("specforge.loading.read_draft") as read:
-                with self.assertRaisesRegex(ValueError, "legacy full resume"):
+                with self.assertRaisesRegex(
+                    ValueError, "Historical optimizer states cannot resume"
+                ):
                     resolve_run(Config.model_validate(raw))
                 read.assert_not_called()
 

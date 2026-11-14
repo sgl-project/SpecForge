@@ -19,7 +19,7 @@ from tests.test_runtime.test_canonical_training import run_config, target_direct
 
 
 class RetiredExportTest(unittest.TestCase):
-    def test_bundled_legacy_files_resolve_through_training_entry(self):
+    def test_bundled_legacy_files_require_checkpoint_import(self):
         for path in sorted(CONFIGS.glob("*.json")):
             with self.subTest(path=path.name):
                 payload = json.loads(path.read_text())
@@ -39,9 +39,8 @@ class RetiredExportTest(unittest.TestCase):
                 cfg = run_config(path.parent, expected).model_copy(
                     update={"draft": str(path)}
                 )
-                if options:
-                    cfg.model.mask_token_id = options["mask_token_id"]
-                self.assertEqual(resolve_config(cfg, target_config=target), expected)
+                with self.assertRaises(ValueError):
+                    resolve_config(cfg, target_config=target)
 
     def test_old_merge_cli_delegates_to_checked_native_export(self):
         with patch("scripts.merge_mtp_to_base.export_draft") as export:
@@ -118,18 +117,13 @@ class RetiredExportTest(unittest.TestCase):
             path = root / "old.json"
             path.write_text(json.dumps(payload))
             cfg = run_config(target, expected).model_copy(update={"draft": str(path)})
-            self.assertEqual(resolve_config(cfg), expected)
+            with self.assertRaises(ValueError):
+                resolve_config(cfg)
             self.assertEqual(
-                resolve_run(cfg).config.draft["architectures"], ["MTPDraftModel"]
-            )
-            old_recipe = cfg.model_copy(update={"draft": None})
-            old_recipe.training = cfg.training.model_copy(update={"strategy": "mtp"})
-            with self.assertRaisesRegex(ValueError, "MTP now requires draft"):
-                resolve_run(old_recipe)
-            cfg.training.loss = {"scheduling": {"chunk_size": 128}}
-            self.assertEqual(
-                resolve_run(cfg).config.training.loss,
-                {"scheduling": {"chunk_size": 128}},
+                decode_legacy_config(
+                    payload, target_config={"hidden_size": 32, "vocab_size": 64}
+                ),
+                expected,
             )
 
 

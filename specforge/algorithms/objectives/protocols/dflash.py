@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..inputs import prepare_blocks
+from ..diagnostics import block_diagnostics, diagnostic_requirements
+from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..predictions import PredictionBatch
 from ..projection import LinearProjection
@@ -16,7 +17,9 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 
 @register_protocol(
     "dflash",
+    resolve_requires=diagnostic_requirements,
     training=TrainingRequirements(
+        host_inputs=prepare_anchor_capacity,
         capture_method="dflash",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
@@ -35,6 +38,8 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
 @dataclass
 class DFlashObjective:
     num_anchors: int = 512
+    teacher_metrics: bool = False
+    metric_top_k: int = 16
     loss_decay_gamma: float | None = None
 
     default_loss = TokenLoss(kind="ce")
@@ -46,7 +51,7 @@ class DFlashObjective:
 
     def __post_init__(self):
         check_options(
-            counts={"num_anchors": self.num_anchors},
+            counts={"num_anchors": self.num_anchors, "metric_top_k": self.metric_top_k},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
         )
 
@@ -63,13 +68,20 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
+        predictions = runtime.block_predictions(
+            output,
+            blocks,
+            batch,
+            projection=LinearProjection(model.project, model.lm_head),
+        )
         return PredictionBatch(
-            (
-                runtime.block_predictions(
-                    output,
-                    blocks,
-                    batch,
-                    projection=LinearProjection(model.project, model.lm_head),
-                ),
-            )
+            (predictions,),
+            diagnostics=block_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                enabled=context.get("collect_detailed_metrics", True),
+                teacher_metrics=self.teacher_metrics,
+                top_k=self.metric_top_k,
+            ),
         )
