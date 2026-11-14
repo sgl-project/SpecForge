@@ -36,7 +36,7 @@ _FUSED_CONV_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 @functools.lru_cache(maxsize=1)
 def _load_fused_grouped_conv() -> Optional[Tuple[Callable, Callable]]:
     try:
-        from .layers.conv.triton import dflash2_grouped_conv_fused, supports_group_size
+        from .dflash2_conv_triton import dflash2_grouped_conv_fused, supports_group_size
     except ModuleNotFoundError as exc:
         name = exc.name or ""
         if name == "triton" or name.startswith("triton."):

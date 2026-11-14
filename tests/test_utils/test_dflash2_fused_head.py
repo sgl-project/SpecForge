@@ -182,7 +182,9 @@ class FusedHeadGateTest(unittest.TestCase):
 
 
 def _project_loss(hidden, weight, targets, top_k):
-    from specforge.losses.fused import fused_ce_l1_loss
+    from specforge.algorithms.objectives.implementations.fused_loss import (
+        fused_ce_l1_loss,
+    )
 
     terms = fused_ce_l1_loss(F.linear(hidden, weight), targets, top_k=top_k)
     return terms.cross_entropy, terms.topk_values, terms.topk_ids, terms.argmax_ids
@@ -558,7 +560,7 @@ class FusedHeadModelParityTest(unittest.TestCase):
             "eager",
         )
 
-        from specforge.losses import fused as fused_loss
+        from specforge.algorithms.objectives.implementations import fused_loss
 
         # The gate above only inspects a probe tensor; also require that the
         # objective really dispatches to (or bypasses) the fused head.

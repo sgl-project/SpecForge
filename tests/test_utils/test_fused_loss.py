@@ -1,4 +1,4 @@
-"""Fused Triton losses vs their eager references (specforge.losses.fused).
+"""Fused Triton losses vs their eager references (specforge.algorithms.objectives.implementations.fused_loss).
 
 One test per loss, comparing loss value and logits-gradient against eager in
 the three regimes that catch distinct bugs: fp32 with saturated point-mass
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import torch
 
-from specforge.losses import fused as fused_loss
+from specforge.algorithms.objectives.implementations import fused_loss
 
 
 def _triton_available() -> bool:

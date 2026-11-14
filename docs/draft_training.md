@@ -348,7 +348,8 @@ adapters. Shared numerical formulas and kernels live in
 `specforge/losses/fused.py`, with CE/L1 Triton details in
 `specforge/losses/_fused_logits_loss_triton.py`. Both the mathematical loss layer
 and execution adapters depend on this library; it imports neither protocols nor
-registries.
+registries. The old `specforge.core.fused_loss` and
+`objectives.implementations.fused_loss` paths remain compatibility aliases.
 `DominoSuffixProjection` lives with the other contracts in `projection.py`;
 `implementations/domino_ce.py` contains only its execution adapter.
 Fusion requires one complete block per

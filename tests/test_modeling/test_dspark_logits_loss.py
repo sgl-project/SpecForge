@@ -53,7 +53,9 @@ class DSparkLogitsLossTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_eager_and_fused_return_matching_terms(self):
-        from specforge.losses.fused import ce_l1_loss
+        from specforge.algorithms.objectives.implementations.fused_loss import (
+            ce_l1_loss,
+        )
 
         torch.manual_seed(31)
         model = build_model("cuda")
