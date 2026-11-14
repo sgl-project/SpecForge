@@ -193,7 +193,7 @@ class TestTrimLossAnalytic(unittest.TestCase):
     """Zero logits + normalized teachers => masked row loss == ln(D) exactly."""
 
     def test_trim_and_full_hit_closed_form(self):
-        from specforge.core.loss import LogSoftmaxLoss
+        from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
 
         D = 64
         g = torch.Generator().manual_seed(2)

@@ -276,7 +276,7 @@ class LossExecutionTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_auxiliary_and_domino_objectives(self):
-        from specforge.core import domino_loss
+        from specforge.losses import domino as domino_loss
 
         for architecture in (
             "DFlash2DraftModel",
@@ -343,8 +343,8 @@ class LossExecutionTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_soft_ce_matches_legacy_real_vocabulary(self):
-        from specforge.core.loss import LogSoftmaxLoss
         from specforge.losses.fused import fused_soft_ce_loss
+        from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
 
         torch.manual_seed(1175)
         logits = torch.randn(2, 3, 128256, device="cuda", dtype=torch.bfloat16)

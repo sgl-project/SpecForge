@@ -5,7 +5,7 @@ import unittest
 
 import torch
 
-from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
+from specforge.losses.lk import compute_acceptance_rate, compute_lk_loss
 
 
 def check_zero_acceptance_optimizer_steps(device):

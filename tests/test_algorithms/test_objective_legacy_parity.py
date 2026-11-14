@@ -243,7 +243,9 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             )
             spec = importlib.util.spec_from_file_location(f"reference_{kind}", path)
             module = importlib.util.module_from_spec(spec)
-            with patch.dict("sys.modules", {"specforge.core.loss": kernel}):
+            with patch.dict(
+                "sys.modules", {"specforge.losses.soft_cross_entropy": kernel}
+            ):
                 spec.loader.exec_module(module)
             return module
 

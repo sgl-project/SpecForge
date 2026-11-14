@@ -203,7 +203,7 @@ model-specific constraints or allocate model weights.
 
 ## Fused token losses
 
-Import losses from `specforge.losses.fused`. Unprefixed functions are eager. The previous `specforge.core.fused_loss` import remains supported.
+Import losses from `specforge.losses.fused`. Unprefixed functions are eager.
 
 | API pair (eager / fused) | Label input | Per-token objective |
 | --- | --- | --- |
