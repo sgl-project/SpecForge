@@ -91,9 +91,11 @@ class Predictions:
     is retained here; project() can be invoked by an eager or chunked executor.
 
     The optional auxiliary callback accepts (predictions, projected_outputs,
-    teacher_logits, default_weights, statistics) and returns AuxiliaryLoss.
+    teacher_logits, default_weights, statistics, primitives) and returns AuxiliaryLoss.
     Statistics map main-term indices to detached named tensors from this
     evaluation only. Missing optional statistics must have a reference fallback.
+    Primitives maps names (currently "ce_l1") to executor-owned callables;
+    callbacks invoke them without choosing kernels or reading execution policy.
     Auxiliary terms and their reduction rules are declared in plan.
     """
 

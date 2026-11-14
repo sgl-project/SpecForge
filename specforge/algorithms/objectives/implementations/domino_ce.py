@@ -1,41 +1,8 @@
-"""Domino block-suffix projection contract and joint CE implementation."""
+"""Joint CE implementation for the Domino block-suffix projection."""
 
-from collections.abc import Callable
-from dataclasses import dataclass
-
-from ..projection import Projection
+from ..projection import DominoSuffixProjection
 from .ce import projection_ce_support
 from .registry import GroupResult, register_implementation
-
-
-@dataclass(frozen=True)
-class DominoSuffixProjection(Projection):
-    """Base logits plus additive corrections on a contiguous block suffix.
-
-    Each projection unit contains exactly one complete Domino block. Prefix
-    logits are unchanged; suffix logits equal base logits plus corrections.
-
-    Attributes:
-        project: Ordinary callable returning base_logits and logits.
-        project_parts: Callable(hidden, **inputs) returning base logits shaped
-            [units, block_size, vocabulary] and corrections shaped
-            [units, 1, block_size - suffix_start, vocabulary].
-        block_size: Positive number of positions in each recurrence block.
-        suffix_start: First corrected position; the suffix must be nonempty.
-    """
-
-    project_parts: Callable
-    block_size: int
-    suffix_start: int
-
-    def __post_init__(self):
-        if type(self.block_size) is not int or self.block_size < 1:
-            raise ValueError("Domino block_size must be a positive integer")
-        if (
-            type(self.suffix_start) is not int
-            or not 0 <= self.suffix_start < self.block_size
-        ):
-            raise ValueError("Domino suffix_start must select a nonempty block suffix")
 
 
 def _domino_suffix_support(request, group):

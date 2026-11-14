@@ -7,7 +7,7 @@ from .implementations.token_kernels import register_token_kernel
 from .losses import LossOutput, register_loss
 from .plan import LossPlan, LossTerm
 from .predictions import AuxiliaryLoss, PredictionBatch, Predictions
-from .projection import LinearProjection, Projection
+from .projection import DominoSuffixProjection, LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
     WindowStatistic,
@@ -45,4 +45,5 @@ __all__ = [
     "LossPlan",
     "Projection",
     "LinearProjection",
+    "DominoSuffixProjection",
 ]

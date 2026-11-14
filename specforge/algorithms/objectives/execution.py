@@ -1,6 +1,7 @@
 """Shared eager and chunked loss execution over deferred predictions."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
@@ -254,8 +255,18 @@ def evaluate_predictions(
 
     ratios = {}
     if p.auxiliary is not None:
+        from .implementations.token_kernels import ce_l1_terms
+
+        primitives = {
+            "ce_l1": partial(
+                ce_l1_terms,
+                fused=execution.fused,
+                selection=selection,
+                key=f"{prediction_index}:aux:ce_l1",
+            )
+        }
         auxiliary = p.auxiliary(
-            p, outputs(), projected.teacher, default_weights, statistics
+            p, outputs(), projected.teacher, default_weights, statistics, primitives
         )
         names = {term.output for term in p.plan.auxiliary_terms}
         if auxiliary.values.keys() != names:
@@ -442,7 +453,13 @@ def evaluate_chunks(
         or not predictions.projection.chunk_safe
     ):
         chunk_size = 0
-    if execution.trim and weighting.kind not in DPACE_LOSS_TYPES and not contextual:
+    if (
+        execution.trim
+        and weighting.kind not in DPACE_LOSS_TYPES
+        and not contextual
+        and predictions.chunk_safe
+        and predictions.projection.chunk_safe
+    ):
         keep = predictions.mask.any(-1)
         for term in predictions.plan.all_terms:
             if term.mask is not None:

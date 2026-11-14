@@ -265,6 +265,7 @@ training:
 - `trim` defaults to false and skips prediction units with no supervised positions.
   It preserves explicit denominators and does not truncate recurrent blocks.
   D-PACE keeps complete chains, and contextual LK losses keep all rows.
+  Trimming also respects both prediction and projection chunk-safety declarations.
 - `teacher_chunk_size` enables compact teacher projection for offline
   vocabulary-aware protocols with a reduced vocabulary and a frozen linear
   teacher. It preserves full-vocabulary argmax and retained probability mass
@@ -343,10 +344,15 @@ There is no algorithm-name branch in the executor.
 Execution adapters live in `objectives/implementations/`: `registry.py` owns
 registration and selection, `linear_ce.py` implements linear fusion, and `ce.py`
 contains shared CE applicability checks. `token_kernels.py` registers token-loss
-adapters; `fused_loss.py` provides their numerical reference and fused kernels,
-with CE/L1 Triton details in `_fused_logits_loss_triton.py`.
-The Domino projection contract and joint CE adapter live in
-`objectives/implementations/domino_ce.py`. Fusion requires one complete block per
+adapters. Shared numerical formulas and kernels live in
+`specforge/losses/fused.py`, with CE/L1 Triton details in
+`specforge/losses/_fused_logits_loss_triton.py`. Both the mathematical loss layer
+and execution adapters depend on this library; it imports neither protocols nor
+registries. The old `specforge.core.fused_loss` and
+`objectives.implementations.fused_loss` paths remain compatibility aliases.
+`DominoSuffixProjection` lives with the other contracts in `projection.py`;
+`implementations/domino_ce.py` contains only its execution adapter.
+Fusion requires one complete block per
 projection unit, additive corrections on a contiguous suffix, and base/final CE
 terms with shared supervision weights. Other layouts use ordinary projection.
 
@@ -355,7 +361,7 @@ implementations with `register_implementation`, or use `register_token_kernel`
 for a per-token kernel. Implementations declare applicability and return weighted
 numerators by term index, plus any predicted tokens needed for metrics. They do
 not apply coefficients or normalization. Selection uses explicit priority and
-stable names; DEBUG logs report selection and fallback reasons. Kernel execution
+stable names; INFO logs report the first selection and fallback reasons. Kernel execution
 errors propagate rather than silently changing implementation.
 
 Term statistics are combined across chunks before normalization. Independent
@@ -379,10 +385,19 @@ Reference losses may return `LossOutput(values, statistics)` instead of a tensor
 Token kernels support the same result; group implementations return statistics
 by main-term index. The executor passes detached statistics to auxiliary callbacks,
 scoped to the current evaluation/chunk rather than stored on the model.
+The callback signature is `(predictions, outputs, teacher, weights, statistics, primitives)`.
+The executor supplies numerical callables through `primitives` (currently `ce_l1`).
+Protocols call them without selecting kernels or reading `execution.fused`.
+Auxiliary fused selections use the same logging, rank agreement and resume checks
+as main losses.
 DSpark reuses the main CE/L1 result's `teacher_l1` for confidence supervision;
-if another main loss supplies no L1, its callback computes the reference target.
+if another main loss supplies no L1, its callback computes the target through the supplied primitive.
 DFlash2 selector and DSpine refinement/alignment are separate named auxiliary terms.
 Existing auxiliary formulas and training coefficients are preserved.
+
+The fused soft CE kernel is new in this PR, rather than migrated from legacy.
+Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`
+on a 128,256-token vocabulary.
 
 Functionality and optimization support are separate: a method can use its ordinary
 projection without supporting linear/Domino suffix fusion. TP, LoRA and quantized heads

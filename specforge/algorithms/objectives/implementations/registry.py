@@ -203,6 +203,20 @@ class ExecutionSelection:
         except (ImportError, ValueError, RuntimeError) as exc:
             error = str(exc)
         name = entry.name if entry else ("split" if len(group) > 1 else "reference")
+        self.record(key, name, error=error, reasons=reasons)
+        self._entries[key] = entry
+        return entry
+
+    def record(self, key, name, *, error=None, reasons=()):
+        """Record a main or auxiliary implementation once and check consistency."""
+        if key in self.names:
+            if error is not None:
+                raise ValueError(error)
+            if self.names[key] != name:
+                raise ValueError(
+                    f"Loss implementation changed for {key}: {self.names[key]} -> {name}"
+                )
+            return
         if (
             error is None
             and self._expected is not None
@@ -225,11 +239,9 @@ class ExecutionSelection:
         if any(item[:2] != (key, name) for item in outcomes):
             raise ValueError(f"Loss implementations differ across ranks: {outcomes}")
         self.names[key] = name
-        self._entries[key] = entry
         logger.info(
             "Loss group %s uses %s%s",
             key,
             name,
             f"; skipped: {'; '.join(reasons)}" if reasons else "",
         )
-        return entry

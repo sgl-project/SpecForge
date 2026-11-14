@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -137,14 +136,13 @@ class DSpineObjective:
             else 1
         )
 
-        def auxiliary(predictions, projected, teacher, weights, statistics):
+        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
             labels = predictions.labels
-            terms = ce_l1_terms(
+            terms = primitives["ce_l1"](
                 projected["logits"],
                 labels,
                 teacher_logits=teacher,
                 top_k=self.top_k,
-                fused=runtime.execution.fused,
             )
             refined = model.refine(
                 predictions.auxiliary_inputs["pre_injection"],
@@ -153,11 +151,10 @@ class DSpineObjective:
             candidates = model.lm_head.candidate_weights(terms.topk_ids)
             scores = torch.einsum("...h,...kh->...k", refined, candidates).float()
             covered = terms.topk_ids == labels[..., None]
-            refinement = ce_l1_terms(
+            refinement = primitives["ce_l1"](
                 scores,
                 covered.long().argmax(-1),
                 teacher_logits=teacher.gather(-1, terms.topk_ids),
-                fused=runtime.execution.fused,
             )
             mass = teacher.float().softmax(-1).gather(-1, terms.topk_ids).sum(-1)
             refined_loss = self.ce_weight * refinement.cross_entropy * covered.any(

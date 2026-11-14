@@ -281,9 +281,7 @@ class FusedHeadKernelTest(unittest.TestCase):
                 self._compare(vocab_size, top_k=top_k)
 
     def test_wide_candidate_sets_and_retained_graphs(self):
-        from specforge.algorithms.objectives.implementations._fused_logits_loss_triton import (
-            MAX_FUSED_TOP_K,
-        )
+        from specforge.losses._fused_logits_loss_triton import MAX_FUSED_TOP_K
 
         torch.manual_seed(4)
         device = torch.device("cuda")
@@ -338,9 +336,7 @@ class FusedHeadKernelTest(unittest.TestCase):
 
     def test_topk_matches_fp32_topk_at_full_vocabulary(self):
         """Random and peaked BF16 rows over the 248k Qwen3.8 vocabulary."""
-        from specforge.algorithms.objectives.implementations._fused_logits_loss_triton import (
-            _launch_stats,
-        )
+        from specforge.losses._fused_logits_loss_triton import _launch_stats
 
         torch.manual_seed(5)
         device = torch.device("cuda")

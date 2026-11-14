@@ -322,11 +322,45 @@ class LossExecutionTest(unittest.TestCase):
                     if not fused:
                         expected = actual
                     else:
+                        if architecture in ("DFlash2DraftModel", "DSpineDraftModel"):
+                            self.assertEqual(
+                                runtime.loss_implementations.names["0:aux:ce_l1"],
+                                "fused_ce_l1",
+                            )
                         torch.testing.assert_close(
                             actual, expected, rtol=8e-4, atol=3e-5
                         )
                         if architecture == "DominoDraftModel":
                             self.assertGreater(kernel.call_count, 0)
+                        if architecture == "DFlash2DraftModel":
+                            saved = dict(runtime.loss_implementations.names)
+                            saved["0:aux:ce_l1"] = "reference"
+                            runtime.loss_implementations.restore(saved)
+                            with self.assertRaisesRegex(
+                                ValueError, "changed on resume"
+                            ):
+                                runtime(batch, step=1, total_steps=10)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_fused_soft_ce_matches_legacy_real_vocabulary(self):
+        from specforge.core.loss import LogSoftmaxLoss
+        from specforge.losses.fused import fused_soft_ce_loss
+
+        torch.manual_seed(1175)
+        logits = torch.randn(2, 3, 128256, device="cuda", dtype=torch.bfloat16)
+        teacher = torch.randn_like(logits)
+        mask = torch.tensor([[1, 0, 1], [0, 1, 1]], device="cuda")
+        expected_input = logits.clone().requires_grad_()
+        actual_input = logits.clone().requires_grad_()
+        expected = LogSoftmaxLoss.apply(
+            expected_input, teacher.float().softmax(-1), mask[..., None]
+        )
+        actual = (fused_soft_ce_loss(actual_input, teacher) * mask).mean()
+        (expected_grad,) = torch.autograd.grad(expected, expected_input)
+        (actual_grad,) = torch.autograd.grad(actual, actual_input)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0.02, atol=2e-8)
+        self.assertEqual(torch.count_nonzero(actual_grad[mask == 0]), 0)
 
     def test_fused_loss_rejects_cpu(self):
         config, runtime = build_runtime("DSparkDraftModel", options={"num_anchors": 2})

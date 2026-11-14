@@ -8,9 +8,9 @@ import torch
 import torch.nn.functional as F
 
 from specforge.core.position_weights import DPACE_LOSS_TYPES
+from specforge.losses import fused as fused_loss
 
 from .base import check_options
-from .implementations import fused_loss
 
 
 @dataclass
@@ -115,7 +115,9 @@ def ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
     )
 
 
-def _distillation(compute):
+def distillation_loss(compute):
+    """Adapt a logits/teacher formula to the common token-loss signature."""
+
     def loss(logits, labels, teacher, **options):
         return compute(logits, teacher, **options)
 
@@ -132,7 +134,7 @@ for _name, _compute in {
     "lk": fused_loss.lk_hybrid_loss,
 }.items():
     register_loss(_name, requires=("logits", "labels", "teacher_logits"))(
-        _distillation(_compute)
+        distillation_loss(_compute)
     )
 
 
@@ -143,7 +145,9 @@ class LossContext:
     denominator: torch.Tensor | None = None
 
 
-def _lk(mode, *, ce_compute=None):
+def lk_loss(mode, *, ce_compute=None):
+    """Build an LK formula using the supplied CE primitive or its reference."""
+
     def compute(
         logits, labels, teacher, *, context, target="labels", kl_scale=1.0, kl_decay=1.0
     ):
@@ -187,7 +191,7 @@ def _lk(mode, *, ce_compute=None):
 
 
 for _mode in ("alpha", "tv", "lambda"):
-    register_loss(f"lk_{_mode}", contextual=True)(_lk(_mode))
+    register_loss(f"lk_{_mode}", contextual=True)(lk_loss(_mode))
 
 
 def _accepted_options(compute):

@@ -15,6 +15,7 @@ from torch import nn
 
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
+from specforge.algorithms.objectives.implementations import domino_ce  # noqa: F401
 from specforge.algorithms.objectives.implementations.linear_ce import _linear_kernel
 from specforge.algorithms.objectives.implementations.registry import (
     _IMPLEMENTATIONS,
@@ -55,7 +56,7 @@ class DistributedPlan(nn.Module):
             labels=labels,
             positions=torch.zeros_like(labels),
             mask=mask,
-            auxiliary=lambda p, out, teacher, weights, statistics: AuxiliaryLoss(
+            auxiliary=lambda p, out, teacher, weights, statistics, primitives: AuxiliaryLoss(
                 {"square": out["logits"].square().mean(-1)}
             ),
             plan=LossPlan(
@@ -241,7 +242,7 @@ class LossPlanTest(unittest.TestCase):
         weighting = PositionWeighting(kind="exponential", gamma=2)
         positions = torch.arange(5)[:, None]
 
-        def auxiliary(p, output, teacher, weights, statistics):
+        def auxiliary(p, output, teacher, weights, statistics, primitives):
             return AuxiliaryLoss(
                 {
                     "square": output["logits"].square().mean(-1),
@@ -308,61 +309,91 @@ class LossPlanTest(unittest.TestCase):
                 key: value.to(device) for key, value in training_batch(config).items()
             }
             p = next(iter(runtime.objective(runtime, batch).predictions))
-            original = p.auxiliary
 
-            def auxiliary(prediction, outputs, teacher, weights, statistics):
+            def reuse(prediction, outputs, teacher, weights, statistics, primitives):
                 self.assertFalse(statistics[0]["teacher_l1"].requires_grad)
-                return original(prediction, outputs, teacher, weights, statistics)
+                unused = Mock(side_effect=AssertionError("L1 should be reused"))
+                return p.auxiliary(
+                    prediction, outputs, teacher, weights, statistics, {"ce_l1": unused}
+                )
 
-            def without_statistics(prediction, outputs, teacher, weights, statistics):
-                return original(prediction, outputs, teacher, weights, {})
+            def recompute(
+                prediction, outputs, teacher, weights, statistics, primitives
+            ):
+                return p.auxiliary(
+                    prediction, outputs, teacher, weights, {}, primitives
+                )
 
             for fused in (False, True) if device == "cuda" else (False,):
-                execution = LossExecution(fused=fused, checkpoint=False)
-                with patch(
-                    "specforge.algorithms.objectives.protocols.dspark.ce_l1_terms",
-                    side_effect=AssertionError("L1 should be reused"),
-                ):
-                    actual = execute_batch(
-                        PredictionBatch((replace(p, auxiliary=auxiliary),)),
+                results = [
+                    execute_batch(
+                        PredictionBatch((replace(p, auxiliary=callback),)),
                         TokenLoss(kind="ce_l1"),
                         PositionWeighting(),
                         training=True,
-                        execution=execution,
+                        execution=LossExecution(fused=fused, checkpoint=False),
                     )
-                expected = execute_batch(
-                    PredictionBatch(
-                        (
-                            replace(
-                                p,
-                                auxiliary=without_statistics,
-                            ),
-                        )
-                    ),
-                    TokenLoss(kind="ce_l1"),
-                    PositionWeighting(),
-                    training=True,
-                    execution=execution,
-                )
-                torch.testing.assert_close(actual.loss, expected.loss)
+                    for callback in (reuse, recompute)
+                ]
+                torch.testing.assert_close(results[0].loss, results[1].loss)
                 torch.testing.assert_close(
-                    torch.autograd.grad(actual.loss, p.hidden, retain_graph=True)[0],
-                    torch.autograd.grad(expected.loss, p.hidden, retain_graph=True)[0],
+                    torch.autograd.grad(results[0].loss, p.hidden, retain_graph=True)[
+                        0
+                    ],
+                    torch.autograd.grad(results[1].loss, p.hidden, retain_graph=True)[
+                        0
+                    ],
                 )
-            # A different main loss supplies no L1: confidence still computes its target.
-            from specforge.algorithms.objectives.protocols.dspark import ce_l1_terms
+            # A different main loss supplies no L1; the callback uses the injected primitive.
+            calls = []
 
-            with patch(
-                "specforge.algorithms.objectives.protocols.dspark.ce_l1_terms",
-                wraps=ce_l1_terms,
-            ) as fallback:
-                execute_batch(
-                    PredictionBatch((p,)),
+            def fallback(prediction, outputs, teacher, weights, statistics, primitives):
+                compute = Mock(wraps=primitives["ce_l1"])
+                result = p.auxiliary(
+                    prediction,
+                    outputs,
+                    teacher,
+                    weights,
+                    statistics,
+                    {"ce_l1": compute},
+                )
+                calls.append(compute.call_count)
+                return result
+
+            execute_batch(
+                PredictionBatch((replace(p, auxiliary=fallback),)),
+                TokenLoss(kind="ce"),
+                PositionWeighting(),
+                training=True,
+            )
+            self.assertEqual(calls, [1])
+
+    def test_trim_preserves_cross_unit_computation(self):
+        for safe_projection in (False, True):
+            hidden = torch.randn(4, 1, 5, requires_grad=True)
+            prediction = Predictions(
+                hidden=hidden,
+                projection=Projection(
+                    lambda x: {"logits": x - x.mean(0)},
+                    chunk_safe=safe_projection,
+                ),
+                chunk_safe=not safe_projection,
+                labels=torch.zeros(4, 1, dtype=torch.long),
+                positions=torch.zeros(4, 1, dtype=torch.long),
+                mask=torch.tensor([1.0, 0.0, 1.0, 0.0])[:, None],
+            )
+            results = []
+            for trim in (False, True):
+                result = execute_batch(
+                    PredictionBatch((prediction,)),
                     TokenLoss(kind="ce"),
                     PositionWeighting(),
                     training=True,
+                    execution=LossExecution(trim=trim, chunk_size=1),
                 )
-            fallback.assert_called_once()
+                (gradient,) = torch.autograd.grad(result.loss, hidden)
+                results.append((result.loss, gradient))
+            torch.testing.assert_close(results[0], results[1])
 
     def test_projection_execution_constraints(self):
         head = nn.Linear(4, 9)

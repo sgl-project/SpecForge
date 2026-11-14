@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -105,12 +104,11 @@ class DFlash2Objective:
         )
         scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
 
-        def auxiliary(predictions, projected, teacher, weights, statistics):
+        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
             labels = predictions.labels
-            terms = ce_l1_terms(
+            terms = primitives["ce_l1"](
                 projected["logits"],
                 labels,
-                fused=runtime.execution.fused,
                 top_k=model.config.draft.spec_config.selector_top_k,
             )
             unary, hidden = terms.topk_values, predictions.hidden
@@ -123,8 +121,8 @@ class DFlash2Objective:
                 predecessor_ids=predictions.auxiliary_inputs["predecessors"],
             )
             covered = terms.topk_ids == labels[..., None]
-            selector = ce_l1_terms(
-                scores, covered.long().argmax(-1), fused=runtime.execution.fused
+            selector = primitives["ce_l1"](
+                scores, covered.long().argmax(-1)
             ).cross_entropy * covered.any(-1)
             return AuxiliaryLoss({"selector": selector})
 

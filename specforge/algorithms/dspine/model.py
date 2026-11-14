@@ -7,8 +7,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-from specforge.algorithms.objectives.implementations.fused_loss import ce_l1_loss
 from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.losses.fused import ce_l1_loss
 
 
 class OnlineDSpineModel(OnlineDFlashModel):

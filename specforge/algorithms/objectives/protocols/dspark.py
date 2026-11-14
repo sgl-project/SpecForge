@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..implementations.token_kernels import ce_l1_terms
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -90,18 +89,17 @@ class DSparkObjective:
             output_logits=False,
         )
 
-        def auxiliary(predictions, projected, teacher, weights, statistics):
+        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
             confidence = projected["confidence_scores"]
             if confidence is None:
                 return AuxiliaryLoss({"confidence": weights.new_zeros(weights.shape)})
             with torch.no_grad():
                 distance = statistics.get(0, {}).get("teacher_l1")
                 if distance is None:
-                    distance = ce_l1_terms(
+                    distance = primitives["ce_l1"](
                         projected["logits"],
                         predictions.labels,
                         teacher_logits=teacher,
-                        fused=runtime.execution.fused,
                     ).teacher_l1
                 acceptance = (1 - distance / 2).clamp(0, 1)
             return AuxiliaryLoss(
