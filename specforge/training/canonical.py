@@ -197,7 +197,6 @@ def _objective_settings(cfg):
         options=cfg.training.objective_options,
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
-        execution=cfg.training.loss_execution,
     )
 
 
@@ -219,7 +218,12 @@ def _validate_imported_objective(cfg, resolved):
         "architectures"
     ) != ["DSpineDraftModel"]:
         return
-    for name, saved in extract_dspine_training_settings(payload).items():
+    # Weight import keeps architecture/sampling checks; loss settings belong
+    # exclusively to the new training configuration, not the model checkpoint.
+    recorded = extract_dspine_training_settings(payload)
+    for name, saved in recorded.items():
+        if name in {"ce_weight", "alignment_weight"}:
+            continue
         if getattr(resolved.objective, name) != saved:
             raise ValueError(
                 f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
@@ -461,6 +465,8 @@ def resolve_run(cfg, *, target_config=None):
         attention_backends=requirements.attention_backends,
         required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
+        supports_trim_loss_positions=True,
+        supports_compact_teacher=vocab,
         supports_liger_kernel=True,
         # a checkpoint import's legacy config becomes the draft; the reader checks it
         allows_aux_layer_override=bool(init and init.checkpoint),
@@ -597,8 +603,7 @@ def build_bundle(cfg, algorithm):
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
-            require_loaded=tuple(cfg.training.frozen)
-            + getattr(resolved.objective, "frozen_parameters", ()),
+            require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
@@ -663,7 +668,7 @@ def build_bundle(cfg, algorithm):
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": cfg.model.use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
-        "canonical_loss": asdict(runtime.token_loss),
+        "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,

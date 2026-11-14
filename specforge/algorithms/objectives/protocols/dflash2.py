@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -36,12 +37,20 @@ from .dflash import COMMON_MODULES
 class DFlash2Objective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
-    selector_loss_alpha: float = 1.0
     selector_warmup_steps: int | None = None
     selector_ramp_steps: int | None = None
     selector_warmup_ratio: float = 0.0
     selector_ramp_ratio: float = 0.0
     selector_stop_gradient: bool = False
+
+    @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            "selector": LossDefinition(
+                TokenLoss("ce"), modules=("candidate_selector",)
+            ),
+        }
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
@@ -54,7 +63,6 @@ class DFlash2Objective:
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
-            nonnegative={"selector_loss_alpha": self.selector_loss_alpha},
             probabilities={
                 "selector_warmup_ratio": self.selector_warmup_ratio,
                 "selector_ramp_ratio": self.selector_ramp_ratio,
@@ -71,10 +79,6 @@ class DFlash2Objective:
                 raise ValueError(f"selector {name} must use steps or ratio, not both")
         if type(self.selector_stop_gradient) is not bool:
             raise ValueError("selector_stop_gradient must be boolean")
-
-    @property
-    def frozen_parameters(self):
-        return ("candidate_selector",) if self.selector_loss_alpha == 0 else ()
 
     def selector_scale(self, step, total_steps):
         if (self.selector_warmup_ratio or self.selector_ramp_ratio) and not total_steps:
@@ -102,7 +106,7 @@ class DFlash2Objective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
+        scale = self.selector_scale(step, total_steps)
 
         def compute(calc):
             calc.run((0,))
@@ -113,6 +117,7 @@ class DFlash2Objective:
                 calc.outputs()["logits"],
                 labels,
                 top_k=model.config.draft.spec_config.selector_top_k,
+                term_index=0,
             )
             ids = terms.statistics["topk_ids"]
             unary, hidden = terms.statistics["topk_values"], predictions.hidden
@@ -125,8 +130,13 @@ class DFlash2Objective:
                 predecessor_ids=predictions.context_inputs["predecessors"],
             )
             covered = ids == labels[..., None]
-            selector = calc.evaluate(
-                "selector", TokenLoss("ce"), scores, covered.long().argmax(-1)
+            selector = calc.evaluate_term(
+                1,
+                scores,
+                covered.long().argmax(-1),
+                teacher=(
+                    calc.teacher.gather(-1, ids) if calc.teacher is not None else None
+                ),
             ).values * covered.any(-1)
             calc.add(1, selector)
 
@@ -135,9 +145,7 @@ class DFlash2Objective:
             blocks,
             batch,
             compute=compute,
-            plan=LossPlan(
-                (LossTerm(), LossTerm("selector", scale, TokenLoss("value")))
-            ),
+            plan=LossPlan((LossTerm(), LossTerm("selector", scale, TokenLoss("ce")))),
             context_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))
