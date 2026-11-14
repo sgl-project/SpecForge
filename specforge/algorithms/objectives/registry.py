@@ -32,7 +32,7 @@ class TrainingRequirements:
     minimum_loss_tokens: int = 1
     loss_mask_filter: Callable[[object], bool] | None = None
     supports_sequence_parallel: bool = False
-    attention_backends: frozenset[str] = frozenset({"eager"})
+    attention_backends: frozenset[str] = frozenset({"eager", "sdpa", "flex_attention"})
     window_statistic: WindowStatistic | None = None
     host_inputs: Callable | None = (
         None  # (batch tensors, draft config) -> extra tensors

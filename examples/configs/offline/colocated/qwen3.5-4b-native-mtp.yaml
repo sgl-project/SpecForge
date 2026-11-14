@@ -1,5 +1,3 @@
-# Native target initialization through ordinary draft YAML and weight mappings.
-# Prepare unshifted input_ids, loss_mask and target_last_hidden_states first.
 model:
   target_model_path: Qwen/Qwen3.5-4B
   torch_dtype: bfloat16
@@ -7,8 +5,8 @@ model:
 draft: specforge/config/draft/presets/native/qwen3_5_4b_mtp.yaml
 initialization:
   from_target:
-    "":
-      from: mtp
+    ? ''
+    : from: mtp
       rename:
         layers: backbone.layers
         norm: backbone.final_norm
@@ -19,7 +17,6 @@ data:
   hidden_states_path: ./cache/hidden_states/qwen3.5-4b-native-mtp
   max_length: 512
 training:
-  strategy: mtp
   attention_backend: sdpa
   objective_options:
     objective_chunk_size: 4096

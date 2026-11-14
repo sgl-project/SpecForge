@@ -9,7 +9,7 @@ load target model classes or derive dimensions from the target configuration.
 
 The bundled preset matches the dense [Qwen3.5-4B configuration](https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/config.json), including offset RMSNorm, gated attention and interleaved partial RoPE.
 Add the following to a recipe with `model.target_model_path: Qwen/Qwen3.5-4B`
-and `training.strategy: mtp`, with `training.attention_backend: eager`.
+with `training.attention_backend: eager`.
 MTP planning at this stage rejects the default `flex_attention`:
 
 ```yaml
@@ -34,7 +34,7 @@ fails before reading tensors. Copied weights remain trainable and are saved;
 optional `training.frozen` prefixes freeze them independently of initialization.
 
 MTP training supports `training.attention_backend: eager` or `sdpa`.
-`training.objective_options.objective_chunk_size` defaults to 4096 token positions;
+Use `training.loss.scheduling.chunk_size` to bound projection/loss chunks;
 0 disables chunking. Each chunk computes LM head and loss together and is
 recomputed during backward, bounding saved logits as well as forward temporaries.
 This does not bound attention or backbone activation memory.
