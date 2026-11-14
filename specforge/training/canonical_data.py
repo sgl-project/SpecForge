@@ -27,6 +27,12 @@ def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
             "offline record fails the objective's loss-mask requirement "
             f"({loss_mask_filter.__name__})"
         )
+    if "lengths" in raw:
+        lengths = raw["lengths"].flatten().long()
+        if lengths.numel() == 0 or (lengths <= 0).any():
+            raise ValueError("lengths must contain positive document lengths")
+        starts = lengths.cumsum(0) - lengths
+        result["lengths"] = lengths.minimum(length - starts)[starts < length]
     result["attention_mask"] = torch.ones_like(result["input_ids"], dtype=torch.bool)
     return result
 
@@ -109,9 +115,14 @@ def collate(features, *, keys):
         "attention_mask",
         *(("position_ids",) if "position_ids" in features[0] else ()),
     )
-    return pad_and_concatenate_features(
+    result = pad_and_concatenate_features(
         features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
     )
+    if any("lengths" in feature for feature in features):
+        if len(features) != 1:
+            raise ValueError("packed documents require batch size one")
+        result["lengths"] = features[0]["lengths"]
+    return result
 
 
 def build_collator(*, keys):
@@ -125,6 +136,11 @@ def build_reader(hidden_states_path, *, strategy, keys, **kwargs):
         hidden_states_path,
         strategy=strategy,
         feature_keys=keys,
+        feature_aliases={
+            "hidden_states": ("aux_hidden_state",),
+            "target_last_hidden_states": ("hidden_state",),
+        },
+        optional_features=("lengths",),
         target_repr="hidden_state" if "target_last_hidden_states" in keys else None,
         **kwargs,
     )

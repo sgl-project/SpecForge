@@ -1,30 +1,28 @@
 model:
-  target_model_path: "Qwen/Qwen2.5-7B-Instruct"
-  draft_model_config: "configs/qwen2.5-7b-eagle3.json"
-  target_backend: "sglang"
-  embedding_key: "model.embed_tokens.weight"
-  vocab_mapping_path: "./cache/vocab_mapping/qwen2.5-7b-eagle3.pt"
-  torch_dtype: "bfloat16"
+  target_model_path: Qwen/Qwen2.5-7B-Instruct
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  vocab_mapping_path: ./cache/vocab_mapping/qwen2.5-7b-eagle3.pt
+  torch_dtype: bfloat16
 data:
-  hidden_states_path: "./cache/hidden_states/qwen2.5-7b"
+  hidden_states_path: ./cache/hidden_states/qwen2.5-7b
   max_length: 4096
-  chat_template: "qwen"
-  cache_dir: "./cache"
+  chat_template: qwen
+  cache_dir: ./cache
 training:
-  strategy: "eagle3"
   num_epochs: 10
   batch_size: 1
-  learning_rate: 0.00005
+  learning_rate: 5.0e-05
   max_grad_norm: 0.5
-  ttt_length: 7
-  attention_backend: "flex_attention"
+  attention_backend: flex_attention
   save_interval: 1000
   log_interval: 50
   dist_timeout: 20
   seed: 0
-run_id: "qwen2.5-7b-eagle3-offline-disaggregated"
-output_dir: "./outputs/qwen2.5-7b-eagle3-offline-disaggregated"
-
+  objective_options:
+    ttt_length: 7
+run_id: qwen2.5-7b-eagle3-offline-disaggregated
+output_dir: ./outputs/qwen2.5-7b-eagle3-offline-disaggregated
 deployment:
   mode: disaggregated
   trainer:
@@ -34,3 +32,4 @@ deployment:
     control_dir: outputs/qwen2.5-7b-eagle3-offline-disaggregated/control
     backend: shared_dir
     store_root: outputs/qwen2.5-7b-eagle3-offline-disaggregated/features
+draft: specforge/config/draft/presets/qwen2.5-7b-eagle3.yaml

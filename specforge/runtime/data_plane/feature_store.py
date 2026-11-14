@@ -515,14 +515,18 @@ class LocalFeatureStore(FeatureStore):
         self, path: str, ref: SampleRef, wanted: List[str]
     ) -> Dict[str, torch.Tensor]:
         raw = load_feature_file(path)
+        aliases = ref.metadata.get("file_feature_aliases", {})
         out = {}
-        for n in wanted:
-            # feature_keys may remap a logical name -> a raw file key.
-            raw_key = ref.feature_keys.get(n, n)
-            raw_key = raw_key.split("/")[-1] if "/" in raw_key else raw_key
-            if raw_key not in raw:
-                raise KeyError(f"{path} missing key {raw_key!r} for feature {n!r}")
-            out[n] = raw[raw_key]
+        for name in wanted:
+            raw_key = ref.feature_keys.get(name, name).rsplit("/", 1)[-1]
+            candidates = (raw_key, *aliases.get(name, ()))
+            selected = next((key for key in candidates if key in raw), None)
+            if selected is None:
+                raise KeyError(f"{path} missing key {raw_key!r} for feature {name!r}")
+            out[name] = raw[selected]
+        for name in ref.metadata.get("optional_file_features", ()):
+            if name in raw:
+                out[name] = raw[name]
         return out
 
     # -- lifetime ----------------------------------------------------------
