@@ -112,6 +112,7 @@ class ObjectiveContractTest(unittest.TestCase):
             patch.object(runtime, "objective") as objective,
             patch("specforge.algorithms.objectives.execution.execute_batch"),
         ):
+            objective.return_value.diagnostics = None
             runtime(batch, step=0, total_steps=None)
             captured = objective.call_args.args[1]
             self.assertEqual(captured["hidden_states"].dtype, torch.bfloat16)

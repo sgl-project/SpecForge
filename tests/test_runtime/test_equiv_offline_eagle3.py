@@ -17,7 +17,7 @@ from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
-ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
+ALGORITHM = builtin_algorithm_registry(ttt_length=3).resolve("eagle3")
 
 
 def _optimizer_factory(module):
@@ -35,19 +35,8 @@ def _optimizer_factory(module):
 @torch.no_grad()
 def _direct_offline_loss(model, target_head, batch) -> float:
     """Compute the EAGLE3 objective below the strategy/runtime boundary."""
-    tensors = batch.tensors
-    input_ids, target, loss_mask = target_head.preprocess(
-        tensors["input_ids"], tensors["target"], tensors["loss_mask"]
-    )
-    target = target_head(target.cuda())
-    plosses, *_ = model(
-        input_ids=input_ids.cuda(),
-        attention_mask=tensors["attention_mask"].cuda(),
-        loss_mask=loss_mask.cuda(),
-        target=target,
-        hidden_states=tensors["hidden_state"].cuda(),
-    )
-    return float(sum(0.8**index * loss for index, loss in enumerate(plosses)).item())
+    tensors = {name: tensor.cuda() for name, tensor in batch.tensors.items()}
+    return float(model(tensors, step=0, total_steps=1).loss.item())
 
 
 @unittest.skipUnless(CUDA, "offline EAGLE3 parity requires CUDA")

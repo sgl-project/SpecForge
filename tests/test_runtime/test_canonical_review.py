@@ -52,6 +52,7 @@ class CanonicalReviewTest(unittest.TestCase):
         result = SimpleNamespace(
             loss=torch.tensor(1.0),
             ratios=ratios,
+            sums={},
             numerator=torch.tensor(1.0),
             denominator=torch.tensor(1.0),
         )

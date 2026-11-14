@@ -24,7 +24,6 @@ class PEagleTrainingTest(unittest.TestCase):
             32, 64, bias=False, device="cuda", dtype=torch.bfloat16
         )
         options = dict(
-            mask_token_id=31,
             num_depths=3,
             down_sample_ratio=1.0,
             down_sample_ratio_min=1.0,
@@ -34,7 +33,7 @@ class PEagleTrainingTest(unittest.TestCase):
         batch["lengths"] = torch.tensor([4, 5], device="cuda")
         before = draft.mask_hidden.detach().clone()
         optimizer = BF16Optimizer(draft, lr=0.01, warmup_ratio=0.0, total_steps=2)
-        model(batch).loss.backward()
+        model(batch, step=0, total_steps=2).loss.backward()
         for name, parameter in draft.named_parameters():
             self.assertIsNotNone(parameter.grad, name)
             self.assertTrue(torch.isfinite(parameter.grad).all(), name)
@@ -47,9 +46,9 @@ class PEagleTrainingTest(unittest.TestCase):
             restored = load_draft(path, device="cuda", dtype=torch.bfloat16)
         other = build_objective_model(restored, target_head=teacher, options=options)
         torch.manual_seed(43)
-        expected = model(batch).loss
+        expected = model(batch, step=0, total_steps=2).loss
         torch.manual_seed(43)
-        actual = other(batch).loss
+        actual = other(batch, step=0, total_steps=2).loss
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

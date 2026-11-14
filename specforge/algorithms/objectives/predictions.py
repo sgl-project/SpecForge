@@ -194,3 +194,6 @@ class PredictionBatch:
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
     chunk_size: int = 0
+    diagnostics: Callable | None = (
+        None  # Detached (ratio pairs, additive counts), run once after loss.
+    )
