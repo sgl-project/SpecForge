@@ -356,21 +356,8 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if not persisted_available and key in (
-                    "canonical_loss_execution",
-                    "canonical_use_fused_conv",
-                ):
-
-                    from specforge.algorithms.objectives.execution_options import (
-                        LossExecution,
-                    )
-
-                    # Older canonical runs used exactly these execution defaults.
-                    comparison_persisted = (
-                        asdict(LossExecution())
-                        if key == "canonical_loss_execution"
-                        else False
-                    )
+                if not persisted_available and key == "canonical_use_fused_conv":
+                    comparison_persisted = False
                     persisted_available = True
                 if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(

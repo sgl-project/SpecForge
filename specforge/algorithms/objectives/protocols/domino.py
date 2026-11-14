@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -38,6 +39,13 @@ class DominoObjective:
     loss_decay_gamma: float | None = None
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
+
+    @property
+    def loss_terms(self):
+        return {
+            "base": LossDefinition(self.default_loss),
+            "final": LossDefinition(self.default_loss),
+        }
 
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)

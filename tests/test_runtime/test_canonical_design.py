@@ -169,7 +169,7 @@ class CanonicalDesignTest(unittest.TestCase):
                 dflash2_config(),
                 training={
                     "attention_backend": "eager",
-                    "objective_options": {"selector_loss_alpha": 0},
+                    "loss": {"terms": {"selector": {"coefficient": 0}}},
                 },
             )
             run = resolve_run(cfg)

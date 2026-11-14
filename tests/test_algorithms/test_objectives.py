@@ -186,7 +186,9 @@ class ObjectiveTest(unittest.TestCase):
             )
             captured = capture_projections(model)
             runtime = build_objective_model(
-                model, options={"num_anchors": 2}, execution={"checkpoint": False}
+                model,
+                options={"num_anchors": 2},
+                loss={"scheduling": {"checkpoint": False}},
             )
             with (
                 patch(

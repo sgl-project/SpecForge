@@ -13,35 +13,32 @@ DSpine, MTP and DMTP. They reuse explicit-label CE/L1 loss primitives and functi
 sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiable
 KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
 KV caches to the backbone.
-This is an eager reference path, including dense vocabulary projections; fused
-losses, sparse attention and sequence parallel execution are not implemented here.
-MTP projects only supervised rows and checkpoints its chunked projection/loss;
-other protocols retain their existing execution paths.
-The legacy training path retains the optimized kernels. MTP/DMTP CE is evaluated
+Reference and optimized loss implementations share the same executor.
+Training wrappers with capabilities not yet migrated, such as sequence parallelism,
+remain available with their existing configuration until the separate cutover. MTP/DMTP CE is evaluated
 in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
 
 Loss and position weighting can be selected independently of the architecture:
 
 ```python
 runtime = build_objective_model(
-    draft, loss={"kind": "kl"}, weighting={"kind": "exponential", "gamma": 7.0}
+    draft, loss={"terms": {"token": {"kind": "kl"}}}, weighting={"kind": "exponential", "gamma": 7.0}
 )
 result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
-`loss.kind` accepts `default`, `ce` (the protocol's labels: data tokens for block and
+`loss.terms.<name>.kind` accepts `ce` (the protocol's labels: data tokens for block and
 MTP protocols, the teacher's top-1 within the draft vocabulary for EAGLE3/P-EAGLE),
 `soft_ce`, `kl`, `reverse_kl`,
 `js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
-plus a frozen head. `default` preserves each algorithm's base loss. Selector,
+plus a frozen head. Omitting a term preserves its algorithm default. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
 Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
 `dpace`, `dpace-cumulative-confidence-only` or `dpace-continuation-value-only`
 (alpha, default 0.5).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
-factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, as are
-DSpark's `ce_loss_alpha`/`l1_loss_alpha` with an explicit loss. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
+factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, rather than silently ignored. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
 position and accepts only uniform weighting. DFlash2 selector warmup
 and ramp accept either absolute steps or ratios of total optimizer steps.
 
@@ -232,33 +229,97 @@ configuration and is recorded in the training resume contract.
 
 ### Loss execution
 
-Execution controls are separate from the objective, token loss and weighting:
+The preferred configuration names mathematical terms and uses one shared fusion
+switch. Omitting fused means reference calculation.
 
 ```yaml
-model:
-  use_fused_conv: true
 training:
-  loss_execution:
-    chunk_size: 128
-    checkpoint: true
+  objective: dspark
+  objective_options:
+    num_anchors: 512
+  loss:
     fused: true
-    trim: true
-    # Vocabulary tile size for offline EAGLE/P-EAGLE teacher projection:
-    # teacher_chunk_size: 32768
+    terms:
+      token:
+        kind: ce_l1
+        options:
+          ce_weight: 0.1
+          l1_weight: 0.9
+      confidence:
+        kind: bce
+        coefficient: 1.0
+    scheduling:
+      chunk_size: 128
+      checkpoint: true
 ```
+
+Algorithms declare stable input names and defaults through `LossDefinition`.
+The resolver rejects unknown names or incompatible mathematical input contracts.
+DSpark confidence uses binary scores and soft targets; DSpine alignment uses
+feature groups. DSpine refinement additionally requires independently masked
+CE/L1 components. Omitted terms retain algorithm defaults.
+
+| Algorithm | Terms |
+| --- | --- |
+| DFlash, EAGLE3, P-EAGLE, MTP, DMTP | token |
+| DSpark | token, confidence |
+| DFlash2 | token, selector |
+| DSpine | token, refinement, alignment |
+| Domino | base, final |
+
+A term's coefficient multiplies its algorithm-supplied schedule factor. Sampling
+and input construction stay in objective_options. Mathematical parameters
+and coefficients belong to loss.terms; loss.fused controls optimization. Dependent auxiliary
+calculations call `calc.evaluate_term()` using those resolved settings.
+
+Domino uses the same configuration shape; its algorithm declares joint inputs internally:
+
+```yaml
+training:
+  objective: domino
+  loss:
+    fused: true
+    terms:
+      base: {kind: ce}
+      final: {kind: ce}
+    scheduling:
+      chunk_size: 128
+      checkpoint: true
+```
+
+With fused enabled, the executor selects the highest-priority compatible
+implementation, including joint optimizations. Unsupported groups split into
+individual terms; unsupported terms use reference formulas. Selection and fallback
+reasons are logged. Missing dependencies and execution failures propagate.
+
+Scheduling accepts chunk_size, checkpoint, trim and teacher_chunk_size.
+Chunking and checkpointing are independent of fusion; checkpointing also works
+without splitting. Losses needing whole-set statistics stay unsplit with a warning
+when a requested split cannot be honored. Unsafe replay disables checkpointing
+with a warning. Unchunked D-PACE also reports that its materialized
+chain-weighting path cannot use loss checkpointing.
+
+LossConfiguration.bind() installs formulas and coefficients while preserving
+algorithm-owned joint ranges. The effective settings are stored in the resume
+contract. Users do not configure groups, implementation names or term execution.
+
+Canonical objectives accept only the named configuration above. Flat loss
+dictionaries, separate `loss_execution`, and loss coefficients in
+`objective_options` are rejected. Retained training wrappers still use their
+existing top-level fields; their configuration cutover is a separate change.
 
 - `chunk_size` counts complete prediction units (blocks for block protocols,
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
   default; zero disables chunking. Recurrent heads always keep whole blocks.
 - `checkpoint` controls recomputation of chunk projections and losses during
-  backward when the prediction set spans multiple chunks. A single chunk is
-  not recomputed. It defaults to true and is independent of fused execution.
+  backward, including an unsplit prediction set. It defaults to true and is
+  independent of fused execution.
 - `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
   corrections without constructing full corrected logits. CPU, FP64 and other
   unsupported generic contracts use a logged reference. Missing required kernel
-  dependencies and incompatible explicit specializations raise.
+  dependencies and execution failures raise.
   Empty inputs use the reference only to preserve zero gradients.
   The first selection for each prediction group is logged at INFO, checked across
   ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
@@ -294,24 +355,21 @@ The fused kernel accumulates in FP32 and rounds once, so
 BF16 results need not be bit-identical to eager per-tap rounding. Parameter names
 and checkpoint tensors do not change. Liger selection remains independent.
 
-Execution settings are saved and checked on full resume. Older canonical
-checkpoints without these fields are interpreted using the previous defaults.
-A checkpoint that enabled fused loss but did not record the selected implementations
-cannot prove kernel compatibility and is rejected for full resume.
-Existing recipes keep their previous defaults until explicitly migrated.
+Execution settings are saved and checked on full resume. Checkpoints must record
+the current named loss settings and execution policy; old loss metadata is not
+converted or assigned defaults. Fused runs must also record selected implementation
+identities. Import model weights and start a new run when this contract is absent.
 
-MTP accepts `objective_chunk_size` through objective options and maps the legacy
-`mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
-Other canonical objectives do not consume legacy `objective_chunk_blocks`,
-`objective_checkpointing`, `fused_logits_loss`, `mtp_objective_chunk_size` or
-`trim_loss_positions`. Non-default values fail validation; explicitly supplied
-legacy defaults produce a warning and do not enable those optimizations.
+MTP uses `loss.scheduling.chunk_size` to control loss projection chunks.
+Its objective's default chunk size remains 4096. The existing top-level MTP
+chunk alias is retained until the training configuration cutover.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
 path. Neither is copied into the other. A canonical checkpoint supplied through
 `training.resume_from` also selects the canonical training route. Legacy DSpine
 imports through `initialization.checkpoint` must explicitly match saved training
-settings in `training.objective_options`; `weights_from` copies weights only.
+sampling settings in `training.objective_options`. Loss settings always come from
+the new training configuration; `weights_from` copies weights only.
 
 
 ### Extending loss execution
@@ -354,20 +412,21 @@ module paths are no longer supported.
 `implementations/domino_ce.py` contains only its execution adapter.
 Fusion requires one complete block per
 projection unit, additive corrections on a contiguous suffix, and base/final CE
-terms with shared supervision weights. Other layouts use ordinary projection.
+terms with shared supervision weights. Other layouts fall back to compatible per-term implementations or reference calculation.
 
 All final and intermediate calculations use `compute_loss(request, group, ...)`.
 The algorithm chooses the mathematical terms and their coefficients. The loss
 entry chooses how to evaluate them:
 
-| Mode | Arguments | Selection |
+| Mode | Configuration | Selection |
 | --- | --- | --- |
-| Reference | fused=False | Registered mathematical formula |
-| Optimized | fused=True | Highest-priority compatible implementation, otherwise reference |
+| Reference | fused: false | Registered mathematical formulas |
+| Optimized | fused: true | Compatible joint or per-term optimization, otherwise reference |
 
-Generic kernels and projection-specific kernels participate in automatic selection.
-Support checks do not materialize projections. Missing required dependencies and
-execution failures propagate. There is no explicit implementation selector.
+Both generic kernels and projection-specific kernels participate in automatic
+selection. Matching checks the mathematical loss, projection, requested outputs,
+device and dtype. Runtime errors and missing required dependencies propagate.
+The execution API has no explicit implementation argument.
 
 Register formulas with `register_loss`; its optional `outputs` callback provides
 extra reference results without changing the formula. CE's L1/top-k outputs use
@@ -377,8 +436,9 @@ or use `register_token_kernel` for generic per-token optimization.
 `implementation_registrations()` exposes the names, categories, loss mapping and
 applicability callbacks for inspection without a second routing table.
 
-Domino declares its base/final joint range. Automatic selection can execute
-`domino_suffix_ce` when fusion is enabled and its input contract matches.
+Domino declares the base/final joint range; the shared selector matches
+domino_suffix_ce automatically when fused is enabled. Explicit implementation
+names are not accepted.
 
 Implementations return weighted numerators by term index, plus predictions or
 requested statistics; they do not apply coefficients or final normalization.
@@ -475,13 +535,13 @@ not added to the canonical configuration.
 Parameters frozen by `training.frozen` or an objective must have loaded weights:
 a complete checkpoint, `weights_from`, `from_target`, or a target binding. An
 objective's frozen head that the draft disables (DSpark's confidence head at
-`confidence_loss_alpha: 0`) needs none.
+`loss.terms.confidence.coefficient: 0`) needs none.
 Freezing a newly initialized parameter fails before model allocation; partial
 imports must cover every frozen parameter, including tied aliases.
 
 Prepare canonical records from the run YAML used for training, so the records
 carry what its objective and loss read (for example `target_last_hidden_states`
-for `loss: {kind: kl}`):
+for `loss: {terms: {token: {kind: kl}}}`):
 
 ```bash
 python scripts/prepare_hidden_states.py -c /configs/run.yaml \
@@ -495,7 +555,17 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 canonical YAML selects the architecture, capture layers and output schema.
 
 
-### Inspecting loss implementations
+### Compatibility boundary
+
+Old canonical checkpoints normalize their loss formulas, coefficients and
+scheduling before resume comparison. Known equivalent CE-statistics identities
+are translated; DSpine's old CE-plus-L1 refinement identity maps to CE/L1, and
+its unchanged cosine calculation gains a reference identity. Unknown execution
+changes still fail the resume check.
+
+Old training wrappers remain for capabilities not yet migrated, including their
+full resume and parallel execution paths. They share specforge/losses numerical
+functions; this PR does not remove those training paths.
 
 Use `loss_registrations()` and `implementation_registrations()` to inspect the
 formula-to-implementation mapping. Each execution registration names its category,
