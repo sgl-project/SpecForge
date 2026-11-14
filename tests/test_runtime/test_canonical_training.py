@@ -105,7 +105,7 @@ def moe_draft_config(intermediate_size=16):
     )
 
 
-def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
+def moe_run_config(target, draft, kernel, bias_update_rate=0.0, aux_loss_coef=0.0):
     return run_config(
         target,
         draft,
@@ -123,6 +123,8 @@ def moe_run_config(target, draft, kernel, bias_update_rate=0.0):
             "objective_options": {
                 "num_anchors": 2,
                 "bias_update_rate": bias_update_rate,
+                "aux_loss_coef": aux_loss_coef,
+                "aux_loss_type": "batch_wise",
             },
         },
     )
@@ -537,12 +539,14 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
 
-    def _train_and_resume_moe(self, root, kernel, bias_update_rate=0.0):
+    def _train_and_resume_moe(
+        self, root, kernel, bias_update_rate=0.0, aux_loss_coef=0.0
+    ):
         self._init_group(root)
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel, bias_update_rate)
+        cfg = moe_run_config(target, draft, kernel, bias_update_rate, aux_loss_coef)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
@@ -587,8 +591,8 @@ class CanonicalTrainingTest(unittest.TestCase):
             build_application_run(Config.model_validate(raw)).run()
         # Balancing joins the contract only while on; switching it either way is a change.
         raw["model"]["moe_experts_kernel"] = kernel
-        raw["training"]["objective_options"]["bias_update_rate"] = (
-            0.0 if bias_update_rate else 0.001
+        raw["training"]["objective_options"].update(
+            bias_update_rate=0.0 if bias_update_rate else 0.001, aux_loss_coef=0.0
         )
         with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
             build_application_run(Config.model_validate(raw)).run()
@@ -628,7 +632,9 @@ class CanonicalTrainingTest(unittest.TestCase):
             raw.update(draft=None, resume=str(checkpoint))
             raw["model"]["moe_experts_kernel"] = "loop"
             raw["training"]["max_steps"] = 2
-            raw["training"]["objective_options"]["bias_update_rate"] = 0.0
+            raw["training"]["objective_options"].update(
+                aux_loss_coef=0.0, aux_loss_type="microbatch_wise"
+            )
             build_application_run(Config.model_validate(raw)).run()
             final = torch.load(
                 root / "output" / "specforge-run-step2" / "training_state.pt",
@@ -641,7 +647,7 @@ class CanonicalTrainingTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
         # grouped_mm also balances: the bias moves, is saved and moves again after resume.
-        balancing = {"grouped_mm": dict(bias_update_rate=0.001)}
+        balancing = {"grouped_mm": dict(bias_update_rate=0.001, aux_loss_coef=0.01)}
         for kernel in sorted(EXPERT_KERNELS):
             with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
                 self._train_and_resume_moe(

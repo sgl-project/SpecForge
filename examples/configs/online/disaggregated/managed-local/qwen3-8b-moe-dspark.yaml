@@ -41,6 +41,9 @@ training:
     confidence_loss_alpha: 0.0
     # Expert-bias load balancing: zero-mean sign step per optimizer step.
     bias_update_rate: 0.001
+    # Load-balance loss on the router scores against this step's pooled load.
+    aux_loss_coef: 0.005
+    aux_loss_type: batch_wise
   weighting:
     kind: exponential
     gamma: 7.0
