@@ -85,7 +85,7 @@ def resume_contract(_config, draft_model, training_model):
             draft_model.sliding_window,
             True,
         ),
-        "dspine_options": tuple(sorted(asdict(draft_model.dspine_config).items())),
+        "dspine_options": tuple(sorted(asdict(training_model.dspine_config).items())),
         "dspine_block_size": draft_model.block_size,
         "dspine_target_layer_ids": tuple(draft_model.target_layer_ids),
         "dspine_num_hidden_layers": len(draft_model.layers),

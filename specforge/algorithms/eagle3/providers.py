@@ -68,10 +68,14 @@ def resume_contract(config, draft_model, training_model):
         "eagle3_lk_loss_type": training_model.lk_loss_type,
         "eagle3_kl_scale": float(training_model.kl_scale),
         "eagle3_kl_decay": float(training_model.kl_decay),
-        "eagle3_trim_loss_positions": bool(config.training.trim_loss_positions),
-        "eagle3_compact_teacher": bool(config.training.compact_teacher),
+        "eagle3_trim_loss_positions": bool(
+            config.training.loss.get("scheduling", {}).get("trim", False)
+        ),
+        "eagle3_compact_teacher": bool(
+            config.training.loss.get("scheduling", {}).get("teacher_chunk_size")
+        ),
         "eagle3_compact_teacher_chunk_size": (
-            config.training.compact_teacher_chunk_size
+            config.training.loss.get("scheduling", {}).get("teacher_chunk_size")
         ),
     }
 

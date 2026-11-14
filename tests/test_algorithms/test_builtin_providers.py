@@ -173,9 +173,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
 
         training = SimpleNamespace(
             attention_backend="flex_attention",
-            trim_loss_positions=True,
-            compact_teacher=True,
-            compact_teacher_chunk_size=1024,
+            loss={"scheduling": {"trim": True, "teacher_chunk_size": 1024}},
             lambda_base_start=0.75,
             lambda_base_decay_ratio=0.25,
         )
@@ -192,6 +190,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             sliding_window=None,
         )
         dflash_family = SimpleNamespace(
+            dspine_config=DSpineConfig(),
             block_size=16,
             mask_token_id=0,
             attention_backend="flex_attention",
@@ -292,9 +291,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         config = SimpleNamespace(
             training=SimpleNamespace(
                 attention_backend="flex_attention",
-                trim_loss_positions=False,
-                compact_teacher=False,
-                compact_teacher_chunk_size=None,
+                loss={},
             )
         )
         model = SimpleNamespace(

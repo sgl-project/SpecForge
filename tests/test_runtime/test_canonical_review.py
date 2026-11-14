@@ -140,10 +140,10 @@ class CanonicalReviewTest(unittest.TestCase):
                 ("fused_logits_loss", False),
                 ("mtp_objective_chunk_size", 1),
             ):
-                changed = cfg.model_copy(deep=True)
-                setattr(changed.training, name, value)
+                changed = cfg.model_dump()
+                changed["training"][name] = value
                 with self.assertRaisesRegex(ValueError, name):
-                    resolve_run(changed)
+                    Config.model_validate(changed)
             for name in ("embedding_key", "lm_head_key"):
                 owned = run_config(
                     target,

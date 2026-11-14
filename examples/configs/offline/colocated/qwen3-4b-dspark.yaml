@@ -12,6 +12,8 @@ data:
   cache_dir: ./cache
 
 training:
+  loss:
+    fused: true
   strategy: dspark
   num_epochs: 6
   max_steps: 10000
