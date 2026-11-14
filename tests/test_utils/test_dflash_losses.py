@@ -47,6 +47,9 @@ _pkg_modeling.__path__ = [str(REPO / "specforge" / "modeling")]
 _pkg_draft = types.ModuleType("specforge.modeling.draft")
 _pkg_draft.__path__ = [str(REPO / "specforge" / "modeling" / "draft")]
 
+# Keep the shared module cached when the temporary model imports are restored.
+importlib.import_module("specforge.losses.fused")
+
 with patch.dict(
     sys.modules,
     {
@@ -392,7 +395,7 @@ class TestDFlashLosses(unittest.TestCase):
         torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
 
     def test_public_dpace_weights_are_detached_and_match_reference(self):
-        from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 
         probability = self.q.detach().requires_grad_(True)
         mask = self.binary_mask.clone()

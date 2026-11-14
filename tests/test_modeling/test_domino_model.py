@@ -303,7 +303,7 @@ class TestDominoDraftModel(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "Triton loss requires CUDA")
     def test_fused_loss_matches_standard_model_path(self):
         from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
-        from specforge.core.domino_loss import domino_weighted_cross_entropy
+        from specforge.losses.domino import domino_weighted_cross_entropy
 
         torch.manual_seed(19)
         hidden_size, vocab_size, block_size = 4, 7, 4
@@ -353,7 +353,7 @@ class TestDominoDraftModel(unittest.TestCase):
         self.assertTrue(model.fused_logits_loss)
         model.fused_logits_loss = False
         with patch(
-            "specforge.core.domino_loss.domino_weighted_cross_entropy",
+            "specforge.losses.domino.domino_weighted_cross_entropy",
             wraps=domino_weighted_cross_entropy,
         ) as loss_fn:
             standard = model(**inputs)
@@ -369,7 +369,7 @@ class TestDominoDraftModel(unittest.TestCase):
 
         model.fused_logits_loss = True
         with patch(
-            "specforge.core.domino_loss.domino_weighted_cross_entropy",
+            "specforge.losses.domino.domino_weighted_cross_entropy",
             wraps=domino_weighted_cross_entropy,
         ) as loss_fn:
             fused = model(**inputs)

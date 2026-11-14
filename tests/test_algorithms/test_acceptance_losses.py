@@ -24,8 +24,8 @@ from specforge.algorithms.objectives.predictions import (
     Teacher,
 )
 from specforge.algorithms.objectives.projection import Projection
-from specforge.core.lk_loss import compute_lk_loss
-from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
+from specforge.losses.lk import compute_lk_loss
+from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objective_legacy_parity import (
     assert_loss_and_gradients,
     block_pair,

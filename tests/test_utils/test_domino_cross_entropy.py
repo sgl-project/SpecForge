@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from specforge.core.domino_loss import domino_weighted_cross_entropy
+from specforge.losses.domino import domino_weighted_cross_entropy
 
 
 def _reference(base, correction, targets, weights, block_size, suffix_start):
@@ -120,7 +120,7 @@ def guarded_import(name, *args, **kwargs):
     return real_import(name, *args, **kwargs)
 
 builtins.__import__ = guarded_import
-from specforge.core.domino_loss import domino_weighted_cross_entropy
+from specforge.losses.domino import domino_weighted_cross_entropy
 
 domino_weighted_cross_entropy(
     torch.randn(4, 8),

@@ -19,6 +19,7 @@ The package initializer does not eagerly import these modules.
 requests and selects optimizations. Chunk scheduling and teacher preparation are
 outside this package.
 
-Previous `specforge.core` loss paths remain module aliases, preserving imported
-symbols and module-level patches. Internal callers use the new paths. Numerical
-formulas, gradients, defaults and reduction behavior are unchanged.
+The previous loss paths under `specforge.core` and
+`algorithms.objectives.implementations.fused_loss` have been removed. Import
+numerical functions from this package. Numerical formulas, gradients, defaults
+and reduction behavior are unchanged.
