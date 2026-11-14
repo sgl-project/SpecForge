@@ -31,9 +31,59 @@ def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
     return result
 
 
-def build_normalizer(max_len, *, keys, loss_mask_filter=None, **topology):
-    return partial(
+def shard_sequence(sample, *, rank, size, overlap):
+    """Keep owned rows plus teacher lookahead, with global RoPE coordinates."""
+    import torch
+
+    if "lengths" in sample:
+        raise ValueError("packed documents are not supported with USP")
+    length = sample["input_ids"].shape[1]
+    chunk = (length + size - 1) // size
+    start, width = rank * chunk, chunk + overlap
+    result = {}
+    for name, tensor in sample.items():
+        part = tensor[:, start : start + width]
+        zeros = tensor.new_zeros(
+            tensor.shape[0], width - part.shape[1], *tensor.shape[2:]
+        )
+        result[name] = torch.cat((part, zeros), dim=1).contiguous()
+    result["position_ids"] = (
+        torch.arange(start, start + width, device=sample["input_ids"].device)
+        .unsqueeze(0)
+        .expand(sample["input_ids"].shape[0], -1)
+    )
+    return result
+
+
+def normalize_parallel_sample(raw, *, normalizer, rank, size, overlap):
+    return shard_sequence(normalizer(raw), rank=rank, size=size, overlap=overlap)
+
+
+def build_normalizer(
+    max_len,
+    *,
+    keys,
+    loss_mask_filter=None,
+    overlap=1,
+    use_usp_preprocess=False,
+    **topology,
+):
+    normalizer = partial(
         normalize_sample, keys=keys, max_len=max_len, loss_mask_filter=loss_mask_filter
+    )
+    if not use_usp_preprocess:
+        return normalizer
+    import torch.distributed as dist
+
+    from specforge.distributed import get_draft_sp_group
+
+    group = get_draft_sp_group()
+    return partial(
+        normalize_parallel_sample,
+        normalizer=normalizer,
+        rank=dist.get_rank(group),
+        size=dist.get_world_size(group),
+        overlap=overlap,
     )
 
 
@@ -54,7 +104,11 @@ def collate(features, *, keys):
         }
         for feature in features
     ]
-    all_keys = (*keys, "attention_mask")
+    all_keys = (
+        *keys,
+        "attention_mask",
+        *(("position_ids",) if "position_ids" in features[0] else ()),
+    )
     return pad_and_concatenate_features(
         features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
     )

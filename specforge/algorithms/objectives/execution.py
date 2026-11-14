@@ -190,6 +190,7 @@ def evaluate_predictions(
                     projected.teacher_mass,
                     fixed if denominator is None else None,
                     None if context_counts is None else context_counts[index],
+                    reduce_statistics=p.reduce_statistics,
                 ),
                 term.reduction,
             )

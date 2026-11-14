@@ -105,6 +105,7 @@ class Predictions:
     accuracy_name: str = "acc"
     report_accuracy: bool = True
     chunk_safe: bool = True
+    reduce_statistics: Callable | None = None
 
     def __post_init__(self):
         shape = self.hidden.shape[:2]
