@@ -381,7 +381,9 @@ groups directly. Algorithms with dependent computations supply
 
 - `calc.run((0,))` executes a declared term (or a joint group).
 - `calc.evaluate(key, loss, logits, labels, teacher=...)` requests per-position
-  values and statistics through the same implementation registry.
+  values and statistics through the same implementation registry. Request extra
+  CE outputs explicitly with `return_teacher_l1=True` or `top_k=k`; these
+  do not change the mathematical loss or its coefficient.
 - `calc.add(index, values)` supplies a computed tensor to a declared
   `TokenLoss("value")` term. It uses the same weighting and denominator rules.
 - `calc.ratios` holds additive metric pairs.

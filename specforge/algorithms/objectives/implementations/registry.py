@@ -62,6 +62,7 @@ class ExecutionRequest:
         teacher: Optional teacher logits aligned with the selected vocabulary.
         outputs: Zero-argument callable that lazily projects and caches named
             outputs within this evaluation. Only compute callbacks may call it.
+        requested_outputs: Extra intermediate results, separate from mathematical loss options.
         materialized: The same output cache; applicability checks may inspect
             whether it is populated without triggering projection.
     """
@@ -74,6 +75,7 @@ class ExecutionRequest:
     materialized: dict
     # Intermediate requests require differentiable per-position results.
     unreduced: bool = False
+    requested_outputs: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,8 @@
 """Reference and precomputed values use the same execution result contract."""
 
+from specforge.losses import fused
+
+from ..losses import ce_outputs
 from .registry import GroupResult, register_implementation
 
 
@@ -30,12 +33,22 @@ def reference(request, group):
     (index,) = group
     term = request.predictions.plan.terms[index]
     inputs = request.terms[index]
-    result = inputs.loss.evaluate(
-        request.outputs()[term.output],
-        request.labels,
-        teacher=request.teacher,
-        context=inputs.context,
-    )
+    logits = request.outputs()[term.output]
+    if request.requested_outputs:
+        result = ce_outputs(
+            fused.ce_l1_loss,
+            logits,
+            request.labels,
+            request.teacher,
+            **request.requested_outputs,
+        )
+    else:
+        result = inputs.loss.evaluate(
+            logits,
+            request.labels,
+            teacher=request.teacher,
+            context=inputs.context,
+        )
     return result_group(request, index, result)
 
 

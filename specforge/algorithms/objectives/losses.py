@@ -118,16 +118,7 @@ def binary_cross_entropy(logits, labels, teacher=None):
 
 
 @register_loss("ce")
-def cross_entropy(logits, labels, teacher=None, *, top_k=None, teacher_l1=False):
-    if top_k is not None or teacher_l1:
-        return ce_outputs(
-            fused_loss.ce_l1_loss,
-            logits,
-            labels,
-            teacher,
-            top_k=top_k,
-            teacher_l1=teacher_l1,
-        )
+def cross_entropy(logits, labels, teacher=None):
     return F.cross_entropy(
         logits.to(torch.promote_types(logits.dtype, torch.float32)).reshape(
             -1, logits.shape[-1]
@@ -270,12 +261,6 @@ class TokenLoss:
             raise ValueError(f"unknown token loss: {self.kind!r}")
         if self.kind == "default" and self.options:
             raise ValueError("loss options require an explicit loss kind")
-        if self.kind == "ce":
-            top_k = self.options.get("top_k")
-            if top_k is not None and (type(top_k) is not int or top_k < 1):
-                raise ValueError("top_k must be a positive integer")
-            if type(self.options.get("teacher_l1", False)) is not bool:
-                raise ValueError("teacher_l1 must be boolean")
         if self.options and not self.registration.contextual:
             accepted = _accepted_options(self.registration.compute)
             unknown = set() if accepted is None else self.options.keys() - accepted
@@ -304,8 +289,6 @@ class TokenLoss:
     @property
     def requires(self):
         required = self.registration.requires
-        if self.options.get("teacher_l1"):
-            required |= {"teacher_logits"}
         if self.registration.contextual and self.options.get("target") == "teacher":
             required |= {"teacher_logits"}
         return required

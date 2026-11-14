@@ -461,6 +461,52 @@ class LossPlanTest(unittest.TestCase):
             torch.autograd.grad(expected, router_logits)[0],
         )
 
+    def test_extra_outputs_do_not_change_the_ce_loss(self):
+        hidden = torch.randn(3, 1, 5, requires_grad=True)
+        teacher = torch.randn_like(hidden)
+        labels = torch.zeros(3, 1, dtype=torch.long)
+
+        def compute(calc):
+            result = calc.evaluate(
+                "ce_with_statistics",
+                TokenLoss(kind="ce"),
+                calc.outputs()["logits"],
+                calc.labels,
+                teacher=teacher,
+                return_teacher_l1=True,
+                top_k=2,
+            )
+            torch.testing.assert_close(
+                result.values, TokenLoss(kind="ce")(hidden, labels)
+            )
+            torch.testing.assert_close(
+                result.statistics["teacher_l1"],
+                (hidden.softmax(-1) - teacher.softmax(-1)).abs().sum(-1),
+            )
+            torch.testing.assert_close(
+                result.statistics["topk_values"], hidden.topk(2).values
+            )
+            calc.add(0, result.values)
+
+        prediction = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            mask=torch.ones_like(labels),
+            positions=torch.zeros_like(labels),
+            compute=compute,
+            plan=LossPlan((LossTerm("ce_value", loss=TokenLoss("value")),)),
+        )
+        actual = run(prediction).loss
+        expected = TokenLoss(kind="ce")(hidden, labels).mean()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual, hidden)[0],
+            torch.autograd.grad(expected, hidden)[0],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown ce options"):
+            TokenLoss(kind="ce", options={"teacher_l1": True})
+
     def test_intermediate_and_final_losses_use_the_same_registry(self):
         hidden = torch.randn(3, 1, 5, requires_grad=True)
         labels = torch.zeros(3, 1, dtype=torch.long)

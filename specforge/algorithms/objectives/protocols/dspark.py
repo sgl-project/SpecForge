@@ -99,10 +99,11 @@ class DSparkObjective:
                 if distance is None:
                     distance = calc.evaluate(
                         "distance",
-                        TokenLoss("ce", {"teacher_l1": True}),
+                        TokenLoss(kind="ce"),
                         calc.outputs()["logits"],
                         calc.labels,
                         teacher=calc.teacher,
+                        return_teacher_l1=True,
                     ).statistics["teacher_l1"]
                 acceptance = (1 - distance / 2).clamp(0, 1)
             values = calc.evaluate(

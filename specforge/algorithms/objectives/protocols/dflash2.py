@@ -109,11 +109,10 @@ class DFlash2Objective:
             predictions, labels = calc.predictions, calc.labels
             terms = calc.evaluate(
                 "candidates",
-                TokenLoss(
-                    "ce", {"top_k": model.config.draft.spec_config.selector_top_k}
-                ),
+                TokenLoss(kind="ce"),
                 calc.outputs()["logits"],
                 labels,
+                top_k=model.config.draft.spec_config.selector_top_k,
             )
             ids = terms.statistics["topk_ids"]
             unary, hidden = terms.statistics["topk_values"], predictions.hidden

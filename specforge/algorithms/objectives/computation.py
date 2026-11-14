@@ -103,20 +103,47 @@ class LossComputation:
         outputs[name] = values
         self.run((index,))
 
-    def evaluate(self, key, loss, logits, labels, *, teacher=None, context=None):
+    def evaluate(
+        self,
+        key,
+        loss,
+        logits,
+        labels,
+        *,
+        teacher=None,
+        context=None,
+        return_teacher_l1=False,
+        top_k=None,
+    ):
         """Return unreduced LossOutput through the ordinary implementation registry.
 
         Args:
             key: Unique, stable name within this chunk procedure.
-            loss: Registered TokenLoss, including any requested intermediate outputs.
+            loss: Mathematical loss definition; output requests are separate.
             logits: Already-computed scores; no extra projection is performed.
             labels: Hard or soft targets aligned with this chunk's positions.
             teacher: Optional aligned teacher logits.
             context: Optional normalization context for whole-set losses.
+            return_teacher_l1: Also return draft/teacher L1 in statistics, not in the loss.
+            top_k: Also return this many candidate IDs and logits in statistics.
+                These extra outputs currently accompany CE.
 
         The algorithm controls gradient truncation and how results are consumed.
         These values are not added to the objective until a declared term runs.
         """
+        if type(return_teacher_l1) is not bool:
+            raise ValueError("return_teacher_l1 must be boolean")
+        if top_k is not None and (type(top_k) is not int or top_k < 1):
+            raise ValueError("top_k must be a positive integer")
+        requested_outputs = {}
+        if return_teacher_l1:
+            requested_outputs["teacher_l1"] = True
+        if top_k is not None:
+            requested_outputs["top_k"] = top_k
+        if requested_outputs and loss.kind != "ce":
+            raise ValueError("L1/top-k output requests currently require CE")
+        if return_teacher_l1 and (teacher is None or teacher.shape != logits.shape):
+            raise ValueError("return_teacher_l1 requires aligned teacher logits")
         if key in self._calls:
             raise ValueError(f"Repeated computation key: {key}")
         self._calls.add(key)
@@ -157,6 +184,7 @@ class LossComputation:
             lambda: outputs,
             outputs,
             unreduced=True,
+            requested_outputs=requested_outputs,
         )
         result = self._execute(request, (0,), f"{self.prediction_index}/compute/{key}")
         if result is None or set(result.values) != {0}:

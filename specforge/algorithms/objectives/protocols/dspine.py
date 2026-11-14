@@ -141,10 +141,12 @@ class DSpineObjective:
             predictions, labels, teacher = calc.predictions, calc.labels, calc.teacher
             terms = calc.evaluate(
                 "candidates",
-                TokenLoss("ce", {"top_k": self.top_k, "teacher_l1": True}),
+                TokenLoss(kind="ce"),
                 calc.outputs()["logits"],
                 labels,
                 teacher=teacher,
+                return_teacher_l1=True,
+                top_k=self.top_k,
             )
             ids = terms.statistics["topk_ids"]
             refined = model.refine(
@@ -156,10 +158,11 @@ class DSpineObjective:
             covered = ids == labels[..., None]
             refinement = calc.evaluate(
                 "refinement",
-                TokenLoss("ce", {"teacher_l1": True}),
+                TokenLoss(kind="ce"),
                 scores,
                 covered.long().argmax(-1),
                 teacher=teacher.gather(-1, ids),
+                return_teacher_l1=True,
             )
             mass = teacher.float().softmax(-1).gather(-1, ids).sum(-1)
             refined_loss = self.ce_weight * refinement.values * covered.any(-1) + (

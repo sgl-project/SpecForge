@@ -80,7 +80,12 @@ def register_token_kernel(kind, compute):
             )
         kwargs = {"context": inputs.context} if loss.registration.contextual else {}
         result = compute(
-            logits, request.labels, request.teacher, **kwargs, **loss.options
+            logits,
+            request.labels,
+            request.teacher,
+            **kwargs,
+            **loss.options,
+            **request.requested_outputs,
         )
         if not isinstance(result, LossOutput):
             result = LossOutput(result)
