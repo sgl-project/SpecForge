@@ -16,7 +16,6 @@ from transformers import Qwen3Config
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.dspine.model import OnlineDSpineModel
-from specforge.config import Config
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
@@ -481,53 +480,42 @@ class DSpineTest(unittest.TestCase):
                 )
             )
 
-    def test_provider_loads_real_target_tensors_and_does_not_reset_a_resumed_transfer_space(
-        self,
-    ):
+    def test_loading_binds_target_and_preserves_resumed_transfer_space(self):
+        from specforge.loading import initialize_draft, load_draft
+        from tests.test_modeling.dspine_fixtures import tiny_config as draft_config
+
         with TemporaryDirectory() as directory:
-            tmp_path = Path(directory)
+            target_path = Path(directory) / "target"
+            target_path.mkdir()
             target = tiny_config()
-            target.save_pretrained(tmp_path)
-            save_file(
-                {
-                    "model.embed_tokens.weight": torch.randn(32, 16),
-                    "lm_head.weight": torch.randn(32, 16),
-                },
-                tmp_path / "model.safetensors",
-            )
-            config = Config.model_validate(
-                dict(
-                    model=dict(
-                        target_model_path=str(tmp_path),
-                        torch_dtype="float32",
-                        mask_token_id=31,
-                    ),
-                    data=dict(hidden_states_path=str(tmp_path / "features")),
-                    training=dict(
-                        strategy="dspine", attention_backend="sdpa", num_anchors=2
-                    ),
-                )
-            )
-            draft = DSpineDraftModel(tiny_config())
-            provider = builtin_algorithm_registry().resolve("dspine").providers
-            parts = provider.model.build_training_model(
-                config, draft, draft.config, target, None
-            )
+            target.num_hidden_layers = 8
+            target.layer_types = ["full_attention"] * 8
+            target.save_pretrained(target_path)
+            weights = {
+                "model.embed_tokens.weight": torch.randn(32, 16),
+                "lm_head.weight": torch.randn(32, 16),
+            }
+            save_file(weights, target_path / "model.safetensors")
+            draft = initialize_draft(draft_config(), target=target_path)
             self.assertTrue(draft.transfer_ready.item())
+            torch.testing.assert_close(
+                draft.embed_tokens.weight, weights["model.embed_tokens.weight"]
+            )
+            torch.testing.assert_close(draft.lm_head.weight, weights["lm_head.weight"])
             with torch.no_grad():
                 draft.injection.readouts[0].weight.add_(1)
-            learned = draft.injection.readouts[0].weight.detach().clone()
-            codes = draft.transfer_codes.clone()
-            again = provider.model.build_training_model(
-                config, draft, draft.config, target, None
+            checkpoint = Path(directory) / "draft"
+            draft.save_pretrained(checkpoint)
+            restored = load_draft(checkpoint, target=target_path)
+            torch.testing.assert_close(
+                restored.injection.readouts[0].weight,
+                draft.injection.readouts[0].weight,
+                atol=0,
+                rtol=0,
             )
             torch.testing.assert_close(
-                draft.injection.readouts[0].weight, learned, atol=0, rtol=0
+                restored.transfer_codes, draft.transfer_codes, atol=0, rtol=0
             )
-            torch.testing.assert_close(draft.transfer_codes, codes, atol=0, rtol=0)
-            self.assertTrue(parts.capture_layers == again.capture_layers == [1, 4, 6])
-            contract = provider.step.resume_contract(config, draft, again.model)
-            self.assertEqual(dict(contract["dspine_options"])["transfer_rank"], 8)
 
     def test_offline_provider_retains_dspine_identity_and_teacher_features(self):
         with TemporaryDirectory() as directory:

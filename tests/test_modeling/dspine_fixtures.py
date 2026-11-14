@@ -40,12 +40,21 @@ def tiny_config(head_dim=4):
 
 
 def training_model(
-    chunk_size=0, head_dim=4, backend="sdpa", dtype=torch.float32, **options
+    chunk_size=0,
+    head_dim=4,
+    backend="sdpa",
+    dtype=torch.float32,
+    device="cpu",
+    **options,
 ):
     torch.manual_seed(17)
-    draft = build_draft_model(tiny_config(head_dim), backend=backend, dtype=dtype)
-    head = nn.Linear(16, 32, bias=False, dtype=dtype)
-    draft.embed_tokens.load_target_weight(torch.randn(32, 16))
+    draft = build_draft_model(
+        tiny_config(head_dim), backend=backend, dtype=dtype, device=device
+    )
+    head = nn.Linear(16, 32, bias=False, dtype=dtype, device=device)
+    draft.embed_tokens.load_target_weight(
+        torch.randn(32, 16, device=device, dtype=dtype)
+    )
     draft.lm_head.load_target_weight(head.weight)
     draft.initialize_transfer_space(chunk_size=7)
     with torch.no_grad():

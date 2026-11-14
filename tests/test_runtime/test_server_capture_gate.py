@@ -14,7 +14,7 @@ What is pinned here:
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux + last_hidden, or aux only with
-  ``training.dflash_teacher_metrics=false``) requests, named per strategy by
+  a loss that does not require teacher logits) requests, named per strategy by
   the client schema; an unrequested artifact is never written.
 - cache isolation: radix cache stays enabled and sequential identical prompts
   still capture every token because each request attempt has a fresh
@@ -48,17 +48,14 @@ H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
 
 def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
-    from types import SimpleNamespace
-
     from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import ServerCaptureSchema
     from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
-    registration = builtin_algorithm_registry().resolve(algorithm)
-    config = SimpleNamespace(
-        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+    registration = builtin_algorithm_registry(teacher_metrics=teacher_metrics).resolve(
+        algorithm
     )
-    layout = resolve_server_capture_layout(registration, config, modality="text")
+    layout = resolve_server_capture_layout(registration, None, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
         last_hidden_feature=layout.last_hidden_feature,
@@ -386,7 +383,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 self.assertEqual(set(record), set(layout.output_names))
                 self.assertEqual(record["input_ids"].tolist(), row)
                 torch.testing.assert_close(
-                    record["aux_hidden_state"].float(),
+                    record[layout.aux_feature].float(),
                     aux[0].float(),
                     rtol=TOL,
                     atol=TOL,
@@ -412,10 +409,9 @@ class TestServerCaptureGate(unittest.TestCase):
         contract = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",
-                "attention_mask",
                 "loss_mask",
-                "hidden_state",
-                "target",
+                "hidden_states",
+                "target_last_hidden_states",
             },
             aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
             target_repr="hidden_state",
@@ -440,20 +436,20 @@ class TestServerCaptureGate(unittest.TestCase):
             fetched.append(out)
             length = len(rows[i])
             self.assertEqual(
-                out["hidden_state"].shape, (1, length, len(AUX_LAYER_IDS) * H)
+                out["hidden_states"].shape, (1, length, len(AUX_LAYER_IDS) * H)
             )
-            self.assertEqual(out["target"].shape, (1, length, H))
+            self.assertEqual(out["target_last_hidden_states"].shape, (1, length, H))
             self.assertEqual(out["input_ids"].tolist(), [rows[i]])
             self.assertEqual(out["loss_mask"].shape, (1, length))
             # extraction correctness vs the independent HF forward
             torch.testing.assert_close(
-                out["hidden_state"].float(),
+                out["hidden_states"].float(),
                 aux_ref[i].float(),
                 rtol=TOL,
                 atol=TOL,
             )
             with torch.no_grad():
-                recomputed = head(out["target"].cuda()).cpu().float()
+                recomputed = head(out["target_last_hidden_states"].cuda()).cpu().float()
             torch.testing.assert_close(
                 recomputed, logits_ref[i].float(), rtol=TOL, atol=TOL
             )
@@ -493,10 +489,11 @@ class TestServerCaptureGate(unittest.TestCase):
                 strategy="eagle3",
                 tensors={
                     "input_ids": out["input_ids"].cuda(),
-                    "attention_mask": out["attention_mask"].cuda(),
                     "loss_mask": out["loss_mask"].cuda(),
-                    "target_last_hidden_states": out["target"].cuda(),
-                    "hidden_states": out["hidden_state"].cuda(),
+                    "target_last_hidden_states": out[
+                        "target_last_hidden_states"
+                    ].cuda(),
+                    "hidden_states": out["hidden_states"].cuda(),
                 },
                 metadata={"target_repr": "hidden_state", "ttt_length": 3},
             )

@@ -263,31 +263,27 @@ def _worker(rank, world_size, port, workdir):
         rank, world_size, tp_size=1, sp_ulysses_size=1, sp_ring_size=4, port=str(port)
     )
     try:
+        from dataclasses import replace
+
         import torch.distributed as dist
 
-        from specforge.algorithms.builtin import builtin_algorithm_registry
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
-        from specforge.modeling.target.target_head import TargetHead
+        from specforge.algorithms.objectives import PredictionBatch
+        from specforge.algorithms.objectives.execution import execute_batch
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+        from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        cfg = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
-        dm = AutoDraftModel.from_config(
-            cfg, attention_backend="usp", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
-        dm.freeze_embedding()
-        model = OnlineEagle3Model(
-            draft_model=dm, length=TTT, attention_backend="usp"
-        ).cuda()
-        model.train()
-        target_head = TargetHead.from_pretrained(
-            os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
+        model = fx.load_eagle3(
+            os.path.join(workdir, "draft.json"),
+            os.path.join(workdir, "target"),
+            os.path.join(workdir, "vocab_mapping.pt"),
+            backend="usp",
+            ttt=TTT,
         )
-        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        model.train()
+        algorithm = builtin_algorithm_registry(ttt_length=TTT).resolve("eagle3")
         provider = algorithm.providers.offline_for("text")
 
         results = {}
@@ -311,14 +307,20 @@ def _worker(rank, world_size, port, workdir):
             batch = next(iter(loader))
 
             def step_losses(trim):
-                strat = algorithm.providers.step.build(
-                    model,
-                    target_head=target_head,
-                    trim_loss_positions=trim,
-                )
+                tensors = {key: value.cuda() for key, value in batch.tensors.items()}
+                execution = replace(model.execution, trim=trim)
                 with torch.no_grad():
-                    out = strat.forward_loss(batch)
-                return [float(p.item()) for p in out.metrics["plosses"]]
+                    predictions = model.objective.rollout(model, tensors)
+                    return [
+                        execute_batch(
+                            PredictionBatch([prediction], reduction="sum_means"),
+                            model.token_loss,
+                            model.weighting,
+                            training=True,
+                            execution=execution,
+                        ).loss.item()
+                        for prediction in predictions
+                    ]
 
             results[case] = {"full": step_losses(False), "trim": step_losses(True)}
 

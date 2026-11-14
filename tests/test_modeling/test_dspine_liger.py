@@ -16,8 +16,8 @@ from tests.test_modeling.test_dspine_accumulation import training_core
 class DSpineLigerTest(unittest.TestCase):
     def test_replayed_updates(self):
         for dtype in (torch.float32, torch.bfloat16):
-            original = training_model(chunk_size=1, head_dim=16).to(
-                device="cuda", dtype=dtype
+            original = training_model(
+                chunk_size=1, head_dim=16, device="cuda", dtype=dtype
             )
             inputs = training_inputs()
             results = []

@@ -159,8 +159,12 @@ class DSpineAccumulationTest(unittest.TestCase):
         for attention_backend in ["sdpa", "flex_attention"]:
             with self.subTest(attention_backend=attention_backend):
                 model = training_model(
-                    chunk_size=1, head_dim=16, backend=attention_backend
-                ).to(device="cuda", dtype=torch.bfloat16)
+                    chunk_size=1,
+                    head_dim=16,
+                    backend=attention_backend,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
                 model.attention_backend = attention_backend
                 model.draft_model.transfer_codes = (
                     model.draft_model.transfer_codes.float()
