@@ -8,7 +8,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from specforge.config.draft.mlp import FFNSpec
+from specforge.config.draft.mlp import FFNSpec, MoEExpertSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.modeling.draft.layers import (
     ComponentLayout,
@@ -19,7 +19,7 @@ from specforge.modeling.draft.layers import (
 )
 from specforge.modeling.draft.layers.layout import join, split
 from specforge.modeling.draft.layers.registry import _BUILDERS, _LAYOUTS
-from tests.test_config.test_draft_moe_spec import moe_spec
+from tests.test_config.test_draft_nodes import moe
 
 EXPERTS = ComponentLayout(
     fused={
@@ -33,6 +33,11 @@ EXPERTS = ComponentLayout(
     },
     count="num_experts",
 )
+
+
+def layout_spec(num_experts):
+    experts = MoEExpertSpec(intermediate_size=5, hidden_act="silu", gated=True)
+    return moe(num_experts=num_experts, experts=experts)
 
 
 def expert_tensors(num_experts, hidden, width, dtype=torch.float32):
@@ -58,7 +63,7 @@ class TestFFN(nn.Module):
 
 class ComponentLayoutTest(unittest.TestCase):
     def test_join_and_split_are_exact_inverses(self):
-        config = moe_spec(num_experts=3, experts={"intermediate_size": 5})
+        config = layout_spec(3)
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 parts = expert_tensors(3, 8, 5, dtype)
@@ -75,14 +80,12 @@ class ComponentLayoutTest(unittest.TestCase):
                 for name, tensor in fused.items():
                     self.assertTrue(torch.equal(rejoined[name], tensor), name)
         self.assertEqual(
-            EXPERTS.part_names(
-                moe_spec(num_experts=2, experts={"intermediate_size": 5})
-            )["experts.down_proj"],
+            EXPERTS.part_names(layout_spec(2))["experts.down_proj"],
             (("experts.0.down_proj.weight",), ("experts.1.down_proj.weight",)),
         )
 
     def test_incomplete_or_mismatched_tensors_are_rejected(self):
-        config = moe_spec(num_experts=2, experts={"intermediate_size": 5})
+        config = layout_spec(2)
         parts = expert_tensors(2, 8, 5)
         with self.assertRaisesRegex(ValueError, "missing checkpoint tensors"):
             join(
