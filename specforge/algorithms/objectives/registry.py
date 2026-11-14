@@ -4,6 +4,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
+from .configuration import (
+    LossConfiguration,
+    loss_definitions,
+    resolve_loss_configuration,
+)
 from .execution_options import LossExecution
 from .losses import PositionWeighting, TokenLoss
 
@@ -111,14 +116,25 @@ class ResolvedObjective:
     loss: TokenLoss
     weighting: PositionWeighting
     execution: LossExecution
+    losses: LossConfiguration
+
+    @property
+    def frozen_parameters(self):
+        """Optional modules disabled by zero loss coefficients."""
+        return tuple(
+            module
+            for key, definition in loss_definitions(self.objective).items()
+            if self.losses.terms[key].coefficient == 0
+            for module in definition.modules
+        )
 
     @property
     def requires_teacher(self):
-        return "teacher_logits" in self.registration.requires | self.loss.requires
+        return "teacher_logits" in self.registration.requires | self.losses.requires
 
 
 def resolve_objective(
-    architecture, *, name=None, options=None, loss=None, weighting=None, execution=None
+    architecture, *, name=None, options=None, loss=None, weighting=None
 ):
     """Resolve algorithm and loss settings without constructing a model.
 
@@ -128,7 +144,6 @@ def resolve_objective(
         options: Algorithm-specific objective constructor options.
         loss: Common mathematical loss configuration, or algorithm defaults.
         weighting: Common position-weighting configuration, or algorithm defaults.
-        execution: Loss execution options such as chunking and fused kernels.
 
     Returns:
         ResolvedObjective with the objective, concrete loss/weighting, execution
@@ -144,41 +159,42 @@ def resolve_objective(
     entry = _PROTOCOLS[name]
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
-    objective = entry.factory(**(options or {}))
-    token_loss = TokenLoss(**(loss or {}))
-    execution = LossExecution(**(execution or {}))
+    options = dict(options or {})
+    objective = entry.factory(**options)
+    loss_configuration, execution = resolve_loss_configuration(
+        objective, {} if loss is None else loss
+    )
     _reject_shadowed_options(
         options,
         weighting is not None,
         getattr(objective, "default_weighting_options", ()),
         "weighting",
     )
-    _reject_shadowed_options(
-        options,
-        token_loss.kind != "default",
-        getattr(objective, "default_loss_options", ()),
-        "loss",
-    )
     if weighting is None:
         weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
-    selected_loss = (
-        objective.default_loss if token_loss.kind == "default" else token_loss
-    )
+    selected_loss = next(iter(loss_configuration.terms.values())).loss
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
-        entry.requires | selected_loss.requires | position_weighting.requires
+        entry.requires | loss_configuration.requires | position_weighting.requires
     ) - entry.provides
     if missing:
         raise ValueError(
             f"protocol {name!r} lacks required capabilities: {sorted(missing)}"
         )
     entry = replace(
-        entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
+        entry,
+        inputs=tuple(dict.fromkeys(entry.inputs + loss_configuration.inputs)),
     )
     return ResolvedObjective(
-        name, entry, objective, selected_loss, position_weighting, execution
+        name,
+        entry,
+        objective,
+        selected_loss,
+        position_weighting,
+        execution,
+        loss_configuration,
     )
 
 
@@ -191,7 +207,6 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
-    execution=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -203,7 +218,6 @@ def build_objective_model(
         target_head: Optional teacher head; it is frozen and kept in eval mode.
         loss: Common mathematical loss configuration.
         weighting: Common position-weighting configuration.
-        execution: Loss execution configuration.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -219,7 +233,6 @@ def build_objective_model(
         options=options,
         loss=loss,
         weighting=weighting,
-        execution=execution,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
     if resolved.execution.teacher_chunk_size:
@@ -238,7 +251,7 @@ def build_objective_model(
             raise ValueError("compact teacher requires a reduced draft vocabulary")
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
-    declared = getattr(objective, "frozen_parameters", ())
+    declared = resolved.frozen_parameters
     frozen, to_freeze = [], []
     for prefix in requested + tuple(declared):
         try:
@@ -282,6 +295,7 @@ def build_objective_model(
         registration=entry,
         name=name,
         token_loss=resolved.loss,
+        loss_configuration=resolved.losses,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,

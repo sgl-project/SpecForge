@@ -7,6 +7,7 @@ import torch
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -38,37 +39,28 @@ from .dflash import COMMON_MODULES
 class DSparkObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
-    ce_loss_alpha: float = 0.1
-    l1_loss_alpha: float = 0.9
-    confidence_loss_alpha: float = 1.0
+
+    @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            "confidence": LossDefinition(
+                TokenLoss("bce"), modules=("confidence_head",)
+            ),
+        }
 
     default_weighting_options = ("loss_decay_gamma",)
-    default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
 
     @property
     def default_weighting(self):
         return decay_weighting(self.loss_decay_gamma)
 
-    @property
-    def frozen_parameters(self):
-        return ("confidence_head",) if self.confidence_loss_alpha == 0 else ()
-
-    @property
-    def default_loss(self):
-        return TokenLoss(
-            kind="ce_l1",
-            options={"ce_weight": self.ce_loss_alpha, "l1_weight": self.l1_loss_alpha},
-        )
+    default_loss = TokenLoss("ce_l1", {"ce_weight": 0.1, "l1_weight": 0.9})
 
     def __post_init__(self):
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
-            nonnegative={
-                "ce_loss_alpha": self.ce_loss_alpha,
-                "l1_loss_alpha": self.l1_loss_alpha,
-                "confidence_loss_alpha": self.confidence_loss_alpha,
-            },
         )
 
     def __call__(self, runtime, batch, **context):
@@ -104,14 +96,10 @@ class DSparkObjective:
                         calc.labels,
                         teacher=calc.teacher,
                         return_teacher_l1=True,
+                        term_index=0,
                     ).statistics["teacher_l1"]
                 acceptance = (1 - distance / 2).clamp(0, 1)
-            values = calc.evaluate(
-                "confidence",
-                TokenLoss("bce"),
-                confidence,
-                acceptance,
-            ).values
+            values = calc.evaluate_term(1, confidence, acceptance).values
             calc.add(1, values)
 
         predictions = runtime.block_predictions(
@@ -124,7 +112,8 @@ class DSparkObjective:
                 (
                     LossTerm(),
                     LossTerm(
-                        "confidence", self.confidence_loss_alpha, TokenLoss("value")
+                        "confidence",
+                        loss=TokenLoss("bce"),
                     ),
                 )
             ),

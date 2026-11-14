@@ -1001,7 +1001,6 @@ class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
     loss: dict = Field(default_factory=dict)
-    loss_execution: dict = Field(default_factory=dict)
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
@@ -1108,6 +1107,9 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        unknown = self.loss.keys() - {"terms", "fused", "scheduling"}
+        if unknown:
+            raise ValueError(f"Unknown training.loss fields: {sorted(unknown)}")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
@@ -1240,12 +1242,11 @@ class Config(StrictConfigModel):
             or self.training.objective_options
             or self.training.frozen
             or self.training.loss
-            or self.training.loss_execution
             or self.model.use_fused_conv
             or self.training.weighting is not None
         ):
             raise ValueError(
-                "objective/options/frozen/loss/weighting/loss_execution/use_fused_conv "
+                "objective/options/frozen/loss/weighting/use_fused_conv "
                 "require the canonical draft loading path"
             )
 

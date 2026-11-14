@@ -235,10 +235,13 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             from specforge.algorithms.objectives.protocols.domino import DominoObjective
 
             model.objective = DominoObjective()
+            model.objective_name = "domino"
+            from specforge.algorithms.objectives.execution_options import LossExecution
+
             contract = {
                 "canonical_objective_options": asdict(model.objective),
                 "canonical_loss_implementations": model.loss_implementations.names,
-                "canonical_loss_execution": {"fused": True},
+                "canonical_loss_execution": asdict(LossExecution(fused=True)),
             }
             trainer, _, _ = self._make_trainer(
                 out,
@@ -258,6 +261,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             model = Composite()
             model.loss_implementations = ExecutionSelection()
             model.objective = DominoObjective()
+            model.objective_name = "domino"
             contract["canonical_objective_options"] = asdict(model.objective)
             contract["canonical_loss_implementations"] = (
                 model.loss_implementations.names
@@ -289,7 +293,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     resume_from=checkpoint,
                 )
 
-    def test_old_checkpoint_uses_default_execution_options(self):
+    def test_checkpoint_requires_recorded_loss_settings(self):
         from dataclasses import asdict
 
         from specforge.algorithms.objectives.execution_options import LossExecution
@@ -300,29 +304,16 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             trainer, _, _ = self._make_trainer(out, feat_dir=features, max_steps=1)
             trainer.fit()
             checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
-            defaults = {
-                "canonical_loss_execution": asdict(LossExecution()),
-                "canonical_use_fused_conv": False,
-            }
-            self._make_trainer(
-                out,
-                feat_dir=features,
-                max_steps=2,
-                resume_from=checkpoint,
-                checkpoint_extra=defaults,
-            )
-            for key, value in (
-                ("canonical_loss_execution", asdict(LossExecution(chunk_size=1))),
-                ("canonical_use_fused_conv", True),
-            ):
-                with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
-                    self._make_trainer(
-                        out,
-                        feat_dir=features,
-                        max_steps=2,
-                        resume_from=checkpoint,
-                        checkpoint_extra={**defaults, key: value},
-                    )
+            with self.assertRaisesRegex(ValueError, "canonical_loss_execution"):
+                self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    resume_from=checkpoint,
+                    checkpoint_extra={
+                        "canonical_loss_execution": asdict(LossExecution())
+                    },
+                )
 
     def test_resume_continues_where_the_run_stopped(self):
         from specforge.training.checkpoint import CheckpointManager
