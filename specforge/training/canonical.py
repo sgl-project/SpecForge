@@ -219,10 +219,21 @@ def _validate_imported_objective(cfg, resolved):
         "architectures"
     ) != ["DSpineDraftModel"]:
         return
-    for name, saved in extract_dspine_training_settings(payload).items():
+    from specforge.algorithms.objectives.compatibility import normalize_loss_settings
+    from specforge.algorithms.objectives.configuration import resolve_loss_configuration
+
+    recorded = extract_dspine_training_settings(payload)
+    options, loss = normalize_loss_settings("dspine", recorded, None, None)
+    for name, saved in options.items():
         if getattr(resolved.objective, name) != saved:
             raise ValueError(
                 f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
+            )
+    expected, _ = resolve_loss_configuration(resolved.objective, loss)
+    for name in loss["terms"]:
+        if resolved.losses.terms[name] != expected.terms[name]:
+            raise ValueError(
+                f"legacy DSpine {name} loss differs; set training.loss.terms.{name} to preserve it"
             )
 
 
@@ -597,8 +608,7 @@ def build_bundle(cfg, algorithm):
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
-            require_loaded=tuple(cfg.training.frozen)
-            + getattr(resolved.objective, "frozen_parameters", ()),
+            require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
@@ -663,11 +673,7 @@ def build_bundle(cfg, algorithm):
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": cfg.model.use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
-        "canonical_loss": (
-            runtime.loss_configuration.to_dict()
-            if runtime.loss_configuration is not None
-            else asdict(runtime.token_loss)
-        ),
+        "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,

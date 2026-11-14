@@ -39,48 +39,28 @@ from .dflash import COMMON_MODULES
 class DSparkObjective:
     num_anchors: int = 512
     loss_decay_gamma: float | None = None
-    ce_loss_alpha: float = 0.1
-    l1_loss_alpha: float = 0.9
-    confidence_loss_alpha: float = 1.0
-
-    legacy_loss_options = ("confidence_loss_alpha",)
 
     @property
     def loss_terms(self):
         return {
             "token": LossDefinition(self.default_loss),
             "confidence": LossDefinition(
-                TokenLoss("bce"), self.confidence_loss_alpha, ("confidence_head",)
+                TokenLoss("bce"), modules=("confidence_head",)
             ),
         }
 
     default_weighting_options = ("loss_decay_gamma",)
-    default_loss_options = ("ce_loss_alpha", "l1_loss_alpha")
 
     @property
     def default_weighting(self):
         return decay_weighting(self.loss_decay_gamma)
 
-    @property
-    def frozen_parameters(self):
-        return ("confidence_head",) if self.confidence_loss_alpha == 0 else ()
-
-    @property
-    def default_loss(self):
-        return TokenLoss(
-            kind="ce_l1",
-            options={"ce_weight": self.ce_loss_alpha, "l1_weight": self.l1_loss_alpha},
-        )
+    default_loss = TokenLoss("ce_l1", {"ce_weight": 0.1, "l1_weight": 0.9})
 
     def __post_init__(self):
         check_options(
             counts={"num_anchors": self.num_anchors},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
-            nonnegative={
-                "ce_loss_alpha": self.ce_loss_alpha,
-                "l1_loss_alpha": self.l1_loss_alpha,
-                "confidence_loss_alpha": self.confidence_loss_alpha,
-            },
         )
 
     def __call__(self, runtime, batch, **context):
@@ -133,12 +113,7 @@ class DSparkObjective:
                     LossTerm(),
                     LossTerm(
                         "confidence",
-                        (
-                            self.confidence_loss_alpha
-                            if runtime.loss_configuration is None
-                            else 1.0
-                        ),
-                        TokenLoss("bce"),
+                        loss=TokenLoss("bce"),
                     ),
                 )
             ),

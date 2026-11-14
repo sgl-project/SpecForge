@@ -308,9 +308,11 @@ contract. Users do not configure groups, implementation names or term execution.
 
 #### Legacy flat configuration
 
-The flat loss and loss_execution fields below remain a compatibility input.
-They cannot be combined with named terms/fused/scheduling. New configurations
-should use the layout above.
+Previous flat loss, loss_execution and algorithm loss coefficients are translated
+once by objectives/compatibility.py into named terms and the shared policy.
+Every runtime uses LossConfiguration; protocols contain no old/new loss branch.
+Do not mix old loss options with named settings. New configurations should use
+the layout above.
 
 Execution controls are separate from the objective, token loss and weighting:
 
@@ -331,14 +333,14 @@ training:
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
   default; zero disables chunking. Recurrent heads always keep whole blocks.
 - `checkpoint` controls recomputation of chunk projections and losses during
-  backward when the prediction set spans multiple chunks. A single chunk is
-  not recomputed. It defaults to true and is independent of fused execution.
+  backward, including an unsplit prediction set. It defaults to true and is
+  independent of fused execution.
 - `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
   corrections without constructing full corrected logits. CPU, FP64 and other
   unsupported generic contracts use a logged reference. Missing required kernel
-  dependencies and incompatible explicit specializations raise.
+  dependencies and execution failures raise.
   Empty inputs use the reference only to preserve zero gradients.
   The first selection for each prediction group is logged at INFO, checked across
   ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
@@ -448,7 +450,7 @@ entry chooses how to evaluate them:
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,
 device and dtype. Runtime errors and missing required dependencies propagate.
-The internal explicit implementation argument remains only for legacy callers.
+The execution API has no explicit implementation argument.
 
 Register formulas with `register_loss`; its optional `outputs` callback provides
 extra reference results without changing the formula. CE's L1/top-k outputs use
@@ -458,10 +460,10 @@ or use `register_token_kernel` for generic per-token optimization.
 `implementation_registrations()` exposes the names, categories, loss mapping and
 applicability callbacks for inspection without a second routing table.
 
-The legacy Domino path explicitly requests `domino_suffix_ce` for its ordinary CE pair
-when the existing fused option is enabled. It resolves that request to specialized
-mode with fused=False; other mathematical losses use the ordinary path. This
-preserves the existing configuration's reference/optimized behavior.
+Domino declares the base/final joint range; the shared selector matches
+domino_suffix_ce automatically. Historical objective_options.impl=domino_suffix_ce
+is translated at the input boundary to fused=true; it no longer pins a kernel.
+Other explicit implementation names are rejected.
 
 Implementations return weighted numerators by term index, plus predictions or
 requested statistics; they do not apply coefficients or final normalization.
@@ -578,26 +580,17 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 canonical YAML selects the architecture, capture layers and output schema.
 
 
-### Explicit specialized loss execution (legacy configuration)
+### Compatibility boundary
 
-An algorithm may call `calc.run(group, impl="name", fused=False)` or
-`calc.evaluate(..., impl="name", fused=False)`. The same arguments are accepted by
-`compute_loss` for callers with an ExecutionRequest. Generic optimizations are
-not selectable by name.
+Old canonical checkpoints normalize their loss formulas, coefficients and
+scheduling before resume comparison. Known equivalent CE-statistics identities
+are translated; DSpine's old CE-plus-L1 refinement identity maps to CE/L1, and
+its unchanged cosine calculation gains a reference identity. Unknown execution
+changes still fail the resume check.
 
-Domino also exposes the choice through its objective options:
-
-```yaml
-training:
-  objective: domino
-  objective_options:
-    impl: domino_suffix_ce
-  loss_execution:
-    fused: false
-```
-
-Leaving impl unset preserves existing fused=True/False behavior. Explicit
-specializations reject incompatible losses or layouts rather than falling back.
+Old training wrappers remain for capabilities not yet migrated, including their
+full resume and parallel execution paths. They share specforge/losses numerical
+functions; this PR does not remove those training paths.
 
 Use `loss_registrations()` and `implementation_registrations()` to inspect the
 formula-to-implementation mapping. Each execution registration names its category,

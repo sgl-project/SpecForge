@@ -44,6 +44,7 @@ class CanonicalReviewTest(unittest.TestCase):
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
         runtime.draft_model = torch.nn.Linear(1, 1)
+        runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
             "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
             "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
@@ -190,7 +191,7 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 source, draft_config(), initialization={"checkpoint": temp}
             )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
+            with self.assertRaisesRegex(ValueError, "loss.terms.token"):
                 _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
             _validate_imported_objective(
                 cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})

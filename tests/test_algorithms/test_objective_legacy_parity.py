@@ -30,7 +30,7 @@ from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 
 
-def block_pair(kind, *, shifted=False):
+def block_pair(kind, *, shifted=False, loss=None):
     configs = {
         "dflash": lambda: draft_config(target_bindings=(), target_logit_transform=None),
         "dflash2": dflash2_config,
@@ -125,7 +125,10 @@ def block_pair(kind, *, shifted=False):
         **({"shift_label": shifted} if kind == "domino" else {}),
     )
     new = build_objective_model(
-        model, options={"num_anchors": 2}, target_head=copy.deepcopy(model.lm_head)
+        model,
+        options={"num_anchors": 2},
+        target_head=copy.deepcopy(model.lm_head),
+        loss=loss,
     )
     parameter_names = {
         n: (

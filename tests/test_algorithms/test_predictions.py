@@ -97,7 +97,17 @@ class PredictionsTest(unittest.TestCase):
             self.assertEqual(teacher.call_count, 0)
             evaluate_predictions(prediction, TokenLoss(kind="ce"), runtime.weighting)
             self.assertEqual(teacher.call_count, 0)
-            evaluate_predictions(prediction, TokenLoss(kind="kl"), runtime.weighting)
+            kl_runtime = build_objective_model(
+                model,
+                options={"num_anchors": 2},
+                target_head=runtime.target_head,
+                loss={"kind": "kl"},
+            )
+            prediction = next(iter(kl_runtime.objective(kl_runtime, batch).predictions))
+            self.assertEqual(teacher.call_count, 0)
+            evaluate_predictions(
+                prediction, kl_runtime.token_loss, kl_runtime.weighting
+            )
             self.assertEqual(teacher.call_count, 1)
 
     def test_capability_mismatch_fails_before_freezing(self):
@@ -113,7 +123,7 @@ class PredictionsTest(unittest.TestCase):
                     model, loss={"kind": "unsupported"}, frozen=("backbone",)
                 )
             self.assertTrue(all(p.requires_grad for p in model.backbone.parameters()))
-            runtime = build_objective_model(model)
+            runtime = build_objective_model(model, loss={"kind": "kl"})
             prediction = next(
                 iter(
                     runtime.objective(
@@ -122,6 +132,4 @@ class PredictionsTest(unittest.TestCase):
                 )
             )
             with self.assertRaisesRegex(ValueError, "teacher_logits"):
-                evaluate_predictions(
-                    prediction, TokenLoss(kind="kl"), runtime.weighting
-                )
+                evaluate_predictions(prediction, runtime.token_loss, runtime.weighting)

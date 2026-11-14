@@ -57,27 +57,20 @@ class LossRoutingTest(unittest.TestCase):
             self.assertEqual(
                 select_implementation(request, fused=True).name, "test_special"
             )
-            actual = compute_loss(request, impl="test_special")
+            actual = compute_loss(request, fused=True)
             torch.testing.assert_close(actual.values, expected.values)
             torch.testing.assert_close(
                 torch.autograd.grad(actual.values[0].sum(), request.tensor(0))[0],
                 torch.autograd.grad(expected.values[0].sum(), request.tensor(0))[0],
             )
-            for impl, fused, message in (
-                ("test_special", True, "mutually exclusive"),
-                ("token_ce", False, "not a specialized"),
-                ("missing", False, "Unknown execution"),
-            ):
-                with (
-                    self.subTest(impl=impl),
-                    self.assertRaisesRegex(ValueError, message),
-                ):
-                    compute_loss(request, impl=impl, fused=fused)
             wrong = replace(
                 request, terms=(replace(request.terms[0], loss=TokenLoss("kl")),)
             )
-            with self.assertRaisesRegex(ValueError, "mathematical loss"):
-                compute_loss(wrong, impl="test_special")
+            self.assertNotEqual(
+                select_implementation(wrong, fused=True).name, "test_special"
+            )
+            with self.assertRaises(TypeError):
+                compute_loss(request, impl="test_special")
 
     def test_ce_outputs_share_the_reference_and_token_implementations(self):
         request = self.request()

@@ -356,7 +356,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                         needs_teacher,
                     )
                     contract = bundle.strategy_kwargs.resume_contract
-                    self.assertEqual(contract["canonical_loss"]["kind"], kind)
+                    self.assertEqual(
+                        contract["canonical_loss"]["terms"]["token"]["kind"], kind
+                    )
                     self.assertEqual(contract["canonical_weighting"]["alpha"], 0.3)
                     if bundle.target_head is not None:
                         self.assertFalse(
@@ -495,7 +497,9 @@ class CanonicalTrainingTest(unittest.TestCase):
             saved = torch.load(checkpoint / "training_state.pt", weights_only=True)
             self.assertIn("canonical_loss_execution", saved)
             self.assertFalse(saved["canonical_use_fused_conv"])
-            # Simulate a checkpoint from before the execution controls existed.
+            # Simulate the old flat loss contract before named terms/execution.
+            token = saved["canonical_loss"]["terms"]["token"]
+            saved["canonical_loss"] = {key: token[key] for key in ("kind", "options")}
             saved.pop("canonical_loss_execution")
             saved.pop("canonical_use_fused_conv")
             torch.save(saved, checkpoint / "training_state.pt")
@@ -509,7 +513,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
-            self.assertEqual(state["canonical_loss"]["kind"], "ce" if mtp else "kl")
+            self.assertEqual(
+                state["canonical_loss"]["terms"]["token"]["kind"], "ce" if mtp else "kl"
+            )
             if mtp:
                 self.assertEqual(state["canonical_weighting"]["kind"], "uniform")
             else:

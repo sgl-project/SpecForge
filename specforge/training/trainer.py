@@ -310,6 +310,12 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            if "canonical_objective_options" in resume_contract:
+                from specforge.algorithms.objectives.compatibility import (
+                    normalize_loss_checkpoint,
+                )
+
+                state = normalize_loss_checkpoint(state, model.objective_name)
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)

@@ -12,6 +12,7 @@ from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mea
 from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.plan import LossPlan, LossTerm
 from specforge.algorithms.objectives.predictions import Predictions
 from specforge.algorithms.objectives.projection import Projection
 from specforge.algorithms.objectives.protocols.dflash2 import DFlash2Objective
@@ -119,6 +120,11 @@ class ObjectiveContractTest(unittest.TestCase):
                 torch.tensor([[1]]),
                 mask=torch.ones(1, 1),
                 labels=torch.zeros(1, 1, dtype=torch.long),
+                plan=LossPlan(
+                    tuple(
+                        LossTerm(name=name) for name in runtime.loss_configuration.terms
+                    )
+                ),
             ).teacher
             self.assertEqual(teacher.values.dtype, torch.float32)
             self.assertEqual(teacher.logits().dtype, torch.float32)
@@ -468,8 +474,15 @@ class ObjectiveContractTest(unittest.TestCase):
             )
         runtime = build_objective_model(model, options={"confidence_loss_alpha": 0.0})
         self.assertEqual(runtime.frozen_parameters, ())
-        misspelled = property(lambda objective: ("confidence_haed",))
-        with patch.object(DSparkObjective, "frozen_parameters", misspelled):
+        from specforge.algorithms.objectives.configuration import LossDefinition
+
+        misspelled = property(
+            lambda objective: {
+                "token": LossDefinition(objective.default_loss),
+                "confidence": LossDefinition(TokenLoss("bce"), 0, ("confidence_haed",)),
+            }
+        )
+        with patch.object(DSparkObjective, "loss_terms", misspelled):
             with self.assertRaisesRegex(ValueError, "confidence_haed"):
                 build_runtime("DSparkDraftModel")
 

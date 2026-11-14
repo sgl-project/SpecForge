@@ -43,11 +43,10 @@ class LossComputation:
         """Materialize the projection once within this chunk."""
         return self.request.outputs()
 
-    def _execute(self, request, group, key, *, impl=None, fused=None):
+    def _execute(self, request, group, key, *, fused=None):
         return compute_loss(
             request,
             group,
-            impl=impl,
             fused=self.execution.fused if fused is None else fused,
             selection=self.selection,
             key=key,
@@ -69,11 +68,10 @@ class LossComputation:
             fused=fused,
         )
 
-    def run(self, group=None, *, impl=None, fused=None):
+    def run(self, group=None, *, fused=None):
         """Execute declared terms once.
 
-        impl selects a specialized implementation and requires fused=False.
-        Otherwise the shared fused setting controls automatic selection.
+        The shared fused setting controls automatic implementation selection.
         """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
         for indices in groups:
@@ -83,7 +81,6 @@ class LossComputation:
                 self.request,
                 indices,
                 self.prediction_index,
-                impl=impl,
                 fused=fused,
             )
             self._collect(result, indices)
@@ -124,7 +121,6 @@ class LossComputation:
         *,
         teacher=None,
         context=None,
-        impl=None,
         fused=None,
         term_index=None,
         **requested_outputs,
@@ -138,8 +134,7 @@ class LossComputation:
             labels: Hard or soft targets aligned with this chunk's positions.
             teacher: Optional aligned teacher logits.
             context: Optional normalization context for whole-set losses.
-            impl: Optional specialized implementation.
-            fused: Override automatic optimization; must be False with impl.
+            fused: Override automatic optimization for this internal request.
             term_index: Optional owner of the input context.
             **requested_outputs: Extra results validated and computed by the
                 selected implementation, e.g. return_teacher_l1=True or top_k=8.
@@ -186,7 +181,6 @@ class LossComputation:
             request,
             (0,),
             f"{self.prediction_index}/compute/{key}",
-            impl=impl,
             fused=fused,
         )
         if result is None or set(result.values) != {0}:

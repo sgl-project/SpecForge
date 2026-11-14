@@ -117,7 +117,8 @@ def resolve_loss_configuration(objective, payload):
         )
         if not isinstance(formula_options, dict):
             raise ValueError(f"Options for loss term {name!r} must be a mapping")
-        loss = TokenLoss(kind, dict(formula_options))
+        defaults = definition.loss.options if kind == definition.loss.kind else {}
+        loss = TokenLoss(kind, {**defaults, **formula_options})
         if kind == "default":
             raise ValueError("Named loss terms require a concrete kind")
         if loss.registration.input_kind != definition.loss.registration.input_kind:

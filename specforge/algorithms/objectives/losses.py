@@ -354,6 +354,14 @@ class TokenLoss:
             if unknown:
                 raise ValueError(f"unknown {self.kind} options: {sorted(unknown)}")
 
+        if self.kind == "ce_l1":
+            check_options(
+                nonnegative={
+                    key: self.options.get(key, default)
+                    for key, default in (("ce_weight", 0.1), ("l1_weight", 0.9))
+                }
+            )
+
         if self.kind in ("lk_alpha", "lk_tv", "lk_lambda"):
             accepted = {"target"} | (
                 {"kl_scale", "kl_decay"} if self.kind == "lk_lambda" else set()

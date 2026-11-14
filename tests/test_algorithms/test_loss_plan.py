@@ -829,7 +829,7 @@ class LossPlanTest(unittest.TestCase):
         )
 
         def compute(calc):
-            calc.run((0, 1), impl="domino_suffix_ce", fused=False)
+            calc.run((0, 1))
             calc.run((2,))
 
         prediction = replace(p, compute=compute)
@@ -850,5 +850,9 @@ class LossPlanTest(unittest.TestCase):
             Projection(p.projection.project),
             replace(p.projection, block_size=p.projection.block_size + 1),
         ):
-            with self.assertRaisesRegex(ValueError, "cannot execute"):
-                run(replace(prediction, projection=projection), fused=True, chunk=1)
+            fallback = run(
+                replace(prediction, projection=projection), fused=True, chunk=1
+            )
+            torch.testing.assert_close(
+                fallback.loss, expected.loss, rtol=3e-4, atol=3e-5
+            )

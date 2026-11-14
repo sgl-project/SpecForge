@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
+from .compatibility import normalize_loss_settings
 from .configuration import (
     LossConfiguration,
     loss_definitions,
@@ -116,13 +117,21 @@ class ResolvedObjective:
     loss: TokenLoss
     weighting: PositionWeighting
     execution: LossExecution
-    losses: LossConfiguration | None = None
+    losses: LossConfiguration
+
+    @property
+    def frozen_parameters(self):
+        """Optional modules disabled by zero loss coefficients."""
+        return tuple(
+            module
+            for key, definition in loss_definitions(self.objective).items()
+            if self.losses.terms[key].coefficient == 0
+            for module in definition.modules
+        )
 
     @property
     def requires_teacher(self):
-        return "teacher_logits" in self.registration.requires | (
-            self.losses.requires if self.losses else self.loss.requires
-        )
+        return "teacher_logits" in self.registration.requires | self.losses.requires
 
 
 def resolve_objective(
@@ -152,56 +161,23 @@ def resolve_objective(
     entry = _PROTOCOLS[name]
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
-    objective = entry.factory(**(options or {}))
-    named = loss is not None and bool(
-        {"terms", "fused", "groups", "scheduling"} & loss.keys()
-    )
-    loss_configuration = None
-    if named:
-        if execution:
-            raise ValueError(
-                "Use loss.fused and loss.scheduling instead of loss_execution"
-            )
-        legacy_options = set(getattr(objective, "legacy_loss_options", ())) | set(
-            getattr(objective, "default_loss_options", ())
-        )
-        if legacy_options.intersection(options or {}):
-            raise ValueError(
-                "Configure loss definitions and coefficients under loss.terms"
-            )
-        loss_configuration, execution = resolve_loss_configuration(objective, loss)
-        token_loss = TokenLoss()
-    else:
-        token_loss = TokenLoss(**(loss or {}))
-        execution = LossExecution(**(execution or {}))
+    options, payload = normalize_loss_settings(name, options, loss, execution)
+    objective = entry.factory(**options)
+    loss_configuration, execution = resolve_loss_configuration(objective, payload)
     _reject_shadowed_options(
         options,
         weighting is not None,
         getattr(objective, "default_weighting_options", ()),
         "weighting",
     )
-    _reject_shadowed_options(
-        options,
-        token_loss.kind != "default",
-        getattr(objective, "default_loss_options", ()),
-        "loss",
-    )
     if weighting is None:
         weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
-    selected_loss = (
-        objective.default_loss if token_loss.kind == "default" else token_loss
-    )
+    selected_loss = next(iter(loss_configuration.terms.values())).loss
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
-        entry.requires
-        | (
-            loss_configuration.requires
-            if loss_configuration
-            else selected_loss.requires
-        )
-        | position_weighting.requires
+        entry.requires | loss_configuration.requires | position_weighting.requires
     ) - entry.provides
     if missing:
         raise ValueError(
@@ -209,16 +185,7 @@ def resolve_objective(
         )
     entry = replace(
         entry,
-        inputs=tuple(
-            dict.fromkeys(
-                entry.inputs
-                + (
-                    loss_configuration.inputs
-                    if loss_configuration
-                    else selected_loss.inputs
-                )
-            )
-        ),
+        inputs=tuple(dict.fromkeys(entry.inputs + loss_configuration.inputs)),
     )
     return ResolvedObjective(
         name,
@@ -287,15 +254,7 @@ def build_objective_model(
             raise ValueError("compact teacher requires a reduced draft vocabulary")
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
-    declared = getattr(objective, "frozen_parameters", ())
-    if resolved.losses is not None:
-        definitions = loss_definitions(objective)
-        declared = tuple(
-            module
-            for key, definition in definitions.items()
-            if resolved.losses.terms[key].coefficient == 0
-            for module in definition.modules
-        )
+    declared = resolved.frozen_parameters
     frozen, to_freeze = [], []
     for prefix in requested + tuple(declared):
         try:

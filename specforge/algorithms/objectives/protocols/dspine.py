@@ -10,7 +10,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from ..base import check_options
 from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
-from ..losses import LossContext, TokenLoss, combine_ce_l1, decay_weighting
+from ..losses import LossContext, TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
@@ -43,16 +43,12 @@ class DSpineObjective:
     num_anchors: int = 512
     loss_decay_gamma: float = 7.0
     top_k: int = 16
-    ce_weight: float = 0.1
-    alignment_weight: float = 0.5
     alignment_warmup_steps: int = 146
     replacement_layers: int = 3
     replacement_probability: float = 0.5
     replacement_hold_ratio: float = 1 / 6
     replacement_end_ratio: float = 1 / 3
     candidate_mass_threshold: float = 1e-4
-
-    legacy_loss_options = ("ce_weight", "alignment_weight")
 
     @property
     def loss_terms(self):
@@ -61,7 +57,7 @@ class DSpineObjective:
             "refinement": LossDefinition(
                 self.default_loss, capabilities=frozenset({"component_masks"})
             ),
-            "alignment": LossDefinition(TokenLoss("cosine"), self.alignment_weight),
+            "alignment": LossDefinition(TokenLoss("cosine"), 0.5),
         }
 
     default_weighting_options = ("loss_decay_gamma",)
@@ -70,19 +66,13 @@ class DSpineObjective:
     def default_weighting(self):
         return decay_weighting(self.loss_decay_gamma)
 
-    @property
-    def default_loss(self):
-        return TokenLoss(
-            kind="ce_l1",
-            options={"ce_weight": self.ce_weight, "l1_weight": 1 - self.ce_weight},
-        )
+    default_loss = TokenLoss("ce_l1", {"ce_weight": 0.1, "l1_weight": 0.9})
 
     def __post_init__(self):
         check_options(
             counts={"num_anchors": self.num_anchors, "top_k": self.top_k},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
             nonnegative={
-                "alignment_weight": self.alignment_weight,
                 "candidate_mass_threshold": self.candidate_mass_threshold,
             },
             zero_counts={
@@ -90,7 +80,6 @@ class DSpineObjective:
                 "replacement_layers": self.replacement_layers,
             },
             probabilities={
-                "ce_weight": self.ce_weight,
                 "replacement_probability": self.replacement_probability,
                 "replacement_hold_ratio": self.replacement_hold_ratio,
                 "replacement_end_ratio": self.replacement_end_ratio,
@@ -149,9 +138,6 @@ class DSpineObjective:
             else 1
         )
 
-        if runtime.loss_configuration is None:
-            beta *= self.alignment_weight
-
         def compute(calc):
             calc.run((0,))
             predictions, labels, teacher = calc.predictions, calc.labels, calc.teacher
@@ -179,38 +165,18 @@ class DSpineObjective:
                 ce_mask=covered.any(-1),
                 l1_mask=mass > self.candidate_mass_threshold,
             )
-            if runtime.loss_configuration is None:
-                # Keep old checkpoint implementation identities. The mathematical
-                # combination is shared with the configured CE/L1 formula.
-                values = calc.evaluate(
-                    "refinement",
-                    TokenLoss("ce"),
-                    scores,
-                    covered.long().argmax(-1),
-                    teacher=teacher.gather(-1, ids),
-                    return_teacher_l1=True,
-                )
-                refinement = combine_ce_l1(
-                    values.values,
-                    values.statistics["teacher_l1"],
-                    refinement_context,
-                    self.ce_weight,
-                    1 - self.ce_weight,
-                )
-            else:
-                refinement = calc.evaluate_term(
-                    1,
-                    scores,
-                    covered.long().argmax(-1),
-                    teacher=teacher.gather(-1, ids),
-                    context=refinement_context,
-                )
+            refinement = calc.evaluate_term(
+                1,
+                scores,
+                covered.long().argmax(-1),
+                teacher=teacher.gather(-1, ids),
+                context=refinement_context,
+            )
             codes = F.embedding(labels, model.transfer_codes).float()
             alignment = calc.evaluate_term(
                 2,
                 predictions.context_inputs["layer_features"],
                 codes[:, :, None],
-                fused=False if runtime.loss_configuration is None else None,
             ).values
             ce_num = (terms.values * calc.weights).sum()
             denominator = calc.weights.sum().detach()

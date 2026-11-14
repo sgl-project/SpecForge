@@ -235,12 +235,13 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             from specforge.algorithms.objectives.protocols.domino import DominoObjective
 
             model.objective = DominoObjective()
+            model.objective_name = "domino"
+            from specforge.algorithms.objectives.execution_options import LossExecution
+
             contract = {
-                "canonical_objective_options": {
-                    k: v for k, v in asdict(model.objective).items() if k != "impl"
-                },
+                "canonical_objective_options": asdict(model.objective),
                 "canonical_loss_implementations": model.loss_implementations.names,
-                "canonical_loss_execution": {"fused": True},
+                "canonical_loss_execution": asdict(LossExecution(fused=True)),
             }
             trainer, _, _ = self._make_trainer(
                 out,
@@ -260,6 +261,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             model = Composite()
             model.loss_implementations = ExecutionSelection()
             model.objective = DominoObjective()
+            model.objective_name = "domino"
             contract["canonical_objective_options"] = asdict(model.objective)
             contract["canonical_loss_implementations"] = (
                 model.loss_implementations.names

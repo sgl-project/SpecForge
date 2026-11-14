@@ -165,41 +165,20 @@ def implementation_registrations():
     return dict(_IMPLEMENTATIONS)
 
 
-def select_implementation(
-    request, group=(0,), *, impl=None, rejections=None, fused=False
-):
+def select_implementation(request, group=(0,), *, rejections=None, fused=False):
     """Choose the highest-priority compatible optimization or a reference.
 
-    Explicit implementations and automatic fusion are mutually exclusive.
-    Inapplicable optimizations fall back; legacy explicit selection never does.
+    Inapplicable optimizations fall back to reference calculation.
     Support checks must not materialize predictions.
     """
-    if impl is not None and fused:
-        raise ValueError("impl and fused=True are mutually exclusive")
-    entries = implementation_registrations()
-    if impl is not None:
-        if impl not in entries:
-            raise ValueError(f"Unknown execution implementation: {impl!r}")
-        entry = entries[impl]
-        if entry.category != "specialized":
-            raise ValueError(
-                f"{impl} is not a specialized implementation; use fused=True"
-            )
-        candidates = [entry]
-    else:
-        candidates = sorted(
-            (
-                entry
-                for entry in entries.values()
-                if entry.category == "reference"
-                or (fused and entry.category != "reference")
-            ),
-            key=lambda entry: (
-                entry.category == "reference",
-                -entry.priority,
-                entry.name,
-            ),
-        )
+    candidates = sorted(
+        (
+            entry
+            for entry in implementation_registrations().values()
+            if fused or entry.category == "reference"
+        ),
+        key=lambda entry: (entry.category == "reference", -entry.priority, entry.name),
+    )
     for entry in candidates:
         reason = (
             "mathematical loss does not match"
@@ -209,20 +188,17 @@ def select_implementation(
         )
         if reason is None:
             return entry
-        if impl is not None:
-            raise ValueError(f"{impl} cannot execute this loss group: {reason}")
         if rejections is not None:
             rejections.append(f"{entry.name}: {reason}")
     return None
 
 
-def compute_loss(request, group=(0,), *, impl=None, fused=False, selection=None, key=0):
+def compute_loss(request, group=(0,), *, fused=False, selection=None, key=0):
     """Execute declared terms through the common loss entry point.
 
     Args:
         request: Resolved supervision and direct or deferred prediction inputs.
         group: Term indices to compute together.
-        impl: Explicit specialized implementation; cannot accompany fused=True.
         fused: Automatically select a compatible optimization.
         selection: Optional distributed/resume selection tracker.
         key: Stable request identity within the algorithm.
@@ -232,9 +208,9 @@ def compute_loss(request, group=(0,), *, impl=None, fused=False, selection=None,
         Joint reference groups are evaluated independently without changing weights.
     """
     entry = (
-        selection.resolve(request, group, key, impl=impl, fused=fused)
+        selection.resolve(request, group, key, fused=fused)
         if selection is not None
-        else select_implementation(request, group, impl=impl, fused=fused)
+        else select_implementation(request, group, fused=fused)
     )
     if entry is not None and request.input_tensor.numel():
         return entry.compute(request, group)
@@ -281,17 +257,15 @@ class ExecutionSelection:
         self._expected = {key: aliases.get(name, name) for key, name in names.items()}
         self.names.clear()
 
-    def resolve(self, request, group, prediction_index, *, impl=None, fused=True):
+    def resolve(self, request, group, prediction_index, *, fused=True):
         """Select and log a group once; reject rank or resume disagreement."""
-        if impl is not None and fused:
-            raise ValueError("impl and fused=True are mutually exclusive")
-        if not fused and impl is None:
+        if not fused:
             return select_implementation(request, group)
         key = f"{prediction_index}:" + ",".join(map(str, group))
         reasons, error, entry = [], None, None
         try:
             entry = select_implementation(
-                request, group, impl=impl, fused=fused, rejections=reasons
+                request, group, fused=fused, rejections=reasons
             )
         except (ImportError, ValueError, RuntimeError) as exc:
             error = str(exc)

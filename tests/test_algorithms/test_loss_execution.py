@@ -292,20 +292,11 @@ class LossExecutionTest(unittest.TestCase):
                 )
             batch = {k: v.cuda() for k, v in training_batch(config).items()}
             expected = None
-            modes = (
-                (False, True, "specialized")
-                if architecture == "DominoDraftModel"
-                else (False, True)
-            )
-            for fused in modes:
+            for fused in (False, True):
                 with self.subTest(architecture=architecture, fused=fused):
                     runtime.execution = LossExecution(
                         chunk_size=1, checkpoint=True, fused=fused is True
                     )
-                    if fused == "specialized":
-                        runtime.objective = replace(
-                            runtime.objective, impl="domino_suffix_ce"
-                        )
                     runtime.zero_grad(set_to_none=True)
                     torch.manual_seed(31)
                     with patch.object(
@@ -351,11 +342,6 @@ class LossExecutionTest(unittest.TestCase):
                                 ValueError, "changed on resume"
                             ):
                                 runtime(batch, step=1, total_steps=10)
-
-            if architecture == "DominoDraftModel":
-                runtime.execution = LossExecution(fused=True)
-                with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-                    runtime(batch, step=1, total_steps=10)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_soft_ce_matches_legacy_real_vocabulary(self):

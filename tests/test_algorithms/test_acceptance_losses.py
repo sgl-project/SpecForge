@@ -41,14 +41,16 @@ class AcceptanceLossTest(unittest.TestCase):
             for mode in ("alpha", "tv", "lambda"):
                 with self.subTest(weighting=weighting, mode=mode):
                     torch.manual_seed(7)
-                    runtime, legacy, names = block_pair("dflash")
-                    runtime.token_loss = TokenLoss(
-                        kind=f"lk_{mode}",
-                        options=(
-                            {"kl_scale": 0.7, "kl_decay": 1.3}
-                            if mode == "lambda"
-                            else {}
-                        ),
+                    runtime, legacy, names = block_pair(
+                        "dflash",
+                        loss={
+                            "kind": f"lk_{mode}",
+                            "options": (
+                                {"kl_scale": 0.7, "kl_decay": 1.3}
+                                if mode == "lambda"
+                                else {}
+                            ),
+                        },
                     )
                     runtime.weighting = PositionWeighting(kind=weighting)
                     legacy.lk_loss_type, legacy.kl_scale, legacy.kl_decay = (
