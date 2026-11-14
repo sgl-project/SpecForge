@@ -228,13 +228,14 @@ def execute_batch(batch, loss, weighting, *, training):
         raise ValueError("protocol must produce at least one prediction set")
     result = combine_results(results)
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
-        return ObjectiveResult(
+        result = ObjectiveResult(
             sum(item.loss for item in results),
             results[0].denominator.new_ones(()),
             result.ratios,
         )
-    if batch.reduction == "global_microbatch":
-        return microbatch_mean(result, global_denominator=training)
-    if batch.reduction not in ("tokens", "sum_means"):
+    elif batch.reduction == "global_microbatch":
+        result = microbatch_mean(result, global_denominator=training)
+    elif batch.reduction not in ("tokens", "sum_means"):
         raise ValueError(f"unknown protocol reduction: {batch.reduction!r}")
+    result.deferred = batch.deferred
     return result
