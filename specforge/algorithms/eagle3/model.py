@@ -34,12 +34,12 @@ from specforge.core.compact_teacher import (
     compute_target_p_padded_from_hidden,
 )
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
-from specforge.core.lk_loss import (
+from specforge.losses.lk import (
     _reduce_acceptance_rows,
     compute_acceptance_rate,
     compute_lk_loss,
 )
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
 from specforge.modeling.draft.base import Eagle3DraftModel
 from specforge.utils import padding
 

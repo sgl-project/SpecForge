@@ -10,7 +10,7 @@ from specforge.algorithms.common.cod import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
 from specforge.modeling.draft.peagle import PEagleDraftModel
 
 

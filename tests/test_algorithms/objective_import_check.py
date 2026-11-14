@@ -1,5 +1,6 @@
 """Check the eager objective path without Triton or Liger installed."""
 
+import importlib
 import importlib.abc
 import sys
 
@@ -17,6 +18,14 @@ from specforge.core import fused_loss as legacy_losses  # noqa: E402
 from specforge.losses import fused as shared_losses  # noqa: E402
 
 assert legacy_losses is shared_losses
+for old, new in (
+    ("domino_loss", "domino"),
+    ("lk_loss", "lk"),
+    ("position_weights", "position_weights"),
+):
+    assert importlib.import_module("specforge.core." + old) is importlib.import_module(
+        "specforge.losses." + new
+    )
 assert "specforge.algorithms.objectives" not in sys.modules
 assert "transformers" not in sys.modules
 
@@ -40,6 +49,7 @@ result = runtime(
 )
 result.loss.backward()
 assert "specforge.core.loss" not in sys.modules
+assert "specforge.losses.soft_cross_entropy" not in sys.modules
 assert "specforge.algorithms.peagle.model" not in sys.modules
 
 from specforge.algorithms.objectives.implementations import fused_loss  # noqa: E402

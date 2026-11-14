@@ -3,7 +3,7 @@ import time
 
 import torch
 
-from specforge.core.loss import LogSoftmaxLoss, _compute_loss
+from specforge.losses.soft_cross_entropy import LogSoftmaxLoss, _compute_loss
 
 TTT_LENGTH = 7
 
@@ -90,7 +90,7 @@ def main():
     parser.add_argument(
         "--num-runs", type=int, default=5, help="Number of runs for averaging"
     )
-    args = parser.parse_args()
+    parser.parse_args()
 
     print("PyTorch version:", torch.__version__)
     if torch.cuda.is_available():
@@ -125,7 +125,7 @@ def main():
     triton_results = benchmark_loss_method("triton", test_configs)
 
     # Print results summary
-    print(f"\n=== Performance Summary ===")
+    print("\n=== Performance Summary ===")
     print(f"Configurations tested: {len(test_configs)}")
 
     # Print detailed results table

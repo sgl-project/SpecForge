@@ -5,7 +5,7 @@ from functools import partial
 
 import torch
 
-from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
+from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 
 from .base import ObjectiveResult
 from .execution_options import LossExecution
