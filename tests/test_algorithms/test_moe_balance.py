@@ -39,9 +39,12 @@ class MoEBalanceTest(unittest.TestCase):
     def test_option_is_validated_and_needs_a_biased_moe_draft(self):
         options = {"num_anchors": 2, "bias_update_rate": 0.001}
         resolved = resolve_objective("DSparkDraftModel", options=options)
-        # The registry takes the balancing option for objectives that provide routing.
+        # The registry takes the balancing options for objectives that provide routing.
         self.assertFalse(hasattr(resolved.objective, "bias_update_rate"))
-        self.assertEqual(resolved.statistics_settings, {"bias_update_rate": 0.001})
+        self.assertEqual(
+            resolved.statistics_settings,
+            {"bias_update_rate": 0.001, "aux_loss_coef": 0.0},
+        )
         resolve_objective("DFlashDraftModel", options={"bias_update_rate": 0.5})
         for architecture in ("DFlash2DraftModel", "DominoDraftModel"):
             # Their models do not carry expert routing out yet, so no option either.
@@ -49,6 +52,8 @@ class MoEBalanceTest(unittest.TestCase):
                 resolve_objective(architecture, options={"bias_update_rate": 0.5})
         with self.assertRaises(ValueError):
             resolve_objective("DSparkDraftModel", options={"bias_update_rate": -1.0})
+        with self.assertRaises(ValueError):
+            resolve_objective("DFlashDraftModel", options={"aux_loss_coef": -0.1})
         with self.assertRaisesRegex(ValueError, "MoE layers"):
             build_objective_model(build_draft_model(dense_config()), options=options)
         with self.assertRaisesRegex(ValueError, "expert_bias"):
@@ -59,6 +64,13 @@ class MoEBalanceTest(unittest.TestCase):
             build_draft_model(moe_model_config()), options={"num_anchors": 2}
         )
         self.assertIsNone(runtime.statistics)
+        # The auxiliary loss alone needs no expert bias.
+        runtime = build_objective_model(
+            build_draft_model(moe_model_config(expert_bias=False)),
+            options={"num_anchors": 2, "aux_loss_coef": 0.01},
+        )
+        self.assertEqual(runtime.statistics.rate, 0.0)
+        self.assertEqual(runtime.statistics.settings["aux_loss_coef"], 0.01)
 
     def test_a_step_pools_the_window_and_moves_each_bias_zero_mean(self):
         config = moe_model_config()

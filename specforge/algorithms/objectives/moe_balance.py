@@ -1,7 +1,10 @@
-"""MoE load balancing: DeepSeek-V3's aux-loss-free expert-bias update from routed-token counts."""
+"""MoE load balancing: DeepSeek-V3's aux-loss-free bias update and its auxiliary loss."""
+
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from specforge.modeling.draft.layers.mlp import MoEFFN
@@ -9,13 +12,15 @@ from specforge.modeling.draft.layers.mlp import MoEFFN
 from .base import check_options
 
 # The options that join a resume contract only while balancing is on.
-BALANCING_OPTIONS = ("bias_update_rate",)
+BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_coef")
 
 
 def balancing_settings(options: dict) -> dict:
-    """The balancing options with defaults filled in and checked; off when the rate is 0."""
-    settings = {"bias_update_rate": 0.0, **options}
-    check_options(nonnegative={"bias_update_rate": settings["bias_update_rate"]})
+    """The balancing options with defaults filled in and checked; off when rate and coef are 0."""
+    settings = {"bias_update_rate": 0.0, "aux_loss_coef": 0.0, **options}
+    check_options(
+        nonnegative={k: settings[k] for k in ("bias_update_rate", "aux_loss_coef")}
+    )
     return settings
 
 
@@ -36,11 +41,34 @@ def dispatch_balance(counts: Tensor) -> Tensor:
     return share.numel() * share.square().sum()
 
 
-class MoEBalancer:
-    """The objectives' StepStatistics for MoE drafts: per-step counts and the bias update."""
+def balance_from_terms(mean_probs, load) -> Tensor:
+    """E * sum_e share_e * P_e per layer with its own E, averaged; 1 when balanced; gradient through P_e."""
+    values = []
+    for probs, counts in zip(mean_probs, load):
+        share = counts.float() / counts.sum().clamp(min=1)
+        values.append(probs.numel() * (share * probs).sum())
+    return torch.stack(values).mean()
 
-    def __init__(self, model: nn.Module, *, rate: float):
+
+@dataclass(frozen=True)
+class MoEBalanceTerm:
+    """A forward's halves of the load-balance loss per layer; its balancer folds them."""
+
+    mean_probs: tuple[Tensor, ...]  # per layer [num_experts] P_e, differentiable
+    counts: tuple[Tensor, ...]  # per layer [num_experts] int64 kept tokens per expert
+    balancer: "MoEBalancer"
+
+    def finish(self, result):
+        """The DeferredTerm contract: the balancer folds this term into the loss."""
+        return self.balancer.finish(result)
+
+
+class MoEBalancer:
+    """The objectives' StepStatistics for MoE drafts: counts, the bias step, the aux loss."""
+
+    def __init__(self, model: nn.Module, *, rate: float, aux_loss_coef: float = 0.0):
         self.rate = rate
+        self.aux_loss_coef = aux_loss_coef
         self.layers = [m for m in model.modules() if isinstance(m, MoEFFN)]
         if not self.layers:
             raise ValueError("MoE load balancing needs a draft with MoE layers")
@@ -55,14 +83,18 @@ class MoEBalancer:
     @classmethod
     def from_settings(cls, model: nn.Module, settings: dict) -> "MoEBalancer | None":
         """A balancer from balancing_settings; None while balancing is off."""
-        if not settings.get("bias_update_rate"):
+        if not settings.get("bias_update_rate") and not settings.get("aux_loss_coef"):
             return None
-        return cls(model, rate=settings["bias_update_rate"])
+        return cls(
+            model,
+            rate=settings["bias_update_rate"],
+            aux_loss_coef=settings["aux_loss_coef"],
+        )
 
     @property
     def settings(self) -> dict:
         """The StepStatistics contract: the options that built this balancer."""
-        return {"bias_update_rate": self.rate}
+        return {"bias_update_rate": self.rate, "aux_loss_coef": self.aux_loss_coef}
 
     def _routings(self, output):
         routings = output.expert_routing or ()
@@ -79,18 +111,40 @@ class MoEBalancer:
             dist.all_reduce(flat, group=process_group)
         return flat.split(self.sizes)
 
-    def observe(self, output, *, keep: Tensor) -> None:
-        """Count one forward's kept tokens per expert, per layer; training forwards accumulate."""
-        if not (torch.is_grad_enabled() and self.layers[0].training):
-            return
+    def observe(self, output, *, keep: Tensor) -> MoEBalanceTerm | None:
+        """Count one forward per layer (training forwards accumulate); the aux term, or None."""
+        counting = torch.is_grad_enabled() and self.layers[0].training
         routings = self._routings(output)
         kept = keep.to(routings[0].expert_ids.device)
+        mean_probs, counts = [], []
         for index, (layer, routing) in enumerate(zip(self.layers, routings)):
             tokens = count_tokens_per_expert(
                 routing.expert_ids, kept, layer.config.num_experts
             )
-            previous = self.counts[index]
-            self.counts[index] = tokens if previous is None else previous + tokens
+            if counting:
+                previous = self.counts[index]
+                self.counts[index] = tokens if previous is None else previous + tokens
+            if self.aux_loss_coef:
+                # P_e over the kept tokens; the L1 normalization matters for sigmoid scores only.
+                probs = F.normalize(routing.scores, p=1, dim=-1) * kept[:, None]
+                mean_probs.append(probs.sum(dim=0) / kept.sum().clamp(min=1))
+                counts.append(tokens)
+        if not self.aux_loss_coef:
+            return None
+        return MoEBalanceTerm(tuple(mean_probs), tuple(counts), self)
+
+    def finish(self, result):
+        """Fold the term into the loss (moe/aux_loss) against this forward's own load."""
+        term = result.deferred
+        if term is None:
+            return result
+        value = balance_from_terms(term.mean_probs, term.counts)
+        numerator = result.numerator + self.aux_loss_coef * value * result.denominator
+        ratios = {
+            **result.ratios,
+            "moe/aux_loss": (value.detach(), result.denominator.new_ones(())),
+        }
+        return replace(result, numerator=numerator, ratios=ratios, deferred=None)
 
     def step(self, *, process_group=None) -> dict[str, Tensor]:
         """At the optimizer step: pool the window's counts over ranks, move the biases, reset."""

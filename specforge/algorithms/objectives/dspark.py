@@ -119,5 +119,8 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        runtime.observe_statistics(output, blocks)
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            deferred=runtime.deferred_term(output, blocks),
+        )

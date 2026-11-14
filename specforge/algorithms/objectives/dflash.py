@@ -63,5 +63,7 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        runtime.observe_statistics(output, blocks)
-        return PredictionBatch((runtime.block_predictions(output, blocks, batch),))
+        predictions = runtime.block_predictions(output, blocks, batch)
+        return PredictionBatch(
+            (predictions,), deferred=runtime.deferred_term(output, blocks)
+        )
