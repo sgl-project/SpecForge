@@ -8,7 +8,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
-from ..inputs import prepare_blocks
+from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch
@@ -19,6 +19,7 @@ from .dflash import COMMON_MODULES
 @register_protocol(
     "dspark",
     training=TrainingRequirements(
+        host_inputs=prepare_anchor_capacity,
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,

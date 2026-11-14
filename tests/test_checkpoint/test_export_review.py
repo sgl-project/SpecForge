@@ -72,15 +72,10 @@ class ExportReviewTest(unittest.TestCase):
             export.reset_mock()
             result = CliRunner().invoke(cli, args + ["--embedding-source", "target"])
             self.assertEqual(result.exit_code, 2)
-            self.assertIn("--target-model", result.output)
-            result = CliRunner().invoke(cli, args + ["--vocab-mapping", "map.pt"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("--vocab-mapping belongs to legacy --to", result.output)
-            export.assert_not_called()
-        with patch("specforge.export.legacy_sglang.export_to_sglang") as export:
+            self.assertIn("No such option", result.output)
             result = CliRunner().invoke(cli, args + ["--to", "sglang"])
             self.assertEqual(result.exit_code, 2)
-            self.assertIn("--draft-config", result.output)
+            self.assertIn("No such option", result.output)
             export.assert_not_called()
 
     def test_sglang_cli_options_and_forwarding(self):
@@ -88,8 +83,8 @@ class ExportReviewTest(unittest.TestCase):
         with patch("specforge.export.model.export_draft") as export:
             for options, error in (
                 (["--copy-target"], "requires native export"),
-                (["--converter", "sglang", "--to", "hf"], "mutually exclusive"),
-                (["--to", "hf", "--copy-target"], "cannot be combined"),
+                (["--converter", "sglang", "--to", "hf"], "No such option"),
+                (["--to", "hf", "--copy-target"], "No such option"),
             ):
                 result = CliRunner().invoke(cli, args + options)
                 self.assertEqual(result.exit_code, 2, result.output)

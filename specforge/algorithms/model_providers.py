@@ -76,7 +76,7 @@ def _warm_start(
         draft_model,
         cfg.model.draft_checkpoint_path,
         draft_config=draft_config,
-        strategy=cfg.training.strategy,
+        strategy=cfg.training.objective,
         allow_missing_embedding=allow_missing_embedding,
         cache_dir=cfg.model.cache_dir,
         trust_remote_code=cfg.model.trust_remote_code,
@@ -277,7 +277,7 @@ def build_eagle3_model(
 
     model = OnlineEagle3Model(
         draft_model=draft_model,
-        length=cfg.training.ttt_length,
+        length=cfg.training.objective_options.get("ttt_length", 7),
         attention_backend=cfg.training.attention_backend,
         **token_arguments(settings, teacher=True),
     ).to(device=_device(), dtype=_torch_dtype(cfg))

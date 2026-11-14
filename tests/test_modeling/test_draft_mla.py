@@ -1,12 +1,12 @@
 """Node-driven MLA matches the existing eager projections and full-QK scaling."""
 
+import copy
 import unittest
 from dataclasses import dataclass, replace
 from typing import ClassVar
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen3Config
 
 from specforge.config.draft.attention import MLASpec
 from specforge.config.draft.codec.components import decode_component
@@ -14,8 +14,6 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec, YaRNSpec
-from specforge.modeling.draft.dflash import Qwen3DFlashMLAAttention
-from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, MLAAttention, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
@@ -23,6 +21,7 @@ from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.residual import StandardResidualConnection
 from specforge.modeling.draft.layers.rope import build_rotary
 from tests.test_config.draft_fixtures import UnpairedRoPESpec
+from tests.test_modeling.attention_reference import context_mla
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -118,28 +117,8 @@ class MLATest(unittest.TestCase):
                     rope=rope_kind,
                     autocast=autocast,
                 ):
-                    config = Qwen3Config(
-                        hidden_size=16,
-                        num_attention_heads=node.num_attention_heads,
-                        num_hidden_layers=1,
-                        layer_types=["full_attention"],
-                        q_lora_rank=rank,
-                        kv_lora_rank=node.kv_lora_rank,
-                        qk_nope_head_dim=node.qk_nope_head_dim,
-                        qk_rope_head_dim=node.qk_rope_head_dim,
-                        v_head_dim=node.v_head_dim,
-                        rope_interleave=interleaved,
-                        attention_bias=node.attention_bias,
-                        rms_norm_eps=1e-6,
-                        attention_dropout=node.attention_dropout,
-                        rope_parameters=rope_dict,
-                    )
-                    config._attn_implementation = "eager"
-                    reference = Qwen3DFlashMLAAttention(
-                        config, 0, DEFAULT_DFLASH_KERNELS
-                    ).to(device=device, dtype=dtype)
                     actual = build(node, rope, device=device, dtype=dtype)
-                    actual.load_state_dict(reference.state_dict(), strict=True)
+                    reference = copy.deepcopy(actual)
                     self.assertEqual(actual.scaling, reference.scaling)
                     hidden = torch.randn(
                         2, 4, 16, device=device, dtype=dtype, requires_grad=True
@@ -186,9 +165,9 @@ class MLATest(unittest.TestCase):
                     )
                     torch.manual_seed(79)
                     with torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
-                        expected = reference(
-                            other, other_context, reference_embeddings, mask
-                        )[0]
+                        expected = context_mla(
+                            reference, other, other_context, reference_embeddings, mask
+                        )
                     torch.manual_seed(79)
                     with torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
                         output = actual(

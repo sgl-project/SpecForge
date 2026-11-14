@@ -36,7 +36,7 @@ Across hosts, replace loopback addresses with reachable addresses and set each
 process's `MOONCAKE_LOCAL_HOSTNAME` to its own reachable address. The offline CPU
 client supports TCP/RDMA; NVLink GPU receive buffers are not used here.
 
-For `configs/qwen3-8b-dflash.json`, launch this server in the SGLang environment:
+For `specforge/config/draft/presets/qwen3-8b-dflash.yaml`, launch this server in the SGLang environment:
 
 ```bash
 SPECFORGE_SPEC_CAPTURE=1 SGLANG_SPEC_CAPTURE_GPU_PUT=0 \
@@ -65,7 +65,7 @@ From the SpecForge environment:
 python scripts/prepare_hidden_states.py \
   --server-urls http://127.0.0.1:30000 \
   --target-model-path Qwen/Qwen3-8B \
-  --strategy dflash --draft-model-config configs/qwen3-8b-dflash.json \
+  --draft specforge/config/draft/presets/qwen3-8b-dflash.yaml \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/qwen3-8b-dflash-sharegpt \
   --chat-template qwen --max-length 3072 --batch-size 32

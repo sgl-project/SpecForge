@@ -16,6 +16,7 @@ from specforge.training import provenance
 
 def _config(target_model_path: str) -> SimpleNamespace:
     return SimpleNamespace(
+        draft="remote/draft",
         model=SimpleNamespace(
             target_model_path=target_model_path,
             draft_model_config="remote/draft",
@@ -25,7 +26,7 @@ def _config(target_model_path: str) -> SimpleNamespace:
             load_target_embedding=True,
             input_modality="text",
             torch_dtype="bfloat16",
-        )
+        ),
     )
 
 

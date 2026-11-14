@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash DSpark disaggregated training
 
-Trains the DSpark drafter in `configs/deepseek-v4-flash-dspark.json` (a
+Trains the DSpark drafter in `specforge/config/draft/presets/deepseek-v4-flash-dspark.yaml` (a
 five-layer Qwen3-style GQA decoder at the target's width) for
 `deepseek-ai/DeepSeek-V4-Flash-0731`, from scratch on ShareGPT. The recipe
 fits one 8-GPU B200 node: two TP2 capture servers on GPUs 0-3 and a four-rank

@@ -60,23 +60,19 @@ the migration; its old checkpoints must use this import path. New HF exports alw
 use canonical names and store each tensor in its own dtype; `config.json` declares
 a dtype only when all floating-point tensors share one.
 
-During migration, `--to hf` and `--to sglang` retain the original exporters and
-require `--draft-config`. Use `--converter sglang` for DFlash-family serving exports.
-Legacy `--to` remains necessary when importing an external vocabulary mapping
-for an old EAGLE3 checkpoint. Only legacy
-`--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
-rejects it and uses `--target-model` for import validation and configuration.
-`--format` is not needed. Use `--converter sglang` for canonical serving export.
-Legacy `--to` paths remain available during migration, including mixed-causality
-recipes that the pinned converter cannot express. For historical EAGLE3 checkpoints
-without vocabulary buffers, the existing legacy path accepts an explicit mapping:
+The retired `--to`, `--embedding-source` and `--embedding-key` options are
+no longer accepted. Use `--converter sglang` for serving conversion and
+`--target-model` for target metadata and bound-weight validation.
+
+Historical EAGLE3 checkpoints without recorded vocabulary buffers can supply
+an explicit mapping at the checkpoint import boundary:
 
 ```bash
-specforge export --to sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
-  --vocab-mapping MAPPING --output-dir SERVING
+specforge export --converter sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
+  --target-model TARGET --vocab-mapping MAPPING --output-dir SERVING
 ```
 
-Canonical export requires the mapping to be stored in the checkpoint. It preserves
+The imported mapping becomes part of the validated canonical state. Export preserves
 recorded `bos_token_id`, `eos_token_id`, and `pad_token_id` metadata.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.

@@ -16,7 +16,7 @@ from specforge.modeling.draft.layers.rope import (
     apply_rotary,
     build_rotary,
 )
-from specforge.modeling.draft.llama3_eagle import (
+from tests.test_modeling.rotary_reference import (
     LlamaMutiRotaryEmbedding,
     apply_multimodal_rotary_pos_emb,
 )

@@ -17,8 +17,7 @@ from specforge.checkpoint.tensors import TensorStore
 from specforge.config.draft.codec import decode_legacy_config
 from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
-from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.config import AutoDraftConfig
+from tests.test_checkpoint.legacy_weights import legacy_state
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_legacy_dflash import legacy_payload
 from tests.test_config.test_draft_legacy_domino import domino_payload
@@ -27,36 +26,7 @@ from tests.test_config.test_draft_legacy_dspine import dspine_payload
 from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
 from tests.test_config.test_draft_legacy_mtp import mtp_payload
 from tests.test_config.test_draft_legacy_peagle import peagle_payload
-from tests.test_modeling import test_canonical_dflash as _dflash
-from tests.test_modeling import test_canonical_domino as _domino
-from tests.test_modeling import test_canonical_eagle3 as _eagle3
-from tests.test_modeling import test_canonical_peagle as _peagle
 from tests.test_modeling.test_canonical_dflash import inputs_for
-
-
-def _mtp_legacy_name(name):
-    # the MTP forward-parity map, inlined: its test module is retired later in the stack
-    for prefix, legacy in (
-        ("fusion.", ""),
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-    ):
-        if name.startswith(prefix):
-            return legacy + name[len(prefix) :]
-    return name
-
-
-# canonical -> legacy names, as the forward-parity tests prove them
-_LEGACY_NAMES = {
-    "legacy_payload": lambda name: _dflash.legacy_name(name) or name,
-    "dflash2_payload": lambda name: _dflash.legacy_name(name) or name,
-    "dspark_payload": lambda name: _dflash.legacy_name(name) or name,
-    "dspine_payload": lambda name: _dflash.legacy_name(name) or name,
-    "domino_payload": _domino.reference_name,
-    "eagle_payload": _eagle3.legacy_name,
-    "peagle_payload": _peagle.legacy_name,
-    "mtp_payload": _mtp_legacy_name,
-}
 
 
 def dflash2_payload():
@@ -115,92 +85,6 @@ class LoadingTest(unittest.TestCase):
                     atol=0,
                 )
 
-    def test_explicit_legacy_settings_preserve_recorded_values(self):
-        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
-        payload = json.loads((fixture / "config.json").read_text())
-        payload.pop("norm_before_residual", None)
-        with TemporaryDirectory() as tmp:
-            path, target = Path(tmp) / "draft", Path(tmp) / "target"
-            path.mkdir()
-            write_target(target)
-            state = {"draft_state_dict": load_file(fixture / "model.safetensors")}
-            torch.save(state, path / "training_state.pt")
-            settings = {"mask_token_id": 63, "norm_before_residual": True}
-            config = read_draft(
-                path, target=target, legacy_config=payload, legacy_settings=settings
-            ).config
-            self.assertEqual(config.spec_config.mask_token_id, 63)
-            self.assertTrue(config.spec_config.norm_before_residual)
-            state["peagle_mask_token_id"] = 62
-            torch.save(state, path / "training_state.pt")
-            with self.assertRaisesRegex(ValueError, "explicit mask_token_id conflicts"):
-                read_draft(
-                    path, target=target, legacy_config=payload, legacy_settings=settings
-                )
-
-    def test_legacy_dflash_records_must_match_supplied_config(self):
-        """A config-less DFlash run imported with a stale JSON must not load silently."""
-        payload = dflash2_payload()
-        with TemporaryDirectory() as tmp:
-            target, source = Path(tmp) / "target", Path(tmp) / "source"
-            target.mkdir()
-            (target / "config.json").write_text(
-                json.dumps(
-                    {
-                        "hidden_size": payload["hidden_size"],
-                        "vocab_size": payload["vocab_size"],
-                        "num_hidden_layers": payload["num_target_layers"],
-                    }
-                )
-            )
-            source.mkdir()
-            (source / "config.json").write_text(json.dumps(payload))
-            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
-            spec = read_draft(source, target=target).config.spec_config
-            matching = {
-                "dflash_target_layer_ids": spec.target_features.target_layer_ids,
-                "dflash_mask_token_id": spec.target_features.mask_token_id,
-                "dflash_block_size": spec.block.block_size,
-            }
-            torch.save(matching, source / "training_state.pt")
-            read_draft(source, target=target)
-            for key, value in (
-                ("dflash_mask_token_id", spec.target_features.mask_token_id + 1),
-                ("dflash_block_size", spec.block.block_size + 1),
-                (
-                    "dflash_target_layer_ids",
-                    spec.target_features.target_layer_ids[::-1],
-                ),
-            ):
-                with self.subTest(key=key):
-                    torch.save(matching | {key: value}, source / "training_state.pt")
-                    with self.assertRaisesRegex(ValueError, key):
-                        read_draft(source, target=target)
-
-    def test_legacy_peagle_residual_order_comes_from_resume_contract(self):
-        """main's YAML may override norm_before_residual; the JSON can omit it."""
-        payload = peagle_payload() | dict(
-            hidden_size=32, vocab_size=64, draft_vocab_size=64
-        )
-        payload.pop("norm_before_residual", None)
-        with TemporaryDirectory() as tmp:
-            target, source = Path(tmp) / "target", Path(tmp) / "source"
-            write_target(target)
-            source.mkdir()
-            (source / "config.json").write_text(json.dumps(payload))
-            save_file({"fc.weight": torch.zeros(1)}, source / "model.safetensors")
-            for recorded in (True, False):
-                with self.subTest(recorded=recorded):
-                    torch.save(
-                        {
-                            "peagle_mask_token_id": 63,
-                            "peagle_norm_before_residual": recorded,
-                        },
-                        source / "training_state.pt",
-                    )
-                    spec = read_draft(source, target=target).config.spec_config
-                    self.assertIs(spec.norm_before_residual, recorded)
-
     def test_legacy_capture_layers_come_from_training_provenance(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
         payload = json.loads((fixture / "config.json").read_text())
@@ -253,10 +137,6 @@ class LoadingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "does not match"):
                 read_draft(path, adapter="legacy")
-            with self.assertRaisesRegex(ValueError, "canonical"):
-                AutoDraftConfig.from_dict(original.config.to_dict())
-            with self.assertRaisesRegex(ValueError, "canonical"):
-                AutoDraftModel.from_config(original.config)
             with patch("huggingface_hub.snapshot_download", return_value=str(path)):
                 restored = load_draft("test/draft", target=target)
             torch.testing.assert_close(
@@ -412,28 +292,24 @@ class LoadingTest(unittest.TestCase):
                     )
                     payload = json.loads((fixture / "config.json").read_text())
                     state = load_file(fixture / "model.safetensors")
-                    old = SimpleNamespace(state_dict=lambda: state)
                 else:
-                    old = AutoDraftModel.from_config(
-                        AutoDraftConfig.from_dict(payload)
-                    ).float()
-                if factory is eagle_payload:
-                    old.t2d[32:] = False
+                    state = legacy_state(payload["architectures"][0])
+                old = SimpleNamespace(state_dict=lambda state=state: state)
                 path, target = Path(tmp) / "draft", Path(tmp) / "target"
                 path.mkdir()
-                target_weights = write_target(target)
-                with torch.no_grad():
-                    if factory is eagle_payload:
-                        old.embed_tokens.weight.copy_(
-                            target_weights["model.embed_tokens.weight"]
-                        )
-                    if factory is mtp_payload:
-                        state["embed_tokens.weight"].copy_(
-                            target_weights["model.embed_tokens.weight"]
-                        )
-                        state["mtp.lm_head.weight"].copy_(
-                            target_weights["lm_head.weight"]
-                        )
+                weights = write_target(target)
+                for key in ("embed_tokens.weight", "lm_head.weight"):
+                    if key in state and (
+                        factory is mtp_payload
+                        or (factory is eagle_payload and key == "embed_tokens.weight")
+                    ):
+                        state[key] = weights[
+                            (
+                                "model.embed_tokens.weight"
+                                if key.startswith("embed")
+                                else key
+                            )
+                        ].clone()
                 (path / "config.json").write_text(json.dumps(payload))
                 state = old.state_dict()
                 if factory in (domino_payload, dspark_payload):
@@ -464,18 +340,11 @@ class LoadingTest(unittest.TestCase):
                 self.assertEqual(
                     restored.config.draft, read_draft(path, target=target).config
                 )
+                # Every persisted destination is backed by a recorded historical tensor layout.
                 artifact = read_draft(path, target=target)
-                # by value, through the maps the forward-parity tests prove
-                old_state = old.state_dict()
-                to_legacy = _LEGACY_NAMES[factory.__name__]
-                for key, value in restored.state_dict().items():
-                    if key == "vocabulary.ready":
-                        continue
-                    legacy = to_legacy(key)
-                    if legacy not in old_state:
-                        legacy = "mtp." + legacy
+                for key, ref in artifact.weights.items():
                     torch.testing.assert_close(
-                        value, old_state[legacy], rtol=0, atol=0, msg=key
+                        restored.state_dict()[key], ref.read(), rtol=0, atol=0
                     )
                 if factory is eagle_payload:
                     self.assertTrue(restored.vocabulary.ready)

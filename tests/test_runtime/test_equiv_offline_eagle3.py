@@ -13,7 +13,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()

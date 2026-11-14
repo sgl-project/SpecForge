@@ -22,7 +22,7 @@ from specforge.modeling.draft.layers.inputs import LayerInputs
 from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_canonical_dflash import legacy_name
 
-CONFIGS = Path(__file__).resolve().parents[2] / "configs"
+CONFIGS = Path(__file__).resolve().parents[2] / "tests/fixtures/legacy_drafts"
 HIDDEN, VOCAB, MASK, WINDOW, CONTEXT = 32, 64, 60, 6, 48
 
 

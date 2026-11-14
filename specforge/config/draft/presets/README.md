@@ -34,7 +34,7 @@ fails before reading tensors. Copied weights remain trainable and are saved;
 optional `training.frozen` prefixes freeze them independently of initialization.
 
 MTP training supports `training.attention_backend: eager` or `sdpa`.
-Use `training.loss.scheduling.chunk_size` to bound projection/loss chunks;
+Use `training.loss.execution.chunk_size` to bound projection/loss chunks;
 0 disables chunking. Each chunk computes LM head and loss together and is
 recomputed during backward, bounding saved logits as well as forward temporaries.
 This does not bound attention or backbone activation memory.

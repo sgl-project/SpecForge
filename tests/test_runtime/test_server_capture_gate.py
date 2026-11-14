@@ -50,9 +50,9 @@ H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
     from types import SimpleNamespace
 
-    from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import ServerCaptureSchema
+    from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
     registration = builtin_algorithm_registry().resolve(algorithm)
     config = SimpleNamespace(
@@ -345,8 +345,8 @@ class TestServerCaptureGate(unittest.TestCase):
         from pathlib import Path
 
         from scripts.prepare_hidden_states import HiddenStatesGenerator
-        from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.offline_capture import OfflineCaptureClient
+        from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         layout = (
             builtin_algorithm_registry()
@@ -463,30 +463,21 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
+        from tests.test_runtime._fixtures import build_strategy
 
         fx.build_single_rank_distributed(
             port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
         )
         torch.manual_seed(0)
-        draft_cfg = AutoDraftModelConfig.from_file(
-            fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
-        )
-        dm = AutoDraftModel.from_config(
-            draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(
-            fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
-        )
-        dm.freeze_embedding()
-        model = OnlineEagle3Model(dm, length=3, attention_backend="sdpa").cuda()
+        config_path = fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
+        vocab_path = fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
+        model = fx.load_eagle3(config_path, self.target_dir, vocab_path, ttt=3)
+        dm = model.draft_model
         backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(
@@ -494,7 +485,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        core = TrainerCore(Eagle3TrainStrategy(model, target_head=head), backend)
+        core = TrainerCore(build_strategy(model, target_head=head), backend)
         # batch_size=1 batches (ragged lengths), one step each
         for i, out in enumerate(fetched):
             batch = TrainBatch(
@@ -504,8 +495,8 @@ class TestServerCaptureGate(unittest.TestCase):
                     "input_ids": out["input_ids"].cuda(),
                     "attention_mask": out["attention_mask"].cuda(),
                     "loss_mask": out["loss_mask"].cuda(),
-                    "target": out["target"].cuda(),
-                    "hidden_state": out["hidden_state"].cuda(),
+                    "target_last_hidden_states": out["target"].cuda(),
+                    "hidden_states": out["hidden_state"].cuda(),
                 },
                 metadata={"target_repr": "hidden_state", "ttt_length": 3},
             )

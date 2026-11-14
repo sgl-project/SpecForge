@@ -37,22 +37,12 @@ def _has_standard_flash_attention() -> bool:
 
 
 def _build_model(workdir: str, attention_backend: str):
-    from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
-
-    draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
-    draft_model = AutoDraftModel.from_config(
-        draft_config,
-        attention_backend=attention_backend,
-        torch_dtype=torch.bfloat16,
-    ).cuda()
-    draft_model.load_vocab_mapping(os.path.join(workdir, "vm.pt"))
-    draft_model.freeze_embedding()
-    return OnlineEagle3Model(
-        draft_model=draft_model,
-        length=3,
-        attention_backend=attention_backend,
-    ).cuda()
+    return fx.load_eagle3(
+        os.path.join(workdir, "draft.json"),
+        os.path.join(workdir, "target"),
+        os.path.join(workdir, "vm.pt"),
+        backend=attention_backend,
+    )
 
 
 def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
@@ -67,12 +57,12 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     try:
         import torch.distributed as dist
 
-        from specforge.algorithms.builtin import builtin_algorithm_registry
         from specforge.distributed import get_draft_sp_group, get_tp_group
         from specforge.launch import _shard_offline_refs, build_offline_runtime
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+        from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         torch.manual_seed(0)
         torch.cuda.manual_seed_all(0)
@@ -106,7 +96,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
 
         reference_loader = FeatureDataLoader(
             LocalFeatureStore(f"usp-reference-{rank}"),
-            refs=[rank_refs[-1]],
+            refs=rank_refs,
             batch_size=1,
             collate_fn=provider.build_collator(),
             per_sample_transform=provider.build_normalizer(
@@ -116,17 +106,17 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             ),
             strategy=algorithm.name,
         )
-        reference_batch = next(iter(reference_loader))
         reference_model.train()
+        reference_strategy = algorithm.providers.step.build(
+            reference_model, target_head=target_head
+        )
         with torch.no_grad():
-            expected_loss = (
-                algorithm.providers.step.build(
-                    reference_model,
-                    target_head=target_head,
-                )
-                .forward_loss(reference_batch)
-                .loss.detach()
-            )
+            # The optimizer-window report pools both accumulation microbatches.
+            losses = [
+                reference_strategy.forward_loss(batch).loss.detach()
+                for batch in reference_loader
+            ]
+            expected_loss = torch.stack(losses).mean()
         dist.all_reduce(expected_loss, op=dist.ReduceOp.SUM)
         expected_loss /= world_size
 

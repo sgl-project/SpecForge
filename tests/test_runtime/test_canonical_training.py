@@ -188,15 +188,13 @@ class CanonicalTrainingTest(unittest.TestCase):
     def test_legacy_import_settings_and_full_resume_boundary(self):
         import shutil
 
-        from specforge.training.canonical import enabled
-
         fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))
             fixture = Path(shutil.copytree(fixture, Path(temp) / "legacy"))
-            torch.save({}, fixture / "training_state.pt")
+            torch.save({"peagle_mask_token_id": 63}, fixture / "training_state.pt")
             raw = dict(
-                model={"target_model_path": str(target), "mask_token_id": 63},
+                model={"target_model_path": str(target)},
                 initialization={"checkpoint": str(fixture)},
                 data={"hidden_states_path": str(target.parent / "features")},
                 training={"attention_backend": "eager"},
@@ -205,7 +203,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertEqual(resolved.config.draft["spec_config"]["mask_token_id"], 63)
             raw.pop("initialization")
             raw["resume"] = str(fixture)
-            with self.assertRaisesRegex(ValueError, "legacy full resume"):
+            with self.assertRaisesRegex(ValueError, "Historical optimizer states"):
                 resolve_run(Config.model_validate(raw))
             raw.pop("resume")
             raw["training"] = {
@@ -213,7 +211,8 @@ class CanonicalTrainingTest(unittest.TestCase):
                 "attention_backend": "eager",
             }
             raw["model"]["draft_model_config"] = str(fixture)
-            self.assertFalse(enabled(Config.model_validate(raw)))
+            with self.assertRaisesRegex(ValueError, "draft_model_config"):
+                Config.model_validate(raw)
 
     @unittest.skipUnless(torch.cuda.is_available(), "Liger requires CUDA")
     def test_liger_training_kernels_preserve_forward_and_gradients(self):
@@ -660,8 +659,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             run_config(
                 Path("target"), draft, initialization={"checkpoint": "a"}, resume="b"
             )
-        cfg = run_config(
-            Path("target"), draft, training={"attention_backend": "flex_attention"}
-        )
+        cfg = run_config(Path("target"), draft, training={"attention_backend": "fa"})
         with self.assertRaisesRegex(ValueError, "attention_backend"):
             resolve_run(cfg)

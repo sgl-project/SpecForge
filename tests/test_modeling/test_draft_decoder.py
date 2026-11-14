@@ -20,9 +20,6 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone
-from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
-from specforge.modeling.draft.dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
-from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
@@ -109,7 +106,7 @@ class TwoStreamConnection(ResidualConnection):
 
 class DecoderTest(unittest.TestCase):
     def _assert_reference(self, device, dtypes, autocast=False):
-        for kind in ("qwen3", "gated", "context", "convolution"):
+        for kind in ("qwen3", "gated"):
             gated = kind == "gated"
             node = make_node(output_gate=gated)
             rotary_dim = 4 if gated else 8
@@ -136,26 +133,9 @@ class DecoderTest(unittest.TestCase):
                         else Qwen3Config(**args)
                     )
                     config._attn_implementation = "eager"
-                    if kind == "convolution":
-                        reference = Qwen3DFlash2DecoderLayer(
-                            config,
-                            0,
-                            DEFAULT_DFLASH_KERNELS,
-                            attention_conv=DFlashGroupedConv(16, 4, 3, 4),
-                            mlp_conv=DFlashGroupedConv(16, 4, 3, 4),
-                        )
-                        with torch.no_grad():
-                            for conv in (reference.attention_conv, reference.mlp_conv):
-                                for parameter in conv.parameters():
-                                    parameter.normal_(std=0.1)
-                    elif kind == "context":
-                        reference = Qwen3DFlashDecoderLayer(
-                            config, 0, DEFAULT_DFLASH_KERNELS
-                        )
-                    else:
-                        reference = (
-                            Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer
-                        )(config, 0)
+                    reference = (Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer)(
+                        config, 0
+                    )
                     reference.to(device=device, dtype=dtype)
                     actual = make_layer(
                         node,

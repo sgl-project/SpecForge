@@ -6,12 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from transformers.models.llama.modeling_llama import LlamaMLP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.mlp.dense import SUPPORTED_ACTIVATIONS
 from specforge.modeling.draft.layers.mlp import DenseFFN
-from specforge.modeling.draft.llama3_eagle import LlamaMLP
 from tests.test_config.test_draft_legacy_dflash import CONFIGS
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
@@ -34,6 +34,7 @@ class DenseFFNTest(unittest.TestCase):
                                 intermediate_size=node.intermediate_size,
                                 hidden_act=activation,
                                 pretraining_tp=1,
+                                mlp_bias=False,
                             )
                         ).to(device=device, dtype=dtype)
                         actual = DenseFFN(

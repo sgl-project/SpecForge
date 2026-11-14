@@ -14,7 +14,7 @@ from specforge.config.draft.codec import (
 )
 from specforge.config.draft.logits import MuPLogitTransformSpec
 
-CONFIGS = Path(__file__).resolve().parents[2] / "configs"
+CONFIGS = Path(__file__).resolve().parents[2] / "tests/fixtures/legacy_drafts"
 
 
 def legacy_payload():
