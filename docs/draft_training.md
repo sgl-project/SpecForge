@@ -230,6 +230,76 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
+### Loss execution
+
+Execution controls are separate from the objective, token loss and weighting:
+
+```yaml
+model:
+  use_fused_conv: true
+training:
+  loss_execution:
+    chunk_size: 128
+    checkpoint: true
+    fused: true
+    trim: true
+    # Vocabulary tile size for offline EAGLE/P-EAGLE teacher projection:
+    # teacher_chunk_size: 32768
+```
+
+- `chunk_size` counts complete prediction units (blocks for block protocols,
+  independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
+  default; zero disables chunking. Recurrent heads always keep whole blocks.
+- `checkpoint` controls recomputation of chunk projections and losses during
+  backward when the prediction set spans multiple chunks. A single chunk is
+  not recomputed. It defaults to true and is independent of fused execution.
+- `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
+  soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
+  use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
+  corrections without constructing full corrected logits. CPU, FP64 and missing
+  required dependencies raise rather than silently disabling the requested kernels.
+  Loss contracts without an optimized implementation use a logged reference.
+  Empty inputs use the reference only to preserve zero gradients.
+  The first selection for each prediction group is logged at INFO, checked across
+  ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
+- `trim` defaults to false and skips prediction units with no supervised positions.
+  It preserves explicit denominators and does not truncate recurrent blocks.
+  D-PACE keeps complete chains, and contextual LK losses keep all rows.
+  Trimming also respects both prediction and projection chunk-safety declarations.
+- `teacher_chunk_size` enables compact teacher projection for offline
+  vocabulary-aware protocols with a reduced vocabulary and a frozen linear
+  teacher. It preserves full-vocabulary argmax and retained probability mass
+  while projecting vocabulary tiles; no full-vocabulary logits are retained.
+
+For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
+retaining full logits. It requires a compatible Liger kernel that also returns
+predicted tokens. Its installed version is checked against the project's Liger
+requirement before loading the kernel; an out-of-range version raises, including
+after a no-deps installation. An unavailable kernel also raises for an eligible
+linear head.
+Wrapped/transformed heads retain ordinary projection and may use a token kernel.
+
+Chunked D-PACE first collects detached chain statistics, then recomputes projection
+chunks with the complete-chain weights. Contextual LK losses retain whole-set
+execution, and DSpine retains it when no window alignment statistic is supplied.
+Thus requesting chunking does not promise bounded loss memory for those paths.
+
+`model.use_fused_conv` opts canonical grouped convolution into its existing Triton
+kernel. Enabling it without grouped convolution, or with unsupported weights or
+group sizes, fails during setup. Incompatible runtime input dtypes and compiled
+execution also raise. The selected path is logged during setup. Ordinary loading
+through specforge.loading and exported models use eager convolution by default;
+this training option is not stored in the model architecture.
+The fused kernel accumulates in FP32 and rounds once, so
+BF16 results need not be bit-identical to eager per-tap rounding. Parameter names
+and checkpoint tensors do not change. Liger selection remains independent.
+
+Execution settings are saved and checked on full resume. Older canonical
+checkpoints without these fields are interpreted using the previous defaults.
+A checkpoint that enabled fused loss but did not record the selected implementations
+cannot prove kernel compatibility and is rejected for full resume.
+Existing recipes keep their previous defaults until explicitly migrated.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,
@@ -243,6 +313,95 @@ path. Neither is copied into the other. A canonical checkpoint supplied through
 imports through `initialization.checkpoint` must explicitly match saved training
 settings in `training.objective_options`; `weights_from` copies weights only.
 
+
+### Extending loss execution
+
+Algorithm implementations live in `specforge/algorithms/objectives/protocols/`:
+one module per algorithm, imported by that package to register the built-in
+protocols. The parent `objectives/` package holds shared contracts, registration,
+loss definitions and execution. New algorithms belong in `protocols/`; they reuse
+the public registration and execution interfaces without adding algorithm branches
+to shared modules.
+
+
+Objectives describe supervision and return `Predictions` carrying a `Projection`
+and an immutable `LossPlan`. The projection exposes ordinary named outputs and,
+optionally, a typed optimization contract. It references existing model parameters
+and must not bypass wrapping, sharding or head transforms.
+
+`LossPlan.terms` declares outputs, coefficients and optional per-term loss, mask,
+weighting and fixed denominator. Omitted settings inherit the prediction/runtime
+defaults. `joint_groups` contains non-overlapping tuples of term indices that
+**may** execute together; it does not select a kernel or combine their denominators.
+Without a matching joint implementation, the executor selects an implementation
+for each term. Removing a joint range preserves the mathematical objective.
+
+Domino declares its existing `lambda * base_CE + (1 - lambda) * final_CE` schedule
+and a `DominoSuffixProjection` contract. Its `domino_suffix_ce` implementation
+uses compact corrections; the reference path computes both outputs normally.
+There is no algorithm-name branch in the executor.
+
+Execution adapters live in `objectives/implementations/`: `registry.py` owns
+registration and selection, `linear_ce.py` implements linear fusion, and `ce.py`
+contains shared CE applicability checks. `token_kernels.py` registers token-loss
+adapters. Shared numerical formulas and kernels live in
+`specforge/losses/fused.py`, with CE/L1 Triton details in
+`specforge/losses/_fused_logits_loss_triton.py`. Both the mathematical loss layer
+and execution adapters depend on this library; it imports neither protocols nor
+registries. The old `specforge.core.fused_loss` and
+`objectives.implementations.fused_loss` paths remain compatibility aliases.
+`DominoSuffixProjection` lives with the other contracts in `projection.py`;
+`implementations/domino_ce.py` contains only its execution adapter.
+Fusion requires one complete block per
+projection unit, additive corrections on a contiguous suffix, and base/final CE
+terms with shared supervision weights. Other layouts use ordinary projection.
+
+Register mathematical formulas with `register_loss`. Register optimized group
+implementations with `register_implementation`, or use `register_token_kernel`
+for a per-token kernel. Implementations declare applicability and return weighted
+numerators by term index, plus any predicted tokens needed for metrics. They do
+not apply coefficients or normalization. Selection uses explicit priority and
+stable names; INFO logs report the first selection and fallback reasons. Kernel execution
+errors propagate rather than silently changing implementation.
+
+Term statistics are combined across chunks before normalization. Independent
+masks/denominators require `sum_means` (normalize each prediction set) or
+`global_microbatch` (normalize each term across ranks during training). The existing
+`tokens` contract and D-PACE require shared term reduction. Differentiable
+denominators and arbitrary accumulation-window normalization are not implemented.
+Existing trainer accumulation and protocol semantics are unchanged.
+
+Reference outputs are reused only within the current evaluation. No logits cache
+is stored on the model. Contextual losses retain whole-set execution; algorithms
+must disable chunking when their projection/auxiliary computation requires it.
+Auxiliary computations remain in their protocols. `LossPlan.auxiliary_terms`
+uses the same `LossTerm` coefficients, masks, position weights and denominators
+as main losses. Its `loss` field must be unset because the callback returns
+already-computed values, named by `output`, in `AuxiliaryLoss.values`.
+Names and shapes must match the declaration. Auxiliary masks participate in
+trimming, and fixed denominators are restored once after chunk reduction.
+
+Reference losses may return `LossOutput(values, statistics)` instead of a tensor.
+Token kernels support the same result; group implementations return statistics
+by main-term index. The executor passes detached statistics to auxiliary callbacks,
+scoped to the current evaluation/chunk rather than stored on the model.
+The callback signature is `(predictions, outputs, teacher, weights, statistics, primitives)`.
+The executor supplies numerical callables through `primitives` (currently `ce_l1`).
+Protocols call them without selecting kernels or reading `execution.fused`.
+Auxiliary fused selections use the same logging, rank agreement and resume checks
+as main losses.
+DSpark reuses the main CE/L1 result's `teacher_l1` for confidence supervision;
+if another main loss supplies no L1, its callback computes the target through the supplied primitive.
+DFlash2 selector and DSpine refinement/alignment are separate named auxiliary terms.
+Existing auxiliary formulas and training coefficients are preserved.
+
+The fused soft CE kernel is new in this PR, rather than migrated from legacy.
+Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`
+on a 128,256-token vocabulary.
+
+Functionality and optimization support are separate: a method can use its ordinary
+projection without supporting linear/Domino suffix fusion. TP, LoRA and quantized heads
+need explicit compatible projection implementations before using these fused paths.
 
 ### Canonical training requirements
 

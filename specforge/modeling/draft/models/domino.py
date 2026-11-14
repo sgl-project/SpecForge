@@ -100,9 +100,7 @@ class DominoDraftModel(DraftPreTrainedModel):
             ),
         )
 
-    def project(
-        self, hidden: Tensor, *, predecessor_ids: Tensor, output_correction_logits=False
-    ):
+    def project_parts(self, hidden: Tensor, *, predecessor_ids: Tensor):
         """Keep GRU context and its suffix in the same projection block."""
         spec = self.config.draft.spec_config
         slots = spec.protocol.num_model_slots
@@ -115,6 +113,15 @@ class DominoDraftModel(DraftPreTrainedModel):
         prefix = previous if spec.block.shift_label else previous[..., 1:, :]
         correction = self.gru_head(states[..., spec.suffix_start :, :], prefix)
         base = self.lm_head(hidden)
+        return base, correction
+
+    def project(
+        self, hidden: Tensor, *, predecessor_ids: Tensor, output_correction_logits=False
+    ):
+        base, correction = self.project_parts(hidden, predecessor_ids=predecessor_ids)
+        spec = self.config.draft.spec_config
+        slots = spec.protocol.num_model_slots
+        shape = (hidden.shape[0], hidden.shape[1] // slots, slots)
         blocks = base.reshape(*shape, base.shape[-1])
         logits = torch.cat(
             (

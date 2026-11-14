@@ -4,12 +4,14 @@ from dataclasses import dataclass
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
-from .base import check_options
+from ..base import check_options
+from ..inputs import prepare_blocks
+from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
+from ..predictions import PredictionBatch
+from ..projection import DominoSuffixProjection
+from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
-from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
-from .predictions import LossTerm, PredictionBatch
-from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
@@ -78,6 +80,15 @@ class DominoObjective:
             blocks,
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
-            terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
+            plan=LossPlan(
+                terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
+                joint_groups=((0, 1),),
+            ),
+            projection=DominoSuffixProjection(
+                model.project,
+                model.project_parts,
+                spec.protocol.num_model_slots,
+                spec.suffix_start,
+            ),
         )
         return PredictionBatch((predictions,))

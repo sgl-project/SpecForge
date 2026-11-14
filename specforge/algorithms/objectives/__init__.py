@@ -1,19 +1,13 @@
 """Canonical objectives, independent of launch topology and file formats."""
 
-from . import (  # noqa: F401
-    dflash,
-    dflash2,
-    dmtp,
-    domino,
-    dspark,
-    dspine,
-    eagle3,
-    mtp,
-    peagle,
-)
+from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
-from .losses import register_loss
-from .predictions import LossTerm, PredictionBatch, Predictions
+from .implementations.registry import register_implementation
+from .implementations.token_kernels import register_token_kernel
+from .losses import LossOutput, register_loss
+from .plan import LossPlan, LossTerm
+from .predictions import AuxiliaryLoss, PredictionBatch, Predictions
+from .projection import DominoSuffixProjection, LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
     WindowStatistic,
@@ -37,11 +31,19 @@ __all__ = [
     "objective_registrations",
     "register_objective",
     "register_loss",
+    "register_implementation",
+    "register_token_kernel",
     "register_protocol",
     "resolve_objective",
     "protocol_registrations",
     "default_protocol",
     "Predictions",
     "PredictionBatch",
+    "AuxiliaryLoss",
+    "LossOutput",
     "LossTerm",
+    "LossPlan",
+    "Projection",
+    "LinearProjection",
+    "DominoSuffixProjection",
 ]

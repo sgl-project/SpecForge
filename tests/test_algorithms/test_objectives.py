@@ -188,7 +188,7 @@ class ObjectiveTest(unittest.TestCase):
             runtime = build_objective_model(model, options={"num_anchors": 2})
             with (
                 patch(
-                    "specforge.algorithms.objectives.domino.prepare_blocks",
+                    "specforge.algorithms.objectives.protocols.domino.prepare_blocks",
                     return_value=blocks,
                 ),
                 patch.object(model, "forward", wraps=model.forward) as forward,

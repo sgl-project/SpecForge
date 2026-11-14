@@ -61,6 +61,31 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_loss_execution_reaches_runtime_and_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = run_config(
+                target,
+                draft_config(),
+                training={
+                    "attention_backend": "eager",
+                    "loss_execution": {
+                        "chunk_size": 2,
+                        "checkpoint": False,
+                        "trim": True,
+                    },
+                },
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertEqual(bundle.model.execution.chunk_size, 2)
+            self.assertFalse(bundle.model.execution.checkpoint)
+            contract = bundle.strategy_kwargs.resume_contract[
+                "canonical_loss_execution"
+            ]
+            self.assertTrue(contract["trim"])
+            self.assertEqual(contract["chunk_size"], 2)
+
     def test_mtp_training_requires_explicit_initialization(self):
         from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
 
@@ -443,6 +468,13 @@ class CanonicalTrainingTest(unittest.TestCase):
             before = {
                 name: tensor.clone() for name, tensor in model.state_dict().items()
             }
+            saved = torch.load(checkpoint / "training_state.pt", weights_only=True)
+            self.assertIn("canonical_loss_execution", saved)
+            self.assertFalse(saved["canonical_use_fused_conv"])
+            # Simulate a checkpoint from before the execution controls existed.
+            saved.pop("canonical_loss_execution")
+            saved.pop("canonical_use_fused_conv")
+            torch.save(saved, checkpoint / "training_state.pt")
             raw = cfg.model_dump()
             raw.update(draft=None, initialization=None, resume=str(checkpoint))
             raw["training"]["max_steps"] = 2
@@ -467,7 +499,10 @@ class CanonicalTrainingTest(unittest.TestCase):
                     for name, tensor in state["draft_state_dict"].items()
                 )
             )
-            changes = [("loss", {"kind": "tv"})]
+            changes = [
+                ("loss", {"kind": "tv"}),
+                ("loss_execution", {"chunk_size": 1}),
+            ]
             if not mtp:
                 changes.append(("weighting", {"kind": "uniform"}))
             for key, changed in changes:

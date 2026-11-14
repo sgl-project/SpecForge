@@ -6,8 +6,8 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from specforge.core import fused_loss
-from specforge.core.fused_loss import fused_ce_l1_loss
+from specforge.algorithms.objectives.implementations import fused_loss
+from specforge.algorithms.objectives.implementations.fused_loss import fused_ce_l1_loss
 
 try:
     import triton  # noqa: F401

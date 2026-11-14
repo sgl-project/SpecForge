@@ -310,6 +310,19 @@ class Trainer:
                 **persisted_contract,
             }
             for key, current in resume_contract.items():
+                if key == "canonical_loss_implementations":
+                    saved = state.get(key)
+                    if saved is None:
+                        if state.get("canonical_loss_execution", {}).get(
+                            "fused", False
+                        ):
+                            raise ValueError(
+                                "checkpoint does not record resolved fused loss implementations"
+                            )
+                        saved = {}
+                    # Compare on real inputs before the first kernel execution.
+                    model.loss_implementations.restore(saved)
+                    continue
                 persisted = state.get(key)
                 persisted_available = key in state
                 comparison_current = current
@@ -338,7 +351,24 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if not persisted_available and key in (
+                    "canonical_loss_execution",
+                    "canonical_use_fused_conv",
+                ):
+                    from dataclasses import asdict
+
+                    from specforge.algorithms.objectives.execution_options import (
+                        LossExecution,
+                    )
+
+                    # Older canonical runs used exactly these execution defaults.
+                    comparison_persisted = (
+                        asdict(LossExecution())
+                        if key == "canonical_loss_execution"
+                        else False
+                    )
+                    persisted_available = True
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

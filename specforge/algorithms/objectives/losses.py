@@ -7,14 +7,35 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from specforge.core import fused_loss
 from specforge.core.position_weights import DPACE_LOSS_TYPES
+from specforge.losses import fused as fused_loss
 
 from .base import check_options
 
 
+@dataclass
+class LossOutput:
+    """Per-position loss values and reusable named statistics.
+
+    Values retain gradients. Statistics are detached by the executor before
+    auxiliary callbacks consume them; they are local to this evaluation/chunk.
+    """
+
+    values: torch.Tensor
+    statistics: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class LossRegistration:
+    """Mathematical loss definition and its data requirements.
+
+    Attributes:
+        compute: Reference per-position loss callable.
+        requires: Capabilities the prediction set must provide.
+        inputs: Additional batch/capture fields needed by the loss.
+        contextual: Whether evaluation needs whole-set statistics and context.
+    """
+
     compute: Callable
     requires: frozenset[str]
     inputs: tuple[str, ...] = ()
@@ -24,8 +45,31 @@ class LossRegistration:
 _LOSSES = {}
 
 
-def register_loss(name, *, requires=("logits", "labels"), inputs=(), contextual=False):
-    """Register a per-token loss; algorithm-specific auxiliary terms stay separate."""
+def register_loss(
+    name,
+    *,
+    requires=("logits", "labels"),
+    inputs=(),
+    contextual=False,
+):
+    """Register a mathematical per-position loss and its reference formula.
+
+    Args:
+        name: Unique loss identifier; "default" is reserved.
+        requires: Prediction capabilities required by this formula.
+        inputs: Additional batch fields required for supervision/capture.
+        contextual: Whether compute also accepts a LossContext and needs
+            whole-set evaluation rather than independent chunks.
+
+    Returns:
+        A decorator preserving the callable. It must accept
+        (logits, labels, teacher, **options), plus context when contextual, and
+        return a tensor aligned with labels or a LossOutput with reusable
+        statistics. Optimized kernels register separately.
+
+    Raises:
+        ValueError: The identifier is reserved or already registered.
+    """
 
     def register(compute):
         if name == "default" or name in _LOSSES:
@@ -54,7 +98,10 @@ def cross_entropy(logits, labels, teacher=None):
     ).reshape(labels.shape)
 
 
-@register_loss("soft_ce", requires=("logits", "labels", "teacher_logits"))
+@register_loss(
+    "soft_ce",
+    requires=("logits", "labels", "teacher_logits"),
+)
 def soft_cross_entropy(logits, labels, teacher):
     return -(teacher.float().softmax(-1) * logits.float().log_softmax(-1)).sum(-1)
 
@@ -62,10 +109,15 @@ def soft_cross_entropy(logits, labels, teacher):
 @register_loss("ce_l1", requires=("logits", "labels", "teacher_logits"))
 def ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
     terms = fused_loss.ce_l1_loss(logits, labels, teacher_logits=teacher)
-    return ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1
+    return LossOutput(
+        ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1,
+        {"teacher_l1": terms.teacher_l1},
+    )
 
 
-def _distillation(compute):
+def distillation_loss(compute):
+    """Adapt a logits/teacher formula to the common token-loss signature."""
+
     def loss(logits, labels, teacher, **options):
         return compute(logits, teacher, **options)
 
@@ -82,7 +134,7 @@ for _name, _compute in {
     "lk": fused_loss.lk_hybrid_loss,
 }.items():
     register_loss(_name, requires=("logits", "labels", "teacher_logits"))(
-        _distillation(_compute)
+        distillation_loss(_compute)
     )
 
 
@@ -93,15 +145,24 @@ class LossContext:
     denominator: torch.Tensor | None = None
 
 
-def _lk(mode):
+def lk_loss(mode, *, ce_compute=None):
+    """Build an LK formula using the supplied CE primitive or its reference."""
+
     def compute(
         logits, labels, teacher, *, context, target="labels", kl_scale=1.0, kl_decay=1.0
     ):
-        log_q = logits.float().log_softmax(-1)
         if target == "labels":
-            ce = -log_q.gather(-1, labels[..., None]).squeeze(-1)
+            ce = (
+                ce_compute(logits, labels)
+                if ce_compute is not None
+                else -logits.float()
+                .log_softmax(-1)
+                .gather(-1, labels[..., None])
+                .squeeze(-1)
+            )
             acceptance = (-ce).exp()
         else:
+            log_q = logits.float().log_softmax(-1)
             p = teacher.float().softmax(-1)
             ce = -(p * log_q).sum(-1)
             if context.teacher_mass is not None:
@@ -130,7 +191,7 @@ def _lk(mode):
 
 
 for _mode in ("alpha", "tv", "lambda"):
-    register_loss(f"lk_{_mode}", contextual=True)(_lk(_mode))
+    register_loss(f"lk_{_mode}", contextual=True)(lk_loss(_mode))
 
 
 def _accepted_options(compute):
@@ -214,14 +275,33 @@ class TokenLoss:
         return "teacher_logits" in self.requires
 
     def __call__(self, logits, labels, *, teacher=None, default=None, context=None):
+        """Return per-position reference values, preserving the tensor-only API."""
         if self.kind == "default" and default is not None:
             return default
+        return self.evaluate(logits, labels, teacher=teacher, context=context).values
+
+    def evaluate(self, logits, labels, *, teacher=None, context=None):
+        """Evaluate the mathematical reference loss without weighting or reduction.
+
+        Args:
+            logits: Draft scores with vocabulary in the final dimension.
+            labels: Token IDs aligned with the scores' leading dimensions.
+            teacher: Optional aligned teacher logits required by distillation.
+            context: Optional supervision/normalization context for contextual losses.
+
+        Returns:
+            LossOutput containing per-position values and optional statistics.
+
+        Raises:
+            ValueError: Distillation teacher logits are absent or misaligned.
+        """
         if self.requires_teacher and (teacher is None or teacher.shape != logits.shape):
             raise ValueError("distillation requires aligned teacher and draft logits")
         kwargs = {"context": context} if self.registration.contextual else {}
-        return self.registration.compute(
+        result = self.registration.compute(
             logits, labels, teacher, **kwargs, **self.options
         )
+        return result if isinstance(result, LossOutput) else LossOutput(result)
 
 
 @dataclass(frozen=True)

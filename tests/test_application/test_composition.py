@@ -53,6 +53,28 @@ def _payload(
 
 
 class ApplicationCompositionTest(unittest.TestCase):
+    def test_legacy_execution_options_are_rejected_with_or_without_resume(self):
+        for section, key, value in (
+            ("training", "loss_execution", {"chunk_size": 7}),
+            ("model", "use_fused_conv", True),
+        ):
+            for resume in (False, True):
+                with self.subTest(key=key, resume=resume), TemporaryDirectory() as temp:
+                    payload = _payload("dflash", mode="offline")
+                    payload[section][key] = value
+                    if resume:
+                        payload["training"]["resume_from"] = temp
+                        config = Config.model_validate(payload)
+                        with self.assertRaisesRegex(
+                            ValueError, "canonical draft loading"
+                        ):
+                            resolve_run(config)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "canonical draft loading"
+                        ):
+                            Config.model_validate(payload)
+
     def test_resolve_run_pairs_config_with_one_registration(self):
         config = Config.model_validate(_payload())
 

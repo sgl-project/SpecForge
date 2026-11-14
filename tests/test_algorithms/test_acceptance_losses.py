@@ -23,6 +23,7 @@ from specforge.algorithms.objectives.predictions import (
     Predictions,
     Teacher,
 )
+from specforge.algorithms.objectives.projection import Projection
 from specforge.core.lk_loss import compute_lk_loss
 from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objective_legacy_parity import (
@@ -121,7 +122,7 @@ class AcceptanceLossTest(unittest.TestCase):
         mask = torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]])
         prediction = Predictions(
             hidden=logits,
-            projector=lambda x: {"logits": x},
+            projection=Projection(lambda x: {"logits": x}),
             mask=mask,
             positions=torch.arange(3).expand(3, 3),
             labels=labels,
@@ -300,7 +301,7 @@ class AcceptanceLossTest(unittest.TestCase):
         teacher[0, 0, 0] = teacher[0, 1, 3] = teacher[0, 2, 1] = 5.0
         prediction = Predictions(
             hidden=torch.zeros(1, 3, 3),
-            projector=lambda hidden: {"logits": hidden},
+            projection=Projection(lambda hidden: {"logits": hidden}),
             mask=torch.ones(1, 3),
             positions=torch.arange(3)[None],
             chain_ids=torch.zeros(1, 3, dtype=torch.long),
@@ -322,7 +323,7 @@ class AcceptanceLossTest(unittest.TestCase):
         torch.manual_seed(13)
         prediction = Predictions(
             hidden=torch.randn(3, 3, 5),
-            projector=lambda x: {"logits": x},
+            projection=Projection(lambda x: {"logits": x}),
             mask=torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]]),
             positions=torch.arange(3).expand(3, 3),
             labels=torch.arange(9).reshape(3, 3) % 5,
