@@ -12,6 +12,11 @@ data:
   cache_dir: ./cache
 
 training:
+  loss:
+    fused: true
+  weighting:
+    kind: exponential
+    gamma: 7.0
   strategy: domino
   num_epochs: 6
   batch_size: 2
@@ -20,7 +25,6 @@ training:
   max_grad_norm: 1.0
   attention_backend: flex_attention
   num_anchors: 256
-  loss_decay_gamma: 7.0
   lambda_base_start: 1.0
   lambda_base_decay_ratio: 1.0
   save_interval: 2000

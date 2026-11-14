@@ -37,6 +37,17 @@ data:
   cache_dir: cache/qwen3.8-27b-dflash2
 
 training:
+  loss:
+    fused: true
+    scheduling:
+      chunk_size: 128
+      checkpoint: false
+    terms:
+      selector:
+        coefficient: 1.0
+  weighting:
+    kind: exponential
+    gamma: 7.0
   # DFlash2 shares the DFlash capture and data contract; the draft JSON turns
   # on the local convolutions and the candidate-selector objective.
   strategy: dflash
@@ -54,13 +65,8 @@ training:
   max_grad_norm: 1.0
   attention_backend: flex_attention
   num_anchors: 512
-  loss_decay_gamma: 7.0
-  objective_chunk_blocks: 128
   # Measured without objective checkpointing: keep each chunk's logits for
   # backward instead of recomputing the 248k-vocabulary projection.
-  objective_checkpointing: false
-  loss_type: dflash
-  dflash2_selector_loss_alpha: 1.0
   dflash2_selector_stop_gradient: false
   save_interval: 500
   log_interval: 10

@@ -30,7 +30,7 @@ OFFLINE_EAGLE3 = {
 
 
 class UnifiedFeatureReachabilityTest(unittest.TestCase):
-    def test_all_example_configs_validate_through_the_typed_entry(self):
+    def test_all_example_configs_validate_without_remote_target_downloads(self):
         paths = sorted(
             path
             for path in EXAMPLE_CONFIG_DIR.rglob("*.yaml")
@@ -40,16 +40,18 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
 
         for path in paths:
             with self.subTest(config=path.name):
-                resolve_run(Config.from_file(str(path)))
+                config = Config.from_file(str(path))
+                # Canonical planning also needs target metadata; local-target
+                # composition is covered in test_canonical_training.
+                if config.draft is None and config.initialization is None:
+                    resolve_run(config)
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(
             {
                 **OFFLINE_EAGLE3,
                 "training": {
-                    "trim_loss_positions": True,
-                    "compact_teacher": True,
-                    "compact_teacher_chunk_size": 2048,
+                    "loss": {"scheduling": {"trim": True, "teacher_chunk_size": 2048}},
                 },
             }
         )
@@ -70,14 +72,14 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 **OFFLINE_EAGLE3,
                 "training": {
                     "strategy": "dflash",
-                    "trim_loss_positions": True,
+                    "loss": {"scheduling": {"trim": True}},
                 },
             }
         )
 
         with self.assertRaisesRegex(
             ValueError,
-            "algorithm 'dflash' does not support training.trim_loss_positions",
+            "algorithm 'dflash' does not support training.loss.scheduling.trim",
         ):
             resolve_run(cfg)
 
@@ -127,7 +129,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 "target_backend": "sglang",
             },
             "data": {"train_data_path": "train.jsonl"},
-            "training": {"compact_teacher": True, "max_steps": 1},
+            "training": {
+                "loss": {"scheduling": {"teacher_chunk_size": 32768}},
+                "max_steps": 1,
+            },
             "deployment": {
                 "mode": "disaggregated",
                 "disaggregated": {
@@ -151,15 +156,13 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                         **OFFLINE_EAGLE3,
                         "training": {
                             "strategy": "dflash",
-                            "compact_teacher": True,
+                            "loss": {"scheduling": {"teacher_chunk_size": 32768}},
                         },
                     }
                 )
             )
 
-        with self.assertRaisesRegex(
-            ValidationError, "requires training.compact_teacher=true"
-        ):
+        with self.assertRaisesRegex(ValidationError, "compact_teacher_chunk_size"):
             Config.model_validate(
                 {
                     **OFFLINE_EAGLE3,

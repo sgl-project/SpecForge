@@ -1,6 +1,5 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
-import logging
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
@@ -281,60 +280,21 @@ def resolve_run(cfg, *, target_config=None):
         validate_target_initialization(draft, target, cfg.initialization.from_target)
     # New objectives have their own options. Never silently consume legacy
     # algorithm switches with a different meaning on the canonical path.
-    optimization_options = {
-        "objective_chunk_blocks",
-        "objective_checkpointing",
-        "fused_logits_loss",
-        "mtp_objective_chunk_size",
-        "trim_loss_positions",
-    }
-    legacy_options = optimization_options | {
-        "loss_type",
-        "lk_loss_type",
-        "dpace_alpha",
-        "kl_scale",
-        "kl_decay",
+    from specforge.config.schema import TrainingConfig
+
+    defaults = TrainingConfig()
+    legacy_options = {
         "ttt_length",
         "num_anchors",
-        "loss_decay_gamma",
-        "dflash2_selector_loss_alpha",
         "dflash2_selector_warmup_ratio",
         "dflash2_selector_ramp_ratio",
         "dflash2_selector_stop_gradient",
         "lambda_base_start",
         "lambda_base_decay_ratio",
-        "dspark_ce_loss_alpha",
-        "dspark_l1_loss_alpha",
-        "dspark_confidence_head_alpha",
         "num_depths",
         "down_sample_ratio",
         "down_sample_ratio_min",
     }
-    from specforge.config.schema import TrainingConfig
-
-    defaults = TrainingConfig()
-    if draft.architecture == "MTPDraftModel":
-        legacy_options.remove("mtp_objective_chunk_size")
-        optimization_options.discard("mtp_objective_chunk_size")
-        chunk = cfg.training.mtp_objective_chunk_size
-        if chunk != defaults.mtp_objective_chunk_size:
-            options = dict(cfg.training.objective_options)
-            if (
-                "objective_chunk_size" in options
-                and options["objective_chunk_size"] != chunk
-            ):
-                raise ValueError("conflicting MTP objective_chunk_size settings")
-            options["objective_chunk_size"] = chunk
-            cfg = cfg.model_copy(
-                update={
-                    "training": cfg.training.model_copy(
-                        update={
-                            "objective_options": options,
-                            "mtp_objective_chunk_size": defaults.mtp_objective_chunk_size,
-                        }
-                    )
-                }
-            )
     present = {
         name
         for name in legacy_options
@@ -342,15 +302,7 @@ def resolve_run(cfg, *, target_config=None):
     }
     if present:
         raise ValueError(
-            f"canonical training uses training.loss, training.weighting and "
-            f"training.objective_options, not {sorted(present)}"
-        )
-    ignored = cfg.training.model_fields_set & optimization_options
-    if ignored:
-        logging.getLogger(__name__).warning(
-            "Canonical objectives do not use legacy optimization options %s; "
-            "their default values do not enable chunking, checkpointing or fused loss",
-            sorted(ignored),
+            f"canonical training uses training.objective_options, not {sorted(present)}"
         )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
     _validate_imported_objective(cfg, resolved)

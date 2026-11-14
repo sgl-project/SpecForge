@@ -1000,7 +1000,9 @@ class InitializationConfig(StrictConfigModel):
 class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
-    loss: dict = Field(default_factory=dict)
+    loss: dict = Field(
+        default_factory=dict
+    )  # Named terms, shared fusion switch and scheduling.
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
@@ -1012,8 +1014,6 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
-    #: Joint logits loss; independent of objective checkpointing.
-    fused_logits_loss: bool = True
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -1031,35 +1031,8 @@ class TrainingConfig(StrictConfigModel):
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
-    #: Acceptance-aware token objective. DFlash-family hard targets make
-    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
-    lk_loss_type: Optional[Literal["lambda", "alpha", "tv"]] = None
-    kl_scale: float = 1.0
-    kl_decay: float = 1.0
-    #: Compute the teacher target_p, draft logits and loss only at supervised
-    #: (loss-masked) positions instead of over the full sequence. Mathematically
-    #: equivalent (the mean denominator is rescaled) and saves memory/compute on
-    #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
-    #: an lk_loss objective is used.
-    trim_loss_positions: bool = False
-    #: MTP token positions per lm_head + CE chunk (0 disables chunking).
-    mtp_objective_chunk_size: int = Field(default=4096, ge=0)
     #: DFlash-family objective/model knobs.
     num_anchors: int = Field(default=512, gt=0)
-    loss_decay_gamma: Optional[float] = None
-    #: Anchor blocks per objective slice; 0 treats the whole objective as one chunk.
-    objective_chunk_blocks: int = Field(default=128, ge=0)
-    #: Recompute each objective chunk during backward, independently of its backend.
-    objective_checkpointing: bool = True
-    loss_type: Literal[
-        "dflash",
-        "dpace",
-        "dpace-cumulative-confidence-only",
-        "dpace-continuation-value-only",
-    ] = "dflash"
-    dpace_alpha: float = 0.5
-    #: Weight of the top-k path-selector objective for DFlash2 drafts.
-    dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
     dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     #: Fraction of optimizer steps used to ramp the selector weight to its target.
@@ -1076,9 +1049,6 @@ class TrainingConfig(StrictConfigModel):
     dflash_teacher_metrics: bool = True
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
-    dspark_ce_loss_alpha: float = 0.1
-    dspark_l1_loss_alpha: float = 0.9
-    dspark_confidence_head_alpha: float = 1.0
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
@@ -1090,10 +1060,6 @@ class TrainingConfig(StrictConfigModel):
     log_interval: int = Field(default=50, gt=0)
     #: CheckpointManager rotation: keep the newest N checkpoints (0 = keep all).
     max_checkpoints: int = Field(default=0, ge=0)
-    #: Offline EAGLE3 teacher projection without materializing full-vocab fp32
-    #: logits. Exact, but trades additional head passes for lower peak memory.
-    compact_teacher: bool = False
-    compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
     #: ``all`` is an offline colocated run. Online runs launch producer and
@@ -1110,8 +1076,6 @@ class TrainingConfig(StrictConfigModel):
         unknown = self.loss.keys() - {"terms", "fused", "scheduling"}
         if unknown:
             raise ValueError(f"Unknown training.loss fields: {sorted(unknown)}")
-        if not 0.0 <= self.dpace_alpha <= 1.0:
-            raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
             raise ValueError("training.down_sample_ratio must be in (0, 1]")
         if not 0.0 < self.down_sample_ratio_min <= self.down_sample_ratio:
@@ -1241,12 +1205,10 @@ class Config(StrictConfigModel):
             self.training.objective
             or self.training.objective_options
             or self.training.frozen
-            or self.training.loss
             or self.model.use_fused_conv
-            or self.training.weighting is not None
         ):
             raise ValueError(
-                "objective/options/frozen/loss/weighting/use_fused_conv "
+                "objective/options/frozen/use_fused_conv "
                 "require the canonical draft loading path"
             )
 
@@ -1354,14 +1316,6 @@ class Config(StrictConfigModel):
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
                 "data.eval_hidden_states_path requires an offline training data source"
-            )
-        if (
-            not self.training.compact_teacher
-            and self.training.compact_teacher_chunk_size is not None
-        ):
-            raise ValueError(
-                "training.compact_teacher_chunk_size requires "
-                "training.compact_teacher=true"
             )
         if (
             mode == "online"

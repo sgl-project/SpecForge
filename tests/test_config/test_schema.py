@@ -547,64 +547,53 @@ class ConfigSchemaTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "dspark_objective_mode"):
             Config.model_validate(payload)
 
-    def test_objective_chunk_blocks_is_shared_and_typed(self):
-        for strategy in ("dflash", "domino", "dspark"):
-            payload = _online_payload(strategy)
-            payload["training"]["objective_chunk_blocks"] = 0
-            payload["training"]["objective_checkpointing"] = False
-            with self.subTest(strategy=strategy):
-                config = Config.model_validate(payload)
-                self.assertEqual(config.training.objective_chunk_blocks, 0)
-                self.assertFalse(config.training.objective_checkpointing)
+    def test_loss_scheduling_reaches_objectives(self):
+        from specforge.algorithms.objectives.registry import resolve_objective
 
-        payload = _online_payload("dflash")
-        payload["training"]["objective_chunk_blocks"] = -1
-        with self.assertRaisesRegex(ValidationError, "objective_chunk_blocks"):
-            Config.model_validate(payload)
+        for architecture in (
+            "DFlashDraftModel",
+            "DominoDraftModel",
+            "DSparkDraftModel",
+            "MTPDraftModel",
+        ):
+            for chunk_size in (0, 17):
+                with self.subTest(architecture=architecture, chunk_size=chunk_size):
+                    payload = _online_payload("dflash")
+                    payload["training"]["loss"] = {
+                        "scheduling": {"chunk_size": chunk_size, "checkpoint": False}
+                    }
+                    config = Config.model_validate(payload)
+                    settings = resolve_objective(
+                        architecture, loss=config.training.loss
+                    )
+                    self.assertEqual(settings.execution.chunk_size, chunk_size)
+                    self.assertFalse(settings.execution.checkpoint)
+        with self.assertRaises(ValueError):
+            resolve_objective(
+                "DFlashDraftModel", loss={"scheduling": {"chunk_size": -1}}
+            )
 
-        payload = _online_payload("dspark")
-        payload["training"]["dspark_objective_chunk_blocks"] = 1
-        with self.assertRaisesRegex(ValidationError, "dspark_objective_chunk_blocks"):
-            Config.model_validate(payload)
-
-    def test_mtp_objective_chunk_size_yaml_reaches_model(self):
-        from specforge.algorithms.objectives.protocols.mtp import MTPObjective
-
-        for chunk_size in (None, 0, 17):
-            with self.subTest(chunk_size=chunk_size):
-                payload = _online_payload("mtp")
-                if chunk_size is not None:
-                    payload["training"]["mtp_objective_chunk_size"] = chunk_size
-                path = _write(payload, ".yaml")
-                try:
-                    config = load_config(path)
-                finally:
-                    os.unlink(path)
-                # Construction does not run the draft: this tests YAML ->
-                # validated config -> provider -> objective without weights.
-                resolved = resolve_run(config)
-                objective = MTPObjective(**resolved.config.training.objective_options)
-                expected = 4096 if chunk_size is None else chunk_size
-                self.assertEqual(config.training.mtp_objective_chunk_size, expected)
-                self.assertEqual(objective.objective_chunk_size, expected)
-
-        for invalid in (-1, 1.5):
-            payload = _online_payload("mtp")
-            payload["training"]["mtp_objective_chunk_size"] = invalid
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(
-                    ValidationError, "mtp_objective_chunk_size"
-                ):
-                    Config.model_validate(payload)
+    def test_legacy_loss_fields_are_rejected(self):
+        for name, value in (
+            ("loss_execution", {}),
+            ("objective_chunk_blocks", 128),
+            ("fused_logits_loss", True),
+            ("lk_loss_type", "tv"),
+            ("dspark_ce_loss_alpha", 0.1),
+            ("mtp_objective_chunk_size", 4096),
+        ):
+            payload = _online_payload("dflash")
+            payload["training"][name] = value
+            with self.subTest(name=name), self.assertRaisesRegex(ValidationError, name):
+                Config.model_validate(payload)
 
     def test_dflash2_selector_objective_settings_are_bounded(self):
         payload = _online_payload("dflash")
-        payload["training"]["dflash2_selector_loss_alpha"] = 0.25
+        payload["training"]["loss"] = {"terms": {"selector": {"coefficient": 0.25}}}
         payload["training"]["dflash2_selector_warmup_ratio"] = 0.1
         payload["training"]["dflash2_selector_ramp_ratio"] = 0.2
         payload["training"]["dflash2_selector_stop_gradient"] = True
         config = Config.model_validate(payload)
-        self.assertEqual(config.training.dflash2_selector_loss_alpha, 0.25)
         self.assertEqual(config.training.dflash2_selector_warmup_ratio, 0.1)
         self.assertEqual(config.training.dflash2_selector_ramp_ratio, 0.2)
         self.assertTrue(config.training.dflash2_selector_stop_gradient)
@@ -613,7 +602,6 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertFalse(default_config.training.dflash2_selector_stop_gradient)
 
         for field, invalid in (
-            ("dflash2_selector_loss_alpha", -0.1),
             ("dflash2_selector_warmup_ratio", -0.1),
             ("dflash2_selector_warmup_ratio", 1.1),
             ("dflash2_selector_ramp_ratio", -0.1),
@@ -678,22 +666,18 @@ class ConfigSchemaTest(unittest.TestCase):
                     mock.patch(
                         "specforge.algorithms.model_providers."
                         "_build_dflash_family_model",
-                        side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                        side_effect=lambda _cfg, _draft, _tok, factory, _settings: factory(
+                            {}
+                        ),
                     ),
                 ):
                     build_training_model(config, None, None, None, None)
                 self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
 
-    def test_fused_logits_loss_reaches_dflash_family(self):
+    def test_loss_fused_reaches_dflash_family(self):
         from unittest import mock
 
         from specforge.algorithms import model_providers
-
-        payload = _online_payload("dflash")
-        self.assertTrue(Config.model_validate(payload).training.fused_logits_loss)
-        payload["training"]["fused_logits_loss"] = None
-        with self.assertRaisesRegex(ValidationError, "fused_logits_loss"):
-            Config.model_validate(payload)
 
         for strategy, model_name in (
             ("dflash", "OnlineDFlashModel"),
@@ -704,7 +688,26 @@ class ConfigSchemaTest(unittest.TestCase):
             for enabled in (False, True):
                 with self.subTest(strategy=strategy, enabled=enabled):
                     payload = _online_payload(strategy)
-                    payload["training"]["fused_logits_loss"] = enabled
+                    terms = {}
+                    expected = {}
+                    if strategy == "dspark":
+                        terms = {
+                            "token": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
+                            "confidence": {"coefficient": 0.2},
+                        }
+                        expected = {
+                            "dspark_ce_loss_alpha": 0.3,
+                            "dspark_l1_loss_alpha": 0.7,
+                            "dspark_confidence_head_alpha": 0.2,
+                        }
+                    elif strategy == "dspine":
+                        terms = {
+                            name: {"options": {"ce_weight": 0.3, "l1_weight": 0.7}}
+                            for name in ("token", "refinement")
+                        }
+                        terms["alignment"] = {"coefficient": 0.2}
+                        expected = {"ce_weight": 0.3, "alignment_weight": 0.2}
+                    payload["training"]["loss"] = {"fused": enabled, "terms": terms}
                     config = Config.model_validate(payload)
                     model_module = (
                         "specforge.algorithms.dspine.model"
@@ -716,7 +719,9 @@ class ConfigSchemaTest(unittest.TestCase):
                         mock.patch.object(
                             model_providers,
                             "_build_dflash_family_model",
-                            side_effect=lambda _cfg, _draft, _tok, factory: factory({}),
+                            side_effect=lambda _cfg, _draft, _tok, factory, _settings: factory(
+                                {}
+                            ),
                         ),
                     ):
                         getattr(model_providers, f"build_{strategy}_model")(
@@ -725,14 +730,16 @@ class ConfigSchemaTest(unittest.TestCase):
                     self.assertIs(
                         model_cls.call_args.kwargs["fused_logits_loss"], enabled
                     )
+                    for name, value in expected.items():
+                        self.assertEqual(model_cls.call_args.kwargs[name], value)
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
-        payload["training"]["lk_loss_type"] = "tv"
+        payload["training"]["loss"] = {"terms": {"token": {"kind": "lk_tv"}}}
 
         config = Config.model_validate(payload)
 
-        self.assertEqual(config.training.lk_loss_type, "tv")
+        self.assertEqual(config.training.loss["terms"]["token"]["kind"], "lk_tv")
 
     def test_unknown_fields_and_unsupported_modes_fail_early(self):
         with self.assertRaises(ValidationError):
