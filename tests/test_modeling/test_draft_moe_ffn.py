@@ -231,7 +231,7 @@ class MoEFFNTest(unittest.TestCase):
         self.assertEqual(sorted(plain.state_dict()), ["weight"])
 
     def test_empty_input_runs_forward_and_backward_with_each_kernel(self):
-        """Zero tokens: a [0, H] update, [0, K] routing, and zero gradients on every weight."""
+        """Zero tokens: a [0, H] update, [0, ...] routing, and zero gradients on every weight."""
         for device in ("cpu", "cuda") if CUDA else ("cpu",):
             for kernel in sorted(EXPERT_KERNELS):
                 with self.subTest(device=device, kernel=kernel):
@@ -241,7 +241,8 @@ class MoEFFNTest(unittest.TestCase):
                     output = module(x)
                     self.assertEqual(tuple(output.update.shape), (0, H))
                     self.assertEqual(tuple(output.routing.expert_ids.shape), (0, 2))
-                    output.update.sum().backward()
+                    self.assertEqual(tuple(output.routing.scores.shape), (0, 4))
+                    (output.update.sum() + output.routing.scores.sum()).backward()
                     self.assertEqual(tuple(x.grad.shape), (0, H))
                     for name, parameter in module.named_parameters():
                         self.assertIsNotNone(parameter.grad, name)

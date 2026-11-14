@@ -302,6 +302,11 @@ class CanonicalDSparkTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(routing.expert_ids, expected.expert_routing[0].expert_ids)
         )
+        self.assertEqual(tuple(routing.scores.shape), (16, 4))
+        self.assertTrue(routing.scores.requires_grad)
+        torch.testing.assert_close(
+            routing.scores, expected.expert_routing[0].scores, rtol=0, atol=0
+        )
         dense = build_draft_model(model_config())
         self.assertIsNone(dense(*args, predecessor_ids=previous).expert_routing)
         others = dict(checkpointed.named_parameters())
