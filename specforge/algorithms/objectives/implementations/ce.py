@@ -5,6 +5,8 @@ import torch
 
 def projection_ce_support(request, group):
     """Return None or a rejection reason for the requested fused CE group."""
+    if any(request.terms[i].reduction != "positions" for i in group):
+        return "projection fusion requires per-position loss terms"
     p = request.predictions
     if not p.hidden.is_cuda or p.hidden.dtype not in (
         torch.float16,
@@ -16,8 +18,10 @@ def projection_ce_support(request, group):
         return "projection does not permit chunked/recomputed fusion"
     if request.materialized:
         return "projection is already materialized"
-    if p.auxiliary is not None:
-        return "auxiliary computation consumes full projection outputs"
+    if request.requested_outputs:
+        return "requires a kernel providing the requested extra outputs"
+    if request.unreduced:
+        return "requires per-position results"
     if p.vocab_mask is not None:
         return "vocabulary mapping requires a different projection implementation"
     if any(

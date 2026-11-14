@@ -8,7 +8,7 @@ from ..base import check_options
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import AuxiliaryLoss, PredictionBatch
+from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
 
@@ -104,34 +104,40 @@ class DFlash2Objective:
         )
         scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
 
-        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
-            labels = predictions.labels
-            terms = primitives["ce_l1"](
-                projected["logits"],
+        def compute(calc):
+            calc.run((0,))
+            predictions, labels = calc.predictions, calc.labels
+            terms = calc.evaluate(
+                "candidates",
+                TokenLoss(kind="ce"),
+                calc.outputs()["logits"],
                 labels,
                 top_k=model.config.draft.spec_config.selector_top_k,
             )
-            unary, hidden = terms.topk_values, predictions.hidden
+            ids = terms.statistics["topk_ids"]
+            unary, hidden = terms.statistics["topk_values"], predictions.hidden
             if self.selector_stop_gradient:
                 unary, hidden = unary.detach(), hidden.detach()
             scores = model.candidate_selector.score_candidates(
-                candidate_ids=terms.topk_ids,
+                candidate_ids=ids,
                 unary_logits=unary,
                 hidden_states=hidden,
-                predecessor_ids=predictions.auxiliary_inputs["predecessors"],
+                predecessor_ids=predictions.context_inputs["predecessors"],
             )
-            covered = terms.topk_ids == labels[..., None]
-            selector = primitives["ce_l1"](
-                scores, covered.long().argmax(-1)
-            ).cross_entropy * covered.any(-1)
-            return AuxiliaryLoss({"selector": selector})
+            covered = ids == labels[..., None]
+            selector = calc.evaluate(
+                "selector", TokenLoss("ce"), scores, covered.long().argmax(-1)
+            ).values * covered.any(-1)
+            calc.add(1, selector)
 
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
-            auxiliary=auxiliary,
-            plan=LossPlan(auxiliary_terms=(LossTerm("selector", scale),)),
-            auxiliary_inputs={"predecessors": blocks.predecessors},
+            compute=compute,
+            plan=LossPlan(
+                (LossTerm(), LossTerm("selector", scale, TokenLoss("value")))
+            ),
+            context_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))

@@ -2,11 +2,16 @@
 
 from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
-from .implementations.registry import register_implementation
+from .computation import LossComputation
+from .implementations.registry import (
+    compute_loss,
+    implementation_registrations,
+    register_implementation,
+)
 from .implementations.token_kernels import register_token_kernel
-from .losses import LossOutput, register_loss
+from .losses import LossOutput, loss_registrations, register_loss
 from .plan import LossPlan, LossTerm
-from .predictions import AuxiliaryLoss, PredictionBatch, Predictions
+from .predictions import PredictionBatch, Predictions
 from .projection import DominoSuffixProjection, LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
@@ -31,7 +36,10 @@ __all__ = [
     "objective_registrations",
     "register_objective",
     "register_loss",
+    "loss_registrations",
     "register_implementation",
+    "compute_loss",
+    "implementation_registrations",
     "register_token_kernel",
     "register_protocol",
     "resolve_objective",
@@ -39,8 +47,8 @@ __all__ = [
     "default_protocol",
     "Predictions",
     "PredictionBatch",
-    "AuxiliaryLoss",
     "LossOutput",
+    "LossComputation",
     "LossTerm",
     "LossPlan",
     "Projection",

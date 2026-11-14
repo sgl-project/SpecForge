@@ -295,7 +295,7 @@ class LossExecutionTest(unittest.TestCase):
             for fused in (False, True):
                 with self.subTest(architecture=architecture, fused=fused):
                     runtime.execution = LossExecution(
-                        chunk_size=1, checkpoint=True, fused=fused
+                        chunk_size=1, checkpoint=True, fused=fused is True
                     )
                     runtime.zero_grad(set_to_none=True)
                     torch.manual_seed(31)
@@ -324,8 +324,10 @@ class LossExecutionTest(unittest.TestCase):
                     else:
                         if architecture in ("DFlash2DraftModel", "DSpineDraftModel"):
                             self.assertEqual(
-                                runtime.loss_implementations.names["0:aux:ce_l1"],
-                                "fused_ce_l1",
+                                runtime.loss_implementations.names[
+                                    "0/compute/candidates:0"
+                                ],
+                                "token_ce",
                             )
                         torch.testing.assert_close(
                             actual, expected, rtol=8e-4, atol=3e-5
@@ -334,7 +336,7 @@ class LossExecutionTest(unittest.TestCase):
                             self.assertGreater(kernel.call_count, 0)
                         if architecture == "DFlash2DraftModel":
                             saved = dict(runtime.loss_implementations.names)
-                            saved["0:aux:ce_l1"] = "reference"
+                            saved["0/compute/candidates:0"] = "reference"
                             runtime.loss_implementations.restore(saved)
                             with self.assertRaisesRegex(
                                 ValueError, "changed on resume"
@@ -362,21 +364,31 @@ class LossExecutionTest(unittest.TestCase):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0.02, atol=2e-8)
         self.assertEqual(torch.count_nonzero(actual_grad[mask == 0]), 0)
 
-    def test_fused_loss_rejects_cpu(self):
+    def test_fused_loss_uses_reference_on_cpu(self):
         config, runtime = build_runtime("DSparkDraftModel", options={"num_anchors": 2})
         runtime.execution = LossExecution(fused=True)
-        with self.assertRaisesRegex(ValueError, "requires CUDA"):
-            runtime(training_batch(config), step=0, total_steps=1)
+        result = runtime(training_batch(config), step=0, total_steps=1)
+        self.assertTrue(torch.isfinite(result.loss))
+        self.assertEqual(
+            set(runtime.loss_implementations.names.values()), {"reference", "value"}
+        )
 
     def test_checkpoint_false_does_not_recompute(self):
         from torch.utils.checkpoint import checkpoint
 
         config, runtime = build_runtime("MTPDraftModel")
-        for enabled in (False, True):
-            runtime.execution = LossExecution(chunk_size=1, checkpoint=enabled)
-            with patch("torch.utils.checkpoint.checkpoint", wraps=checkpoint) as calls:
-                runtime(training_batch(config), step=0, total_steps=1).loss.backward()
-            self.assertEqual(calls.called, enabled)
+        for chunk_size in (0, 1):
+            for enabled in (False, True):
+                runtime.execution = LossExecution(
+                    chunk_size=chunk_size, checkpoint=enabled
+                )
+                with patch(
+                    "torch.utils.checkpoint.checkpoint", wraps=checkpoint
+                ) as calls:
+                    runtime(
+                        training_batch(config), step=0, total_steps=1
+                    ).loss.backward()
+                self.assertEqual(calls.called, enabled)
 
     def test_fused_conv_rejects_invalid_configuration(self):
         from specforge.config.draft.conv import GroupedCausalConvSpec
@@ -469,7 +481,15 @@ class LossExecutionTest(unittest.TestCase):
             run(restored)
         # An unsupported loss contract is a visible reference fallback.
         with (
-            patch.dict(_IMPLEMENTATIONS, {}, clear=True),
+            patch.dict(
+                _IMPLEMENTATIONS,
+                {
+                    k: v
+                    for k, v in _IMPLEMENTATIONS.items()
+                    if v.category == "reference"
+                },
+                clear=True,
+            ),
             self.assertLogs(
                 "specforge.algorithms.objectives.implementations.registry", level="INFO"
             ) as logs,
