@@ -1,27 +1,10 @@
-"""Named loss terms and joint execution, resolved before training starts."""
+"""Named mathematical losses and a shared optimization policy."""
 
 import math
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 
 from .execution_options import LossExecution
 from .losses import TokenLoss
-
-
-@dataclass(frozen=True)
-class LossMode:
-    """Implementation choice for one term or group, independent of scheduling."""
-
-    fused: bool = False
-    impl: str | None = None
-
-    def __post_init__(self):
-        if type(self.fused) is not bool:
-            raise ValueError("fused must be boolean")
-        if self.impl is not None:
-            if not isinstance(self.impl, str) or not self.impl:
-                raise ValueError("impl must be a nonempty name")
-            if self.fused:
-                raise ValueError("impl and fused=True are mutually exclusive")
 
 
 @dataclass(frozen=True)
@@ -38,21 +21,14 @@ class LossDefinition:
 class ConfiguredLoss:
     loss: TokenLoss
     coefficient: float
-    execution: LossMode = field(default_factory=LossMode)
-
-
-@dataclass(frozen=True)
-class LossGroup:
-    terms: tuple[str, ...]
-    execution: LossMode = field(default_factory=LossMode)
 
 
 @dataclass(frozen=True)
 class LossConfiguration:
-    """Resolved names, formulas and execution choices; no model tensors."""
+    """Resolved formulas and the shared fusion switch; no model tensors."""
 
     terms: dict[str, ConfiguredLoss]
-    groups: dict[str, LossGroup]
+    fused: bool = False
 
     @property
     def requires(self):
@@ -82,39 +58,18 @@ class LossConfiguration:
                 name=name,
                 loss=self.terms[name].loss,
                 coefficient=self.terms[name].coefficient * term.coefficient,
-                execution=self.terms[name].execution,
             )
             for name, term in zip(names, plan.terms)
         )
-        groups = tuple(
-            tuple(names.index(name) for name in group.terms)
-            for group in self.groups.values()
-        )
-        modes = {
-            indices: group.execution
-            for indices, group in zip(groups, self.groups.values())
-        }
-        return replace(plan, terms=terms, joint_groups=groups, group_execution=modes)
+        return replace(plan, terms=terms)
 
     def to_dict(self):
         """Stable effective settings persisted in the resume contract."""
-        grouped = {name for group in self.groups.values() for name in group.terms}
         return {
+            "fused": self.fused,
             "terms": {
-                name: {
-                    **asdict(term.loss),
-                    "coefficient": term.coefficient,
-                    **(
-                        {"execution": asdict(term.execution)}
-                        if name not in grouped
-                        else {}
-                    ),
-                }
+                name: {**asdict(term.loss), "coefficient": term.coefficient}
                 for name, term in self.terms.items()
-            },
-            "groups": {
-                name: {"terms": list(group.terms), "execution": asdict(group.execution)}
-                for name, group in self.groups.items()
             },
         }
 
@@ -137,19 +92,14 @@ def _fields(payload, allowed, path):
         raise ValueError(f"Unknown {path} fields: {sorted(unknown)}")
 
 
-def _mode(payload, path):
-    _fields(payload, {"fused", "impl"}, path)
-    return LossMode(**payload)
-
-
 def resolve_loss_configuration(objective, payload):
-    """Resolve defaults and reject unknown terms, incompatible inputs and overlaps.
+    """Resolve mathematical terms and user-controlled execution settings.
 
     Returns:
-        (LossConfiguration, LossExecution). Scheduling contains no implementation
-        choice; an omitted per-term/group execution always means reference.
+        (LossConfiguration, LossExecution). The shared execution policy selects
+        compatible optimizations only when loss.fused is true.
     """
-    _fields(payload, {"terms", "groups", "scheduling"}, "loss")
+    _fields(payload, {"terms", "fused", "scheduling"}, "loss")
     definitions = loss_definitions(objective)
     requested = payload.get("terms", {})
     _fields(requested, set(definitions), "loss.terms")
@@ -158,7 +108,7 @@ def resolve_loss_configuration(objective, payload):
         options = requested.get(name, {})
         _fields(
             options,
-            {"kind", "options", "coefficient", "execution"},
+            {"kind", "options", "coefficient"},
             f"loss.terms.{name}",
         )
         kind = options.get("kind", definition.loss.kind)
@@ -181,62 +131,12 @@ def resolve_loss_configuration(objective, payload):
             or coefficient < 0
         ):
             raise ValueError(f"Invalid coefficient for loss term {name!r}")
-        mode = _mode(options.get("execution", {}), f"loss.terms.{name}.execution")
-        _validate_mode(mode, (loss,))
-        resolved[name] = ConfiguredLoss(loss, coefficient, mode)
-    groups = {}
-    occupied = set()
-    raw_groups = payload.get("groups", {})
-    if not isinstance(raw_groups, dict):
-        raise ValueError("loss.groups must be a mapping")
-    for name, group in raw_groups.items():
-        _fields(group, {"terms", "execution"}, f"loss.groups.{name}")
-        members = group.get("terms", [])
-        if (
-            not isinstance(members, (list, tuple))
-            or len(members) < 2
-            or any(not isinstance(v, str) for v in members)
-        ):
-            raise ValueError("A loss group requires at least two named terms")
-        if (
-            len(set(members)) != len(members)
-            or set(members) - resolved.keys()
-            or occupied.intersection(members)
-        ):
-            raise ValueError(
-                f"Unknown, repeated or overlapping terms in group {name!r}"
-            )
-        allowed = getattr(objective, "joint_loss_groups", ())
-        if not any(set(members) == set(group) for group in allowed):
-            raise ValueError(
-                f"Algorithm does not provide joint inputs for group {name!r}"
-            )
-        if any("execution" in requested.get(member, {}) for member in members):
-            raise ValueError("Group members cannot specify individual execution")
-        mode = _mode(group.get("execution", {}), f"loss.groups.{name}.execution")
-        _validate_mode(mode, tuple(resolved[member].loss for member in members))
-        groups[name] = LossGroup(tuple(members), mode)
-        occupied.update(members)
+        resolved[name] = ConfiguredLoss(loss, coefficient)
     scheduling = payload.get("scheduling", {})
     _fields(
         scheduling,
         {"chunk_size", "checkpoint", "trim", "teacher_chunk_size"},
         "loss.scheduling",
     )
-    return LossConfiguration(resolved, groups), LossExecution(**scheduling)
-
-
-def _validate_mode(mode, losses):
-    if mode.impl is None:
-        return
-    from .implementations.registry import implementation_registrations
-
-    entry = implementation_registrations().get(mode.impl)
-    if entry is None or entry.category != "specialized":
-        raise ValueError(
-            f"{mode.impl!r} is not a registered specialized implementation"
-        )
-    if entry.losses and any(loss.kind not in entry.losses for loss in losses):
-        raise ValueError(
-            f"{mode.impl} does not implement the selected mathematical losses"
-        )
+    execution = LossExecution(fused=payload.get("fused", False), **scheduling)
+    return LossConfiguration(resolved, execution.fused), execution

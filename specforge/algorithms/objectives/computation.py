@@ -53,10 +53,6 @@ class LossComputation:
             key=key,
         )
 
-    def mode(self, index):
-        """Configured execution for a term, or None for a legacy caller."""
-        return self.predictions.plan.terms[index].execution
-
     def evaluate_term(
         self, index, logits, labels, *, teacher=None, context=None, fused=None
     ):
@@ -77,25 +73,18 @@ class LossComputation:
         """Execute declared terms once.
 
         impl selects a specialized implementation and requires fused=False.
-        Otherwise the term/group owns its execution mode. Only legacy plans
-        without a mode inherit the runtime fused setting.
+        Otherwise the shared fused setting controls automatic selection.
         """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
         for indices in groups:
             if any(i in self.numerators for i in indices):
                 raise ValueError("Loss terms must execute exactly once")
-            mode = self.predictions.plan.group_execution.get(indices)
-            if mode is None and len(indices) == 1:
-                mode = self.mode(indices[0])
-            chosen_impl, chosen_fused = impl, fused
-            if mode is not None and impl is None and fused is None:
-                chosen_impl, chosen_fused = mode.impl, mode.fused
             result = self._execute(
                 self.request,
                 indices,
                 self.prediction_index,
-                impl=chosen_impl,
-                fused=chosen_fused,
+                impl=impl,
+                fused=fused,
             )
             self._collect(result, indices)
 
@@ -151,7 +140,7 @@ class LossComputation:
             context: Optional normalization context for whole-set losses.
             impl: Optional specialized implementation.
             fused: Override automatic optimization; must be False with impl.
-            term_index: Optional owner of the input context and execution mode.
+            term_index: Optional owner of the input context.
             **requested_outputs: Extra results validated and computed by the
                 selected implementation, e.g. return_teacher_l1=True or top_k=8.
 
@@ -172,10 +161,6 @@ class LossComputation:
             and (self.predictions.chunk_safe and self.predictions.projection.chunk_safe)
         ):
             raise ValueError("Contextual intermediate losses require chunk_safe=False")
-        if term_index is not None:
-            mode = self.mode(term_index)
-            if mode is not None and impl is None and fused is None:
-                impl, fused = mode.impl, mode.fused
         inputs = replace(
             self.request.terms[0 if term_index is None else term_index],
             loss=loss,

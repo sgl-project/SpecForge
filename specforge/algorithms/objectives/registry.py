@@ -153,19 +153,21 @@ def resolve_objective(
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
-    named = loss is not None and bool({"terms", "groups", "scheduling"} & loss.keys())
+    named = loss is not None and bool(
+        {"terms", "fused", "groups", "scheduling"} & loss.keys()
+    )
     loss_configuration = None
     if named:
         if execution:
             raise ValueError(
-                "Use loss.scheduling and per-term execution instead of loss_execution"
+                "Use loss.fused and loss.scheduling instead of loss_execution"
             )
         legacy_options = set(getattr(objective, "legacy_loss_options", ())) | set(
             getattr(objective, "default_loss_options", ())
         )
         if legacy_options.intersection(options or {}):
             raise ValueError(
-                "Configure loss definitions and coefficients under loss.terms/groups"
+                "Configure loss definitions and coefficients under loss.terms"
             )
         loss_configuration, execution = resolve_loss_configuration(objective, loss)
         token_loss = TokenLoss()

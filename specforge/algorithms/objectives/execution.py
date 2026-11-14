@@ -1,5 +1,6 @@
 """Shared eager and chunked loss execution over deferred predictions."""
 
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -383,7 +384,20 @@ def evaluate_chunks(
         selected.registration.scope == "prediction" for selected in losses
     ) or any(term.reduction == "scalar" for term in predictions.plan.terms)
     if whole_set or not predictions.chunk_safe or not predictions.projection.chunk_safe:
+        if chunk_size and chunk_size < predictions.hidden.shape[0]:
+            warnings.warn(
+                "Loss chunking is disabled: the loss or projection requires "
+                "the complete prediction set.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         chunk_size = 0
+    if execution.checkpoint and not predictions.projection.recompute_safe:
+        warnings.warn(
+            "Loss checkpointing is disabled: the projection is not recompute-safe.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if (
         execution.trim
         and weighting.kind not in DPACE_LOSS_TYPES
@@ -430,8 +444,7 @@ def evaluate_chunks(
             denominator=None if denominator is None else denominator[part].sum(),
         )
         if (
-            0 < chunk_size < predictions.hidden.shape[0]
-            and execution.checkpoint
+            execution.checkpoint
             and predictions.projection.recompute_safe
             and torch.is_grad_enabled()
         ):
@@ -500,8 +513,22 @@ def execute_batch(
             not p.projection.chunk_safe or not p.projection.recompute_safe
             for p in predictions
         ):
+            if chunk_size:
+                warnings.warn(
+                    "D-PACE loss chunking is disabled: the projection cannot "
+                    "be safely chunked and replayed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             chunk_size = 0
         if not chunk_size:
+            if execution.checkpoint:
+                warnings.warn(
+                    "Loss checkpointing is disabled for unchunked D-PACE: "
+                    "chain weighting uses materialized predictions.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             projected = [
                 project_predictions(p, loss, weighting, execution) for p in predictions
             ]

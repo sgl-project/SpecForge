@@ -232,8 +232,8 @@ configuration and is recorded in the training resume contract.
 
 ### Loss execution
 
-The preferred configuration names every mathematical term. Each term owns its
-implementation choice; omitting execution means reference calculation.
+The preferred configuration names mathematical terms and uses one shared fusion
+switch. Omitting fused means reference calculation.
 
 ```yaml
 training:
@@ -241,14 +241,13 @@ training:
   objective_options:
     num_anchors: 512
   loss:
+    fused: true
     terms:
       token:
         kind: ce_l1
         options:
           ce_weight: 0.1
           l1_weight: 0.9
-        execution:
-          fused: true
       confidence:
         kind: bce
         coefficient: 1.0
@@ -261,7 +260,7 @@ Algorithms declare stable input names and defaults through `LossDefinition`.
 The resolver rejects unknown names or incompatible mathematical input contracts.
 DSpark confidence uses binary scores and soft targets; DSpine alignment uses
 feature groups. DSpine refinement additionally requires independently masked
-CE/L1 components. Omitted terms retain algorithm defaults, with reference execution.
+CE/L1 components. Omitted terms retain algorithm defaults.
 
 | Algorithm | Terms |
 | --- | --- |
@@ -272,43 +271,45 @@ CE/L1 components. Omitted terms retain algorithm defaults, with reference execut
 | Domino | base, final |
 
 A term's coefficient multiplies its algorithm-supplied schedule factor. Sampling
-and input construction stay in objective_options. Mathematical parameters,
-coefficients and execution choices belong to loss.terms. Dependent auxiliary
+and input construction stay in objective_options. Mathematical parameters
+and coefficients belong to loss.terms; loss.fused controls optimization. Dependent auxiliary
 calculations call `calc.evaluate_term()` using those resolved settings.
 
-Joint computation belongs to a group, and members cannot also set execution:
+Domino uses the same configuration shape; its algorithm declares joint inputs internally:
 
 ```yaml
 training:
   objective: domino
   loss:
+    fused: true
     terms:
       base: {kind: ce}
       final: {kind: ce}
-    groups:
-      joint_ce:
-        terms: [base, final]
-        execution:
-          impl: domino_suffix_ce
     scheduling:
       chunk_size: 128
       checkpoint: true
 ```
 
-Only algorithm-declared joint inputs can be grouped. Groups must not overlap.
-Within one execution setting, impl and fused=True are mutually exclusive; generic
-kernels cannot be selected by name. Scheduling accepts chunk_size, checkpoint,
-trim and teacher_chunk_size, but no fused/impl. There is no global fused inheritance
-in the named configuration.
+With fused enabled, the executor selects the highest-priority compatible
+implementation, including joint optimizations. Unsupported groups split into
+individual terms; unsupported terms use reference formulas. Selection and fallback
+reasons are logged. Missing dependencies and execution failures propagate.
 
-`LossConfiguration.bind()` installs formulas, coefficients and term/group modes
-on each runtime plan. The effective configuration is stored in the resume contract;
-group members are not serialized with duplicate execution settings.
+Scheduling accepts chunk_size, checkpoint, trim and teacher_chunk_size.
+Chunking and checkpointing are independent of fusion; checkpointing also works
+without splitting. Losses needing whole-set statistics stay unsplit with a warning
+when a requested split cannot be honored. Unsafe replay disables checkpointing
+with a warning. Unchunked D-PACE also reports that its materialized
+chain-weighting path cannot use loss checkpointing.
+
+LossConfiguration.bind() installs formulas and coefficients while preserving
+algorithm-owned joint ranges. The effective settings are stored in the resume
+contract. Users do not configure groups, implementation names or term execution.
 
 #### Legacy flat configuration
 
 The flat loss and loss_execution fields below remain a compatibility input.
-They cannot be combined with named terms/groups/scheduling. New configurations
+They cannot be combined with named terms/fused/scheduling. New configurations
 should use the layout above.
 
 Execution controls are separate from the objective, token loss and weighting:
@@ -433,23 +434,21 @@ module paths are no longer supported.
 `implementations/domino_ce.py` contains only its execution adapter.
 Fusion requires one complete block per
 projection unit, additive corrections on a contiguous suffix, and base/final CE
-terms with shared supervision weights. Other layouts use ordinary projection when no specialized implementation is requested; incompatible explicit requests fail.
+terms with shared supervision weights. Other layouts fall back to compatible per-term implementations or reference calculation.
 
 All final and intermediate calculations use `compute_loss(request, group, ...)`.
 The algorithm chooses the mathematical terms and their coefficients. The loss
 entry chooses how to evaluate them:
 
-| Mode | Arguments | Selection |
+| Mode | Configuration | Selection |
 | --- | --- | --- |
-| Reference | No impl, fused=False | Registered mathematical formula |
-| Generic optimization | No impl, fused=True | Compatible generic kernel, otherwise reference |
-| Specialized | impl="name", fused=False | That exact specialized implementation |
+| Reference | fused: false | Registered mathematical formulas |
+| Optimized | fused: true | Compatible joint or per-term optimization, otherwise reference |
 
-Explicit impl and fused=True are mutually exclusive. Generic kernels such as
-linear_ce and token_ce cannot be selected by name. A specialized implementation
-can use fused kernels internally; it is not part of automatic generic selection.
-Unknown or incompatible explicit implementations fail instead of falling back.
-Missing required kernel dependencies and runtime errors also propagate.
+Both generic kernels and projection-specific kernels participate in automatic
+selection. Matching checks the mathematical loss, projection, requested outputs,
+device and dtype. Runtime errors and missing required dependencies propagate.
+The internal explicit implementation argument remains only for legacy callers.
 
 Register formulas with `register_loss`; its optional `outputs` callback provides
 extra reference results without changing the formula. CE's L1/top-k outputs use
@@ -459,7 +458,7 @@ or use `register_token_kernel` for generic per-token optimization.
 `implementation_registrations()` exposes the names, categories, loss mapping and
 applicability callbacks for inspection without a second routing table.
 
-Domino's protocol explicitly requests `domino_suffix_ce` for its ordinary CE pair
+The legacy Domino path explicitly requests `domino_suffix_ce` for its ordinary CE pair
 when the existing fused option is enabled. It resolves that request to specialized
 mode with fused=False; other mathematical losses use the ordinary path. This
 preserves the existing configuration's reference/optimized behavior.

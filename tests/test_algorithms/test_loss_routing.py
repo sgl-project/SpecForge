@@ -55,7 +55,7 @@ class LossRoutingTest(unittest.TestCase):
                 return reference.compute(req, group)
 
             self.assertEqual(
-                select_implementation(request, fused=True).category, "reference"
+                select_implementation(request, fused=True).name, "test_special"
             )
             actual = compute_loss(request, impl="test_special")
             torch.testing.assert_close(actual.values, expected.values)

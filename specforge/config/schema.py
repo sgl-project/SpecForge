@@ -1002,7 +1002,7 @@ class TrainingConfig(StrictConfigModel):
     objective_options: dict = Field(default_factory=dict)
     loss: dict = Field(
         default_factory=dict
-    )  # Named terms/groups and shared scheduling.
+    )  # Named terms, shared fusion switch and scheduling.
     loss_execution: dict = Field(
         default_factory=dict
     )  # Legacy flat-loss compatibility.

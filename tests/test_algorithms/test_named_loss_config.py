@@ -14,23 +14,23 @@ class NamedLossTest(unittest.TestCase):
         settings = resolve_objective(
             "DSparkDraftModel",
             loss={
+                "fused": True,
                 "terms": {
-                    "token": {"execution": {"fused": True}},
                     "confidence": {"coefficient": 0.2},
                 },
                 "scheduling": {"chunk_size": 2},
             },
         )
-        self.assertTrue(settings.losses.terms["token"].execution.fused)
-        self.assertFalse(settings.losses.terms["confidence"].execution.fused)
+        self.assertTrue(settings.losses.fused)
         self.assertEqual(settings.execution.chunk_size, 2)
-        self.assertFalse(settings.execution.fused)
+        self.assertTrue(settings.execution.fused)
         cases = [
             {"terms": {"missing": {}}},
             {"terms": {"confidence": {"kind": "ce"}}},
             {"terms": {"token": {"execution": {"impl": "token_ce"}}}},
             {"terms": {"token": {"execution": {"impl": "x", "fused": True}}}},
             {"terms": {"token": {"execution": {"chunk_size": 1}}}},
+            {"fused": "true"},
             {"scheduling": {"fused": True}},
             {"groups": {"g": {"terms": ["token", "confidence"]}}},
         ]
@@ -50,26 +50,11 @@ class NamedLossTest(unittest.TestCase):
                 loss={"terms": {}},
                 options={"confidence_loss_alpha": 0.2},
             )
-        with self.assertRaisesRegex(ValueError, "individual execution"):
-            resolve_objective(
-                "DominoDraftModel",
-                loss={
-                    "terms": {"base": {"execution": {}}},
-                    "groups": {"joint": {"terms": ["base", "final"]}},
-                },
-            )
 
-    def test_group_settings_round_trip_without_member_execution(self):
-        payload = {
-            "groups": {
-                "pair": {
-                    "terms": ["base", "final"],
-                    "execution": {"impl": "domino_suffix_ce"},
-                }
-            }
-        }
-        first = resolve_objective("DominoDraftModel", loss=payload)
+    def test_settings_round_trip(self):
+        first = resolve_objective("DominoDraftModel", loss={"fused": True})
         saved = first.losses.to_dict()
+        self.assertNotIn("groups", saved)
         self.assertNotIn("execution", saved["terms"]["base"])
         second = resolve_objective("DominoDraftModel", loss=saved)
         self.assertEqual(second.losses.to_dict(), saved)
@@ -162,34 +147,51 @@ class NamedLossTest(unittest.TestCase):
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-    def test_term_and_group_modes_reach_the_actual_kernels(self):
-        for architecture, loss in (
-            ("DSparkDraftModel", {"terms": {"token": {"execution": {"fused": True}}}}),
-            (
-                "DominoDraftModel",
-                {
-                    "groups": {
-                        "joint_ce": {
-                            "terms": ["base", "final"],
-                            "execution": {"impl": "domino_suffix_ce"},
-                        }
-                    }
-                },
-            ),
+    def test_shared_fusion_preserves_losses_and_gradients(self):
+        for architecture, terms in (
+            ("DSparkDraftModel", {}),
+            ("DominoDraftModel", {}),
+            ("DominoDraftModel", {"final": {"kind": "kl"}}),
         ):
-            with self.subTest(architecture=architecture):
-                config, runtime = build_runtime(
-                    architecture, options={"num_anchors": 2}, loss=loss
-                )
-                runtime.cuda()
-                for name in config.target_bindings:
-                    module = runtime.draft_model.get_submodule(name)
-                    module.load_target_weight(torch.randn_like(module.weight))
-                batch = {k: v.cuda() for k, v in training_batch(config).items()}
-                runtime(batch, step=1, total_steps=10).loss.backward()
-                names = runtime.loss_implementations.names
-                if architecture == "DSparkDraftModel":
-                    self.assertEqual(names["0:0"], "token_ce_l1")
-                    self.assertNotIn("0/compute/confidence:0", names)
-                else:
-                    self.assertEqual(names["0:0,1"], "domino_suffix_ce")
+            outputs = []
+            for fused in (False, True):
+                with self.subTest(architecture=architecture, terms=terms, fused=fused):
+                    config, runtime = build_runtime(
+                        architecture,
+                        options={"num_anchors": 2},
+                        loss={
+                            "fused": fused,
+                            "terms": terms,
+                            "scheduling": {"chunk_size": 1, "checkpoint": True},
+                        },
+                    )
+                    runtime.cuda()
+                    torch.manual_seed(17)
+                    for name in config.target_bindings:
+                        module = runtime.draft_model.get_submodule(name)
+                        module.load_target_weight(torch.randn_like(module.weight))
+                    batch = {k: v.cuda() for k, v in training_batch(config).items()}
+                    torch.manual_seed(31)
+                    result = runtime(batch, step=1, total_steps=10)
+                    result.loss.backward()
+                    outputs.append(
+                        (
+                            result.loss,
+                            {
+                                name: p.grad
+                                for name, p in runtime.named_parameters()
+                                if p.grad is not None
+                            },
+                        )
+                    )
+                    names = runtime.loss_implementations.names
+                    if not fused:
+                        self.assertFalse(names)
+                    elif architecture == "DSparkDraftModel":
+                        self.assertEqual(names["0:0"], "token_ce_l1")
+                        self.assertEqual(names["0/compute/confidence:0"], "reference")
+                    elif terms:
+                        self.assertEqual(names["0:0,1"], "split")
+                    else:
+                        self.assertEqual(names["0:0,1"], "domino_suffix_ce")
+            torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-4, atol=1e-5)

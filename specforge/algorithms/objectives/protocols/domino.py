@@ -42,7 +42,6 @@ class DominoObjective:
     impl: str | None = None
 
     legacy_loss_options = ("impl",)
-    joint_loss_groups = (("base", "final"),)
 
     @property
     def loss_terms(self):

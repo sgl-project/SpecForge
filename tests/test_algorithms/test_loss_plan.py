@@ -640,7 +640,7 @@ class LossPlanTest(unittest.TestCase):
     def test_projection_execution_constraints(self):
         head = nn.Linear(4, 9)
         for options, expected_calls in (
-            ({"chunk_safe": False}, [4]),
+            ({"chunk_safe": False}, [4, 4]),
             ({"recompute_safe": False}, [1, 1, 1, 1]),
         ):
             with self.subTest(options=options):

@@ -1,15 +1,11 @@
 """Declarative loss terms and optional, non-overlapping joint ranges."""
 
 import math
-from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
 
 from torch import Tensor
 
 from .losses import PositionWeighting, TokenLoss
-
-if TYPE_CHECKING:
-    from .configuration import LossMode
 
 
 @dataclass(frozen=True)
@@ -36,7 +32,6 @@ class LossTerm:
     denominator: Tensor | None = None
     reduction: str = "positions"
     name: str | None = None
-    execution: "LossMode | None" = None
 
     def __post_init__(self):
         if self.reduction not in ("positions", "scalar"):
@@ -82,7 +77,6 @@ class LossPlan:
 
     terms: tuple[LossTerm, ...] = (LossTerm(),)
     joint_groups: tuple[tuple[int, ...], ...] = ()
-    group_execution: dict[tuple[int, ...], "LossMode"] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.terms:

@@ -105,7 +105,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertIsNotNone(bundle.model.target_head)
             term = bundle.model.loss_configuration.terms["token"]
             self.assertEqual(term.loss.kind, "kl")
-            self.assertFalse(term.execution.fused)
+            self.assertFalse(bundle.model.execution.fused)
             saved = bundle.strategy_kwargs.resume_contract
             self.assertEqual(saved["canonical_loss"]["terms"]["token"]["kind"], "kl")
             self.assertEqual(saved["canonical_loss_execution"]["chunk_size"], 2)

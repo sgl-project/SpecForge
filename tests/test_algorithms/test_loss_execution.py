@@ -391,11 +391,18 @@ class LossExecutionTest(unittest.TestCase):
         from torch.utils.checkpoint import checkpoint
 
         config, runtime = build_runtime("MTPDraftModel")
-        for enabled in (False, True):
-            runtime.execution = LossExecution(chunk_size=1, checkpoint=enabled)
-            with patch("torch.utils.checkpoint.checkpoint", wraps=checkpoint) as calls:
-                runtime(training_batch(config), step=0, total_steps=1).loss.backward()
-            self.assertEqual(calls.called, enabled)
+        for chunk_size in (0, 1):
+            for enabled in (False, True):
+                runtime.execution = LossExecution(
+                    chunk_size=chunk_size, checkpoint=enabled
+                )
+                with patch(
+                    "torch.utils.checkpoint.checkpoint", wraps=checkpoint
+                ) as calls:
+                    runtime(
+                        training_batch(config), step=0, total_steps=1
+                    ).loss.backward()
+                self.assertEqual(calls.called, enabled)
 
     def test_fused_conv_rejects_invalid_configuration(self):
         from specforge.config.draft.conv import GroupedCausalConvSpec

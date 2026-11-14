@@ -105,7 +105,7 @@ class Implementation:
         priority: Selection priority; larger values are considered first.
         supports: Callable(request, group) returning None when applicable,
             otherwise a human-readable rejection reason. It must not project.
-        category: Reference, generic optimization, or explicit specialization.
+        category: Reference, generic optimization, or projection-specific optimization.
         losses: Mathematical definitions accepted by this implementation.
         compute: Callable(request, group) returning a GroupResult. Runtime
             failures propagate; they are not treated as applicability failures.
@@ -132,8 +132,8 @@ def register_implementation(
         supports: Callable(request, group) returning None if supported or a
             rejection-reason string. It checks capabilities without projection.
         priority: Selection priority; higher values take precedence.
-        category: "generic" for automatic optimization, "specialized" for explicit
-            selection, or "reference" for portable mathematical evaluation.
+        category: "generic" for automatic optimization, "specialized" for projection-specific
+            optimization, or "reference" for portable mathematical evaluation.
         losses: Supported mathematical loss names; empty for the generic reference.
 
     Returns:
@@ -168,10 +168,10 @@ def implementation_registrations():
 def select_implementation(
     request, group=(0,), *, impl=None, rejections=None, fused=False
 ):
-    """Choose a reference, generic optimization, or explicitly named specialization.
+    """Choose the highest-priority compatible optimization or a reference.
 
     Explicit implementations and automatic fusion are mutually exclusive.
-    Inapplicable generic kernels fall back; explicit selection never does.
+    Inapplicable optimizations fall back; legacy explicit selection never does.
     Support checks must not materialize predictions.
     """
     if impl is not None and fused:
@@ -192,7 +192,7 @@ def select_implementation(
                 entry
                 for entry in entries.values()
                 if entry.category == "reference"
-                or (fused and entry.category == "generic")
+                or (fused and entry.category != "reference")
             ),
             key=lambda entry: (
                 entry.category == "reference",
@@ -223,7 +223,7 @@ def compute_loss(request, group=(0,), *, impl=None, fused=False, selection=None,
         request: Resolved supervision and direct or deferred prediction inputs.
         group: Term indices to compute together.
         impl: Explicit specialized implementation; cannot accompany fused=True.
-        fused: Automatically select a compatible generic optimization.
+        fused: Automatically select a compatible optimization.
         selection: Optional distributed/resume selection tracker.
         key: Stable request identity within the algorithm.
 
