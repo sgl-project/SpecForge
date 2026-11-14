@@ -12,6 +12,7 @@ from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mea
 from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
+from specforge.algorithms.objectives.plan import LossPlan, LossTerm
 from specforge.algorithms.objectives.predictions import Predictions
 from specforge.algorithms.objectives.projection import Projection
 from specforge.algorithms.objectives.protocols.dflash2 import DFlash2Objective
@@ -72,7 +73,9 @@ class ObjectiveContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "steps or ratio"):
             DFlash2Objective(selector_ramp_steps=2, selector_ramp_ratio=0.2)
         model = build_draft_model(dflash2_config())
-        build_objective_model(model, options={"selector_loss_alpha": 0})
+        build_objective_model(
+            model, options={}, loss={"terms": {"selector": {"coefficient": 0}}}
+        )
         self.assertFalse(
             any(p.requires_grad for p in model.candidate_selector.parameters())
         )
@@ -119,6 +122,11 @@ class ObjectiveContractTest(unittest.TestCase):
                 torch.tensor([[1]]),
                 mask=torch.ones(1, 1),
                 labels=torch.zeros(1, 1, dtype=torch.long),
+                plan=LossPlan(
+                    tuple(
+                        LossTerm(name=name) for name in runtime.loss_configuration.terms
+                    )
+                ),
             ).teacher
             self.assertEqual(teacher.values.dtype, torch.float32)
             self.assertEqual(teacher.logits().dtype, torch.float32)
@@ -167,7 +175,7 @@ class ObjectiveContractTest(unittest.TestCase):
         runtime = build_objective_model(
             build_draft_model(config),
             options={"num_anchors": 2},
-            loss={"kind": "kl"},
+            loss={"terms": {"token": {"kind": "kl"}}},
             weighting={"kind": "exponential", "gamma": 2},
         )
         batch = training_batch(config)
@@ -316,7 +324,7 @@ class ObjectiveContractTest(unittest.TestCase):
             runtime = build_objective_model(
                 build_draft_model(config),
                 options={"num_anchors": 1},
-                loss={"kind": "custom"},
+                loss={"terms": {"token": {"kind": "custom"}}},
             )
             batch = training_batch(config)
             batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
@@ -433,21 +441,27 @@ class ObjectiveContractTest(unittest.TestCase):
 
     def test_explicit_selection_rejects_options_it_would_ignore(self):
         build_runtime("DSpineDraftModel", weighting={"kind": "uniform"})
-        build_runtime("DSparkDraftModel", loss={"kind": "kl"})
+        build_runtime("DSparkDraftModel", loss={"terms": {"token": {"kind": "kl"}}})
         build_runtime(
-            "DSpineDraftModel", options={"ce_weight": 0.2}, loss={"kind": "kl"}
+            "DSpineDraftModel",
+            options={},
+            loss={
+                "terms": {
+                    "token": {"kind": "kl"},
+                    "refinement": {"options": {"ce_weight": 0.2, "l1_weight": 1 - 0.2}},
+                }
+            },
         )
         build_runtime(
             "DFlashDraftModel",
             options={"loss_decay_gamma": None},
             weighting={"kind": "uniform"},
         )
-        uniform, kl = {"weighting": {"kind": "uniform"}}, {"loss": {"kind": "kl"}}
+        uniform = {"weighting": {"kind": "uniform"}}
         for architecture, options, selection in (
             ("DFlashDraftModel", {"loss_decay_gamma": 7.0}, uniform),
             ("DSpineDraftModel", {"loss_decay_gamma": 7.0}, uniform),
             ("Eagle3DraftModel", {"depth_decay": 0.1}, uniform),
-            ("DSparkDraftModel", {"ce_loss_alpha": 0.1}, kl),
         ):
             with self.subTest(architecture=architecture, options=options):
                 with self.assertRaisesRegex(ValueError, next(iter(options))):
@@ -455,7 +469,9 @@ class ObjectiveContractTest(unittest.TestCase):
 
     def test_dspark_zero_confidence_weight_freezes_the_head(self):
         _, runtime = build_runtime(
-            "DSparkDraftModel", options={"confidence_loss_alpha": 0.0}
+            "DSparkDraftModel",
+            options={},
+            loss={"terms": {"confidence": {"coefficient": 0.0}}},
         )
         head = runtime.draft_model.confidence_head
         self.assertFalse(any(p.requires_grad for p in head.parameters()))
@@ -466,10 +482,19 @@ class ObjectiveContractTest(unittest.TestCase):
             model.get_submodule(name).load_target_weight(
                 torch.randn(config.vocab_size, config.hidden_size)
             )
-        runtime = build_objective_model(model, options={"confidence_loss_alpha": 0.0})
+        runtime = build_objective_model(
+            model, options={}, loss={"terms": {"confidence": {"coefficient": 0.0}}}
+        )
         self.assertEqual(runtime.frozen_parameters, ())
-        misspelled = property(lambda objective: ("confidence_haed",))
-        with patch.object(DSparkObjective, "frozen_parameters", misspelled):
+        from specforge.algorithms.objectives.configuration import LossDefinition
+
+        misspelled = property(
+            lambda objective: {
+                "token": LossDefinition(objective.default_loss),
+                "confidence": LossDefinition(TokenLoss("bce"), 0, ("confidence_haed",)),
+            }
+        )
+        with patch.object(DSparkObjective, "loss_terms", misspelled):
             with self.assertRaisesRegex(ValueError, "confidence_haed"):
                 build_runtime("DSparkDraftModel")
 
@@ -520,7 +545,11 @@ class ObjectiveContractTest(unittest.TestCase):
         self.assertEqual(result.denominator.item(), 2)
 
     def test_runtime_keeps_the_resolved_default_loss(self):
-        _, dspark = build_runtime("DSparkDraftModel", options={"ce_loss_alpha": 0.3})
+        _, dspark = build_runtime(
+            "DSparkDraftModel",
+            options={},
+            loss={"terms": {"token": {"options": {"ce_weight": 0.3}}}},
+        )
         self.assertEqual(
             dspark.token_loss,
             TokenLoss(kind="ce_l1", options={"ce_weight": 0.3, "l1_weight": 0.9}),

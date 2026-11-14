@@ -44,6 +44,7 @@ class CanonicalReviewTest(unittest.TestCase):
         runtime = torch.nn.Module()
         runtime.registration = objective_registrations()["eagle3"]
         runtime.draft_model = torch.nn.Linear(1, 1)
+        runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
             "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
             "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
@@ -117,7 +118,10 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 target,
                 draft_config(),
-                training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                training={
+                    "attention_backend": "eager",
+                    "loss": {"terms": {"token": {"kind": "kl"}}},
+                },
             )
             resolved = resolve_run(cfg)
             bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
@@ -140,12 +144,6 @@ class CanonicalReviewTest(unittest.TestCase):
                 setattr(changed.training, name, value)
                 with self.assertRaisesRegex(ValueError, name):
                     resolve_run(changed)
-            cfg.training.objective_chunk_blocks = 128
-            with self.assertLogs(
-                "specforge.training.canonical", level="WARNING"
-            ) as logs:
-                resolve_run(cfg)
-            self.assertIn("do not enable", logs.output[0])
             for name in ("embedding_key", "lm_head_key"):
                 owned = run_config(
                     target,
@@ -177,7 +175,7 @@ class CanonicalReviewTest(unittest.TestCase):
                 encode_config(draft_config()),
             )
 
-    def test_legacy_dspine_requires_explicit_matching_training_settings(self):
+    def test_weight_import_does_not_restore_legacy_loss_settings(self):
         from specforge.algorithms.objectives import resolve_objective
         from specforge.training.canonical import _validate_imported_objective
         from tests.test_config.test_draft_legacy_dspine import dspine_payload
@@ -190,10 +188,23 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 source, draft_config(), initialization={"checkpoint": temp}
             )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
-                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
             _validate_imported_objective(
-                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+                cfg,
+                resolve_objective(
+                    "DSpineDraftModel",
+                    options={},
+                    loss={
+                        "terms": {
+                            "token": {
+                                "options": {"ce_weight": 0.3, "l1_weight": 1 - 0.3}
+                            },
+                            "refinement": {
+                                "options": {"ce_weight": 0.3, "l1_weight": 1 - 0.3}
+                            },
+                        }
+                    },
+                ),
             )
 
     def test_scratch_embedding_key_survives_resume(self):
@@ -407,7 +418,7 @@ class CanonicalReviewTest(unittest.TestCase):
                     dspark(confidence=confidence),
                     training={
                         "attention_backend": "eager",
-                        "objective_options": {"confidence_loss_alpha": 0.0},
+                        "loss": {"terms": {"confidence": {"coefficient": 0.0}}},
                     },
                 )
                 resolved = resolve_run(cfg)

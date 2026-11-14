@@ -1067,12 +1067,12 @@ class ConfigSchemaTest(unittest.TestCase):
             cfg,
             [
                 "training.objective_options.num_anchors=64",
-                "training.loss={kind: kl}",
+                "training.loss={terms: {token: {kind: kl}}}",
                 "training.weighting={kind: exponential, gamma: 7.0}",
             ],
         )
         self.assertEqual(out.training.objective_options, {"num_anchors": 64})
-        self.assertEqual(out.training.loss, {"kind": "kl"})
+        self.assertEqual(out.training.loss, {"terms": {"token": {"kind": "kl"}}})
         self.assertEqual(out.training.weighting, {"kind": "exponential", "gamma": 7.0})
         self.assertNotIn("objective_chunk_blocks", out.training.model_fields_set)
         with self.assertRaisesRegex(ValueError, "does not exist"):

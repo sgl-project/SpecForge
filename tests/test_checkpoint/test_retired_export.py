@@ -126,16 +126,11 @@ class RetiredExportTest(unittest.TestCase):
             old_recipe.training = cfg.training.model_copy(update={"strategy": "mtp"})
             with self.assertRaisesRegex(ValueError, "MTP now requires draft"):
                 resolve_run(old_recipe)
-            cfg.training.mtp_objective_chunk_size = 128
+            cfg.training.loss = {"scheduling": {"chunk_size": 128}}
             self.assertEqual(
-                resolve_run(cfg).config.training.objective_options[
-                    "objective_chunk_size"
-                ],
-                128,
+                resolve_run(cfg).config.training.loss,
+                {"scheduling": {"chunk_size": 128}},
             )
-            cfg.training.objective_options = {"objective_chunk_size": 64}
-            with self.assertRaisesRegex(ValueError, "conflicting MTP"):
-                resolve_run(cfg)
 
 
 if __name__ == "__main__":
