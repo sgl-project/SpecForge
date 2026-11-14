@@ -186,18 +186,22 @@ class LossRoutingTest(unittest.TestCase):
                         expected_grad,
                     )
 
-    def test_equivalent_statistics_names_restore(self):
+    def test_saved_implementation_names_are_checked_without_aliases(self):
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
         )
 
         selection = ExecutionSelection()
-        selection.restore({"0:0": "fused_ce_statistics"})
+        selection.restore({"0:0": "token_ce"})
         selection.record("0:0", "token_ce")
-        with self.assertRaisesRegex(ValueError, "changed on resume"):
-            other = ExecutionSelection()
-            other.restore({"0:0": "linear_ce"})
-            other.record("0:0", "token_ce")
+        for name in ("fused_ce_statistics", "linear_ce"):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "changed on resume"),
+            ):
+                other = ExecutionSelection()
+                other.restore({"0:0": name})
+                other.record("0:0", "token_ce")
 
     def test_empty_joint_split_keeps_selection_sequence(self):
         from specforge.algorithms.objectives.implementations.registry import (

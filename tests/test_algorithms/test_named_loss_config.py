@@ -41,11 +41,11 @@ class NamedLossTest(unittest.TestCase):
                 self.assertRaises((ValueError, TypeError)),
             ):
                 resolve_objective("DSparkDraftModel", loss=payload)
-        with self.assertRaisesRegex(ValueError, "loss_execution"):
+        with self.assertRaisesRegex(TypeError, "execution"):
             resolve_objective(
                 "DSparkDraftModel", loss={"terms": {}}, execution={"fused": True}
             )
-        with self.assertRaisesRegex(ValueError, "loss.terms"):
+        with self.assertRaisesRegex(TypeError, "confidence_loss_alpha"):
             resolve_objective(
                 "DSparkDraftModel",
                 loss={"terms": {}},
@@ -60,102 +60,19 @@ class NamedLossTest(unittest.TestCase):
         second = resolve_objective("DominoDraftModel", loss=saved)
         self.assertEqual(second.losses.to_dict(), saved)
 
-    def test_old_options_resolve_to_the_same_named_terms(self):
-        cases = (
-            (
-                "DSparkDraftModel",
-                {"ce_loss_alpha": 0.3, "confidence_loss_alpha": 0.2},
-                {
-                    "token": {"options": {"ce_weight": 0.3}},
-                    "confidence": {"coefficient": 0.2},
-                },
-            ),
-            (
-                "DSpineDraftModel",
-                {"ce_weight": 0.2, "alignment_weight": 0.4},
-                {
-                    "token": {"options": {"ce_weight": 0.2, "l1_weight": 0.8}},
-                    "refinement": {"options": {"ce_weight": 0.2, "l1_weight": 0.8}},
-                    "alignment": {"coefficient": 0.4},
-                },
-            ),
-            (
-                "DFlash2DraftModel",
-                {"selector_loss_alpha": 0},
-                {"selector": {"coefficient": 0}},
-            ),
-        )
-        for architecture, options, terms in cases:
-            with self.subTest(architecture=architecture):
-                old = resolve_objective(
-                    architecture, options=options, execution={"fused": True}
-                )
-                new = resolve_objective(
-                    architecture, loss={"fused": True, "terms": terms}
-                )
-                self.assertEqual(old.losses, new.losses)
-                self.assertEqual(old.objective, new.objective)
-                self.assertEqual(old.frozen_parameters, new.frozen_parameters)
-        domino = resolve_objective(
-            "DominoDraftModel", options={"impl": "domino_suffix_ce"}
-        )
-        self.assertTrue(domino.execution.fused)
-        self.assertFalse(hasattr(domino.objective, "impl"))
-        with self.assertRaises(ValueError):
-            resolve_objective("DSpineDraftModel", options={"ce_weight": 1.1})
+    def test_old_loss_configuration_is_rejected(self):
+        for payload in ({"kind": "ce"}, {"kind": "default"}, {"options": {}}):
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ValueError, "Unknown loss"),
+            ):
+                resolve_objective("DSparkDraftModel", loss=payload)
+        with self.assertRaises(TypeError):
+            resolve_objective("DominoDraftModel", options={"impl": "domino_suffix_ce"})
 
-    def test_previous_checkpoint_metadata_is_normalized_once(self):
-        from specforge.algorithms.objectives.compatibility import (
-            normalize_loss_checkpoint,
-        )
-
-        saved = {
-            "canonical_objective": "dspine",
-            "canonical_objective_options": {"ce_weight": 0.2, "alignment_weight": 0.4},
-            "canonical_loss": {
-                "kind": "ce_l1",
-                "options": {"ce_weight": 0.2, "l1_weight": 0.8},
-            },
-            "canonical_loss_execution": {"fused": True, "chunk_size": 1},
-            "canonical_loss_implementations": {
-                "0/compute/refinement:0": "token_ce",
-                "0:1": "value",
-            },
-        }
-        normalized = normalize_loss_checkpoint(saved, "dspine")
-        self.assertEqual(
-            normalized["canonical_loss"]["terms"]["alignment"]["coefficient"], 0.4
-        )
-        self.assertNotIn("ce_weight", normalized["canonical_objective_options"])
-        self.assertEqual(
-            normalized["canonical_loss_implementations"],
-            {
-                "0/compute/refinement:0": "token_ce_l1",
-                "0:1": "value",
-                "0/compute/alignment:0": "reference",
-            },
-        )
-        self.assertEqual(normalize_loss_checkpoint(normalized, "dspine"), normalized)
-        self.assertIn("ce_weight", saved["canonical_objective_options"])
-        dspark = {
-            "canonical_objective_options": {
-                "ce_loss_alpha": 0.3,
-                "confidence_loss_alpha": 0.2,
-            },
-            "canonical_loss": {
-                "kind": "ce_l1",
-                "options": {"ce_weight": 0.3, "l1_weight": 0.9},
-            },
-        }
-        migrated = normalize_loss_checkpoint(dspark, "dspark")
-        self.assertEqual(
-            migrated["canonical_loss"]["terms"]["confidence"]["coefficient"], 0.2
-        )
-        self.assertEqual(
-            migrated["canonical_loss"]["terms"]["token"]["options"]["ce_weight"], 0.3
-        )
-
-    def test_flat_and_named_defaults_preserve_algorithm_losses_and_gradients(self):
+    def test_implicit_and_explicit_defaults_preserve_algorithm_losses_and_gradients(
+        self,
+    ):
         for config in configurations():
             with self.subTest(architecture=config.architecture):
                 from specforge.algorithms.objectives.registry import (

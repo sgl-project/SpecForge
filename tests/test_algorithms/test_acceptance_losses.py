@@ -44,12 +44,16 @@ class AcceptanceLossTest(unittest.TestCase):
                     runtime, legacy, names = block_pair(
                         "dflash",
                         loss={
-                            "kind": f"lk_{mode}",
-                            "options": (
-                                {"kl_scale": 0.7, "kl_decay": 1.3}
-                                if mode == "lambda"
-                                else {}
-                            ),
+                            "terms": {
+                                "token": {
+                                    "kind": f"lk_{mode}",
+                                    "options": (
+                                        {"kl_scale": 0.7, "kl_decay": 1.3}
+                                        if mode == "lambda"
+                                        else {}
+                                    ),
+                                }
+                            }
                         },
                     )
                     runtime.weighting = PositionWeighting(kind=weighting)

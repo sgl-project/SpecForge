@@ -101,7 +101,7 @@ class PredictionsTest(unittest.TestCase):
                 model,
                 options={"num_anchors": 2},
                 target_head=runtime.target_head,
-                loss={"kind": "kl"},
+                loss={"terms": {"token": {"kind": "kl"}}},
             )
             prediction = next(iter(kl_runtime.objective(kl_runtime, batch).predictions))
             self.assertEqual(teacher.call_count, 0)
@@ -120,10 +120,14 @@ class PredictionsTest(unittest.TestCase):
             model = build_draft_model(configurations()[0])
             with self.assertRaisesRegex(ValueError, "unsupported_capability"):
                 build_objective_model(
-                    model, loss={"kind": "unsupported"}, frozen=("backbone",)
+                    model,
+                    loss={"terms": {"token": {"kind": "unsupported"}}},
+                    frozen=("backbone",),
                 )
             self.assertTrue(all(p.requires_grad for p in model.backbone.parameters()))
-            runtime = build_objective_model(model, loss={"kind": "kl"})
+            runtime = build_objective_model(
+                model, loss={"terms": {"token": {"kind": "kl"}}}
+            )
             prediction = next(
                 iter(
                     runtime.objective(

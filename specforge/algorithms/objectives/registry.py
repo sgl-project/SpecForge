@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
-from .compatibility import normalize_loss_settings
 from .configuration import (
     LossConfiguration,
     loss_definitions,
@@ -135,7 +134,7 @@ class ResolvedObjective:
 
 
 def resolve_objective(
-    architecture, *, name=None, options=None, loss=None, weighting=None, execution=None
+    architecture, *, name=None, options=None, loss=None, weighting=None
 ):
     """Resolve algorithm and loss settings without constructing a model.
 
@@ -145,7 +144,6 @@ def resolve_objective(
         options: Algorithm-specific objective constructor options.
         loss: Common mathematical loss configuration, or algorithm defaults.
         weighting: Common position-weighting configuration, or algorithm defaults.
-        execution: Loss execution options such as chunking and fused kernels.
 
     Returns:
         ResolvedObjective with the objective, concrete loss/weighting, execution
@@ -161,9 +159,11 @@ def resolve_objective(
     entry = _PROTOCOLS[name]
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
-    options, payload = normalize_loss_settings(name, options, loss, execution)
+    options = dict(options or {})
     objective = entry.factory(**options)
-    loss_configuration, execution = resolve_loss_configuration(objective, payload)
+    loss_configuration, execution = resolve_loss_configuration(
+        objective, {} if loss is None else loss
+    )
     _reject_shadowed_options(
         options,
         weighting is not None,
@@ -207,7 +207,6 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
-    execution=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -219,7 +218,6 @@ def build_objective_model(
         target_head: Optional teacher head; it is frozen and kept in eval mode.
         loss: Common mathematical loss configuration.
         weighting: Common position-weighting configuration.
-        execution: Loss execution configuration.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -235,7 +233,6 @@ def build_objective_model(
         options=options,
         loss=loss,
         weighting=weighting,
-        execution=execution,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
     if resolved.execution.teacher_chunk_size:

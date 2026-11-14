@@ -13,35 +13,32 @@ DSpine, MTP and DMTP. They reuse explicit-label CE/L1 loss primitives and functi
 sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiable
 KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
 KV caches to the backbone.
-This is an eager reference path, including dense vocabulary projections; fused
-losses, sparse attention and sequence parallel execution are not implemented here.
-MTP projects only supervised rows and checkpoints its chunked projection/loss;
-other protocols retain their existing execution paths.
-The legacy training path retains the optimized kernels. MTP/DMTP CE is evaluated
+Reference and optimized loss implementations share the same executor.
+Training wrappers with capabilities not yet migrated, such as sequence parallelism,
+remain available and read the same named loss configuration. MTP/DMTP CE is evaluated
 in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
 
 Loss and position weighting can be selected independently of the architecture:
 
 ```python
 runtime = build_objective_model(
-    draft, loss={"kind": "kl"}, weighting={"kind": "exponential", "gamma": 7.0}
+    draft, loss={"terms": {"token": {"kind": "kl"}}}, weighting={"kind": "exponential", "gamma": 7.0}
 )
 result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 ```
 
-`loss.kind` accepts `default`, `ce` (the protocol's labels: data tokens for block and
+`loss.terms.<name>.kind` accepts `ce` (the protocol's labels: data tokens for block and
 MTP protocols, the teacher's top-1 within the draft vocabulary for EAGLE3/P-EAGLE),
 `soft_ce`, `kl`, `reverse_kl`,
 `js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
-plus a frozen head. `default` preserves each algorithm's base loss. Selector,
+plus a frozen head. Omitting a term preserves its algorithm default. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
 Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
 `dpace`, `dpace-cumulative-confidence-only` or `dpace-continuation-value-only`
 (alpha, default 0.5).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
-factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, as are
-DSpark's `ce_loss_alpha`/`l1_loss_alpha` with an explicit loss. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
+factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, rather than silently ignored. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per
 position and accepts only uniform weighting. DFlash2 selector warmup
 and ramp accept either absolute steps or ratios of total optimizer steps.
 
@@ -306,28 +303,10 @@ LossConfiguration.bind() installs formulas and coefficients while preserving
 algorithm-owned joint ranges. The effective settings are stored in the resume
 contract. Users do not configure groups, implementation names or term execution.
 
-#### Legacy flat configuration
-
-Previous flat loss, loss_execution and algorithm loss coefficients are translated
-once by objectives/compatibility.py into named terms and the shared policy.
-Every runtime uses LossConfiguration; protocols contain no old/new loss branch.
-Do not mix old loss options with named settings. New configurations should use
-the layout above.
-
-Execution controls are separate from the objective, token loss and weighting:
-
-```yaml
-model:
-  use_fused_conv: true
-training:
-  loss_execution:
-    chunk_size: 128
-    checkpoint: true
-    fused: true
-    trim: true
-    # Vocabulary tile size for offline EAGLE/P-EAGLE teacher projection:
-    # teacher_chunk_size: 32768
-```
+Only the named configuration above is accepted. Flat loss dictionaries,
+separate `loss_execution`, old top-level loss flags, and loss coefficients in
+`objective_options` are rejected. Retained training wrappers consume the same
+configuration and reject formulas or scheduling they cannot execute.
 
 - `chunk_size` counts complete prediction units (blocks for block protocols,
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
@@ -376,24 +355,20 @@ The fused kernel accumulates in FP32 and rounds once, so
 BF16 results need not be bit-identical to eager per-tap rounding. Parameter names
 and checkpoint tensors do not change. Liger selection remains independent.
 
-Execution settings are saved and checked on full resume. Older canonical
-checkpoints without these fields are interpreted using the previous defaults.
-A checkpoint that enabled fused loss but did not record the selected implementations
-cannot prove kernel compatibility and is rejected for full resume.
-Existing recipes keep their previous defaults until explicitly migrated.
+Execution settings are saved and checked on full resume. Checkpoints must record
+the current named loss settings and execution policy; old loss metadata is not
+converted or assigned defaults. Fused runs must also record selected implementation
+identities. Import model weights and start a new run when this contract is absent.
 
-MTP accepts `objective_chunk_size` through objective options and maps the legacy
-`mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
-Other canonical objectives do not consume legacy `objective_chunk_blocks`,
-`objective_checkpointing`, `fused_logits_loss`, `mtp_objective_chunk_size` or
-`trim_loss_positions`. Non-default values fail validation; explicitly supplied
-legacy defaults produce a warning and do not enable those optimizations.
+MTP uses `loss.scheduling.chunk_size` to control loss projection chunks.
+Its objective's default chunk size remains 4096.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
 path. Neither is copied into the other. A canonical checkpoint supplied through
 `training.resume_from` also selects the canonical training route. Legacy DSpine
 imports through `initialization.checkpoint` must explicitly match saved training
-settings in `training.objective_options`; `weights_from` copies weights only.
+sampling settings in `training.objective_options`. Loss settings always come from
+the new training configuration; `weights_from` copies weights only.
 
 
 ### Extending loss execution
@@ -461,9 +436,8 @@ or use `register_token_kernel` for generic per-token optimization.
 applicability callbacks for inspection without a second routing table.
 
 Domino declares the base/final joint range; the shared selector matches
-domino_suffix_ce automatically. Historical objective_options.impl=domino_suffix_ce
-is translated at the input boundary to fused=true; it no longer pins a kernel.
-Other explicit implementation names are rejected.
+domino_suffix_ce automatically when fused is enabled. Explicit implementation
+names are not accepted.
 
 Implementations return weighted numerators by term index, plus predictions or
 requested statistics; they do not apply coefficients or final normalization.
@@ -560,13 +534,13 @@ not added to the canonical configuration.
 Parameters frozen by `training.frozen` or an objective must have loaded weights:
 a complete checkpoint, `weights_from`, `from_target`, or a target binding. An
 objective's frozen head that the draft disables (DSpark's confidence head at
-`confidence_loss_alpha: 0`) needs none.
+`loss.terms.confidence.coefficient: 0`) needs none.
 Freezing a newly initialized parameter fails before model allocation; partial
 imports must cover every frozen parameter, including tied aliases.
 
 Prepare canonical records from the run YAML used for training, so the records
 carry what its objective and loss read (for example `target_last_hidden_states`
-for `loss: {kind: kl}`):
+for `loss: {terms: {token: {kind: kl}}}`):
 
 ```bash
 python scripts/prepare_hidden_states.py -c /configs/run.yaml \

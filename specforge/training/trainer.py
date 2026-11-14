@@ -310,12 +310,6 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
-            if "canonical_objective_options" in resume_contract:
-                from specforge.algorithms.objectives.compatibility import (
-                    normalize_loss_checkpoint,
-                )
-
-                state = normalize_loss_checkpoint(state, model.objective_name)
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
@@ -362,21 +356,8 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if not persisted_available and key in (
-                    "canonical_loss_execution",
-                    "canonical_use_fused_conv",
-                ):
-
-                    from specforge.algorithms.objectives.execution_options import (
-                        LossExecution,
-                    )
-
-                    # Older canonical runs used exactly these execution defaults.
-                    comparison_persisted = (
-                        asdict(LossExecution())
-                        if key == "canonical_loss_execution"
-                        else False
-                    )
+                if not persisted_available and key == "canonical_use_fused_conv":
+                    comparison_persisted = False
                     persisted_available = True
                 if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(

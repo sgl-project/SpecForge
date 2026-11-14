@@ -252,9 +252,7 @@ class ExecutionSelection:
 
     def restore(self, names):
         """Set the saved selections to check when real prediction inputs arrive."""
-        # These previous names differed only by CE's requested output capability.
-        aliases = {"ce_statistics": "reference", "fused_ce_statistics": "token_ce"}
-        self._expected = {key: aliases.get(name, name) for key, name in names.items()}
+        self._expected = dict(names)
         self.names.clear()
 
     def resolve(self, request, group, prediction_index, *, fused=True):
