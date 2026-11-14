@@ -186,10 +186,6 @@ class RotaryPrecisionTest(unittest.TestCase):
             apply_rotary_pos_emb as dflash_rotate,
         )
 
-        from specforge.modeling.draft.llama3_eagle import (
-            apply_rotary_pos_emb as eagle_rotate,
-        )
-
         node = DefaultRoPESpec(
             interleaved=False, rope_theta=1e7, partial_rotary_factor=1.0
         )
@@ -200,16 +196,8 @@ class RotaryPrecisionTest(unittest.TestCase):
         q = torch.randn(1, 4, 2, 128, device="cuda", dtype=torch.bfloat16)
         rounded = tuple(t.bfloat16() for t in tables)
         eager, _ = dflash_rotate(q, q, *rounded)
-        # Legacy EAGLE indexes a full cache, whereas DFlash takes selected tables.
-        all_tables = build_rotary(node, head_dim=128)(
-            hidden, torch.arange(65536, device="cuda")[None]
-        )
-        compiled, _ = eagle_rotate(
-            q, q, *(t[None].bfloat16() for t in all_tables), positions
-        )
         actual = apply_rotary(q, tables)
         self.assertFalse(torch.equal(actual, eager))
-        self.assertFalse(torch.equal(actual, compiled))
         # Pin the one-final-cast choice, independently of either legacy path.
         first, second = q.float().chunk(2, dim=-1)
         expected = (

@@ -591,7 +591,9 @@ class TestDFlashSlidingDispatch(unittest.TestCase):
 class TestDFlashSlidingConfig(unittest.TestCase):
     def test_checked_in_qwen36_config_preserves_hybrid_layout(self):
         config_path = (
-            Path(__file__).resolve().parents[2] / "configs" / "qwen3.6-27b-dflash.json"
+            Path(__file__).resolve().parents[2]
+            / "tests/fixtures/legacy_drafts"
+            / "qwen3.6-27b-dflash.json"
         )
         config = Qwen3Config.from_json_file(str(config_path))
 

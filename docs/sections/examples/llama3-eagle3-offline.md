@@ -22,9 +22,8 @@ Llama target and EAGLE3 layer IDs. Then run the CPU preparation client:
 ```bash
 python scripts/prepare_hidden_states.py \
   --server-urls http://127.0.0.1:30000 \
-  --strategy eagle3 \
   --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-  --draft-model-config configs/llama3-8B-eagle3.json \
+  --draft specforge/config/draft/presets/llama3-8B-eagle3.yaml \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/sharegpt_train_Llama-3.1-8B-Instruct \
   --chat-template llama3 \
@@ -68,7 +67,7 @@ For long sequences, EAGLE3 offline can instead use USP by setting
 `training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
 also supports DFlash, DFlash2, Domino, and DSpark when the feature
 checkpoints and draft config use that strategy's contract.
-`training.loss.scheduling.teacher_chunk_size: 32768` enables
+`training.compact_teacher: true` enables
 the exact lower-memory teacher projection for offline text EAGLE3. See
 [Parallel topologies](../basic_usage/training.md#parallel-topologies) for the
 multi-process launch contract.

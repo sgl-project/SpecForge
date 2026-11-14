@@ -11,8 +11,8 @@ from specforge.config.draft.codec.components import encode_component
 from specforge.config.draft.codec.legacy.eagle_rope import resolve_eagle_rope
 from specforge.config.draft.codec.legacy.rules import resolve_rope
 from specforge.modeling.draft.layers.rope import build_rotary
-from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
 from tests.test_config.test_draft_llama3_rope import llama3_payload
+from tests.test_modeling.rotary_reference import LlamaRotaryEmbedding
 
 
 class Llama3RoPECodecParityTest(unittest.TestCase):

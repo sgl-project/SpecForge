@@ -308,6 +308,7 @@ class ArenaStoreFactoryTest(unittest.TestCase):
     def _cfg(self, receive_buffers):
         return Config.model_validate(
             {
+                "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                 "model": {"target_model_path": "target"},
                 "data": {"prompts_path": "prompts.jsonl"},
                 "deployment": {

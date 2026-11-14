@@ -10,6 +10,8 @@ from specforge.training.assembly import _prompt_cache_key
 
 def _cache_config(path: str):
     return SimpleNamespace(
+        draft="specforge/config/draft/presets/llama3-8B-eagle3.yaml",
+        initialization=None,
         data=SimpleNamespace(
             prompts_path="",
             train_data_path=path,
@@ -21,13 +23,13 @@ def _cache_config(path: str):
         ),
         model=SimpleNamespace(
             target_model_path="org/target-model",
-            draft_model_config="configs/draft.json",
+            draft_model_config="tests/fixtures/legacy_drafts/draft.json",
             draft_checkpoint_path=None,
             draft_num_hidden_layers=None,
             draft_block_size=None,
             input_modality="text",
         ),
-        training=SimpleNamespace(strategy="eagle3"),
+        training=SimpleNamespace(objective="eagle3"),
     )
 
 

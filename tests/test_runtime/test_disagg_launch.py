@@ -18,15 +18,15 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.contracts import assert_no_tensors
-from specforge.runtime.data_plane import LocalFeatureStore, OfflineManifestReader
+from specforge.runtime.data_plane import LocalFeatureStore
 from specforge.runtime.data_plane.disagg_ingest import (
     ingest_offline_features,
     read_ref_manifest,
     write_ref_manifest,
 )
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
@@ -56,7 +56,11 @@ class TestDisaggDataEquivalence(unittest.TestCase):
     def test_disagg_store_serves_identical_tensors(self):
         # Colocated path: OfflineManifestReader file:// refs over LocalFeatureStore.
         local = LocalFeatureStore("local")
-        offline_refs = OfflineManifestReader(self.feat_dir, run_id="off").read()
+        offline_refs = (
+            ALGORITHM.providers.offline_for("text")
+            .build_reader(self.feat_dir, run_id="off", ttt_length=7, max_len=2048)
+            .read()
+        )
 
         # Disagg path: ingest the same files into a SharedDirFeatureStore.
         shared = SharedDirFeatureStore(os.path.join(self.work, "store"), store_id="st")
@@ -78,6 +82,17 @@ class TestDisaggDataEquivalence(unittest.TestCase):
                 )
             local.release(off_h)
             shared.release(dis_h)
+
+    def test_packed_lengths_survive_disaggregated_ingestion(self):
+        path = os.path.join(self.feat_dir, "0000.ckpt")
+        raw = torch.load(path, weights_only=True)
+        raw["lengths"] = torch.tensor([7, 9])
+        torch.save(raw, path)
+        shared = SharedDirFeatureStore(os.path.join(self.work, "packed"), store_id="st")
+        ref = _ingest(shared, self.feat_dir, limit=1)[0]
+        tensors, handle = shared.get(ref)
+        torch.testing.assert_close(tensors["lengths"], raw["lengths"])
+        shared.release(handle)
 
     def test_manifest_roundtrips_and_carries_no_tensors(self):
         shared = SharedDirFeatureStore(
@@ -105,7 +120,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
 
         # a consumer can fetch the reconstructed refs from the shared store
         t, h = shared.get(loaded[0])
-        self.assertIn("hidden_state", t)
+        self.assertIn("hidden_states", t)
         shared.release(h)
 
     def test_retain_on_release_keeps_features_for_reiteration(self):
@@ -119,7 +134,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
         for _epoch in range(3):
             for r in refs:
                 t, h = store.get(r)
-                self.assertIn("hidden_state", t)
+                self.assertIn("hidden_states", t)
                 store.release(h)  # retained: file kept for the next epoch
         self.assertEqual(store.health()["resident_samples"], len(refs))
 

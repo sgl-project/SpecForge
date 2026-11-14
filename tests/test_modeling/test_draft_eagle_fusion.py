@@ -1,11 +1,12 @@
 """Model-owned EAGLE fusion matches the legacy first-layer wiring."""
 
+import copy
 import unittest
 from unittest.mock import patch
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.norm import RMSNormSpec
@@ -16,7 +17,6 @@ from specforge.modeling.draft.models.eagle_fusion import (
     AuxiliaryFeatureProjection,
     EagleDecoderStage,
 )
-from specforge.modeling.draft.peagle import PEagleFirstLayer
 from tests.test_config.test_draft_eagle3_spec import eagle_config
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
 from tests.test_modeling.test_draft_mla import prepare
@@ -75,13 +75,6 @@ class EagleFusionTest(unittest.TestCase):
                     normalize_features=normalized,
                     norm=config.norm_config,
                 )
-                # Call the unchanged legacy projection on a minimal owner so the
-                # test is independent of legacy model construction and caches.
-                from specforge.modeling.draft.llama3_eagle import (
-                    LlamaForCausalLMEagle3,
-                    LlamaRMSNorm,
-                )
-
                 reference = nn.Module()
                 reference.target_hidden_size = 32
                 reference.fc = nn.Linear(96, 16, bias=False)
@@ -96,8 +89,15 @@ class EagleFusionTest(unittest.TestCase):
                 features = torch.randn(2, 4, 96, requires_grad=True)
                 other = features.detach().clone().requires_grad_()
                 output = actual(features)
-                expected = LlamaForCausalLMEagle3.project_hidden_states(
-                    reference, other
+                chunks = other.split(32, -1)
+                expected = reference.fc(
+                    torch.cat(
+                        [
+                            reference.fc_norm[i](chunk) if normalized else chunk
+                            for i, chunk in enumerate(chunks)
+                        ],
+                        -1,
+                    )
                 )
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 grad = torch.randn_like(output)
@@ -127,28 +127,12 @@ class EagleFusionTest(unittest.TestCase):
                 actual = stage(
                     norm_before_residual=normalized_residual, device=device, dtype=dtype
                 )
-                config = LlamaConfig(
-                    hidden_size=16,
-                    intermediate_size=32,
-                    num_attention_heads=2,
-                    num_key_value_heads=1,
-                    head_dim=8,
-                    rms_norm_eps=1e-6,
-                    hidden_act="silu",
-                )
-                reference = PEagleFirstLayer(
-                    config, norm_before_residual=normalized_residual
-                ).to(device=device, dtype=dtype)
-                reference.load_state_dict(actual.state_dict(), strict=True)
+                reference = copy.deepcopy(actual)
                 hidden = torch.randn(
                     2, 4, 32, device=device, dtype=dtype, requires_grad=True
                 )
                 other = hidden.detach().clone().requires_grad_()
                 layout = layout_for(hidden)
-                causal = (
-                    layout.key_positions[:, None, None, :]
-                    <= layout.query_positions[:, None, :, None]
-                )
                 angles = torch.randn(2, 4, 4, device=device, dtype=dtype).repeat(
                     1, 1, 2
                 )
@@ -162,14 +146,19 @@ class EagleFusionTest(unittest.TestCase):
                         ),
                     ),
                 )
-                with patch(
-                    "specforge.modeling.draft.peagle.compile_friendly_flex_attention",
-                    eager_reference,
-                ):
-                    expected = reference(other, causal, embeddings)
-                torch.testing.assert_close(
-                    output, expected, rtol=tolerance, atol=tolerance
+                embeds, features = other.split(16, -1)
+                normalized = reference.hidden_norm(features)
+                residual = normalized if normalized_residual else features
+                update = reference.self_attn(
+                    torch.cat((reference.input_layernorm(embeds), normalized), -1),
+                    attention=prepare(reference.self_attn, layout, hidden.shape[0]),
+                    position_embeddings=tuple(table.float() for table in embeddings),
                 )
+                expected = residual + update
+                expected = expected + reference.mlp(
+                    reference.post_attention_layernorm(expected)
+                )
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 grad = torch.randn_like(output)
                 output.backward(grad)
                 expected.backward(grad)

@@ -15,9 +15,9 @@ from specforge.modeling.draft.layers.rope import (
     apply_rotary,
     build_rotary,
 )
-from specforge.modeling.draft.llama3_eagle import LlamaYarnRotaryEmbedding
 from tests.test_config.test_draft_eagle_rope_rules import yarn_settings
 from tests.test_modeling.mtp_reference import apply_rotary_pos_emb
+from tests.test_modeling.rotary_reference import LlamaYarnRotaryEmbedding
 
 
 def yarn_node(**overrides):

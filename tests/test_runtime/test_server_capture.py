@@ -26,7 +26,6 @@ from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import resolve_server_capture_layout
 from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
@@ -41,6 +40,7 @@ from specforge.inference.capture import (
 )
 from specforge.runtime.contracts import FeatureSpec, PromptTask, SampleRef
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 HIDDEN = 8
 AUX_LAYERS = (2, 5, 8)
@@ -229,10 +229,9 @@ def _eagle3_contract() -> CaptureConfig:
     return CaptureConfig.from_strategy(
         required_features={
             "input_ids",
-            "attention_mask",
             "loss_mask",
-            "hidden_state",
-            "target",
+            "hidden_states",
+            "target_last_hidden_states",
         },
         aux_hidden_state_layer_ids=AUX_LAYERS,
         target_repr="hidden_state",
@@ -264,9 +263,11 @@ def _dspark_contract() -> CaptureConfig:
 
 
 def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
-    registration = builtin_algorithm_registry().resolve(algorithm)
+    registration = builtin_algorithm_registry(teacher_metrics=teacher_metrics).resolve(
+        algorithm
+    )
     config = SimpleNamespace(
-        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+        training=SimpleNamespace(objective_options={"teacher_metrics": teacher_metrics})
     )
     layout = resolve_server_capture_layout(registration, config, modality="text")
     return ServerCaptureSchema(
@@ -441,11 +442,17 @@ class TestServerCaptureAdapter(unittest.TestCase):
             )
             length = len(task.payload["input_ids"])
             self.assertEqual(
-                ref.feature_specs["hidden_state"].shape,
+                ref.feature_specs["hidden_states"].shape,
                 (1, length, len(AUX_LAYERS) * HIDDEN),
             )
-            self.assertEqual(ref.feature_specs["target"].shape, (1, length, HIDDEN))
-            self.assertEqual(ref.feature_specs["target"].target_repr, "hidden_state")
+            self.assertEqual(
+                ref.feature_specs["target_last_hidden_states"].shape,
+                (1, length, HIDDEN),
+            )
+            self.assertEqual(
+                ref.feature_specs["target_last_hidden_states"].target_repr,
+                "hidden_state",
+            )
             # offline convention for the hidden_state train path: (B, L);
             # TargetHead.preprocess adds the trailing mask dim
             self.assertEqual(ref.feature_specs["loss_mask"].shape, (1, length))
@@ -535,7 +542,9 @@ class TestServerCaptureAdapter(unittest.TestCase):
             fetched.append({key: value.clone() for key, value in out.items()})
             store.release(handle)
         batch = collate(fetched)
-        self.assertEqual(["hidden_states", "input_ids", "loss_mask"], sorted(batch))
+        self.assertEqual(
+            ["attention_mask", "hidden_states", "input_ids", "loss_mask"], sorted(batch)
+        )
         self.assertEqual((2, 7, len(AUX_LAYERS) * HIDDEN), batch["hidden_states"].shape)
 
     def test_dspark_schema_includes_target_last_hidden(self):
@@ -777,31 +786,36 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
     def test_verify_specs_matches_tensor_verification_semantics(self):
         contract = _eagle3_contract()
+        names = dict(
+            aux_feature_name="hidden_states",
+            target_feature_name="target_last_hidden_states",
+        )
         specs = {
             n: FeatureSpec(name=n, shape=s, dtype="bfloat16")
             for n, s in {
                 "input_ids": (1, 4),
                 "attention_mask": (1, 4),
                 "loss_mask": (1, 4, 1),
-                "hidden_state": (1, 4, len(AUX_LAYERS) * HIDDEN),
-                "target": (1, 4, HIDDEN),
+                "hidden_states": (1, 4, len(AUX_LAYERS) * HIDDEN),
+                "target_last_hidden_states": (1, 4, HIDDEN),
             }.items()
         }
         verify_capture_specs(
-            specs, contract, sample_id="s0", recorded_aux_layer_ids=AUX_LAYERS
+            specs, contract, sample_id="s0", recorded_aux_layer_ids=AUX_LAYERS, **names
         )
         bad = dict(specs)
-        bad["hidden_state"] = FeatureSpec(
-            name="hidden_state", shape=(1, 4, HIDDEN), dtype="bfloat16"
+        bad["hidden_states"] = FeatureSpec(
+            name="hidden_states", shape=(1, 4, HIDDEN), dtype="bfloat16"
         )
         with self.assertRaises(CaptureMismatchError):
-            verify_capture_specs(bad, contract, sample_id="s0")
+            verify_capture_specs(bad, contract, sample_id="s0", **names)
         with self.assertRaises(CaptureMismatchError):
             verify_capture_specs(
                 specs,
                 contract,
                 sample_id="s0",
                 recorded_aux_layer_ids=(1, 2, 3),
+                **names,
             )
 
     def test_transport_requires_an_injected_capture_schema(self):
@@ -876,7 +890,7 @@ class TestServerCapturePluginTransport(unittest.TestCase):
             self.assertIsInstance(ref, SampleRef)
             length = len(task.payload["input_ids"])
             self.assertEqual(
-                ref.feature_specs["hidden_state"].shape,
+                ref.feature_specs["hidden_states"].shape,
                 (1, length, len(AUX_LAYERS) * HIDDEN),
             )
             out, handle = store.get(ref)

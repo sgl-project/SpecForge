@@ -5,13 +5,15 @@ import types
 import unittest
 from unittest import mock
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
+from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import (
     ModelBundle,
     _prepare_prompts,
     build_training_run,
 )
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -20,9 +22,9 @@ class TestEvalAssembly(unittest.TestCase):
     def test_prompt_preparation_honors_eval_path_and_cache_key_overrides(self):
         cfg = Config.model_validate(
             {
+                "draft": encode_config(draft_config()),
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
                 },
                 "data": {
                     "train_data_path": "/train.jsonl",
@@ -65,9 +67,9 @@ class TestEvalAssembly(unittest.TestCase):
     def test_offline_config_wires_eval_into_the_unified_runtime(self):
         cfg = Config.model_validate(
             {
+                "draft": encode_config(draft_config()),
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
                     "vocab_mapping_path": "mapping.pt",
                 },
                 "data": {

@@ -32,7 +32,7 @@ from specforge.modeling.draft.layers.rope import (
     build_rotary,
 )
 from specforge.modeling.draft.layers.rope.base import RotaryEmbedding
-from specforge.modeling.draft.llama3_eagle import (
+from tests.test_modeling.rotary_reference import (
     LlamaLinearScalingRotaryEmbedding,
     LlamaRotaryEmbedding,
 )

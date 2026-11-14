@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..inputs import gather, prepare_blocks
+from ..inputs import gather, prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..predictions import PredictionBatch
 from ..registry import TrainingRequirements, register_protocol
@@ -14,8 +14,9 @@ from .dflash import COMMON_MODULES
 
 @register_protocol(
     "dmtp",
-    legacy_strategy="dflash",
+    runtime_name="dflash",
     training=TrainingRequirements(
+        host_inputs=prepare_anchor_capacity,
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
     ),

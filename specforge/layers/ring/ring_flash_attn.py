@@ -1,5 +1,9 @@
 import torch
-from yunchang.kernels import AttnType, select_flash_attn_impl
+
+try:
+    from yunchang.kernels import AttnType, select_flash_attn_impl
+except ImportError as error:
+    raise ImportError("Ring attention requires yunchang") from error
 
 from .utils import RingComm, update_out_and_lse
 

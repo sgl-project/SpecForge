@@ -267,11 +267,7 @@ def _compute_model_resume_provenance(
     *,
     capture_layers: Optional[list[int]],
 ) -> dict[str, Any]:
-    draft_source = cfg.model.draft_model_config or getattr(
-        draft_config,
-        "_name_or_path",
-        None,
-    )
+    draft_source = cfg.draft if isinstance(cfg.draft, str) else None
     return {
         MODEL_SOURCE_IDENTITY_FORMAT_FIELD: MODEL_SOURCE_IDENTITY_FORMAT,
         "target_model": model_source_identity(cfg.model.target_model_path),

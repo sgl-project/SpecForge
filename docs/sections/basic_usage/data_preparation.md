@@ -274,9 +274,8 @@ checked-in Qwen3-8B DFlash recipe with:
 ```bash
 python scripts/prepare_hidden_states.py \
     --server-urls http://127.0.0.1:30000 \
-    --strategy dflash \
     --target-model-path Qwen/Qwen3-8B \
-    --draft-model-config configs/qwen3-8b-dflash.json \
+    --draft specforge/config/draft/presets/qwen3-8b-dflash.yaml \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/qwen3-8b-dflash-sharegpt \
     --chat-template qwen \
@@ -288,51 +287,21 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 
 | Strategy | Target model | Draft config | Output path used by the recipe |
 | --- | --- | --- | --- |
-| EAGLE3 | `Qwen/Qwen3-8B` | `configs/qwen3-8b-eagle3.json` | `cache/hidden_states/qwen3-8b-sharegpt` |
-| DFlash | `Qwen/Qwen3-8B` | `configs/qwen3-8b-dflash.json` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
-| Domino | `Qwen/Qwen3-8B` | `configs/qwen3-8b-domino.json` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
-| DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
+| EAGLE3 | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-eagle3.yaml` | `cache/hidden_states/qwen3-8b-sharegpt` |
+| DFlash | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-dflash.yaml` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
+| Domino | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-domino.yaml` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
+| DSpark | `Qwen/Qwen3-4B` | `specforge/config/draft/presets/qwen3-4b-dspark.yaml` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
-`--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
-reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
-passing the same explicit config used by training is recommended for every
-strategy. Capture layers come from the resolved draft config. EAGLE3 retains
-target-derived defaults for legacy configs that do not define
-`eagle_config.eagle_aux_hidden_state_layer_ids`.
-
-Each output record contains the strategy's exact offline feature contract:
-
-| Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
-| --- | --- |
-| EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
-| DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
-
-For the DFlash family, `hidden_states` concatenates the target layers selected
-by the draft config. DSpark additionally stores the target model's final hidden
-state for its L1 and confidence objectives. Keep each strategy in a separate
-output directory; the offline reader validates the contract instead of
-silently adapting incompatible features.
-
-DFlash2 feature preparation still uses `--strategy dflash`; pass a
-`DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture
-uses the intended `target_layer_ids`. Its convolution, selector, and selector
-loss schedule are draft/trainer concerns and do not add tensors to the offline
-record.
-
-D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
-uses `--strategy dflash`, but feature preparation must receive its DTA draft
-config so the captured layer contract matches the training run.
-
-For preformatted input, add `--is-preformatted` to the same command and keep
-`--chat-template` aligned with the template already applied to the text:
+`--draft` is required and accepts the same canonical YAML/JSON as training.
+Capture layers and output feature names are resolved from that complete draft.
+Use `--objective-options` for options that change required teacher features, such
+as `'{"teacher_metrics": false}'` for DFlash or a P-EAGLE `mask_token_id`.
 
 ```bash
 python scripts/prepare_hidden_states.py \
     --server-urls http://127.0.0.1:30000 \
-    --strategy eagle3 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config configs/llama3-8B-eagle3.json \
+    --draft specforge/config/draft/presets/llama3-8B-eagle3.yaml \
     --data-path ./your_preformatted_dataset.jsonl \
     --output-path ./cache/hidden_states/llama3.1-8b-eagle3 \
     --chat-template llama3 \

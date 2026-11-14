@@ -24,6 +24,7 @@ def sequence_inputs(
         query_positions=positions,
         key_positions=positions if key_positions is None else key_positions,
         visibility=visibility[:, None],
+        active_queries=visibility.any(-1),
     )
     return tuple(
         LayerInputs(
@@ -74,6 +75,27 @@ class Blocks:
     layer_inputs: tuple[LayerInputs, ...]
 
 
+def prepare_anchor_capacity(batch, config):
+    """Encode the host-side valid-anchor count in a tensor shape before H2D."""
+    if batch["loss_mask"].device.type != "cpu":
+        return {}
+    valid = valid_tokens(batch)
+    count = int((valid[:, :-1] & valid[:, 1:]).sum(-1).max())
+    return {"anchor_capacity": torch.empty(count, dtype=torch.bool)}
+
+
+def sample_anchors(valid, num_anchors, available=None):
+    """Sample sorted valid anchors, retaining masked padding for uneven rows."""
+    available = int(valid.sum(-1).max()) if available is None else available
+    count = min(num_anchors, max(1, available))
+    scores = torch.rand(valid.shape, device=valid.device).masked_fill(~valid, 2)
+    anchors = scores.argsort(-1)[:, :count]
+    keep = valid.gather(1, anchors)
+    anchors = anchors.masked_fill(~keep, valid.shape[1]).sort(-1).values
+    keep = anchors < valid.shape[1]
+    return anchors.masked_fill(~keep, 0), keep
+
+
 def prepare_blocks(
     config,
     batch,
@@ -96,13 +118,11 @@ def prepare_blocks(
     if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
         raise ValueError("block objectives require unpacked sequences")
     valid = supervised[:, :-1] & supervised[:, 1:]
-    count = min(num_anchors, max(1, int(valid.sum(-1).max())))
-    scores = torch.rand(valid.shape, device=ids.device).masked_fill(~valid, 2)
-    anchors = scores.argsort(-1)[:, :count]
-    keep = valid.gather(1, anchors)
-    anchors = anchors.masked_fill(~keep, ids.shape[1]).sort(-1).values
-    keep = anchors < ids.shape[1]
-    anchors = anchors.masked_fill(~keep, 0)
+    capacity = batch.get("anchor_capacity")
+    anchors, keep = sample_anchors(
+        valid, num_anchors, None if capacity is None else capacity.numel()
+    )
+    count = anchors.shape[1]
     spec, size = config.spec_config, config.spec_config.protocol.num_model_slots
     slots = torch.arange(size, device=ids.device)
     positions = anchors[..., None] + input_offset + slots
@@ -110,7 +130,8 @@ def prepare_blocks(
     labels = gather(ids, label_positions)
     predecessors = gather(ids, label_positions - 1)
     prediction = torch.zeros(size, dtype=torch.bool, device=ids.device)
-    prediction[list(spec.protocol.prediction_positions)] = True
+    for position in spec.protocol.prediction_positions:
+        prediction |= slots == position
     allowed = (
         keep[..., None]
         & (label_positions < ids.shape[1])
@@ -143,7 +164,10 @@ def prepare_blocks(
     visible = torch.cat((context_visible, draft_visible), dim=-1)
     visible &= keep.repeat_interleave(size, dim=1)[..., None]
     layout = AttentionLayout(
-        query_positions=query, key_positions=keys, visibility=visible[:, None]
+        query_positions=query,
+        key_positions=keys,
+        visibility=visible[:, None],
+        active_queries=keep.repeat_interleave(size, dim=1),
     )
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)

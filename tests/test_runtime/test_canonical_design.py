@@ -51,10 +51,7 @@ class CanonicalDesignTest(unittest.TestCase):
                 draft_config(),
                 training={"attention_backend": "sdpa", "objective": "custom"},
             )
-            with patch(
-                "specforge.algorithms.builtin.builtin_algorithm_registry",
-                side_effect=AssertionError("legacy registry used"),
-            ):
+            with patch.dict("sys.modules", {"specforge.algorithms.builtin": None}):
                 resolved = resolve_run(cfg)
             self.assertEqual(resolved.algorithm.name, "custom")
             self.assertEqual(
@@ -93,7 +90,12 @@ class CanonicalDesignTest(unittest.TestCase):
                     )
                 if draft.architecture in ("DFlash2DraftModel", "DMTPDraftModel"):
                     self.assertEqual(run.algorithm.name, "dflash")
-                    self.assertEqual(run.config.training.strategy, "dflash")
+                    self.assertEqual(
+                        run.config.training.objective,
+                        {"DFlash2DraftModel": "dflash2", "DMTPDraftModel": "dmtp"}[
+                            draft.architecture
+                        ],
+                    )
 
     def test_target_metadata_is_raw_and_shared_with_capture(self):
         with TemporaryDirectory() as temp:

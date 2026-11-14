@@ -20,7 +20,7 @@ def _linear_kernel():
     raise before importing the kernel. Missing packages or a missing output
     capability return None; the caller reports that fused linear CE is unavailable.
     """
-    from specforge.modeling.draft.dflash_kernels import LIGER_REQUIREMENT
+    from specforge.modeling.draft.layers.kernels import LIGER_REQUIREMENT
 
     requirement = Requirement(LIGER_REQUIREMENT)
     try:

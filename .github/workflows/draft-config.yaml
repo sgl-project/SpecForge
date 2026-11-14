@@ -26,7 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CUDA_VISIBLE_DEVICES: ''
-      TORCH_COMPILE_DISABLE: '1'
       OMP_NUM_THREADS: '2'
     steps:
       - uses: actions/checkout@v4
@@ -37,13 +36,13 @@ jobs:
         run: |
           python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install transformers==5.19.0 'pydantic>=2,<3' pyyaml
-      - name: Test legacy codec parity on CPU with eager execution
+      - name: Test canonical model composition and rotary parity on CPU
         run: >-
           python -m unittest
-          tests.test_modeling.test_draft_eagle3_codec
-          tests.test_modeling.test_draft_peagle_codec
+          tests.test_modeling.test_canonical_eagle3
+          tests.test_modeling.test_canonical_peagle
           tests.test_modeling.test_draft_mtp_codec
-          tests.test_modeling.test_draft_eagle_rope_codec -v
+          tests.test_modeling.test_draft_scaled_rotary -v
       - name: Test checkpoint loading and publication on CPU
         run: python -m unittest discover -s tests/test_checkpoint -t . -v
       - name: Test canonical training objectives on CPU

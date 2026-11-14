@@ -14,10 +14,18 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
 CUDA = torch.cuda.is_available()
+
+
+def write_legacy_draft_config(path):
+    """The retired exporter consumes historical JSON, not canonical fixtures."""
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_runtime_eagle.json"
+    Path(path).write_text(fixture.read_text())
+    return path
 
 
 class TestRoPEConfigCompatibility(unittest.TestCase):
@@ -115,7 +123,7 @@ class TestLegacyVocabMappingCompatibility(unittest.TestCase):
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="legacy_export_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = write_legacy_draft_config(
             os.path.join(self.tempdir.name, "draft.json")
         )
         self.vocab_path = fx.write_vocab_mapping(
@@ -174,7 +182,7 @@ class TestHFVocabMappingExport(unittest.TestCase):
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="hf_mapping_export_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = write_legacy_draft_config(
             os.path.join(self.tempdir.name, "draft.json")
         )
         old_path = fx.write_vocab_mapping(
@@ -255,7 +263,7 @@ class TestHFVocabMappingExport(unittest.TestCase):
         )
         self._assert_export(self.replacement)
 
-    def test_cli_mapping_override_with_external_embedding(self):
+    def test_retired_cli_rejects_old_options_while_legacy_reference_stays_exact(self):
         from click.testing import CliRunner
         from safetensors.torch import save_file
 
@@ -294,7 +302,17 @@ class TestHFVocabMappingExport(unittest.TestCase):
                 source,
             ],
         )
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No such option '--to'", result.output)
+        from specforge.export.legacy_hf import export_to_hf
+
+        export_to_hf(
+            self.checkpoint,
+            self.cfg_path,
+            self.output,
+            vocab_mapping_path=self.mapping_path,
+            embedding_source=source,
+        )
         # The embedding loader materializes in the export dtype, which follows
         # the checkpoint; this checkpoint is FP32, so the embedding stays FP32.
         self._assert_export(self.replacement)
@@ -308,7 +326,7 @@ class TestExportCheckpointPrecision(unittest.TestCase):
 
         self.tempdir = tempfile.TemporaryDirectory(prefix="export_precision_")
         self.addCleanup(self.tempdir.cleanup)
-        self.cfg_path = fx.write_draft_config(
+        self.cfg_path = write_legacy_draft_config(
             os.path.join(self.tempdir.name, "draft.json")
         )
         self.vocab_path = fx.write_vocab_mapping(
@@ -420,7 +438,9 @@ class TestExporters(unittest.TestCase):
 
         TTT, BS, N = 3, 2, 4
         cls.workdir = tempfile.mkdtemp(prefix="export_gate_")
-        cls.cfg_path = fx.write_draft_config(os.path.join(cls.workdir, "draft.json"))
+        cls.cfg_path = write_legacy_draft_config(
+            os.path.join(cls.workdir, "draft.json")
+        )
         target_dir = fx.write_target_head_dir(os.path.join(cls.workdir, "target"))
         cls.vocab_path = fx.write_vocab_mapping(os.path.join(cls.workdir, "vm.pt"))
         feat_dir = fx.write_offline_files(os.path.join(cls.workdir, "features"), n=N)

@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import OfflineCaptureLayout
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 
 class OfflineCaptureLayoutTest(unittest.TestCase):
@@ -18,8 +18,8 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
             "eagle3": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
-                "aux_hidden_state": "aux_hidden_states",
-                "hidden_state": "last_hidden_states",
+                "hidden_states": "aux_hidden_states",
+                "target_last_hidden_states": "last_hidden_states",
             },
             "dflash": {
                 "input_ids": "input_ids",
@@ -116,7 +116,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                     .providers.offline_for("text")
                     .build_normalizer(3)
                 )
-                with self.assertRaisesRegex(ValueError, "two consecutive"):
+                with self.assertRaisesRegex(ValueError, "loss-mask requirement"):
                     normalizer(raw)
 
     def test_duplicate_output_names_are_rejected(self):
