@@ -59,7 +59,7 @@ class MoEFFN(nn.Module):
     def forward(self, hidden: Tensor) -> MoEOutput:
         """The stream update in `hidden`'s shape, typed together with its routing."""
         x = hidden.reshape(-1, hidden.shape[-1])
-        _, indices, weights = self.gate(x)
+        scores, indices, weights = self.gate(x)
         out = self.experts(x, indices, weights, kernel=self.experts_kernel)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
@@ -68,7 +68,7 @@ class MoEFFN(nn.Module):
             out = out + shared
         # The routed sum is fp32; cast back once, after adding the shared expert.
         update = out.to(hidden.dtype).view(hidden.shape)
-        return MoEOutput(update=update, routing=ExpertRouting(indices))
+        return MoEOutput(update=update, routing=ExpertRouting(indices, scores))
 
 
 register_component_builder("mlp", MoEFFNSpec, MoEFFN)
