@@ -111,7 +111,7 @@ def _validate_algorithm_capabilities(
                 "distinct non-negative layer ids"
             )
 
-    if training.compact_teacher and (
+    if training.loss.get("scheduling", {}).get("teacher_chunk_size") and (
         not capabilities.supports_compact_teacher
         or mode is not FeatureMode.OFFLINE
         or cfg.model.input_modality != "text"
@@ -121,10 +121,13 @@ def _validate_algorithm_capabilities(
             f"mode={mode.value!r}, modality={cfg.model.input_modality!r}"
         )
 
-    if training.trim_loss_positions and not capabilities.supports_trim_loss_positions:
+    if (
+        training.loss.get("scheduling", {}).get("trim", False)
+        and not capabilities.supports_trim_loss_positions
+    ):
         raise ValueError(
             f"algorithm {algorithm.name!r} does not support "
-            "training.trim_loss_positions"
+            "training.loss.scheduling.trim"
         )
 
     if (

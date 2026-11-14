@@ -12,6 +12,11 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
+  loss:
+    fused: true
+  weighting:
+    kind: exponential
+    gamma: 7
   strategy: "domino"
   num_epochs: 10
   batch_size: 1
@@ -21,7 +26,6 @@ training:
   max_grad_norm: 1
   attention_backend: "sdpa"
   num_anchors: 16
-  loss_decay_gamma: 7
   lambda_base_start: 1
   lambda_base_decay_ratio: 1
   save_interval: 3000

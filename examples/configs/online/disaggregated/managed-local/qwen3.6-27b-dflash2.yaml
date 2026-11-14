@@ -16,6 +16,20 @@ data:
   build_dataset_num_proc: 64
 
 training:
+  loss:
+    fused: true
+    scheduling:
+      chunk_size: 128
+      checkpoint: false
+    terms:
+      token:
+        kind: lk_lambda
+        options: {}
+      selector:
+        coefficient: 1.0
+  weighting:
+    kind: dpace
+    alpha: 0.5
   # DFlash2 shares DFlash capture/data semantics; the draft architecture turns
   # on the local convolutions and candidate-selector objective.
   strategy: dflash
@@ -28,14 +42,8 @@ training:
   max_grad_norm: 1.0
   attention_backend: flex_attention
   num_anchors: 512
-  loss_decay_gamma: 7.0
-  lk_loss_type: lambda
-  loss_type: dpace
-  objective_chunk_blocks: 128
   # Measured without objective checkpointing: keep each chunk's logits for
   # backward instead of recomputing the 248k-vocabulary projection.
-  objective_checkpointing: false
-  dflash2_selector_loss_alpha: 1.0
   dflash2_selector_warmup_ratio: 0.0005
   dflash2_selector_ramp_ratio: 0.0005
   save_interval: 200

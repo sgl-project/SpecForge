@@ -33,6 +33,20 @@ data:
   dataloader_num_workers: 8
 
 training:
+  loss:
+    fused: true
+    scheduling:
+      chunk_size: 128
+    terms:
+      token:
+        options:
+          ce_weight: 0.1
+          l1_weight: 0.9
+      confidence:
+        coefficient: 1.0
+  weighting:
+    kind: exponential
+    gamma: 4.0
   strategy: dspark
   num_epochs: 2
   # 4 ranks x 32 microbatches -> global batch 128.
@@ -44,11 +58,6 @@ training:
   max_grad_norm: 1
   attention_backend: flex_attention
   num_anchors: 512
-  loss_decay_gamma: 4.0
-  objective_chunk_blocks: 128
-  dspark_ce_loss_alpha: 0.1
-  dspark_l1_loss_alpha: 0.9
-  dspark_confidence_head_alpha: 1.0
   save_interval: 128
   log_interval: 10
   dist_timeout: 30

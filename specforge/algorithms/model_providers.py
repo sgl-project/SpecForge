@@ -264,15 +264,22 @@ def build_eagle3_model(
     target_config: Any,
     _tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        resolve_wrapper_loss,
+        token_arguments,
+    )
+
+    settings = resolve_wrapper_loss(
+        cfg.training, "Eagle3DraftModel", scheduling=("trim", "teacher_chunk_size")
+    )
+
     from specforge.algorithms.eagle3.model import OnlineEagle3Model
 
     model = OnlineEagle3Model(
         draft_model=draft_model,
         length=cfg.training.ttt_length,
         attention_backend=cfg.training.attention_backend,
-        lk_loss_type=cfg.training.lk_loss_type,
-        kl_scale=cfg.training.kl_scale,
-        kl_decay=cfg.training.kl_decay,
+        **token_arguments(settings, teacher=True),
     ).to(device=_device(), dtype=_torch_dtype(cfg))
     needs_target_head = cfg.mode == "offline" or (
         cfg.deployment.mode == "disaggregated" and cfg.training.role == "consumer"
@@ -301,8 +308,16 @@ def build_peagle_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        require_term,
+        resolve_wrapper_loss,
+    )
+
+    settings = resolve_wrapper_loss(cfg.training, "PEagleDraftModel", scheduling=())
+
     from specforge.algorithms.peagle.model import OnlinePEagleModel
 
+    require_term(settings, "token", {"soft_ce"})
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
     model = OnlinePEagleModel(
         draft_model=draft_model,
@@ -338,8 +353,23 @@ def _build_dflash_family_model(
     draft_model: Any,
     tokenizer: Any,
     model_factory: Callable[[Dict[str, Any]], Any],
+    settings,
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+    if settings.weighting.kind not in {
+        "uniform",
+        "exponential",
+        "dpace",
+        "dpace-cumulative-confidence-only",
+        "dpace-continuation-value-only",
+    } or (
+        settings.name not in {"dflash", "dflash2"}
+        and settings.weighting.kind.startswith("dpace")
+    ):
+        raise ValueError(
+            "This training wrapper does not support the requested weighting"
+        )
 
     _validate_dflash_block_size(draft_model)
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
@@ -368,11 +398,16 @@ def _build_dflash_family_model(
         "block_size": int(draft_model.block_size),
         "attention_backend": cfg.training.attention_backend,
         "num_anchors": cfg.training.num_anchors,
-        "loss_decay_gamma": cfg.training.loss_decay_gamma,
-        "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
-        "objective_checkpointing": cfg.training.objective_checkpointing,
+        "loss_decay_gamma": settings.weighting.gamma,
+        "objective_chunk_blocks": (
+            128
+            if settings.execution.chunk_size is None
+            else settings.execution.chunk_size
+        ),
+        "objective_checkpointing": settings.execution.checkpoint,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
+    model.loss_decay_gamma = settings.weighting.gamma
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),
@@ -386,26 +421,55 @@ def build_dflash_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        require_term,
+        resolve_wrapper_loss,
+        token_arguments,
+    )
+
+    settings = resolve_wrapper_loss(
+        cfg.training,
+        (
+            "DFlash2DraftModel"
+            if hasattr(draft_model, "candidate_selector")
+            else "DFlashDraftModel"
+        ),
+        scheduling=("chunk_size", "checkpoint"),
+    )
+
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
+    if "selector" in settings.losses.terms:
+        require_term(settings, "selector", {"ce"}, coefficient=True)
     return _build_dflash_family_model(
         cfg,
         draft_model,
         tokenizer,
         lambda common: OnlineDFlashModel(
             **common,
-            loss_type=cfg.training.loss_type,
-            dpace_alpha=cfg.training.dpace_alpha,
-            selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
+            loss_type=(
+                "dflash"
+                if settings.weighting.kind in {"uniform", "exponential"}
+                else settings.weighting.kind
+            ),
+            dpace_alpha=(
+                settings.weighting.alpha
+                if settings.weighting.alpha is not None
+                else 0.5
+            ),
+            selector_loss_alpha=(
+                settings.losses.terms["selector"].coefficient
+                if "selector" in settings.losses.terms
+                else 0.0
+            ),
             selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
             selector_stop_gradient=cfg.training.dflash2_selector_stop_gradient,
-            lk_loss_type=cfg.training.lk_loss_type,
-            kl_scale=cfg.training.kl_scale,
-            kl_decay=cfg.training.kl_decay,
+            **token_arguments(settings),
             teacher_metrics=cfg.training.dflash_teacher_metrics,
-            fused_logits_loss=cfg.training.fused_logits_loss,
+            fused_logits_loss=settings.execution.fused,
         ),
+        settings,
     )
 
 
@@ -416,8 +480,19 @@ def build_domino_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        require_term,
+        resolve_wrapper_loss,
+    )
+
+    settings = resolve_wrapper_loss(
+        cfg.training, "DominoDraftModel", scheduling=("chunk_size", "checkpoint")
+    )
+
     from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 
+    for name in ("base", "final"):
+        require_term(settings, name, {"ce"})
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -425,8 +500,9 @@ def build_domino_model(
         lambda common: OnlineDominoModel(
             **common,
             shift_label=bool(getattr(draft_model, "shift_label", False)),
-            fused_logits_loss=cfg.training.fused_logits_loss,
+            fused_logits_loss=settings.execution.fused,
         ),
+        settings,
     )
 
 
@@ -437,19 +513,37 @@ def build_dspark_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        require_term,
+        resolve_wrapper_loss,
+    )
+
+    settings = resolve_wrapper_loss(
+        cfg.training, "DSparkDraftModel", scheduling=("chunk_size", "checkpoint")
+    )
+
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
+    require_term(settings, "token", {"ce_l1"}, options={"ce_weight", "l1_weight"})
+    require_term(settings, "confidence", {"bce"}, coefficient=True)
     return _build_dflash_family_model(
         cfg,
         draft_model,
         tokenizer,
         lambda common: OnlineDSparkModel(
             **common,
-            dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
-            dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
-            fused_logits_loss=cfg.training.fused_logits_loss,
-            dspark_confidence_head_alpha=(cfg.training.dspark_confidence_head_alpha),
+            dspark_ce_loss_alpha=settings.losses.terms["token"].loss.options[
+                "ce_weight"
+            ],
+            dspark_l1_loss_alpha=settings.losses.terms["token"].loss.options[
+                "l1_weight"
+            ],
+            fused_logits_loss=settings.execution.fused,
+            dspark_confidence_head_alpha=(
+                settings.losses.terms["confidence"].coefficient
+            ),
         ),
+        settings,
     )
 
 
@@ -460,23 +554,56 @@ def build_dspine_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
+    from specforge.algorithms.common.loss_settings import (
+        require_term,
+        resolve_wrapper_loss,
+    )
+
+    settings = resolve_wrapper_loss(
+        cfg.training, "DSpineDraftModel", scheduling=("chunk_size", "checkpoint")
+    )
+
     from specforge.algorithms.dspine.model import OnlineDSpineModel
 
+    token = require_term(
+        settings, "token", {"ce_l1"}, options={"ce_weight", "l1_weight"}
+    )
+    refinement = require_term(
+        settings, "refinement", {"ce_l1"}, options={"ce_weight", "l1_weight"}
+    )
+    require_term(settings, "alignment", {"cosine"}, coefficient=True)
+    if (
+        token.loss != refinement.loss
+        or abs(sum(token.loss.options.values()) - 1) > 1e-8
+    ):
+        raise ValueError(
+            "DSpine wrapper requires matching token/refinement weights summing to one"
+        )
     return _build_dflash_family_model(
         cfg,
         draft_model,
         tokenizer,
         lambda common: OnlineDSpineModel(
-            **common, fused_logits_loss=cfg.training.fused_logits_loss
+            **common,
+            fused_logits_loss=settings.execution.fused,
+            ce_weight=token.loss.options["ce_weight"],
+            alignment_weight=settings.losses.terms["alignment"].coefficient,
         ),
+        settings,
     )
 
 
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
-        "trim_loss_positions": cfg.training.trim_loss_positions,
-        "compact_teacher": cfg.training.compact_teacher,
-        "compact_teacher_chunk_size": cfg.training.compact_teacher_chunk_size,
+        "trim_loss_positions": cfg.training.loss.get("scheduling", {}).get(
+            "trim", False
+        ),
+        "compact_teacher": bool(
+            cfg.training.loss.get("scheduling", {}).get("teacher_chunk_size")
+        ),
+        "compact_teacher_chunk_size": cfg.training.loss.get("scheduling", {}).get(
+            "teacher_chunk_size"
+        ),
     }
 
 
