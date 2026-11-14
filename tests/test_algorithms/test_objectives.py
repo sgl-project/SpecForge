@@ -185,7 +185,9 @@ class ObjectiveTest(unittest.TestCase):
                 config, batch, num_anchors=2, label_offset=int(shifted)
             )
             captured = capture_projections(model)
-            runtime = build_objective_model(model, options={"num_anchors": 2})
+            runtime = build_objective_model(
+                model, options={"num_anchors": 2}, execution={"checkpoint": False}
+            )
             with (
                 patch(
                     "specforge.algorithms.objectives.protocols.domino.prepare_blocks",

@@ -230,7 +230,13 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             out = os.path.join(workdir, "out")
             model = Composite()
             model.loss_implementations = ExecutionSelection()
+            from dataclasses import asdict
+
+            from specforge.algorithms.objectives.protocols.domino import DominoObjective
+
+            model.objective = DominoObjective()
             contract = {
+                "canonical_objective_options": asdict(model.objective),
                 "canonical_loss_implementations": model.loss_implementations.names,
                 "canonical_loss_execution": {"fused": True},
             }
@@ -251,6 +257,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
             model = Composite()
             model.loss_implementations = ExecutionSelection()
+            model.objective = DominoObjective()
+            contract["canonical_objective_options"] = asdict(model.objective)
             contract["canonical_loss_implementations"] = (
                 model.loss_implementations.names
             )

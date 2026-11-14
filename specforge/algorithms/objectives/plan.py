@@ -13,11 +13,13 @@ class LossTerm:
     """One mathematical loss with optional supervision/reduction overrides.
 
     Attributes:
-        output: Projection output name, or auxiliary callback result name.
+        output: Named prediction output or value produced by the chunk computation.
         coefficient: Multiplier applied after the term's statistics are reduced.
         loss: Explicit loss, or None/default to inherit the runtime selection.
         mask: Optional [units, positions] supervision mask.
         weighting: Optional position-weighting rule.
+        reduction: "positions" applies token weights; "scalar" adds one already
+            normalized scalar per prediction set, without token weighting.
         denominator: Optional fixed scalar denominator for the whole prediction
             set, not each chunk. It must not require gradients.
     """
@@ -28,8 +30,18 @@ class LossTerm:
     mask: Tensor | None = None
     weighting: PositionWeighting | None = None
     denominator: Tensor | None = None
+    reduction: str = "positions"
+    name: str | None = None
 
     def __post_init__(self):
+        if self.reduction not in ("positions", "scalar"):
+            raise ValueError(f"Unknown term reduction: {self.reduction!r}")
+        if self.reduction == "scalar" and any(
+            item is not None for item in (self.mask, self.weighting, self.denominator)
+        ):
+            raise ValueError(
+                "Scalar losses must declare their normalization in the formula"
+            )
         if not self.output or not math.isfinite(self.coefficient):
             raise ValueError("Loss term requires an output and a finite coefficient")
         if self.denominator is not None:
@@ -61,23 +73,14 @@ class LossPlan:
         joint_groups: Non-overlapping tuples of at least two term indices.
             These permit joint execution but do not require a particular kernel
             or imply shared masks/denominators. Unlisted terms run independently.
-        auxiliary_terms: Named, already-computed auxiliary losses. They use the
-            same coefficient, mask, weighting and denominator rules as main terms;
-            their loss field must be None.
     """
 
     terms: tuple[LossTerm, ...] = (LossTerm(),)
     joint_groups: tuple[tuple[int, ...], ...] = ()
-    auxiliary_terms: tuple[LossTerm, ...] = ()
 
     def __post_init__(self):
         if not self.terms:
             raise ValueError("Loss plan must contain at least one term")
-        names = [term.output for term in self.auxiliary_terms]
-        if len(names) != len(set(names)):
-            raise ValueError("Auxiliary output names must be unique")
-        if any(term.loss is not None for term in self.auxiliary_terms):
-            raise ValueError("Auxiliary terms already contain computed loss values")
         seen = set()
         for group in self.joint_groups:
             if len(group) < 2:
@@ -88,11 +91,6 @@ class LossPlan:
                 if index in seen:
                     raise ValueError("Joint ranges must not overlap")
                 seen.add(index)
-
-    @property
-    def all_terms(self):
-        """Return main and auxiliary terms in reduction order."""
-        return self.terms + self.auxiliary_terms
 
     @property
     def groups(self):
@@ -106,8 +104,11 @@ class LossPlan:
     def shared_reduction(self):
         """Return whether every term inherits the prediction's reduction inputs."""
         return all(
-            term.mask is None and term.weighting is None and term.denominator is None
-            for term in self.all_terms
+            term.reduction == "positions"
+            and term.mask is None
+            and term.weighting is None
+            and term.denominator is None
+            for term in self.terms
         )
 
     def select(self, units):
@@ -122,5 +123,4 @@ class LossPlan:
         return replace(
             self,
             terms=tuple(term.select(units) for term in self.terms),
-            auxiliary_terms=tuple(term.select(units) for term in self.auxiliary_terms),
         )

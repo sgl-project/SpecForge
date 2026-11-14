@@ -4,47 +4,32 @@ import torch
 
 from specforge.losses import fused as fused_loss
 
-from ..losses import LossOutput, distillation_loss, lk_loss
-from .registry import GroupResult, register_implementation
+from ..losses import (
+    LossOutput,
+    ce_output_options,
+    ce_outputs,
+    combine_ce_l1,
+    distillation_loss,
+    lk_loss,
+)
+from .reference import result_group
+from .registry import register_implementation
 
 
-def ce_l1_terms(logits, labels, *, fused=False, selection=None, key=None, **options):
-    """Execute the CE/L1 primitive supplied to auxiliary callbacks.
-
-    Args:
-        logits: Scores with vocabulary in the last dimension.
-        labels: Token IDs aligned with the leading dimensions.
-        fused: Executor policy; protocols do not choose the kernel.
-        selection: Optional run-local implementation recorder.
-        key: Stable identity of this auxiliary primitive in the prediction plan.
-        **options: CE/L1 options, including teacher_logits and top_k.
-
-    Returns:
-        Unreduced CEL1Loss values. Empty inputs retain the zero-gradient path.
-        Unsupported fused environments raise instead of switching implementations.
-    """
-    if not fused:
-        return fused_loss.ce_l1_loss(logits, labels, **options)
-    error = None
-    if not fused_loss.supports_fused_ce_l1_loss(logits):
-        error = "fused CE/L1 requires CUDA/ROCm FP16/BF16/FP32 logits and Triton"
-    if selection is not None:
-        selection.record(key, "fused_ce_l1", error=error)
-    elif error is not None:
-        raise ValueError(error)
-    compute = fused_loss.fused_ce_l1_loss if logits.numel() else fused_loss.ce_l1_loss
-    return compute(logits, labels, **options)
+def _ce(logits, labels, teacher=None, **requested_outputs):
+    return ce_outputs(
+        fused_loss.fused_ce_l1_loss,
+        logits,
+        labels,
+        teacher,
+        **ce_output_options(requested_outputs),
+    )
 
 
-def _ce(logits, labels, teacher=None):
-    return ce_l1_terms(logits, labels, fused=True).cross_entropy
-
-
-def _ce_l1(logits, labels, teacher, *, ce_weight=0.1, l1_weight=0.9):
-    terms = ce_l1_terms(logits, labels, teacher_logits=teacher, fused=True)
-    return LossOutput(
-        ce_weight * terms.cross_entropy + l1_weight * terms.teacher_l1,
-        {"teacher_l1": terms.teacher_l1},
+def _ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
+    terms = fused_loss.fused_ce_l1_loss(logits, labels, teacher_logits=teacher)
+    return combine_ce_l1(
+        terms.cross_entropy, terms.teacher_l1, context, ce_weight, l1_weight
     )
 
 
@@ -67,20 +52,31 @@ def register_token_kernel(kind, compute):
     """
 
     def supports(request, group):
-        p = request.predictions
+        tensor = request.input_tensor
         if len(group) != 1 or request.terms[group[0]].loss.kind != kind:
             return "requires one matching token loss"
-        if not p.hidden.is_cuda:
+        if request.requested_outputs:
+            if kind != "ce":
+                return "token kernel does not provide requested extra outputs"
+            ce_output_options(request.requested_outputs)
+        if (
+            kind in ("lk_alpha", "lk_tv", "lk_lambda")
+            and request.terms[group[0]].loss.options.get("target") == "teacher"
+        ):
+            return "teacher LK uses the reference formula"
+        if not tensor.is_cuda:
             return "requires CUDA inputs"
-        if p.hidden.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             return "requires FP16/BF16/FP32"
+        if kind in ("ce", "ce_l1") and not fused_loss.supports_fused_ce_l1_loss(tensor):
+            raise ValueError("fused CE/L1 requires Triton")
         return None
 
-    @register_implementation("token_" + kind, supports=supports)
+    @register_implementation("token_" + kind, supports=supports, losses=(kind,))
     def execute(request, group):
         index = group[0]
-        term, inputs = request.predictions.plan.terms[index], request.terms[index]
-        logits = request.outputs()[term.output]
+        inputs = request.terms[index]
+        logits = request.tensor(index)
         loss = inputs.loss
         if loss.requires_teacher and (
             request.teacher is None or request.teacher.shape != logits.shape
@@ -96,14 +92,16 @@ def register_token_kernel(kind, compute):
             )
         kwargs = {"context": inputs.context} if loss.registration.contextual else {}
         result = compute(
-            logits, request.labels, request.teacher, **kwargs, **loss.options
+            logits,
+            request.labels,
+            request.teacher,
+            **kwargs,
+            **loss.options,
+            **request.requested_outputs,
         )
         if not isinstance(result, LossOutput):
             result = LossOutput(result)
-        return GroupResult(
-            {index: (result.values * inputs.weights).sum()},
-            statistics={index: result.statistics},
-        )
+        return result_group(request, index, result)
 
     return execute
 
@@ -121,4 +119,7 @@ for _kind, _compute in {
 }.items():
     register_token_kernel(_kind, distillation_loss(_compute))
 for _mode in ("alpha", "tv", "lambda"):
-    register_token_kernel("lk_" + _mode, lk_loss(_mode, ce_compute=_ce))
+    register_token_kernel(
+        "lk_" + _mode,
+        lk_loss(_mode, ce_compute=lambda logits, labels: _ce(logits, labels).values),
+    )

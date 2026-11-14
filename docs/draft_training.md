@@ -256,15 +256,15 @@ training:
 - `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
-  corrections without constructing full corrected logits. CPU, FP64 and missing
-  required dependencies raise rather than silently disabling the requested kernels.
-  Loss contracts without an optimized implementation use a logged reference.
+  corrections without constructing full corrected logits. CPU, FP64 and other
+  unsupported generic contracts use a logged reference. Missing required kernel
+  dependencies and incompatible explicit specializations raise.
   Empty inputs use the reference only to preserve zero gradients.
   The first selection for each prediction group is logged at INFO, checked across
   ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
 - `trim` defaults to false and skips prediction units with no supervised positions.
   It preserves explicit denominators and does not truncate recurrent blocks.
-  D-PACE keeps complete chains, and contextual LK losses keep all rows.
+  D-PACE keeps complete chains; prediction-scope losses and scalar terms keep all rows.
   Trimming also respects both prediction and projection chunk-safety declarations.
 - `teacher_chunk_size` enables compact teacher projection for offline
   vocabulary-aware protocols with a reduced vocabulary and a frozen linear
@@ -356,13 +356,34 @@ Fusion requires one complete block per
 projection unit, additive corrections on a contiguous suffix, and base/final CE
 terms with shared supervision weights. Other layouts use ordinary projection.
 
-Register mathematical formulas with `register_loss`. Register optimized group
-implementations with `register_implementation`, or use `register_token_kernel`
-for a per-token kernel. Implementations declare applicability and return weighted
-numerators by term index, plus any predicted tokens needed for metrics. They do
-not apply coefficients or normalization. Selection uses explicit priority and
-stable names; INFO logs report the first selection and fallback reasons. Kernel execution
-errors propagate rather than silently changing implementation.
+All final and intermediate calculations use `compute_loss(request, group, ...)`.
+The algorithm chooses the mathematical terms and their coefficients. The loss
+entry chooses how to evaluate them:
+
+| Mode | Arguments | Selection |
+| --- | --- | --- |
+| Reference | fused=False | Registered mathematical formula |
+| Optimized | fused=True | Highest-priority compatible implementation, otherwise reference |
+
+Generic kernels and projection-specific kernels participate in automatic selection.
+Support checks do not materialize projections. Missing required dependencies and
+execution failures propagate. There is no explicit implementation selector.
+
+Register formulas with `register_loss`; its optional `outputs` callback provides
+extra reference results without changing the formula. CE's L1/top-k outputs use
+the same reference and token CE paths, not separate statistics registrations.
+Register implementations with `register_implementation(category=..., losses=...)`,
+or use `register_token_kernel` for generic per-token optimization.
+`implementation_registrations()` exposes the names, categories, loss mapping and
+applicability callbacks for inspection without a second routing table.
+
+Domino declares its base/final joint range. Automatic selection can execute
+`domino_suffix_ce` when fusion is enabled and its input contract matches.
+
+Implementations return weighted numerators by term index, plus predictions or
+requested statistics; they do not apply coefficients or final normalization.
+Selection uses priority and stable names. INFO logs report the first selection
+and fallback reasons, and distributed/resume validation retains the actual name.
 
 Term statistics are combined across chunks before normalization. Independent
 masks/denominators require `sum_means` (normalize each prediction set) or
@@ -371,29 +392,55 @@ masks/denominators require `sum_means` (normalize each prediction set) or
 denominators and arbitrary accumulation-window normalization are not implemented.
 Existing trainer accumulation and protocol semantics are unchanged.
 
-Reference outputs are reused only within the current evaluation. No logits cache
-is stored on the model. Contextual losses retain whole-set execution; algorithms
-must disable chunking when their projection/auxiliary computation requires it.
-Auxiliary computations remain in their protocols. `LossPlan.auxiliary_terms`
-uses the same `LossTerm` coefficients, masks, position weights and denominators
-as main losses. Its `loss` field must be unset because the callback returns
-already-computed values, named by `output`, in `AuxiliaryLoss.values`.
-Names and shapes must match the declaration. Auxiliary masks participate in
-trimming, and fixed denominators are restored once after chunk reduction.
+Projection outputs and intermediate results are scoped to one chunk. No logits
+cache is stored on the model. Loss registrations distinguish context inputs from statistics scope: prediction-scope
+losses stay unsplit; per-position contextual losses can share fixed whole-set counts.
+Algorithms must set `chunk_safe=False` when their computation couples units.
 
-Reference losses may return `LossOutput(values, statistics)` instead of a tensor.
-Token kernels support the same result; group implementations return statistics
-by main-term index. The executor passes detached statistics to auxiliary callbacks,
-scoped to the current evaluation/chunk rather than stored on the model.
-The callback signature is `(predictions, outputs, teacher, weights, statistics, primitives)`.
-The executor supplies numerical callables through `primitives` (currently `ce_l1`).
-Protocols call them without selecting kernels or reading `execution.fused`.
-Auxiliary fused selections use the same logging, rank agreement and resume checks
-as main losses.
-DSpark reuses the main CE/L1 result's `teacher_l1` for confidence supervision;
-if another main loss supplies no L1, its callback computes the target through the supplied primitive.
-DFlash2 selector and DSpine refinement/alignment are separate named auxiliary terms.
-Existing auxiliary formulas and training coefficients are preserved.
+All objective terms live in `LossPlan.terms`. By default the executor runs its
+groups directly. Algorithms with dependent computations supply
+`Predictions.compute(calc)`, executed inside each chunk and checkpoint replay:
+
+- `calc.run((0,))` executes a declared term (or a joint group).
+- `calc.evaluate(key, loss, logits, labels, teacher=...)` requests per-position
+  values and statistics through the same implementation registry. Request extra
+  CE outputs explicitly with `return_teacher_l1=True` or `top_k=k`; these
+  do not change the mathematical loss or its coefficient.
+- `calc.add(index, values)` supplies a computed tensor to a declared
+  `TokenLoss("value")` term. It uses the same weighting and denominator rules.
+- `calc.ratios` holds additive metric pairs.
+
+Every declared term executes exactly once. Intermediate keys must be unique and
+stable across ranks, steps and checkpoint replays. Reference and optimized
+implementations share the result contract: weighted numerators for final terms,
+or differentiable per-position values for intermediate requests. Projection-fused
+implementations can decline requests requiring intermediate values.
+Statistics retain gradients; algorithms explicitly detach supervision targets.
+
+For example, DSpark reuses `teacher_l1` from the main loss, constructs a detached
+acceptance target, and requests BCE through the registry. DFlash2 requests top-k
+CE statistics, runs its selector, then requests candidate CE. DSpine similarly
+keeps refinement and alignment logic in its protocol. There is no separate
+primitive registry or auxiliary-loss execution channel.
+
+A MoE model can expose per-token router z-loss through `context_inputs` and add
+it as a value term with its own coefficient and mask. This preserves gradients
+to router parameters and supports additive chunk reduction. Load-balancing losses
+that depend on whole-batch expert statistics require whole-set execution and
+explicit normalization; do not recompute them independently per chunk. Router
+statistics, cross-rank aggregation, and optimizer-step updates remain model/training
+responsibilities, not loss-kernel responsibilities. Scalar model losses use `LossTerm(..., loss=TokenLoss("value"), reduction="scalar")`
+and `calc.add(index, scalar)`. Such a plan runs unsplit and untrimmed, counts the scalar
+once per prediction set, and applies no token mask or denominator. It requires
+sum_means or global_microbatch reduction. The latter averages local scalars across
+ranks; cross-rank expert statistics must be computed explicitly by the model.
+No router state updates run inside loss callbacks or checkpoint recomputation.
+
+Fused resume contracts include stable implementation identities for intermediate
+calls as well as final terms. Checkpoints using the previous auxiliary primitive
+identities fail the existing resume check rather than silently changing execution.
+The equivalent CE statistics names ce_statistics and fused_ce_statistics map to
+reference and token_ce on restore; other identity changes still fail.
 
 The fused soft CE kernel is new in this PR, rather than migrated from legacy.
 Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`
@@ -446,3 +493,17 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 `--draft /configs/eagle3.yaml` captures for the default objective and loss only.
 `-c`, `--draft` and the legacy `--draft-model-config` are mutually exclusive. The
 canonical YAML selects the architecture, capture layers and output schema.
+
+
+### Inspecting loss implementations
+
+Use `loss_registrations()` and `implementation_registrations()` to inspect the
+formula-to-implementation mapping. Each execution registration names its category,
+mathematical loss names, and a supports callback for dynamic constraints.
+
+
+Generate the implementation inventory directly from the registry:
+
+```bash
+python -m specforge.algorithms.objectives.implementations
+```

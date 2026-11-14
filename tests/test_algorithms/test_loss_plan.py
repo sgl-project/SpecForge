@@ -19,16 +19,13 @@ from specforge.algorithms.objectives.implementations import domino_ce  # noqa: F
 from specforge.algorithms.objectives.implementations.linear_ce import _linear_kernel
 from specforge.algorithms.objectives.implementations.registry import (
     _IMPLEMENTATIONS,
+    ExecutionSelection,
     GroupResult,
     register_implementation,
 )
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.plan import LossPlan, LossTerm
-from specforge.algorithms.objectives.predictions import (
-    AuxiliaryLoss,
-    PredictionBatch,
-    Predictions,
-)
+from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
 from specforge.algorithms.objectives.projection import LinearProjection, Projection
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
@@ -45,23 +42,37 @@ def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
 
 
 class DistributedPlan(nn.Module):
-    def __init__(self):
+    def __init__(self, scalar=False):
         super().__init__()
+        self.scalar = scalar
         self.head = nn.Linear(4, 9).double()
 
     def forward(self, hidden, labels, mask, other):
+        def compute(calc):
+            calc.run((0,))
+            calc.run((1,))
+            calc.add(2, calc.outputs()["logits"].square().mean(-1))
+            if self.scalar:
+                calc.add(3, calc.outputs()["logits"].square().mean())
+
         prediction = Predictions(
             hidden=hidden,
             projection=Projection(lambda x: {"logits": self.head(x)}),
             labels=labels,
             positions=torch.zeros_like(labels),
             mask=mask,
-            auxiliary=lambda p, out, teacher, weights, statistics, primitives: AuxiliaryLoss(
-                {"square": out["logits"].square().mean(-1)}
-            ),
+            compute=compute,
             plan=LossPlan(
-                (LossTerm(), LossTerm(coefficient=0.3, mask=other)),
-                auxiliary_terms=(LossTerm("square", 0.2, mask=other),),
+                (
+                    LossTerm(),
+                    LossTerm(coefficient=0.3, mask=other),
+                    LossTerm("square", 0.2, TokenLoss("value"), mask=other),
+                )
+                + (
+                    (LossTerm("router", 0.1, TokenLoss("value"), reduction="scalar"),)
+                    if self.scalar
+                    else ()
+                ),
             ),
         )
         return run(prediction, chunk=1, reduction="global_microbatch").loss
@@ -72,40 +83,42 @@ def distributed_reduction(rank, rendezvous):
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     try:
-        torch.manual_seed(19)
-        model = DistributedPlan()
-        reference = nn.Linear(4, 9).double()
-        reference.load_state_dict(model.head.state_dict())
-        wrapped = DistributedDataParallel(model)
-        expected = 0
-        for step in range(2):
-            hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
-                10 + step
-            )
-            labels = (torch.arange(6) + step).reshape(6, 1)
-            mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
-            other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
-            part = slice(rank * 3, (rank + 1) * 3)
-            (
-                wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
-            ).backward()
-            values = TokenLoss(kind="ce")(reference(hidden), labels)
-            expected = (
-                expected
-                + (
-                    (values * mask).sum() / mask.sum()
-                    + 0.3 * (values * other).sum() / other.sum()
-                    + 0.2
-                    * (reference(hidden).square().mean(-1) * other).sum()
-                    / other.sum()
+        for scalar in (False, True):
+            torch.manual_seed(19)
+            model = DistributedPlan(scalar=scalar)
+            reference = nn.Linear(4, 9).double()
+            reference.load_state_dict(model.head.state_dict())
+            wrapped = DistributedDataParallel(model)
+            expected = 0
+            for step in range(2):
+                hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
+                    10 + step
                 )
-                / 2
+                labels = (torch.arange(6) + step).reshape(6, 1)
+                mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
+                other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
+                part = slice(rank * 3, (rank + 1) * 3)
+                (
+                    wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
+                ).backward()
+                values = TokenLoss(kind="ce")(reference(hidden), labels)
+                expected = (
+                    expected
+                    + (
+                        (values * mask).sum() / mask.sum()
+                        + 0.3 * (values * other).sum() / other.sum()
+                        + 0.2
+                        * (reference(hidden).square().mean(-1) * other).sum()
+                        / other.sum()
+                        + (0.1 * reference(hidden).square().mean() if scalar else 0)
+                    )
+                    / 2
+                )
+            expected.backward()
+            torch.testing.assert_close(
+                tuple(p.grad for p in model.head.parameters()),
+                tuple(p.grad for p in reference.parameters()),
             )
-        expected.backward()
-        torch.testing.assert_close(
-            tuple(p.grad for p in model.head.parameters()),
-            tuple(p.grad for p in reference.parameters()),
-        )
         # Resolve before compute: every rank sees mismatches and dependency errors.
 
         from specforge.algorithms.objectives.implementations.registry import (
@@ -113,7 +126,7 @@ def distributed_reduction(rank, rendezvous):
             Implementation,
         )
 
-        request = SimpleNamespace(predictions=SimpleNamespace(hidden=hidden))
+        request = SimpleNamespace(input_tensor=hidden)
         for mismatch in (False, True):
             entry = Implementation(f"kernel_{rank if mismatch else 0}", 0, None, None)
             with patch(
@@ -189,7 +202,11 @@ class LossPlanTest(unittest.TestCase):
         )
         parameters = (hidden, *head.parameters())
         expected_grad = torch.autograd.grad(expected, parameters, retain_graph=True)
-        with patch.dict(_IMPLEMENTATIONS, clear=True):
+        with patch.dict(
+            _IMPLEMENTATIONS,
+            {k: v for k, v in _IMPLEMENTATIONS.items() if v.category == "reference"},
+            clear=True,
+        ):
             calls = []
 
             @register_implementation(
@@ -230,10 +247,23 @@ class LossPlanTest(unittest.TestCase):
                         torch.testing.assert_close(actual.loss, expected)
                         torch.testing.assert_close(gradients, expected_grad)
                         self.assertEqual(bool(calls), bool(groups))
+            # Empty ranks retain the same joint-selection sequence as populated ranks.
+            selection = ExecutionSelection()
+            execute_batch(
+                PredictionBatch((p.select(slice(0, 0)),), reduction="sum_means"),
+                TokenLoss("ce"),
+                PositionWeighting(),
+                training=True,
+                execution=LossExecution(fused=True),
+                selection=selection,
+            )
+            self.assertEqual(
+                selection.names, {"0:0,1": "test_joint", "0:2": "test_single"}
+            )
             with self.assertRaisesRegex(ValueError, "Independent term reductions"):
                 run(p, reduction="tokens")
 
-    def test_auxiliary_terms_have_independent_reductions(self):
+    def test_computed_terms_have_independent_reductions(self):
         torch.manual_seed(17)
         hidden = torch.randn(5, 1, 4, dtype=torch.float64, requires_grad=True)
         mask = torch.tensor([1, 0, 0, 0.5, 0], dtype=torch.float64)[:, None]
@@ -242,13 +272,11 @@ class LossPlanTest(unittest.TestCase):
         weighting = PositionWeighting(kind="exponential", gamma=2)
         positions = torch.arange(5)[:, None]
 
-        def auxiliary(p, output, teacher, weights, statistics, primitives):
-            return AuxiliaryLoss(
-                {
-                    "square": output["logits"].square().mean(-1),
-                    "absolute": output["logits"].abs().mean(-1),
-                }
-            )
+        def compute(calc):
+            calc.run((0,))
+            output = calc.outputs()
+            calc.add(1, output["logits"].square().mean(-1))
+            calc.add(2, output["logits"].abs().mean(-1))
 
         p = Predictions(
             hidden=hidden,
@@ -256,13 +284,23 @@ class LossPlanTest(unittest.TestCase):
             mask=mask,
             labels=labels,
             positions=positions,
-            auxiliary=auxiliary,
+            compute=compute,
             plan=LossPlan(
-                terms=(LossTerm(coefficient=0.7, denominator=torch.tensor(3.0)),),
-                auxiliary_terms=(
-                    LossTerm("square", 0.2, mask=other, weighting=weighting),
+                terms=(
+                    LossTerm(coefficient=0.7, denominator=torch.tensor(3.0)),
                     LossTerm(
-                        "absolute", 0.3, mask=other, denominator=torch.tensor(7.0)
+                        "square",
+                        0.2,
+                        TokenLoss("value"),
+                        mask=other,
+                        weighting=weighting,
+                    ),
+                    LossTerm(
+                        "absolute",
+                        0.3,
+                        TokenLoss("value"),
+                        mask=other,
+                        denominator=torch.tensor(7.0),
                     ),
                 ),
             ),
@@ -285,15 +323,14 @@ class LossPlanTest(unittest.TestCase):
             mask=torch.zeros_like(mask),
             plan=replace(
                 p.plan,
-                auxiliary_terms=tuple(
-                    replace(term, mask=torch.zeros_like(other))
-                    for term in p.plan.auxiliary_terms
+                terms=tuple(
+                    replace(term, mask=torch.zeros_like(other)) for term in p.plan.terms
                 ),
             ),
         )
         self.assertEqual(run(empty, chunk=1).loss.item(), 0)
-        with self.assertRaisesRegex(ValueError, "declared term names"):
-            run(replace(p, auxiliary=lambda *args: AuxiliaryLoss({})))
+        with self.assertRaisesRegex(ValueError, "every declared loss term"):
+            run(replace(p, compute=lambda calc: None))
 
     def test_dspark_reuses_l1_statistics(self):
         devices = ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
@@ -309,64 +346,269 @@ class LossPlanTest(unittest.TestCase):
                 key: value.to(device) for key, value in training_batch(config).items()
             }
             p = next(iter(runtime.objective(runtime, batch).predictions))
-
-            def reuse(prediction, outputs, teacher, weights, statistics, primitives):
-                self.assertFalse(statistics[0]["teacher_l1"].requires_grad)
-                unused = Mock(side_effect=AssertionError("L1 should be reused"))
-                return p.auxiliary(
-                    prediction, outputs, teacher, weights, statistics, {"ce_l1": unused}
-                )
-
-            def recompute(
-                prediction, outputs, teacher, weights, statistics, primitives
-            ):
-                return p.auxiliary(
-                    prediction, outputs, teacher, weights, {}, primitives
-                )
-
             for fused in (False, True) if device == "cuda" else (False,):
-                results = [
-                    execute_batch(
-                        PredictionBatch((replace(p, auxiliary=callback),)),
-                        TokenLoss(kind="ce_l1"),
+                results = []
+                for reuse in (True, False):
+
+                    def compute(calc):
+                        original_run = calc.run
+
+                        def run_group(group=None):
+                            original_run(group)
+                            if group == (0,) and not reuse:
+                                calc.statistics.clear()
+
+                        with (
+                            patch.object(calc, "run", side_effect=run_group),
+                            patch.object(
+                                calc, "evaluate", wraps=calc.evaluate
+                            ) as evaluate,
+                        ):
+                            p.compute(calc)
+                        keys = [call.args[0] for call in evaluate.call_args_list]
+                        self.assertEqual("distance" in keys, not reuse)
+
+                    result = execute_batch(
+                        PredictionBatch((replace(p, compute=compute),)),
+                        TokenLoss("ce_l1"),
                         PositionWeighting(),
                         training=True,
                         execution=LossExecution(fused=fused, checkpoint=False),
                     )
-                    for callback in (reuse, recompute)
-                ]
-                torch.testing.assert_close(results[0].loss, results[1].loss)
-                torch.testing.assert_close(
-                    torch.autograd.grad(results[0].loss, p.hidden, retain_graph=True)[
-                        0
-                    ],
-                    torch.autograd.grad(results[1].loss, p.hidden, retain_graph=True)[
-                        0
-                    ],
-                )
-            # A different main loss supplies no L1; the callback uses the injected primitive.
-            calls = []
+                    gradient = torch.autograd.grad(
+                        result.loss, p.hidden, retain_graph=True
+                    )[0]
+                    results.append((result.loss, gradient))
+                torch.testing.assert_close(results[0], results[1])
 
-            def fallback(prediction, outputs, teacher, weights, statistics, primitives):
-                compute = Mock(wraps=primitives["ce_l1"])
-                result = p.auxiliary(
-                    prediction,
-                    outputs,
-                    teacher,
-                    weights,
-                    statistics,
-                    {"ce_l1": compute},
-                )
-                calls.append(compute.call_count)
-                return result
+    def test_router_loss_uses_shared_reduction_and_keeps_gradients(self):
+        torch.manual_seed(13)
+        hidden = torch.randn(4, 1, 5, requires_grad=True)
+        router = nn.Linear(5, 3)
+        labels = torch.zeros(4, 1, dtype=torch.long)
+        mask = torch.tensor([1.0, 0.0, 0.5, 1.0])[:, None]
+        router_mask = torch.tensor([0.0, 1.0, 1.0, 1.0])[:, None]
+        # A model-owned, differentiable router z-loss; no new loss backend needed.
+        z_loss = router(hidden).logsumexp(-1).square()
 
-            execute_batch(
-                PredictionBatch((replace(p, auxiliary=fallback),)),
-                TokenLoss(kind="ce"),
-                PositionWeighting(),
-                training=True,
+        def compute(calc):
+            calc.run((0,))
+            calc.add(1, calc.predictions.context_inputs["router_z"])
+
+        p = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            mask=mask,
+            positions=torch.zeros_like(labels),
+            context_inputs={"router_z": z_loss},
+            compute=compute,
+            plan=LossPlan(
+                (
+                    LossTerm(),
+                    LossTerm("router_z", 0.1, TokenLoss("value"), mask=router_mask),
+                )
+            ),
+        )
+        expected = (TokenLoss("ce")(hidden, labels) * mask).sum() / mask.sum() + 0.1 * (
+            z_loss * router_mask
+        ).sum() / router_mask.sum()
+        parameters = (hidden, *router.parameters())
+        gradient = torch.autograd.grad(expected, parameters, retain_graph=True)
+        for chunk in (0, 1, 3):
+            actual = run(p, chunk=chunk)
+            torch.testing.assert_close(actual.loss, expected)
+            torch.testing.assert_close(
+                torch.autograd.grad(actual.loss, parameters, retain_graph=True),
+                gradient,
             )
-            self.assertEqual(calls, [1])
+
+    def test_whole_batch_router_balance_is_not_recomputed_per_chunk(self):
+        router_logits = torch.randn(4, 1, 3, requires_grad=True)
+        labels = torch.zeros(4, 1, dtype=torch.long)
+        mask = torch.tensor([1.0, 0.0, 1.0, 1.0])[:, None]
+        calls = []
+
+        def balance(logits, mask):
+            probs = logits.softmax(-1)
+            frequency = torch.nn.functional.one_hot(probs.argmax(-1), 3).to(probs)
+            count = mask.sum()
+            return (
+                3
+                * (
+                    (probs * mask[..., None]).sum((0, 1))
+                    / count
+                    * (frequency * mask[..., None]).sum((0, 1))
+                    / count
+                ).sum()
+            )
+
+        def compute(calc):
+            calc.run((0,))
+            calls.append(calc.predictions.hidden.shape[0])
+            value = balance(calc.predictions.hidden, calc.predictions.mask)
+            # Explicitly represent the batch mean as a constant per-token value.
+            calc.add(1, value.expand_as(calc.predictions.mask))
+
+        p = Predictions(
+            hidden=router_logits,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            positions=torch.zeros_like(labels),
+            mask=mask,
+            compute=compute,
+            chunk_safe=False,
+            plan=LossPlan((LossTerm(), LossTerm("balance", 0.1, TokenLoss("value")))),
+        )
+        actual = run(p, chunk=1)
+        expected = (
+            TokenLoss("ce")(router_logits, labels) * mask
+        ).sum() / mask.sum() + 0.1 * balance(router_logits, mask)
+        self.assertEqual(calls, [4])
+        torch.testing.assert_close(actual.loss, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual.loss, router_logits)[0],
+            torch.autograd.grad(expected, router_logits)[0],
+        )
+
+    def test_extra_outputs_do_not_change_the_ce_loss(self):
+        hidden = torch.randn(3, 1, 5, requires_grad=True)
+        teacher = torch.randn_like(hidden)
+        labels = torch.zeros(3, 1, dtype=torch.long)
+
+        def compute(calc):
+            result = calc.evaluate(
+                "ce_with_statistics",
+                TokenLoss(kind="ce"),
+                calc.outputs()["logits"],
+                calc.labels,
+                teacher=teacher,
+                return_teacher_l1=True,
+                top_k=2,
+            )
+            torch.testing.assert_close(
+                result.values, TokenLoss(kind="ce")(hidden, labels)
+            )
+            torch.testing.assert_close(
+                result.statistics["teacher_l1"],
+                (hidden.softmax(-1) - teacher.softmax(-1)).abs().sum(-1),
+            )
+            torch.testing.assert_close(
+                result.statistics["topk_values"], hidden.topk(2).values
+            )
+            calc.add(0, result.values)
+
+        prediction = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            mask=torch.ones_like(labels),
+            positions=torch.zeros_like(labels),
+            compute=compute,
+            plan=LossPlan((LossTerm("ce_value", loss=TokenLoss("value")),)),
+        )
+        actual = run(prediction).loss
+        expected = TokenLoss(kind="ce")(hidden, labels).mean()
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual, hidden)[0],
+            torch.autograd.grad(expected, hidden)[0],
+        )
+        with self.assertRaisesRegex(ValueError, "unknown ce options"):
+            TokenLoss(kind="ce", options={"teacher_l1": True})
+
+    def test_new_statistics_belong_to_the_mathematical_loss(self):
+        from specforge.algorithms.objectives.losses import _LOSSES, LossOutput
+
+        def outputs(logits, labels, teacher, options, requested, context):
+            self.assertEqual(requested, {"return_entropy": True})
+            logp = logits.log_softmax(-1)
+            return LossOutput(
+                TokenLoss("ce")(logits, labels),
+                {"entropy": -(logp.exp() * logp).sum(-1)},
+            )
+
+        def compute(calc):
+            calc.run((0,))
+            result = calc.evaluate(
+                "entropy",
+                TokenLoss("ce"),
+                calc.outputs()["logits"],
+                calc.labels,
+                return_entropy=True,
+            )
+            calc.add(1, result.statistics["entropy"])
+
+        with patch.dict(_LOSSES, {"ce": replace(_LOSSES["ce"], outputs=outputs)}):
+            for length in (0, 3):
+                hidden = torch.randn(length, 1, 5, requires_grad=True)
+                labels = torch.zeros(length, 1, dtype=torch.long)
+                p = Predictions(
+                    hidden=hidden,
+                    projection=Projection(lambda x: {"logits": x}),
+                    labels=labels,
+                    mask=torch.ones_like(labels),
+                    positions=torch.zeros_like(labels),
+                    compute=compute,
+                    plan=LossPlan(
+                        (LossTerm(), LossTerm("entropy", 0.2, TokenLoss("value")))
+                    ),
+                )
+                actual = run(p, chunk=1)
+                logp = hidden.log_softmax(-1)
+                expected = (
+                    TokenLoss("ce")(hidden, labels).sum()
+                    - 0.2 * (logp.exp() * logp).sum()
+                ) / max(length, 1)
+                torch.testing.assert_close(actual.loss, expected)
+                torch.testing.assert_close(
+                    torch.autograd.grad(actual.loss, hidden)[0],
+                    torch.autograd.grad(expected, hidden)[0],
+                )
+
+    def test_intermediate_and_final_losses_use_the_same_registry(self):
+        hidden = torch.randn(3, 1, 5, requires_grad=True)
+        labels = torch.zeros(3, 1, dtype=torch.long)
+        calls = []
+        reference = _IMPLEMENTATIONS["reference"]
+
+        def observe(request, group):
+            calls.append(request.unreduced)
+            return reference.compute(request, group)
+
+        def compute(calc):
+            calc.run((0,))
+            result = calc.evaluate(
+                "ce", TokenLoss("ce"), calc.outputs()["logits"], calc.labels
+            )
+            # Intermediate values keep gradients until the algorithm detaches them.
+            self.assertTrue(result.values.requires_grad)
+            calc.add(1, result.values)
+            with self.assertRaisesRegex(ValueError, "Repeated computation key"):
+                calc.evaluate(
+                    "ce", TokenLoss("ce"), calc.outputs()["logits"], calc.labels
+                )
+
+        p = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            positions=torch.zeros_like(labels),
+            mask=torch.ones_like(labels),
+            compute=compute,
+            plan=LossPlan((LossTerm(), LossTerm("second", loss=TokenLoss("value")))),
+        )
+        with patch.dict(
+            _IMPLEMENTATIONS, {"reference": replace(reference, compute=observe)}
+        ):
+            result = run(p)
+        self.assertEqual(calls, [False, True])
+        expected = 2 * TokenLoss("ce")(hidden, labels).mean()
+        torch.testing.assert_close(result.loss, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(result.loss, hidden)[0],
+            torch.autograd.grad(expected, hidden)[0],
+        )
 
     def test_trim_preserves_cross_unit_computation(self):
         for safe_projection in (False, True):
@@ -398,7 +640,7 @@ class LossPlanTest(unittest.TestCase):
     def test_projection_execution_constraints(self):
         head = nn.Linear(4, 9)
         for options, expected_calls in (
-            ({"chunk_safe": False}, [4]),
+            ({"chunk_safe": False}, [4, 4]),
             ({"recompute_safe": False}, [1, 1, 1, 1]),
         ):
             with self.subTest(options=options):
@@ -446,7 +688,11 @@ class LossPlanTest(unittest.TestCase):
             labels=torch.zeros(2, 1, dtype=torch.long),
             positions=torch.zeros(2, 1, dtype=torch.long),
         )
-        with patch.dict(_IMPLEMENTATIONS, clear=True):
+        with patch.dict(
+            _IMPLEMENTATIONS,
+            {k: v for k, v in _IMPLEMENTATIONS.items() if v.category == "reference"},
+            clear=True,
+        ):
 
             @register_implementation("broken", supports=lambda req, group: None)
             def broken(req, group):
@@ -525,6 +771,33 @@ class LossPlanTest(unittest.TestCase):
                 actual_grad, gradients, rtol=tolerance, atol=tolerance * 0.02
             )
             torch.testing.assert_close(actual.ratios, expected.ratios)
+
+            def compute(calc):
+                calc.run((0,))
+                calc.add(1, calc.predictions.hidden.square().mean(-1))
+
+            regularized = replace(
+                p,
+                compute=compute,
+                plan=LossPlan(
+                    (LossTerm(), LossTerm("router", 0.1, TokenLoss("value")))
+                ),
+            )
+            reference = run(regularized, chunk=2)
+            reference_grad = torch.autograd.grad(reference.loss, parameters)
+            project.reset_mock()
+            actual = run(regularized, fused=True, chunk=2)
+            project.assert_not_called()
+            torch.testing.assert_close(
+                actual.loss, reference.loss, rtol=tolerance, atol=2e-5
+            )
+            torch.testing.assert_close(
+                torch.autograd.grad(actual.loss, parameters),
+                reference_grad,
+                rtol=tolerance,
+                atol=tolerance * 0.02,
+            )
+
             with patch(
                 "specforge.algorithms.objectives.implementations.linear_ce._linear_kernel",
                 return_value=None,
@@ -554,35 +827,32 @@ class LossPlanTest(unittest.TestCase):
         gradients = torch.autograd.grad(
             expected.loss, parameters, retain_graph=True, allow_unused=True
         )
-        cases = (
-            (p, True),
-            (replace(p, plan=replace(p.plan, joint_groups=())), False),
-            (replace(p, projection=Projection(p.projection.project)), False),
-            (
-                replace(
-                    p,
-                    projection=replace(
-                        p.projection, block_size=p.projection.block_size + 1
-                    ),
-                ),
-                False,
-            ),
-        )
-        for prediction, fused in cases:
-            entry = _IMPLEMENTATIONS["domino_suffix_ce"]
-            optimized = Mock(wraps=entry.compute)
-            with patch.dict(
-                _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
-            ):
-                actual = run(
-                    prediction,
-                    fused=True,
-                    chunk=1,
-                )
-                actual_grad = torch.autograd.grad(
-                    actual.loss, parameters, retain_graph=True, allow_unused=True
-                )
-            self.assertEqual(bool(optimized.call_count), fused)
-            torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
-            torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
-            torch.testing.assert_close(actual.ratios, expected.ratios)
+
+        def compute(calc):
+            calc.run((0, 1))
+            calc.run((2,))
+
+        prediction = replace(p, compute=compute)
+        entry = _IMPLEMENTATIONS["domino_suffix_ce"]
+        optimized = Mock(wraps=entry.compute)
+        with patch.dict(
+            _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
+        ):
+            actual = run(prediction, fused=True, chunk=1)
+            actual_grad = torch.autograd.grad(
+                actual.loss, parameters, retain_graph=True, allow_unused=True
+            )
+        self.assertGreater(optimized.call_count, 0)
+        torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
+        torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
+        torch.testing.assert_close(actual.ratios, expected.ratios)
+        for projection in (
+            Projection(p.projection.project),
+            replace(p.projection, block_size=p.projection.block_size + 1),
+        ):
+            fallback = run(
+                replace(prediction, projection=projection), fused=True, chunk=1
+            )
+            torch.testing.assert_close(
+                fallback.loss, expected.loss, rtol=3e-4, atol=3e-5
+            )

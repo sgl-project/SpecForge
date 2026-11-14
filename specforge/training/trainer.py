@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
+from dataclasses import asdict
 from typing import Callable, Mapping, Optional
 
 import torch
@@ -327,6 +328,10 @@ class Trainer:
                 persisted_available = key in state
                 comparison_current = current
                 comparison_persisted = persisted
+                if key == "canonical_objective_options" and persisted_available:
+                    # Resolve newly added optional fields through the objective's
+                    # own defaults, while retaining strict checks on effective values.
+                    comparison_persisted = asdict(type(model.objective)(**persisted))
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,
@@ -355,7 +360,6 @@ class Trainer:
                     "canonical_loss_execution",
                     "canonical_use_fused_conv",
                 ):
-                    from dataclasses import asdict
 
                     from specforge.algorithms.objectives.execution_options import (
                         LossExecution,
