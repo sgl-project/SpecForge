@@ -69,6 +69,29 @@ class Eagle3DraftModel(DraftPreTrainedModel):
             hidden = self.backbone.final_norm(hidden)
         return self.lm_head(hidden)
 
+    def new_rollout(self, backend=None, *, ring_group=None, ulysses_group=None):
+        """Create a cache owned by one caller; it is never saved in model state."""
+        from ..layers.attention.gqa import GQAAttention
+        from .eagle_rollout import EagleRollout, FullEagleRollout
+
+        attention = self.backbone.layers[0].self_attn
+        backend = backend or attention.backend
+        if not isinstance(attention, GQAAttention):
+            if backend in ("fa", "usp"):
+                raise ValueError("cached Flash/USP requires GQA/MHA")
+            return FullEagleRollout(self)
+        if backend in ("fa", "usp") and (
+            not attention.config.is_causal
+            or attention.config.sliding_window is not None
+            or attention.config.attention_dropout != 0
+        ):
+            raise ValueError(
+                "cached Flash/USP requires causal full attention without dropout"
+            )
+        return EagleRollout(
+            self, backend, ring_group=ring_group, ulysses_group=ulysses_group
+        )
+
     def forward(
         self,
         input_ids: Tensor,
