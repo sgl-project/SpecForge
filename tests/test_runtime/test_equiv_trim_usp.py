@@ -1,23 +1,8 @@
 # coding=utf-8
-"""trim_loss_positions under USP sequence parallelism.
+"""Canonical trim/full loss parity on one GPU and four-rank USP.
 
-Three layers, so CI keeps guarding the USP row-selection math even on hosts
-without four GPUs:
-
-1. ``TestTrimPackGolden`` (CPU) -- hand-derived literal tables for the per-step
-   row sets: the overlap-tail bound (``s - j < chunk_len``), dead-step padding,
-   the unreachable-supervision fallback, and non-USP back-compat.
-2. ``TestTrimLossAnalytic`` (one GPU) -- with zero logits and normalized
-   teachers every masked row's loss is exactly ``ln(draft_vocab)``, so the
-   trim-scaled and full-shaped losses must both hit a closed-form constant.
-3. ``TestEquivTrimUspFourRank`` (four GPUs + flash-attn, like
-   ``test_equiv_4rank``) -- per-step loss parity, trim ON vs OFF, on a real
-   ring-4 offline pipeline across three adversarial masks: all-supervised
-   (trivial-equality boundary: any row/denominator error is exposed without
-   tolerance cover), supervision straddling every rank boundary
-   (overlap-tail-as-teacher), and supervision only inside one rank's overlap
-   tail (dead steps plus ranks with no supervision at all, which fall back to
-   the full path -- the mixed-path collective-alignment hazard).
+The single-GPU gate checks the closed-form zero-logit loss. The distributed
+gate compares supervised, boundary and overlap-tail masks across four ranks.
 """
 
 import json
@@ -26,7 +11,6 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 
 import torch
 
@@ -47,145 +31,6 @@ def _has_standard_flash_attention() -> bool:
     except Exception:
         return False
     return True
-
-
-class TestTrimPackGolden(unittest.TestCase):
-    """Hand-derived expected outputs for _build_trim_pack (CPU only)."""
-
-    def _mk(self, mask_list, seed=1, vocab=32, draft=8):
-        g = torch.Generator().manual_seed(seed)
-        ids = torch.randperm(vocab, generator=g)[:draft].sort().values
-        t2d = torch.zeros(vocab, dtype=torch.bool)
-        t2d[ids] = True
-        L = len(mask_list)
-        lm = torch.tensor(mask_list, dtype=torch.long).view(1, L, 1)
-        tgt = torch.randn(1, L, vocab, generator=g)
-        return tgt, t2d, lm
-
-    def test_usp_tail_bound(self):
-        # C=6, ttt=2, local_len=8, supervised {4,5,6}; 6 is an overlap-tail
-        # position: a legal teacher, never a loss row.
-        #   step0: {s : s-0 < 6} = {4,5}   -> rows [4,5],   n=2
-        #   step1: all of {4,5,6}          -> rows [3,4,5], n=3
-        from specforge.algorithms.eagle3.model import _build_trim_pack
-
-        tgt, t2d, lm = self._mk([0, 0, 0, 0, 1, 1, 1, 0])
-        p = _build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6)
-        self.assertEqual(p["full_len"], 6)
-        self.assertEqual(p["sup"].tolist(), [4, 5, 6])
-        self.assertEqual(p["rows_steps"][0].tolist(), [4, 5])
-        self.assertEqual(p["keep_steps"][0].tolist(), [0, 1])
-        self.assertEqual(p["nrows_steps"][0], 2)
-        self.assertEqual(p["rows_steps"][1].tolist(), [3, 4, 5])
-        self.assertEqual(p["nrows_steps"][1], 3)
-
-    def test_usp_dead_step(self):
-        # Supervision only at {6,7} (pure tail). Position 7 can never reach a
-        # row (needs j >= 2) and is filtered; 6 is unreachable at step 0.
-        from specforge.algorithms.eagle3.model import _build_trim_pack
-
-        tgt, t2d, lm = self._mk([0, 0, 0, 0, 0, 0, 1, 1])
-        p = _build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6)
-        self.assertEqual(p["sup"].tolist(), [6])
-        self.assertEqual(p["nrows_steps"][0], 0)  # dead step
-        self.assertEqual(p["rows_steps"][0].tolist(), [0])  # padded dummy
-        self.assertEqual(p["rows_steps"][1].tolist(), [5])
-        self.assertEqual(p["nrows_steps"][1], 1)
-
-    def test_unreachable_supervision_falls_back(self):
-        from specforge.algorithms.eagle3.model import _build_trim_pack
-
-        tgt, t2d, lm = self._mk([0, 0, 0, 0, 0, 0, 0, 1])
-        self.assertIsNone(_build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6))
-
-    def test_empty_supervision_falls_back(self):
-        from specforge.algorithms.eagle3.model import _build_trim_pack
-
-        tgt, t2d, lm = self._mk([0] * 8)
-        self.assertIsNone(_build_trim_pack(tgt, t2d, lm, length=2, chunk_len=6))
-
-    def test_reuses_position_mask_from_teacher_computation(self):
-        from specforge.algorithms.eagle3 import model as eagle_model
-
-        tgt, t2d, lm = self._mk([0, 1, 0, 1])
-        nrows = 2
-        draft_vocab = int(t2d.sum())
-        teacher = (
-            torch.zeros(1, nrows, draft_vocab),
-            torch.zeros(1, nrows, draft_vocab),
-            torch.zeros(1, nrows, dtype=torch.long),
-            torch.full((1, nrows, 1), 7),
-        )
-        with mock.patch.object(
-            eagle_model, "_compute_target_p_eager", return_value=teacher
-        ):
-            pack = eagle_model._build_trim_pack(tgt, t2d, lm, length=2)
-
-        self.assertIs(pack["position_mask_sup"], teacher[3])
-
-    def test_non_usp_backcompat(self):
-        # chunk_len=None -> C=L: the pre-USP semantics, plus full_len now comes
-        # from the row count rather than the (possibly padded) mask length.
-        from specforge.algorithms.eagle3.model import _build_trim_pack
-
-        tgt, t2d, lm = self._mk([1, 0, 0, 0, 1, 0, 0, 1])
-        p = _build_trim_pack(tgt, t2d, lm, length=2)
-        self.assertEqual(p["full_len"], 8)
-        self.assertEqual(p["rows_steps"][0].tolist(), [0, 4, 7])
-        self.assertEqual(p["rows_steps"][1].tolist(), [3, 6])
-        self.assertEqual(p["keep_steps"][1].tolist(), [1, 2])
-        self.assertEqual(p["nrows_steps"][1], 2)
-
-
-class TestTrimAdapterViews(unittest.TestCase):
-    def _inputs(self):
-        return {
-            "global_input_ids": torch.arange(8).view(1, 8),
-            "hidden_states": torch.arange(24).view(1, 8, 3),
-            "attention_mask": torch.ones(1, 8),
-            "position_ids": torch.arange(16).view(1, 16),
-        }
-
-    def test_default_adapter_keeps_full_backbone_view(self):
-        from specforge.core.eagle3_adapters import BackendAdapter
-
-        adapter = BackendAdapter(model=None)
-        inputs = self._inputs()
-        self.assertEqual(adapter.backbone_row_count(seq_length=8, ttt_length=2), 8)
-
-        view = adapter.backbone_view(row_count=8, **inputs)
-
-        self.assertIs(view.input_ids, inputs["global_input_ids"])
-        self.assertIs(view.hidden_states, inputs["hidden_states"])
-        self.assertIs(view.attention_mask, inputs["attention_mask"])
-        self.assertIs(view.position_ids, inputs["position_ids"])
-
-    def test_usp_adapter_owns_chunk_and_position_slicing(self):
-        from specforge.core import eagle3_adapters
-
-        world_sizes = {"sp": 4, "ulysses": 2}
-        with (
-            mock.patch.object(eagle3_adapters, "get_draft_sp_group", return_value="sp"),
-            mock.patch.object(
-                eagle3_adapters, "get_sp_ulysses_group", return_value="ulysses"
-            ),
-            mock.patch.object(
-                eagle3_adapters.dist,
-                "get_world_size",
-                side_effect=lambda group: world_sizes[group],
-            ),
-        ):
-            adapter = eagle3_adapters.UspAdapter(model=None)
-
-        inputs = self._inputs()
-        row_count = adapter.backbone_row_count(seq_length=8, ttt_length=2)
-        view = adapter.backbone_view(row_count=row_count, **inputs)
-
-        self.assertEqual(row_count, 6)
-        self.assertEqual(view.input_ids.shape, (1, 6))
-        self.assertEqual(view.hidden_states.shape, (1, 6, 3))
-        self.assertEqual(view.attention_mask.shape, (1, 6))
-        self.assertEqual(view.position_ids.shape, (1, 6))
 
 
 @unittest.skipUnless(CUDA, "loss kernel is a Triton kernel")
@@ -314,10 +159,11 @@ def _worker(rank, world_size, port, workdir):
                     return [
                         execute_batch(
                             PredictionBatch([prediction], reduction="sum_means"),
-                            model.token_loss,
+                            None,
                             model.weighting,
                             training=True,
                             execution=execution,
+                            selection=model.loss_implementations,
                         ).loss.item()
                         for prediction in predictions
                     ]

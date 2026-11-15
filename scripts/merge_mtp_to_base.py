@@ -13,10 +13,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model-path", required=True)
     parser.add_argument("--mtp-checkpoint-path", required=True)
-    parser.add_argument(
-        "--draft-config",
-        help="Supplementary JSON for config-less historical checkpoints",
-    )
     parser.add_argument("--output-path", required=True)
     parser.add_argument(
         "--key-format",
@@ -33,7 +29,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
     export_draft(
         args.mtp_checkpoint_path,
-        args.draft_config,
         args.output_path,
         target_model=args.base_model_path,
         copy_target=args.copy_target,

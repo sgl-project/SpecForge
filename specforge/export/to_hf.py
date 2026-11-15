@@ -16,7 +16,6 @@ from typing import Optional
 
 def export_to_hf(
     checkpoint_path: str,
-    draft_config_path: str,
     output_dir: str,
     *,
     vocab_mapping_path: Optional[str] = None,
@@ -36,7 +35,6 @@ def export_to_hf(
         )
     return export_draft(
         checkpoint_path,
-        draft_config_path,
         output_dir,
         export_mode="standalone",
         target_model=target_model,
@@ -61,7 +59,6 @@ def write_hf(checkpoint, state, model_class, output_dir):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=export_to_hf.__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--draft-config", default=None)
     parser.add_argument("--target-model", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--vocab-mapping", default=None)
@@ -74,7 +71,6 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     out = export_to_hf(
         args.checkpoint,
-        args.draft_config,
         args.output_dir,
         vocab_mapping_path=args.vocab_mapping,
         embedding_source=args.embedding_source,

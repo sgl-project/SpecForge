@@ -5,42 +5,14 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from scripts.merge_mtp_to_base import main
 from specforge.application.composition import resolve_run
 from specforge.config import load_config
-from specforge.config.draft.codec import decode_legacy_config
-from specforge.training.canonical import resolve_config
-from tests.test_config.test_draft_legacy_dflash import CONFIGS
-from tests.test_config.test_draft_legacy_mtp import mtp_payload
-from tests.test_runtime.test_canonical_training import run_config, target_directory
 
 
 class RetiredExportTest(unittest.TestCase):
-    def test_bundled_legacy_files_require_checkpoint_import(self):
-        for path in sorted(CONFIGS.glob("*.json")):
-            with self.subTest(path=path.name):
-                payload = json.loads(path.read_text())
-                options = (
-                    {"mask_token_id": 1}
-                    if payload["architectures"] == ["PEagleDraftModel"]
-                    else {}
-                )
-                target = {
-                    "hidden_size": payload["hidden_size"],
-                    "vocab_size": payload["vocab_size"],
-                    "num_hidden_layers": payload.get("num_target_layers", 128),
-                }
-                expected = decode_legacy_config(
-                    payload, **options, target_config=target
-                )
-                cfg = run_config(path.parent, expected).model_copy(
-                    update={"draft": str(path)}
-                )
-                with self.assertRaises(ValueError):
-                    resolve_config(cfg, target_config=target)
 
     def test_old_merge_cli_delegates_to_checked_native_export(self):
         with patch("scripts.merge_mtp_to_base.export_draft") as export:
@@ -56,7 +28,6 @@ class RetiredExportTest(unittest.TestCase):
             )
         export.assert_called_once_with(
             "draft",
-            None,
             "output",
             target_model="target",
             copy_target=True,
@@ -105,26 +76,6 @@ class RetiredExportTest(unittest.TestCase):
                 self.assertLess(
                     max(capture.aux_layer_ids), target["num_hidden_layers"] - 1
                 )
-
-    def test_legacy_config_file_resolves_through_codec(self):
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = target_directory(root)
-            payload = mtp_payload() | {"hidden_size": 32, "vocab_size": 64}
-            expected = decode_legacy_config(
-                payload, target_config={"hidden_size": 32, "vocab_size": 64}
-            )
-            path = root / "old.json"
-            path.write_text(json.dumps(payload))
-            cfg = run_config(target, expected).model_copy(update={"draft": str(path)})
-            with self.assertRaises(ValueError):
-                resolve_config(cfg)
-            self.assertEqual(
-                decode_legacy_config(
-                    payload, target_config={"hidden_size": 32, "vocab_size": 64}
-                ),
-                expected,
-            )
 
 
 if __name__ == "__main__":

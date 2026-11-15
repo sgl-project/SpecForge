@@ -1,4 +1,4 @@
-"""Historical MTP weights/outputs survive removal of its model implementation."""
+"""Canonical MTP preserves the saved independent outputs and gradients."""
 
 import json
 import unittest
@@ -11,20 +11,19 @@ from safetensors.torch import load_file, save_file
 from specforge.algorithms.objectives.inputs import sequence_inputs
 from specforge.loading import load_draft, read_draft
 
-FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/legacy_mtp"
+FIXTURE = Path(__file__).resolve().parents[1] / "fixtures/mtp_reference"
 
 
 class MTPCodecParityTest(unittest.TestCase):
-    def test_saved_legacy_outputs_and_gradients(self):
+    def test_saved_outputs_and_gradients(self):
         reference = load_file(FIXTURE / "reference.safetensors")
-        weights = load_file(FIXTURE / "model.safetensors")
         with TemporaryDirectory() as temp:
             target = Path(temp)
             (target / "config.json").write_text(
                 json.dumps({"hidden_size": 32, "vocab_size": 64})
             )
             save_file(
-                {"model.embed_tokens.weight": weights["embed_tokens.weight"]},
+                {"model.embed_tokens.weight": reference["target_embedding"]},
                 target / "model.safetensors",
             )
             artifact = read_draft(FIXTURE, target=target)

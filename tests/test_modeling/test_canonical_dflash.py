@@ -175,14 +175,3 @@ class CanonicalDFlashTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-def legacy_name(name):
-    for prefix, replacement in (
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-        ("fusion.", ""),
-    ):
-        if name.startswith(prefix):
-            return replacement + name[len(prefix) :]
-    return None

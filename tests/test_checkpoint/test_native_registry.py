@@ -98,7 +98,6 @@ class NativeRegistryTest(unittest.TestCase):
                 output = Path(tmp) / "output"
                 export_draft(
                     "checkpoint",
-                    None,
                     output,
                     export_mode="native",
                     target_model=target,

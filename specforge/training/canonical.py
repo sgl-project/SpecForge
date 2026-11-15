@@ -5,16 +5,6 @@ from functools import partial
 from pathlib import Path
 
 
-def _is_canonical_checkpoint(cfg, source):
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-
-    path = resolve_checkpoint_path(
-        source, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    config = (path.parent if path.is_file() else path) / "config.json"
-    return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
-
-
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
@@ -41,17 +31,11 @@ def resolve_config(cfg, *, target_config=None):
     if source:
         from specforge.loading import read_draft
 
-        canonical = _is_canonical_checkpoint(cfg, source)
-        if cfg.resume_path and not canonical:
-            raise ValueError(
-                "Historical optimizer states cannot resume after the training cutover; use initialization.checkpoint to import weights"
-            )
         loaded = read_draft(
             source,
             target=cfg.model.target_model_path,
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
-            legacy_config=initialization.legacy_config if initialization else None,
         ).config
         if supplied is not None and supplied != loaded:
             raise ValueError(
@@ -103,69 +87,6 @@ def _objective_settings(cfg):
     )
 
 
-def _validate_imported_objective(cfg, resolved):
-    """Require explicit preservation of recorded legacy DSpine training settings."""
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-    from specforge.config.draft.codec.legacy.dspine import (
-        extract_dspine_training_settings,
-    )
-
-    payloads = []
-    draft = cfg.draft
-    if isinstance(draft, str):
-        import yaml
-
-        draft = yaml.safe_load(Path(draft).read_text())
-    if isinstance(draft, dict):
-        payloads.append(draft)
-    init = cfg.initialization
-    if init is not None and init.checkpoint is not None:
-        source = resolve_checkpoint_path(
-            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-        )
-        directory = source.parent if source.is_file() else source
-        payloads.append(read_json(init.legacy_config or directory / "config.json"))
-    for payload in payloads:
-        if payload.get("model_type") == "specforge_draft" or payload.get(
-            "architectures"
-        ) != ["DSpineDraftModel"]:
-            continue
-        for name, saved in extract_dspine_training_settings(payload).items():
-            if name == "ce_weight":
-                values = {
-                    f"loss.terms.{term}.options.{key}": (
-                        configured.loss.options[key],
-                        expected,
-                    )
-                    for term, configured in resolved.losses.terms.items()
-                    if term in {"token", "refinement"}
-                    and configured.loss.kind == "ce_l1"
-                    for key, expected in (
-                        ("ce_weight", saved),
-                        ("l1_weight", 1 - saved),
-                    )
-                }
-            elif name == "alignment_weight":
-                values = {
-                    "loss.terms.alignment.coefficient": (
-                        resolved.losses.terms["alignment"].coefficient,
-                        saved,
-                    )
-                }
-            else:
-                values = {
-                    f"objective_options.{name}": (
-                        getattr(resolved.objective, name),
-                        saved,
-                    )
-                }
-            for path, (current, expected) in values.items():
-                if current != expected:
-                    raise ValueError(
-                        f"legacy DSpine {name}={saved!r}; set training.{path}={expected!r} to preserve it"
-                    )
-
-
 def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
     from specforge.algorithms.common.defaults import (
@@ -212,7 +133,6 @@ def resolve_run(cfg, *, target_config=None):
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
-    _validate_imported_objective(cfg, resolved)
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
@@ -326,8 +246,6 @@ def resolve_run(cfg, *, target_config=None):
         supports_trim_loss_positions=True,
         supports_compact_teacher=vocab,
         supports_liger_kernel=True,
-        # a checkpoint import's legacy config becomes the draft; the reader checks it
-        allows_aux_layer_override=bool(init and init.checkpoint),
     )
     spec = AlgorithmSpec(
         name=family,
@@ -339,8 +257,6 @@ def resolve_run(cfg, *, target_config=None):
         capabilities=capabilities,
     )
     provider = ModelProvider(
-        build_draft=None,
-        build_training_model=None,
         build_bundle=build_bundle,
         needs_input_tools=online_needs_input_tools,
         default_dataloader_num_workers=None,
@@ -438,7 +354,6 @@ def build_bundle(cfg, algorithm):
             source,
             **common,
             adapter=init.adapter if init else None,
-            legacy_config=init.legacy_config if init else None,
         ).train()
     else:
         weights = init.weights_from if init else None
@@ -467,7 +382,6 @@ def build_bundle(cfg, algorithm):
             require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
-            legacy_config=init.legacy_config if init else None,
         )
     teacher = None
     if resolved.requires_teacher:

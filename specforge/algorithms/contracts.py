@@ -240,7 +240,6 @@ class AlgorithmCapabilities:
     supports_compact_teacher: bool = False
     supports_trim_loss_positions: bool = False
     supports_vocab_mapping: bool = False
-    allows_aux_layer_override: bool = False
     #: ``training.dflash_teacher_metrics=false`` can drop the teacher-only
     #: final hidden state from the streaming capture.
     supports_teacher_metrics_opt_out: bool = False
@@ -262,7 +261,6 @@ class AlgorithmCapabilities:
             "supports_compact_teacher",
             "supports_trim_loss_positions",
             "supports_vocab_mapping",
-            "allows_aux_layer_override",
             "supports_teacher_metrics_opt_out",
             "supports_liger_kernel",
         ):

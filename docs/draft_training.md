@@ -127,10 +127,9 @@ position weights; omitting them preserves the protocol defaults. Capture inputs
 combine protocol and loss requirements. A teacher head is loaded only when the
 loss or protocol requires teacher logits; final-state inputs alone do not imply
 a head is needed.
-Legacy algorithm switches remain on the legacy route. On the canonical route,
-use loss/weighting for the common objective and objective_options for sampling
+Use loss/weighting for the common objective and objective_options for sampling
 and auxiliary training. DFlash2 selector_warmup_ratio/selector_ramp_ratio belong
-in objective_options. Nondefault legacy loss/sampling settings are rejected.
+in objective_options. Removed flat training options are rejected.
 
 ```yaml
 model:
@@ -171,9 +170,9 @@ Only one loading path may be selected:
   optional draft must equal the saved structure exactly. Training options and
   the original schedule horizon must still match the recorded run contract.
 
-`initialization.adapter` and `initialization.legacy_config` handle explicit
-external checkpoint import. `resume` and initialization are mutually exclusive;
-none of these fields may mix with legacy `model.draft_*` source fields.
+`initialization.adapter` selects a registered checkpoint reader. Built-in loading
+accepts canonical checkpoints only. `resume` and initialization are mutually exclusive;
+legacy `model.draft_*` source fields and `initialization.legacy_config` are rejected.
 
 Checkpoints contain the canonical `config.json` alongside the existing
 `training_state.pt` and per-rank optimizer/RNG files. The public loader reads only
@@ -192,13 +191,10 @@ server capture adapters now supply unshifted canonical records. DMTP currently
 accepts offline records with `mtp_hidden_states`; the generic capture service
 cannot produce frozen-MTP features and DMTP streaming fails validation.
 
-The new route supports eager attention (EAGLE3 also SDPA) and data parallel
-training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
-FSDP, matching the existing training backend's frozen-table policy. The canonical
-model's requested dtype also controls FSDP computation. Other optimized backends and
-sequence-parallel execution remain on the legacy route. Online wiring is
-validated through capture contracts; a live SGLang capture run is not part of the
-current integration tests.
+Training supports the attention backends declared by each objective, DDP/FSDP,
+and USP for objectives that declare sequence-parallel support. Frozen target
+bindings and teacher heads remain replicated outside FSDP. Trainer TP remains
+restricted to one. There is no fallback to old training wrappers.
 
 DSpine training uses a graph-free prepass and RNG-preserving replay for every
 optimizer window, including a single microbatch. The strategy reduces backbone
@@ -207,13 +203,9 @@ Objective evaluation performs no collectives; the objective itself never reduces
 its alignment statistics across ranks. Transfer-space initialization and
 restoration remain owned by the public model loader.
 
-Legacy checkpoints keep their original full-resume path (`model.draft_*` plus
-`training.resume_from`). Importing one through `initialization.checkpoint` or
-`weights_from` reads weights and effective settings only; it does not translate
-optimizer shards, scheduler state or RNG. For legacy imports, explicit
-`model.mask_token_id`, `model.aux_hidden_state_layer_ids` and
-`training.norm_before_residual` must agree with recorded settings. Canonical YAML
-keeps these settings in its architecture nodes.
+Historical draft checkpoints cannot be loaded or resumed. Canonical checkpoints
+support exact training resume; native target weights are copied through explicit
+`from_target` mappings.
 
 For scratch training, `model.load_target_embedding: true` copies the target table
 into an owned embedding with shape validation. Like legacy `load_embedding`, this
@@ -558,7 +550,7 @@ a legacy algorithm registration. An optional `window_statistic=WindowStatistic(r
 requests accumulation-window reduction and replay, passing the result to the
 objective by the declared argument name.
 
-`legacy_strategy` is separate registration metadata that preserves existing data
+`runtime_name` is separate registration metadata that preserves existing data
 and rendezvous identifiers; it does not select a legacy provider.
 `supports_vocab_mapping` declares draft-vocabulary support.
 Worker counts belong to `data.dataloader_num_workers`, not objective requirements.
@@ -588,7 +580,7 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 
 `--target-model-path` defaults to the run's `model.target_model_path`.
 `--draft /configs/eagle3.yaml` captures for the default objective and loss only.
-`-c`, `--draft` and the legacy `--draft-model-config` are mutually exclusive. The
+`-c` and `--draft` are mutually exclusive. The
 canonical YAML selects the architecture, capture layers and output schema.
 
 

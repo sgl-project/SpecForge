@@ -657,10 +657,7 @@ def _build_online(
             algorithm,
             input_adapter=input_adapter,
         )
-        draft_config = resolve_draft_config(
-            cfg,
-            provider=algorithm.providers.model.draft_config,
-        )
+        draft_config = resolve_draft_config(cfg)
         if input_adapter is None:
             prompts = prepare_prompts(
                 cfg,

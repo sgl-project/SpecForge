@@ -52,28 +52,11 @@ Bundled code may import only torch, transformers and the standard library, so lo
 by Hub repo id needs nothing else; optional packages such as flash-attn are imported
 inside `try`, only when their backend is selected.
 
-A historical checkpoint needs `--target-model TARGET`, and also
-`--draft-config OLD.json` when it has no `config.json`. The target configuration
-resolves legacy target-derived semantics, and any copy of a target table that the
-checkpoint saved must equal the target's. Legacy training remains available during
-the migration; its old checkpoints must use this import path. New HF exports always
-use canonical names and store each tensor in its own dtype; `config.json` declares
-a dtype only when all floating-point tensors share one.
-
-The retired `--to`, `--embedding-source` and `--embedding-key` options are
-no longer accepted. Use `--converter sglang` for serving conversion and
-`--target-model` for target metadata and bound-weight validation.
-
-Historical EAGLE3 checkpoints without recorded vocabulary buffers can supply
-an explicit mapping at the checkpoint import boundary:
-
-```bash
-specforge export --converter sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
-  --target-model TARGET --vocab-mapping MAPPING --output-dir SERVING
-```
-
-The imported mapping becomes part of the validated canonical state. Export preserves
-recorded `bos_token_id`, `eos_token_id`, and `pad_token_id` metadata.
+Export accepts canonical checkpoints containing `config.json`. Historical
+weight imports and `--draft-config` are not supported. Token metadata
+(`bos_token_id`, `eos_token_id`, `pad_token_id`) is preserved.
+Use `--converter sglang` for serving conversion and `--target-model` for
+target metadata or native merge-back.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.
 Restore those explicitly before exporting. Missing, unexpected or misshaped

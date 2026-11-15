@@ -5,36 +5,18 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
 from specforge.checkpoint.resolve import _ADAPTERS, register_adapter
 from specforge.checkpoint.tensors import TensorStore
-from specforge.config.draft.codec import decode_legacy_config
 from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
-from tests.test_checkpoint.legacy_weights import legacy_state
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_config.test_draft_legacy_dflash import legacy_payload
-from tests.test_config.test_draft_legacy_domino import domino_payload
-from tests.test_config.test_draft_legacy_dspark import dspark_payload
-from tests.test_config.test_draft_legacy_dspine import dspine_payload
-from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
-from tests.test_config.test_draft_legacy_mtp import mtp_payload
-from tests.test_config.test_draft_legacy_peagle import peagle_payload
 from tests.test_modeling.test_canonical_dflash import inputs_for
-
-
-def dflash2_payload():
-    payload = legacy_payload() | {"architectures": ["DFlash2DraftModel"]}
-    payload["dflash_config"].update(
-        conv_kernel_size=3, conv_group_size=8, selector_rank=4, selector_top_k=3
-    )
-    return payload
 
 
 def write_target(path, extra=None):
@@ -51,78 +33,27 @@ def write_target(path, extra=None):
 
 
 class LoadingTest(unittest.TestCase):
-    def test_legacy_mtp_binds_mup_head_in_training_dtype(self):
-        payload = mtp_payload() | dict(
-            hidden_size=32,
-            intermediate_size=64,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            vocab_size=64,
-            draft_vocab_size=64,
-            mtp_config={"share_lm_head": True},
-        )
-        with TemporaryDirectory() as tmp:
-            target = Path(tmp) / "target"
-            weights = write_target(target)
-            config_path = target / "config.json"
-            target_config = json.loads(config_path.read_text()) | {
-                "logits_mup_width_multiplier": 3
-            }
-            config_path.write_text(json.dumps(target_config))
-            config = decode_legacy_config(payload, target_config=target_config)
-            for dtype in (torch.float32, torch.bfloat16):
-                model = initialize_draft(config, target=target, dtype=dtype)
-                expected = weights["lm_head.weight"].to(dtype) / 3
-                torch.testing.assert_close(
-                    model.lm_head.weight, expected, rtol=0, atol=0
-                )
-                hidden = torch.randn(2, 32, dtype=dtype)
-                torch.testing.assert_close(
-                    model.lm_head(hidden),
-                    torch.nn.functional.linear(hidden, expected),
-                    rtol=0,
-                    atol=0,
-                )
 
-    def test_legacy_capture_layers_come_from_training_provenance(self):
-        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
-        payload = json.loads((fixture / "config.json").read_text())
-        payload.pop("eagle_config")
-        with TemporaryDirectory() as tmp:
-            path, target = Path(tmp) / "draft", Path(tmp) / "target"
-            path.mkdir()
-            write_target(target)
-            torch.save(
-                {
-                    "draft_state_dict": load_file(fixture / "model.safetensors"),
-                    "specforge_model_provenance": (("capture_layers", (2, 4, 6)),),
-                    "peagle_mask_token_id": 63,
-                },
-                path / "training_state.pt",
-            )
-            for architecture in ("PEagleDraftModel", "LlamaForCausalLMEagle3"):
-                payload["architectures"] = [architecture]
-                config = read_draft(path, target=target, legacy_config=payload).config
-                self.assertEqual(
-                    config.spec_config.target_features.target_layer_ids, (2, 4, 6)
-                )
-                for layers in ([2, 4, 6], [1, 2, 3]):
-                    supplied = payload | {
-                        "eagle_config": {"eagle_aux_hidden_state_layer_ids": layers}
-                    }
-                    if layers == [2, 4, 6]:
-                        self.assertEqual(
-                            read_draft(
-                                path, target=target, legacy_config=supplied
-                            ).config,
-                            config,
+    def test_historical_checkpoint_formats_are_rejected_before_weight_reads(self):
+        with TemporaryDirectory() as temp:
+            path = Path(temp)
+            for architecture in (
+                "DFlashDraftModel",
+                "LlamaForCausalLMEagle3",
+                "Qwen3_5MTPDraftModel",
+            ):
+                with self.subTest(architecture=architecture):
+                    (path / "config.json").write_text(
+                        json.dumps(
+                            {"model_type": "qwen3", "architectures": [architecture]}
                         )
-                    else:
+                    )
+                    with patch("specforge.checkpoint.resolve.TensorStore") as store:
                         with self.assertRaisesRegex(
-                            ValueError, "capture_layers conflict"
+                            ValueError, "canonical SpecForge checkpoint"
                         ):
-                            read_draft(path, target=target, legacy_config=supplied)
+                            read_draft(path)
+                        store.assert_not_called()
 
     def test_canonical_forward_restore_and_structure_guard(self):
         with TemporaryDirectory() as tmp:
@@ -132,9 +63,7 @@ class LoadingTest(unittest.TestCase):
             args = inputs_for(original.config.draft)
             save_draft(original, path)
             # Canonical and historical DFlash share a class name, not a format.
-            self.assertEqual(
-                original.config.architectures, legacy_payload()["architectures"]
-            )
+            self.assertEqual(original.config.architectures, ["DFlashDraftModel"])
             with self.assertRaisesRegex(ValueError, "does not match"):
                 read_draft(path, adapter="legacy")
             with patch("huggingface_hub.snapshot_download", return_value=str(path)):
@@ -246,140 +175,6 @@ class LoadingTest(unittest.TestCase):
                 mapping={"fusion": "fusion"},
                 allow_new=allowed,
             )
-
-    def test_all_legacy_model_layouts_and_configless_training_weights(self):
-        factories = [
-            legacy_payload,
-            dflash2_payload,
-            dspark_payload,
-            dspine_payload,
-            domino_payload,
-            eagle_payload,
-            peagle_payload,
-            mtp_payload,
-        ]
-        for factory in factories:
-            with self.subTest(factory=factory.__name__), TemporaryDirectory() as tmp:
-                payload = factory() | dict(
-                    hidden_size=32,
-                    intermediate_size=64,
-                    num_attention_heads=4,
-                    num_key_value_heads=2,
-                    head_dim=8,
-                    vocab_size=64,
-                    draft_vocab_size=64,
-                    bos_token_id=None,
-                    eos_token_id=None,
-                    pad_token_id=None,
-                )
-                if "dflash_config" in payload:
-                    payload.update(
-                        num_hidden_layers=2,
-                        num_target_layers=128,
-                        layer_types=["full_attention"] * 2,
-                    )
-                    payload["dflash_config"].update(
-                        mask_token_id=63, target_layer_ids=[1, 3]
-                    )
-                if factory in (eagle_payload, peagle_payload):
-                    payload["target_hidden_size"] = 32
-                if factory is eagle_payload:
-                    payload["draft_vocab_size"] = 32
-                    payload["fc_norm"] = True
-                if factory is mtp_payload:
-                    fixture = (
-                        Path(__file__).resolve().parents[1] / "fixtures/legacy_mtp"
-                    )
-                    payload = json.loads((fixture / "config.json").read_text())
-                    state = load_file(fixture / "model.safetensors")
-                else:
-                    state = legacy_state(payload["architectures"][0])
-                old = SimpleNamespace(state_dict=lambda state=state: state)
-                path, target = Path(tmp) / "draft", Path(tmp) / "target"
-                path.mkdir()
-                weights = write_target(target)
-                for key in ("embed_tokens.weight", "lm_head.weight"):
-                    if key in state and (
-                        factory is mtp_payload
-                        or (factory is eagle_payload and key == "embed_tokens.weight")
-                    ):
-                        state[key] = weights[
-                            (
-                                "model.embed_tokens.weight"
-                                if key.startswith("embed")
-                                else key
-                            )
-                        ].clone()
-                (path / "config.json").write_text(json.dumps(payload))
-                state = old.state_dict()
-                if factory in (domino_payload, dspark_payload):
-                    state = {
-                        (
-                            "logit_head." + k
-                            if k.startswith(
-                                (
-                                    "prefix_gru.",
-                                    "embed_proj.",
-                                    "markov_head.",
-                                    "confidence_head.",
-                                )
-                            )
-                            else k
-                        ): v
-                        for k, v in state.items()
-                    }
-                torch.save(state, path / "pytorch_model.bin")
-                if factory is peagle_payload:
-                    torch.save({"peagle_mask_token_id": 63}, path / "training_state.pt")
-                if factory in (domino_payload, dspark_payload):
-                    expected = read_draft(path, target=target).config
-                    payload["architectures"] = ["DFlashDraftModel"]
-                    (path / "config.json").write_text(json.dumps(payload))
-                    self.assertEqual(read_draft(path, target=target).config, expected)
-                restored = load_draft(path, target=target)
-                self.assertEqual(
-                    restored.config.draft, read_draft(path, target=target).config
-                )
-                # Every persisted destination is backed by a recorded historical tensor layout.
-                artifact = read_draft(path, target=target)
-                for key, ref in artifact.weights.items():
-                    torch.testing.assert_close(
-                        restored.state_dict()[key], ref.read(), rtol=0, atol=0
-                    )
-                if factory is eagle_payload:
-                    self.assertTrue(restored.vocabulary.ready)
-                    invalid = dict(old.state_dict())
-                    invalid["t2d"] = ~invalid["t2d"]
-                    torch.save(invalid, path / "pytorch_model.bin")
-                    with self.assertRaisesRegex(
-                        ValueError, "same ascending target IDs"
-                    ):
-                        load_draft(path, target=target)
-                    state = {
-                        k: v
-                        for k, v in old.state_dict().items()
-                        if k not in {"t2d", "d2t"}
-                    }
-                    torch.save(state, path / "pytorch_model.bin")
-                    with self.assertRaisesRegex(ValueError, "missing draft tensors"):
-                        load_draft(path, target=target)
-                    warm = initialize_draft(
-                        artifact.config,
-                        target=target,
-                        weights_from=path,
-                        allow_new=["vocabulary"],
-                    )
-                    self.assertFalse(bool(warm.vocabulary.ready))
-                if factory is legacy_payload:
-                    (path / "pytorch_model.bin").unlink()
-                    (path / "config.json").unlink()
-                    torch.save(
-                        {"draft_state_dict": old.state_dict(), "step": 42},
-                        path / "training_state.pt",
-                    )
-                    with self.assertRaisesRegex(ValueError, "legacy_config"):
-                        load_draft(path, target=target)
-                    load_draft(path, target=target, legacy_config=payload)
 
     def test_format_detection_and_ambiguous_target_keys(self):
         with TemporaryDirectory() as tmp:

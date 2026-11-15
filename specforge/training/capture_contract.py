@@ -34,7 +34,7 @@ def resolve_server_capture_contract(
     target_cfg = training_target_config(cfg)
     hidden_size, vocab_size = target_cfg["hidden_size"], bound_vocab_size(target_cfg)
     model_provider = algorithm.providers.model
-    draft_cfg = draft_config_dict(cfg, provider=model_provider.draft_config)
+    draft_cfg = draft_config_dict(cfg)
     layers = model_provider.resolve_capture_layers(cfg, draft_cfg, target_cfg)
     if not layers:
         raise ValueError("draft config does not define target capture layer ids")

@@ -39,7 +39,7 @@ class ExportContractTest(unittest.TestCase):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 expected = self.save(dtype)
-                export_draft(self.source, None, self.output)
+                export_draft(self.source, self.output)
                 torch.testing.assert_close(
                     load_draft(self.output).state_dict(),
                     expected,
@@ -51,7 +51,7 @@ class ExportContractTest(unittest.TestCase):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 expected = self.save(dtype, bound=True)
-                export_draft(self.source, None, self.output, converter="sglang")
+                export_draft(self.source, self.output, converter="sglang")
                 served = load_file(self.output / "model.safetensors")
                 self.assertFalse(any(k.startswith("draft_model.") for k in served))
                 for key in ("t2d", "d2t", "lm_head.weight"):
@@ -71,7 +71,7 @@ class ExportContractTest(unittest.TestCase):
     def test_export_rejects_mapping_replacement(self):
         self.save()
         with self.assertRaisesRegex(ValueError, "never replaces checkpoint tensors"):
-            export_draft(self.source, None, self.output, vocab_mapping_path="new.pt")
+            export_draft(self.source, self.output, vocab_mapping_path="new.pt")
 
     def test_missing_mapping_and_other_weights_remain_strict(self):
         original = self.save()
@@ -82,7 +82,7 @@ class ExportContractTest(unittest.TestCase):
                     self.source / "model.safetensors",
                 )
                 with self.assertRaises(ValueError):
-                    export_draft(self.source, None, self.output)
+                    export_draft(self.source, self.output)
 
     def test_cli_uses_the_same_writer(self):
         expected = self.save()

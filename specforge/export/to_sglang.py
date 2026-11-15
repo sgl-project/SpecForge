@@ -1,4 +1,4 @@
-"""Export canonical or imported legacy weights to a pinned serving format."""
+"""Export canonical weights to a pinned serving format."""
 
 import argparse
 import warnings
@@ -12,7 +12,6 @@ from .model import export_draft
 
 def export_to_sglang(
     checkpoint_path,
-    draft_config_path,
     output_dir,
     *,
     target_model=None,
@@ -27,7 +26,6 @@ def export_to_sglang(
         )
     return export_draft(
         checkpoint_path,
-        draft_config_path,
         output_dir,
         converter="sglang",
         export_mode=export_mode,
@@ -78,14 +76,12 @@ def legacy_native_mode(config, target_model):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--draft-config")
     parser.add_argument("--target-model")
     parser.add_argument("--copy-target", action="store_true")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
     export_to_sglang(
         args.checkpoint,
-        args.draft_config,
         args.output_dir,
         target_model=args.target_model,
         copy_target=args.copy_target,

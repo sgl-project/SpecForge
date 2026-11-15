@@ -964,7 +964,6 @@ class InitializationConfig(StrictConfigModel):
     weights_from: Optional[WeightsFromConfig] = None
     from_target: Optional[dict] = None
     adapter: Optional[str] = None
-    legacy_config: Optional[str] = None
 
     @model_validator(mode="after")
     def _exclusive_sources(self):
@@ -974,8 +973,6 @@ class InitializationConfig(StrictConfigModel):
             )
         if self.adapter and not self.checkpoint:
             raise ValueError("adapter requires initialization.checkpoint")
-        if self.legacy_config and not (self.checkpoint or self.weights_from):
-            raise ValueError("legacy_config requires a checkpoint source")
         return self
 
 

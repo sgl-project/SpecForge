@@ -122,17 +122,16 @@ experiment, use a new suffix consistently in `run_id`, `output_dir`,
 First export the trained draft:
 
 ```bash
-# Export a serving artifact (legacy checkpoints need the config and target)
+# Export a canonical checkpoint to a serving artifact
 specforge export \
-  --format sglang \
+  --converter sglang \
   --checkpoint outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer/${MODEL_NAME}-${SPEC_METHOD}-overfit-latest \
-  --draft-config ${DRAFT_MODEL_CONFIG} \
   --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_sglang \
   --target-model ${MODEL}
 ```
 
 The converter writes serving fields directly; no post-export normalization is
-needed. Canonical checkpoints do not need `--draft-config` or `--target-model`.
+needed. Historical checkpoint imports and `--draft-config` are not supported.
 The block size comes from the trained configuration.
 
 Start SGLang in the first terminal:

@@ -338,7 +338,7 @@ specforge train \
   model.target_model_path=/path/to/Qwen3.6-27B
 ```
 
-Export for serving with `specforge export --format sglang`. Serving requires an SGLang
+Export for serving with `specforge export --converter sglang`. Serving requires an SGLang
 version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
 name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
 new path automatically.
@@ -640,13 +640,11 @@ Canonical checkpoints carry their model configuration. Export them without a
 training YAML:
 
 ```bash
-specforge export --format sglang --checkpoint /path/to/checkpoint --output-dir ./serving
-specforge export --format hf --checkpoint /path/to/checkpoint --output-dir ./hf-model
+specforge export --converter sglang --checkpoint /path/to/checkpoint --output-dir ./serving
+specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 ```
 
-Historical checkpoints without `config.json` additionally require
-`--draft-config OLD.json --target-model TARGET`. `--to` remains an alias for
-`--format`. HF exports now contain canonical configuration and bundled code for
+Only canonical checkpoints containing `config.json` are supported. HF exports now contain canonical configuration and bundled code for
 Transformers, and cannot be served directly by SGLang. Except for native merge-back,
 both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
 running the model. Restore vocabulary mappings before export; export does not
@@ -665,7 +663,7 @@ public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
 MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
 and attention computations. Do not resume those runs; retrain from native MTP
-weights under the corrected model. The legacy codec follows the corrected model.
+weights under the corrected model. Historical draft checkpoint import is not supported.
 
 For native MTP, use the ordinary YAML preset and explicit target mapping in
 [the preset guide](../../../specforge/config/draft/presets/README.md). A complete
@@ -673,15 +671,14 @@ text-only offline recipe is available at
 `examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
 ```bash
-specforge export --format sglang \
+specforge export --export-mode native \
   --checkpoint ./outputs/native-mtp/native-mtp-latest \
   --target-model Qwen/Qwen3.5-4B \
   --output-dir ./exports/Qwen3.5-4B-MTP
 ```
 
 Native export rewrites shards containing old MTP tensors and links unchanged
-shards; add `--copy-target` for a self-contained directory. Historical checkpoints
-use the same importer, with `--draft-config OLD.json` when configuration is absent.
+shards; add `--copy-target` for a self-contained directory. Historical checkpoint import is not supported.
 The `scripts/merge_mtp_to_base.py` CLI is a compatibility wrapper for this exporter;
 there is no separate legacy merge implementation. Target computation mismatches
 fail instead of rewriting the target's settings to fit a draft.
@@ -697,16 +694,8 @@ FlashAttention and Ulysses/Ring sequence parallelism; trainer tensor parallelism
 remains unsupported. See [objective and backend options](../../draft_training.md).
 The old model implementations and training wrappers have been removed.
 
-Use a canonical YAML preset or inline `draft` to construct a model, or
-`initialization.checkpoint` to import an existing draft. Historical configurations
-are decoded only during checkpoint import, with `initialization.legacy_config`
-when a separate configuration is needed. Native presets describe the target's
-own draft structure; legacy MTP import uses the declared RoPE theta and the
-corrected #1014 computation.
-Retired `model.draft_*` fields and algorithm-specific training aliases are rejected.
-Historical model weights remain importable, but optimizer-state resume across
-old/new training implementations is unsupported. Use `resume` for checkpoints
-saved by the canonical trainer.
+Historical draft checkpoints and configuration formats are no longer accepted.
+Use canonical presets or inline canonical configurations for new training.
 
 ## Troubleshooting
 

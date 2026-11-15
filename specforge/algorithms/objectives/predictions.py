@@ -43,8 +43,9 @@ class Teacher:
             ValueError: The head is not a supported linear projection or the
                 vocabulary mask does not match its weight rows.
         """
-        from specforge.core.compact_teacher import _tiled_logsumexp_argmax
         from specforge.modeling.draft.bindings import BoundLMHead
+
+        from .teacher import tiled_logsumexp_argmax
 
         if isinstance(self.head, BoundLMHead):
             weight = self.head.bound_weight()
@@ -59,7 +60,7 @@ class Teacher:
                 "compact teacher requires a matching draft vocabulary mask"
             )
         ids = vocab_mask.nonzero().flatten()
-        log_z, argmax, logits = _tiled_logsumexp_argmax(
+        log_z, argmax, logits = tiled_logsumexp_argmax(
             self.values, weight, chunk_size=chunk_size, selected_token_ids=ids
         )
         mass = (logits - log_z).exp().sum(-1)

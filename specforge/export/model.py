@@ -23,7 +23,6 @@ def check_export_options(
 
 def export_draft(
     checkpoint_path,
-    draft_config_path,
     output_dir,
     *,
     export_mode=None,
@@ -45,7 +44,6 @@ def export_draft(
     )
     checkpoint, state, model_class = read_export(
         checkpoint_path,
-        draft_config=draft_config_path,
         target=target_model,
         vocab_mapping=vocab_mapping_path,
     )

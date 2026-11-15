@@ -288,16 +288,10 @@ def train(
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
 @click.option(
-    "--draft-config",
-    default=None,
-    metavar="PATH",
-    help="Draft configuration for import of a " "checkpoint without config.json.",
-)
-@click.option(
     "--target-model",
     default=None,
     metavar="PATH",
-    help="Canonical export only: target checkpoint that resolves legacy semantics.",
+    help="Target checkpoint for binding validation or native merge-back.",
 )
 @click.option("--output-dir", required=True, metavar="PATH")
 @click.option("--vocab-mapping", default=None, metavar="PATH")
@@ -308,7 +302,6 @@ def export(
     export_mode: Optional[str],
     copy_target: bool,
     checkpoint: str,
-    draft_config: Optional[str],
     target_model: Optional[str],
     output_dir: str,
     vocab_mapping: Optional[str],
@@ -328,7 +321,6 @@ def export(
         raise click.UsageError(str(error), ctx) from error
     export_draft(
         checkpoint,
-        draft_config,
         output_dir,
         **options,
         vocab_mapping_path=vocab_mapping,

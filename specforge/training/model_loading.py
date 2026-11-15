@@ -1,7 +1,7 @@
 """Resolve draft metadata and preflight training kernels before model assembly."""
 
 
-def resolve_draft_config(cfg, *, provider=None):
+def resolve_draft_config(cfg):
     from .canonical import resolve_config
 
     return resolve_config(cfg)
@@ -14,7 +14,7 @@ def preflight_draft_kernels(cfg, *, algorithm):
         load_liger_kernels()
 
 
-def draft_config_dict(cfg, *, provider=None):
+def draft_config_dict(cfg):
     from specforge.config.draft.codec import encode_config
 
     return encode_config(resolve_draft_config(cfg))

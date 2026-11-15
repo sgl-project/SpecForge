@@ -36,8 +36,7 @@ class CaptureContractTest(unittest.TestCase):
                 self.assertEqual(
                     server.capture_method, offline.capture_layout.capture_method
                 )
-                self.assertIsNone(registration.providers.model.build_draft)
-                self.assertIsNone(registration.providers.model.build_training_model)
+                self.assertTrue(callable(registration.providers.model.build_bundle))
 
     def test_mismatched_feature_lengths_fail_before_training(self):
         provider = (

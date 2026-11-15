@@ -8,16 +8,13 @@ from transformers import Qwen3Config
 from transformers.modeling_rope_utils import _compute_yarn_parameters
 
 from specforge.config.draft.codec.components import encode_component
-from specforge.config.draft.codec.legacy.eagle_rope import resolve_eagle_rope
 from specforge.config.draft.rope import NoRoPESpec, YaRNSpec
 from specforge.modeling.draft.layers.rope import (
     YaRNRotaryEmbedding,
     apply_rotary,
     build_rotary,
 )
-from tests.test_config.test_draft_eagle_rope_rules import yarn_settings
 from tests.test_modeling.mtp_reference import apply_rotary_pos_emb
-from tests.test_modeling.rotary_reference import LlamaYarnRotaryEmbedding
 
 
 def yarn_node(**overrides):
@@ -99,44 +96,6 @@ class YaRNRotaryTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_cuda_reference_outputs_and_gradients(self):
         self._assert_hf_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
-
-    def test_eagle_codec_amplitude_ratio_matches_existing_cache(self):
-        for settings in (
-            yarn_settings(),
-            {
-                k: v
-                for k, v in yarn_settings().items()
-                if k != "original_max_position_embeddings"
-            },
-            yarn_settings(mscale=0, mscale_all_dim=0),
-            yarn_settings(mscale=1, mscale_all_dim=0),
-        ):
-            node = resolve_eagle_rope(
-                {
-                    "rope_scaling": settings,
-                    "rope_theta": 10000,
-                    "max_position_embeddings": 64,
-                }
-            )
-            reference = LlamaYarnRotaryEmbedding(
-                dim=128,
-                max_position_embeddings=64,
-                base=node.rope_theta,
-                scaling_factor=settings["factor"],
-                original_max_position_embeddings=settings.get(
-                    "original_max_position_embeddings", 64
-                ),
-                beta_fast=settings["beta_fast"],
-                beta_slow=settings["beta_slow"],
-                mscale=settings["mscale"],
-                mscale_all_dim=settings["mscale_all_dim"],
-            )
-            positions = torch.tensor([[0, 9, 31, 64]])
-            actual = build_rotary(node, head_dim=128)(torch.empty(1, 4, 128), positions)
-            for left, right in zip(
-                actual, (reference.cos_cached, reference.sin_cached)
-            ):
-                torch.testing.assert_close(left, right[0, 0][positions], rtol=0, atol=0)
 
     def test_mla_full_score_scale_is_not_applied_to_rotary_prefix(self):
         node = yarn_node()

@@ -1,7 +1,6 @@
 """Canonical DFlash layouts match explicit causal/window visibility per layer."""
 
 import copy
-import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,52 +8,77 @@ from unittest.mock import patch
 
 import torch
 
-from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.attention import gqa
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
 
-CONFIGS = Path(__file__).resolve().parents[2] / "tests/fixtures/legacy_drafts"
+CONFIGS = Path(__file__).resolve().parents[2] / "specforge/config/draft/presets"
 HIDDEN, VOCAB, MASK, WINDOW, CONTEXT = 32, 64, 60, 6, 48
 
 
 def small_payload(name, **overrides):
-    payload = json.loads((CONFIGS / name).read_text())
-    payload.update(
-        hidden_size=HIDDEN,
-        intermediate_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        vocab_size=VOCAB,
-        bos_token_id=None,
-        eos_token_id=None,
-        pad_token_id=None,
+    import yaml
+
+    from specforge.config.draft.codec import parse_draft
+
+    payload = yaml.safe_load((CONFIGS / name.replace(".json", ".yaml")).read_text())
+    config = parse_draft(payload, target_config=None)
+    attentions = {
+        key: replace(
+            value,
+            num_attention_heads=4,
+            num_key_value_heads=overrides.get("num_key_value_heads", 2),
+            head_dim=8,
+            is_causal=overrides.get("is_causal", value.is_causal),
+            sliding_window=WINDOW if value.sliding_window else None,
+        )
+        for key, value in config.attention_configs.items()
+    }
+    spec = replace(
+        config.spec_config,
+        target_features=replace(
+            config.spec_config.target_features, hidden_size=HIDDEN, mask_token_id=MASK
+        ),
     )
-    if payload.get("use_sliding_window"):
-        # A window much shorter than the context, so anchors straddle it.
-        payload["sliding_window"] = WINDOW
-    method = dict(payload["dflash_config"], mask_token_id=MASK)
-    if "conv_group_size" in method:
-        method.update(conv_group_size=4, selector_rank=4, selector_top_k=3)
-    payload["dflash_config"] = method
-    return payload | overrides
+    if config.architecture == "DFlash2DraftModel":
+        spec = replace(spec, selector_rank=4, selector_top_k=3)
+    return replace(
+        config,
+        hidden_size=HIDDEN,
+        vocab_size=VOCAB,
+        draft_vocab_size=VOCAB,
+        attention_configs=attentions,
+        mlp_configs={
+            k: replace(v, intermediate_size=64) for k, v in config.mlp_configs.items()
+        },
+        conv_configs={
+            k: replace(v, group_size=4) for k, v in config.conv_configs.items()
+        },
+        spec_config=spec,
+    )
 
 
-def mla(payload):
-    payload = copy.deepcopy(payload)
-    payload["dflash_config"]["attention_mode"] = "mla"
-    payload.pop("head_dim")
-    payload.update(
+def mla(config):
+    from specforge.config.draft.attention import MLASpec
+
+    attention = next(iter(config.attention_configs.values()))
+    node = MLASpec(
+        num_attention_heads=4,
         q_lora_rank=None,
         kv_lora_rank=16,
         qk_nope_head_dim=8,
         qk_rope_head_dim=8,
         v_head_dim=8,
-        rope_interleave=True,
+        attention_bias=False,
+        attention_dropout=0.0,
+        is_causal=attention.is_causal,
+        sliding_window=attention.sliding_window,
+        rope_parameters=None,
     )
-    return payload
+    return replace(
+        config, attention_configs={k: node for k in config.attention_configs}
+    )
 
 
 def training_layout(anchors, keep, block):
@@ -81,13 +105,7 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
     # Compare attention layout, not fused versus unfused convolution rounding.
     @patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"})
     def _parity(self, payload, dtype=torch.float32):
-        layer_count = payload.get("num_target_layers") or 64
-        target = {
-            "hidden_size": HIDDEN,
-            "num_hidden_layers": layer_count,
-            "vocab_size": VOCAB,
-        }
-        config = decode_legacy_config(payload, target_config=target)
+        config = payload
         block = config.spec_config.block.block_size
         torch.manual_seed(0)
         model = build_draft_model(config, dtype=dtype)
@@ -160,7 +178,6 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
         for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
             with self.subTest(recipe=name):
                 payload = small_payload(name, num_key_value_heads=4)
-                payload["dflash_config"]["attention_mode"] = "mha"
                 self._parity(payload, dtype=torch.bfloat16)
 
     def test_mha_rotary_preserves_fp32_layout(self):

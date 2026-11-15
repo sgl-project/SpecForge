@@ -1,4 +1,4 @@
-"""Validate owned export state; target tables are read only to check legacy copies."""
+"""Validate canonical owned export state without reading target weights."""
 
 from dataclasses import dataclass
 
@@ -6,7 +6,7 @@ import torch
 
 from specforge.checkpoint import make_weight_plan
 from specforge.checkpoint.tensors import TensorInfo, TensorRef
-from specforge.loading import check_bound_copies, read_draft
+from specforge.loading import read_draft
 from specforge.modeling import build_draft_model
 
 
@@ -15,19 +15,11 @@ class _BindingMetadata:
     metadata: dict[str, TensorInfo]
 
 
-def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=None):
+def read_export(checkpoint, *, target=None, vocab_mapping=None):
     from specforge.checkpoint.resolve import resolve_checkpoint_path
 
     path = resolve_checkpoint_path(checkpoint)
-    directory = path.parent if path.is_file() else path
-    supplementary = draft_config if not (directory / "config.json").exists() else None
-    checkpoint = read_draft(
-        path if path.exists() else checkpoint,
-        target=target,
-        legacy_config=supplementary,
-    )
-    if draft_config is not None and supplementary is None:
-        raise ValueError("checkpoint already has config.json; omit --draft-config")
+    checkpoint = read_draft(path, target=target)
     if vocab_mapping is not None:
         raise ValueError(
             "restore vocabulary mappings before export; export never replaces checkpoint tensors"
@@ -51,6 +43,4 @@ def read_export(checkpoint, *, draft_config=None, target=None, vocab_mapping=Non
             state[name] = ref.read().contiguous()
             seen.add(ref)
     preview.validate_export_state(state)
-    # the artifact drops legacy copies of bound tables, so they must equal the target
-    check_bound_copies(checkpoint, target=target)
     return checkpoint, state, type(preview)

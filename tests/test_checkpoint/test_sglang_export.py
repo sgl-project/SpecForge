@@ -266,7 +266,6 @@ class SGLangExportTest(unittest.TestCase):
                     warnings.simplefilter("always", FutureWarning)
                     export_to_sglang(
                         str(root / "draft"),
-                        None,
                         str(root / "served"),
                         target_model=str(target),
                         copy_target=copy,
@@ -403,7 +402,6 @@ class SGLangExportTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     export_to_sglang(
                         str(root / "draft"),
-                        None,
                         str(root / "bad"),
                         target_model=str(target),
                     )

@@ -18,14 +18,9 @@ def builtin_algorithm_registry(*, teacher_metrics=False, ttt_length=7):
         if name == "mtp":
             draft = encode_config(mtp_config())
         elif name == "dspine":
-            from specforge.config.draft.codec.legacy import decode_legacy_config
-            from tests.test_config.test_draft_legacy_dflash import target_for
-            from tests.test_config.test_draft_legacy_dspine import dspine_payload
+            from tests.test_modeling.dspine_fixtures import model_config
 
-            payload = dspine_payload()
-            draft = encode_config(
-                decode_legacy_config(payload, target_config=target_for(payload))
-            )
+            draft = encode_config(model_config())
         else:
             draft = str(PRESETS / f"qwen3-8b-{name}.yaml")
         cfg = Config.model_validate(

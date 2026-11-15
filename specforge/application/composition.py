@@ -85,10 +85,7 @@ def resolve_offline_capture(
     resolved = resolve_run(cfg, registry, target_config=target)
 
     model_provider = resolved.algorithm.providers.model
-    draft_config = resolve_draft_config(
-        resolved.config,
-        provider=model_provider.draft_config,
-    )
+    draft_config = resolve_draft_config(resolved.config)
     layers = tuple(
         model_provider.resolve_capture_layers(cfg, draft_config, target_config)
     )
