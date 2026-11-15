@@ -163,6 +163,83 @@ def distributed_reduction(rank, rendezvous):
 
 
 class LossPlanTest(unittest.TestCase):
+
+    def test_contextual_intermediate_keeps_whole_set_count(self):
+        logits = torch.zeros(2, 1, 2, requires_grad=True)
+        labels = torch.zeros(2, 1, dtype=torch.long)
+        for owner in (None, 0):
+
+            def compute(calc):
+                result = calc.evaluate(
+                    "tv",
+                    TokenLoss("lk_tv"),
+                    calc.outputs()["logits"],
+                    calc.labels,
+                    term_index=owner,
+                )
+                calc.add(0, result.values)
+
+            prediction = Predictions(
+                hidden=logits,
+                projection=Projection(lambda x: {"logits": x}),
+                labels=labels,
+                mask=torch.ones_like(labels),
+                positions=labels,
+                denominator=torch.tensor(4.0),
+                compute=compute,
+                plan=LossPlan((LossTerm(loss=TokenLoss("value")),)),
+            )
+            for chunk in (0, 1):
+                for checkpoint in (False, True):
+                    with self.subTest(owner=owner, chunk=chunk, checkpoint=checkpoint):
+                        result = execute_batch(
+                            PredictionBatch((prediction,), reduction="sum_means"),
+                            TokenLoss("ce"),
+                            PositionWeighting(),
+                            training=True,
+                            execution=LossExecution(
+                                chunk_size=chunk, checkpoint=checkpoint
+                            ),
+                        )
+                        torch.testing.assert_close(result.loss, torch.tensor(0.5))
+                        (gradient,) = torch.autograd.grad(result.loss, logits)
+                        torch.testing.assert_close(
+                            gradient, torch.tensor([[[-0.125, 0.125]]] * 2)
+                        )
+
+            # Direct tensor requests from the callback obey the same fused policy.
+            with self.assertRaisesRegex(ValueError, "requires CUDA/ROCm"):
+                run(prediction, fused=True)
+
+    def test_intermediate_prediction_scope_cannot_bypass_chunk_safety(self):
+        labels = torch.zeros(2, 1, dtype=torch.long)
+        for owner in (None, 0):
+
+            def compute(calc):
+                result = calc.evaluate(
+                    "lambda",
+                    TokenLoss("lk_lambda"),
+                    calc.outputs()["logits"],
+                    calc.labels,
+                    term_index=owner,
+                )
+                calc.add(0, result.values)
+
+            prediction = Predictions(
+                hidden=torch.zeros(2, 1, 2),
+                projection=Projection(lambda x: {"logits": x}),
+                labels=labels,
+                mask=torch.ones_like(labels),
+                positions=labels,
+                compute=compute,
+                plan=LossPlan((LossTerm(loss=TokenLoss("value")),)),
+            )
+            with self.subTest(owner=owner):
+                with self.assertRaisesRegex(ValueError, "require chunk_safe=False"):
+                    run(prediction, chunk=1)
+                result = run(replace(prediction, chunk_safe=False), chunk=1)
+                self.assertTrue(torch.isfinite(result.loss))
+
     @unittest.skipUnless(dist.is_gloo_available(), "Gloo required")
     def test_distributed_term_reduction_and_accumulation(self):
         with TemporaryDirectory() as tmp:
@@ -645,7 +722,7 @@ class LossPlanTest(unittest.TestCase):
     def test_projection_execution_constraints(self):
         head = nn.Linear(4, 9)
         for options, expected_calls in (
-            ({"chunk_safe": False}, [4, 4]),
+            ({"chunk_safe": False}, [4]),
             ({"recompute_safe": False}, [1, 1, 1, 1]),
         ):
             with self.subTest(options=options):

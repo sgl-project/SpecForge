@@ -66,9 +66,8 @@ class LossRoutingTest(unittest.TestCase):
             wrong = replace(
                 request, terms=(replace(request.terms[0], loss=TokenLoss("kl")),)
             )
-            self.assertNotEqual(
-                select_implementation(wrong, fused=True).name, "test_special"
-            )
+            with self.assertRaisesRegex(ValueError, "requires CUDA/ROCm"):
+                select_implementation(wrong, fused=True)
             with self.assertRaises(TypeError):
                 compute_loss(request, impl="test_special")
 
@@ -203,10 +202,22 @@ class LossRoutingTest(unittest.TestCase):
                 other.restore({"0:0": name})
                 other.record("0:0", "token_ce")
 
+    @patch.dict(_IMPLEMENTATIONS)
     def test_empty_joint_split_keeps_selection_sequence(self):
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
         )
+
+        @register_implementation(
+            "test_token",
+            losses=("ce",),
+            supports=lambda request, group: (
+                None if len(group) == 1 else "single term only"
+            ),
+        )
+        def token(request, group):
+            self.assertGreater(request.input_tensor.numel(), 0)
+            return select_implementation(request, group).compute(request, group)
 
         for length in (0, 2):
             request = self.request()
@@ -226,5 +237,5 @@ class LossRoutingTest(unittest.TestCase):
             compute_loss(request, (0, 1), fused=True, selection=selection)
             self.assertEqual(
                 selection.names,
-                {"0:0,1": "split", "0:0": "reference", "0:1": "reference"},
+                {"0:0,1": "split", "0:0": "test_token", "0:1": "test_token"},
             )

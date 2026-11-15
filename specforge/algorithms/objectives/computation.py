@@ -151,8 +151,12 @@ class LossComputation:
         ):
             raise ValueError("Computation labels must align with prediction units")
         if (
-            term_index is None
-            and loss.registration.scope == "prediction"
+            loss.registration.scope == "prediction"
+            and not any(
+                term.loss.registration.scope == "prediction"
+                or term.reduction == "scalar"
+                for term in self.request.terms
+            )
             and (self.predictions.chunk_safe and self.predictions.projection.chunk_safe)
         ):
             raise ValueError("Contextual intermediate losses require chunk_safe=False")

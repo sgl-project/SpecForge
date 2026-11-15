@@ -364,20 +364,29 @@ class LossExecutionTest(unittest.TestCase):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0.02, atol=2e-8)
         self.assertEqual(torch.count_nonzero(actual_grad[mask == 0]), 0)
 
-    def test_fused_loss_uses_reference_on_cpu(self):
-        config, runtime = build_runtime("DSparkDraftModel", options={"num_anchors": 2})
-        runtime.execution = LossExecution(fused=True)
-        result = runtime(training_batch(config), step=0, total_steps=1)
-        self.assertTrue(torch.isfinite(result.loss))
-        self.assertEqual(
-            set(runtime.loss_implementations.names.values()), {"reference", "value"}
-        )
+    def test_fused_loss_rejects_unsupported_device_and_dtype(self):
+        inputs = [("cpu", torch.float32), ("cpu", torch.float64)]
+        if torch.cuda.is_available():
+            inputs.append(("cuda", torch.float64))
+        for device, dtype in inputs:
+            with self.subTest(device=device, dtype=dtype):
+                config, runtime = build_runtime(
+                    "DSparkDraftModel", options={"num_anchors": 2}
+                )
+                runtime = runtime.to(device=device, dtype=dtype)
+                runtime.execution = LossExecution(fused=True)
+                batch = {
+                    key: value.to(device)
+                    for key, value in training_batch(config).items()
+                }
+                with self.assertRaisesRegex(ValueError, "requires CUDA/ROCm"):
+                    runtime(batch, step=0, total_steps=1)
 
     def test_checkpoint_false_does_not_recompute(self):
         from torch.utils.checkpoint import checkpoint
 
         config, runtime = build_runtime("MTPDraftModel")
-        for chunk_size in (0, 1):
+        for chunk_size in (0, 1, 4096):
             for enabled in (False, True):
                 runtime.execution = LossExecution(
                     chunk_size=chunk_size, checkpoint=enabled
@@ -388,7 +397,7 @@ class LossExecutionTest(unittest.TestCase):
                     runtime(
                         training_batch(config), step=0, total_steps=1
                     ).loss.backward()
-                self.assertEqual(calls.called, enabled)
+                self.assertEqual(calls.called, enabled and chunk_size == 1)
 
     def test_fused_conv_rejects_invalid_configuration(self):
         from specforge.config.draft.conv import GroupedCausalConvSpec

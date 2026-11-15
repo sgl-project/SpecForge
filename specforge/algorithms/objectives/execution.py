@@ -392,12 +392,6 @@ def evaluate_chunks(
                 stacklevel=2,
             )
         chunk_size = 0
-    if execution.checkpoint and not predictions.projection.recompute_safe:
-        warnings.warn(
-            "Loss checkpointing is disabled: the projection is not recompute-safe.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     if (
         execution.trim
         and weighting.kind not in DPACE_LOSS_TYPES
@@ -410,11 +404,19 @@ def evaluate_chunks(
             if term.mask is not None:
                 keep |= term.mask.any(-1)
         predictions = predictions.select(keep.nonzero().flatten())
+    split = 0 < chunk_size < predictions.hidden.shape[0]
+    if split and execution.checkpoint and not predictions.projection.recompute_safe:
+        warnings.warn(
+            "Loss checkpointing is disabled: the projection is not recompute-safe.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     # Contextual per-position formulas keep the whole-set supervised count,
-    # even when their values are evaluated in smaller chunks.
+    # even when their values are evaluated in smaller chunks. Callbacks may
+    # request contextual formulas for terms declared as precomputed values.
     context_counts = None
-    if chunk_size and any(
-        selected.registration.contextual
+    if split and any(
+        (selected.registration.contextual or predictions.compute is not None)
         and (term.denominator is not None or predictions.denominator is not None)
         for term, selected in zip(predictions.plan.terms, losses)
     ):
@@ -444,7 +446,8 @@ def evaluate_chunks(
             denominator=None if denominator is None else denominator[part].sum(),
         )
         if (
-            execution.checkpoint
+            split
+            and execution.checkpoint
             and predictions.projection.recompute_safe
             and torch.is_grad_enabled()
         ):
@@ -503,6 +506,7 @@ def execute_batch(
     )
     if weighting.kind in DPACE_LOSS_TYPES:
         predictions = list(batch.predictions)
+        requested_split = any(0 < chunk_size < p.hidden.shape[0] for p in predictions)
         if not predictions:
             raise ValueError("protocol must produce at least one prediction set")
         if any(not p.plan.shared_reduction for p in predictions):
@@ -522,7 +526,7 @@ def execute_batch(
                 )
             chunk_size = 0
         if not chunk_size:
-            if execution.checkpoint:
+            if requested_split and execution.checkpoint:
                 warnings.warn(
                     "Loss checkpointing is disabled for unchunked D-PACE: "
                     "chain weighting uses materialized predictions.",

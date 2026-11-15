@@ -187,6 +187,20 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
             else entry.supports(request, group)
         )
         if reason is None:
+            if (
+                fused
+                and entry.category == "reference"
+                and any(
+                    request.terms[i].loss.registration.input_kind == "categorical"
+                    for i in group
+                )
+                and (
+                    not request.input_tensor.is_cuda
+                    or request.input_tensor.dtype
+                    not in (torch.float16, torch.bfloat16, torch.float32)
+                )
+            ):
+                raise ValueError("fused loss requires CUDA/ROCm FP16/BF16/FP32 inputs")
             return entry
         if rejections is not None:
             rejections.append(f"{entry.name}: {reason}")
