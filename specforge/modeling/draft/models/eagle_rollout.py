@@ -241,7 +241,10 @@ class EagleCachedStep:
         query, key, value = [tensor.transpose(1, 2) for tensor in (query, key, value)]
         ring = ulysses = None
         if self.backend == "usp":
-            from yunchang.comm import SeqAllToAll4D
+            try:
+                from yunchang.comm import SeqAllToAll4D
+            except ImportError as exc:
+                raise ImportError("USP attention requires yunchang") from exc
 
             ring, ulysses = self.ring_group, self.ulysses_group
             if ring is None or ulysses is None:
