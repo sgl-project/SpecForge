@@ -80,7 +80,7 @@ def forward_inputs(model):
     )
 
 
-def training_model(chunk_size=0, head_dim=4):
+def training_model(chunk_size=0, head_dim=4, **loss_options):
     draft, head_weight = initialized_model(head_dim=head_dim)
     head = nn.Linear(16, 32, bias=False)
     head.weight.data.copy_(head_weight)
@@ -96,6 +96,7 @@ def training_model(chunk_size=0, head_dim=4):
         num_anchors=4,
         attention_backend="sdpa",
         objective_chunk_blocks=chunk_size,
+        **loss_options,
     )
 
 
@@ -111,6 +112,37 @@ def training_inputs():
 
 
 class DSpineTest(unittest.TestCase):
+    def test_explicit_wrapper_weights_change_the_loss(self):
+        losses = []
+        for ce_weight, alignment_weight in ((0.1, 0.5), (0.3, 0.9)):
+            with self.subTest(ce_weight=ce_weight, alignment_weight=alignment_weight):
+                model = training_model(
+                    ce_weight=ce_weight,
+                    alignment_weight=alignment_weight,
+                    fused_logits_loss=False,
+                ).eval()
+                torch.manual_seed(37)
+                inputs = training_inputs()
+                loss, _, metrics = model(**inputs, global_step=200, total_steps=1000)
+                ratios = metrics["ratio_metrics"]
+                ce, denominator = ratios["dspine/backbone_ce"]
+                l1, _ = ratios["dspine/backbone_l1"]
+                refinement, _ = ratios["dspine/refinement_loss"]
+                alignment, _ = ratios["dspine/alignment_loss"]
+                expected = (
+                    ce_weight * ce
+                    + (1 - ce_weight) * l1
+                    + refinement
+                    + alignment_weight * (ce / denominator) * alignment
+                ) / denominator
+                torch.testing.assert_close(loss, expected)
+                loss.backward()
+                self.assertTrue(
+                    any(p.grad is not None for p in model.draft_model.parameters())
+                )
+                losses.append(loss.detach())
+        self.assertNotEqual(losses[0].item(), losses[1].item())
+
     def test_rejects_bidirectional_attention(self):
         config = tiny_config()
         config.is_causal = False

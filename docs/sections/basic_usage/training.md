@@ -252,7 +252,7 @@ Both objectives receive the configured fixed-decay or D-PACE position weight,
 and their combined numerator is normalized by the sum of valid effective token
 weights rather than by batch or anchor count.
 
-Set `training.dflash2_selector_loss_alpha` to scale the selector objective.
+Set `training.loss.terms.selector.coefficient` to scale the selector objective.
 `training.dflash2_selector_warmup_ratio` keeps that scale at zero for an initial
 fraction of optimizer steps, and `training.dflash2_selector_ramp_ratio` then
 ramps it linearly to the configured value. Both schedule ratios default to
@@ -604,8 +604,9 @@ instead of materializing full-vocabulary fp32 logits:
 ```yaml
 training:
   strategy: eagle3
-  compact_teacher: true
-  compact_teacher_chunk_size: 4096
+  loss:
+    execution:
+      teacher_chunk_size: 4096
 ```
 
 This lowers peak memory without changing the teacher distribution, at the cost
@@ -803,16 +804,15 @@ MTP migration changes:
 - CE computes in FP32 rather than the old BF16 reduction. Small loss/gradient
   differences are intentional. Only supervised rows are projected, in bounded chunks.
 - Old optimizer state cannot resume under the canonical implementation. Import
-  model weights instead. Canonical resume rejects a changed `objective_chunk_size`.
+  model weights instead. Canonical resume validates the recorded loss execution settings.
 - `draft: OLD.json` uses the registered legacy codecs for all supported architectures,
   not only MTP; required recorded settings such as P-EAGLE's mask token stay explicit.
 
 The canonical MTP trainer supports eager and SDPA attention. Set
-`training.objective_options.objective_chunk_size` (default 4096; 0 disables
-chunking) to bound the number of token positions passed through LM head and loss
-at once. Chunked training recomputes these intermediates during backward. The
-old `training.mtp_objective_chunk_size` option remains a compatibility alias;
-conflicting non-default settings are rejected. The online NPU MTP recipe now
+`training.loss.execution.chunk_size` (default 4096; 0 disables chunking) to
+bound the token positions projected at once. `loss.execution.checkpoint`
+controls recomputation during backward.
+The online NPU MTP recipe now
 uses this canonical path and the native preset.
 
 Trainer TP/SP sizes remain one on the canonical path. Legacy implementations

@@ -290,7 +290,7 @@ Common fields:
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
 | `training.loss` | `{}` | Named loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
-| `training.loss.fused` | `false` | Automatically select compatible optimized loss implementations. |
+| `training.loss.fused` | canonical: `false`; retained wrappers: `true` | Select compatible optimized implementations. Retained EAGLE3/P-EAGLE require `true`; explicit `false` is rejected. |
 | `training.loss.execution` | `{}` | `chunk_size`, `checkpoint`, `trim`, and offline `teacher_chunk_size`. |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
@@ -325,13 +325,18 @@ Strategy-specific fields should be written only when tuning that objective:
 | Strategy | Fields and defaults |
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`); choose `soft_ce` or an LK formula under `loss.terms.token`. |
-| DFlash / DFlash2 / Domino | `training.num_anchors` (`512`); configure CE/LK under `loss.terms`, and exponential/D-PACE weighting under `training.weighting`. Selector warmup/ramp and Domino schedules remain algorithm options. |
+| DFlash / DFlash2 | `training.num_anchors` (`512`); CE/LK under `loss.terms`, uniform/exponential/D-PACE under `training.weighting`. |
+| Domino | CE only in retained wrappers; uniform/exponential weighting. `training.num_anchors` defaults to `512`. |
+| DFlash2 schedules | `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), `training.dflash2_selector_stop_gradient` (`false`). |
+| Domino schedule | `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`). |
 | DSpark | `loss.terms.token` defaults to CE/L1 weights 0.1/0.9; `loss.terms.confidence.coefficient` defaults to 1. Sampling stays in `num_anchors`. |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`). |
 | MTP | `training.loss.execution.chunk_size` controls projection/loss chunks; `0` disables splitting. |
 
 Old loss fields and flat loss dictionaries are rejected. Full resume requires
-current loss metadata; import weights for a fresh run when old metadata is incompatible.
+current loss metadata. Canonical checkpoints with old records can use the
+[standalone converter](../../docs/draft_training.md#compatibility-boundary).
+See the migration notes below for retained-wrapper resume exceptions.
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or
@@ -679,3 +684,42 @@ Migration notes:
 - Qwen3-8B DTA still shares the DFlash trainer, as before. Its specialized
   behavior is encoded by the draft JSON (`training_mode: vp_drafter`); there is
   no second DTA training entry.
+
+## Migrating loss configuration
+
+Removed fields below are rejected, including CLI overrides. There is no automatic
+translation. Paths in this table are relative to `training`.
+
+| Removed field | Replacement |
+| --- | --- |
+| `fused_logits_loss` | `loss.fused` |
+| `lk_loss_type` | `loss.terms.token.kind: lk_alpha / lk_tv / lk_lambda`; omit for default CE. EAGLE3 LK also needs `options.target: teacher`. |
+| `kl_scale`, `kl_decay` | `loss.terms.token.options.kl_scale / kl_decay` with `kind: lk_lambda` |
+| `loss_decay_gamma` | Positive: `weighting: {kind: exponential, gamma: VALUE}`. Nonpositive: `{kind: uniform}`. Omit for protocol defaults. |
+| `loss_type`, `dpace_alpha` | `weighting: {kind: dpace, alpha: VALUE}` (or a supported D-PACE variant). Former `dflash` means uniform/exponential weighting. |
+| `objective_chunk_blocks`, `mtp_objective_chunk_size` | `loss.execution.chunk_size` |
+| `objective_checkpointing` | `loss.execution.checkpoint` |
+| `trim_loss_positions` | `loss.execution.trim` |
+| `compact_teacher`, `compact_teacher_chunk_size` | Positive `loss.execution.teacher_chunk_size` enables compact teacher; omit to disable. Use `32768` for the former implicit chunk size. |
+| `dflash2_selector_loss_alpha` | `loss.terms.selector.coefficient` |
+| `dspark_ce_loss_alpha`, `dspark_l1_loss_alpha` | `loss.terms.token.options.ce_weight / l1_weight` |
+| `dspark_confidence_head_alpha` | `loss.terms.confidence.coefficient` |
+
+Retained wrappers still use the five selector/Domino schedule fields above.
+Canonical runs put these under `training.objective_options`, with selector
+names `selector_warmup_ratio`, `selector_ramp_ratio`, `selector_stop_gradient`.
+
+If a historical DSpine draft records nondefault CE or alignment weights, set
+`loss.terms.token.options` and `loss.terms.refinement.options` explicitly
+(`ce_weight` and `l1_weight`, summing to one), and
+`loss.terms.alignment.coefficient`. Explicit overrides are allowed.
+
+For canonical checkpoints, use the standalone
+[`convert_canonical_checkpoint.py` command](../../docs/draft_training.md) before resuming
+a checkpoint with the old loss contract. Retained-wrapper full resume still
+checks the recorded effective settings. Two metadata differences can reject
+an otherwise equivalent run: historical D-PACE may record an unused
+`dflash_loss_decay_gamma=7` instead of `None`, and compact EAGLE3 teacher may
+record an implicit chunk size as `None` instead of `32768`.
+These are not silently rewritten; use weight-only initialization if the
+retained-wrapper resume contract differs.

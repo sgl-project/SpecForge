@@ -14,6 +14,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_dspark_offline_normalizer,
     build_dspark_offline_reader,
 )
+from specforge.algorithms.common.loss_settings import wrapper_loss_validator
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -169,6 +170,11 @@ def algorithm_providers() -> AlgorithmProviders:
             uses_external_target_head=False,
         ),
         model=ModelProvider(
+            validate_config=wrapper_loss_validator(
+                "DSparkDraftModel",
+                execution=("chunk_size", "checkpoint"),
+                compatible=(),
+            ),
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,

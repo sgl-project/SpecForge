@@ -244,10 +244,11 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.loss.fused` is a boolean, defaulting to `false` for all supported
-models, including DFlash2 and Domino. Set `false` to use eager losses.
-Unsupported devices and dtypes fall back to eager. Domino uses its specialized
-CE kernel under the same flag.
+`training.loss.fused` defaults to `false` for canonical objectives and `true`
+for retained training wrappers. DFlash-family wrappers accept `false` for eager
+losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
+Canonical optimized implementations fall back to the reference when unsupported.
+Domino selects its specialized CE kernel under the same flag.
 
 `training.loss.execution.chunk_size` sets the chunk size, and
 `training.loss.execution.checkpoint` (default `true`) independently controls

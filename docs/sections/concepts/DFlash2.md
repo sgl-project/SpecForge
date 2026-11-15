@@ -72,14 +72,16 @@ Configure its weight and optimizer-step schedule in the training YAML:
 ```yaml
 training:
   strategy: dflash
-  dflash2_selector_loss_alpha: 1.0
+  loss:
+    terms:
+      selector: {coefficient: 1.0}
   dflash2_selector_warmup_ratio: 0.0005
   dflash2_selector_ramp_ratio: 0.0005
   dflash2_selector_stop_gradient: false
 ```
 
 The effective selector weight is zero during warmup, increases linearly during
-the ramp, and then stays at `dflash2_selector_loss_alpha`. Warmup and ramp are
+the ramp, and then stays at `loss.terms.selector.coefficient`. Warmup and ramp are
 fractions of the resolved optimizer-step horizon, not micro-batch counts. With
 a positive configured alpha the selector remains in the optimizer and autograd
 graph during warmup, which keeps DDP behavior stable. Setting the configured

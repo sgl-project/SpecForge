@@ -25,6 +25,7 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1.0
   num_anchors: 512
+  # Optimizer-step equivalent of 2,000 source microsteps at global microbatch 32.
   save_interval: 125
   dist_timeout: 30
   seed: 42

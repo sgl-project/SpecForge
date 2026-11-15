@@ -174,6 +174,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         training = SimpleNamespace(
             attention_backend="flex_attention",
             loss={"execution": {"trim": True, "teacher_chunk_size": 1024}},
+            weighting=None,
             lambda_base_start=0.75,
             lambda_base_decay_ratio=0.25,
         )
@@ -292,6 +293,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             training=SimpleNamespace(
                 attention_backend="flex_attention",
                 loss={},
+                weighting=None,
             )
         )
         model = SimpleNamespace(

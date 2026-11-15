@@ -308,16 +308,12 @@ def build_peagle_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
-    from specforge.algorithms.common.loss_settings import (
-        require_term,
-        resolve_wrapper_loss,
-    )
+    from specforge.algorithms.common.loss_settings import resolve_wrapper_loss
 
-    settings = resolve_wrapper_loss(cfg.training, "PEagleDraftModel", execution=())
+    resolve_wrapper_loss(cfg.training, "PEagleDraftModel", execution=())
 
     from specforge.algorithms.peagle.model import OnlinePEagleModel
 
-    require_term(settings, "token", {"soft_ce"})
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
     model = OnlinePEagleModel(
         draft_model=draft_model,
@@ -356,20 +352,6 @@ def _build_dflash_family_model(
     settings,
 ) -> AlgorithmModelParts:
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
-
-    if settings.weighting.kind not in {
-        "uniform",
-        "exponential",
-        "dpace",
-        "dpace-cumulative-confidence-only",
-        "dpace-continuation-value-only",
-    } or (
-        settings.name not in {"dflash", "dflash2"}
-        and settings.weighting.kind.startswith("dpace")
-    ):
-        raise ValueError(
-            "This training wrapper does not support the requested weighting"
-        )
 
     _validate_dflash_block_size(draft_model)
     mask_token_id = _resolve_mask_token_id(cfg, draft_model, tokenizer)
@@ -422,7 +404,6 @@ def build_dflash_model(
     tokenizer: Any,
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.loss_settings import (
-        require_term,
         resolve_wrapper_loss,
         token_arguments,
     )
@@ -439,8 +420,6 @@ def build_dflash_model(
 
     from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 
-    if "selector" in settings.losses.terms:
-        require_term(settings, "selector", {"ce"}, coefficient=True)
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -480,10 +459,7 @@ def build_domino_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
-    from specforge.algorithms.common.loss_settings import (
-        require_term,
-        resolve_wrapper_loss,
-    )
+    from specforge.algorithms.common.loss_settings import resolve_wrapper_loss
 
     settings = resolve_wrapper_loss(
         cfg.training, "DominoDraftModel", execution=("chunk_size", "checkpoint")
@@ -491,8 +467,6 @@ def build_domino_model(
 
     from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
 
-    for name in ("base", "final"):
-        require_term(settings, name, {"ce"})
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -513,10 +487,7 @@ def build_dspark_model(
     _target_config: Any,
     tokenizer: Any,
 ) -> AlgorithmModelParts:
-    from specforge.algorithms.common.loss_settings import (
-        require_term,
-        resolve_wrapper_loss,
-    )
+    from specforge.algorithms.common.loss_settings import resolve_wrapper_loss
 
     settings = resolve_wrapper_loss(
         cfg.training, "DSparkDraftModel", execution=("chunk_size", "checkpoint")
@@ -524,8 +495,6 @@ def build_dspark_model(
 
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
 
-    require_term(settings, "token", {"ce_l1"}, options={"ce_weight", "l1_weight"})
-    require_term(settings, "confidence", {"bce"}, coefficient=True)
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -555,8 +524,8 @@ def build_dspine_model(
     tokenizer: Any,
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.loss_settings import (
-        require_term,
         resolve_wrapper_loss,
+        validate_dspine_weights,
     )
 
     settings = resolve_wrapper_loss(
@@ -565,20 +534,8 @@ def build_dspine_model(
 
     from specforge.algorithms.dspine.model import OnlineDSpineModel
 
-    token = require_term(
-        settings, "token", {"ce_l1"}, options={"ce_weight", "l1_weight"}
-    )
-    refinement = require_term(
-        settings, "refinement", {"ce_l1"}, options={"ce_weight", "l1_weight"}
-    )
-    require_term(settings, "alignment", {"cosine"}, coefficient=True)
-    if (
-        token.loss != refinement.loss
-        or abs(sum(token.loss.options.values()) - 1) > 1e-8
-    ):
-        raise ValueError(
-            "DSpine wrapper requires matching token/refinement weights summing to one"
-        )
+    validate_dspine_weights(cfg.training, draft_model.config.dspine_config)
+    token = settings.losses.terms["token"]
     return _build_dflash_family_model(
         cfg,
         draft_model,
@@ -594,16 +551,15 @@ def build_dspine_model(
 
 
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
+    from specforge.algorithms.common.loss_settings import resolve_wrapper_loss
+
+    execution = resolve_wrapper_loss(
+        cfg.training, "Eagle3DraftModel", execution=("trim", "teacher_chunk_size")
+    ).execution
     return {
-        "trim_loss_positions": cfg.training.loss.get("execution", {}).get(
-            "trim", False
-        ),
-        "compact_teacher": bool(
-            cfg.training.loss.get("execution", {}).get("teacher_chunk_size")
-        ),
-        "compact_teacher_chunk_size": cfg.training.loss.get("execution", {}).get(
-            "teacher_chunk_size"
-        ),
+        "trim_loss_positions": execution.trim,
+        "compact_teacher": bool(execution.teacher_chunk_size),
+        "compact_teacher_chunk_size": execution.teacher_chunk_size,
     }
 
 

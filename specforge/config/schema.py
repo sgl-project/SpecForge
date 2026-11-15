@@ -1096,6 +1096,15 @@ class TrainingConfig(StrictConfigModel):
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_loss_fields(cls, value):
+        from .loss_migration import reject_removed_loss_fields
+
+        if isinstance(value, dict):
+            reject_removed_loss_fields(value)
+        return value
+
     @field_validator("loss")
     @classmethod
     def _validate_loss(cls, value):
@@ -1558,6 +1567,10 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
         keys = path.split(".")
+        if len(keys) > 1 and keys[0] == "training":
+            from .loss_migration import reject_removed_loss_fields
+
+            reject_removed_loss_fields({keys[1]})
         owner, node = config, raw
         for key in keys[:-1]:
             owner = _override_field(owner, key, path)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+from specforge.config.schema import LossExecutionConfig
 
 
 def _feature_mode(cfg: Config) -> FeatureMode:
@@ -111,7 +112,8 @@ def _validate_algorithm_capabilities(
                 "distinct non-negative layer ids"
             )
 
-    if training.loss.get("execution", {}).get("teacher_chunk_size") and (
+    execution = LossExecutionConfig.model_validate(training.loss.get("execution", {}))
+    if execution.teacher_chunk_size and (
         not capabilities.supports_compact_teacher
         or mode is not FeatureMode.OFFLINE
         or cfg.model.input_modality != "text"
@@ -121,10 +123,7 @@ def _validate_algorithm_capabilities(
             f"mode={mode.value!r}, modality={cfg.model.input_modality!r}"
         )
 
-    if (
-        training.loss.get("execution", {}).get("trim", False)
-        and not capabilities.supports_trim_loss_positions
-    ):
+    if execution.trim and not capabilities.supports_trim_loss_positions:
         raise ValueError(
             f"algorithm {algorithm.name!r} does not support "
             "training.loss.execution.trim"
@@ -231,6 +230,8 @@ def validate_resolved_run(
     _validate_algorithm_capabilities(cfg, algorithm, mode)
     _validate_training_topology(cfg, mode)
     _validate_vocab_mapping(cfg, algorithm, mode)
+    if algorithm.providers.model.validate_config is not None:
+        algorithm.providers.model.validate_config(cfg)
 
 
 __all__ = ["validate_resolved_run"]

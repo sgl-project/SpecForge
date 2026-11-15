@@ -41,10 +41,28 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         for path in paths:
             with self.subTest(config=path.name):
                 config = Config.from_file(str(path))
-                # Canonical planning also needs target metadata; local-target
-                # composition is covered in test_canonical_training.
-                if config.draft is None and config.initialization is None:
-                    resolve_run(config)
+                # Native MTP presets use matching local metadata, without a Hub call.
+                target = dict(
+                    model_type="qwen3_5",
+                    hidden_size=2560,
+                    vocab_size=248320,
+                    intermediate_size=9216,
+                    hidden_act="silu",
+                    rms_norm_eps=1e-6,
+                    num_attention_heads=16,
+                    num_key_value_heads=4,
+                    head_dim=256,
+                    max_position_embeddings=262144,
+                    attn_output_gate=True,
+                    rope_parameters=dict(
+                        rope_type="mrope",
+                        rope_theta=10000000.0,
+                        partial_rotary_factor=0.25,
+                        mrope_section=[11, 11, 10],
+                        mrope_interleaved=True,
+                    ),
+                )
+                resolve_run(config, target_config=target)
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(

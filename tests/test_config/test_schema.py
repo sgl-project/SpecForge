@@ -646,36 +646,10 @@ class ConfigSchemaTest(unittest.TestCase):
                 ):
                     resolve_run(Config.model_validate(payload))
 
-    def test_dflash_teacher_metrics_reaches_the_training_model(self):
-        from unittest import mock
+    def test_loss_settings_reach_real_family_builder(self):
+        from types import SimpleNamespace
 
-        from specforge.algorithms.dflash.providers import build_training_model
-
-        for enabled in (True, False):
-            with self.subTest(dflash_teacher_metrics=enabled):
-                payload = _online_payload("dflash")
-                payload["training"]["dflash_teacher_metrics"] = enabled
-                config = Config.model_validate(payload)
-                # Construction only: the family builder hands the factory its
-                # shared kwargs, and the objective records the config value.
-                with (
-                    mock.patch(
-                        "specforge.algorithms.common.dflash_family_model."
-                        "OnlineDFlashModel"
-                    ) as model_cls,
-                    mock.patch(
-                        "specforge.algorithms.model_providers."
-                        "_build_dflash_family_model",
-                        side_effect=lambda _cfg, _draft, _tok, factory, _settings: factory(
-                            {}
-                        ),
-                    ),
-                ):
-                    build_training_model(config, None, None, None, None)
-                self.assertIs(enabled, model_cls.call_args.kwargs["teacher_metrics"])
-
-    def test_loss_fused_reaches_dflash_family(self):
-        from unittest import mock
+        import torch
 
         from specforge.algorithms import model_providers
 
@@ -685,13 +659,33 @@ class ConfigSchemaTest(unittest.TestCase):
             ("domino", "OnlineDominoModel"),
             ("dspine", "OnlineDSpineModel"),
         ):
-            for enabled in (False, True):
-                with self.subTest(strategy=strategy, enabled=enabled):
+            for fused in (None, False, True):
+                with self.subTest(strategy=strategy, fused=fused):
                     payload = _online_payload(strategy)
-                    terms = {}
+                    loss = {"execution": {"chunk_size": 3, "checkpoint": False}}
+                    if fused is not None:
+                        loss["fused"] = fused
                     expected = {}
-                    if strategy == "dspark":
-                        terms = {
+                    if strategy == "dflash":
+                        loss["terms"] = {
+                            "token": {
+                                "kind": "lk_lambda",
+                                "options": {"kl_scale": 0.4, "kl_decay": 0.8},
+                            },
+                            "selector": {"coefficient": 0.2},
+                        }
+                        expected = {
+                            "lk_loss_type": "lambda",
+                            "kl_scale": 0.4,
+                            "kl_decay": 0.8,
+                            "loss_type": "dpace",
+                            "dpace_alpha": 0.3,
+                            "selector_loss_alpha": 0.2,
+                            "teacher_metrics": False,
+                        }
+                        payload["training"].update(dflash_teacher_metrics=False)
+                    elif strategy == "dspark":
+                        loss["terms"] = {
                             "token": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
                             "confidence": {"coefficient": 0.2},
                         }
@@ -701,37 +695,163 @@ class ConfigSchemaTest(unittest.TestCase):
                             "dspark_confidence_head_alpha": 0.2,
                         }
                     elif strategy == "dspine":
-                        terms = {
+                        loss["terms"] = {
                             name: {"options": {"ce_weight": 0.3, "l1_weight": 0.7}}
                             for name in ("token", "refinement")
                         }
-                        terms["alignment"] = {"coefficient": 0.2}
+                        loss["terms"]["alignment"] = {"coefficient": 0.2}
                         expected = {"ce_weight": 0.3, "alignment_weight": 0.2}
-                    payload["training"]["loss"] = {"fused": enabled, "terms": terms}
-                    config = Config.model_validate(payload)
-                    model_module = (
+                    payload["training"].update(
+                        loss=loss,
+                        weighting=(
+                            {"kind": "dpace", "alpha": 0.3}
+                            if strategy == "dflash"
+                            else {"kind": "exponential", "gamma": 4.0}
+                        ),
+                    )
+                    cfg = Config.model_validate(payload)
+                    draft = SimpleNamespace(
+                        block_size=4,
+                        target_layer_ids=[1, 3],
+                        config=SimpleNamespace(
+                            vocab_size=32,
+                            dspine_config={},
+                            dflash_config={"mask_token_id": 31},
+                        ),
+                    )
+                    if strategy == "dflash":
+                        draft.candidate_selector = object()
+                    module = (
                         "specforge.algorithms.dspine.model"
                         if strategy == "dspine"
                         else "specforge.algorithms.common.dflash_family_model"
                     )
                     with (
-                        mock.patch(f"{model_module}.{model_name}") as model_cls,
-                        mock.patch.object(
-                            model_providers,
-                            "_build_dflash_family_model",
-                            side_effect=lambda _cfg, _draft, _tok, factory, _settings: factory(
-                                {}
+                        mock.patch(f"{module}.{model_name}") as wrapper,
+                        mock.patch(
+                            "specforge.modeling.target.target_utils.TargetEmbeddingsAndHead.from_pretrained",
+                            return_value=SimpleNamespace(
+                                lm_head=object(), embed_tokens=object()
                             ),
                         ),
+                        mock.patch.object(
+                            model_providers, "_device", return_value=torch.device("cpu")
+                        ),
                     ):
-                        getattr(model_providers, f"build_{strategy}_model")(
-                            config, None, None, None, None
+                        parts = getattr(model_providers, f"build_{strategy}_model")(
+                            cfg, draft, None, None, None
                         )
-                    self.assertIs(
-                        model_cls.call_args.kwargs["fused_logits_loss"], enabled
+                    arguments = wrapper.call_args.kwargs
+                    self.assertEqual(parts.capture_layers, [1, 3])
+                    self.assertEqual(arguments["objective_chunk_blocks"], 3)
+                    self.assertFalse(arguments["objective_checkpointing"])
+                    self.assertEqual(
+                        arguments["loss_decay_gamma"],
+                        None if strategy == "dflash" else 4.0,
                     )
-                    for name, value in expected.items():
-                        self.assertEqual(model_cls.call_args.kwargs[name], value)
+                    self.assertEqual(arguments["fused_logits_loss"], fused is not False)
+                    for key, value in expected.items():
+                        self.assertEqual(arguments[key], value)
+
+    def test_eagle_builder_receives_teacher_lk_options(self):
+        import torch
+
+        from specforge.algorithms import model_providers
+
+        payload = _online_payload("eagle3")
+        payload["training"]["loss"] = {
+            "terms": {
+                "token": {
+                    "kind": "lk_lambda",
+                    "options": {"target": "teacher", "kl_scale": 0.3, "kl_decay": 0.9},
+                }
+            }
+        }
+        with (
+            mock.patch(
+                "specforge.algorithms.eagle3.model.OnlineEagle3Model"
+            ) as wrapper,
+            mock.patch.object(
+                model_providers, "_device", return_value=torch.device("cpu")
+            ),
+        ):
+            model_providers.build_eagle3_model(
+                Config.model_validate(payload), None, None, None, None
+            )
+        for key, value in {
+            "lk_loss_type": "lambda",
+            "kl_scale": 0.3,
+            "kl_decay": 0.9,
+        }.items():
+            self.assertEqual(wrapper.call_args.kwargs[key], value)
+
+    def test_wrapper_loss_errors_fail_during_planning(self):
+        cases = (
+            ("eagle3", {"fused": False}, None),
+            ("peagle", {"fused": False}, None),
+            ("dflash", {"terms": {"unknown": {}}}, None),
+            ("dflash", {"execution": {"teacher_chunk_size": 32}}, None),
+            ("domino", {"terms": {"base": {"kind": "lk_tv"}}}, None),
+            ("domino", {}, {"kind": "dpace", "alpha": 0.5}),
+            ("dspark", {"terms": {"token": {"kind": "ce"}}}, None),
+            ("dspine", {"terms": {"token": {"options": {"ce_weight": 0.3}}}}, None),
+        )
+        for strategy, loss, weighting in cases:
+            with (
+                self.subTest(strategy=strategy, loss=loss),
+                self.assertRaises(ValueError),
+            ):
+                payload = _online_payload(strategy)
+                payload["training"].update(loss=loss, weighting=weighting)
+                resolve_run(Config.model_validate(payload))
+
+    def test_planning_reads_dflash2_and_dspine_metadata(self):
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            draft = Path(directory) / "config.json"
+            for strategy, architecture, metadata, terms in (
+                ("dflash", "DFlash2DraftModel", {}, {"selector": {"coefficient": 0.2}}),
+                (
+                    "dspine",
+                    "DSpineDraftModel",
+                    {"ce_weight": 0.3, "alignment_weight": 0.9},
+                    {
+                        "token": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
+                        "refinement": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
+                        "alignment": {"coefficient": 0.5},
+                    },
+                ),
+            ):
+                with self.subTest(strategy=strategy):
+                    draft.write_text(
+                        json.dumps(
+                            {"architectures": [architecture], "dspine_config": metadata}
+                        )
+                    )
+                    payload = _online_payload(strategy)
+                    payload["model"]["draft_model_config"] = str(draft)
+                    if strategy == "dspine":
+                        with self.assertRaisesRegex(
+                            ValueError, "training.loss.terms.token.options"
+                        ):
+                            resolve_run(Config.model_validate(payload))
+                    payload["training"]["loss"] = {"terms": terms}
+                    resolve_run(Config.model_validate(payload))
+
+    def test_removed_loss_keys_name_the_replacement(self):
+        from specforge.config.loss_migration import REMOVED_LOSS_FIELDS
+
+        for key, replacement in REMOVED_LOSS_FIELDS.items():
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError) as caught:
+                    Config.model_validate({**MINIMAL, "training": {key: True}})
+                self.assertIn(replacement, str(caught.exception))
+                with self.assertRaises(ValueError) as caught:
+                    apply_overrides(
+                        Config.model_validate(MINIMAL), [f"training.{key}=true"]
+                    )
+                self.assertIn(replacement, str(caught.exception))
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

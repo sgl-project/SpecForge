@@ -42,6 +42,7 @@ training:
   max_grad_norm: 1.0
   attention_backend: eager
   num_anchors: 512
+  # Optimizer-step equivalent of about 250 source microsteps at microbatch 16.
   save_interval: 8
   dist_timeout: 30
   seed: 42
