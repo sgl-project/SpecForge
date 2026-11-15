@@ -41,6 +41,21 @@ def _config(*, strategy="dflash", **model_overrides):
 
 
 class DisaggregatedModelLoadingTest(unittest.TestCase):
+    def setUp(self):
+        # Hub metadata is now read during planning, before capture construction.
+        def metadata(source, **kwargs):
+            architecture = {
+                "domino-draft": "DominoDraftModel",
+                "dspark-draft": "DSparkDraftModel",
+            }.get(source, "DFlashDraftModel")
+            return {"architectures": [architecture]}, {}
+
+        patch = mock.patch(
+            "transformers.PretrainedConfig.get_config_dict", side_effect=metadata
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_capture_contract_uses_canonical_draft_config_sources(self):
         configs = (
             _config(),

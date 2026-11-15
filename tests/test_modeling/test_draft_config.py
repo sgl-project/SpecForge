@@ -35,6 +35,103 @@ class DraftConfigTest(unittest.TestCase):
     def write(self, payload):
         self.path.write_text(json.dumps(payload), encoding="utf-8")
 
+    def test_planning_and_model_loading_share_config_sources(self):
+        from specforge.application import resolve_run
+        from specforge.config import Config
+        from specforge.training.model_loading import resolve_draft_config
+
+        weights = self.path.parent / "model.safetensors"
+        weights.write_bytes(b"\x80not JSON")  # Neither path should read the weights.
+        run = self.path.parent / "run"
+        run.mkdir()
+        (run / "draft-latest").symlink_to(self.path.parent, target_is_directory=True)
+        sources = [
+            ("draft_model_config", str(self.path)),
+            ("draft_model_config", str(self.path.parent)),
+            ("draft_model_config", self.path.as_uri()),
+            ("draft_model_config", "org/draft"),
+            ("draft_checkpoint_path", str(weights)),
+            ("draft_checkpoint_path", weights.as_uri()),
+            ("draft_checkpoint_path", str(self.path.parent)),
+            ("draft_checkpoint_path", str(run)),
+            ("draft_checkpoint_path", "org/draft"),
+        ]
+        for strategy, architecture, metadata, terms in (
+            ("dflash", "DFlash2DraftModel", {}, {"selector": {"coefficient": 0.2}}),
+            (
+                "dspine",
+                "DSpineDraftModel",
+                {"ce_weight": 0.3, "alignment_weight": 0.9},
+                {
+                    "token": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
+                    "refinement": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
+                    "alignment": {"coefficient": 0.9},
+                },
+            ),
+        ):
+            payload = {
+                **self.payload,
+                "architectures": [architecture],
+                "dspine_config": metadata,
+            }
+            self.write(payload)
+            for field, source in sources:
+                with self.subTest(strategy=strategy, field=field, source=source):
+                    cfg = Config.model_validate(
+                        {
+                            "model": {
+                                "target_model_path": "unused-target",
+                                field: source,
+                            },
+                            "data": {"hidden_states_path": "unused-features"},
+                            "training": {
+                                "strategy": strategy,
+                                "loss": {"terms": terms},
+                            },
+                        }
+                    )
+                    # Exercise the real Hub dispatch without downloading a model.
+                    with mock.patch.object(
+                        PretrainedConfig, "get_config_dict", return_value=(payload, {})
+                    ) as hub:
+                        if strategy == "dspine":
+                            missing = cfg.model_copy(deep=True)
+                            missing.training.loss = {}
+                            with self.assertRaisesRegex(
+                                ValueError, "training.loss.terms.token.options"
+                            ):
+                                resolve_run(missing)
+                        resolved = resolve_run(cfg)
+                        loaded = resolve_draft_config(
+                            cfg,
+                            provider=resolved.algorithm.providers.model.draft_config,
+                        )
+                        self.assertEqual(loaded.architectures, [architecture])
+                        if source == "org/draft":
+                            self.assertTrue(hub.called)
+                            self.assertEqual(hub.call_args.args, ("org/draft",))
+                        else:
+                            hub.assert_not_called()
+
+    def test_planning_does_not_default_a_missing_explicit_config(self):
+        from specforge.application import resolve_run
+        from specforge.config import Config
+
+        cfg = Config.model_validate(
+            {
+                "model": {
+                    "target_model_path": "unused-target",
+                    "draft_model_config": str(self.path),
+                },
+                "data": {"hidden_states_path": "unused-features"},
+                "training": {"strategy": "dflash"},
+            }
+        )
+        with self.assertRaisesRegex(
+            FileNotFoundError, "draft model config does not exist"
+        ):
+            resolve_run(cfg)
+
     def test_sources_and_legacy_entry_points_are_equivalent(self):
         self.write(self.payload)
         expected = AutoDraftConfig.from_dict(self.payload).to_dict()

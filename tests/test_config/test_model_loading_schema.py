@@ -2,6 +2,7 @@
 """Typed contract for draft config resolution and weights-only warm starts."""
 
 import unittest
+from unittest import mock
 
 from pydantic import ValidationError
 
@@ -50,7 +51,11 @@ class ModelLoadingSchemaTest(unittest.TestCase):
                 resolve_run(cfg)
                 self.assertIsNone(cfg.model.draft_model_config)
 
-    def test_specialized_dflash_architectures_still_require_a_config(self):
+    @mock.patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"architectures": ["DominoDraftModel"]}, {}),
+    )
+    def test_specialized_dflash_architectures_still_require_a_config(self, _hub):
         with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
             resolve_run(Config.model_validate(_payload("domino")))
         with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
@@ -117,7 +122,11 @@ class ModelLoadingSchemaTest(unittest.TestCase):
                 }
             )
 
-    def test_disaggregated_producer_can_resolve_warm_start_metadata(self):
+    @mock.patch(
+        "transformers.PretrainedConfig.get_config_dict",
+        return_value=({"architectures": ["DFlashDraftModel"]}, {}),
+    )
+    def test_disaggregated_producer_can_resolve_warm_start_metadata(self, _hub):
         payload = _payload(
             "dflash",
             draft_checkpoint_path="org/dflash-draft",

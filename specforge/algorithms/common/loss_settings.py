@@ -4,9 +4,7 @@ Wrappers keep their execution capabilities, but accept only the shared public
 loss configuration. Unsupported formulas or scheduling fail before training.
 """
 
-import json
 from dataclasses import asdict
-from pathlib import Path
 
 
 def resolve_wrapper_loss(training, architecture, *, execution=()):
@@ -144,19 +142,15 @@ def validate_dspine_weights(training, recorded):
 def wrapper_loss_validator(architecture, *, execution=(), compatible=()):
     """Build a planning hook using the same loss resolver as model assembly.
 
-    Read only local draft metadata to distinguish DFlash2 and historical weights;
-    target weights and model construction are not needed for loss validation.
+    Reuse model loading's config source resolution to distinguish DFlash2 and
+    historical weights, without loading target weights or constructing a model.
     """
 
     def validate(config):
-        recorded = {}
-        source = config.model.draft_model_config or config.model.draft_checkpoint_path
-        if source:
-            path = Path(source)
-            if path.is_dir():
-                path /= "config.json"
-            if path.is_file():
-                recorded = json.loads(path.read_text())
+        from specforge.training.model_loading import load_explicit_draft_config
+
+        draft = load_explicit_draft_config(config)
+        recorded = draft.to_dict() if draft is not None else {}
         selected = recorded.get("architectures", [architecture])[0]
         if selected not in (architecture, *compatible):
             selected = architecture

@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 from pydantic import ValidationError
@@ -85,6 +86,15 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        draft = Path(directory.name) / "config.json"
+        draft.write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}))
+        patch = mock.patch.dict(MINIMAL["model"], draft_model_config=str(draft))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_consumer_dispatch_defaults_and_validation(self):
         from specforge.config.schema import RuntimeConfig
 

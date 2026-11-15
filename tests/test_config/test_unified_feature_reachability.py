@@ -1,6 +1,8 @@
 # coding=utf-8
 """Config-to-assembly reachability for retained training capabilities."""
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +32,15 @@ OFFLINE_EAGLE3 = {
 
 
 class UnifiedFeatureReachabilityTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        draft = Path(directory.name) / "config.json"
+        draft.write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}))
+        patch = mock.patch.dict(OFFLINE_EAGLE3["model"], draft_model_config=str(draft))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_all_example_configs_validate_without_remote_target_downloads(self):
         paths = sorted(
             path
