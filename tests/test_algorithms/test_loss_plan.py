@@ -723,9 +723,9 @@ class LossPlanTest(unittest.TestCase):
 
     def test_projection_execution_constraints(self):
         head = nn.Linear(4, 9)
-        for options, expected_calls in (
-            ({"chunk_safe": False}, [4]),
-            ({"recompute_safe": False}, [1, 1, 1, 1]),
+        for options, expected_calls, expected_warning in (
+            ({"chunk_safe": False}, [4], "Loss chunking is disabled"),
+            ({"recompute_safe": False}, [1, 1, 1, 1], "Loss checkpointing is disabled"),
         ):
             with self.subTest(options=options):
                 project = Mock(side_effect=lambda x: {"logits": head(x)})
@@ -736,8 +736,16 @@ class LossPlanTest(unittest.TestCase):
                     positions=torch.zeros(4, 1, dtype=torch.long),
                     mask=torch.ones(4, 1),
                 )
-                with self.assertWarnsRegex(RuntimeWarning, "Loss .* is disabled"):
+                with warnings.catch_warnings(record=True) as notices:
+                    warnings.simplefilter("always", RuntimeWarning)
                     run(p, chunk=1).loss.backward()
+                self.assertTrue(
+                    any(
+                        issubclass(notice.category, RuntimeWarning)
+                        and str(notice.message).startswith(expected_warning)
+                        for notice in notices
+                    )
+                )
                 self.assertEqual(
                     [call.args[0].shape[0] for call in project.call_args_list],
                     expected_calls,
