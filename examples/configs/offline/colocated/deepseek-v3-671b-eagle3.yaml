@@ -10,6 +10,8 @@ data:
   chat_template: deepseek-v3
   cache_dir: ./cache
 training:
+  loss:
+    fused: true
   num_epochs: 10
   batch_size: 1
   learning_rate: 5.0e-05

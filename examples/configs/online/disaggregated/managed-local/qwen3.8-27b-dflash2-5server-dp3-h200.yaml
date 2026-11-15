@@ -46,7 +46,6 @@ training:
   # The objective never reads the target's final hidden state; it only feeds
   # the dflash/teacher/* diagnostics on log steps. Skipping it removes 1/6 of
   # every sample's capture, Mooncake and fetch bytes.
-  dflash_teacher_metrics: false
   save_interval: 500
   log_interval: 10
   dist_timeout: 30

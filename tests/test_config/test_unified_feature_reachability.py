@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
 from pydantic import ValidationError
 
 from specforge.application import resolve_run
@@ -73,6 +74,27 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                         mrope_interleaved=True,
                     ),
                 )
+                if config.draft:
+                    payload = (
+                        yaml.safe_load((REPO_ROOT / config.draft).read_text())
+                        if isinstance(config.draft, str)
+                        else config.draft
+                    )
+                    if payload["architectures"] != ["MTPDraftModel"]:
+                        features = payload["spec_config"]["target_features"]
+                        target = {
+                            "hidden_size": features["hidden_size"],
+                            "vocab_size": payload["vocab_size"],
+                            "num_hidden_layers": max(
+                                features.get("target_layer_ids", [0])
+                            )
+                            + 2,
+                        }
+                        transform = payload.get("target_logit_transform", {})
+                        if transform.get("type") == "mup":
+                            target["logits_mup_width_multiplier"] = transform[
+                                "multiplier"
+                            ]
                 resolve_run(config, target_config=target)
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
