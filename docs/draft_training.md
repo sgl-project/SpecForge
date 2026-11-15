@@ -256,9 +256,10 @@ training:
 - `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
-  corrections without constructing full corrected logits. CPU, FP64 and other
-  unsupported generic contracts use a logged reference. Missing required kernel
-  dependencies and incompatible explicit specializations raise.
+  corrections without constructing full corrected logits. Categorical fused
+  requests on CPU or FP64 raise. An eligible kernel path with missing Triton or
+  Liger also raises. A projection that does not match a specialization can use
+  another compatible kernel or a logged reference on a supported device/dtype.
   Empty inputs use the reference only to preserve zero gradients.
   The first selection for each prediction group is logged at INFO, checked across
   ranks, and recorded for resume. Rejection reasons explain lower-priority choices.
@@ -280,7 +281,7 @@ linear head.
 Wrapped/transformed heads retain ordinary projection and may use a token kernel.
 
 Chunked D-PACE first collects detached chain statistics, then recomputes projection
-chunks with the complete-chain weights. Contextual LK losses retain whole-set
+chunks with the complete-chain weights. Only `lk_lambda` among the LK variants retains whole-set
 execution, and DSpine retains it when no window alignment statistic is supplied.
 Thus requesting chunking does not promise bounded loss memory for those paths.
 
@@ -396,6 +397,12 @@ Projection outputs and intermediate results are scoped to one chunk. No logits
 cache is stored on the model. Loss registrations distinguish context inputs from statistics scope: prediction-scope
 losses stay unsplit; per-position contextual losses can share fixed whole-set counts.
 Algorithms must set `chunk_safe=False` when their computation couples units.
+Losses declare `context_statistics` separately from accepting `LossContext`:
+`supervised_count` requests a whole-set count, and `teacher_mass` requests the
+probability mass retained by vocabulary selection. CE/L1 uses component masks
+without requesting either statistic. Contextual extensions that omit this
+declaration retain both statistics for compatibility.
+
 
 All objective terms live in `LossPlan.terms`. By default the executor runs its
 groups directly. Algorithms with dependent computations supply
@@ -406,8 +413,9 @@ groups directly. Algorithms with dependent computations supply
   values and statistics through the same implementation registry. Request extra
   CE outputs explicitly with `return_teacher_l1=True` or `top_k=k`; these
   do not change the mathematical loss or its coefficient.
-- `calc.add(index, values)` supplies a computed tensor to a declared
-  `TokenLoss("value")` term. It uses the same weighting and denominator rules.
+- `calc.add(index, values)` supplies already-computed values for a declared term,
+  including `TokenLoss("value")` or a formula term. It applies that term's weighting
+  and denominator without evaluating its formula again.
 - `calc.ratios` holds additive metric pairs.
 
 Every declared term executes exactly once. Intermediate keys must be unique and
@@ -416,6 +424,15 @@ implementations share the result contract: weighted numerators for final terms,
 or differentiable per-position values for intermediate requests. Projection-fused
 implementations can decline requests requiring intermediate values.
 Statistics retain gradients; algorithms explicitly detach supervision targets.
+Callbacks share the run's fused policy; individual calls cannot override it.
+Implementations that handle intermediate or non-categorical requests must declare
+their supported `losses`. Without this declaration, an optimization receives only
+ordinary categorical prediction requests. Intermediate requests may have
+`predictions=None`, direct `tensors`, `unreduced=True`, and `requested_outputs`;
+support checks must inspect these fields without projecting model outputs.
+The protocol's default loss defines its main loss input kind. Selecting another
+input kind fails during objective construction.
+
 
 For example, DSpark reuses `teacher_l1` from the main loss, constructs a detached
 acceptance target, and requests BCE through the registry. DFlash2 requests top-k
@@ -439,8 +456,6 @@ No router state updates run inside loss callbacks or checkpoint recomputation.
 Fused resume contracts include stable implementation identities for intermediate
 calls as well as final terms. Checkpoints using the previous auxiliary primitive
 identities fail the existing resume check rather than silently changing execution.
-The equivalent CE statistics names ce_statistics and fused_ce_statistics map to
-reference and token_ce on restore; other identity changes still fail.
 
 The fused soft CE kernel is new in this PR, rather than migrated from legacy.
 Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`

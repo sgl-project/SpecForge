@@ -3,6 +3,7 @@
 import gc
 import sys
 import unittest
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -296,6 +297,7 @@ class LossPlanTest(unittest.TestCase):
                 supports=lambda req, group: None if group == (0, 1) else "pair only",
             )
             def joint(req, group):
+                self.assertGreater(req.input_tensor.numel(), 0)
                 if len(group) > 1:
                     calls.append(group)
                 values = req.outputs()
@@ -734,7 +736,8 @@ class LossPlanTest(unittest.TestCase):
                     positions=torch.zeros(4, 1, dtype=torch.long),
                     mask=torch.ones(4, 1),
                 )
-                run(p, chunk=1).loss.backward()
+                with self.assertWarnsRegex(RuntimeWarning, "Loss .* is disabled"):
+                    run(p, chunk=1).loss.backward()
                 self.assertEqual(
                     [call.args[0].shape[0] for call in project.call_args_list],
                     expected_calls,
@@ -746,12 +749,24 @@ class LossPlanTest(unittest.TestCase):
                     chain_ids=torch.arange(4)[:, None],
                     sequence_ids=torch.zeros(4, 1, dtype=torch.long),
                 )
-                result = execute_batch(
-                    PredictionBatch((p,)),
-                    TokenLoss(kind="ce"),
-                    PositionWeighting(kind="dpace"),
-                    training=True,
-                    execution=LossExecution(chunk_size=1),
+                with warnings.catch_warnings(record=True) as notices:
+                    warnings.simplefilter("always")
+                    result = execute_batch(
+                        PredictionBatch((p,)),
+                        TokenLoss(kind="ce"),
+                        PositionWeighting(kind="dpace"),
+                        training=True,
+                        execution=LossExecution(chunk_size=1),
+                    )
+                messages = [str(notice.message) for notice in notices]
+                self.assertTrue(
+                    any("D-PACE loss chunking is disabled" in text for text in messages)
+                )
+                self.assertTrue(
+                    any(
+                        "checkpointing is disabled for unchunked D-PACE" in text
+                        for text in messages
+                    )
                 )
                 result.loss.backward()
                 self.assertEqual(
@@ -910,31 +925,36 @@ class LossPlanTest(unittest.TestCase):
             expected.loss, parameters, retain_graph=True, allow_unused=True
         )
 
-        def compute(calc):
-            calc.run((0, 1))
-            calc.run((2,))
-
-        prediction = replace(p, compute=compute)
         entry = _IMPLEMENTATIONS["domino_suffix_ce"]
-        optimized = Mock(wraps=entry.compute)
-        with patch.dict(
-            _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
-        ):
-            actual = run(prediction, fused=True, chunk=1)
-            actual_grad = torch.autograd.grad(
-                actual.loss, parameters, retain_graph=True, allow_unused=True
-            )
-        self.assertGreater(optimized.call_count, 0)
-        torch.testing.assert_close(actual.loss, expected.loss, rtol=3e-4, atol=3e-5)
-        torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
-        torch.testing.assert_close(actual.ratios, expected.ratios)
-        for projection in (
-            Projection(p.projection.project),
-            replace(p.projection, block_size=p.projection.block_size + 1),
-        ):
-            fallback = run(
-                replace(prediction, projection=projection), fused=True, chunk=1
-            )
-            torch.testing.assert_close(
-                fallback.loss, expected.loss, rtol=3e-4, atol=3e-5
-            )
+        cases = (
+            (p, True),
+            (replace(p, projection=Projection(p.projection.project)), False),
+            (
+                replace(
+                    p,
+                    projection=replace(
+                        p.projection, block_size=p.projection.block_size + 1
+                    ),
+                ),
+                False,
+            ),
+            (replace(p, plan=replace(p.plan, joint_groups=())), False),
+        )
+        for prediction, uses_joint in cases:
+            optimized = Mock(wraps=entry.compute)
+            with (
+                self.subTest(uses_joint=uses_joint),
+                patch.dict(
+                    _IMPLEMENTATIONS, {entry.name: replace(entry, compute=optimized)}
+                ),
+            ):
+                actual = run(prediction, fused=True, chunk=1)
+                actual_grad = torch.autograd.grad(
+                    actual.loss, parameters, retain_graph=True, allow_unused=True
+                )
+                self.assertEqual(bool(optimized.call_count), uses_joint)
+                torch.testing.assert_close(
+                    actual.loss, expected.loss, rtol=3e-4, atol=3e-5
+                )
+                torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
+                torch.testing.assert_close(actual.ratios, expected.ratios)

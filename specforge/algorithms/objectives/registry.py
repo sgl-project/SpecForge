@@ -165,6 +165,12 @@ def resolve_objective(
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
     )
+    input_kind = objective.default_loss.registration.input_kind
+    if selected_loss.registration.input_kind != input_kind:
+        raise ValueError(
+            f"protocol {name!r} supplies {input_kind} loss inputs, "
+            f"but {selected_loss.kind!r} requires {selected_loss.registration.input_kind}"
+        )
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (

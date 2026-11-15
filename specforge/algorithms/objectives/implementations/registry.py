@@ -134,7 +134,9 @@ def register_implementation(
         priority: Selection priority; higher values take precedence.
         category: "generic" for automatic optimization, "specialized" for projection-specific
             optimization, or "reference" for portable mathematical evaluation.
-        losses: Supported mathematical loss names; empty for the generic reference.
+        losses: Supported mathematical loss names. Without a declaration, optimizations
+            receive only ordinary categorical prediction requests. The reference
+            implementation may accept all request forms.
 
     Returns:
         A decorator that registers and returns the compute callable unchanged.
@@ -180,12 +182,25 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
         key=lambda entry: (entry.category == "reference", -entry.priority, entry.name),
     )
     for entry in candidates:
-        reason = (
-            "mathematical loss does not match"
-            if entry.losses
-            and any(request.terms[i].loss.kind not in entry.losses for i in group)
-            else entry.supports(request, group)
-        )
+        if entry.losses and any(
+            request.terms[i].loss.kind not in entry.losses for i in group
+        ):
+            reason = "mathematical loss does not match"
+        elif (
+            entry.category != "reference"
+            and not entry.losses
+            and (
+                request.predictions is None
+                or request.unreduced
+                or any(
+                    request.terms[i].loss.registration.input_kind != "categorical"
+                    for i in group
+                )
+            )
+        ):
+            reason = "intermediate and non-categorical requests require declared losses"
+        else:
+            reason = entry.supports(request, group)
         if reason is None:
             if (
                 fused
@@ -270,7 +285,7 @@ class ExecutionSelection:
         self.names.clear()
 
     def resolve(self, request, group, prediction_index, *, fused=True):
-        """Select and log a group once; reject rank or resume disagreement."""
+        """Select on each call; log once per key and reject rank or resume disagreement."""
         if not fused:
             return select_implementation(request, group)
         key = f"{prediction_index}:" + ",".join(map(str, group))

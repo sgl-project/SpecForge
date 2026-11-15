@@ -90,7 +90,11 @@ def prepare_supervision(predictions, loss, weighting, execution):
             teacher = predictions.teacher.logits()
             teacher_ids = teacher.argmax(-1)
             if predictions.vocab_mask is not None:
-                if any(selected.registration.contextual for selected in losses):
+                if any(
+                    "teacher_mass" in selected.registration.context_statistics
+                    and selected.requires_teacher
+                    for selected in losses
+                ):
                     mass = (
                         teacher.float().softmax(-1)[..., predictions.vocab_mask].sum(-1)
                     )
@@ -416,22 +420,34 @@ def evaluate_chunks(
     # request contextual formulas for terms declared as precomputed values.
     context_counts = None
     if split and any(
-        (selected.registration.contextual or predictions.compute is not None)
+        (
+            "supervised_count" in selected.registration.context_statistics
+            or predictions.compute is not None
+        )
         and (term.denominator is not None or predictions.denominator is not None)
         for term, selected in zip(predictions.plan.terms, losses)
     ):
-        context_counts = [
-            predictions.hidden.new_zeros((), dtype=torch.float32) for _ in losses
-        ]
-        with torch.no_grad():
-            for part in prediction_slices(predictions, chunk_size):
-                item = predictions.select(part)
-                supervision = prepare_supervision(item, loss, weighting, execution)
-                for index, term in enumerate(item.plan.terms):
-                    mask = supervision.mask if term.mask is None else term.mask
-                    if term.mask is not None and item.vocab_mask is not None:
-                        mask = mask * item.vocab_mask[supervision.teacher_ids]
-                    context_counts[index] += mask.float().sum()
+        eligibility = None
+        if predictions.vocab_mask is not None:
+            # Counts need only vocabulary eligibility, not teacher probabilities.
+            eligible = []
+            with torch.no_grad():
+                for part in prediction_slices(predictions, chunk_size):
+                    teacher = predictions.teacher.select(part)
+                    if execution.teacher_chunk_size:
+                        _, ids, _ = teacher.compact(
+                            predictions.vocab_mask, execution.teacher_chunk_size
+                        )
+                    else:
+                        ids = teacher.logits().argmax(-1)
+                    eligible.append(predictions.vocab_mask[ids])
+            eligibility = torch.cat(eligible)
+        context_counts = []
+        for term in predictions.plan.terms:
+            mask = predictions.mask if term.mask is None else term.mask
+            if eligibility is not None:
+                mask = mask * eligibility
+            context_counts.append(mask.float().sum().detach())
     from torch.utils.checkpoint import checkpoint
 
     results = []

@@ -35,6 +35,7 @@ class LossRegistration:
         inputs: Additional batch/capture fields needed by the loss.
         contextual: Whether the mathematical formula receives LossContext.
         scope: Whether statistics require a whole prediction set.
+        context_statistics: Names of the count/mass statistics consumed by the formula.
     """
 
     compute: Callable
@@ -45,9 +46,11 @@ class LossRegistration:
     scope: str = "positions"
     input_kind: str = "categorical"
     capabilities: frozenset[str] = frozenset()
+    context_statistics: frozenset[str] = frozenset()
 
 
 _LOSSES = {}
+_RESERVED_OPTIONS = {"logits", "labels", "teacher", "context"}
 
 
 def loss_registrations():
@@ -65,6 +68,7 @@ def register_loss(
     scope=None,
     input_kind="categorical",
     capabilities=(),
+    context_statistics=None,
 ):
     """Register a mathematical per-position loss and its reference formula.
 
@@ -76,6 +80,8 @@ def register_loss(
             statistics. Contextual extensions default to prediction scope.
         outputs: Optional reference callable for extra output requests. It receives
             (logits, labels, teacher, options, requested_outputs, context).
+        context_statistics: Required context statistics: supervised_count and/or
+            teacher_mass. Contextual extensions default to both for compatibility.
         contextual: Whether compute also accepts LossContext. scope separately
             declares whether values depend on whole-set statistics.
 
@@ -89,6 +95,19 @@ def register_loss(
         ValueError: The identifier is reserved or already registered.
     """
 
+    if input_kind not in {"categorical", "binary", "features", "value"}:
+        raise ValueError(f"Unknown loss input kind: {input_kind!r}")
+    statistics = frozenset(
+        ("supervised_count", "teacher_mass")
+        if context_statistics is None and contextual
+        else context_statistics or ()
+    )
+    if statistics - {"supervised_count", "teacher_mass"} or (
+        statistics and not contextual
+    ):
+        raise ValueError(
+            "Context statistics require a contextual loss and supported names"
+        )
     resolved_scope = scope or ("prediction" if contextual else "positions")
     if resolved_scope not in ("positions", "prediction"):
         raise ValueError(f"Unknown loss statistics scope: {resolved_scope!r}")
@@ -112,6 +131,7 @@ def register_loss(
             resolved_scope,
             input_kind,
             frozenset(capabilities),
+            statistics,
         )
         return compute
 
@@ -198,6 +218,7 @@ def soft_cross_entropy(logits, labels, teacher):
     contextual=True,
     scope="positions",
     capabilities=("component_masks",),
+    context_statistics=(),
 )
 def ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
     terms = fused_loss.ce_l1_loss(logits, labels, teacher_logits=teacher)
@@ -324,8 +345,8 @@ def _accepted_options(compute):
     return {
         p.name
         for p in parameters
-        if p.kind is p.KEYWORD_ONLY
-        or (p.default is not p.empty and p.name != "teacher")
+        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        and p.name not in _RESERVED_OPTIONS
     }
 
 
@@ -350,7 +371,9 @@ class TokenLoss:
             raise ValueError("loss options require an explicit loss kind")
         if self.options:
             accepted = _accepted_options(self.registration.compute)
-            unknown = set() if accepted is None else self.options.keys() - accepted
+            unknown = self.options.keys() & _RESERVED_OPTIONS
+            if accepted is not None:
+                unknown |= self.options.keys() - accepted
             if unknown:
                 raise ValueError(f"unknown {self.kind} options: {sorted(unknown)}")
 

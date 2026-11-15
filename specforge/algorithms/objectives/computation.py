@@ -43,18 +43,16 @@ class LossComputation:
         """Materialize the projection once within this chunk."""
         return self.request.outputs()
 
-    def _execute(self, request, group, key, *, fused=None):
+    def _execute(self, request, group, key):
         return compute_loss(
             request,
             group,
-            fused=self.execution.fused if fused is None else fused,
+            fused=self.execution.fused,
             selection=self.selection,
             key=key,
         )
 
-    def evaluate_term(
-        self, index, logits, labels, *, teacher=None, context=None, fused=None
-    ):
+    def evaluate_term(self, index, logits, labels, *, teacher=None, context=None):
         """Evaluate the declared formula on algorithm-prepared inputs."""
         term = self.predictions.plan.terms[index]
         return self.evaluate(
@@ -65,10 +63,9 @@ class LossComputation:
             teacher=teacher,
             context=context,
             term_index=index,
-            fused=fused,
         )
 
-    def run(self, group=None, *, fused=None):
+    def run(self, group=None):
         """Execute declared terms once.
 
         The shared fused setting controls automatic implementation selection.
@@ -81,7 +78,6 @@ class LossComputation:
                 self.request,
                 indices,
                 self.prediction_index,
-                fused=fused,
             )
             self._collect(result, indices)
 
@@ -121,7 +117,6 @@ class LossComputation:
         *,
         teacher=None,
         context=None,
-        fused=None,
         term_index=None,
         **requested_outputs,
     ):
@@ -134,7 +129,6 @@ class LossComputation:
             labels: Hard or soft targets aligned with this chunk's positions.
             teacher: Optional aligned teacher logits.
             context: Optional normalization context for whole-set losses.
-            fused: Override automatic optimization for this internal request.
             term_index: Optional owner of the input context.
             **requested_outputs: Extra results validated and computed by the
                 selected implementation, e.g. return_teacher_l1=True or top_k=8.
@@ -185,7 +179,6 @@ class LossComputation:
             request,
             (0,),
             f"{self.prediction_index}/compute/{key}",
-            fused=fused,
         )
         if result is None or set(result.values) != {0}:
             raise ValueError(

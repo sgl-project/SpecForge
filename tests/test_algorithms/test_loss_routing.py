@@ -2,7 +2,7 @@
 
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -19,6 +19,132 @@ from specforge.algorithms.objectives.losses import LossContext, TokenLoss
 
 
 class LossRoutingTest(unittest.TestCase):
+
+    def test_loss_input_kinds_and_reserved_options_fail_at_construction(self):
+        from specforge.algorithms.objectives.losses import _LOSSES, register_loss
+        from specforge.algorithms.objectives.registry import resolve_objective
+
+        for kind in ("value", "bce", "cosine"):
+            with (
+                self.subTest(kind=kind),
+                self.assertRaisesRegex(ValueError, "loss inputs"),
+            ):
+                resolve_objective("MTPDraftModel", loss={"kind": kind})
+        with self.assertRaisesRegex(ValueError, "input kind"):
+            register_loss("bad", input_kind="featurez")
+        with self.assertRaisesRegex(ValueError, "unknown ce_l1 options"):
+            TokenLoss("ce_l1", {"context": None})
+        with patch.dict(_LOSSES):
+
+            @register_loss("ext_ctx", contextual=True)
+            def loss(logits, labels, teacher, context, temperature):
+                return logits[..., 0] / temperature
+
+            request = self.request()
+            result = TokenLoss("ext_ctx", {"temperature": 2.0})(
+                request.tensor(0), request.labels, context=request.terms[0].context
+            )
+            torch.testing.assert_close(result, request.tensor(0)[..., 0] / 2)
+
+    def test_undeclared_implementations_do_not_receive_new_request_shapes(self):
+        request = self.request()
+        with patch.dict(_IMPLEMENTATIONS):
+            supports = Mock(side_effect=AssertionError("legacy supports was called"))
+            register_implementation("legacy", supports=supports)(
+                lambda req, group: None
+            )
+            with self.assertRaisesRegex(ValueError, "requires CUDA/ROCm"):
+                compute_loss(request, fused=True)
+            value = replace(
+                request,
+                terms=(replace(request.terms[0], loss=TokenLoss("value")),),
+                tensors={0: torch.ones_like(request.labels, dtype=torch.float32)},
+            )
+            compute_loss(value, fused=True)
+            supports.assert_not_called()
+
+    def test_supervision_only_prepares_requested_statistics(self):
+        from specforge.algorithms.objectives.execution import prepare_supervision
+        from specforge.algorithms.objectives.execution_options import LossExecution
+        from specforge.algorithms.objectives.losses import PositionWeighting
+        from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+        from specforge.algorithms.objectives.predictions import Predictions, Teacher
+        from specforge.algorithms.objectives.projection import Projection
+        from tests.test_algorithms.test_loss_plan import run
+
+        labels = torch.zeros(4, 1, dtype=torch.long)
+        for kind, vocabulary, calls in (
+            ("ce_l1", True, 4),
+            ("lk_tv", False, 4),
+            ("lk_tv", True, 8),
+        ):
+            with self.subTest(kind=kind, vocabulary=vocabulary):
+                head = Mock(side_effect=lambda hidden: hidden)
+                teacher = torch.zeros(4, 1, 6)
+                prediction = Predictions(
+                    hidden=torch.randn(4, 1, 4 if vocabulary else 6),
+                    projection=Projection(lambda x: {"logits": x}),
+                    labels=labels,
+                    mask=torch.ones_like(labels),
+                    positions=labels,
+                    teacher=Teacher(teacher, head),
+                    requires=frozenset({"teacher_logits"}),
+                    vocab_mask=(
+                        torch.tensor([True] * 4 + [False] * 2) if vocabulary else None
+                    ),
+                    denominator=torch.tensor(4.0),
+                    plan=LossPlan((LossTerm(loss=TokenLoss(kind)),)),
+                )
+                supervision = prepare_supervision(
+                    prediction, TokenLoss(kind), PositionWeighting(), LossExecution()
+                )
+                self.assertIsNone(supervision.teacher_mass)
+                head.reset_mock()
+                with torch.no_grad():
+                    run(prediction, chunk=1)
+                self.assertEqual(head.call_count, calls)
+
+    def test_computation_rejects_invalid_labels_and_term_execution(self):
+        from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+        from specforge.algorithms.objectives.predictions import Predictions
+        from specforge.algorithms.objectives.projection import Projection
+        from tests.test_algorithms.test_loss_plan import run
+
+        request = self.request()
+        prediction = Predictions(
+            hidden=request.tensor(0),
+            projection=Projection(lambda x: {"logits": x}),
+            labels=request.labels,
+            mask=request.terms[0].mask,
+            positions=request.labels,
+        )
+
+        def duplicate(calc):
+            calc.run()
+            calc.run()
+
+        def wrong_labels(calc):
+            calc.evaluate(
+                "ce", TokenLoss("ce"), calc.outputs()["logits"], calc.labels.flatten()
+            )
+
+        for compute, message in (
+            (duplicate, "exactly once"),
+            (wrong_labels, "labels must align"),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                run(replace(prediction, compute=compute))
+        scalar = replace(
+            prediction,
+            plan=LossPlan((LossTerm(loss=TokenLoss("value"), reduction="scalar"),)),
+            compute=lambda calc: calc.add(0, calc.predictions.hidden),
+        )
+        with self.assertRaisesRegex(ValueError, "Scalar loss must return"):
+            run(scalar)
+
     def request(self):
         logits = torch.randn(2, 1, 5, requires_grad=True)
         labels = torch.tensor([[1], [3]])
