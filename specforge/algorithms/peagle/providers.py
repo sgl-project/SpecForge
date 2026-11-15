@@ -8,7 +8,6 @@ from specforge.algorithms.common.defaults import (
     one_loss_token,
     online_needs_input_tools,
 )
-from specforge.algorithms.common.loss_settings import wrapper_loss_validator
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -116,9 +115,6 @@ def algorithm_providers() -> AlgorithmProviders:
             uses_external_target_head=True,
         ),
         model=ModelProvider(
-            validate_config=wrapper_loss_validator(
-                "PEagleDraftModel", execution=(), compatible=()
-            ),
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 target_defaults=TargetDerivedDraftDefaults(

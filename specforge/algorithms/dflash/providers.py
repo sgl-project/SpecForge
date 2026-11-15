@@ -15,7 +15,6 @@ from specforge.algorithms.common.hidden_states_data import (
     build_offline_normalizer,
     build_offline_reader,
 )
-from specforge.algorithms.common.loss_settings import wrapper_loss_validator
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -242,11 +241,6 @@ def algorithm_providers() -> AlgorithmProviders:
             uses_external_target_head=False,
         ),
         model=ModelProvider(
-            validate_config=wrapper_loss_validator(
-                "DFlashDraftModel",
-                execution=("chunk_size", "checkpoint"),
-                compatible=("DFlash2DraftModel",),
-            ),
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import yaml
 from pydantic import ValidationError
 
 from specforge.application import resolve_run
@@ -41,10 +42,49 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         for path in paths:
             with self.subTest(config=path.name):
                 config = Config.from_file(str(path))
-                # Canonical planning also needs target metadata; local-target
-                # composition is covered in test_canonical_training.
-                if config.draft is None and config.initialization is None:
-                    resolve_run(config)
+                # Native MTP presets use matching local metadata, without a Hub call.
+                target = dict(
+                    model_type="qwen3_5",
+                    hidden_size=2560,
+                    vocab_size=248320,
+                    intermediate_size=9216,
+                    hidden_act="silu",
+                    rms_norm_eps=1e-6,
+                    num_attention_heads=16,
+                    num_key_value_heads=4,
+                    head_dim=256,
+                    max_position_embeddings=262144,
+                    attn_output_gate=True,
+                    rope_parameters=dict(
+                        rope_type="mrope",
+                        rope_theta=10000000.0,
+                        partial_rotary_factor=0.25,
+                        mrope_section=[11, 11, 10],
+                        mrope_interleaved=True,
+                    ),
+                )
+                if config.draft:
+                    payload = (
+                        yaml.safe_load((REPO_ROOT / config.draft).read_text())
+                        if isinstance(config.draft, str)
+                        else config.draft
+                    )
+                    if payload["architectures"] != ["MTPDraftModel"]:
+                        features = payload["spec_config"]["target_features"]
+                        target = {
+                            "hidden_size": features["hidden_size"],
+                            "vocab_size": payload["vocab_size"],
+                            "num_hidden_layers": max(
+                                features.get("target_layer_ids", [0])
+                            )
+                            + 2,
+                        }
+                        transform = payload.get("target_logit_transform", {})
+                        if transform.get("type") == "mup":
+                            target["logits_mup_width_multiplier"] = transform[
+                                "multiplier"
+                            ]
+                resolve_run(config, target_config=target)
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(
@@ -58,7 +98,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         resolved = resolve_run(cfg)
 
         self.assertEqual(
-            resolved.config.training.loss["scheduling"],
+            resolved.config.training.loss["execution"],
             {"trim": True, "teacher_chunk_size": 2048},
         )
 
@@ -75,7 +115,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
 
         resolved = resolve_run(cfg)
-        self.assertTrue(resolved.config.training.loss["scheduling"]["trim"])
+        self.assertTrue(resolved.config.training.loss["execution"]["trim"])
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
         eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))

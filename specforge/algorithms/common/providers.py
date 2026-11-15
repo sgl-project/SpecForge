@@ -378,11 +378,8 @@ class ModelProvider:
     allow_missing_warm_start_embedding: bool = False
     loss_mask_filter: Factory | None = None
     build_bundle: Factory | None = None
-    validate_config: Factory | None = None
 
     def __post_init__(self) -> None:
-        if self.validate_config is not None and not callable(self.validate_config):
-            raise TypeError("validate_config must be callable or None")
         if self.build_bundle is None:
             _factories_are_callable(
                 (

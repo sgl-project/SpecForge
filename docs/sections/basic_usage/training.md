@@ -143,9 +143,11 @@ training:
   attention_backend: flex_attention
   objective_options:
     num_anchors: 128
-    objective_chunk_blocks: 128
-    objective_checkpointing: true
-    fused_logits_loss: true
+  loss:
+    fused: true
+    execution:
+      chunk_size: 128
+      checkpoint: true
 ```
 
 Named `attention_configs` define GQA, MHA or MLA, including `is_causal` and
@@ -184,7 +186,7 @@ Both objectives receive the configured fixed-decay or D-PACE position weight,
 and their combined numerator is normalized by the sum of valid effective token
 weights rather than by batch or anchor count.
 
-Set `training.objective_options.selector_loss_alpha` to scale the selector objective.
+Set `training.loss.terms.selector.coefficient` to scale the selector objective.
 `training.objective_options.selector_warmup_ratio` keeps that scale at zero for an initial
 fraction of optimizer steps, and `training.objective_options.selector_ramp_ratio` then
 ramps it linearly to the configured value. Both schedule ratios default to
@@ -519,8 +521,9 @@ instead of materializing full-vocabulary fp32 logits:
 
 ```yaml
 training:
-  compact_teacher: true
-  compact_teacher_chunk_size: 4096
+  loss:
+    execution:
+      teacher_chunk_size: 4096
 ```
 
 This lowers peak memory without changing the teacher distribution, at the cost

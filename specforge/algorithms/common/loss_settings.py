@@ -137,25 +137,3 @@ def validate_dspine_weights(training, recorded):
             f"Draft records alignment_weight={alignment}; explicitly set "
             "training.loss.terms.alignment.coefficient"
         )
-
-
-def wrapper_loss_validator(architecture, *, execution=(), compatible=()):
-    """Build a planning hook using the same loss resolver as model assembly.
-
-    Reuse model loading's config source resolution to distinguish DFlash2 and
-    historical weights, without loading target weights or constructing a model.
-    """
-
-    def validate(config):
-        from specforge.training.model_loading import load_explicit_draft_config
-
-        draft = load_explicit_draft_config(config)
-        recorded = draft.to_dict() if draft is not None else {}
-        selected = recorded.get("architectures", [architecture])[0]
-        if selected not in (architecture, *compatible):
-            selected = architecture
-        resolve_wrapper_loss(config.training, selected, execution=execution)
-        if selected == "DSpineDraftModel":
-            validate_dspine_weights(config.training, recorded.get("dspine_config", {}))
-
-    return validate

@@ -163,8 +163,6 @@ def validate_resolved_run(
     _validate_algorithm_capabilities(cfg, algorithm, mode)
     _validate_training_topology(cfg, mode)
     _validate_vocab_mapping(cfg, algorithm, mode)
-    if algorithm.providers.model.validate_config is not None:
-        algorithm.providers.model.validate_config(cfg)
 
 
 __all__ = ["validate_resolved_run"]
