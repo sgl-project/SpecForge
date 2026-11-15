@@ -618,7 +618,7 @@ class TestCliLifecycle(unittest.TestCase):
                 ]
             )
         self.assertEqual(status, 0)
-        self.assertEqual(export.call_args.args, ("checkpoint", None, "exported"))
+        self.assertEqual(export.call_args.args, ("checkpoint", "exported"))
         self.assertEqual(export.call_args.kwargs["target_model"], "target")
 
     def test_retired_export_options_are_usage_errors(self):

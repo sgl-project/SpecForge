@@ -372,19 +372,17 @@ and checkpoint tensors do not change. Liger selection remains independent.
 
 Execution settings are saved and checked on full resume. Checkpoints must record
 the current named loss settings and execution policy; old loss metadata is not
-converted or assigned defaults. Fused runs must also record selected implementation
-identities. Use the standalone converter below for pre-named-loss checkpoints.
+converted or assigned defaults. All runs must record selected implementation
+identities, effective total steps, the current model provenance format and the
+RNG device type. These fields are written by the current checkpoint writer.
 
 MTP uses `loss.execution.chunk_size` to control loss projection chunks.
 Its objective's default chunk size remains 4096; `objective_options.objective_chunk_size`
 sets that default.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
-path. Neither is copied into the other. A canonical checkpoint supplied through
-`training.resume_from` also selects the canonical training route. Legacy DSpine
-imports through `initialization.checkpoint` must explicitly match saved training
-sampling settings in `training.objective_options`. Loss settings always come from
-the new training configuration; `weights_from` copies weights only.
+path. Neither is copied into the other. Loss settings always come from
+the new training configuration; `weights_from` copies canonical weights only.
 
 
 ### Extending loss execution
@@ -584,40 +582,13 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 canonical YAML selects the architecture, capture layers and output schema.
 
 
-### Compatibility boundary
+### Checkpoint and configuration boundary
 
-Resume reads only current records; it never converts old loss metadata.
-Convert a pre-named-loss canonical checkpoint into a new directory:
-
-```bash
-PYTHONPATH=. python scripts/convert_canonical_checkpoint.py \
-  --checkpoint CHECKPOINT_PATH --output-dir CONVERTED_PATH
-```
-
-The converter accepts the old flat `canonical_loss` record, with or without
-the execution metadata introduced later. It rewrites loss-related `canonical_*`
-fields in `training_state.pt` using the current objective resolver. Weights,
-optimizer state, counters, provenance, `config.json` and rank shards are preserved;
-the source directory is unchanged. Known DSpine refinement identities map from
-CE plus explicit L1 to CE/L1, and alignment gains its reference identity.
-Unknown refinement implementations are rejected.
-
-Use the corresponding named settings in the run YAML:
-
-| Previous objective option | Named setting |
-| --- | --- |
-| `selector_loss_alpha` | `loss.terms.selector.coefficient` |
-| `confidence_loss_alpha` | `loss.terms.confidence.coefficient` |
-| `alignment_weight` | `loss.terms.alignment.coefficient` |
-| `ce_loss_alpha` / `l1_loss_alpha` | `loss.terms.token.options.ce_weight` / `l1_weight` |
-| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement and on token when it uses CE/L1 |
-
-Both CE/L1 weights must be specified to preserve a non-default mixture; changing
-only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to
-both `base` and `final`.
-
-Old training wrappers remain for full resume and parallel execution capabilities
-not yet migrated. They share numerical functions in `specforge/losses`.
+Training accepts current canonical configuration and checkpoints only.
+Deployment settings belong under `deployment`; the former
+`training.deployment_mode`, `training.server_urls` and
+`training.metadata_db_path` fields are rejected. Historical checkpoint
+conversion scripts and training wrappers have been removed.
 
 ### Inspecting loss implementations
 

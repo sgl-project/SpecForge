@@ -1,4 +1,4 @@
-"""One native publisher, isolated canonical imports and legacy-file entry."""
+"""Canonical import boundaries and native recipes."""
 
 import json
 import subprocess
@@ -7,32 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.merge_mtp_to_base import main
 from specforge.application.composition import resolve_run
 from specforge.config import load_config
 
 
 class RetiredExportTest(unittest.TestCase):
-
-    def test_old_merge_cli_delegates_to_checked_native_export(self):
-        with patch("scripts.merge_mtp_to_base.export_draft") as export:
-            main(
-                [
-                    "--base-model-path",
-                    "target",
-                    "--mtp-checkpoint-path",
-                    "draft",
-                    "--output-path",
-                    "output",
-                ]
-            )
-        export.assert_called_once_with(
-            "draft",
-            "output",
-            target_model="target",
-            copy_target=True,
-            export_mode="native",
-        )
 
     def test_canonical_import_does_not_load_old_implementations(self):
         helper = Path(__file__).parent / "helpers/check_canonical_imports.py"

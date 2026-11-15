@@ -2,7 +2,6 @@
 
 import json
 import unittest
-import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -30,6 +29,7 @@ from specforge.config.draft.logits import NoLogitTransformSpec
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.registry import _SCHEMAS, register_component_schema
 from specforge.config.draft.rope import LinearRoPESpec
+from specforge.export.model import export_draft
 from specforge.export.to_sglang import export_to_sglang
 from specforge.loading import read_draft
 from specforge.modeling import build_draft_model
@@ -262,30 +262,24 @@ class SGLangExportTest(unittest.TestCase):
                     json.dumps({"weight_map": index})
                 )
                 save_draft(model, root / "draft")
-                with warnings.catch_warnings(record=True) as captured:
-                    warnings.simplefilter("always", FutureWarning)
-                    export_to_sglang(
-                        str(root / "draft"),
-                        str(root / "served"),
-                        target_model=str(target),
-                        copy_target=copy,
-                    )
-                self.assertTrue(
-                    any(
-                        issubclass(w.category, FutureWarning)
-                        and "export-mode native" in str(w.message)
-                        for w in captured
-                    )
+                export_draft(
+                    str(root / "draft"),
+                    str(root / "served"),
+                    export_mode="native",
+                    target_model=str(target),
+                    copy_target=copy,
                 )
                 restored = TensorStore(root / "served")
                 exported = json.loads((root / "served" / "config.json").read_text())
-                self.assertEqual(exported["specforge_artifact"], artifact_metadata())
+                self.assertEqual(exported["specforge_artifact"]["format"], "native")
                 self.assertEqual(
                     {k: v for k, v in exported.items() if k != "specforge_artifact"},
                     payload,
                 )
                 self.assertFalse((root / "served" / "artifact.json").exists())
-                with self.assertRaisesRegex(ValueError, "serving-only"):
+                with self.assertRaisesRegex(
+                    ValueError, "native artifacts are target checkpoints"
+                ):
                     read_draft(root / "served")
                 for key, tensor in serving_weights(config, model.state_dict()).items():
                     self.assertTrue(torch.equal(restored.read("mtp." + key), tensor))

@@ -1,7 +1,6 @@
 """Export canonical weights to a pinned serving format."""
 
 import argparse
-import warnings
 
 from specforge.checkpoint.draft_dir import write_artifact
 from specforge.checkpoint.formats.sglang import artifact_metadata, convert_config
@@ -48,29 +47,6 @@ def write_sglang(checkpoint, state, output_dir):
     fields["torch_dtype"] = dtypes.pop()
     write_artifact(output_dir, fields, weights, metadata=artifact_metadata())
     return output_dir
-
-
-def legacy_native_mode(config, target_model):
-    """Preserve only the historical Qwen3.5 command; never consult new registrations."""
-    if config.architecture != "MTPDraftModel":
-        return False
-    if target_model is None:
-        raise ValueError(
-            "historical MTP serving export requires --target-model; use --export-mode standalone for a canonical draft"
-        )
-    from specforge.checkpoint.resolve import read_target_config
-
-    if read_target_config(target_model).get("model_type") != "qwen3_5_text":
-        return False
-    from specforge.checkpoint.formats.sglang.models.qwen3_5 import convert_config
-
-    convert_config(config)
-    warnings.warn(
-        "Implicit Qwen3.5 native export is deprecated; replace --converter sglang with --export-mode native",
-        FutureWarning,
-        stacklevel=3,
-    )
-    return True
 
 
 def main(argv=None):

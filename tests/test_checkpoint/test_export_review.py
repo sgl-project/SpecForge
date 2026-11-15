@@ -83,6 +83,7 @@ class ExportReviewTest(unittest.TestCase):
         with patch("specforge.export.model.export_draft") as export:
             for options, error in (
                 (["--copy-target"], "requires native export"),
+                (["--converter", "sglang", "--copy-target"], "requires native export"),
                 (["--draft-config", "old.json"], "No such option"),
                 (["--converter", "sglang", "--to", "hf"], "No such option"),
                 (["--to", "hf", "--copy-target"], "No such option"),
@@ -99,7 +100,6 @@ class ExportReviewTest(unittest.TestCase):
                     "sglang",
                     "--target-model",
                     "target",
-                    "--copy-target",
                 ],
             )
             self.assertEqual(result.exit_code, 0, result.output)
@@ -108,7 +108,7 @@ class ExportReviewTest(unittest.TestCase):
                 "out",
                 vocab_mapping_path=None,
                 target_model="target",
-                copy_target=True,
+                copy_target=False,
                 export_mode=None,
                 converter="sglang",
             )

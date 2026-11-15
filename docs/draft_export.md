@@ -78,11 +78,8 @@ specforge export --export-mode native --checkpoint CHECKPOINT_PATH --target-mode
   --output-dir MERGED_TARGET
 ```
 
-For compatibility, an old `--converter sglang` command with no export mode still
-performs native merge-back for Qwen3.5 MTP, with a migration warning. Replace
-`--converter sglang` with `--export-mode native`. This exception is fixed to the
-historical target/architecture pair; future registrations do not extend it.
-Legacy `--to` exporters remain unchanged and do not accept `--export-mode`.
+Native merge-back requires explicit `--export-mode native`. The SGLang converter
+only writes standalone serving artifacts. The old merge CLI has been removed.
 
 The converter targets SGLang commit
 `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, also pinned in CI. Each artifact records

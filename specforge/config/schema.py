@@ -16,7 +16,6 @@ overrides both re-validate through the same schema.
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -407,7 +406,7 @@ class DataConfig(StrictConfigModel):
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` uses the shared
-    #: default (4) for canonical runs, or the provider default for legacy runs.
+    #: default (4) when unspecified.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -1084,72 +1083,6 @@ class TrainingConfig(StrictConfigModel):
         return self
 
 
-def migrate_legacy_config(values: dict) -> dict:
-    """Translate legacy deployment keys before constructing the domain config.
-
-    Compatibility exists only at this raw loader boundary. The returned domain
-    model never projects canonical deployment state back into ``training``.
-    """
-
-    if not isinstance(values, dict):
-        return values
-    raw = copy.deepcopy(values)
-    training = raw.get("training")
-    if not isinstance(training, dict):
-        return raw
-
-    has_legacy_mode = "deployment_mode" in training
-    has_legacy_urls = "server_urls" in training
-    has_legacy_database = "metadata_db_path" in training
-    if not (has_legacy_mode or has_legacy_urls or has_legacy_database):
-        return raw
-
-    legacy_mode = training.pop("deployment_mode", None)
-    legacy_urls = training.pop("server_urls", None)
-    legacy_database = training.pop("metadata_db_path", None)
-    deployment = raw.setdefault("deployment", {})
-    if not isinstance(deployment, dict):
-        return raw
-
-    canonical_mode = deployment.get("mode")
-    if legacy_mode is not None:
-        if canonical_mode is not None and canonical_mode != legacy_mode:
-            raise ValueError(
-                "deployment.mode conflicts with legacy training.deployment_mode"
-            )
-        deployment["mode"] = legacy_mode
-    elif canonical_mode is None and (legacy_urls or legacy_database):
-        deployment["mode"] = "disaggregated"
-
-    if legacy_urls is not None or legacy_database is not None:
-        disaggregated = deployment.setdefault("disaggregated", {})
-        if not isinstance(disaggregated, dict):
-            return raw
-        if legacy_urls is not None:
-            canonical_urls = disaggregated.get("server_urls")
-            if canonical_urls is not None and canonical_urls != legacy_urls:
-                raise ValueError(
-                    "deployment.disaggregated.server_urls conflicts with legacy "
-                    "training.server_urls"
-                )
-            disaggregated["server_urls"] = legacy_urls
-        if legacy_database:
-            if os.path.basename(legacy_database) != "consumer.sqlite":
-                raise ValueError(
-                    "legacy training.metadata_db_path must end in consumer.sqlite; "
-                    "use deployment.disaggregated.consumer_state_dir instead"
-                )
-            state_dir = os.path.dirname(legacy_database) or "."
-            canonical_state_dir = disaggregated.get("consumer_state_dir")
-            if canonical_state_dir is not None and canonical_state_dir != state_dir:
-                raise ValueError(
-                    "deployment.disaggregated.consumer_state_dir conflicts with "
-                    "legacy training.metadata_db_path"
-                )
-            disaggregated["consumer_state_dir"] = state_dir
-    return raw
-
-
 class Config(StrictConfigModel):
     draft: Optional[dict | str] = None
     initialization: Optional[InitializationConfig] = None
@@ -1461,7 +1394,7 @@ class Config(StrictConfigModel):
                 raw = yaml.safe_load(f)
             else:
                 raw = json.load(f)
-        return cls.model_validate(migrate_legacy_config(raw))
+        return cls.model_validate(raw)
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
@@ -1538,7 +1471,6 @@ __all__ = [
     "DeploymentConfig",
     "TrainingConfig",
     "Config",
-    "migrate_legacy_config",
     "load_config",
     "apply_overrides",
 ]

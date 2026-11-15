@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pydantic import ValidationError
@@ -671,6 +672,11 @@ class ConfigSchemaTest(unittest.TestCase):
             payload["training"] = {field: value}
             with self.subTest(field=field), self.assertRaises(ValidationError):
                 Config.model_validate(payload)
+            with self.subTest(loader=field), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "run.json"
+                path.write_text(json.dumps(payload))
+                with self.assertRaises(ValidationError):
+                    load_config(str(path))
 
     def test_invalid_core_bounds_fail_during_config_validation(self):
         cases = (

@@ -679,8 +679,7 @@ specforge export --export-mode native \
 
 Native export rewrites shards containing old MTP tensors and links unchanged
 shards; add `--copy-target` for a self-contained directory. Historical checkpoint import is not supported.
-The `scripts/merge_mtp_to_base.py` CLI is a compatibility wrapper for this exporter;
-there is no separate legacy merge implementation. Target computation mismatches
+Target computation mismatches
 fail instead of rewriting the target's settings to fit a draft.
 
 The MTP trainer uses the composed model and canonical objective. Set

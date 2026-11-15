@@ -338,6 +338,26 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     },
                 )
 
+    def test_resume_rejects_old_loss_metadata(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            features = _write_feature_files(os.path.join(workdir, "features"), n=4)
+            out = os.path.join(workdir, "out")
+            trainer, _, _ = self._make_trainer(out, feat_dir=features, max_steps=1)
+            trainer.fit()
+            checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
+            state_path = os.path.join(checkpoint, "training_state.pt")
+            state = torch.load(state_path, weights_only=False)
+            state["canonical_loss"] = {"kind": "ce"}
+            torch.save(state, state_path)
+            with self.assertRaisesRegex(ValueError, "unsupported canonical_loss"):
+                self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    resume_from=checkpoint,
+                    checkpoint_extra={"canonical_loss": {"terms": {}}},
+                )
+
     def test_resume_continues_where_the_run_stopped(self):
         from specforge.training.checkpoint import CheckpointManager
 
@@ -537,7 +557,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=checkpoint,
             )
 
-    def test_legacy_checkpoint_recovers_horizon_from_scheduler_state(self):
+    def test_resume_rejects_missing_schedule_horizon(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_horizon_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
         source_dir = os.path.join(workdir, "source")
@@ -554,24 +574,14 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         state.pop("effective_total_steps")
         torch.save(state, state_path)
 
-        resumed, _, _ = self._make_trainer(
-            os.path.join(workdir, "same"),
-            feat_dir=feat_dir,
-            max_steps=2,
-            total_steps=6,
-            resume_from=checkpoint,
-        )
-        self.assertEqual(resumed._controller.total_steps, 6)
-
         with self.assertRaisesRegex(
-            ValueError,
-            "effective_total_steps=6 but this run has effective_total_steps=7",
+            ValueError, "does not record effective_total_steps"
         ):
             self._make_trainer(
-                os.path.join(workdir, "changed"),
+                os.path.join(workdir, "same"),
                 feat_dir=feat_dir,
                 max_steps=2,
-                total_steps=7,
+                total_steps=6,
                 resume_from=checkpoint,
             )
 
@@ -828,6 +838,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         )
                     ),
                     MODEL_PROVENANCE_CONTRACT_KEY: (
+                        ("source_identity_format", "stat-v2"),
                         ("test_model_source", "fixture-v1"),
                     ),
                 },

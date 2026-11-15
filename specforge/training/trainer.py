@@ -38,41 +38,6 @@ from specforge.training.controller import TrainerController, TrainerCore
 logger = logging.getLogger(__name__)
 
 
-def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:
-    """Recover the BF16 optimizer horizon from a pre-contract checkpoint.
-
-    Older checkpoints did not copy the effective horizon into the shared
-    trainer contract, but their rank-local cosine scheduler persisted both the
-    warmup length and post-warmup ``T_max``.  Reading those two immutable
-    scheduler fields preserves resume compatibility without guessing from a
-    possibly changed ``max_steps`` value.
-    """
-    backend = state.get("backend")
-    if not isinstance(backend, Mapping):
-        return None
-    optimizer = backend.get("optimizer")
-    if not isinstance(optimizer, Mapping):
-        return None
-    scheduler = optimizer.get("scheduler_state_dict")
-    if not isinstance(scheduler, Mapping):
-        return None
-    after_scheduler = scheduler.get("after_scheduler_dict")
-    if not isinstance(after_scheduler, Mapping):
-        return None
-    warmup_steps = scheduler.get("warmup_epochs")
-    cosine_steps = after_scheduler.get("T_max")
-    if (
-        isinstance(warmup_steps, bool)
-        or not isinstance(warmup_steps, int)
-        or isinstance(cosine_steps, bool)
-        or not isinstance(cosine_steps, int)
-        or warmup_steps < 0
-        or cosine_steps < 1
-    ):
-        return None
-    return warmup_steps + cosine_steps
-
-
 class Trainer:
     """Domain training lifecycle wrapping the runtime controller/core seam."""
 
@@ -324,20 +289,16 @@ class Trainer:
                     )
                 ):
                     raise ValueError(
-                        f"checkpoint uses an old {key} record; convert it with "
-                        "scripts/convert_canonical_checkpoint.py before resuming"
+                        f"checkpoint uses an unsupported {key} record; "
+                        "resume requires current checkpoint metadata"
                     )
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
                     if saved is None:
-                        if state.get("canonical_loss_execution", {}).get(
-                            "fused", False
-                        ):
-                            raise ValueError(
-                                "checkpoint does not record resolved fused loss implementations"
-                            )
-                        saved = {}
+                        raise ValueError(
+                            "checkpoint does not record resolved loss implementations"
+                        )
                     # Compare on real inputs before the first kernel execution.
                     model.loss_implementations.restore(saved)
                     continue
@@ -356,19 +317,11 @@ class Trainer:
                     ) = model_provenance_for_resume_comparison(
                         current,
                         persisted,
-                        cache_root=output_dir,
                     )
                 if key == "effective_total_steps" and key not in state:
-                    persisted = _legacy_scheduler_total_steps(state)
-                    comparison_persisted = persisted
-                    persisted_available = persisted is not None
-                    if not persisted_available:
-                        raise ValueError(
-                            f"checkpoint {resume_from} does not record "
-                            "effective_total_steps and its saved scheduler does "
-                            "not expose a recoverable horizon; the restored "
-                            "optimizer schedule cannot be proven to match this run"
-                        )
+                    raise ValueError(
+                        f"checkpoint {resume_from} does not record effective_total_steps"
+                    )
                 if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
