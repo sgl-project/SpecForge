@@ -274,6 +274,22 @@ and input construction stay in objective_options. Mathematical parameters
 and coefficients belong to loss.terms; loss.fused controls optimization. Dependent auxiliary
 calculations call `calc.evaluate_term()` using those resolved settings.
 
+Loss term names are declared by the algorithm and must match the keys under
+`loss.terms`. They identify training purposes, not model output tensors or token
+positions. Model output names are defined by `project()`; `LossTerm` binds an
+output to a configured term, so the two names need not match.
+
+For Domino:
+
+| Loss term | Model output | Purpose |
+| --- | --- | --- |
+| `base` | `base_logits` | Train the base token predictions |
+| `final` | `logits` | Train the final predictions after the GRU suffix correction |
+
+For example, `LossTerm("base_logits", weight, name="base")` applies the formula
+configured in `loss.terms.base` to the `base_logits` output. `final` refers to
+the final prediction stage, not the last token in a sequence.
+
 Domino uses the same configuration shape; its algorithm declares joint inputs internally:
 
 ```yaml
