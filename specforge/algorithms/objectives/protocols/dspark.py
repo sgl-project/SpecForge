@@ -113,7 +113,6 @@ class DSparkObjective:
                     LossTerm(),
                     LossTerm(
                         "confidence",
-                        loss=TokenLoss("bce"),
                     ),
                 )
             ),

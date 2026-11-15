@@ -235,7 +235,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             from specforge.algorithms.objectives.protocols.domino import DominoObjective
 
             model.objective = DominoObjective()
-            model.objective_name = "domino"
             from specforge.algorithms.objectives.execution_options import LossExecution
 
             contract = {
@@ -261,7 +260,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             model = Composite()
             model.loss_implementations = ExecutionSelection()
             model.objective = DominoObjective()
-            model.objective_name = "domino"
             contract["canonical_objective_options"] = asdict(model.objective)
             contract["canonical_loss_implementations"] = (
                 model.loss_implementations.names

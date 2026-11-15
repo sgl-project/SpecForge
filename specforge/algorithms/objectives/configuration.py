@@ -1,6 +1,5 @@
 """Named mathematical losses and a shared optimization policy."""
 
-import math
 from dataclasses import asdict, dataclass, replace
 
 from .execution_options import LossExecution
@@ -25,10 +24,9 @@ class ConfiguredLoss:
 
 @dataclass(frozen=True)
 class LossConfiguration:
-    """Resolved formulas and the shared fusion switch; no model tensors."""
+    """Resolved named formulas and coefficients; no execution policy or tensors."""
 
     terms: dict[str, ConfiguredLoss]
-    fused: bool = False
 
     @property
     def requires(self):
@@ -66,7 +64,6 @@ class LossConfiguration:
     def to_dict(self):
         """Stable effective settings persisted in the resume contract."""
         return {
-            "fused": self.fused,
             "terms": {
                 name: {**asdict(term.loss), "coefficient": term.coefficient}
                 for name, term in self.terms.items()
@@ -84,60 +81,52 @@ def loss_definitions(objective):
     )
 
 
-def _fields(payload, allowed, path):
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path} must be a mapping")
-    unknown = payload.keys() - allowed
-    if unknown:
-        raise ValueError(f"Unknown {path} fields: {sorted(unknown)}")
-
-
 def resolve_loss_configuration(objective, payload):
-    """Resolve mathematical terms and user-controlled execution settings.
+    """Validate loss syntax, then bind formulas to the algorithm's input contracts."""
+    from pydantic import ValidationError
 
-    Returns:
-        (LossConfiguration, LossExecution). The shared execution policy selects
-        compatible optimizations only when loss.fused is true.
-    """
-    _fields(payload, {"terms", "fused", "scheduling"}, "loss")
+    from specforge.config.schema import LossConfig
+
+    try:
+        parsed = LossConfig.model_validate(payload)
+    except ValidationError as error:
+        details = "; ".join(
+            f"training.loss.{'.'.join(map(str, item['loc']))}={item['input']!r}: {item['msg']}"
+            for item in error.errors()
+        )
+        raise ValueError(details) from error
     definitions = loss_definitions(objective)
-    requested = payload.get("terms", {})
-    _fields(requested, set(definitions), "loss.terms")
+    unknown = parsed.terms.keys() - definitions.keys()
+    if unknown:
+        raise ValueError(f"Unknown training.loss.terms: {sorted(unknown)!r}")
     resolved = {}
     for name, definition in definitions.items():
-        options = requested.get(name, {})
-        _fields(
-            options,
-            {"kind", "options", "coefficient"},
-            f"loss.terms.{name}",
+        options = (
+            parsed.terms[name].model_dump(exclude_unset=True)
+            if name in parsed.terms
+            else {}
         )
+        path = f"training.loss.terms.{name}"
         kind = options.get("kind", definition.loss.kind)
-        formula_options = options.get(
-            "options", definition.loss.options if kind == definition.loss.kind else {}
-        )
-        if not isinstance(formula_options, dict):
-            raise ValueError(f"Options for loss term {name!r} must be a mapping")
         defaults = definition.loss.options if kind == definition.loss.kind else {}
-        loss = TokenLoss(kind, {**defaults, **formula_options})
+        formula_options = {**defaults, **options.get("options", {})}
+        try:
+            loss = TokenLoss(kind, formula_options)
+        except ValueError as error:
+            # Include exact option paths without duplicating formula validators here.
+            values = ", ".join(
+                f"{path}.options.{key}={value!r}"
+                for key, value in formula_options.items()
+            )
+            raise ValueError(f"{path}.kind={kind!r}; {values}: {error}") from error
         if kind == "default":
-            raise ValueError("Named loss terms require a concrete kind")
+            raise ValueError(f"{path}.kind={kind!r}: a concrete formula is required")
         if loss.registration.input_kind != definition.loss.registration.input_kind:
-            raise ValueError(f"Loss {kind!r} is incompatible with {name!r} inputs")
+            raise ValueError(f"{path}.kind={kind!r}: incompatible with {name!r} inputs")
         if definition.capabilities - loss.registration.capabilities:
-            raise ValueError(f"Loss {kind!r} lacks required capabilities for {name!r}")
-        coefficient = options.get("coefficient", definition.coefficient)
-        if (
-            type(coefficient) not in (int, float)
-            or not math.isfinite(coefficient)
-            or coefficient < 0
-        ):
-            raise ValueError(f"Invalid coefficient for loss term {name!r}")
-        resolved[name] = ConfiguredLoss(loss, coefficient)
-    scheduling = payload.get("scheduling", {})
-    _fields(
-        scheduling,
-        {"chunk_size", "checkpoint", "trim", "teacher_chunk_size"},
-        "loss.scheduling",
-    )
-    execution = LossExecution(fused=payload.get("fused", False), **scheduling)
-    return LossConfiguration(resolved, execution.fused), execution
+            raise ValueError(f"{path}.kind={kind!r}: lacks required capabilities")
+        resolved[name] = ConfiguredLoss(
+            loss, options.get("coefficient", definition.coefficient)
+        )
+    execution = LossExecution(fused=parsed.fused, **parsed.execution.model_dump())
+    return LossConfiguration(resolved), execution

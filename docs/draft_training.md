@@ -106,12 +106,12 @@ The existing `lk` remains the per-token KL/TV hybrid, with configurable `eta`.
 ```python
 runtime = build_objective_model(
     draft,
-    loss={"kind": "lk_lambda", "options": {"kl_scale": 1.0, "kl_decay": 1.0}},
+    loss={"terms": {"token": {"kind": "lk_lambda", "options": {"kl_scale": 1.0, "kl_decay": 1.0}}}},
     weighting={"kind": "dpace", "alpha": 0.5},
 )
 ```
 
-For legacy EAGLE LK semantics, select `options.target="teacher"` and retain the
+For legacy EAGLE LK semantics, select `loss.terms.token.options.target="teacher"` and retain the
 default geometric weighting. The training entry resolves loss and weighting
 before capture, and records both in the exact-resume contract.
 
@@ -147,7 +147,9 @@ training:
   objective_options:
     num_anchors: 128
   loss:
-    kind: kl
+    terms:
+      token:
+        kind: kl
   weighting:
     kind: exponential
     gamma: 7.0
@@ -248,7 +250,7 @@ training:
       confidence:
         kind: bce
         coefficient: 1.0
-    scheduling:
+    execution:
       chunk_size: 128
       checkpoint: true
 ```
@@ -282,7 +284,7 @@ training:
     terms:
       base: {kind: ce}
       final: {kind: ce}
-    scheduling:
+    execution:
       chunk_size: 128
       checkpoint: true
 ```
@@ -292,7 +294,7 @@ implementation, including joint optimizations. Unsupported groups split into
 individual terms; unsupported terms use reference formulas. Selection and fallback
 reasons are logged. Missing dependencies and execution failures propagate.
 
-Scheduling accepts chunk_size, checkpoint, trim and teacher_chunk_size.
+Execution accepts chunk_size, checkpoint, trim and teacher_chunk_size.
 Chunking and checkpointing are independent of fusion; checkpointing applies
 only when the prediction set spans multiple chunks. Losses needing whole-set statistics stay unsplit with a warning
 when a requested split cannot be honored. Unsafe replay disables checkpointing
@@ -302,6 +304,10 @@ chain-weighting path cannot use loss checkpointing.
 LossConfiguration.bind() installs formulas and coefficients while preserving
 algorithm-owned joint ranges. The effective settings are stored in the resume
 contract. Users do not configure groups, implementation names or term execution.
+
+Available formulas depend on the term input contract: built-in confidence uses
+`bce`, alignment uses `cosine`, and refinement uses `ce_l1`. Extensions must
+register compatible input kinds and required capabilities.
 
 Canonical objectives accept only the named configuration above. Flat loss
 dictionaries, separate `loss_execution`, and loss coefficients in
@@ -359,10 +365,11 @@ and checkpoint tensors do not change. Liger selection remains independent.
 Execution settings are saved and checked on full resume. Checkpoints must record
 the current named loss settings and execution policy; old loss metadata is not
 converted or assigned defaults. Fused runs must also record selected implementation
-identities. Import model weights and start a new run when this contract is absent.
+identities. Use the standalone converter below for pre-named-loss checkpoints.
 
-MTP uses `loss.scheduling.chunk_size` to control loss projection chunks.
-Its objective's default chunk size remains 4096. The existing top-level MTP
+MTP uses `loss.execution.chunk_size` to control loss projection chunks.
+Its objective's default chunk size remains 4096; `objective_options.objective_chunk_size`
+sets that default. The existing top-level MTP
 chunk alias is retained until the training configuration cutover.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
@@ -517,7 +524,7 @@ Fused resume contracts include stable implementation identities for intermediate
 calls as well as final terms. Checkpoints using the previous auxiliary primitive
 identities fail the existing resume check rather than silently changing execution.
 
-The fused soft CE kernel is new in this PR, rather than migrated from legacy.
+The fused soft CE kernel implements the same mathematical formula as the reference.
 Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`
 on a 128,256-token vocabulary.
 
@@ -572,15 +579,40 @@ canonical YAML selects the architecture, capture layers and output schema.
 
 ### Compatibility boundary
 
-Old canonical checkpoints normalize their loss formulas, coefficients and
-scheduling before resume comparison. Known equivalent CE-statistics identities
-are translated; DSpine's old CE-plus-L1 refinement identity maps to CE/L1, and
-its unchanged cosine calculation gains a reference identity. Unknown execution
-changes still fail the resume check.
+Resume reads only current records; it never converts old loss metadata.
+Convert a pre-named-loss canonical checkpoint into a new directory:
 
-Old training wrappers remain for capabilities not yet migrated, including their
-full resume and parallel execution paths. They share specforge/losses numerical
-functions; this PR does not remove those training paths.
+```bash
+PYTHONPATH=. python scripts/convert_canonical_checkpoint.py \
+  --checkpoint CHECKPOINT_PATH --output-dir CONVERTED_PATH
+```
+
+The converter accepts the old flat `canonical_loss` record, with or without
+the execution metadata introduced later. It rewrites loss-related `canonical_*`
+fields in `training_state.pt` using the current objective resolver. Weights,
+optimizer state, counters, provenance, `config.json` and rank shards are preserved;
+the source directory is unchanged. Known DSpine refinement identities map from
+CE plus explicit L1 to CE/L1, and alignment gains its reference identity.
+Unknown refinement implementations are rejected.
+
+Use the corresponding named settings in the run YAML:
+
+| Previous objective option | Named setting |
+| --- | --- |
+| `selector_loss_alpha` | `loss.terms.selector.coefficient` |
+| `confidence_loss_alpha` | `loss.terms.confidence.coefficient` |
+| `alignment_weight` | `loss.terms.alignment.coefficient` |
+| `ce_loss_alpha` / `l1_loss_alpha` | `loss.terms.token.options.ce_weight` / `l1_weight` |
+| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement and on token when it uses CE/L1 |
+
+Both CE/L1 weights must be specified to preserve a non-default mixture; changing
+only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to
+both `base` and `final`.
+
+Old training wrappers remain for full resume and parallel execution capabilities
+not yet migrated. They share numerical functions in `specforge/losses`.
+
+### Inspecting loss implementations
 
 Use `loss_registrations()` and `implementation_registrations()` to inspect the
 formula-to-implementation mapping. Each execution registration names its category,

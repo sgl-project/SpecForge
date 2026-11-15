@@ -10,7 +10,7 @@ from .configuration import (
     resolve_loss_configuration,
 )
 from .execution_options import LossExecution
-from .losses import PositionWeighting, TokenLoss
+from .losses import PositionWeighting
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,6 @@ class ResolvedObjective:
     name: str
     registration: ProtocolRegistration
     objective: object
-    loss: TokenLoss
     weighting: PositionWeighting
     execution: LossExecution
     losses: LossConfiguration
@@ -173,7 +172,6 @@ def resolve_objective(
     if weighting is None:
         weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
-    selected_loss = next(iter(loss_configuration.terms.values())).loss
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
@@ -191,7 +189,6 @@ def resolve_objective(
         name,
         entry,
         objective,
-        selected_loss,
         position_weighting,
         execution,
         loss_configuration,
@@ -294,7 +291,6 @@ def build_objective_model(
         target_head,
         registration=entry,
         name=name,
-        token_loss=resolved.loss,
         loss_configuration=resolved.losses,
         weighting=resolved.weighting,
         frozen_parameters=frozen,

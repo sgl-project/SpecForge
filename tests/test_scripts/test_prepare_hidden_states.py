@@ -296,7 +296,7 @@ class CanonicalCaptureTest(unittest.TestCase):
                         "data": {"hidden_states_path": str(root / "features")},
                         "training": {
                             "attention_backend": "eager",
-                            "loss": {"kind": "kl"},
+                            "loss": {"terms": {"token": {"kind": "kl"}}},
                         },
                     }
                 )

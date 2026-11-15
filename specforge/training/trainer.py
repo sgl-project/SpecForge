@@ -309,6 +309,24 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            for key in ("canonical_objective_options", "canonical_loss"):
+                saved = state.get(key)
+                current = resume_contract.get(key)
+                if (
+                    current is not None
+                    and isinstance(saved, dict)
+                    and (
+                        (key == "canonical_loss" and "terms" not in saved)
+                        or (
+                            key == "canonical_objective_options"
+                            and saved.keys() - current.keys()
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        f"checkpoint uses an old {key} record; convert it with "
+                        "scripts/convert_canonical_checkpoint.py before resuming"
+                    )
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
@@ -351,9 +369,6 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if not persisted_available and key == "canonical_use_fused_conv":
-                    comparison_persisted = False
-                    persisted_available = True
                 if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "

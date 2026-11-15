@@ -196,8 +196,8 @@ class DSpineObjective:
             plan=LossPlan(
                 (
                     LossTerm(),
-                    LossTerm("refinement", loss=self.default_loss),
-                    LossTerm("alignment", beta, TokenLoss("cosine")),
+                    LossTerm("refinement"),
+                    LossTerm("alignment", beta),
                 )
             ),
             requires=frozenset({"teacher_logits"}),

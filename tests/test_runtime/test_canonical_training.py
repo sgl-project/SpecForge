@@ -70,7 +70,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 training={
                     "attention_backend": "eager",
                     "loss": {
-                        "scheduling": {
+                        "execution": {
                             "chunk_size": 2,
                             "checkpoint": False,
                             "trim": True,
@@ -98,7 +98,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     "attention_backend": "eager",
                     "loss": {
                         "terms": {"token": {"kind": "kl"}},
-                        "scheduling": {"chunk_size": 2},
+                        "execution": {"chunk_size": 2},
                     },
                 },
             )
@@ -542,7 +542,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             )
             changes = [
                 ("loss", {"terms": {"token": {"kind": "tv"}}}),
-                ("loss", {**saved["canonical_loss"], "scheduling": {"chunk_size": 1}}),
+                ("loss", {**saved["canonical_loss"], "execution": {"chunk_size": 1}}),
             ]
             if not mtp:
                 changes.append(("weighting", {"kind": "uniform"}))

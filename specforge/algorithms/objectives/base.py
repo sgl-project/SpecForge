@@ -46,7 +46,6 @@ class ObjectiveModel(nn.Module):
         *,
         registration=None,
         name=None,
-        token_loss=None,
         loss_configuration,
         weighting=None,
         frozen_parameters=(),
@@ -63,7 +62,6 @@ class ObjectiveModel(nn.Module):
         self.registration = registration
         self.objective_name = name
         self.target_head = target_head
-        self.token_loss = token_loss
         self.loss_configuration = loss_configuration
         self.weighting = weighting
         self.frozen_parameters = tuple(frozen_parameters)
@@ -217,7 +215,7 @@ class ObjectiveModel(nn.Module):
         )
         return execute_batch(
             prepared,
-            self.token_loss,
+            None,
             self.weighting,
             training=self.draft_model.training,
             execution=self.execution,

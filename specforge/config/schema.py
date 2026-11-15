@@ -997,6 +997,31 @@ class InitializationConfig(StrictConfigModel):
         return self
 
 
+class LossTermConfig(StrictConfigModel):
+    """User-selected formula and coefficient; defaults belong to the protocol."""
+
+    kind: str = Field(default="default", strict=True)
+    options: dict[str, object] = Field(default_factory=dict)
+    coefficient: float = Field(default=1.0, strict=True, ge=0, allow_inf_nan=False)
+
+
+class LossExecutionConfig(StrictConfigModel):
+    """Projection chunking and recomputation, independent of the formula."""
+
+    chunk_size: int | None = Field(default=None, strict=True, ge=0)
+    checkpoint: bool = Field(default=True, strict=True)
+    trim: bool = Field(default=False, strict=True)
+    teacher_chunk_size: int | None = Field(default=None, strict=True, gt=0)
+
+
+class LossConfig(StrictConfigModel):
+    """Shared syntax for run files and programmatic objective construction."""
+
+    terms: dict[str, LossTermConfig] = Field(default_factory=dict)
+    fused: bool = Field(default=False, strict=True)
+    execution: LossExecutionConfig = Field(default_factory=LossExecutionConfig)
+
+
 class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
@@ -1105,11 +1130,13 @@ class TrainingConfig(StrictConfigModel):
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
 
+    @field_validator("loss")
+    @classmethod
+    def _validate_loss(cls, value):
+        return LossConfig.model_validate(value).model_dump(exclude_unset=True)
+
     @model_validator(mode="after")
     def _validate_training_shape(self):
-        unknown = self.loss.keys() - {"terms", "fused", "scheduling"}
-        if unknown:
-            raise ValueError(f"Unknown training.loss fields: {sorted(unknown)}")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

@@ -201,33 +201,66 @@ def _objective_settings(cfg):
 
 
 def _validate_imported_objective(cfg, resolved):
-    init = cfg.initialization
-    if init is None or init.checkpoint is None:
-        return
-    from specforge.checkpoint.resolve import read_json, resolve_directory
+    """Require explicit preservation of recorded legacy DSpine training settings."""
+    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
     from specforge.config.draft.codec.legacy.dspine import (
         extract_dspine_training_settings,
     )
 
-    source = resolve_directory(
-        init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    directory = source.parent if source.is_file() else source
-    payload = read_json(init.legacy_config or directory / "config.json")
-    if payload.get("model_type") == "specforge_draft" or payload.get(
-        "architectures"
-    ) != ["DSpineDraftModel"]:
-        return
-    # Weight import keeps architecture/sampling checks; loss settings belong
-    # exclusively to the new training configuration, not the model checkpoint.
-    recorded = extract_dspine_training_settings(payload)
-    for name, saved in recorded.items():
-        if name in {"ce_weight", "alignment_weight"}:
+    payloads = []
+    draft = cfg.draft
+    if isinstance(draft, str):
+        import yaml
+
+        draft = yaml.safe_load(Path(draft).read_text())
+    if isinstance(draft, dict):
+        payloads.append(draft)
+    init = cfg.initialization
+    if init is not None and init.checkpoint is not None:
+        source = resolve_checkpoint_path(
+            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
+        )
+        directory = source.parent if source.is_file() else source
+        payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    for payload in payloads:
+        if payload.get("model_type") == "specforge_draft" or payload.get(
+            "architectures"
+        ) != ["DSpineDraftModel"]:
             continue
-        if getattr(resolved.objective, name) != saved:
-            raise ValueError(
-                f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
-            )
+        for name, saved in extract_dspine_training_settings(payload).items():
+            if name == "ce_weight":
+                values = {
+                    f"loss.terms.{term}.options.{key}": (
+                        configured.loss.options[key],
+                        expected,
+                    )
+                    for term, configured in resolved.losses.terms.items()
+                    if term in {"token", "refinement"}
+                    and configured.loss.kind == "ce_l1"
+                    for key, expected in (
+                        ("ce_weight", saved),
+                        ("l1_weight", 1 - saved),
+                    )
+                }
+            elif name == "alignment_weight":
+                values = {
+                    "loss.terms.alignment.coefficient": (
+                        resolved.losses.terms["alignment"].coefficient,
+                        saved,
+                    )
+                }
+            else:
+                values = {
+                    f"objective_options.{name}": (
+                        getattr(resolved.objective, name),
+                        saved,
+                    )
+                }
+            for path, (current, expected) in values.items():
+                if current != expected:
+                    raise ValueError(
+                        f"legacy DSpine {name}={saved!r}; set training.{path}={expected!r} to preserve it"
+                    )
 
 
 def resolve_run(cfg, *, target_config=None):
@@ -465,8 +498,6 @@ def resolve_run(cfg, *, target_config=None):
         attention_backends=requirements.attention_backends,
         required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
-        supports_trim_loss_positions=True,
-        supports_compact_teacher=vocab,
         supports_liger_kernel=True,
         # a checkpoint import's legacy config becomes the draft; the reader checks it
         allows_aux_layer_override=bool(init and init.checkpoint),

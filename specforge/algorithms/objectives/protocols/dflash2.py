@@ -145,7 +145,7 @@ class DFlash2Objective:
             blocks,
             batch,
             compute=compute,
-            plan=LossPlan((LossTerm(), LossTerm("selector", scale, TokenLoss("ce")))),
+            plan=LossPlan((LossTerm(), LossTerm("selector", scale))),
             context_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))

@@ -144,6 +144,12 @@ class CanonicalReviewTest(unittest.TestCase):
                 setattr(changed.training, name, value)
                 with self.assertRaisesRegex(ValueError, name):
                     resolve_run(changed)
+            cfg.training.objective_chunk_blocks = 128
+            with self.assertLogs(
+                "specforge.training.canonical", level="WARNING"
+            ) as logs:
+                resolve_run(cfg)
+            self.assertIn("do not enable", logs.output[0])
             for name in ("embedding_key", "lm_head_key"):
                 owned = run_config(
                     target,
@@ -175,7 +181,25 @@ class CanonicalReviewTest(unittest.TestCase):
                 encode_config(draft_config()),
             )
 
-    def test_weight_import_does_not_restore_legacy_loss_settings(self):
+    def test_legacy_compact_teacher_is_not_silently_accepted(self):
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+        from tests.test_modeling.test_canonical_peagle import (
+            model_config as peagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for config in (eagle_config(), peagle_config()):
+                with self.subTest(architecture=config.architecture):
+                    cfg = run_config(target, config)
+                    cfg.training.batch_size = 1
+                    cfg.training.compact_teacher = True
+                    with self.assertRaisesRegex(ValueError, "compact teacher"):
+                        resolve_run(cfg)
+
+    def test_weight_import_requires_matching_legacy_loss_settings(self):
         from specforge.algorithms.objectives import resolve_objective
         from specforge.training.canonical import _validate_imported_objective
         from tests.test_config.test_draft_legacy_dspine import dspine_payload
@@ -188,24 +212,39 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 source, draft_config(), initialization={"checkpoint": temp}
             )
-            _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
+                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            inline = cfg.model_copy(update={"draft": payload, "initialization": None})
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
+                _validate_imported_objective(
+                    inline, resolve_objective("DSpineDraftModel")
+                )
+            terms = {
+                name: {"options": {"ce_weight": 0.3, "l1_weight": 0.7}}
+                for name in ("token", "refinement")
+            }
             _validate_imported_objective(
-                cfg,
-                resolve_objective(
-                    "DSpineDraftModel",
-                    options={},
-                    loss={
-                        "terms": {
-                            "token": {
-                                "options": {"ce_weight": 0.3, "l1_weight": 1 - 0.3}
-                            },
-                            "refinement": {
-                                "options": {"ce_weight": 0.3, "l1_weight": 1 - 0.3}
-                            },
-                        }
-                    },
-                ),
+                cfg, resolve_objective("DSpineDraftModel", loss={"terms": terms})
             )
+            for term, setting, value in (
+                ("refinement", "options", {"ce_weight": 0.1, "l1_weight": 0.9}),
+                ("alignment", "coefficient", 0.7),
+            ):
+                with self.subTest(term=term):
+                    changed = {**terms, term: {setting: value}}
+                    with self.assertRaisesRegex(
+                        ValueError, f"training.loss.terms.{term}"
+                    ):
+                        _validate_imported_objective(
+                            inline,
+                            resolve_objective(
+                                "DSpineDraftModel", loss={"terms": changed}
+                            ),
+                        )
 
     def test_scratch_embedding_key_survives_resume(self):
         """A scratch run that needed model.embedding_key must resume with it."""

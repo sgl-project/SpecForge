@@ -198,7 +198,10 @@ class ObjectiveContractTest(unittest.TestCase):
             reduction="none",
         ).sum(-1)
         torch.testing.assert_close(
-            runtime.token_loss(logits, logits.argmax(-1), teacher=teacher), expected
+            runtime.loss_configuration.terms["token"].loss(
+                logits, logits.argmax(-1), teacher=teacher
+            ),
+            expected,
         )
         torch.testing.assert_close(
             runtime.weighting(torch.ones(4), torch.arange(4)),
@@ -544,18 +547,20 @@ class ObjectiveContractTest(unittest.TestCase):
         result = runtime(batch, step=0, total_steps=None)
         self.assertEqual(result.denominator.item(), 2)
 
-    def test_runtime_keeps_the_resolved_default_loss(self):
+    def test_runtime_keeps_the_resolved_named_loss(self):
         _, dspark = build_runtime(
             "DSparkDraftModel",
             options={},
             loss={"terms": {"token": {"options": {"ce_weight": 0.3}}}},
         )
         self.assertEqual(
-            dspark.token_loss,
+            dspark.loss_configuration.terms["token"].loss,
             TokenLoss(kind="ce_l1", options={"ce_weight": 0.3, "l1_weight": 0.9}),
         )
         _, eagle = build_runtime("Eagle3DraftModel")
-        self.assertEqual(eagle.token_loss, TokenLoss(kind="soft_ce"))
+        self.assertEqual(
+            eagle.loss_configuration.terms["token"].loss, TokenLoss(kind="soft_ce")
+        )
 
     def test_protocols_declare_their_default_weighting(self):
         _, dflash = build_runtime("DFlashDraftModel", options={"loss_decay_gamma": 2.0})

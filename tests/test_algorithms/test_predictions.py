@@ -106,7 +106,9 @@ class PredictionsTest(unittest.TestCase):
             prediction = next(iter(kl_runtime.objective(kl_runtime, batch).predictions))
             self.assertEqual(teacher.call_count, 0)
             evaluate_predictions(
-                prediction, kl_runtime.token_loss, kl_runtime.weighting
+                prediction,
+                kl_runtime.loss_configuration.terms["token"].loss,
+                kl_runtime.weighting,
             )
             self.assertEqual(teacher.call_count, 1)
 
@@ -136,4 +138,8 @@ class PredictionsTest(unittest.TestCase):
                 )
             )
             with self.assertRaisesRegex(ValueError, "teacher_logits"):
-                evaluate_predictions(prediction, runtime.token_loss, runtime.weighting)
+                evaluate_predictions(
+                    prediction,
+                    runtime.loss_configuration.terms["token"].loss,
+                    runtime.weighting,
+                )
