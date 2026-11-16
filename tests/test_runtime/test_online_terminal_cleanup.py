@@ -223,5 +223,136 @@ class TerminalCleanupTests(unittest.TestCase):
             self.store.adopt(refs[-1])  # Normal handoff tombstones were not reopened.
 
 
+class OnlineProducerCloseTests(unittest.TestCase):
+    """Exercise the actual _build_online -> TrainingRun.run -> produce lifecycle."""
+
+    def _build(self, directory, backend, drive):
+        from specforge.runtime.data_plane.mooncake_store import _InjectedReplicateConfig
+        cfg = Config.model_validate({
+            'model': {'target_model_path':'target', 'draft_model_config':'draft'},
+            'data': {'prompts_path':'unused'},
+            'training': {'strategy':'dflash', 'role':'producer', 'max_steps':30, 'total_steps':1197},
+            'deployment': {'mode':'disaggregated', 'disaggregated': {
+                'control_dir':directory, 'backend':'mooncake', 'server_urls':['http://capture'],
+                'receive_buffers':'pageable'}}})
+        # _mooncake_store and the owned FeatureStore constructor remain real;
+        # only the optional native client's connection is replaced by CPU bytes.
+        import specforge.training.disaggregated as disaggregated
+        real_store = disaggregated._mooncake_store
+        stores = []
+        def capture_store(*args, **kwargs):
+            store = real_store(*args, **kwargs)
+            stores.append(store)
+            return store
+        with (
+            mock.patch('specforge.runtime.data_plane.mooncake_store._connect_store', return_value=(backend, _InjectedReplicateConfig)),
+            mock.patch('specforge.training.disaggregated._mooncake_store', side_effect=capture_store),
+            mock.patch('specforge.training.assembly._load_input_tools'),
+            mock.patch('specforge.training.model_loading.resolve_draft_config'),
+            mock.patch('specforge.training.disaggregated._producer_capture_metadata', return_value=([1,3],2,4,4)),
+            mock.patch('specforge.inference.adapters.server_capture.SGLangServerCaptureAdapter'),
+            mock.patch('specforge.launch.build_disagg_online_producer', return_value=([], lambda **kwargs: drive(stores[0], **kwargs))),
+        ):
+            run = _build_online(cfg, algorithm=builtin_algorithm_registry().resolve('dflash'),
+                build_model_bundle=mock.Mock(),
+                prepare_prompts=lambda *args, **kwargs: [{'task_id':'p','payload':{'input_ids':[1,2]}}],
+                optimizer_factory=mock.Mock(), logger=None)
+        return run, stores[0]
+
+    def _env(self, directory):
+        return mock.patch.dict(os.environ, {
+            'DISAGG_REF_CHANNEL':directory+'/refs', 'DISAGG_STORE_ID':'run0',
+            'MOONCAKE_PROTOCOL':'tcp', 'MOONCAKE_METADATA_SERVER':'cpu-fixture',
+            'MOONCAKE_MASTER_SERVER_ADDR':'cpu-fixture', 'DISAGG_RECEIVE_BUFFERS':'pageable',
+            'SPECFORGE_HS_SEGMENTED':'1', 'SPECFORGE_TRAINER_NODE_POOL':'1',
+            'SPECFORGE_TRAINER_NODE_POOL_DIR':directory+'/pool',
+            'SPECFORGE_TRAINER_NODE_POOL_BYTES':'8192'})
+
+    def test_real_producer_closes_last_pool_client_native_and_terminal_authority(self):
+        import sqlite3
+        from tests.test_runtime.test_segment_manifest import Fixture
+        with tempfile.TemporaryDirectory() as directory, self._env(directory):
+            fixture = Fixture(directory)
+            refs = [fixture.publish('a'), fixture.publish('b', n=10, l=5)]
+            backend = Backend()
+            backend._d = fixture.backend._d  # One CPU stand-in for the remote master.
+            def drive(store, *, should_stop):
+                self.assertFalse(should_stop())
+                self.assertTrue(store._owns_store)
+                channel = StreamingRefChannel(directory+'/refs')
+                for ref in refs:
+                    store.adopt(ref)
+                    channel.publish(ref)
+                    store.relinquish_published(ref)
+                consumer = fixture.reader()
+                tensors, handle = consumer.get(refs[0])
+                self.assertEqual(tensors['hidden_states'].shape, (1,9,2))
+                consumer.release(handle)
+                fixture.drain(consumer, refs[0])
+                consumer.close()
+                # Producer remains the last actual mapped client until produce
+                # performs its terminal scan and explicit store close.
+                self.assertEqual(store.health()['node_pool_clients'], 1)
+                self.assertTrue(Path(directory+'/pool/data.mmap').exists())
+                channel.mark_consumer_done()
+                channel.close()
+                return len(refs)
+            run, store = self._build(directory, backend, drive)
+            try:
+                self.assertEqual(run.run(), 2)
+                self.assertTrue(store._closed)
+                self.assertTrue(store._terminal_cleanup_authority._closed)
+                self.assertIsNone(store._terminal_cleanup_authority._node_pool)
+                self.assertEqual(backend.close_calls, 1)
+                self.assertFalse(Path(directory+'/pool/data.mmap').exists())
+                self.assertFalse(Path(directory+'/pool/directory.sqlite').exists())
+                proof_path = Path(directory+'/pool.terminal.sqlite')
+                self.assertTrue(proof_path.exists())
+                self.assertFalse(Path(str(proof_path)+'-journal').exists())
+                with sqlite3.connect(f'file:{proof_path}?mode=ro&immutable=1', uri=True) as proof:
+                    self.assertEqual(proof.execute("SELECT phase,COUNT(*) FROM proofs GROUP BY phase").fetchall(), [('PROVED',2)])
+                fixture.owner.progress()
+                self.assertEqual(fixture.owner.health()['remote_owner_charged_bytes'], 0)
+                self.assertFalse(backend._d)
+            finally:
+                # Idempotent cleanup also makes the pre-fix failing fixture safe.
+                store.close()
+                fixture.close()
+
+    def test_drive_failure_still_closes_real_producer_store(self):
+        with tempfile.TemporaryDirectory() as directory, self._env(directory):
+            backend = Backend()
+            def fail(store, *, should_stop):
+                raise RuntimeError('drive exploded')
+            run, store = self._build(directory, backend, fail)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'drive exploded'):
+                    run.run()
+                self.assertTrue(store._closed)
+                self.assertEqual(backend.close_calls, 1)
+                self.assertFalse(Path(directory+'/pool/data.mmap').exists())
+            finally:
+                store.close()
+
+    def test_terminal_cleanup_failure_still_closes_real_producer_store(self):
+        with tempfile.TemporaryDirectory() as directory, self._env(directory):
+            backend = Backend()
+            def drive(store, *, should_stop):
+                channel = StreamingRefChannel(directory+'/refs')
+                channel.mark_consumer_done()
+                channel.close()
+                return 0
+            run, store = self._build(directory, backend, drive)
+            try:
+                with mock.patch.object(store, 'discard_external_attempts', side_effect=RuntimeError('cleanup exploded')):
+                    with self.assertRaisesRegex(RuntimeError, 'unadopted-capture cleanup.*cleanup exploded'):
+                        run.run()
+                self.assertTrue(store._closed)
+                self.assertEqual(backend.close_calls, 1)
+                self.assertFalse(Path(directory+'/pool/data.mmap').exists())
+            finally:
+                store.close()
+
+
 if __name__ == '__main__':
     unittest.main()

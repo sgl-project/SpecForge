@@ -822,6 +822,12 @@ def _build_online(
                 cleanup_errors.append(
                     f"pending-remove drain: {type(exc).__name__}: {exc}"
                 )
+            try:
+                store.close()
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"feature-store close: {type(exc).__name__}: {exc}"
+                )
             if primary_exc is not None and cleanup_errors:
                 raise RuntimeError(
                     f"producer failed ({type(primary_exc).__name__}: "
