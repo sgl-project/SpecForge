@@ -742,7 +742,7 @@ the pinned serving format's representable structures. Dense Qwen3.5 MTP uses
 `--export-mode native --target-model TARGET` for native merge-back.
 DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
 exported. Mixed causality supports causal sliding layers with bidirectional full layers.
-See [draft export](../../draft_export.md) for restrictions and validation.
+See [draft export](/draft_export.md) for restrictions and validation.
 
 Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
 saved precision when tensors share one floating-point dtype; SGLang casts to
@@ -758,7 +758,7 @@ and attention computations. Do not resume those runs; retrain from native MTP
 weights under the corrected model. The legacy codec follows the corrected model.
 
 For native MTP, use the ordinary YAML preset and explicit target mapping in
-[the preset guide](../../../specforge/config/draft/presets/README.md). A complete
+[the preset guide](https://github.com/sgl-project/SpecForge/blob/main/specforge/config/draft/presets/README.md). A complete
 text-only offline recipe is available at
 `examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
