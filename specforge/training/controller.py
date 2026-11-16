@@ -900,6 +900,7 @@ class TrainerController:
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
         progress = self._make_progress_bar()
+        self._fit_iterator = None
         if self.async_ack and self.ack_fn is not None:
             self._ack_runner = _AsyncAckRunner(self.ack_fn)
         try:
@@ -911,8 +912,30 @@ class TrainerController:
             self._close_ack_runner(exc)
             raise
         finally:
-            if progress is not None:
-                progress.close()
+            primary = sys.exc_info()[1]
+            try:
+                # Retain and explicitly close the iterator after durable ACKs
+                # drain. Generator destruction must not swallow close errors.
+                self._close_fit_iterator()
+            except BaseException as cleanup_error:
+                if primary is None:
+                    raise
+                primary.add_note(f"training iterator close also failed: {cleanup_error}")
+            finally:
+                if progress is not None:
+                    prior = sys.exc_info()[1] or primary
+                    try:
+                        progress.close()
+                    except BaseException as cleanup_error:
+                        if prior is None:
+                            raise
+                        prior.add_note(f"training progress close also failed: {cleanup_error}")
+
+    def _close_fit_iterator(self):
+        iterator, self._fit_iterator = self._fit_iterator, None
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
 
     def _close_ack_runner(self, primary: Optional[BaseException]) -> None:
         runner, self._ack_runner = self._ack_runner, None
@@ -992,8 +1015,12 @@ class TrainerController:
                     accumulation_steps=self.core.accumulation_steps,
                     accumulation_remainder=self.core.accumulation_remainder,
                     log_interval=self.log_interval, has_logger=self.logger is not None,
+                    max_batches=(None if self.max_steps is None else max(
+                        0, (self.max_steps - self.global_step) * self.core.accumulation_steps
+                        - self.core.accumulation_remainder,
+                    )),
                 )
-            _it = iter(stream)
+            _it = self._fit_iterator = iter(stream)
             while True:
                 data_wait_started = time.perf_counter()
                 try:
@@ -1148,6 +1175,7 @@ class TrainerController:
                     progress.update(1)
                 if self.max_steps is not None and self.global_step >= self.max_steps:
                     return self.global_step
+            self._close_fit_iterator()
             self._epoch_batch = 0
             self._epoch_samples = 0
             # Persist the *next* epoch after a naturally exhausted pass.  A

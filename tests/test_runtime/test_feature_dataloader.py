@@ -803,7 +803,9 @@ class TestFeatureDataLoader(unittest.TestCase):
             consumer.start()
             self.assertTrue(store.entered.wait(timeout=1.0))
             state = loader._prefetch_state
-            with mock.patch.object(loader_module, "_PREFETCH_JOIN_TIMEOUT_S", 0.05):
+            with mock.patch.object(loader_module, "_PREFETCH_JOIN_TIMEOUT_S", 0.05), mock.patch.object(
+                loader_module, "_PREFETCH_DRAIN_TIMEOUT_S", 0.05
+            ):
                 started = time.monotonic()
                 with self.assertRaisesRegex(RuntimeError, "did not stop"):
                     loader.close()
@@ -812,6 +814,7 @@ class TestFeatureDataLoader(unittest.TestCase):
 
             store.resume.set()
             state.thread.join(timeout=1.0)
+            self.assertFalse(futures.wait(state.live_fetches(), timeout=1.0).not_done)
             loader.close()
             consumer.join(timeout=1.0)
             iterator.close()
