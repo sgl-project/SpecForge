@@ -783,7 +783,12 @@ class FeatureDataLoader:
                         failed_refs = state.settle_unyielded_fetch(future)
                         if failed_refs is not None:
                             state.mark_fetch_failed(failed_refs)
-                            self._settle_unyielded_refs(state, failed_refs, reason=f"materialize:{exc}")
+                            try:
+                                self._settle_unyielded_refs(state, failed_refs, reason=f"materialize:{exc}")
+                            except BaseException as cleanup_error:
+                                # Keep exact outstanding refs for finally or a
+                                # later close, and preserve the original fetch.
+                                exc.add_note(f"prefetch ref settlement also failed: {cleanup_error}")
                         raise
                 else:
                     return

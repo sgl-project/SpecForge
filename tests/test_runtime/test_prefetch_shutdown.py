@@ -283,6 +283,37 @@ class TestCooperativeStop(unittest.TestCase):
         self.assertEqual({sid for ids, retry in queue.failures if not retry for sid in ids}, {'s0'})
         self.assertEqual({sid for ids, retry in queue.failures if retry for sid in ids}, {'s1', 's2'})
 
+    def test_fetch_error_identity_survives_failed_queue_settlement(self):
+        store, queue = Store(), Queue()
+        queue.put(refs(store, 3))
+        loader = FeatureDataLoader(store, queue, batch_size=3, num_workers=1,
+                                   strategy='fake', ack=False)
+        primary = ValueError('original-fetch-object')
+        cleanup = RuntimeError('queue-settlement-cleanup')
+        iterator = iter(loader)
+        try:
+            with mock.patch.object(store, 'get', side_effect=primary), \
+                 mock.patch.object(queue, 'fail', side_effect=cleanup):
+                with self.assertRaises(ValueError) as caught:
+                    next(iterator)
+                self.assertIs(caught.exception, primary)
+                self.assertIn('queue-settlement-cleanup', ' '.join(primary.__notes__))
+                state = loader._prefetch_state
+                self.assertIsNotNone(state)
+                self.assertEqual(state.outstanding_ids(), ['s0', 's1', 's2'])
+                entries = state.outstanding_entries()
+                self.assertTrue(entries[0].touched and entries[0].failed)
+                self.assertTrue(all(not entry.touched for entry in entries[1:]))
+                self.assertEqual(queue.in_flight(), 3)
+                self.assertFalse(state.shutdown_complete)
+        finally:
+            # Restore queue settlement, then finish the retained exact refs.
+            loader.close()
+            iterator.close()
+        self.assertIsNone(loader._prefetch_state)
+        self.assertEqual(queue.depth(), 2)
+        self.assertEqual(queue.in_flight(), 0)
+
     def test_release_failure_keeps_touched_sample_terminal_and_tail_retryable(self):
         store, queue = Store(), Queue()
         queue.put(refs(store, 3))
