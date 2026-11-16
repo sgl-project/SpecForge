@@ -73,6 +73,7 @@ SpecBundle is a collection of production-grade speculative decoding models that 
 
 
 ## 🎉 News
+- [2026-11] 🎉 Released DMTP drafts for [Qwen3.6-27B](https://huggingface.co/Piggy12/Qwen3.6-27B-DMTP) and [Qwen3.8 Next 120B](https://huggingface.co/Piggy12/Qwen3.8-next-120b-dmtp). DMTP combines native MTP with DFlash-family parallel drafting. See the [release and serving notes](./docs/sections/concepts/DMTP.md) and [SpecBundle](https://docs.sglang.io/SpecForge/specbundle.html).
 - [2026-08] 🔥 Added DFlash2 online training for DFlash draft models.
 - [2026-08] 🎉 Released SpecBundle (phase 2) and SpecForge v0.3.0. Check out our blog at [LMSYS.org](https://www.lmsys.org/blog/2026-08-04-specforge-v0-3)
 - [2026-07] 🚀 Day0 supported two flagship dspark draft model, [Inkling](https://huggingface.co/RadixArk/Inkling-DSpark-Preview) and [Kimi-K3](https://huggingface.co/RadixArk/Kimi-K3-DSpark).
