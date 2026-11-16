@@ -321,5 +321,153 @@ class TestSegmentManifest(unittest.TestCase):
             fixture.owner.ledger.forget(manifest['receipt_key'])
             fixture.owner.manifests.pop(manifest['token'])
             reader._release_pending.clear()
+            if reader._terminal_proofs is not None:
+                reader._terminal_proofs.db.execute('DELETE FROM proofs WHERE token=?', (manifest['token'],))
             reader.close()
+            fixture.close()
+
+    def test_terminal_rescan_uses_durable_receipt_proof_and_does_not_retain_pool_client(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            producer = fixture.reader()
+            producer.adopt(ref)
+            producer.relinquish_published(ref)
+            self.assertEqual(producer.health()['segment_manifests'], 0)
+            consumer = fixture.reader()
+            consumer.adopt(ref)
+            fixture.drain(consumer, ref)
+            self.assertEqual(fixture.owner.health()['active_manifests'], 0)
+            self.assertFalse(fixture.backend._d)
+            producer.cleanup_terminal_refs([ref], consumer_done=True, producer_closed=True)
+            self.assertIsNone(producer._terminal_cleanup_authority._node_pool)
+            self.assertFalse(fixture.backend._d)
+            consumer.close()
+            producer.close()
+            self.assertTrue(producer._terminal_cleanup_authority._closed)
+            self.assertFalse(os.path.exists(directory + '/pool/data.mmap'))
+            self.assertTrue(os.path.exists(directory + '/pool.terminal.sqlite'))
+            fixture.close()
+
+    def test_missing_header_without_proof_still_detaches_unacked_manifest(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            for key in ref.feature_keys.values():
+                fixture.backend.remove(key)
+            reader = fixture.reader()
+            reader.cleanup_terminal_refs([ref], consumer_done=True, producer_closed=True)
+            fixture.owner.progress()
+            self.assertEqual(fixture.owner.health()['manifest_acked'], 1)
+            self.assertEqual(fixture.owner.health()['remote_owner_charged_bytes'], 0)
+            self.assertFalse(fixture.backend._d)
+            reader.close()
+            fixture.close()
+
+    def test_cached_terminal_proof_cannot_authorize_a_different_digest(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            first = fixture.reader()
+            first.adopt(ref)
+            fixture.drain(first, ref)
+            bad = copy.deepcopy(ref.metadata['segment_manifest'])
+            bad['owner_epoch'] = 'different-owner'
+            bad['digest'] = digest_manifest({name:value for name,value in bad.items() if name != 'digest'})
+            wire = {**ref.metadata['capture_fence'], 'segment_manifest': bad}
+            forged = replace(ref, metadata={**ref.metadata,'segment_manifest':bad,'capture_fence':wire})
+            second = fixture.reader()
+            second.adopt(forged)
+            with self.assertRaisesRegex(ValueError, 'proof attempt/digest identity mismatch'):
+                second.abort_ref(forged)
+            self.assertFalse(fixture.backend._d)
+            first.close()
+            second.close()
+            fixture.close()
+
+    def test_pool_disabled_keeps_cross_client_terminal_proof(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory), mock.patch.dict(os.environ, {'SPECFORGE_TRAINER_NODE_POOL':'0'}):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            first, second = fixture.reader(), fixture.reader()
+            self.assertIsNone(first._node_pool)
+            first.adopt(ref)
+            fixture.drain(first, ref)
+            second.cleanup_terminal_refs([ref], consumer_done=True, producer_closed=True)
+            self.assertFalse(fixture.backend._d)
+            first.close()
+            second.close()
+            fixture.close()
+
+    def test_fresh_authority_racing_original_ack_cannot_issue_a_late_marker(self):
+        import threading
+        from specforge.runtime.data_plane.terminal_receipt_proofs import TerminalReceiptProofs
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            consumer, producer = fixture.reader(), fixture.reader()
+            consumer.adopt(ref)
+            producer.adopt(ref)
+            producer.relinquish_published(ref)
+            entered, finish, busy = threading.Event(), threading.Event(), threading.Event()
+            errors, put_keys = [], []
+            real_put, real_claim = fixture.backend.put_from, TerminalReceiptProofs.claim
+            def counted_put(key, *args, **kwargs):
+                put_keys.append(key)
+                return real_put(key, *args, **kwargs)
+            original_ack = consumer._put_manifest_ack
+            def delayed_ack(manifest):
+                entered.set()
+                if not finish.wait(5):
+                    raise RuntimeError('ACK gate not released')
+                return original_ack(manifest)
+            def observed_claim(proofs, *args, **kwargs):
+                result = real_claim(proofs, *args, **kwargs)
+                if result == 'BUSY':
+                    busy.set()
+                return result
+            def consume():
+                try:
+                    fixture.drain(consumer, ref)
+                except BaseException as exc:
+                    errors.append(exc)
+            def cleanup():
+                try:
+                    producer.cleanup_terminal_refs([ref], consumer_done=True, producer_closed=True)
+                except BaseException as exc:
+                    errors.append(exc)
+            with mock.patch.object(consumer, '_put_manifest_ack', side_effect=delayed_ack), mock.patch.object(fixture.backend, 'put_from', side_effect=counted_put), mock.patch.object(TerminalReceiptProofs, 'claim', new=observed_claim):
+                a = threading.Thread(target=consume)
+                a.start()
+                self.assertTrue(entered.wait(5))
+                b = threading.Thread(target=cleanup)
+                b.start()
+                self.assertTrue(busy.wait(5))
+                finish.set()
+                a.join(10)
+                b.join(10)
+                self.assertFalse(a.is_alive() or b.is_alive())
+            self.assertFalse(errors, errors)
+            fixture.owner.progress()
+            self.assertEqual(put_keys.count(ref.metadata['segment_manifest']['ack_key']), 1)
+            self.assertFalse(fixture.backend._d)
+            consumer.close()
+            producer.close()
+            fixture.close()
+
+    def test_ready_manifest_cancel_counts_once_and_closes_without_fake_ack(self):
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            ref = fixture.publish('a')
+            token = ref.metadata['segment_manifest']['token']
+            fixture.owner.cancel(token)
+            fixture.owner.cancel(token)
+            fixture.owner.progress()
+            fixture.owner.cancel(token)
+            health = fixture.owner.health()
+            self.assertEqual(health['ready_manifest_cancelled'], 1)
+            self.assertEqual(health['manifest_published'], health['manifest_acked'] + health['ready_manifest_cancelled'])
+            self.assertEqual(health['receipt_completed'], health['manifest_acked'])
+            self.assertEqual(health['remote_owner_charged_bytes'], 0)
+            self.assertFalse(fixture.backend._d)
             fixture.close()

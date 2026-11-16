@@ -181,7 +181,8 @@ class RemoteManifestOwner:
         self.objects, self.manifests = {}, {}
         self.stats = dict.fromkeys(('manifest_published', 'manifest_dependencies', 'block_new',
                                     'block_reused', 'logical_feature_bytes', 'physical_put_bytes',
-                                    'manifest_acked', 'receipt_completed', 'publication_failures'), 0)
+                                    'manifest_acked', 'receipt_completed', 'publication_failures',
+                                    'ready_manifest_cancelled'), 0)
         self.stop = threading.Event()
         self.error = None
         self.closed = False
@@ -338,8 +339,11 @@ class RemoteManifestOwner:
             if rec['phase'] == 'QUARANTINED':
                 raise RuntimeError('cannot cancel a manifest with an unknown native writer')
             if rec['phase'] in ('PUBLISHING', 'READY'):
+                was_published = rec['phase'] == 'READY'
                 self._detach(token, rec)
                 rec['phase'] = 'ABORTED'
+                if was_published:
+                    self.stats['ready_manifest_cancelled'] += 1
 
     def _ack_matches(self, rec):
         value = torch.empty(MARKER_BYTES, dtype=torch.uint8)

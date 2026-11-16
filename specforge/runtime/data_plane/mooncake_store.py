@@ -597,11 +597,14 @@ class MooncakeFeatureStore(FeatureStore):
         clock: Callable[[], float] = time.monotonic,
         receive_buffers: str = "pageable",
         receive_pool_bytes: int = DEFAULT_RECEIVE_POOL_BYTES,
+        node_pool_enabled: Optional[bool] = None,
     ) -> None:
         self.auth = auth or AuthPolicy()
         self._credential = credential
         self.auth.check(credential)  # attach-time gate (B9)
         self.store_id = store_id or uuid.uuid4().hex[:8]
+        if os.environ.get('SPECFORGE_HS_SEGMENTED', '0') == '1' and not os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR'):
+            raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
         self._owns_store = store is None
         self._closed = False
         self._closing = False
@@ -642,7 +645,12 @@ class MooncakeFeatureStore(FeatureStore):
             'transport_get_requested_bytes', 'transport_get_completed_bytes',
             'receive_to_pageable_copy_bytes', 'manifest_ack_puts', 'manifest_receipt_drains'), 0)
         self._node_pool = None
-        if os.environ.get('SPECFORGE_TRAINER_NODE_POOL', '0') == '1':
+        self._terminal_proofs = None
+        self._terminal_proof_owner = uuid.uuid4().hex
+        self._terminal_proof_health = {}
+        use_node_pool = (os.environ.get('SPECFORGE_TRAINER_NODE_POOL', '0') == '1'
+                         if node_pool_enabled is None else bool(node_pool_enabled))
+        if use_node_pool:
             from specforge.runtime.data_plane.node_content_pool import NodeContentPool
             directory = os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR')
             if not directory:
@@ -954,6 +962,8 @@ class MooncakeFeatureStore(FeatureStore):
         if layout not in ('full-v1', 'hs-manifest-v1'):
             raise ValueError('unknown capture feature layout')
         if layout == 'hs-manifest-v1':
+            if not os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR'):
+                raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
             from specforge.runtime.data_plane.segment_manifest import validate_manifest
             if ref.schema_version != 2 or wire is None or wire.get('feature_layout') != layout:
                 raise ValueError('segmented capture requires explicit versioned ownership')
@@ -1182,6 +1192,13 @@ class MooncakeFeatureStore(FeatureStore):
                 raise RuntimeError("cannot close capture transport with live readers")
         # CUDA H2D completion is independent of native transport shutdown.
         self._drain_h2d_quarantine()
+        if self._terminal_cleanup_authority is not None:
+            self._terminal_cleanup_authority.close()
+        if self._terminal_proofs is not None:
+            if self._terminal_proofs.owned_claims(self._terminal_proof_owner):
+                raise RuntimeError('cannot close with unresolved terminal ACK claims')
+            self._terminal_proof_health = self._terminal_proofs.health()
+            self._terminal_proofs.close()
         if self._node_pool is not None:
             self._node_pool.close()
         if self._receive_pool is not None:
@@ -1437,28 +1454,54 @@ class MooncakeFeatureStore(FeatureStore):
                 self._capture_quarantined_registrations.add(ptr)
                 self._quarantine_buffer(tensor)
 
+    def _receipt_proofs(self):
+        if self._terminal_proofs is None:
+            from pathlib import Path
+            from specforge.runtime.data_plane.terminal_receipt_proofs import TerminalReceiptProofs
+            directory = os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR')
+            if not directory:
+                raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
+            root = Path(directory)
+            capacity = int(os.environ.get('SPECFORGE_TRAINER_NODE_POOL_BYTES', str(8 << 30)))
+            metadata = min(32 << 20, capacity // 128) if capacity >= (64 << 20) else 0
+            proof_budget = (metadata - metadata // 8) // 2 if metadata else (1 << 20)  # tiny CPU pools
+            self._terminal_proofs = TerminalReceiptProofs(root.parent / (root.name + '.terminal.sqlite'), proof_budget)
+        return self._terminal_proofs
+
     def _try_manifest_free(self, sample_id):
         manifest = self._segment_manifests[sample_id]
-        if manifest['token'] in self._segment_ack_unsafe:
-            raise RuntimeError('ACK native completion is unknown; exact attempt retained')
-        if sample_id not in self._segment_ack_sent:
-            self._put_manifest_ack(manifest)
-            self._segment_ack_sent.add(sample_id)
-            self._segment_counters['manifest_ack_puts'] += 1
-        if sample_id not in self._segment_receipt_seen:
+        proofs = self._receipt_proofs()
+        claim = proofs.claim(self.store_id, sample_id, manifest, self._terminal_proof_owner)
+        if claim == 'BUSY':
+            return False  # Another exact claimant alone may publish ACK/proof.
+        if claim != 'PROVED':
+            if manifest['token'] in self._segment_ack_unsafe:
+                raise RuntimeError('ACK native completion is unknown; exact attempt retained')
             if not self._store_exists(manifest['receipt_key']):
-                return False
+                if sample_id not in self._segment_ack_sent:
+                    try:
+                        self._put_manifest_ack(manifest)
+                    except BaseException:
+                        proofs.unsafe(self.store_id, sample_id, manifest, self._terminal_proof_owner)
+                        raise
+                    self._segment_ack_sent.add(sample_id)
+                    self._segment_counters['manifest_ack_puts'] += 1
+                if not self._store_exists(manifest['receipt_key']):
+                    return False
             from specforge.runtime.contracts import FeatureSpec
             value = self._fetch_tensor(manifest['receipt_key'], FeatureSpec('__receipt', (32,), 'uint8'), 'cpu')
             if bytes(value.tolist()).hex() != manifest['digest']:
+                proofs.unsafe(self.store_id, sample_id, manifest, self._terminal_proof_owner)
                 raise RuntimeError('manifest ACK receipt digest mismatch')
-            self._segment_receipt_seen.add(sample_id)
-        # The receipt certifies dependency detach and last-owned-key absence.
-        # It does not require shared objects still held by other manifests to die.
+            proofs.prove(self.store_id, sample_id, manifest, self._terminal_proof_owner)
+        # A durable exact receipt proof also serves a fresh terminal authority
+        # after the original consumer removed the receipt and the owner retired.
+        # No client may issue another ACK after this state is durable.
         if not self._store_remove(manifest['receipt_key'], force=True):
             return False
         if self._store_exists(manifest['receipt_key']):
             return False
+        self._segment_receipt_seen.add(sample_id)
         self._segment_counters['manifest_receipt_drains'] += 1
         return True
 
@@ -2421,8 +2464,11 @@ class MooncakeFeatureStore(FeatureStore):
                 raise RuntimeError('cannot relinquish capture with local reader ownership')
             self._mark_freed_locked(sid, int(wire['gen']))
             for mapping in (self._generation, self._sample_names, self._sample_bytes, self._put_time,
-                            self._release_pending, self._capture_ack_pending, self._capture_fences):
+                            self._release_pending, self._capture_ack_pending, self._capture_fences,
+                            self._segment_manifests):
                 mapping.pop(sid, None)
+            self._segment_ack_sent.discard(sid)
+            self._segment_receipt_seen.discard(sid)
             self._external_provisional.pop((sid, int(wire['gen'])), None)
 
     def _validate_terminal_capture_ref(self, ref, wire):
@@ -2471,7 +2517,7 @@ class MooncakeFeatureStore(FeatureStore):
                     if authority is None:
                         authority = MooncakeFeatureStore(store_id=self.store_id, store=self._store,
                             auth=self.auth, credential=self._credential,
-                            max_release_attempts=self.max_release_attempts)
+                            max_release_attempts=self.max_release_attempts, node_pool_enabled=False)
                         self._terminal_cleanup_authority = authority
                     token = wire.get("reservation_token")
                     with authority._lock:
@@ -2602,6 +2648,7 @@ class MooncakeFeatureStore(FeatureStore):
                 "segment_manifests": len(self._segment_manifests),
                 "manifest_ack_unsafe": len(self._segment_ack_unsafe),
                 **self._segment_counters,
+                **(self._terminal_proofs.health() if self._terminal_proofs is not None and not self._terminal_proofs.closed else self._terminal_proof_health),
                 **(self._node_pool.health() if self._node_pool is not None else {"node_pool_enabled": False}),
             }
             if self._receive_pool is not None:

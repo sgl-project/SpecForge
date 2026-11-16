@@ -147,3 +147,23 @@ class TestBatchMaterialization(unittest.TestCase):
         self.assertFalse(store._h2d_quarantined)
         store._receive_pool = None
         store.close()
+
+    def test_pool_disabled_segmented_client_requires_proof_anchor_before_connect(self):
+        from unittest import mock
+        from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        with patch.dict(os.environ, {'SPECFORGE_HS_SEGMENTED':'1', 'SPECFORGE_TRAINER_NODE_POOL':'0'}):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('SPECFORGE_TRAINER_NODE_POOL_DIR', None)
+                with mock.patch('specforge.runtime.data_plane.mooncake_store._connect_store', side_effect=AssertionError('must fail before connecting')):
+                    with self.assertRaisesRegex(ValueError, 'terminal-proof anchor'):
+                        MooncakeFeatureStore()
+
+    def test_default_disabled_client_does_not_create_or_require_proof_storage(self):
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        with patch.dict(os.environ, {'SPECFORGE_HS_SEGMENTED':'0', 'SPECFORGE_TRAINER_NODE_POOL':'0'}):
+            os.environ.pop('SPECFORGE_TRAINER_NODE_POOL_DIR', None)
+            store = MooncakeFeatureStore(store=_FakeMooncakeStore())
+            self.assertIsNone(store._terminal_proofs)
+            self.assertIsNone(store._node_pool)
+            store.close()

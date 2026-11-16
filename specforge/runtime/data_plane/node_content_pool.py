@@ -56,7 +56,9 @@ class NodeContentPool:
         # slot tests; production-sized pools always reserve this headroom.
         self.metadata_budget = min(32 << 20, self.total_capacity // 128) if self.total_capacity >= (64 << 20) else 0
         self.capacity = self.total_capacity - self.metadata_budget
-        self.max_entries = max(1, (self.metadata_budget - (256 << 10)) // 4096) if self.metadata_budget else None
+        self.metadata_runtime_headroom = self.metadata_budget // 8
+        self.directory_budget = (self.metadata_budget - self.metadata_runtime_headroom) // 2
+        self.max_entries = max(1, (self.directory_budget - (256 << 10)) // 4096) if self.metadata_budget else None
         if self.capacity < 4096:
             raise ValueError('node pool capacity must be at least one 4096-byte page')
         self.wait_timeout = float(wait_timeout_s)
@@ -68,9 +70,13 @@ class NodeContentPool:
         with self._file_lock():
             self._db = sqlite3.connect(self.directory / 'directory.sqlite', timeout=30,
                                        isolation_level=None, check_same_thread=False)
+            self._db.execute('PRAGMA page_size=4096')
+            if self._db.execute('PRAGMA page_size').fetchone()[0] != 4096:
+                raise ValueError('node directory requires 4096-byte SQLite pages')
+            self._db.execute('PRAGMA cache_size=-64')
             self._db.execute('PRAGMA journal_mode=DELETE')
             if self.metadata_budget:
-                self._db.execute(f'PRAGMA max_page_count={max(32, (self.metadata_budget - 4096) // 8192)}')
+                self._db.execute(f'PRAGMA max_page_count={max(8, (self.directory_budget - (64 << 10)) // 8192)}')
             self._db.executescript('''
                 CREATE TABLE IF NOT EXISTS config(version TEXT, capacity INTEGER);
                 CREATE TABLE IF NOT EXISTS clients(id TEXT PRIMARY KEY, pid INTEGER);
@@ -258,10 +264,18 @@ class NodeContentPool:
         with self._transaction() as db:
             self._reap(db)
             result = {f'node_pool_{name}': value for name, value in db.execute('SELECT name,value FROM counters')}
+            metadata_file_bytes = 0
+            for path in self.directory.glob('directory.sqlite*'):
+                try:
+                    metadata_file_bytes += path.stat().st_size
+                except FileNotFoundError:
+                    pass
             result.update(node_pool_enabled=True, node_pool_capacity_bytes=self.total_capacity,
                           node_pool_data_capacity_bytes=self.capacity, node_pool_metadata_budget_bytes=self.metadata_budget,
+                          node_pool_directory_budget_bytes=self.directory_budget, node_pool_terminal_proof_budget_bytes=self.directory_budget,
+                          node_pool_metadata_runtime_headroom_bytes=self.metadata_runtime_headroom,
                           node_pool_committed_file_bytes=(self.directory / 'data.mmap').stat().st_blocks * 512,
-                          node_pool_metadata_file_bytes=sum(path.stat().st_size for path in self.directory.iterdir() if path.name.startswith('directory.sqlite')),
+                          node_pool_metadata_file_bytes=metadata_file_bytes,
                           node_pool_storage_bytes=db.execute("SELECT COALESCE(SUM(extent),0) FROM entries WHERE state IN ('READY','WRITING')").fetchone()[0],
                           node_pool_inflight_bytes=db.execute("SELECT COALESCE(SUM(extent),0) FROM entries WHERE state='WRITING'").fetchone()[0],
                           node_pool_active_pins=db.execute('SELECT COUNT(*) FROM pins').fetchone()[0],
