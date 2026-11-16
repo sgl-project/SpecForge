@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -35,6 +37,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -82,11 +86,24 @@ class TrainingRun:
             return result
         except BaseException as exc:
             if self.on_failure is not None:
-                self.on_failure(exc)
+                try:
+                    self.on_failure(exc)
+                except BaseException as secondary:
+                    note = f"TrainingRun.on_failure also failed: {type(secondary).__name__}: {secondary}"
+                    exc.add_note(note)
+                    logger.error(note, exc_info=True)
             raise
         finally:
             if self.on_finally is not None:
-                self.on_finally()
+                primary = sys.exc_info()[1]
+                try:
+                    self.on_finally()
+                except BaseException as secondary:
+                    if primary is None:
+                        raise
+                    note = f"TrainingRun.on_finally also failed: {type(secondary).__name__}: {secondary}"
+                    primary.add_note(note)
+                    logger.error(note, exc_info=True)
 
 
 def _target_text_config(config):
