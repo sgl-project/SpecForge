@@ -71,9 +71,6 @@ python3 -m sglang.launch_server \
 Each model card on Hugging Face documents the exact launch flags and the
 serving configuration used for its published benchmarks.
 
-[DMTP](/concepts/DMTP.md#serving) requires a matching runtime and adapter;
-follow its model card rather than the generic DFlash command above.
-
 <style>
 /* Every rule is prefixed with `.sb-hero` so it outranks VitePress' `.vp-doc p` / `.vp-doc a`. */
 .sb-hero {
