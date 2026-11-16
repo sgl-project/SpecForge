@@ -27,9 +27,9 @@ draft architectures that can be used inside DMTP.
 
 ## How it works?
 
-![DMTP obtains the first candidate and its predictor state from native MTP, conditions a parallel draft, and verifies the combined candidates with the target.](/diagrams/dmtp-workflow.svg)
+![Official dual-anchor DMTP architecture: native MTP proposes T1 and its predictor state conditions the parallel draft through a residual added to T1's embedding.](/diagrams/dmtp-official-architecture.svg)
 
-<p align="center"><em>The 27B release uses an anchor, an MTP first candidate, and six parallel draft positions. Other checkpoints can use different layouts. Illustration by SpecForge.</em></p>
+<p align="center"><em>Source: <a href="https://sylvan820.github.io/D-MTP/">the official DMTP blog, Figure 2</a>. The diagram illustrates dual-anchor residual conditioning; the conditioning adapter and proposal layout are checkpoint-specific.</em></p>
 
 Let A be the last emitted token and T1 the next candidate. One round proceeds
 as follows:

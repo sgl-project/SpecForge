@@ -16,9 +16,9 @@ draft-and-verify loop.
 
 ## How it works?
 
-![DFlash2 sends an anchor and masked slots through a convolution-enhanced draft, builds candidate sets, selects a path, and asks the target to verify it.](/diagrams/dflash2-workflow.svg)
+![Official DFlash2 diagram showing dynamic convolutions before and after attention and MLP sublayers, with a two-tap convolution connecting neighboring positions.](/diagrams/dflash2-official-convolution.svg)
 
-<p align="center"><em>One parallel draft forward, followed by candidate selection and target verification. Illustration by SpecForge.</em></p>
+<p align="center"><em>Source: <a href="https://inco.ai/blog/dflash2/#figure-4">Inco AI, DFlash 2: Keep drafting parallel, Figure 4</a>. The official diagram shows the placement and operation of the dynamic convolutions.</em></p>
 
 One inference cycle has four stages:
 
