@@ -2518,6 +2518,8 @@ class MooncakeFeatureStore(FeatureStore):
                         authority = MooncakeFeatureStore(store_id=self.store_id, store=self._store,
                             auth=self.auth, credential=self._credential,
                             max_release_attempts=self.max_release_attempts, node_pool_enabled=False)
+                        # Borrow the native backend together with its typed put config.
+                        authority._put_config = self._put_config
                         self._terminal_cleanup_authority = authority
                     token = wire.get("reservation_token")
                     with authority._lock:
