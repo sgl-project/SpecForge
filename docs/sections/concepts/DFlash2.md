@@ -1,9 +1,110 @@
 # DFlash2
 
-DFlash2 extends the one-pass DFlash draft with grouped dynamic convolutions and
-a low-rank selector that chooses a coherent path through the target head's
-top-k candidates. In SpecForge it is a **draft architecture**, not a separate
-training strategy or feature protocol.
+## Overview
+
+DFlash drafts several future tokens with one parallel backbone forward. A
+known anchor and masked proposal positions read context features from the
+target. This reduces sequential drafting work, but each position's highest
+scoring token may not form a good continuation with its neighbors.
+
+[DFlash2](https://inco.ai/blog/dflash2/) keeps this one-pass backbone and adds
+two components: grouped dynamic convolutions for local information exchange,
+and a low-rank selector for choosing a coherent path through candidate tokens.
+The target still verifies the resulting proposal. Review
+[speculative decoding](./speculative_decoding.md) for the common
+draft-and-verify loop.
+
+## How it works?
+
+![DFlash2 sends an anchor and masked slots through a convolution-enhanced draft, builds candidate sets, selects a path, and asks the target to verify it.](/diagrams/dflash2-workflow.svg)
+
+<p align="center"><em>One parallel draft forward, followed by candidate selection and target verification. Illustration by SpecForge.</em></p>
+
+One inference cycle has four stages:
+
+1. **Build a draft block.** The input contains a known anchor and masked
+   positions for the proposed continuation. Target features supply the
+   verified context.
+2. **Predict positions in parallel.** Attention reads context, while short
+   dynamic convolutions exchange information between nearby block positions.
+   The language-model head produces a vocabulary distribution at each slot.
+3. **Choose a candidate path.** Retain a small top-k set at every slot. The
+   selector combines each candidate's own score with its compatibility with
+   the preceding token.
+4. **Verify with the target.** The target checks the chosen continuation and
+   commits the accepted prefix. Unaccepted draft positions are discarded.
+
+### Why use a local convolution?
+
+Later positions must predict farther from the known anchor. A short causal
+convolution gives each position an additional route to nearby representations
+without running another draft backbone forward. A two-tap example is
+
+$$
+y_t = k_{t,0}\odot x_t + k_{t,1}\odot x_{t-1}.
+$$
+
+The coefficients depend on the current hidden state, and groups of channels
+share their dynamic corrections. This exchanges local information while the
+positions remain parallel. The example uses two taps; kernel size and channel
+group size are configurable in SpecForge.
+
+### Why select a path instead of independent top-1 tokens?
+
+A candidate can be plausible at one position yet fit poorly after the token
+chosen immediately before it. The selector adds a predecessor-dependent
+transition score to the unary logit:
+
+$$
+S_t(a,b)=U_t(b)+\langle A(a)\odot H(h_t),B(b)\rangle.
+$$
+
+`a` is the predecessor token, `b` is a candidate at the current position, and
+`h_t` is the draft hidden state. The token codebooks and hidden projection
+use a low rank so candidate scoring is cheaper than another full-vocabulary
+prediction. Pair scores can be computed together; a small path-selection
+step still depends on earlier choices. Thus, parallel backbone prediction
+does not imply that every operation in the cycle is independent.
+
+The selector cannot recover a token absent from its candidate set. Candidate
+coverage and selection accuracy therefore measure different problems. The
+[candidate-selector implementation](https://github.com/sgl-project/SpecForge/blob/main/specforge/modeling/draft/heads/candidate_selector.py)
+contains both the pair-score lattice and the local greedy path helper.
+
+## Training
+
+The frozen target supplies context features. SpecForge trains the draft's
+token predictions and an auxiliary selector objective. Selector supervision
+is limited to positions whose reference token is in the unary top-k set;
+positions outside that set still contribute to the configured base loss.
+
+The selector coefficient can warm up and ramp with optimizer steps. This
+lets its influence increase gradually rather than changing the objective
+abruptly. Convolutions start as identity operations and the selector's
+transition correction starts at zero, preserving the corresponding plain
+draft computation at initialization. The configuration details below explain
+how the coefficient and gradient routing are controlled.
+
+## Inference
+
+The draft architecture changes proposal generation; the target remains the
+verifier. The runtime must use the proposal probabilities corresponding to
+its selector and sampling path when performing exact rejection sampling.
+The selector itself is not an acceptance test.
+
+A larger candidate set offers more choices but increases scoring work.
+A longer block offers more potential tokens per verification but can reduce
+acceptance at later positions. Compare accepted length with complete
+draft-and-verify latency or throughput under the same sampling settings.
+The [DFlash2 report](https://inco.ai/blog/dflash2/) provides workload-specific
+measurements; its speedups should not be treated as guarantees for another
+target, batch size, or runtime.
+
+## Using DFlash2 in SpecForge
+
+The published recipes reuse DFlash capture and data semantics. The draft
+architecture selects the DFlash2 model and its selector objective; the target
+does not need a different feature-capture protocol.
 
 | Boundary | DFlash2 value |
 | --- | --- |
@@ -14,11 +115,11 @@ training strategy or feature protocol.
 | Export target | `specforge export --converter sglang` |
 | SGLang serving algorithm | `DFLASH` |
 
-This reuse is intentional. The convolution and selector run entirely in the
-draft, so the target server captures the same layers and the trainer consumes
-the same tensors as standard DFlash.
+The sections below retain the model configuration, selector schedule, online
+and offline commands, and serving requirements for these recipes. Start with
+the [training guide](../basic_usage/training.md) for the shared run lifecycle.
 
-## Architecture
+### Architecture
 
 Every attention and MLP sublayer is wrapped by a grouped, dynamic depthwise
 convolution. `conv_kernel_size` controls its number of causal taps and
@@ -58,7 +159,7 @@ Unlike a standard DFlash draft, DFlash2 cannot be selected through
 target-derived defaults: provide this config or a pretrained DFlash2 directory
 whose `config.json` declares `DFlash2DraftModel`.
 
-## Selector objective and schedule
+### Selector objective and schedule
 
 The base head keeps the configured DFlash, D-PACE, CE/LK, and TV behavior. The
 selector has a separate categorical cross-entropy objective over the strict
@@ -98,7 +199,7 @@ effective-token denominator. Selector metrics retain their own denominators so
 coverage, accuracy, probability, and CE remain interpretable when only part of
 the unary candidate set covers the target.
 
-## Train online or offline
+### Train online or offline
 
 The managed-local Qwen3.6-27B example owns one target capture process and one
 trainer process. Update its model/data paths and GPU allocation, then run:
@@ -134,7 +235,7 @@ Point an offline training YAML at that directory with
 config. DFlash2 supports the DFlash `eager`, `sdpa`, and `flex_attention`
 training backends and the same full/sliding per-layer layouts.
 
-## Export and serve
+### Export and serve
 
 Export the runtime checkpoint as an SGLang serving directory:
 
