@@ -290,3 +290,36 @@ class TestSegmentManifest(unittest.TestCase):
             fixture.drain(reader, ref)
             reader.close()
             fixture.close()
+
+    def test_receipt_native_failure_retains_manifest_and_quarantined_charge(self):
+        from specforge_sglang_capture.sink import CaptureWriterUncertain
+        with tempfile.TemporaryDirectory() as directory, self.environment(directory):
+            fixture = Fixture(directory)
+            # Drive owner progress ourselves so the injected boundary is exact.
+            fixture.owner.stop.set()
+            fixture.owner.thread.join(5)
+            ref = fixture.publish('a')
+            reader = fixture.reader()
+            reader.adopt(ref)
+            reader.abort_ref(ref)
+            with mock.patch.object(fixture.owner, 'put', side_effect=CaptureWriterUncertain('receipt drain unknown')):
+                with self.assertRaisesRegex(CaptureWriterUncertain, 'receipt drain unknown'):
+                    fixture.owner.progress()
+            manifest = ref.metadata['segment_manifest']
+            rec = fixture.owner.manifests[manifest['token']]
+            self.assertEqual(rec['phase'], 'QUARANTINED')
+            health = fixture.owner.health()
+            self.assertEqual(health['remote_inflight_bytes'], 0)
+            self.assertEqual(health['remote_quarantined_bytes'], 4096)
+            self.assertEqual(health['remote_owner_charged_bytes'], 4096)
+            self.assertEqual(health['active_manifests'], 1)
+            with self.assertRaisesRegex(RuntimeError, 'before ACK/receipt drains'):
+                fixture.owner.close()
+            # The CPU mock raised before submitting any native operation. This
+            # test-only proof permits fixture cleanup; production has no implicit
+            # recovery of an unknown native writer.
+            fixture.owner.ledger.forget(manifest['receipt_key'])
+            fixture.owner.manifests.pop(manifest['token'])
+            reader._release_pending.clear()
+            reader.close()
+            fixture.close()

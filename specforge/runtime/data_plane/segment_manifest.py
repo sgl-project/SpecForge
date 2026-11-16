@@ -393,7 +393,15 @@ class RemoteManifestOwner:
                     value = torch.tensor(list(bytes.fromhex(rec['manifest']['digest'])), dtype=torch.uint8)
                     self.ledger.state([rec['receipt_key']], 'WRITING')
                     self.stats['physical_put_bytes'] += MARKER_BYTES
-                    self.put({rec['receipt_key']: value})
+                    try:
+                        self.put({rec['receipt_key']: value})
+                    except BaseException:
+                        # The writer callback retains uncertain native sources.
+                        # This exact control object remains charged until an
+                        # explicit recovery proves its writer/registration drain.
+                        self.ledger.state([rec['receipt_key']], 'QUARANTINED')
+                        rec['phase'] = 'QUARANTINED'
+                        raise
                     self.ledger.state([rec['receipt_key']], 'READY')
                     rec['phase'] = 'RECEIPT'
                 elif rec['phase'] == 'RECEIPT' and int(self.store.is_exist(rec['receipt_key'])) == 0:
