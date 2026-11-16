@@ -193,6 +193,15 @@ class CapturedSpan:
     ready_event: torch.cuda.Event | None
 
 
+@dataclass(frozen=True)
+class MaterializedBlock:
+    start: int
+    end: int
+    digest: str
+    complete: bool
+    features: Mapping[str, torch.Tensor]
+
+
 class MaterializedSample:
     """Owned CPU output; release only after every sink reader has ended.
 
@@ -201,11 +210,12 @@ class MaterializedSample:
     """
 
     def __init__(self, execution: ExecutionIdentity, features: Mapping[str, torch.Tensor],
-                 n_tokens: int, on_release: Callable[[], None], *, timings=None):
+                 n_tokens: int, on_release: Callable[[], None], *, timings=None, segments=()):
         self.execution = execution
         self.n_tokens = n_tokens
         self.timings = MappingProxyType(dict(timings or {}))
         self._features = MappingProxyType(dict(features))
+        self.segments = tuple(segments)
         self._on_release = on_release
         self._lock = threading.Lock()
         self._released = False
@@ -223,6 +233,7 @@ class MaterializedSample:
                 return
             self._released = True
             self._features = MappingProxyType({})
+            self.segments = ()
             callback, self._on_release = self._on_release, lambda: None
         callback()
 

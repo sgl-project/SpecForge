@@ -331,6 +331,8 @@ class SpecCaptureSink:
         self._uncertain_lock = threading.Lock()
         self._closed = False
         self.require_hard_pin = False
+        self._manifest_owner = None
+        self._manifest_owner_lock = threading.Lock()
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
         self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
@@ -465,7 +467,18 @@ class SpecCaptureSink:
                 for name in names
             )
         )
-        future = self._executor.submit(self._discard_keys, keys)
+        def discard():
+            if self._manifest_owner is not None and spec.get('reservation_token') in self._manifest_owner.manifests:
+                self._manifest_owner.cancel(spec['reservation_token'])
+                deadline = time.monotonic() + 10
+                while spec['reservation_token'] in self._manifest_owner.manifests:
+                    self._manifest_owner.progress()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('cancelled manifest objects did not drain')
+                    time.sleep(0.05)
+                return
+            return self._discard_keys(keys)
+        future = self._executor.submit(discard)
 
         def report_failure(done):
             try:
@@ -584,12 +597,109 @@ class SpecCaptureSink:
         self._executor.shutdown(wait=True, cancel_futures=False)
         if self._uncertain_snapshot():
             raise RuntimeError("capture sink retains native writes whose drain is unproven")
+        if self._manifest_owner is not None:
+            self._manifest_owner.close()
         if self._control_listener is not None and self._nvlink is None:
             self._control_listener.close()
         if self._owns_store and self._store is not None:
             close = getattr(self._store, "close", None)
             if close is not None:
                 close()
+
+    def _managed_put(self, objects):
+        """Exact-key writer used by blocks, metadata and receipts alike."""
+        if not objects:
+            return
+        store = self._connect()
+        registered, submitted, uncertain = [], False, False
+        tensors = list(objects.values())
+        keys = list(objects)
+        try:
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                ptr = storage.data_ptr()
+                if ptr in registered:
+                    continue
+                rc = store.register_buffer(ptr, storage.nbytes())
+                if rc is not None and int(rc) != 0:
+                    raise RuntimeError('managed object registration failed')
+                registered.append(ptr)
+            submitted = True
+            batch_put = getattr(store, 'batch_put_from', None)
+            sizes = [tensor.numel() * tensor.element_size() for tensor in tensors]
+            if batch_put is not None:
+                statuses = batch_put(keys, [tensor.data_ptr() for tensor in tensors], sizes, self._put_config)
+            else:
+                statuses = [store.put_from(key, tensor.data_ptr(), size, self._put_config)
+                            for key, tensor, size in zip(keys, tensors, sizes)]
+            statuses = [0] * len(keys) if statuses is None else list(statuses)
+            if len(statuses) != len(keys) or any(status is not None and int(status) == -800 for status in statuses):
+                raise CaptureWriterUncertain('managed native writer completion unknown')
+            if any(status is not None and int(status) < 0 for status in statuses):
+                raise _DrainedWriteFailure('managed publication failed after native drain')
+        except BaseException as exc:
+            if submitted and not isinstance(exc, _DrainedWriteFailure):
+                uncertain = True
+                self._retain_uncertain({'tensors': tensors, 'keys': keys,
+                                        'registered': tuple(registered),
+                                        'bytes': sum(t.numel()*t.element_size() for t in tensors)})
+                raise CaptureWriterUncertain(str(exc)) from None
+            raise
+        finally:
+            if not uncertain:
+                for ptr in registered:
+                    try:
+                        rc = store.unregister_buffer(ptr)
+                    except BaseException:
+                        rc = -1
+                    if rc is not None and int(rc) != 0:
+                        self._retain_uncertain({'tensors': tensors, 'keys': keys, 'registered': tuple(registered), 'bytes': sum(t.numel()*t.element_size() for t in tensors)})
+                        raise CaptureWriterUncertain('managed object unregister did not complete')
+
+    def _get_manifest_owner(self):
+        with self._manifest_owner_lock:
+            if self._manifest_owner is None:
+                from specforge.runtime.data_plane.segment_manifest import RemoteManifestOwner
+                directory = os.environ.get('SPECFORGE_HS_REMOTE_LEDGER_DIR')
+                budget = int(os.environ.get('SPECFORGE_HS_REMOTE_BUDGET_BYTES', '0'))
+                if not directory or budget <= 0:
+                    raise RuntimeError('segmented HS requires explicit node remote ledger directory and budget')
+                store = self._connect()
+                self._manifest_owner = RemoteManifestOwner(
+                    store, self._managed_put, directory=directory, capacity=budget,
+                    hard_pin=getattr(self._put_config, 'with_hard_pin', False) is True)
+            return self._manifest_owner
+
+    def manifest_stats(self):
+        return self._manifest_owner.health() if self._manifest_owner is not None else {}
+
+    def submit_segmented_samples(self, samples):
+        if self._closed:
+            raise RuntimeError('capture sink is closed')
+        owned = list(samples)
+        samples.clear()
+        def publish():
+            try:
+                owner = self._get_manifest_owner()
+                results = []
+                for spec, sample, schema, namespace in owned:
+                    # Explicit full-object fallback still uses the same owner/ledger.
+                    if os.environ.get('SPECFORGE_HS_SEGMENT_FORCE_FULL', '0') == '1':
+                        from types import SimpleNamespace
+                        from specforge_sglang_capture.hs.protocol import MaterializedBlock
+                        values = dict(sample.features)
+                        block = MaterializedBlock(0, sample.n_tokens, 'full-' + spec['reservation_token'], False, values)
+                        source = SimpleNamespace(n_tokens=sample.n_tokens, segments=(block,))
+                        result = owner.publish(spec, source, schema, namespace, sample_object_key)
+                        result['full_object_fallback'] = True
+                    else:
+                        result = owner.publish(spec, sample, schema, namespace, sample_object_key)
+                        result['full_object_fallback'] = False
+                    results.append(result)
+                return results
+            finally:
+                owned.clear()
+        return self._executor.submit(publish)
 
     def put_samples(self, samples: List[Sample]) -> List[Dict[str, Any]]:
         """Publish samples with one batched Mooncake call; return their results.

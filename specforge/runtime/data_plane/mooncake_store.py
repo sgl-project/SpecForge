@@ -632,6 +632,22 @@ class MooncakeFeatureStore(FeatureStore):
         self._quarantined_buffers: List[torch.Tensor] = []
         self._quarantined_bytes = 0
         self._quarantine_lock = threading.Lock()
+        self._h2d_quarantined = []
+        self._segment_manifests = {}
+        self._segment_ack_sent = set()
+        self._segment_ack_unsafe = set()
+        self._segment_receipt_seen = set()
+        self._segment_counters = dict.fromkeys(('segment_get_bytes', 'segment_get_objects',
+            'segment_materialized_features', 'node_pool_staging_copy_bytes',
+            'transport_get_requested_bytes', 'transport_get_completed_bytes',
+            'receive_to_pageable_copy_bytes', 'manifest_ack_puts', 'manifest_receipt_drains'), 0)
+        self._node_pool = None
+        if os.environ.get('SPECFORGE_TRAINER_NODE_POOL', '0') == '1':
+            from specforge.runtime.data_plane.node_content_pool import NodeContentPool
+            directory = os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR')
+            if not directory:
+                raise ValueError('node content pool requires an explicit node-shared directory')
+            self._node_pool = NodeContentPool(directory, int(os.environ.get('SPECFORGE_TRAINER_NODE_POOL_BYTES', str(8 << 30))))
         if receive_buffers not in RECEIVE_BUFFER_KINDS:
             raise ValueError(
                 f"receive_buffers={receive_buffers!r} not in {RECEIVE_BUFFER_KINDS}"
@@ -934,6 +950,20 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _capture_from_ref(self, ref, *, validate_remote=False):
         wire = ref.metadata.get("capture_fence")
+        layout = ref.metadata.get('feature_layout', 'full-v1')
+        if layout not in ('full-v1', 'hs-manifest-v1'):
+            raise ValueError('unknown capture feature layout')
+        if layout == 'hs-manifest-v1':
+            from specforge.runtime.data_plane.segment_manifest import validate_manifest
+            if ref.schema_version != 2 or wire is None or wire.get('feature_layout') != layout:
+                raise ValueError('segmented capture requires explicit versioned ownership')
+            if getattr(self._put_config, 'with_hard_pin', False) is not True:
+                raise RuntimeError('manifest ACK protocol requires true native hard pin')
+            manifest = validate_manifest(ref.metadata['segment_manifest'], ref.feature_specs, ref.num_tokens)
+            if wire.get('segment_manifest') != manifest or manifest['token'] != wire.get('reservation_token'):
+                raise ValueError('manifest differs from immutable ownership certificate')
+        elif ref.schema_version != SCHEMA_VERSION:
+            raise ValueError('unknown full capture schema version')
         if wire is None:
             return
         sid = ref.sample_id
@@ -960,6 +990,9 @@ class MooncakeFeatureStore(FeatureStore):
         # A returned complete SampleRef is emitted only after writer completion.
         fence.writer_drained = True
         fence.adopted = True
+        if layout == 'hs-manifest-v1':
+            with self._lock:
+                self._segment_manifests[sid] = manifest
         return fence
 
     def _resolve_capture_writer(self, sid, expected_token=None):
@@ -971,6 +1004,16 @@ class MooncakeFeatureStore(FeatureStore):
                 return
         with fence.lock:
             fence.drain(cancel=True)
+            # Lost /generate responses have no SampleRef. The exact transfer
+            # certificate must still seed manifest cleanup, including shared deps.
+            if fence.wire.get('feature_layout') == 'hs-manifest-v1':
+                manifest = fence.wire.get('segment_manifest')
+                from specforge.runtime.data_plane.segment_manifest import digest_manifest
+                if (not isinstance(manifest, dict) or manifest.get('token') != fence.token
+                        or manifest.get('digest') != digest_manifest({name:value for name,value in manifest.items() if name != 'digest'})):
+                    raise RuntimeError('cleanup certificate contains an invalid manifest')
+                with self._lock:
+                    self._segment_manifests[sid] = manifest
 
     def _flush_capture_acks(self, sample_ids=None):
         if getattr(self._capture_cleanup_local, "depth", 0):
@@ -1137,6 +1180,10 @@ class MooncakeFeatureStore(FeatureStore):
             if self._active_get_calls or any(intent["active"] or (intent["handle"] is not None and not intent["release_requested"])
                    for intent in self._capture_read_intents.values()):
                 raise RuntimeError("cannot close capture transport with live readers")
+        # CUDA H2D completion is independent of native transport shutdown.
+        self._drain_h2d_quarantine()
+        if self._node_pool is not None:
+            self._node_pool.close()
         if self._receive_pool is not None:
             self._receive_pool.close()
         if self._owns_store:
@@ -1186,6 +1233,7 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _fetch_tensor_once(self, key: str, spec, device) -> torch.Tensor:
         destination = getattr(self._capture_read_local, "destinations", {}).get(key)
+        stream = None
         pool = self._receive_pool
         if pool is None:
             dst = _alloc_from_spec(spec)
@@ -1198,7 +1246,7 @@ class MooncakeFeatureStore(FeatureStore):
                     self._quarantine_buffer(dst)
                 raise
             if destination is not None:
-                destination.copy_(dst, non_blocking=False)
+                self._copy_segment_into(dst, destination)
                 return destination
             return dst
         dtype = _TORCH_DTYPES.get(spec.dtype)
@@ -1210,6 +1258,7 @@ class MooncakeFeatureStore(FeatureStore):
         )
         slot, pooled = pool.acquire(max(nbytes, 1), device)
         try:
+            self._segment_counters["transport_get_requested_bytes"] += nbytes
             rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
         except Exception:
             pool.release(slot, pooled, quarantine=True)
@@ -1217,6 +1266,7 @@ class MooncakeFeatureStore(FeatureStore):
         if rc is None or int(rc) < 0 or int(rc) != nbytes:
             pool.release(slot, pooled, quarantine=True)
             _check_get_result(key, rc, nbytes)
+        self._segment_counters["transport_get_completed_bytes"] += nbytes
         view = slot.storage[:nbytes].view(dtype).view(shape)
         target = torch.device(device)
         if _stays_on_host(dtype):
@@ -1227,6 +1277,7 @@ class MooncakeFeatureStore(FeatureStore):
                 if out.device.type == "cuda":
                     stream = pool.copy_stream(out.device)
                     stream.wait_stream(torch.cuda.current_stream(out.device))
+                    out.record_stream(stream)
                     with torch.cuda.stream(stream):
                         out.copy_(view, non_blocking=True)
                     # Source and registered receive slot remain owned until DMA ends.
@@ -1236,6 +1287,7 @@ class MooncakeFeatureStore(FeatureStore):
                     out.copy_(view, non_blocking=False)
             elif target.type == "cpu" and not view.is_cuda:
                 out = view.clone()
+                self._segment_counters["receive_to_pageable_copy_bytes"] += nbytes
             else:
                 stream = pool.copy_stream(view.device if view.is_cuda else target)
                 with torch.cuda.stream(stream):
@@ -1245,11 +1297,170 @@ class MooncakeFeatureStore(FeatureStore):
                 if out.is_cuda:
                     out.record_stream(torch.cuda.current_stream(target))
         except Exception:
+            if destination is not None and destination.is_cuda and stream is not None:
+                self._quarantine_h2d(destination, view, stream)
             pool.release(slot, pooled, quarantine=True)
             raise
         else:
             pool.release(slot, pooled)
         return out
+
+    def _quarantine_h2d(self, destination, source, stream, pin=None):
+        with self._quarantine_lock:
+            self._h2d_quarantined.append({'destination': destination, 'source': source,
+                                          'stream': stream, 'pin': pin})
+
+    def _drain_h2d_quarantine(self):
+        with self._quarantine_lock:
+            for item in self._h2d_quarantined:
+                item['stream'].synchronize()
+                if item['pin'] is not None:
+                    item['pin'].release()
+            self._h2d_quarantined.clear()
+
+    def _copy_segment_into(self, source, destination, pin=None):
+        pool = self._receive_pool
+        if not destination.is_cuda:
+            destination.copy_(source, non_blocking=False)
+            return
+        if pool is None or pool.kind != 'pinned':
+            stream = torch.cuda.current_stream(destination.device)
+            destination.record_stream(stream)
+            try:
+                destination.copy_(source, non_blocking=False)
+            except BaseException:
+                self._quarantine_h2d(destination, source, stream, pin)
+                raise
+            return
+        nbytes = source.numel() * source.element_size()
+        slot, pooled = (None, False) if source.is_pinned() else pool.acquire(max(1, nbytes), destination.device)
+        stream = pool.copy_stream(destination.device)
+        try:
+            if slot is None:
+                staged = source
+            else:
+                staged = slot.storage[:nbytes].view(source.dtype).view(source.shape)
+                staged.copy_(source, non_blocking=False)
+                self._segment_counters['node_pool_staging_copy_bytes'] += nbytes
+            stream.wait_stream(torch.cuda.current_stream(destination.device))
+            destination.record_stream(stream)
+            with torch.cuda.stream(stream):
+                destination.copy_(staged, non_blocking=True)
+            stream.synchronize()
+        except BaseException:
+            self._quarantine_h2d(destination, source, stream, pin)
+            if slot is not None:
+                pool.release(slot, pooled, quarantine=True)
+            raise
+        else:
+            if slot is not None:
+                pool.release(slot, pooled)
+
+    def _fetch_segment_source(self, key, spec):
+        """Lease existing pinned receive storage; no per-miss pageable clone."""
+        pool = self._receive_pool
+        if pool is None or pool.kind != 'pinned':
+            return self._fetch_tensor(key, spec, 'cpu')
+        dtype = _TORCH_DTYPES[spec.dtype]
+        nbytes = torch.empty((), dtype=dtype).element_size() * int(torch.Size(spec.shape).numel())
+        slot, pooled = pool.acquire(max(1, nbytes), 'cpu')
+        try:
+            self._segment_counters['transport_get_requested_bytes'] += nbytes
+            rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
+            _check_get_result(key, rc, nbytes)
+            self._segment_counters['transport_get_completed_bytes'] += nbytes
+        except BaseException:
+            pool.release(slot, pooled, quarantine=True)
+            raise
+        tensor = slot.storage[:nbytes].view(dtype).view(spec.shape)
+        released = False
+        def release(*, quarantine=False):
+            nonlocal released
+            if not released:
+                released = True
+                pool.release(slot, pooled, quarantine=quarantine)
+        return tensor, release
+
+    def _get_segments(self, ref, name, destination):
+        from dataclasses import replace
+        for segment in self._segment_manifests[ref.sample_id]['features'][name]:
+            spec = replace(ref.feature_specs[name], shape=tuple(segment['shape']))
+            def fetch():
+                self._segment_counters['segment_get_bytes'] += segment['nbytes']
+                self._segment_counters['segment_get_objects'] += 1
+                return self._fetch_segment_source(segment['key'], spec)
+            pin = self._node_pool.acquire(segment['logical_key'], segment['nbytes'], fetch) if self._node_pool is not None else None
+            source = None
+            source_release = None
+            try:
+                if pin is not None:
+                    source = pin.tensor.view(_TORCH_DTYPES[spec.dtype]).view(spec.shape)
+                else:
+                    source = fetch()
+                    if isinstance(source, tuple):
+                        source, source_release = source
+                self._copy_segment_into(source, destination[:,segment['start']:segment['end']], pin)
+            finally:
+                if source_release is not None:
+                    uncertain = any(item['source'] is source for item in self._h2d_quarantined)
+                    source_release(quarantine=uncertain)
+                source = None
+                if pin is not None and not any(item['pin'] is pin for item in self._h2d_quarantined):
+                    pin.release()
+        self._segment_counters['segment_materialized_features'] += 1
+
+    def _put_manifest_ack(self, manifest):
+        tensor = torch.tensor(list(bytes.fromhex(manifest['digest'])), dtype=torch.uint8)
+        ptr, size = tensor.data_ptr(), tensor.numel()
+        rc = self._store.register_buffer(ptr, size)
+        if rc is not None and int(rc) != 0:
+            raise RuntimeError('ACK marker registration failed')
+        drained = False
+        try:
+            rc = self._store.put_from(manifest['ack_key'], ptr, size, self._put_config)
+            drained = rc is None or int(rc) != -800
+            if rc is not None and int(rc) < 0:
+                raise RuntimeError('ACK marker publication failed')
+        finally:
+            if drained:
+                try:
+                    rc = self._store.unregister_buffer(ptr)
+                except BaseException:
+                    rc = -1
+                if rc is not None and int(rc) != 0:
+                    self._segment_ack_unsafe.add(manifest['token'])
+                    self._capture_quarantined_registrations.add(ptr)
+                    self._quarantine_buffer(tensor)
+                    raise RuntimeError('ACK marker registration drain failed')
+            else:
+                self._segment_ack_unsafe.add(manifest['token'])
+                self._capture_quarantined_registrations.add(ptr)
+                self._quarantine_buffer(tensor)
+
+    def _try_manifest_free(self, sample_id):
+        manifest = self._segment_manifests[sample_id]
+        if manifest['token'] in self._segment_ack_unsafe:
+            raise RuntimeError('ACK native completion is unknown; exact attempt retained')
+        if sample_id not in self._segment_ack_sent:
+            self._put_manifest_ack(manifest)
+            self._segment_ack_sent.add(sample_id)
+            self._segment_counters['manifest_ack_puts'] += 1
+        if sample_id not in self._segment_receipt_seen:
+            if not self._store_exists(manifest['receipt_key']):
+                return False
+            from specforge.runtime.contracts import FeatureSpec
+            value = self._fetch_tensor(manifest['receipt_key'], FeatureSpec('__receipt', (32,), 'uint8'), 'cpu')
+            if bytes(value.tolist()).hex() != manifest['digest']:
+                raise RuntimeError('manifest ACK receipt digest mismatch')
+            self._segment_receipt_seen.add(sample_id)
+        # The receipt certifies dependency detach and last-owned-key absence.
+        # It does not require shared objects still held by other manifests to die.
+        if not self._store_remove(manifest['receipt_key'], force=True):
+            return False
+        if self._store_exists(manifest['receipt_key']):
+            return False
+        self._segment_counters['manifest_receipt_drains'] += 1
+        return True
 
     def _quarantine_buffer(self, tensor: torch.Tensor) -> None:
         size = _nbytes(tensor)
@@ -1277,8 +1488,10 @@ class MooncakeFeatureStore(FeatureStore):
             pass
         drained = False
         try:
+            self._segment_counters["transport_get_requested_bytes"] += nb
             rc = self._store.get_into(key, out.data_ptr(), nb)
             _check_get_result(key, rc, nb)
+            self._segment_counters["transport_get_completed_bytes"] += nb
             drained = True
         finally:
             if drained or getattr(self._capture_read_local, "intent", None) is None:
@@ -1687,6 +1900,23 @@ class MooncakeFeatureStore(FeatureStore):
             if spec is None:
                 raise KeyError(f"sample {sid} ref has no spec for feature {n!r}")
             key = self._tkey(sid, gen, n)
+            if sid in self._segment_manifests and n in self._segment_manifests[sid]['features']:
+                if not self._store_exists(key):
+                    raise KeyError('manifest ownership object is no longer readable')
+                try:
+                    destination = getattr(self._capture_read_local, 'destinations', {}).get(key)
+                    if destination is None:
+                        dtype = _TORCH_DTYPES[spec.dtype]
+                        target = torch.device('cpu') if _stays_on_host(dtype) else torch.device(device)
+                        destination = torch.empty(spec.shape, dtype=dtype, device=target)
+                    self._get_segments(ref, n, destination)
+                    out[n] = destination
+                except BaseException:
+                    intent = getattr(self._capture_read_local, 'intent', None)
+                    if intent is not None:
+                        intent['unsafe_fetch'] = True
+                    raise
+                continue
             if not self._store_exists(key):
                 # freed (release/abort), superseded by a re-put, or never written
                 raise KeyError(
@@ -1748,6 +1978,8 @@ class MooncakeFeatureStore(FeatureStore):
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
+        if sample_id in self._segment_manifests:
+            return self._try_manifest_free(sample_id)
         ok = True
         for name in self._sample_names.get(sample_id, []):
             key = self._tkey(sample_id, gen, name)
@@ -1768,6 +2000,9 @@ class MooncakeFeatureStore(FeatureStore):
                 raise RuntimeError("free bookkeeping before capture writer drain")
             fence.removed = True
             self._capture_ack_pending[sample_id] = fence
+        self._segment_manifests.pop(sample_id, None)
+        self._segment_ack_sent.discard(sample_id)
+        self._segment_receipt_seen.discard(sample_id)
         generation = self._generation.get(sample_id)
         nbytes = self._sample_bytes.pop(sample_id, 0)
         self._generation.pop(sample_id, None)
@@ -2362,6 +2597,12 @@ class MooncakeFeatureStore(FeatureStore):
                 "quarantined_buffers": quarantined_buffers,
                 "quarantined_bytes": quarantined_bytes,
                 "max_quarantined_bytes": self.max_quarantined_bytes,
+                "h2d_quarantined_buffers": len(self._h2d_quarantined),
+                "h2d_quarantined_bytes": sum({item['destination'].untyped_storage().data_ptr(): item['destination'].untyped_storage().nbytes() for item in self._h2d_quarantined}.values()),
+                "segment_manifests": len(self._segment_manifests),
+                "manifest_ack_unsafe": len(self._segment_ack_unsafe),
+                **self._segment_counters,
+                **(self._node_pool.health() if self._node_pool is not None else {"node_pool_enabled": False}),
             }
             if self._receive_pool is not None:
                 pool_health = self._receive_pool.health()

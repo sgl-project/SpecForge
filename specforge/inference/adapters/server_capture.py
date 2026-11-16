@@ -31,6 +31,7 @@ from specforge.runtime.data_plane.feature_store import abort_feature_ref
 
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -400,7 +401,7 @@ class SGLangServerCaptureAdapter:
             feature_keys=(dict(result["physical_keys"]) if result.get("publication_ownership") == "attempt-v1" else {n: f"{sample_id}/{n}" for n in specs}),
             feature_specs=specs,
             strategy=self.strategy,
-            schema_version=SCHEMA_VERSION,
+            schema_version=(2 if result.get("feature_layout") == "hs-manifest-v1" else SCHEMA_VERSION),
             target_model_version=self.target_model_version,
             tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
             num_tokens=num_tokens,
@@ -423,12 +424,17 @@ class SGLangServerCaptureAdapter:
                 ),
             },
         )
+        if result.get('feature_layout') == 'hs-manifest-v1':
+            from specforge.runtime.data_plane.segment_manifest import validate_manifest
+            ref.metadata['feature_layout'] = result['feature_layout']
+            ref.metadata['segment_manifest'] = validate_manifest(result['segment_manifest'], specs, num_tokens)
+            ref.metadata['full_object_fallback'] = bool(result.get('full_object_fallback'))
         if result.get("protocol_version") == 1:
             ref.metadata["capture_fence"] = {
                 **{name: result[name] for name in ("server_epoch", "store_id", "sample_id", "gen", "attempt_id", "reservation_token")},
                 "protocol_version": 1, "control_url": self.base_url + "/spec_capture/control",
                 "timeout_s": self.timeout_s,
-                **{name: result[name] for name in ('object_key_layout', 'publication_ownership', 'physical_keys', 'writer_drained', 'state') if name in result},
+                **{name: result[name] for name in ('object_key_layout', 'publication_ownership', 'physical_keys', 'writer_drained', 'state', 'feature_layout', 'segment_manifest') if name in result},
             }
             ref.metadata["capture_diagnostics"] = {name: result.get(name) for name in
                 ("H", "L", "N", "span", "execution_epoch", "rank", "reused_tokens", "capture_namespace", "capture_signature", "timings")}
@@ -487,6 +493,12 @@ class SGLangServerCaptureAdapter:
             body = self._request_inputs(tasks)
             body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
             payloads = [self._spec_capture_payload(task) for task in tasks]
+            if capability is not None:
+                layout = 'hs-manifest-v1' if os.environ.get('SPECFORGE_HS_SEGMENTED', '0') == '1' else 'full-v1'
+                if layout not in capability.get('feature_layouts', ['full-v1']):
+                    raise RuntimeError('capture feature layout capability mismatch')
+                for payload in payloads:
+                    payload['feature_layout'] = layout
             if capability is not None:
                 for payload in payloads:
                     self.store.prepare_capture_retry(payload["sample_id"])
@@ -587,6 +599,8 @@ class SGLangServerCaptureAdapter:
     @staticmethod
     def _verify_hs_feature_metadata(result, payload, capability):
         """Check the complete negotiated schema, including passthrough dtype."""
+        if result.get('feature_layout', 'full-v1') != payload.get('feature_layout', 'full-v1'):
+            raise RuntimeError('capture returned an unnegotiated feature layout')
         schema = {item["name"]: item for item in capability["schema"]}
         n = result.get("N")
         if isinstance(n, bool) or not isinstance(n, int) or n < 1:

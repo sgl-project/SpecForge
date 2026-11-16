@@ -175,6 +175,10 @@ class WriterFence:
         expected = attempt_keys(self.wire, self.names)
         if certificate.get('physical_keys') != expected:
             raise RuntimeError('capture ownership certificate keys mismatch')
+        if certificate.get('feature_layout', 'full-v1') not in ('full-v1', 'hs-manifest-v1'):
+            raise RuntimeError('unknown capture feature layout')
+        if certificate.get('feature_layout') == 'hs-manifest-v1':
+            self.wire.update(feature_layout='hs-manifest-v1', segment_manifest=certificate['segment_manifest'])
         self.wire.update(publication_ownership='attempt-v1', physical_keys=expected,
                          writer_drained=True, state='PUBLISHED')
         self.transferred = self.writer_drained = True

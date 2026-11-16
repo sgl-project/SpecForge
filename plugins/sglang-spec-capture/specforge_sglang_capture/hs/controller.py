@@ -21,7 +21,7 @@ from .cache import PrefixFeatureCache, _token_tuple
 from .protocol import (
     DTYPES, DTYPE_BYTES, AdmissionBudgetError, CaptureCancelledError, CaptureCompletion,
     CaptureContractError, CapturePlan, CapturedSpan, DrainHandle, ExecutionIdentity,
-    ContentBlockKey, FeatureSchema, MaterializedSample, OutputReservation, PrefixLease,
+    ContentBlockKey, FeatureSchema, MaterializedBlock, MaterializedSample, OutputReservation, PrefixLease,
     canonical_digest, checked_int, _normalized_error,
 )
 
@@ -48,6 +48,7 @@ class _Execution:
     cache_keys: tuple[ContentBlockKey, ...] = ()
     fills: dict[str, object] = field(default_factory=dict)
     quarantined: list[object] = field(default_factory=list)
+    borrowed_release: object | None = None
     completion_pending: bool = False
     drained_queued: bool = False
     drained_polled: bool = False
@@ -78,10 +79,12 @@ class CaptureController:
                  pinned_budget_bytes: int = 256 * 1024**2,
                  output_budget_bytes: int = 512 * 1024**2,
                  device_budget_bytes: int = 256 * 1024**2, *,
-                 max_workers: int = 4):
+                 max_workers: int = 4, segmented: bool = False):
         if not isinstance(cache, PrefixFeatureCache) or schema != cache.schema:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
+        self.segmented = bool(segmented)
+        self._segment_stats = dict.fromkeys(("segmented_samples", "segment_new_blocks", "segment_reused_blocks", "segment_assembly_bytes", "segment_cache_fill_bytes"), 0)
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
         self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
@@ -316,6 +319,9 @@ class CaptureController:
                 return
             state = self._executions[reservation.execution]
             state.sample = None
+            if state.borrowed_release is not None:
+                state.borrowed_release()
+                state.borrowed_release = None
             owned, state.owned_output = state.owned_output, {}
             adoption_started = perf_counter()
             try:
@@ -323,7 +329,7 @@ class CaptureController:
                 # tensor references. Readers may not access or modify them
                 # after this ownership transfer. Keep the output charge until
                 # the cache has charged every retained backing allocation.
-                if owned and not state.cancelled and not rec.release_requested and not self._closed:
+                if owned and not self.segmented and not state.cancelled and not rec.release_requested and not self._closed:
                     if state.cache_keys or not self.cache.skip_unused_cache_work:
                         self._adoption_calls += 1
                         self.cache._adopt_released_sample(state.cache_keys, owned)
@@ -485,6 +491,8 @@ class CaptureController:
             return ()
 
     def _run_job(self, job: _Job) -> None:
+        if self.segmented and os.environ.get("SPECFORGE_HS_SEGMENT_FORCE_FULL", "0") != "1":
+            return self._run_segmented_job(job)
         output, staging = {}, {}
         sample = None
         completion = None
@@ -537,6 +545,21 @@ class CaptureController:
             self.schema.validate(output, job.plan.N, "cpu")
             assembled_at = perf_counter()
             cache_keys = self._prepare_cache_adoption(job)
+            if self.segmented:
+                # Full-object compatibility still fills independent compact cache
+                # blocks, and never transfers the N-row publication allocation.
+                for key in cache_keys:
+                    if key.end <= job.plan.L:
+                        continue
+                    fill = self.cache.reserve_fill(key, job.plan.execution)
+                    if fill is not None:
+                        try:
+                            compact = {name: value[key.start:key.end].clone() for name,value in output.items()}
+                            self.cache.publish_compact(fill, compact)
+                            compact.clear()
+                        finally:
+                            self.cache.abort_fill(fill)
+                cache_keys = ()
             filled_at = perf_counter()
             if job.diagnostics:
                 job.diagnostics["p0_v1_key_prepare_ms"] = (filled_at - assembled_at) * 1000.0
@@ -596,6 +619,112 @@ class CaptureController:
             else:
                 job.future.set_result(completion.sample)
 
+    def _run_segmented_job(self, job):
+        staging, blocks = {}, []
+        sample = None
+        release_prefix = None
+        unsafe = False
+        try:
+            started = perf_counter()
+            staging = self._copy_suffix(job)
+            copied = perf_counter()
+            job.features.clear()
+            job.ready_event = None
+            if self._cancelled(job):
+                raise CaptureCancelledError(job.state.reason or "execution released")
+            borrowed, release_prefix = self.cache.borrow_prefix_blocks(job.plan.lease, job.plan.L)
+            prefix = {key.start: (key, features) for key, features in borrowed}
+            complete = self.cache.block_keys(job.plan.namespace, job.plan.tokens)
+            fresh = reused = assembled = filled = 0
+            for start in range(0, job.plan.N, self.cache.chunk_tokens):
+                end = min(start + self.cache.chunk_tokens, job.plan.N)
+                key = complete[start // self.cache.chunk_tokens] if end - start == self.cache.chunk_tokens else None
+                if end <= job.plan.L:
+                    values = prefix[start][1]
+                    reused += 1
+                else:
+                    values = {spec.name: torch.empty((end - start, spec.width), dtype=DTYPES[spec.dtype])
+                              for spec in self.schema.features}
+                    split = max(start, min(end, job.plan.L))
+                    for name, target in values.items():
+                        if split > start:
+                            target[:split-start].copy_(prefix[start][1][name][:split-start])
+                        target[split-start:].copy_(staging[name][split-job.plan.L:end-job.plan.L])
+                    fresh += 1
+                    assembled += (end - start) * self.schema.row_bytes
+                    if key is not None and self.cache.capacity_bytes:
+                        fill = self.cache.reserve_fill(key, job.plan.execution)
+                        if fill is not None:
+                            with self._lock:
+                                job.state.fills[fill.reservation_id] = fill
+                            try:
+                                if self.cache.publish_compact(fill, values):
+                                    filled += self.cache._chunk_bytes
+                            finally:
+                                self.cache.abort_fill(fill)
+                                with self._lock:
+                                    job.state.fills.pop(fill.reservation_id, None)
+                digest = key.digest if key is not None else canonical_digest([
+                    'spec-tail-v1', job.plan.namespace, job.plan.tokens, start, end,
+                    job.plan.execution.attempt_id, job.plan.execution.execution_epoch])
+                blocks.append(MaterializedBlock(start, end, digest, key is not None, values))
+            staging.clear()
+            with self._lock:
+                self._release_transient_locked(self._reservation(job.plan.reservation))
+                if self._cancelled(job):
+                    raise CaptureCancelledError(job.state.reason or "execution released")
+                job.state.borrowed_release = release_prefix
+                release_prefix = None
+                self._segment_stats['segmented_samples'] += 1
+                self._segment_stats['segment_new_blocks'] += fresh
+                self._segment_stats['segment_reused_blocks'] += reused
+                self._segment_stats['segment_assembly_bytes'] += assembled
+                self._segment_stats['segment_cache_fill_bytes'] += filled
+            sample = MaterializedSample(job.plan.execution, {}, job.plan.N,
+                        lambda: self._sample_released(job.plan.reservation), segments=blocks,
+                        timings={**job.diagnostics, 'd2h_wait_ms': (copied-started)*1000,
+                                 'assembly_ms': (perf_counter()-copied)*1000,
+                                 'segment_assembly_bytes': assembled})
+            blocks.clear()
+            with self._lock:
+                job.state.sample = sample
+            completion = CaptureCompletion(job.plan.execution, sample=sample)
+        except _UnsafeDrain as exc:
+            unsafe = True
+            with self._lock:
+                self._arena_poisoned = True
+                job.state.quarantined.extend([job, exc.retained])
+            completion = CaptureCompletion(job.plan.execution, error=RuntimeError(str(exc)))
+        except BaseException as exc:
+            completion = CaptureCompletion(job.plan.execution, error=_normalized_error(exc))
+        finally:
+            if release_prefix is not None:
+                release_prefix()
+            self.cache.release_lease(job.plan.lease)
+            blocks.clear()
+            if not unsafe:
+                staging.clear()
+                job.features.clear()
+                job.ready_event = None
+                with self._lock:
+                    rec = self._reservations.get(job.plan.reservation.reservation_id)
+                    if rec is not None:
+                        self._release_transient_locked(rec)
+                        if sample is None:
+                            if job.state.borrowed_release is not None:
+                                job.state.borrowed_release()
+                                job.state.borrowed_release = None
+                            self._release_host_locked(rec, job.state)
+            with self._lock:
+                job.state.jobs -= 1
+                job.state.completion_pending = True
+                self._completed.append(completion)
+                self._maybe_drained_locked(job.state)
+            if completion.error is not None:
+                job.future.set_exception(completion.error)
+            else:
+                job.future.set_result(sample)
+
     def poll_completed(self) -> list[CaptureCompletion]:
         with self._lock:
             result = list(self._completed)
@@ -645,6 +774,7 @@ class CaptureController:
                           pending_copies=sum(s.jobs for s in self._executions.values()),
                           output_reservations=len(self._reservations),
                           quarantined_executions=sum(bool(s.quarantined) for s in self._executions.values()),
+                          **self._segment_stats,
                           fill_failures=self._fill_failures,
                           capture_workers=self._max_workers,
                           cache_adoption_calls=self._adoption_calls,

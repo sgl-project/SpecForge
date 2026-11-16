@@ -155,7 +155,9 @@ class HSCaptureRuntime:
                                                 config.cache_bytes if self.enabled else 0)
                 self.controller = CaptureController(
                     self.cache, schema, config.pinned_bytes, config.output_bytes,
-                    config.device_bytes, max_workers=config.max_workers)
+                    config.device_bytes, max_workers=config.max_workers, segmented=config.segmented)
+                if config.segmented:
+                    self.capture.sink._get_manifest_owner()
 
         try:
             self._local_phase("startup.core", create_core)
@@ -329,6 +331,8 @@ class HSCaptureRuntime:
                 "capture_namespace": self.namespace, "capture_signature": self.signature,
                 "schema": self.schema_wire, "cache_enabled": self.enabled,
                 "transport": "host", "no_oversize_fallback": True,
+                "feature_layouts": (["hs-manifest-v1"] if self.config.segmented else ["full-v1"]),
+                "segment_hard_pin_required": self.config.segmented,
                 "support": {"nonchunked": True, "host_publication": True,
                             "causal_text_only": True, "pp_size": 1, "dp_size": 1,
                             "offload": False, "sessions": False, "lora": False,
@@ -347,6 +351,9 @@ class HSCaptureRuntime:
                                ("capture_signature", self.signature)):
             if spec.get(name) != expected:
                 raise CaptureContractError("capture " + name + " mismatch")
+        expected_layout = 'hs-manifest-v1' if self.config.segmented else 'full-v1'
+        if spec.get('feature_layout', 'full-v1') != expected_layout:
+            raise CaptureContractError('capture feature layout was not negotiated')
         if spec.get("object_key_layout") != "attempt-v1":
             raise CaptureContractError("HS capture requires negotiated immutable attempt keys")
         if req.sampling_params.max_new_tokens != 0:
@@ -732,11 +739,15 @@ class HSCaptureRuntime:
             except Exception as exc:
                 self._finish_error(job, exc)
         if ready:
-            samples = [(job.spec, job.sample.features["aux"],
-                        job.sample.features["last_hidden"]) for job in ready]
+            if self.config.segmented:
+                samples = [(job.spec, job.sample, self.schema, self.namespace) for job in ready]
+            else:
+                samples = [(job.spec, job.sample.features["aux"],
+                            job.sample.features["last_hidden"]) for job in ready]
             enqueue_ns = time.monotonic_ns() if self._diagnostics else 0
             try:
-                future = self.capture.sink.submit_samples(samples)
+                future = (self.capture.sink.submit_segmented_samples(samples) if self.config.segmented
+                          else self.capture.sink.submit_samples(samples))
             except Exception as exc:
                 samples.clear()
                 future = Future()
@@ -794,7 +805,9 @@ class HSCaptureRuntime:
                 entry.state = "PUBLISHED"
                 certificate = {**self._wire(entry), "publication_ownership": "attempt-v1",
                                "object_key_layout": "attempt-v1", "physical_keys": keys,
-                               "schema": self.schema_wire}
+                               "schema": self.schema_wire,
+                               **({name: result[name] for name in ('feature_layout', 'segment_manifest', 'full_object_fallback')}
+                                  if self.config.segmented else {})}
                 entry.transfer_certificate = {"publication_ownership": "attempt-v1",
                     "physical_keys": keys, "publication_certificate": certificate}
                 result.update(self._wire(entry))
@@ -814,6 +827,9 @@ class HSCaptureRuntime:
                     if not job.output.done():
                         job.output.set_exception(scalar_error(exc))
                     self._drop_job(job)
+                elif self.config.segmented:
+                    job.failed = scalar_error(exc)
+                    job.cleanup = self.capture.sink.discard_sample(job.spec)
                 else:
                     self._finish_error(job, exc)
         for entry in self.registry.active.values():
@@ -918,7 +934,8 @@ class HSCaptureRuntime:
                             "p0_v1_diagnostic_every": self._diagnostic_every,
                             "p0_v1_diagnostic_limit": self._diagnostic_limit} if self._diagnostics else {}),
                         "cache": self.cache.stats() if self.cache else {},
-                        "controller": self.controller.stats() if self.controller else {}}
+                        "controller": self.controller.stats() if self.controller else {},
+                        "manifest_owner": self.capture.sink.manifest_stats() if self.writer else {}}
             return self._local_phase("control.stats", stats)
         if action in ("begin", "begin_batch"):
             return self._begin_control(body, action)

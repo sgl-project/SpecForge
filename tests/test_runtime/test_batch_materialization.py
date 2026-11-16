@@ -112,3 +112,38 @@ class TestBatchMaterialization(unittest.TestCase):
         self.assertEqual(int(actual.tensors['hidden_states'][0, 3:].count_nonzero()), 0)
         self.assertFalse(store._active_leases)
         store.close()
+
+    def test_unknown_h2d_completion_holds_destination_and_pool_pin_until_cuda_drain(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from unittest import mock
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+        store = MooncakeFeatureStore(store=_FakeMooncakeStore())
+        calls = []
+        destination = mock.Mock(is_cuda=True, device=torch.device('cuda', 0))
+        destination.record_stream.side_effect = lambda stream: calls.append('record')
+        destination.copy_.side_effect = lambda *args, **kwargs: calls.append('enqueue')
+        stream = mock.Mock()
+        stream.synchronize.side_effect = RuntimeError('CUDA completion unknown')
+        slot = SimpleNamespace(storage=torch.empty(32, dtype=torch.uint8))
+        pool = mock.Mock(kind='pinned')
+        pool.acquire.return_value = (slot, True)
+        pool.copy_stream.return_value = stream
+        store._receive_pool = pool
+        pin = mock.Mock()
+        with mock.patch.object(torch.cuda, 'current_stream', return_value=mock.Mock()), mock.patch.object(torch.cuda, 'stream', return_value=nullcontext()):
+            with self.assertRaisesRegex(RuntimeError, 'completion unknown'):
+                store._copy_segment_into(torch.ones((1,2,4)), destination, pin)
+        self.assertEqual(calls, ['record', 'enqueue'])
+        self.assertIs(store._h2d_quarantined[0]['destination'], destination)
+        pin.release.assert_not_called()
+        with self.assertRaises(RuntimeError):
+            store._drain_h2d_quarantine()
+        self.assertEqual(len(store._h2d_quarantined), 1)
+        stream.synchronize.side_effect = None
+        store._drain_h2d_quarantine()
+        pin.release.assert_called_once()
+        self.assertFalse(store._h2d_quarantined)
+        store._receive_pool = None
+        store.close()

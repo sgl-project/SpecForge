@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import tempfile
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -82,14 +83,17 @@ class HSPluginTests(unittest.TestCase):
         self.protocol_module.stop()
         self.env.stop()
 
-    def runtime(self, *, store=None, cache=True, capacity=16, parallel=None):
+    def runtime(self, *, store=None, cache=True, capacity=16, parallel=None, segmented=False):
         writer = sink.SpecCaptureSink([1, 3])
         writer._store, writer._put_config = store or _Store(), object()
+        if segmented:
+            from specforge.runtime.data_plane.mooncake_store import _InjectedReplicateConfig
+            writer._put_config = _InjectedReplicateConfig()
         deferred = []
         native = capture.CaptureRuntime(sink=writer, is_writer=True, gpu_put=False,
             max_pending_batches=2, defer_response=lambda req, completion: deferred.append((req, completion)))
         scheduler = SimpleNamespace(abort_request=lambda req: None)
-        config = HSConfig(capture=True, cache=cache, chunk_tokens=4, cache_bytes=4096,
+        config = HSConfig(capture=True, cache=cache, segmented=segmented, chunk_tokens=4, cache_bytes=4096,
             pinned_bytes=4096, output_bytes=8192, device_bytes=4096, attempt_capacity=capacity)
         kwargs = dict(manifest={"model": "cpu-fixture", "weights": "load-epoch"}, schema=_schema())
         if parallel is None:
@@ -109,6 +113,8 @@ class HSPluginTests(unittest.TestCase):
                 "features": {"aux": "hidden_states", "last_hidden": "target"},
                 "passthrough": [{"name": "loss_mask", "data": [[mask] * len(tokens)],
                                   "shape": [1, len(tokens)], "dtype": "int64"}]}
+        if hs.config.segmented:
+            spec["feature_layout"] = "hs-manifest-v1"
         digest = digest_request(tokens, spec)
         body = {"protocol_version": 1, "action": "begin", "server_epoch": hs.epoch,
                 "store_id": "store", "sample_id": sample, "gen": 1,
@@ -159,6 +165,38 @@ class HSPluginTests(unittest.TestCase):
                 self.fail("HS pipeline did not make progress")
             time.sleep(0.001)
         hs.poll()
+
+    def test_segmented_runtime_and_explicit_full_fallback_use_owner_and_compact_cache(self):
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        for force_full in ('0', '1'):
+            with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+                'SPECFORGE_HS_REMOTE_LEDGER_DIR': directory,
+                'SPECFORGE_HS_REMOTE_BUDGET_BYTES': str(1 << 24),
+                'SPECFORGE_HS_SEGMENT_FORCE_FULL': force_full,
+            }):
+                backend = _FakeMooncakeStore()
+                hs = self.runtime(store=backend, segmented=True)
+                req = self.request(hs, 'segment-' + force_full, tokens=tuple(range(9)))
+                self.admit(hs, req)
+                self.forward(hs, [req], [9])
+                self.spin(hs, lambda: hs.deferred[0][1].done())
+                hs.deferred[0][1].result()
+                result = hs.capture.results[req.rid]
+                self.assertEqual(result['feature_layout'], 'hs-manifest-v1')
+                self.assertEqual(result['full_object_fallback'], force_full == '1')
+                manifest = result['segment_manifest']
+                self.assertEqual(len(manifest['features']['hidden_states']), 1 if force_full == '1' else 3)
+                self.assertEqual(hs.cache.stats()['cache_adopted_samples'], 0)
+                hs.capture.sink._managed_put({manifest['ack_key']: torch.tensor(list(bytes.fromhex(manifest['digest'])), dtype=torch.uint8)})
+                owner = hs.capture.sink._manifest_owner
+                owner.progress()
+                self.assertTrue(backend.is_exist(manifest['receipt_key']))
+                backend.remove(manifest['receipt_key'])
+                owner.progress()
+                self.assertEqual(owner.health()['remote_owner_charged_bytes'], 0)
+                self.assertFalse(backend._d)
+                hs.shutdown()
+                self.runtimes.remove(hs)
 
     def test_native_complete_n_rows_from_nonaligned_prefix_and_loss_mask_independent_identity(self):
         hs = self.runtime(parallel=SimpleNamespace(tp_size=1, tp_rank=0))

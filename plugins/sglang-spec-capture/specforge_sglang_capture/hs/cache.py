@@ -269,6 +269,47 @@ class PrefixFeatureCache:
         if failure is not None:
             raise failure from None
 
+    def borrow_prefix_blocks(self, lease, end):
+        """Borrow immutable compact blocks while retaining one atomic lease reader."""
+        with self._lock:
+            rec = self._checked_lease(lease, end)
+            entries = rec.entries[:(end + self.chunk_tokens - 1) // self.chunk_tokens]
+            if any(not self._complete(entry) for entry in entries):
+                raise CaptureContractError("leased prefix block is incomplete")
+            rec.readers += 1
+            blocks = tuple((entry.key, {
+                spec.name: (entry.owner.features[spec.name][entry.key.start:entry.key.end]
+                            if entry.owner is not None else entry.features[spec.name])
+                for spec in self.schema.features}) for entry in entries)
+        released = False
+        def release():
+            nonlocal released
+            with self._lock:
+                if released:
+                    return
+                released = True
+                rec.readers -= 1
+                if rec.released and not rec.readers:
+                    self._finish_release(rec)
+        return blocks, release
+
+    def publish_compact(self, fill, features):
+        """Install independently owned immutable block storage, never a full output view."""
+        self.schema.validate(features, self.chunk_tokens, "cpu")
+        storages = {tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+                    for tensor in features.values()}
+        if sum(storages.values()) != self._chunk_bytes:
+            raise CaptureContractError("compact block storage differs from its charged bytes")
+        with self._lock:
+            rec = self._fills.get(getattr(fill, "reservation_id", None))
+            if rec is None or rec.handle is not fill or rec.abort_requested or rec.writer_active:
+                return False
+            rec.entry.features = dict(features)
+            rec.entry.state = "READY"
+            self._fills.pop(fill.reservation_id)
+            self._lru[fill.key] = None
+            return True
+
     def reserve_fill(self, key: ContentBlockKey,
                      execution: ExecutionIdentity) -> FillReservation | None:
         self._validate_key(key)

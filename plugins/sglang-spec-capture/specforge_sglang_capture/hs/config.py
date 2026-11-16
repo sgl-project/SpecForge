@@ -17,6 +17,7 @@ def _flag(name: str) -> bool:
 class HSConfig:
     capture: bool = False
     cache: bool = False
+    segmented: bool = False
     chunk_tokens: int = 256
     cache_bytes: int = 1 << 30
     pinned_bytes: int = 256 << 20
@@ -28,7 +29,8 @@ class HSConfig:
     @classmethod
     def from_env(cls) -> HSConfig:
         values = {"capture": _flag("SPECFORGE_HS_CAPTURE"),
-                  "cache": _flag("SPECFORGE_HS_CACHE")}
+                  "cache": _flag("SPECFORGE_HS_CACHE"),
+                  "segmented": _flag("SPECFORGE_HS_SEGMENTED")}
         for name in ("chunk_tokens", "cache_bytes", "pinned_bytes", "output_bytes",
                      "device_bytes", "max_workers", "attempt_capacity"):
             env = "SPECFORGE_HS_" + name.upper()
@@ -36,6 +38,8 @@ class HSConfig:
             if value <= 0:
                 raise ValueError(f"{env} must be positive")
             values[name] = value
+        if values["segmented"] and not values["capture"]:
+            raise ValueError("SPECFORGE_HS_SEGMENTED=1 requires capture")
         if values["cache"] and not values["capture"]:
             raise ValueError("SPECFORGE_HS_CACHE=1 requires SPECFORGE_HS_CAPTURE=1")
         return cls(**values)
