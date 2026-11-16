@@ -31,6 +31,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 import torch
 
 from specforge.runtime.contracts import SampleRef, TrainBatch
+from specforge.runtime.data_plane.batch_materialization import (
+    ConsumerSchedule, allocate_sequence_batch, copy_sample_into,
+)
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
@@ -188,6 +191,11 @@ class FeatureDataLoader:
             raise ValueError("num_workers must be >= 0")
         self.num_workers = int(num_workers)
         self.pin_memory = bool(pin_memory)
+        self.direct_batch = os.environ.get("SPECFORGE_TRAINER_DIRECT_BATCH", "0") == "1"
+        self.feature_demand = os.environ.get("SPECFORGE_TRAINER_FEATURE_DEMAND", "0") == "1"
+        self._consumer_schedule = None
+        self._batch_sequence = 0
+        self._sequence_lock = threading.Lock()
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
         # (Mooncake remove -> -706): release() parks it and gc() must retry.
@@ -206,6 +214,14 @@ class FeatureDataLoader:
             "fetch_bytes": 0.0,
             "fetch_batches": 0.0,
             "fetch_samples": 0.0,
+            "direct_batch_batches": 0.0,
+            "direct_batch_fallback_batches": 0.0,
+            "feature_demand_trimmed_batches": 0.0,
+            "feature_requested_bytes": 0.0,
+            "feature_materialized_bytes": 0.0,
+            "feature_h2d_bytes": 0.0,
+            "last_hidden_requested_bytes": 0.0,
+            "last_hidden_h2d_bytes": 0.0,
         }
 
     def _perf_add(self, **deltas: float) -> None:
@@ -222,9 +238,24 @@ class FeatureDataLoader:
                     self._perf[name] = 0.0
         return snapshot
 
-    def _timed_make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+    def configure_consumer_schedule(self, *, global_step, accumulation_steps,
+                                    accumulation_remainder, log_interval, has_logger):
+        # Called on the consuming thread before any iterator/prefetch is started.
+        self._consumer_schedule = ConsumerSchedule(
+            int(global_step), max(1, int(accumulation_steps)),
+            int(accumulation_remainder), max(1, int(log_interval)), bool(has_logger),
+        )
+        self._batch_sequence = 0
+
+    def _next_batch_index(self):
+        with self._sequence_lock:
+            index = self._batch_sequence
+            self._batch_sequence += 1
+            return index
+
+    def _timed_make_batch(self, refs: List[SampleRef], batch_index=None) -> TrainBatch:
         started = time.perf_counter()
-        batch = self._make_batch(refs)
+        batch = self._make_batch(refs, batch_index=batch_index)
         self._perf_add(
             fetch_s=time.perf_counter() - started,
             fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
@@ -233,8 +264,8 @@ class FeatureDataLoader:
         )
         return batch
 
-    def _prepare_batch(self, refs: List[SampleRef]) -> _PreparedBatch:
-        batch = self._timed_make_batch(refs)
+    def _prepare_batch(self, refs: List[SampleRef], batch_index=None) -> _PreparedBatch:
+        batch = self._timed_make_batch(refs, batch_index=batch_index)
         ready = {}
         for tensor in batch.tensors.values():
             if tensor.is_cuda and tensor.device not in ready:
@@ -305,8 +336,13 @@ class FeatureDataLoader:
             tensors = self.per_sample_transform(tensors)
         return tensors
 
-    def _make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+    def _make_batch(self, refs: List[SampleRef], batch_index=None) -> TrainBatch:
         self._validate_refs(refs)
+        layout = getattr(self.collate_fn, "sequence_batch_layout", None)
+        if self.direct_batch and layout is not None and self.per_sample_transform is None:
+            return self._make_direct_batch(refs, layout, batch_index)
+        if self.direct_batch:
+            self._perf_add(direct_batch_fallback_batches=1.0)
         per_sample = [self._materialize(r) for r in refs]
         batch_tensors = self.collate_fn(per_sample)
         non_tensors = [
@@ -333,6 +369,37 @@ class FeatureDataLoader:
                 "target_repr": refs[0].metadata.get("target_repr"),
                 "ttt_length": refs[0].metadata.get("ttt_length"),
             },
+        )
+
+    def _make_direct_batch(self, refs, layout, batch_index):
+        names = None
+        if (self.feature_demand and self.strategy == "dflash"
+                and self._consumer_schedule is not None and batch_index is not None
+                and not self._consumer_schedule.detailed_metrics(batch_index)):
+            names = set(refs[0].feature_specs) - {"target_last_hidden_states"}
+            self._perf_add(feature_demand_trimmed_batches=1.0)
+        tensors, destinations = allocate_sequence_batch(
+            refs, layout, device=self.device, names=names,
+        )
+        for ref, dest in zip(refs, destinations):
+            _, handle = copy_sample_into(self.store, ref, dest)
+            # get_into certifies completion of every source copy, including H2D.
+            self.store.release(handle, reason="loaded")
+            requested = sum(value.numel() * value.element_size() for value in dest.values())
+            h2d = sum(value.numel() * value.element_size() for value in dest.values() if value.is_cuda)
+            last = dest.get("target_last_hidden_states")
+            last_bytes = last.numel() * last.element_size() if last is not None else 0
+            self._perf_add(feature_requested_bytes=requested,
+                           feature_materialized_bytes=requested, feature_h2d_bytes=h2d,
+                           last_hidden_requested_bytes=last_bytes,
+                           last_hidden_h2d_bytes=last_bytes if last is not None and last.is_cuda else 0)
+        self._maybe_gc()
+        self._perf_add(direct_batch_batches=1.0)
+        return TrainBatch(
+            sample_ids=[ref.sample_id for ref in refs], strategy=self.strategy,
+            tensors=tensors, metadata={"target_repr": refs[0].metadata.get("target_repr"),
+                                      "ttt_length": refs[0].metadata.get("ttt_length"),
+                                      "direct_batch": True, "consumer_batch_index": batch_index},
         )
 
     def _settle_incomplete_queue_batch(self, refs: List[SampleRef]) -> None:
@@ -377,7 +444,7 @@ class FeatureDataLoader:
             yield from self._iter_refs_prefetch(chunks)
             return
         for chunk in chunks:
-            yield self._make_batch(chunk)
+            yield self._make_batch(chunk, batch_index=self._next_batch_index())
 
     def _iter_refs_prefetch(
         self, chunks: List[List[SampleRef]]
@@ -397,14 +464,14 @@ class FeatureDataLoader:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     break
-                pending.append(executor.submit(self._prepare_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk, self._next_batch_index()))
             while pending:
                 yield pending.popleft().result().consume()
                 try:
                     chunk = next(chunk_iter)
                 except StopIteration:
                     continue
-                pending.append(executor.submit(self._prepare_batch, chunk))
+                pending.append(executor.submit(self._prepare_batch, chunk, self._next_batch_index()))
 
     def seek(self, num_batches: int) -> None:
         """Skip the first ``num_batches`` of the NEXT iteration (refs mode; one-shot).
@@ -449,7 +516,7 @@ class FeatureDataLoader:
                 return
             try:
                 fetch_started = time.perf_counter()
-                batch = self._timed_make_batch(refs)
+                batch = self._timed_make_batch(refs, batch_index=self._next_batch_index())
                 self._perf_add(wait_fetch_s=time.perf_counter() - fetch_started)
             except Exception as exc:
                 self.queue.fail(refs, reason=f"materialize:{exc}", retryable=False)
@@ -506,7 +573,7 @@ class FeatureDataLoader:
                             state.mark_yielded_or_failed(refs)
                         put_interruptibly(eos)
                         return
-                    future = pool.submit(self._prepare_batch, refs)
+                    future = pool.submit(self._prepare_batch, refs, self._next_batch_index())
                     state.track_fetch(future, refs)
                     if not put_interruptibly((future, refs)):
                         return

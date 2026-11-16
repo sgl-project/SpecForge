@@ -1185,6 +1185,7 @@ class MooncakeFeatureStore(FeatureStore):
         raise AssertionError("unreachable Mooncake fetch retry state")
 
     def _fetch_tensor_once(self, key: str, spec, device) -> torch.Tensor:
+        destination = getattr(self._capture_read_local, "destinations", {}).get(key)
         pool = self._receive_pool
         if pool is None:
             dst = _alloc_from_spec(spec)
@@ -1196,6 +1197,9 @@ class MooncakeFeatureStore(FeatureStore):
                 if isinstance(exc, _MooncakeGetError) or getattr(self._capture_read_local, "intent", None) is not None:
                     self._quarantine_buffer(dst)
                 raise
+            if destination is not None:
+                destination.copy_(dst, non_blocking=False)
+                return destination
             return dst
         dtype = _TORCH_DTYPES.get(spec.dtype)
         if dtype is None:
@@ -1218,7 +1222,19 @@ class MooncakeFeatureStore(FeatureStore):
         if _stays_on_host(dtype):
             target = torch.device("cpu")
         try:
-            if target.type == "cpu" and not view.is_cuda:
+            if destination is not None:
+                out = destination
+                if out.device.type == "cuda":
+                    stream = pool.copy_stream(out.device)
+                    stream.wait_stream(torch.cuda.current_stream(out.device))
+                    with torch.cuda.stream(stream):
+                        out.copy_(view, non_blocking=True)
+                    # Source and registered receive slot remain owned until DMA ends.
+                    stream.synchronize()
+                    out.record_stream(torch.cuda.current_stream(out.device))
+                else:
+                    out.copy_(view, non_blocking=False)
+            elif target.type == "cpu" and not view.is_cuda:
                 out = view.clone()
             else:
                 stream = pool.copy_stream(view.device if view.is_cuda else target)
@@ -1537,6 +1553,24 @@ class MooncakeFeatureStore(FeatureStore):
         return discarded
 
     # -- read --------------------------------------------------------------
+    def get_into(self, sample_ref, destinations):
+        """Fill caller-owned final-batch views without intermediate GPU tensors."""
+        self._capture_from_ref(sample_ref)
+        mapping = {}
+        for name, tensor in destinations.items():
+            spec = sample_ref.feature_specs[name]
+            if tuple(tensor.shape) != tuple(spec.shape) or str(tensor.dtype).removeprefix("torch.") != spec.dtype:
+                raise ValueError(f"destination layout differs for {name!r}")
+            if not tensor.is_contiguous():
+                raise ValueError("direct destination must be contiguous")
+            mapping[self._tkey(sample_ref.sample_id, int(sample_ref.metadata["generation"]), name)] = tensor
+        previous = getattr(self._capture_read_local, "destinations", {})
+        self._capture_read_local.destinations = mapping
+        try:
+            return self.get(sample_ref, device="cpu", names=list(destinations))
+        finally:
+            self._capture_read_local.destinations = previous
+
     def get(self, sample_ref: SampleRef, *, device="cpu", names=None):
         with self._lock:
             if self._closing or self._closed:

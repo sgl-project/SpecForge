@@ -985,6 +985,14 @@ class TrainerController:
                             f"cannot skip {skip}"
                         )
                     stream = it
+            configure_schedule = getattr(data, "configure_consumer_schedule", None)
+            if callable(configure_schedule):
+                configure_schedule(
+                    global_step=self.global_step,
+                    accumulation_steps=self.core.accumulation_steps,
+                    accumulation_remainder=self.core.accumulation_remainder,
+                    log_interval=self.log_interval, has_logger=self.logger is not None,
+                )
             _it = iter(stream)
             while True:
                 data_wait_started = time.perf_counter()
