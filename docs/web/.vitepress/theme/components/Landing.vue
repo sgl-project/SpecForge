@@ -24,7 +24,7 @@ const features = [
   {
     title: 'Every draft family',
     icon: 'M4 6h16M4 12h10M4 18h7M19 15v6m-3-3h6',
-    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino and MTP drafts train through one runtime. DMTP combines native MTP with DFlash-family parallel drafting.',
+    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DMTP, DSpark, Domino and MTP drafts train through one runtime.',
   },
   {
     title: 'Any scale, any accelerator',
