@@ -31,6 +31,7 @@ from .registry import TrainingRequirements, register_protocol
         "teacher_logits",
         "chain_positions",
         "acceptance_chain",
+        "expert_routing",
     ),
     trains=COMMON_MODULES + ("markov_head", "confidence_head"),
 )
@@ -118,4 +119,8 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            deferred=runtime.deferred_term(output, blocks),
+        )

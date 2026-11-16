@@ -230,6 +230,47 @@ selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain the
 PyTorch implementation. This option does not change parameter names or canonical
 configuration and is recorded in the training resume contract.
 
+`model.moe_experts_kernel` selects the routed-expert kernel of MoE drafts:
+`grouped_mm` (default) runs every expert in one `F.grouped_mm` call, which torch
+accepts only when `hidden_size` and the expert `intermediate_size` are multiples
+of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
+device. Startup probes the chosen kernel on every MoE layer and fails rather
+than falling back; MoE drafts record the choice in the training resume contract.
+
+A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
+holds the expert count, top-k, an `experts` sub-node (per-expert
+`intermediate_size`, `hidden_act`, `gated`), an optional `shared_expert` sub-node
+of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
+MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
+`sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
+that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
+`experts.down_proj`); their layout declares how they assemble from and split
+into Transformers' per-expert tensors, for the target-weight copies and the
+SGLang converter that follow in their own PR.
+`configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
+whose every FFN is a MoE of 8 experts with top-1 routing.
+
+Load balancing is DeepSeek-V3's aux-loss-free bias update. The DFlash and DSpark
+objectives take `bias_update_rate` in `training.objective_options` (`0`, the
+default, keeps the bias fixed; the recipe uses `0.001`). Over one optimizer step
+the trainer counts, across micro-batches and ranks, the tokens of kept blocks
+each MoE layer routed to each expert, then moves every router's `expert_bias` by
+that rate toward the under-loaded experts with a zero-mean sign step; the bias
+shifts which experts are chosen, not their weights. `moe/step_balance` reports
+the dispatch's balance: 1 when uniform, E / K when the same K experts take every
+token.
+
+The auxiliary loss is DeepSeek-V3's load-balance loss on the router scores,
+E × Σ_e share_e × P_e per MoE layer with its own expert count, averaged (1 when
+balanced), weighted by `aux_loss_coef` (`0` skips
+it; the recipe uses `0.005`) and reported as `moe/aux_loss`. `aux_loss_type`
+picks the load behind share_e: `microbatch_wise` is this forward's own,
+`batch_wise` (the default) this optimizer step's so far, pooled over
+micro-batches and ranks, as in torchtitan and Megatron. The objective hands the
+loss out as a typed term holding its P_e and counts; the strategy pools the
+counts and finishes it, so objective evaluation still performs no collectives,
+and evaluation forwards balance against their own load.
+
 MTP accepts `objective_chunk_size` through objective options and maps the legacy
 `mtp_objective_chunk_size` alias to it; projection and loss are checkpointed in chunks.
 Other canonical objectives do not consume legacy `objective_chunk_blocks`,

@@ -293,6 +293,8 @@ class ModelConfig(StrictConfigModel):
     #: fails when they cannot be used; ``false`` disables them. Resolved kernels
     #: that cannot be imported are an error in both the auto and explicit cases.
     use_liger_kernel: Optional[bool] = None
+    #: MoE routed-expert kernel, grouped_mm or loop; probed at startup, no fallback.
+    moe_experts_kernel: str = "grouped_mm"
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).

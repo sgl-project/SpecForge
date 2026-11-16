@@ -59,6 +59,8 @@ class StepContext:
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
     accumulation_steps: int = 1
+    # The data-parallel group the trainer reduces over; None is the default group.
+    process_group: Any = None
 
 
 def linear_lambda_base(
@@ -120,6 +122,10 @@ class DraftTrainStrategy(abc.ABC):
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Select the keys this strategy persists as draft weights."""
         return state_dict
+
+    def after_step(self, *, process_group=None) -> Dict[str, Any]:
+        """Run after each optimizer step; returned scalars join that step's metrics."""
+        return {}
 
 
 def _prepare_eagle_target(

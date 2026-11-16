@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import Tensor
 
+from .base import DeferredTerm
 from .losses import TokenLoss
 
 
@@ -126,3 +127,5 @@ class PredictionBatch:
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
     chunk_size: int = 0
+    # A term the training layer finishes before the loss is read; None without one.
+    deferred: DeferredTerm | None = None

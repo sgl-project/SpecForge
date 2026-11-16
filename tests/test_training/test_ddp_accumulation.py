@@ -24,6 +24,9 @@ class _Strategy:
             loss=self.model(batch.tensors["input"]).square().mean(), metrics={}
         )
 
+    def after_step(self, *, process_group=None):
+        return {}
+
 
 class _Optimizer(torch.optim.SGD):
     def step(self):
