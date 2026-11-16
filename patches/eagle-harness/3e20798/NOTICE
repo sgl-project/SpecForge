@@ -1,0 +1,29 @@
+EAGLE-4
+Copyright © 2026 Eagle AI Corp.
+
+EAGLE-4 software in this repository is made available under the Eagle 4
+Source-Available License in the root LICENSE file. This license is not an
+OSI-approved open-source license and incorporates the Eagle Trademark Policy
+in TRADEMARKS.md.
+
+Downloading, cloning, forking, copying, accessing, modifying, using, hosting,
+distributing, or otherwise exercising any licensed right constitutes acceptance
+of the Eagle 4 Source-Available License and incorporated Eagle Trademark Policy.
+Mere viewing or inspection of the repository does not itself constitute
+trademark use.
+
+EAGLE, Eagle 4, EAGLE-Harness, and EAGLE Efficient LM Head are trademarks or
+claimed trademarks of Eagle AI Corp. All other names and marks are the property
+of their respective owners.
+
+Source-file notices are per file: each first-party source file carries a
+copyright line and SPDX-License-Identifier: LicenseRef-Eagle-4-Source-Available.
+Files derived from other projects carry their upstream copyright and provenance
+headers instead, and are listed in THIRD_PARTY_NOTICES.md with the full license
+texts in LICENSES/.
+
+Commercial licensing and trademark permissions: licensing@eagle.ai
+
+This NOTICE is for the official EAGLE-4 repository. Derivative distributions
+must also comply with the attribution, modification, non-affiliation, and
+notice requirements in the license and trademark policy.

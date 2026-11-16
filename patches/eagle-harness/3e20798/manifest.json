@@ -1,0 +1,15 @@
+{
+  "upstream": "https://github.com/eagle-hq/EAGLE-4.git",
+  "revision": "3e20798bcce810486cd810ecf087936488106ae2",
+  "packages": {
+    "torch": "2.9.1+rocm7.2.0.lw.git7e1940d4",
+    "transformers": "5.12.1",
+    "sglang": "0.5.23.dev252+eagle.4.rocm",
+    "triton": "3.7.0+amd.rocm7.2.0.git89002410"
+  },
+  "sha256_lf": {
+    "eagle_harness/models/eagle4_config.py": "96952359a2b7a6054f3e9d9c7b6afef2933d67d6e0eb167f4d33acfdbe7f358e",
+    "eagle_harness/sglang/models/llama_eagle4.py": "9a613391edf61e894331e7640e988cffa17cef72910cc814d2c4656e69ea5dfe",
+    "eagle_harness/sglang/worker.py": "58d64830bdef1193e6eb809bda9288bd8a8e74a8a8faa547cb22f3ce1d2e0ae9"
+  }
+}

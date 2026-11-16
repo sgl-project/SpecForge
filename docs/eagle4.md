@@ -181,3 +181,8 @@ Implementation references: [head and loss](../specforge/modeling/draft/eagle4.py
 [positive-count rule](../specforge/modeling/draft/eagle4_structure.py),
 [loading and freezing](../specforge/algorithms/model_providers.py), and
 [TTT loss integration](../specforge/algorithms/eagle3/model.py).
+
+For serving exported checkpoints, the version-pinned
+[EAGLE-Harness compatibility patch](../patches/eagle-harness/3e20798/README.md)
+documents dense and low-rank head support, runtime requirements, and application
+and source-hash verification instructions.

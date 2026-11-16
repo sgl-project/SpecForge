@@ -1,0 +1,14 @@
+eagle_harness/models/eagle4_config.py
+# Copyright 2026 Eagle AI Corp.
+# SPDX-License-Identifier: LicenseRef-Eagle-4-Source-Available
+
+eagle_harness/sglang/models/llama_eagle4.py
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+# SPDX-FileCopyrightText: Copyright 2025 SafeAI Lab (SAIL)
+# Derived from sglang (Apache-2.0) python/sglang/srt/models/llama_eagle3.py, itself adapted from SafeAILab EAGLE
+# (Apache-2.0) eagle/model/cnets.py. Modified by Eagle AI Corp: the EAGLE-4 draft (fc over three aux hidden states,
+# sliding window, low-rank candidate head). Notices and license texts: THIRD_PARTY_NOTICES.md and LICENSES/.
+
+eagle_harness/sglang/worker.py
+# Copyright 2026 Eagle AI Corp.
+# SPDX-License-Identifier: LicenseRef-Eagle-4-Source-Available

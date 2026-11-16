@@ -1,0 +1,184 @@
+diff --git a/eagle_harness/models/eagle4_config.py b/eagle_harness/models/eagle4_config.py
+--- a/eagle_harness/models/eagle4_config.py
++++ b/eagle_harness/models/eagle4_config.py
+@@ -116,6 +116,7 @@
+         "moe_router_bias_update_rate",
+         # candidate lm_head
+         "efficient_lm_head_config",
++        "specforge_normalized_fusion_residual",
+         # retired structures, accepted only when off
+         "enable_2hs",
+         "enable_defa",
+@@ -266,7 +267,7 @@
+ }
+ 
+ 
+-def check_ported(config, unported: Mapping[str, object] = UNPORTED) -> None:
++def check_ported(config, unported: Mapping[str, object] = UNPORTED, *, allow_dense_head: bool = False) -> None:
+     """Validate the config and refuse draft structures the adapters do not build.
+ 
+     ``unported`` maps a config key to the value that is not built.
+@@ -279,7 +280,7 @@
+         )
+     if config.num_hidden_layers != 1:
+         raise NotImplementedError(f"EAGLE-4 drafts with {config.num_hidden_layers} layers are not ported (1 only).")
+-    if getattr(config, "efficient_lm_head_config", None) is None:
++    if getattr(config, "efficient_lm_head_config", None) is None and not allow_dense_head:
+         raise NotImplementedError("EAGLE-4 drafts without efficient_lm_head_config are not ported.")
+     if (getattr(config, "draft_vocab_size", None) or config.vocab_size) != config.vocab_size:
+         raise NotImplementedError("EAGLE-4 drafts with a reduced vocab (d2t) are not ported.")
+diff --git a/eagle_harness/sglang/models/llama_eagle4.py b/eagle_harness/sglang/models/llama_eagle4.py
+--- a/eagle_harness/sglang/models/llama_eagle4.py
++++ b/eagle_harness/sglang/models/llama_eagle4.py
+@@ -43,7 +43,7 @@
+ from sglang.srt.layers.layer_boundary import layer_stack
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
++from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, PPProxyTensors
+@@ -93,7 +93,7 @@
+ 
+ def check_supported(config) -> None:
+     """Validate the config and refuse draft structures this adapter does not build."""
+-    check_ported(config, _UNSUPPORTED)
++    check_ported(config, _UNSUPPORTED, allow_dense_head=True)
+     moe = draft_moe_architecture(config)
+     if moe not in (None, LATENT_MOE_ARCHITECTURE):
+         raise NotImplementedError(f"EAGLE-4 drafts with the {moe!r} MoE are not ported to eagle-harness on sglang.")
+@@ -122,6 +122,12 @@
+     return base
+ 
+ 
++class _TorchReLU2(nn.Module):
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = F.relu(x)
++        return x * x
++
++
+ def build_latent_moe(config, prefix: str) -> nn.Module:
+     """The latent ReLU^2 MoE of a ``nemotron_latent_relu2`` draft: sglang's ``NemotronHMoE``, the target's block.
+ 
+@@ -129,6 +135,8 @@
+     and ``fc2_latent_proj``, ``routed_scaling_factor`` on the routed sum, plus a ReLU^2 shared expert. Experts and
+     the shared expert split over TP and the block returns this rank's partial sum, reduced by the layer.
+     """
++    if torch.version.hip and not get_moe_runner_backend().is_triton():
++        raise ValueError("The stage-1 ReLU2 draft requires --speculative-moe-runner-backend triton on ROCm.")
+     parallel = get_parallel()
+     if parallel.moe_ep_size != 1 or parallel.moe_tp_size != parallel.tp_size or not get_moe_a2a_backend().is_none():
+         raise ValueError(
+@@ -139,7 +147,12 @@
+     # Imported here: sglang's model registry turns an import error into a warning and would drop the draft.
+     from sglang.srt.models.nemotron_h import NemotronHMoE
+ 
+-    return NemotronHMoE(latent_moe_config(config), layer_idx=0, quant_config=None, prefix=prefix)
++    # A draft has its own experts; it must not use the target's EPLB placement metadata.
++    moe = NemotronHMoE(latent_moe_config(config), layer_idx=0, quant_config=None, prefix=prefix, is_nextn=True)
++    if torch.version.hip and moe.shared_experts is not None:
++        # The pinned ROCm engine's ReLU2 dispatch references an unavailable CUDA op.
++        moe.shared_experts.act_fn = _TorchReLU2()
++    return moe
+ 
+ 
+ def prefill_read_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+@@ -336,7 +349,20 @@
+         self.window = served_sliding_window(config)
+         self.model = Eagle4Model(config, quant_config, add_prefix("model", prefix), self.window)
+ 
+-        head = config.efficient_lm_head_config
++        head = getattr(config, "efficient_lm_head_config", None)
++        self.dense_head = head is None
++        if self.dense_head:
++            from sglang.srt.layers.logits_processor import LogitsProcessor
++
++            if get_parallel().tp_size != 1:
++                raise NotImplementedError("The stage-1 dense serving experiment supports TP1 only.")
++            self.load_lm_head_from_target = False
++            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, prefix=add_prefix("lm_head", prefix))
++            self.logits_processor = LogitsProcessor(config)
++            self.capture_aux_hidden_states = True
++            self.hot_token_id = None
++            self._tp_size = 1
++            return
+         self.num_candidates = int(head["num_candidates"])
+         self.low_rank_type = head["type"]
+         self.smooth_factor = head.get("smooth_factor", 10)
+@@ -433,6 +459,10 @@
+         """The complete sparse distribution the sampled draft draws from (``[rows, C]`` fp32 logits, int64 ids); on
+         CUDA the greedy path's candidate pipeline without its top-k, so a sampled step costs the greedy step's
+         collectives."""
++        if self.dense_head:
++            logits = self._dense_logits(hidden)
++            ids = torch.arange(self.config.vocab_size, device=hidden.device).expand(hidden.shape[0], -1)
++            return Candidates(logits, ids)
+         if not hidden.is_cuda:
+             return self._candidates(hidden)
+         logits, tokens, _ = self._candidate_head(hidden, 0)
+@@ -444,11 +474,17 @@
+         The softmax runs over the ``C`` candidates only, which equals the
+         full-vocab softmax of :class:`CandidateLogitsProcessor`'s rows.
+         """
++        if self.dense_head:
++            return torch.topk(torch.softmax(self._dense_logits(hidden), dim=-1), k, dim=-1)
+         if hidden.is_cuda:
+             return self._candidate_head(hidden, k)[2]
+         candidates = self._candidates(hidden)
+         probs, pick = torch.topk(torch.softmax(candidates.logits, dim=-1), k, dim=-1)
+         return probs, torch.gather(candidates.token_ids, 1, pick)
++
++    def _dense_logits(self, hidden: torch.Tensor) -> torch.Tensor:
++        # Full trained vocabulary, no SVD, shortlist, or target-head substitution.
++        return F.linear(hidden, self.lm_head.weight[: self.config.vocab_size]).float()
+ 
+     def _candidate_head(self, hidden: torch.Tensor, k: int):
+         """``candidate_ops.candidate_head`` on this head's shard (bit-identical to torch): logits, ids, top-``k``."""
+@@ -508,8 +544,22 @@
+         latent_moe = draft_moe_architecture(self.config) == LATENT_MOE_ARCHITECTURE
+         expert_tensors = set()
+         for name, weight in weights:
++            if name in ("t2d", "d2t"):
++                expected = 1 if name == "t2d" else 0
++                if weight.numel() != self.config.vocab_size or not bool((weight == expected).all()):
++                    raise ValueError(f"Stage-1 serving requires identity {name} mapping.")
++                continue
+             name = _checkpoint_name(name)
+             if latent_moe and ".mlp." in name:
++                packed = re.fullmatch(r"(.*\.mlp\.experts)\.(up_proj|down_proj)", name)
++                if packed is not None:
++                    if weight.shape[0] != int(self.config.n_routed_experts):
++                        raise ValueError(f"Wrong expert count in {name}: {tuple(weight.shape)}")
++                    for expert_id, expert_weight in enumerate(weight.unbind(0)):
++                        expert_name = f"{packed.group(1)}.{expert_id}.{packed.group(2)}.weight"
++                        loaded.add(self._load_latent_moe_weight(params, expert_name, expert_weight))
++                        expert_tensors.add(expert_name)
++                    continue
+                 loaded.add(self._load_latent_moe_weight(params, name, weight))
+                 if ".mlp.experts." in name:
+                     expert_tensors.add(name)
+@@ -538,7 +588,7 @@
+             missing.update(expected_experts - expert_tensors)
+         if missing:
+             raise RuntimeError(f"EAGLE-4 checkpoint is missing {sorted(missing)}.")
+-        if not low_rank <= loaded:
++        if not self.dense_head and not low_rank <= loaded:
+             self._low_rank_head_from_svd()
+ 
+     @staticmethod
+diff --git a/eagle_harness/sglang/worker.py b/eagle_harness/sglang/worker.py
+--- a/eagle_harness/sglang/worker.py
++++ b/eagle_harness/sglang/worker.py
+@@ -165,6 +165,11 @@
+         self._intensity = policy.intensity
+         self._verify_budget = policy.max_history_verify_num
+         self._delta_slots = policy.launch_depths
++        # A dense target may not seed MoE runtime flags. Seed them before the
++        # draft-build context selects the requested speculative MoE backend.
++        from sglang.srt.layers.moe.utils import initialize_moe_config
++
++        initialize_moe_config()
+         super().__init__(server_args, gpu_id, nccl_port, target_worker)
+ 
+     def init_attention_backend(self) -> None:
