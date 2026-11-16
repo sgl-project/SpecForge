@@ -119,9 +119,9 @@ class _RecordingCheckpointManager(CheckpointManager):
         self.marker_step = marker_step
         self.saves = []
 
-    def save(self, state, step, *, rank_state=None):
+    def save(self, state, step, *, rank_state=None, pin=False):
         self.saves.append((step, self.marker_step()))
-        return super().save(state, step, rank_state=rank_state)
+        return super().save(state, step, rank_state=rank_state, pin=pin)
 
 
 def _batch(*sample_ids: str) -> TrainBatch:

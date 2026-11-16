@@ -785,6 +785,7 @@ class TrainerController:
         run_id: str,
         output_dir: str = "./output",
         save_interval: int = 0,
+        save_on_epoch_end: bool = False,
         eval_interval: int = 0,
         eval_data_factory: Optional[
             Callable[[], Optional[Iterable[TrainBatch]]]
@@ -793,6 +794,7 @@ class TrainerController:
         max_steps: Optional[int] = None,
         total_steps: Optional[int] = None,
         num_epochs: int = 1,
+        epoch_pin_steps: Optional[Iterable[int]] = None,
         logger: Optional[Callable[[Dict[str, Any], int], None]] = None,
         ack_fn: Optional[Callable[[List[str], int], None]] = None,
         start_step: int = 0,
@@ -815,6 +817,8 @@ class TrainerController:
         self.run_id = run_id
         self.output_dir = output_dir
         self.save_interval = save_interval
+        # Pin an extra checkpoint at each epoch boundary (survives rotation).
+        self.save_on_epoch_end = save_on_epoch_end
         self.eval_interval = eval_interval
         self.eval_data_factory = eval_data_factory
         self.log_interval = log_interval
@@ -829,6 +833,13 @@ class TrainerController:
         # max_steps; None means schedule-reading strategies decay nothing.
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
+        # Absolute optimizer-step boundaries at which to pin a rotation-exempt
+        # checkpoint. Epoch-agnostic online disaggregated runs (single continuous
+        # producer stream, num_epochs=1) never trigger the epoch-exhaustion save
+        # at the bottom of the epoch loop, so they pass the precomputed per-epoch
+        # boundary steps here instead. Empty for offline/local runs, which get
+        # their epoch checkpoints from iterator exhaustion.
+        self._epoch_pin_steps = {int(s) for s in (epoch_pin_steps or ())}
         self.logger = logger
         # ack_fn(sample_ids, global_step) records the durable ack transaction at
         # the optimizer-step boundary; None = the loader acks (simple runs).
@@ -1130,8 +1141,12 @@ class TrainerController:
                 is_best = bool(
                     eval_metrics and self._checkpoint_manager().is_better(eval_metrics)
                 )
-                if interval_hit or is_best:
-                    self.save_checkpoint(self.global_step)
+                # Epoch-agnostic online runs pin a rotation-exempt milestone when
+                # an optimizer step lands on a precomputed epoch boundary; their
+                # continuous stream never reaches the epoch-exhaustion save below.
+                epoch_pin_hit = self.global_step in self._epoch_pin_steps
+                if interval_hit or is_best or epoch_pin_hit:
+                    self.save_checkpoint(self.global_step, pin=epoch_pin_hit)
                 if is_best:
                     self._checkpoint_manager().update_best(
                         self.global_step, eval_metrics
@@ -1147,6 +1162,12 @@ class TrainerController:
             # work, not epoch ``N`` at batch zero (which would replay that
             # entire epoch on resume).
             self.epoch = epoch + 1
+            # Pin an epoch-boundary milestone (exempt from rotation). Saved with
+            # the just-advanced epoch/zeroed counters so resume treats the epoch
+            # as complete. Skip if this step was already checkpointed this loop
+            # (e.g. a save_interval hit landed exactly on the epoch boundary).
+            if self.save_on_epoch_end and self.last_checkpoint_step != self.global_step:
+                self.save_checkpoint(self.global_step, pin=True)
         remainder = self.core.accumulation_remainder
         if remainder:
             raise RuntimeError(
@@ -1226,13 +1247,14 @@ class TrainerController:
             self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
         return self._checkpoint_mgr
 
-    def save_checkpoint(self, step: int) -> Checkpoint:
+    def save_checkpoint(self, step: int, *, pin: bool = False) -> Checkpoint:
         # A checkpoint must never be ahead of its durable ack: resume requires
         # the ledger marker to equal the checkpoint step.
         self._flush_durable_ack()
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
         # identical DDP optimizer is written once in the shared rank0 payload.
+        # ``pin`` marks this checkpoint a permanent milestone (epoch boundary).
         full = self.core.backend.state_dict()
         mgr = self._checkpoint_manager()
         replicated_optimizer = bool(
@@ -1269,6 +1291,7 @@ class TrainerController:
                 "optimizer": None if replicated_optimizer else full["optimizer"],
                 "rng": full["rng"],
             },
+            pin=pin,
         )
         self.last_checkpoint_step = step
         return Checkpoint(

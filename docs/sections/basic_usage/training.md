@@ -686,6 +686,14 @@ prerequisites, managed-local ownership, freshness rules, and both launch forms.
 even when `save_interval` is zero or the final step is not an interval boundary.
 The `<run_id>-latest` symlink resolves to the newest complete checkpoint.
 
+Set `training.save_on_epoch_end: true` to also keep one checkpoint per epoch.
+Each epoch checkpoint is full-state (resumable) and pinned, so
+`max_checkpoints` rotation never removes it; pins are recorded in
+`<run_id>.pinned_steps.json` and survive restarts. Online disaggregated
+consumers train on one continuous stream, so they pin the optimizer step
+nearest each epoch boundary (`round(e * total_steps / num_epochs)`) instead;
+this needs `total_steps` to be known (set it or leave `max_steps` unset).
+
 Offline colocated runs restore draft weights, optimizer/scheduler, epoch/step/data
 position, and per-rank RNG. Offline disaggregated consumers have the same
 checkpoint contract. For an offline colocated run, override

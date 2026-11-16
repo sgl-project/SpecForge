@@ -133,6 +133,43 @@ class TestRewind(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(out, "run.best_meta.json")))
 
 
+class TestPinnedMilestones(unittest.TestCase):
+    def test_pinned_checkpoint_survives_rotation(self):
+        out = tempfile.mkdtemp(prefix="ckpt_pin_")
+        mgr = _mgr(out, max_checkpoints=2)
+        mgr.save(_state(1), 1, pin=True)  # epoch milestone
+        mgr.save(_state(2), 2)
+        mgr.save(_state(3), 3)
+        mgr.save(_state(4), 4)
+        # rolling keeps the newest 2 (3, 4); the pinned step 1 is exempt, so only
+        # the unpinned step 2 rotates out.
+        self.assertEqual(_steps(mgr), [1, 3, 4])
+
+    def test_pins_persist_across_reload(self):
+        out = tempfile.mkdtemp(prefix="ckpt_pin_reload_")
+        mgr = _mgr(out, max_checkpoints=2)
+        mgr.save(_state(10), 10, pin=True)
+        mgr.save(_state(20), 20)
+        # a fresh manager (restart) must rehydrate the pin from disk and keep
+        # honoring it: a later rotation may not delete step 10.
+        mgr2 = _mgr(out, max_checkpoints=2)
+        self.assertEqual(mgr2._pinned_steps, {10})
+        mgr2.save(_state(30), 30)
+        mgr2.save(_state(40), 40)
+        self.assertEqual(_steps(mgr2), [10, 30, 40])
+
+    def test_rewind_drops_pins_in_range(self):
+        out = tempfile.mkdtemp(prefix="ckpt_pin_rewind_")
+        mgr = _mgr(out)
+        mgr.save(_state(1), 1, pin=True)
+        mgr.save(_state(2), 2, pin=True)
+        with self.assertLogs(LOGGER, level="WARNING"):
+            mgr.save(_state(2), 2)  # rewind at >= 2 deletes the step-2 pin too
+        self.assertEqual(mgr._pinned_steps, {1})
+        # the persisted pin file reflects the drop for a subsequent restart.
+        self.assertEqual(_mgr(out)._pinned_steps, {1})
+
+
 class TestRunScoping(unittest.TestCase):
     def test_two_run_ids_do_not_interact(self):
         out = tempfile.mkdtemp(prefix="ckpt_runs_")

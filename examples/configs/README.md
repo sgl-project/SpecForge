@@ -313,6 +313,7 @@ Common fields:
 | `training.eval_interval` | `0` | Evaluate every N optimizer steps; 0 disables evaluation. |
 | `training.log_interval` | `50` | Positive optimizer-step logging interval. |
 | `training.max_checkpoints` | `0` | Keep the newest N checkpoints; 0 keeps all. |
+| `training.save_on_epoch_end` | `false` | Also save a full-state checkpoint at the end of every epoch and pin it, so `max_checkpoints` rotation never removes it. |
 | `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
 | `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
 | `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
