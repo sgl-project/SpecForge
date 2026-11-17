@@ -279,6 +279,14 @@ Loss term names are declared by the algorithm and must match the keys under
 positions. Model output names are defined by `project()`; `LossTerm` binds an
 output to a configured term, so the two names need not match.
 
+An algorithm declares its terms in the objective's `loss_terms` property: each
+name maps to a `LossDefinition` holding the default formula and coefficient.
+Objectives without the property have the single term `token`. A plan term whose
+name is not declared there is rejected when the plan is bound (`Algorithm loss
+terms ... do not match configured terms ...`), and a declared term's own `loss=`
+is replaced by the configured formula. An extension that adds a term, such as a
+MoE router loss, therefore adds an entry to `loss_terms` first.
+
 For Domino:
 
 | Loss term | Model output | Purpose |
@@ -536,7 +544,8 @@ that depend on whole-batch expert statistics require whole-set execution and
 explicit normalization; do not recompute them independently per chunk. Router
 statistics, cross-rank aggregation, and optimizer-step updates remain model/training
 responsibilities, not loss-kernel responsibilities. Scalar model losses use `LossTerm(..., loss=TokenLoss("value"), reduction="scalar")`
-and `calc.add(index, scalar)`. Such a plan runs unsplit and untrimmed, counts the scalar
+and `calc.add(index, scalar)`, with the term declared in the objective's
+`loss_terms` as `LossDefinition(TokenLoss("value"))`. Such a plan runs unsplit and untrimmed, counts the scalar
 once per prediction set, and applies no token mask or denominator. It requires
 sum_means or global_microbatch reduction. The latter averages local scalars across
 ranks; cross-rank expert statistics must be computed explicitly by the model.
