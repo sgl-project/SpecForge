@@ -61,6 +61,27 @@ class KernelDefaultsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires a Triton GPU backend"):
             choice(True, True, "cpu")
 
+    def test_startup_preflight_reads_nothing_where_auto_cannot_enable_liger(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from specforge.training import canonical
+
+        cfg = SimpleNamespace(model=SimpleNamespace(use_liger_kernel=None))
+        with (
+            patch(
+                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
+                return_value="cpu",
+            ),
+            patch.object(canonical, "resolve_config") as resolve,
+        ):
+            canonical.preflight_kernels(cfg)
+        resolve.assert_not_called()
+        cfg.model.use_liger_kernel = False
+        with patch.object(canonical, "resolve_config") as resolve:
+            canonical.preflight_kernels(cfg)
+        resolve.assert_not_called()
+
     def test_block_objectives_bound_the_loss_chunk_per_row(self):
         for architecture, expected in (
             ("DFlashDraftModel", (128, True)),

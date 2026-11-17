@@ -560,7 +560,10 @@ def preflight_kernels(cfg):
     if requested is None:
         from specforge.algorithms.objectives import resolve_objective
         from specforge.config.draft.mlp.dense import DenseFFNSpec
+        from specforge.modeling.draft.dflash_kernels import current_liger_platform
 
+        if current_liger_platform() not in ("cuda", "rocm"):
+            return  # auto never enables Liger here, so there is nothing to read
         draft = resolve_config(cfg)
         acts = {
             node.hidden_act
