@@ -24,7 +24,7 @@ const features = [
   {
     title: 'Every draft family',
     icon: 'M4 6h16M4 12h10M4 18h7M19 15v6m-3-3h6',
-    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino and MTP drafts all train through one runtime with shared data, evaluation and export.',
+    text: 'EAGLE3, P-EAGLE, DFlash, DFlash2, DMTP, DSpark, Domino and MTP drafts train through one runtime.',
   },
   {
     title: 'Any scale, any accelerator',
@@ -40,7 +40,7 @@ const steps = [
   { title: 'Export and serve', text: 'Run <code>specforge export --to hf</code> (or <code>--to sglang</code> for EAGLE3) and launch SGLang with the draft for faster decoding.', link: '/get_started/about' },
 ]
 
-const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DSpark', 'Domino', 'MTP']
+const methods = ['EAGLE3', 'P-EAGLE', 'DFlash', 'DFlash2', 'DMTP', 'DSpark', 'Domino', 'MTP']
 const hardware = ['NVIDIA GPUs', 'AMD GPUs', 'Ascend NPUs']
 const families = ['Llama', 'Qwen', 'Kimi', 'DeepSeek', 'GLM', 'gpt-oss', 'Step', 'Ling', 'Inkling']
 
@@ -88,7 +88,7 @@ const p = (path: string) => withBase(path + '.html')
             <span class="sf-accent">Forge Draft Models</span> for Speculative Decoding
           </h1>
           <p class="sf-sub">
-            SpecForge is the SGLang-native framework for training EAGLE3, DFlash, DSpark and Domino
+            SpecForge is the SGLang-native framework for training EAGLE3, DFlash, DMTP, DSpark and Domino
             draft models. Train once, export once, serve at speed.
           </p>
           <div class="sf-actions">
@@ -151,6 +151,10 @@ const p = (path: string) => withBase(path + '.html')
             <div class="sf-tiles">
               <span v-for="m in methods" :key="m" class="sf-tile">{{ m }}</span>
             </div>
+            <p class="sf-method-note">
+              <a :href="p('/concepts/DMTP')">DMTP</a> training is available on the
+              <a href="https://github.com/sgl-project/SpecForge/tree/feat/dmtp-plugin">implementation branch</a>.
+            </p>
             <a class="sf-link" :href="p('/basic_usage/training')">See the training guide →</a>
           </div>
           <div class="sf-support">
@@ -393,6 +397,8 @@ const p = (path: string) => withBase(path + '.html')
   font-weight: 700;
 }
 .sf-support h3 svg { color: var(--vp-c-brand-1); }
+.sf-method-note { margin: 14px 0; font-size: 14px; line-height: 1.6; color: var(--vp-c-text-2); }
+.sf-method-note a { color: var(--vp-c-brand-1); text-decoration: underline; text-underline-offset: 3px; }
 .sf-tiles {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
