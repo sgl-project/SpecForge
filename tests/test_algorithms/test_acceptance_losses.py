@@ -63,6 +63,8 @@ class AcceptanceLossTest(unittest.TestCase):
                         1.3,
                     )
                     legacy.loss_type = "dflash" if weighting == "uniform" else weighting
+                    # the recorded values must not depend on the wrapper's draws
+                    torch.manual_seed(13)
                     batch = {
                         k: v.repeat(2, *([1] * (v.ndim - 1)))
                         for k, v in training_batch(

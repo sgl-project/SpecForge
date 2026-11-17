@@ -218,6 +218,9 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                     new, old, names = block_pair(kind, shifted=shifted)
                     new.draft_model.train(not evaluation)
                     old.train(not evaluation)
+                    # Building the legacy wrapper draws random numbers; the
+                    # recorded values must not depend on how many.
+                    torch.manual_seed(13)
                     batch = training_batch(new.draft_model.config.draft)
                     batch["loss_mask"][0, 4:6] = 0
                     old_args = {
@@ -373,6 +376,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                             {"ttt_length": 3} if kind == "eagle3" else {"num_depths": 3}
                         )
                         new = build_objective_model(model, options=options)
+                        torch.manual_seed(13)
                         batch = {
                             k: v[:, :length].detach()
                             for k, v in training_batch(config).items()
