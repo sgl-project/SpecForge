@@ -12,8 +12,8 @@ import torch
 
 from specforge.algorithms.objectives import build_objective_model
 from specforge.modeling import build_draft_model
-from tests.test_algorithms.test_objectives import training_batch
 from tests.test_algorithms.test_objective_goldens import assert_golden
+from tests.test_algorithms.test_objectives import training_batch
 
 
 def assert_loss_and_gradients(new, old, new_loss, old_loss, names):
