@@ -660,8 +660,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             run_config(
                 Path("target"), draft, initialization={"checkpoint": "a"}, resume="b"
             )
-        cfg = run_config(
-            Path("target"), draft, training={"attention_backend": "flex_attention"}
-        )
+        cfg = run_config(Path("target"), draft, training={"attention_backend": "fa"})
         with self.assertRaisesRegex(ValueError, "attention_backend"):
             resolve_run(cfg)
