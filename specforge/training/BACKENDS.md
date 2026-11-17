@@ -1,6 +1,6 @@
 # Training backends: program, step runner, trainer (`specforge.training`)
 
-**Status: proposal, third revision.** Nothing in this note is implemented and nothing in it was
+**Status: proposal, fourth revision.** Nothing in this note is implemented and nothing in it was
 run. The design that runs today is [`DESIGN.md`](DESIGN.md); the cross-plane picture is
 [`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md). Symbols cited as "today" were read on
 `main` at `c0f0a39c`. The section [Decisions for maintainers](#decisions-for-maintainers) lists the
@@ -54,6 +54,11 @@ This is fixed outside the training plane and a backend must fit inside it.
   not create groups in a rank-dependent order, does not re-seed, and does not change process-wide
   torch state without declaring it. It is the only part that hands a process group to a component
   (see [Two axes of communication](#two-axes-of-communication)).
+- **Groups are created in one order, before the first batch.** Today that is the world and its
+  meshes in `specforge.cli`, then the data plane's acknowledgement group where a run uses one
+  (`build_disagg_online_consumer`), then the trainer. `runner.prepare` takes the trainer's place:
+  a runner whose engine creates groups does so there, on every rank in the same order, and nothing
+  creates a group after `prepare` returns. The composition root owns the order.
 - **The launcher owns process lifetime.** A trainer that starts helper processes owns their death.
 
 torchtitan's `TrainingEngine` constructor binds the device, applies NUMA binding, seeds RNG, sets
@@ -208,7 +213,9 @@ statistics. `ProgramSpec.reduction` declares one **reduction** for the program:
 so it can carry one denominator only. An objective whose terms need different denominators has
 three choices, made when it is resolved and never at run time: declare `microbatch`; normalise each
 term locally and return a denominator of one (the mean of local losses); or be refused, with the
-terms named. The three reductions in `objectives/execution.py` map onto these: `tokens` is
+terms named. Several terms that share one denominator need none of this and stay under `window`:
+that is every multi-term canonical objective today (DFlash2, Domino, DSpine) except DSpark's, which
+is `microbatch`. The three reductions in `objectives/execution.py` map onto these: `tokens` is
 `window`; `sum_means` is `window` with locally normalised terms and a denominator of one, except
 under D-PACE weighting, where it keeps a pooled denominator like `tokens`; `global_microbatch` is
 `microbatch`.
@@ -291,11 +298,17 @@ Every method runs on every rank in the same order. Collectives and failure handl
 | `prepare` | yes | raises on that rank before the first collective of the step path; the launcher tears the world down |
 | `forward_backward` | yes in every multi-rank run: gradient synchronisation and the reductions; every rank receives the same number of batches | raises on that rank and the launcher tears the world down; a failure inside a step is not agreed, as today |
 | `prepass`, `evaluate` | yes under sharding or with a model-parallel axis; every rank receives the same number of batches | as for `forward_backward` |
-| `reduce_sum`, `apply_step`, `draft_state`, `save_resume`, `load_resume` | yes | reported through `agree`, never raised between two collectives |
+| `reduce_sum`, `apply_step` | yes | a check on a reduced value reaches the same verdict on every rank, so all ranks raise together; any other failure raises on that rank and the launcher tears the world down |
+| `draft_state`, `save_resume`, `load_resume` | yes | reported through `agree`, never raised between two collectives |
 | `agree` | yes: one gather of error strings | raises the combined error on every rank |
 | `close` | no | — |
 
 `draft_state()` is legal only between `apply_step` and the next `forward_backward`.
+
+**`agree` is never called inside a step.** It runs in the checkpoint sequence and after
+`load_resume`, where `CheckpointManager._all_ok` runs today. A step adds no gather and no host
+read: its checks (the loss denominator, a finite gradient norm) use values that are already
+reduced, in the single host read `BF16Optimizer` makes today.
 
 ### What each part owns
 
@@ -315,10 +328,11 @@ dtype is in `PrecisionSpec`.
 The initial state is handed over the same way as every other fact: the factory yields full tensors
 under canonical keys, the same for every runner and world size on a given device type and
 `PrecisionSpec`, and the runner writes them into the program it placed. Storage has two owners.
-Replication and sharding are the runner's, so a runner that shards before it initializes slices
-each tensor itself. Fused or model-parallel storage is the component's, converted in its own
-state-dict load and save. Both `initial_state` and `draft_state` therefore speak canonical keys.
-All random draws happen in `initial_state`, on today's device and dtype and in today's order;
+Replication and sharding are the runner's, so a runner that shards before it initializes slices each
+tensor itself. Tensors are yielded one at a time, so the transient cost on a rank is the largest
+single parameter, not the draft. Fused or model-parallel storage is the component's, converted in
+its own state-dict load and save. Both `initial_state` and `draft_state` therefore speak canonical
+keys. All random draws happen in `initial_state`, on today's device and dtype and in today's order;
 `build` draws none.
 
 ### Checkpoints
@@ -409,7 +423,7 @@ the reference has to be re-recorded on whichever build is chosen.
 | `prepare` | `TrainingEngine.initialize`: `model_config.build()` on the meta device → `model.parallelize(...)` → `to_empty` → `init_weights` → optimizer → checkpointer | Every stateful child must implement torchtitan's `Module` protocol; `_parallelize` raises on a plain `nn.Module` that owns parameters or buffers. The adapter has to meet that protocol for any component generically; a second implementation per component is not part of this design unless decision 11 allows it. Parameters are sharded before `init_weights`, while `initial_state` yields full tensors under canonical keys, so the adapter slices each one for its shards; torchtitan's own route for initial weights is its checkpointer with a state-dict adapter. `Config` must provide `max_context_length`, `get_parameter_counts` and `build_flops_estimator` |
 | Process model | the constructor binds the device, applies NUMA binding, seeds RNG and sets group timeouts | make each a no-op or the single owner |
 | `forward_backward` | `engine.forward_backward` expects its micro-batch type, `global_loss_token_counts` before the forward, and `preprocess_inputs`; accelerator-graph capture is on by default and forbids host syncs and varying shapes | miles bypasses it and drives `model_parts`, `loss_fn` and `engine.loss` itself, with a stateful loss object. Either route depends on engine internals; say which |
-| Reduction | stock FSDP2 divides; torchtitan disables the division only inside its decoder helper; deferring the reduction to the last micro-batch is opt-in | the adapter's own `_apply_fsdp` decides, and `apply_step` scales accordingly |
+| Reduction | stock FSDP2 divides; torchtitan turns the division off in each model's own FSDP setup (`apply_fsdp_to_decoder`, and the flux and Transformers-backend equivalents), not in the engine; deferring the reduction to the last micro-batch is opt-in | the adapter's own `_apply_fsdp` decides, and `apply_step` scales accordingly |
 | `apply_step` | `engine.optim_step()`: clip, finite check by `torch._assert_async`, step, scheduler | scale the reduced gradients before it |
 | `save_resume`, `load_resume` | its checkpointer saves on its own interval, model-only at the last step by default, rotates, and loads the newest step in its folder. It saves no RNG | drive it explicitly; add RNG; reconcile its step counter with the run record |
 | `draft_state` | no engine call gathers a full state | gather; map names to canonical keys; cast to the artifact dtype |
