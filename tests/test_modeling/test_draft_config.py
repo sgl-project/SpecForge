@@ -12,7 +12,7 @@ from transformers import LlamaConfig, PretrainedConfig, Qwen3Config
 
 from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft.config import AutoDraftConfig
-from specforge.modeling.draft.registry import DRAFT_REGISTRY
+from specforge.modeling.draft.registry import resolve_draft
 
 
 class DraftConfigTest(unittest.TestCase):
@@ -67,7 +67,7 @@ class DraftConfigTest(unittest.TestCase):
             config = AutoDraftConfig.from_pretrained("org/draft")
         self.assertEqual(config.draft_vocab_size, payload["vocab_size"])
 
-        model_cls = DRAFT_REGISTRY[payload["architectures"][0]]
+        model_cls = resolve_draft(payload["architectures"][0])
         with mock.patch.object(model_cls, "from_pretrained") as load:
             AutoDraftModel.from_pretrained(self.path.parent)
         config = load.call_args.kwargs["config"]
@@ -143,7 +143,7 @@ class DraftConfigTest(unittest.TestCase):
         self.assertTrue(hub.call_args.kwargs["local_files_only"])
 
     def test_pretrained_model_passes_source_options_and_normalized_config(self):
-        model_cls = DRAFT_REGISTRY["LlamaForCausalLMEagle3"]
+        model_cls = resolve_draft("LlamaForCausalLMEagle3")
         with (
             mock.patch.object(
                 PretrainedConfig, "get_config_dict", return_value=(self.payload, {})
@@ -167,7 +167,7 @@ class DraftConfigTest(unittest.TestCase):
 
     def test_explicit_config_is_preserved_for_pretrained_model(self):
         config = AutoDraftConfig.from_dict(self.payload)
-        model_cls = DRAFT_REGISTRY["LlamaForCausalLMEagle3"]
+        model_cls = resolve_draft("LlamaForCausalLMEagle3")
         with (
             mock.patch.object(AutoDraftConfig, "from_pretrained") as parse,
             mock.patch.object(model_cls, "from_pretrained") as load,
