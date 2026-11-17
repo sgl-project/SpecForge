@@ -898,6 +898,58 @@ class ConfigSchemaTest(unittest.TestCase):
                 resolved = resolve_objective(architecture, loss={"fused": enabled})
                 self.assertEqual(resolved.execution.fused, enabled)
 
+    def test_removed_loss_keys_name_the_replacement(self):
+        from specforge.config.removed_fields import REMOVED_LOSS_FIELDS
+
+        for key, replacement in REMOVED_LOSS_FIELDS.items():
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError) as caught:
+                    Config.model_validate({**MINIMAL, "training": {key: True}})
+                self.assertIn(replacement, str(caught.exception))
+                with self.assertRaises(ValueError) as caught:
+                    apply_overrides(
+                        Config.model_validate(MINIMAL), [f"training.{key}=true"]
+                    )
+                self.assertIn(replacement, str(caught.exception))
+                # a dotted override cannot create the nested mapping
+                self.assertIn("training.loss={", str(caught.exception))
+        config = apply_overrides(
+            Config.model_validate(MINIMAL),
+            ["training.loss={execution: {chunk_size: 64}}"],
+        )
+        self.assertEqual(config.training.loss, {"execution": {"chunk_size": 64}})
+
+    def test_removed_keys_name_their_replacement(self):
+        """A recipe written for the legacy entry learns where each setting went."""
+        from specforge.config.removed_fields import REMOVED_FIELDS
+        from specforge.config.schema import (
+            InitializationConfig,
+            ModelConfig,
+            TrainingConfig,
+        )
+
+        for section, fields in REMOVED_FIELDS.items():
+            for key, replacement in fields.items():
+                with self.subTest(key=f"{section}.{key}"):
+                    payload = {**MINIMAL, section: {**MINIMAL.get(section, {}), key: 1}}
+                    with self.assertRaises(ValueError) as caught:
+                        Config.model_validate(payload)
+                    self.assertIn(
+                        f"{section}.{key} -> {replacement}", str(caught.exception)
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        apply_overrides(
+                            Config.model_validate(MINIMAL), [f"{section}.{key}=1"]
+                        )
+                    self.assertIn(replacement, str(caught.exception))
+        # the table only lists fields that are really gone from the schema
+        for section, model in (
+            ("model", ModelConfig),
+            ("training", TrainingConfig),
+            ("initialization", InitializationConfig),
+        ):
+            self.assertFalse(REMOVED_FIELDS[section].keys() & model.model_fields.keys())
+
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")
         payload["training"]["loss"] = {"terms": {"token": {"kind": "lk_tv"}}}

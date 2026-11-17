@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
-from .removed_fields import reject_removed_loss_fields
+from .removed_fields import reject_removed_fields, reject_removed_loss_fields
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
@@ -263,6 +263,13 @@ class StrictConfigModel(BaseModel):
 
 
 class ModelConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("model", value)
+        return value
+
     target_model_path: str
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
@@ -965,6 +972,13 @@ class WeightsFromConfig(StrictConfigModel):
 
 
 class InitializationConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("initialization", value)
+        return value
+
     checkpoint: Optional[str] = None
     weights_from: Optional[WeightsFromConfig] = None
     from_target: Optional[dict] = None
@@ -1061,9 +1075,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _reject_removed_loss_fields(cls, value):
+    def _reject_removed_fields(cls, value):
         if isinstance(value, dict):
             reject_removed_loss_fields(value)
+            reject_removed_fields("training", value)
         return value
 
     @field_validator("loss")
@@ -1420,8 +1435,10 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
         keys = path.split(".")
-        if len(keys) > 1 and keys[0] == "training":
-            reject_removed_loss_fields({keys[1]}, override=True)
+        if len(keys) > 1:
+            if keys[0] == "training":
+                reject_removed_loss_fields({keys[1]}, override=True)
+            reject_removed_fields(keys[0], {keys[1]})
         owner, node = config, raw
         for key in keys[:-1]:
             owner = _override_field(owner, key, path)

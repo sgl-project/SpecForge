@@ -102,9 +102,9 @@ avoids terminating healthy training merely because it runs longer than a fixed
 wall-clock default. An explicitly configured timeout is terminal: expiration
 fails the attempt and runs its feature cleanup.
 
-The file loader translates the former `training.deployment_mode`,
-`training.server_urls`, and `training.metadata_db_path` fields at its migration
-boundary. New recipes use `deployment`; `training.role` remains the canonical
+The former `training.deployment_mode`, `training.server_urls` and
+`training.metadata_db_path` fields are rejected with the `deployment` setting
+that replaces each. Recipes use `deployment`; `training.role` remains the canonical
 persisted role selection and normally stays `auto` for a shared config.
 
 ## Single-node producer and consumer
