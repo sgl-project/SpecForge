@@ -244,7 +244,6 @@ Export the runtime checkpoint as an SGLang serving directory:
 ```bash
 specforge export --converter sglang \
   --checkpoint ./outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/qwen3.6-27b-dflash2-disaggregated-with-selector-latest \
-  --draft-config configs/qwen3.6-27b-dflash2.json \
   --target-model /path/to/Qwen3.6-27B \
   --output-dir ./exports/qwen3.6-27b-dflash2
 ```
