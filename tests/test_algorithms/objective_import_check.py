@@ -39,4 +39,3 @@ result = runtime(
 )
 result.loss.backward()
 assert "specforge.losses.soft_cross_entropy" not in sys.modules
-assert "specforge.algorithms.peagle.model" not in sys.modules

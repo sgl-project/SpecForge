@@ -1,8 +1,6 @@
 # coding=utf-8
 """Config-to-assembly reachability for retained training capabilities."""
 
-import json
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,9 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
 
 OFFLINE_EAGLE3 = {
+    "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
     "model": {
         "target_model_path": "target",
-        "draft_model_config": "draft.json",
         "vocab_mapping_path": "mapping.pt",
     },
     "data": {"hidden_states_path": "features"},
@@ -33,15 +31,6 @@ OFFLINE_EAGLE3 = {
 
 
 class UnifiedFeatureReachabilityTest(unittest.TestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        draft = Path(directory.name) / "config.json"
-        draft.write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}))
-        patch = mock.patch.dict(OFFLINE_EAGLE3["model"], draft_model_config=str(draft))
-        patch.start()
-        self.addCleanup(patch.stop)
-
     def test_all_example_configs_validate_without_remote_target_downloads(self):
         paths = sorted(
             path
@@ -109,30 +98,24 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         resolved = resolve_run(cfg)
 
         self.assertEqual(
-            resolved.algorithm.providers.step.options(cfg),
-            {
-                "trim_loss_positions": True,
-                "compact_teacher": True,
-                "compact_teacher_chunk_size": 2048,
-            },
+            resolved.config.training.loss["execution"],
+            {"trim": True, "teacher_chunk_size": 2048},
         )
 
-    def test_trim_loss_positions_rejects_non_eagle3_strategy(self):
+    def test_trim_loss_positions_reaches_block_objectives(self):
         cfg = Config.model_validate(
             {
                 **OFFLINE_EAGLE3,
+                "model": {"target_model_path": "target"},
+                "draft": "specforge/config/draft/presets/qwen3-8b-dflash.yaml",
                 "training": {
-                    "strategy": "dflash",
                     "loss": {"execution": {"trim": True}},
                 },
             }
         )
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "algorithm 'dflash' does not support training.loss.execution.trim",
-        ):
-            resolve_run(cfg)
+        resolved = resolve_run(cfg)
+        self.assertTrue(resolved.config.training.loss["execution"]["trim"])
 
     def test_loader_and_profiler_options_reach_the_canonical_trainer(self):
         eagle = resolve_run(Config.model_validate(OFFLINE_EAGLE3))
@@ -140,7 +123,8 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             Config.model_validate(
                 {
                     **OFFLINE_EAGLE3,
-                    "training": {"strategy": "dflash"},
+                    "draft": "specforge/config/draft/presets/qwen3-8b-dflash.yaml",
+                    "model": {"target_model_path": "target"},
                 }
             )
         )
@@ -163,6 +147,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
 
         self.assertEqual(_dataloader_num_workers(eagle.config, eagle.algorithm), 4)
+        # the block objectives declare the loader default they were tuned with
         self.assertEqual(_dataloader_num_workers(dflash.config, dflash.algorithm), 8)
         self.assertEqual(
             _dataloader_num_workers(explicit.config, explicit.algorithm), 2
@@ -194,19 +179,20 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             },
         }
         with self.assertRaisesRegex(
-            ValueError, "does not support compact teacher for mode='streaming'"
+            ValueError, "compact teacher currently requires offline"
         ):
             resolve_run(Config.model_validate(online))
 
         with self.assertRaisesRegex(
-            ValueError, "algorithm 'dflash' does not support compact teacher"
+            ValueError, "compact teacher requires a vocabulary-aware protocol"
         ):
             resolve_run(
                 Config.model_validate(
                     {
                         **OFFLINE_EAGLE3,
+                        "draft": "specforge/config/draft/presets/qwen3-8b-dflash.yaml",
+                        "model": {"target_model_path": "target"},
                         "training": {
-                            "strategy": "dflash",
                             "loss": {"execution": {"teacher_chunk_size": 32768}},
                         },
                     }
@@ -253,8 +239,8 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         self.assertEqual(args.wandb_dir, "/tmp/wandb")
         self.assertEqual(args.specforge_config["run_id"], "run")
         self.assertEqual(
-            args.specforge_config["training"]["strategy"],
-            cfg.training.strategy,
+            args.specforge_config["training"]["objective"],
+            cfg.training.objective,
         )
         self.assertEqual(output_dir, "/tmp/output")
         self.assertIs(create.call_args.kwargs["console_logger"], _logger)
