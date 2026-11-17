@@ -45,6 +45,8 @@ class Case:
     lk_lambda: bool = False
     selector: bool = True
     confidence: bool = True
+    # Relative tolerance against the recorded values on another platform.
+    tolerance: float = 1e-4
 
 
 CASES = (
@@ -63,7 +65,9 @@ CASES = (
     Case("domino shifted", "domino", shifted=True),
     Case("dspark", "dspark"),
     Case("dspark without a confidence head", "dspark", confidence=False),
-    Case("dspine", "dspine"),
+    # DSpine's metrics move a few hundred times the rounding noise of its
+    # inputs (3e-4 between macOS arm64 and Linux x86), whatever the optimizer.
+    Case("dspine", "dspine", tolerance=2e-3),
 )
 
 
@@ -165,7 +169,10 @@ def fit(runtime, tensors, *, steps=18):
         for name, parameter in runtime.draft_model.named_parameters()
         if parameter.requires_grad and name not in TARGET_TABLES
     ]
-    optimizer = torch.optim.Adam(trained, lr=1e-2)
+    # Adam's default epsilon turns a gradient of rounding noise into a full
+    # step, so the fitted weights would differ between platforms; this one
+    # leaves such gradients where they are.
+    optimizer = torch.optim.Adam(trained, lr=1e-2, eps=1e-2)
     for index in range(steps):
         optimizer.zero_grad()
         torch.manual_seed(100 + index)
@@ -226,7 +233,10 @@ class MetricGoldenTest(unittest.TestCase):
                     # Loose enough for another BLAS after eighteen optimizer
                     # steps; a wrong formula moves a value by a token in dozens.
                     self.assertAlmostEqual(
-                        actual[key], value, delta=1e-5 + 1e-4 * abs(value), msg=key
+                        actual[key],
+                        value,
+                        delta=1e-5 + case.tolerance * abs(value),
+                        msg=key,
                     )
         if update:
             GOLDENS.write_text(json.dumps(recorded, indent=1, sort_keys=True) + "\n")
