@@ -7,7 +7,7 @@ import torch
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from specforge.algorithms.dspine.strategy import DSpineTrainStrategy
-from specforge.core import fused_loss
+from specforge.algorithms.objectives.implementations import fused_loss
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext
 from tests.test_modeling.test_dspine import training_inputs, training_model
@@ -255,7 +255,7 @@ class DSpineOptimizationsTest(unittest.TestCase):
                         "torch.utils.checkpoint.checkpoint", wraps=activation_checkpoint
                     ) as checkpoint_call,
                     patch(
-                        "specforge.core.fused_loss.fused_ce_l1_loss",
+                        "specforge.algorithms.objectives.implementations.fused_loss.fused_ce_l1_loss",
                         wraps=fused_loss.fused_ce_l1_loss,
                     ) as fused_call,
                 ):

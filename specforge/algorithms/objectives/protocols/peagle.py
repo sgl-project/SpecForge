@@ -9,11 +9,11 @@ from specforge.algorithms.common.cod import (
     generate_cod_sample_indices,
 )
 
-from .base import check_options
-from .inputs import gather, sequence_inputs, valid_tokens
-from .losses import TokenLoss
-from .predictions import PredictionBatch
-from .registry import TrainingRequirements, register_protocol
+from ..base import check_options
+from ..inputs import gather, sequence_inputs, valid_tokens
+from ..losses import TokenLoss
+from ..predictions import PredictionBatch
+from ..registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(

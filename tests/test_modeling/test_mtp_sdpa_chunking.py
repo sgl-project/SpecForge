@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 
 from specforge.algorithms.objectives import build_objective_model
-from specforge.algorithms.objectives.mtp import prepare_supervised_rows
+from specforge.algorithms.objectives.protocols.mtp import prepare_supervised_rows
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_checkpoint.test_native_presets import native_configs
@@ -80,7 +80,12 @@ class MTPBackendObjectiveTest(unittest.TestCase):
                         self.assertEqual(
                             head.call_count,
                             forward_calls
-                            * (2 if 0 < chunk_size < selected.numel() else 1),
+                            * (
+                                2
+                                if 0 < chunk_size < selected.numel()
+                                and runtime.execution.checkpoint
+                                else 1
+                            ),
                         )
                         self.assertLessEqual(
                             max(call.args[0].shape[0] for call in head.call_args_list),
@@ -156,7 +161,7 @@ class MTPBackendObjectiveTest(unittest.TestCase):
             torch.cuda.set_sync_debug_mode(previous)
 
     def test_chunk_sizes_validate(self):
-        from specforge.algorithms.objectives.mtp import MTPObjective
+        from specforge.algorithms.objectives.protocols.mtp import MTPObjective
 
         for value in (-1, True, 0.5):
             with self.assertRaises(ValueError):

@@ -218,6 +218,104 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
         return trainer, model, seen
 
+    def test_resolved_loss_implementations_are_saved_and_restored(self):
+        from specforge.algorithms.objectives.implementations.registry import (
+            ExecutionSelection,
+        )
+        from specforge.training.checkpoint import CheckpointManager
+
+        Composite, _, _ = _fake_seam()
+        with tempfile.TemporaryDirectory() as workdir:
+            features = _write_feature_files(os.path.join(workdir, "features"), n=4)
+            out = os.path.join(workdir, "out")
+            model = Composite()
+            model.loss_implementations = ExecutionSelection()
+            contract = {
+                "canonical_loss_implementations": model.loss_implementations.names,
+                "canonical_loss_execution": {"fused": True},
+            }
+            trainer, _, _ = self._make_trainer(
+                out,
+                feat_dir=features,
+                max_steps=1,
+                model=model,
+                checkpoint_extra=contract,
+            )
+            # Selection happens after Trainer construction, on the first real batch.
+            model.loss_implementations.names["0:0"] = "token_ce"
+            trainer.fit()
+            checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
+            state = CheckpointManager.read_resume_state(checkpoint)
+            self.assertEqual(
+                state["canonical_loss_implementations"], {"0:0": "token_ce"}
+            )
+            model = Composite()
+            model.loss_implementations = ExecutionSelection()
+            contract["canonical_loss_implementations"] = (
+                model.loss_implementations.names
+            )
+            with mock.patch.object(
+                model.loss_implementations,
+                "restore",
+                wraps=model.loss_implementations.restore,
+            ) as restore:
+                self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    model=model,
+                    checkpoint_extra=contract,
+                    resume_from=checkpoint,
+                )
+            restore.assert_called_once_with({"0:0": "token_ce"})
+            # Old fused checkpoints cannot prove which implementation ran.
+            state.pop("canonical_loss_implementations")
+            torch.save(state, os.path.join(checkpoint, "training_state.pt"))
+            with self.assertRaisesRegex(ValueError, "does not record resolved"):
+                self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    model=model,
+                    checkpoint_extra=contract,
+                    resume_from=checkpoint,
+                )
+
+    def test_old_checkpoint_uses_default_execution_options(self):
+        from dataclasses import asdict
+
+        from specforge.algorithms.objectives.execution_options import LossExecution
+
+        with tempfile.TemporaryDirectory() as workdir:
+            features = _write_feature_files(os.path.join(workdir, "features"), n=4)
+            out = os.path.join(workdir, "out")
+            trainer, _, _ = self._make_trainer(out, feat_dir=features, max_steps=1)
+            trainer.fit()
+            checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
+            defaults = {
+                "canonical_loss_execution": asdict(LossExecution()),
+                "canonical_use_fused_conv": False,
+            }
+            self._make_trainer(
+                out,
+                feat_dir=features,
+                max_steps=2,
+                resume_from=checkpoint,
+                checkpoint_extra=defaults,
+            )
+            for key, value in (
+                ("canonical_loss_execution", asdict(LossExecution(chunk_size=1))),
+                ("canonical_use_fused_conv", True),
+            ):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                    self._make_trainer(
+                        out,
+                        feat_dir=features,
+                        max_steps=2,
+                        resume_from=checkpoint,
+                        checkpoint_extra={**defaults, key: value},
+                    )
+
     def test_resume_continues_where_the_run_stopped(self):
         from specforge.training.checkpoint import CheckpointManager
 

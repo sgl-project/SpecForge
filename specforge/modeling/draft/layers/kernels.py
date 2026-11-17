@@ -1,5 +1,10 @@
 """Opt-in Liger RMSNorm and SwiGLU without changing checkpoint parameters."""
 
+import logging
+
+import torch
+
+from .conv.grouped_causal import GroupedCausalConv
 from .mlp.dense import DenseFFN
 from .norm.rms import RMSNorm
 
@@ -11,7 +16,34 @@ def load_liger_kernels():
     return LigerRMSNormFunction.apply, LigerSiLUMulFunction.apply
 
 
-def configure_kernels(model, *, use_liger=False):
+def configure_kernels(model, *, use_liger=False, use_fused_conv=False):
+    convolutions = [m for m in model.modules() if isinstance(m, GroupedCausalConv)]
+    if use_fused_conv:
+        if not convolutions:
+            raise ValueError("use_fused_conv requires a grouped convolution")
+        for module in convolutions:
+            if not module.base_kernel.is_cuda or module.base_kernel.dtype not in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            ):
+                raise ValueError(
+                    "use_fused_conv requires CUDA/ROCm FP16/BF16/FP32 weights"
+                )
+        from .conv.triton import supports_group_size
+
+        for module in convolutions:
+            if not supports_group_size(module.config.group_size):
+                raise ValueError(
+                    "use_fused_conv requires a power-of-two group_size <= 1024"
+                )
+    for module in convolutions:
+        module.use_fused = use_fused_conv
+    if convolutions:
+        logging.getLogger(__name__).info(
+            "Grouped convolution uses %s", "Triton" if use_fused_conv else "eager"
+        )
+
     if not use_liger:
         for module in model.modules():
             if isinstance(module, RMSNorm):

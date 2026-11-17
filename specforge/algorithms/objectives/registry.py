@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .base import ObjectiveModel
+from .execution_options import LossExecution
 from .losses import PositionWeighting, TokenLoss
 
 
@@ -60,6 +61,26 @@ def register_protocol(
     training=TrainingRequirements(),
     legacy_strategy=None,
 ):
+    """Register an algorithm objective and its training requirements.
+
+    Args:
+        name: Unique protocol identifier.
+        architectures: Canonical architecture names supported by the protocol.
+        inputs: Required batch tensor names.
+        provides: Capabilities made available by the protocol's predictions.
+        trains: Module paths that the objective trains.
+        requires: Capabilities required regardless of the selected common loss.
+        default: Whether this becomes the default for the listed architectures.
+        training: Data, capture and execution requirements used by composition.
+        legacy_strategy: Optional existing data/rendezvous strategy identifier.
+
+    Returns:
+        A decorator registering and returning the objective factory unchanged.
+
+    Raises:
+        ValueError: The name or an architecture's default is already registered.
+    """
+
     def register(factory):
         if name in _PROTOCOLS:
             raise ValueError(f"objective already registered: {name}")
@@ -89,6 +110,7 @@ class ResolvedObjective:
     objective: object
     loss: TokenLoss
     weighting: PositionWeighting
+    execution: LossExecution
 
     @property
     def requires_teacher(self):
@@ -96,9 +118,26 @@ class ResolvedObjective:
 
 
 def resolve_objective(
-    architecture, *, name=None, options=None, loss=None, weighting=None
+    architecture, *, name=None, options=None, loss=None, weighting=None, execution=None
 ):
-    """Resolve defaults and capture requirements without constructing a model."""
+    """Resolve algorithm and loss settings without constructing a model.
+
+    Args:
+        architecture: Canonical draft architecture name.
+        name: Optional protocol name; otherwise use the architecture's default.
+        options: Algorithm-specific objective constructor options.
+        loss: Common mathematical loss configuration, or algorithm defaults.
+        weighting: Common position-weighting configuration, or algorithm defaults.
+        execution: Loss execution options such as chunking and fused kernels.
+
+    Returns:
+        ResolvedObjective with the objective, concrete loss/weighting, execution
+        options and registration updated with required capture inputs.
+
+    Raises:
+        ValueError: Selection is unknown/incompatible, options are shadowed,
+            or required capabilities are unavailable.
+    """
     name = name or default_protocol(architecture)
     if name not in _PROTOCOLS:
         raise ValueError(f"unknown objective: {name!r}")
@@ -107,6 +146,7 @@ def resolve_objective(
         raise ValueError(f"objective {name!r} does not support {architecture}")
     objective = entry.factory(**(options or {}))
     token_loss = TokenLoss(**(loss or {}))
+    execution = LossExecution(**(execution or {}))
     _reject_shadowed_options(
         options,
         weighting is not None,
@@ -125,6 +165,8 @@ def resolve_objective(
     selected_loss = (
         objective.default_loss if token_loss.kind == "default" else token_loss
     )
+    if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
+        raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (
         entry.requires | selected_loss.requires | position_weighting.requires
     ) - entry.provides
@@ -135,7 +177,9 @@ def resolve_objective(
     entry = replace(
         entry, inputs=tuple(dict.fromkeys(entry.inputs + selected_loss.inputs))
     )
-    return ResolvedObjective(name, entry, objective, selected_loss, position_weighting)
+    return ResolvedObjective(
+        name, entry, objective, selected_loss, position_weighting, execution
+    )
 
 
 def build_objective_model(
@@ -147,15 +191,51 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
+    execution=None,
 ):
+    """Compose a draft model with its objective and selected loss execution.
+
+    Args:
+        draft_model: Constructed canonical draft model.
+        name: Optional protocol name; defaults from the draft architecture.
+        options: Algorithm-specific objective options.
+        frozen: Additional module/parameter paths to freeze.
+        target_head: Optional teacher head; it is frozen and kept in eval mode.
+        loss: Common mathematical loss configuration.
+        weighting: Common position-weighting configuration.
+        execution: Loss execution configuration.
+
+    Returns:
+        ObjectiveModel wrapping the existing draft and optional teacher head.
+        Parameter freezing is applied to these modules after compatibility checks.
+
+    Raises:
+        ValueError: Requested capabilities, vocabulary optimization, or freezing
+            settings are incompatible with the model/protocol.
+    """
     resolved = resolve_objective(
         draft_model.config.draft.architecture,
         name=name,
         options=options,
         loss=loss,
         weighting=weighting,
+        execution=execution,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    if resolved.execution.teacher_chunk_size:
+        from torch import nn
+
+        from specforge.modeling.draft.bindings import BoundLMHead
+
+        if not (
+            isinstance(target_head, BoundLMHead)
+            or isinstance(target_head, nn.Linear)
+            and target_head.bias is None
+        ):
+            raise ValueError("compact teacher requires a linear teacher head")
+        draft = draft_model.config.draft
+        if draft.draft_vocab_size >= draft.vocab_size:
+            raise ValueError("compact teacher requires a reduced draft vocabulary")
     requested = tuple(frozen)
     # a protocol may freeze an optional head this draft disables (set to None)
     declared = getattr(objective, "frozen_parameters", ())
@@ -204,6 +284,7 @@ def build_objective_model(
         token_loss=resolved.loss,
         weighting=resolved.weighting,
         frozen_parameters=frozen,
+        execution=resolved.execution,
     )
 
 
@@ -218,10 +299,22 @@ def _reject_shadowed_options(options, replaced, names, selection):
 
 
 def protocol_registrations():
+    """Return a shallow copy of the protocol-name to registration mapping."""
     return dict(_PROTOCOLS)
 
 
 def default_protocol(architecture):
+    """Return the default protocol name for an architecture.
+
+    Args:
+        architecture: Canonical draft architecture name.
+
+    Returns:
+        The registered default protocol identifier.
+
+    Raises:
+        ValueError: No default is registered for the architecture.
+    """
     if architecture not in _DEFAULTS:
         raise ValueError(f"no default objective for {architecture!r}")
     return _DEFAULTS[architecture]

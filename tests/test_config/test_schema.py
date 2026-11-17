@@ -568,7 +568,7 @@ class ConfigSchemaTest(unittest.TestCase):
             Config.model_validate(payload)
 
     def test_mtp_objective_chunk_size_yaml_reaches_model(self):
-        from specforge.algorithms.objectives.mtp import MTPObjective
+        from specforge.algorithms.objectives.protocols.mtp import MTPObjective
 
         for chunk_size in (None, 0, 17):
             with self.subTest(chunk_size=chunk_size):

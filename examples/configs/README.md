@@ -215,6 +215,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
+| `model.use_fused_conv` | `false` | Opt canonical grouped convolution into its existing CUDA/ROCm fused kernel; independent of Liger. |
 | `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. Canonical runs (top-level `draft`, `initialization` or `resume`, or a canonical checkpoint in `training.resume_from`) use PyTorch kernels unless this is `true`; `true` swaps in Liger RMSNorm and SiLU-gated SwiGLU on CUDA/ROCm only and is recorded in the resume contract. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
@@ -288,6 +289,7 @@ Common fields:
 | `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
+| `training.loss_execution` | `{}` | Canonical projection/loss execution: `chunk_size`, `checkpoint`, `fused`, `trim`, and offline `teacher_chunk_size`. See [loss execution](../../docs/draft_training.md#loss-execution). |
 | `training.loss` | `{}` | Canonical token loss, for example `{kind: kl}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |

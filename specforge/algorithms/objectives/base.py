@@ -49,8 +49,14 @@ class ObjectiveModel(nn.Module):
         token_loss=None,
         weighting=None,
         frozen_parameters=(),
+        execution=None,
     ):
         super().__init__()
+        from .execution_options import LossExecution
+        from .implementations.registry import ExecutionSelection
+
+        self.execution = execution or LossExecution()
+        self.loss_implementations = ExecutionSelection()
         self.draft_model = draft_model
         self.objective = objective
         self.registration = registration
@@ -83,10 +89,33 @@ class ObjectiveModel(nn.Module):
         sequence_ids=None,
         projection_inputs=None,
         auxiliary_inputs=None,
+        projection=None,
         **options,
     ):
+        """Align algorithm output and supervision into deferred prediction units.
+
+        Args:
+            hidden: Backbone hidden states, with hidden size in the last dimension.
+            batch: Captured batch tensors; teacher logits or hidden states are optional.
+            teacher_positions: Indices used to gather teacher supervision.
+            mask: Supervision weights/eligibility aligned with the prediction positions.
+            labels: Optional hard token targets aligned with mask.
+            positions: Optional position/depth values used by weighting.
+            unit_size: Number of positions in each indivisible projection unit.
+            chain_ids: Optional acceptance-chain IDs broadcastable to the unit layout.
+            sequence_ids: Optional source-sequence IDs broadcastable to mask.
+            projection_inputs: Extra aligned tensors passed to the projection.
+            auxiliary_inputs: Extra aligned tensors consumed by algorithm auxiliaries.
+            projection: Optional adapter; defaults to the draft's ordinary project.
+            **options: Remaining Predictions fields, such as plan and denominator.
+
+        Returns:
+            Predictions with tensors aligned to [units, positions, ...]. Draft
+            projection is deferred; teacher data is gathered but not projected.
+        """
         from .inputs import gather
         from .predictions import Predictions, Teacher
+        from .projection import Projection
 
         def align(value):
             return value.reshape(-1, unit_size, *value.shape[mask.ndim :])
@@ -114,7 +143,7 @@ class ObjectiveModel(nn.Module):
             )
         return Predictions(
             hidden=hidden,
-            projector=self.draft_model.project,
+            projection=projection or Projection(self.draft_model.project),
             mask=mask.reshape(-1, unit_size),
             chain_ids=torch.broadcast_to(chain_ids, hidden.shape[:2]),
             sequence_ids=torch.broadcast_to(sequence_ids, mask.shape).reshape(
@@ -133,6 +162,17 @@ class ObjectiveModel(nn.Module):
         )
 
     def block_predictions(self, output, blocks, batch, **options):
+        """Build deferred predictions for complete algorithm proposal blocks.
+
+        Args:
+            output: Draft forward output containing hidden_states.
+            blocks: Prepared tokens, labels, masks and teacher positions.
+            batch: Captured batch inputs used to gather teacher data.
+            **options: Projection, loss plan and other prediction overrides.
+
+        Returns:
+            Predictions preserving the configured number of model slots per block.
+        """
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
         return self.predictions(
@@ -175,6 +215,8 @@ class ObjectiveModel(nn.Module):
             self.token_loss,
             self.weighting,
             training=self.draft_model.training,
+            execution=self.execution,
+            selection=self.loss_implementations,
         )
 
 

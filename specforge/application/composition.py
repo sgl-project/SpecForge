@@ -53,16 +53,7 @@ def resolve_run(
     if enabled(cfg):
         cfg, algorithm = resolve_canonical_run(cfg, target_config=target_config)
         return bind_run(cfg, algorithm)
-    if (
-        cfg.training.objective
-        or cfg.training.objective_options
-        or cfg.training.frozen
-        or cfg.training.loss
-        or cfg.training.weighting is not None
-    ):
-        raise ValueError(
-            "objective/options/frozen/loss/weighting require the canonical draft loading path"
-        )
+    cfg.validate_legacy_training_options()
     if registry is None:
         from specforge.algorithms.builtin import builtin_algorithm_registry
 

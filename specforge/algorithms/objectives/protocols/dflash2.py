@@ -2,15 +2,15 @@
 
 from dataclasses import dataclass
 
-from specforge.core.fused_loss import ce_l1_loss
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
-from .base import check_options
+from ..base import check_options
+from ..inputs import prepare_blocks
+from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
+from ..predictions import AuxiliaryLoss, PredictionBatch
+from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
-from .inputs import prepare_blocks
-from .losses import TokenLoss, decay_weighting
-from .predictions import AuxiliaryLoss, PredictionBatch
-from .registry import TrainingRequirements, register_protocol
 
 
 @register_protocol(
@@ -104,9 +104,9 @@ class DFlash2Objective:
         )
         scale = self.selector_loss_alpha * self.selector_scale(step, total_steps)
 
-        def auxiliary(predictions, projected, teacher, weights):
+        def auxiliary(predictions, projected, teacher, weights, statistics, primitives):
             labels = predictions.labels
-            terms = ce_l1_loss(
+            terms = primitives["ce_l1"](
                 projected["logits"],
                 labels,
                 top_k=model.config.draft.spec_config.selector_top_k,
@@ -121,16 +121,17 @@ class DFlash2Objective:
                 predecessor_ids=predictions.auxiliary_inputs["predecessors"],
             )
             covered = terms.topk_ids == labels[..., None]
-            selector = ce_l1_loss(
+            selector = primitives["ce_l1"](
                 scores, covered.long().argmax(-1)
             ).cross_entropy * covered.any(-1)
-            return AuxiliaryLoss(scale * selector)
+            return AuxiliaryLoss({"selector": selector})
 
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             auxiliary=auxiliary,
+            plan=LossPlan(auxiliary_terms=(LossTerm("selector", scale),)),
             auxiliary_inputs={"predecessors": blocks.predecessors},
         )
         return PredictionBatch((predictions,))
