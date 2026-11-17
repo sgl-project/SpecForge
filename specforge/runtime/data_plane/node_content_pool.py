@@ -93,6 +93,13 @@ class NodeContentPool:
         self.max_entries = self.budgets['max_entries']
         self.max_page_count = self.budgets['max_page_count']
         self._diag = get_diagnostics().component('node_pool')
+        self.batch_enabled = os.environ.get('SPECFORGE_TRAINER_NODE_POOL_BATCHED', '0') == '1'
+        self._batch_windows = {}
+        self._batch_high_water = {}
+        self._batch_closing = False
+        if self.batch_enabled:
+            from .node_pool_batch import batch_limits
+            self.batch_limits = batch_limits()
         self._transaction_sequence = 0
         self._observed_metadata = {}
         self.wait_timeout = float(wait_timeout_s)
@@ -360,6 +367,8 @@ class NodeContentPool:
         Return None when all capacity is held by readers/writers. The caller
         then fetches one segment through staging directly into its final batch.
         """
+        if self.batch_enabled:
+            raise RuntimeError('batched pool requires acquire_many to preserve its window bound')
         nbytes = int(nbytes)
         extent = (nbytes + 4095) // 4096 * 4096
         deadline = time.monotonic() + self.wait_timeout
@@ -489,6 +498,52 @@ class NodeContentPool:
             db.execute('DELETE FROM pins WHERE token=? AND key=? AND generation=? AND client=?',
                        (token, key, generation, self.client))
 
+    def acquire_many(self, requests, *, cancelled=None):
+        """Return a bounded context manager; its pins remain owned until exit."""
+        from .node_pool_batch import BatchWindow
+        if not self.batch_enabled:
+            raise RuntimeError('batched node-pool transactions are disabled')
+        return BatchWindow(self, requests, cancelled=cancelled)
+
+    def release_many(self, pins):
+        """Clear exact claims only after DELETEs have successfully committed."""
+        unique = {}
+        for pin in pins:
+            if pin.pool is not self:
+                raise ValueError('batch pin belongs to a different pool')
+            if pin.token is not None:
+                unique[(pin.key, pin.generation, pin.token)] = pin
+        if not unique:
+            return
+        with self._transaction('batch_release') as db:
+            for key, generation, token in unique:
+                db.execute('DELETE FROM pins WHERE token=? AND key=? AND generation=? AND client=?',
+                           (token, key, generation, self.client))
+        for pin in unique.values():
+            token = pin.token
+            pin.tensor, pin.token = None, None
+            window = getattr(pin, '_window', None)
+            if window is not None:
+                window.pin_released(pin.key, token)
+
+    def batch_receive_only(self):
+        return bool(self._batch_windows) and all(window.receive_only() for window in self._batch_windows.values())
+
+    def retry_batch_cleanup(self):
+        """Retry ended contexts only; active/unknown H2D windows remain fenced."""
+        for window in list(self._batch_windows.values()):
+            if window.closing and not window.deferred:
+                window.close()
+
+    def batch_health(self):
+        if not self.batch_enabled:
+            return {}
+        from .node_pool_batch import process_gate
+        window = process_gate().current()
+        current = window.snapshot() if window is not None else {}
+        return {'node_pool_batch_enabled': True, 'node_pool_batch_limits': self.batch_limits,
+                'node_pool_batch_current': current, 'node_pool_batch_high_water': dict(self._batch_high_water)}
+
     def health(self):
         if self._closed:
             return {**self._last_health, 'node_pool_closed': True}
@@ -520,11 +575,17 @@ class NodeContentPool:
                           node_pool_clients=db.execute('SELECT COUNT(*) FROM clients').fetchone()[0],
                           node_pool_quarantined_bytes=0, node_pool_closed=False,
                           node_pool_backing='file-mmap-pageable')
+            result.update(self.batch_health())
             return result
 
     def close(self):
         if self._closed:
             return
+        if self.batch_enabled:
+            with self._lock:
+                if self._batch_windows:
+                    raise RuntimeError('cannot close node content pool with unsettled batch windows')
+                self._batch_closing = True
         with self._file_lock():
             with self._transaction('close') as db:
                 self._reap(db)

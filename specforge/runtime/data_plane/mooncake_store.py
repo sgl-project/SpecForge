@@ -603,6 +603,10 @@ class MooncakeFeatureStore(FeatureStore):
         self.auth = auth or AuthPolicy()
         self._credential = credential
         self.auth.check(credential)  # attach-time gate (B9)
+        use_node_pool = (os.environ.get('SPECFORGE_TRAINER_NODE_POOL', '0') == '1'
+                         if node_pool_enabled is None else bool(node_pool_enabled))
+        if use_node_pool and os.environ.get('SPECFORGE_TRAINER_NODE_POOL_BATCHED', '0') == '1' and receive_buffers != 'pinned':
+            raise ValueError('batched node-pool store requires receive_buffers=pinned')
         self.store_id = store_id or uuid.uuid4().hex[:8]
         if os.environ.get('SPECFORGE_HS_SEGMENTED', '0') == '1' and not os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR'):
             raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
@@ -648,11 +652,10 @@ class MooncakeFeatureStore(FeatureStore):
         self._diagnostics = get_diagnostics()
         self._diag = self._diagnostics.component("store")
         self._node_pool = None
+        self._batch_receive_windows = {}
         self._terminal_proofs = None
         self._terminal_proof_owner = uuid.uuid4().hex
         self._terminal_proof_health = {}
-        use_node_pool = (os.environ.get('SPECFORGE_TRAINER_NODE_POOL', '0') == '1'
-                         if node_pool_enabled is None else bool(node_pool_enabled))
         if use_node_pool:
             from specforge.runtime.data_plane.node_content_pool import NodeContentPool
             directory = os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR')
@@ -1202,8 +1205,26 @@ class MooncakeFeatureStore(FeatureStore):
                 raise RuntimeError('cannot close with unresolved terminal ACK claims')
             self._terminal_proof_health = self._terminal_proofs.health()
             self._terminal_proofs.close()
+        defer_node_close = False
         if self._node_pool is not None:
-            self._node_pool.close()
+            self._node_pool.retry_batch_cleanup()
+            if self._node_pool.batch_receive_only():
+                # A receive-only window cannot release its gate until this
+                # exact owner proves native DMA stopped. CUDA was drained
+                # independently above; this never substitutes for H2D proof.
+                if not self._owns_store or self._receive_pool is None or self._h2d_quarantined:
+                    raise RuntimeError('batch receive quarantine requires its owned transport drain')
+                for window in self._node_pool._batch_windows.values():
+                    binding = self._batch_receive_windows.get(window.id)
+                    if binding is None or len(binding) != 3 or any(actual is not expected for actual, expected in
+                            zip(binding, (window, self._store, self._receive_pool))):
+                        raise RuntimeError('batch receive quarantine owner binding differs')
+                with self._receive_pool._lock:
+                    if self._receive_pool._active:
+                        raise RuntimeError('cannot defer batch close with active receive slots')
+                defer_node_close = True
+            else:
+                self._node_pool.close()
         if self._receive_pool is not None:
             self._receive_pool.close()
         if self._owns_store:
@@ -1214,6 +1235,11 @@ class MooncakeFeatureStore(FeatureStore):
                 self._transport_stopped = True
             if self._receive_pool is not None:
                 self._receive_pool.close(transport_stopped=True)
+            if defer_node_close:
+                for window, backend, receive_pool in list(self._batch_receive_windows.values()):
+                    window.resolve_external('receive')
+                    self._batch_receive_windows.pop(window.id, None)
+                self._node_pool.close()
             self._quarantined_buffers.clear()
             self._quarantined_bytes = 0
             self._capture_quarantined_registrations.clear()
@@ -1342,6 +1368,8 @@ class MooncakeFeatureStore(FeatureStore):
                 item['stream'].synchronize()
                 if item['pin'] is not None:
                     item['pin'].release()
+                if item.get('batch_window') is not None:
+                    item['batch_window'].resolve_deferred(item['batch_index'])
             self._h2d_quarantined.clear()
 
     def _copy_segment_into(self, source, destination, pin=None):
@@ -1415,6 +1443,8 @@ class MooncakeFeatureStore(FeatureStore):
         return tensor, release
 
     def _get_segments(self, ref, name, destination):
+        if self._node_pool is not None and self._node_pool.batch_enabled:
+            return self._get_segments_batched(ref, name, destination)
         from dataclasses import replace
         manifest = self._segment_manifests[ref.sample_id]
         for segment in manifest['features'][name]:
@@ -1466,6 +1496,128 @@ class MooncakeFeatureStore(FeatureStore):
                     pin.release()
                 self._diagnostics.event('finish', op, {'copy_completed': completed,
                     'pin_released': pin is None or pin.token is None})
+        self._segment_counters['segment_materialized_features'] += 1
+
+    def _hold_batch_receive(self, window, *, force=False):
+        if self._receive_pool is not None and (force or self._receive_pool.health()['receive_pool_quarantined_bytes']):
+            window.hold_external('receive')
+            self._batch_receive_windows[window.id] = (window, self._store, self._receive_pool)
+
+    def _get_segments_batched(self, ref, name, destination):
+        from dataclasses import replace
+        from .node_pool_batch import NORMAL_BLOCK_BYTES
+        if self._receive_pool is None or self._receive_pool.kind != 'pinned':
+            raise ValueError('batched node-pool store requires its pinned receive pool before fetch')
+        manifest = self._segment_manifests[ref.sample_id]
+        segments = iter(manifest['features'][name])
+        pending = None
+        while True:
+            group, extent = [], 0
+            while len(group) < self._node_pool.batch_limits['blocks']:
+                segment = pending if pending is not None else next(segments, None)
+                pending = None
+                if segment is None:
+                    break
+                size = (int(segment['nbytes']) + 4095) // 4096 * 4096
+                if size > self._node_pool.batch_limits['extent_bytes']:
+                    raise ValueError('segment exceeds hard batch/fallback extent bound before native fetch')
+                oversized = segment['nbytes'] > NORMAL_BLOCK_BYTES
+                if group and (oversized or extent + size > self._node_pool.batch_limits['extent_bytes']):
+                    pending = segment
+                    break
+                group.append(segment)
+                extent += size
+                if oversized:
+                    break
+            if not group:
+                break
+            records = []
+            window = None
+            for segment in group:
+                spec = replace(ref.feature_specs[name], shape=tuple(segment['shape']))
+                op = self._diagnostics.begin_block({'namespace': manifest['namespace'],
+                    'load_epoch': ref.metadata.get('capture_fence', {}).get('server_epoch'),
+                    'owner_epoch': manifest['owner_epoch'], 'schema_signature': manifest['schema_signature'],
+                    'feature': name, 'logical_key': segment['logical_key'], 'physical_key': segment['key'],
+                    'publication_generation': segment['publication_generation'], 'nbytes': segment['nbytes'],
+                    'dtype': spec.dtype, 'shape': list(spec.shape)})
+                record = {'segment': segment, 'spec': spec, 'op': op, 'fetched': False, 'completed': False}
+                def fetch(record=record):
+                    record['fetched'] = True
+                    self._diagnostics.event('miss_fetch', record['op'])
+                    self._segment_counters['segment_get_bytes'] += record['segment']['nbytes']
+                    self._segment_counters['segment_get_objects'] += 1
+                    try:
+                        value = self._fetch_segment_source(record['segment']['key'], record['spec'])
+                        if isinstance(value, tuple):
+                            source, release = value
+                            def safe_release(*args, **kwargs):
+                                try:
+                                    return release(*args, **kwargs)
+                                except BaseException:
+                                    self._hold_batch_receive(window, force=True)
+                                    raise
+                            return source, safe_release
+                        return value
+                    except BaseException:
+                        # A native exception can quarantine a slot before a
+                        # source/release tuple exists. Keep the window charged.
+                        self._hold_batch_receive(window)
+                        raise
+                record['fetch'] = fetch
+                records.append(record)
+            window = self._node_pool.acquire_many((r['segment']['logical_key'], r['segment']['nbytes'], r['fetch']) for r in records)
+            try:
+                with window:
+                    for index, record in enumerate(records):
+                        pin = window.pins[index]
+                        source = source_release = None
+                        primary = None
+                        self._diagnostics.event('pin', record['op'], {'pooled': pin is not None,
+                            'fetched': record['fetched'], 'generation': pin.generation if pin is not None else None})
+                        try:
+                            if pin is not None:
+                                source = pin.tensor.view(_TORCH_DTYPES[record['spec'].dtype]).view(record['spec'].shape)
+                            else:
+                                source = record['fetch']()
+                                if isinstance(source, tuple):
+                                    source, source_release = source
+                            nbytes = record['segment']['nbytes']
+                            self._diag.count('lookup_bytes', nbytes)
+                            self._diag.count('miss_bytes' if record['fetched'] else 'hit_bytes', nbytes)
+                            self._diag.count('miss_blocks' if record['fetched'] else 'hit_blocks')
+                            self._diag.count('fallback_blocks', int(pin is None))
+                            self._copy_segment_into(source, destination[:,record['segment']['start']:record['segment']['end']], pin)
+                            record['completed'] = True
+                            self._diagnostics.event('copy_complete', record['op'])
+                        except BaseException as exc:
+                            primary = exc
+                            with self._quarantine_lock:
+                                for item in self._h2d_quarantined:
+                                    if item['source'] is source and item.get('batch_window') is None:
+                                        window.defer(index)
+                                        item.update(batch_window=window, batch_index=index)
+                            self._hold_batch_receive(window)
+                            raise
+                        finally:
+                            if source_release is not None:
+                                uncertain = any(item['source'] is source for item in self._h2d_quarantined)
+                                try:
+                                    source_release(quarantine=uncertain)
+                                except BaseException as cleanup:
+                                    if primary is None:
+                                        raise
+                                    primary.add_note(f'batch source cleanup also failed: {cleanup!r}')
+                                finally:
+                                    self._hold_batch_receive(window)
+                            source = None
+            finally:
+                # Each finish reflects the real release transaction, after
+                # __exit__; no early finish for a still-owned batch token.
+                for index, record in enumerate(records):
+                    entry = window.entries[record['segment']['logical_key']]
+                    self._diagnostics.event('finish', record['op'], {'copy_completed': record['completed'],
+                        'pin_released': entry['token'] is None and index not in window.deferred})
         self._segment_counters['segment_materialized_features'] += 1
 
     def _put_manifest_ack(self, manifest):
