@@ -90,9 +90,9 @@
   "loss": 4.477447986602783
  },
  "dmtp": {
-  "gradient_norm": 7.421003216883787,
+  "gradient_norm": 5.4170260758956585,
   "gradient_tensors": 30,
-  "loss": 4.2418951988220215
+  "loss": 4.169641971588135
  },
  "domino-shifted-step0-train": {
   "gradient_norm": 5.739894283143199,
@@ -165,9 +165,9 @@
   "loss": 4.457488059997559
  },
  "mtp": {
-  "gradient_norm": 3.5912653190183534,
+  "gradient_norm": 3.8812088502063165,
   "gradient_tensors": 17,
-  "loss": 4.1326212882995605
+  "loss": 4.132400989532471
  },
  "peagle-length7": {
   "gradient_norm": 2.528435116025731,
