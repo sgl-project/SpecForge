@@ -628,7 +628,7 @@ Use the corresponding named settings in the run YAML:
 | `confidence_loss_alpha` | `loss.terms.confidence.coefficient` |
 | `alignment_weight` | `loss.terms.alignment.coefficient` |
 | `ce_loss_alpha` / `l1_loss_alpha` | `loss.terms.token.options.ce_weight` / `l1_weight` |
-| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement and on token when it uses CE/L1 |
+| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement, and on token when the old run used the objective's default loss. An old run with an explicit flat `ce_l1` loss kept that loss's own weights on token |
 
 Both CE/L1 weights must be specified to preserve a non-default mixture; changing
 only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to

@@ -11,35 +11,57 @@ from scripts.convert_canonical_checkpoint import convert_checkpoint, convert_rec
 from specforge.algorithms.objectives.registry import resolve_objective
 from tests.test_runtime import test_checkpoint_resume as resume_tests
 
+# (architecture, objective, old objective options, old flat loss as the old code
+# recorded it: always resolved, never "default", expected named terms)
 CASES = (
-    ("DFlashDraftModel", "dflash", {}, {}),
+    ("DFlashDraftModel", "dflash", {}, {"kind": "ce", "options": {}}, {}),
     (
         "DFlash2DraftModel",
         "dflash2",
         {"selector_loss_alpha": 0.4},
+        {"kind": "ce", "options": {}},
         {"selector": {"coefficient": 0.4}},
     ),
     (
         "DSparkDraftModel",
         "dspark",
         {"ce_loss_alpha": 0.2, "l1_loss_alpha": 0.8, "confidence_loss_alpha": 0.3},
+        {"kind": "ce_l1", "options": {"ce_weight": 0.2, "l1_weight": 0.8}},
         {
             "token": {"options": {"ce_weight": 0.2, "l1_weight": 0.8}},
             "confidence": {"coefficient": 0.3},
         },
     ),
-    ("DominoDraftModel", "domino", {}, {}),
+    (
+        "DominoDraftModel",
+        "domino",
+        {},
+        {"kind": "kl", "options": {}},
+        {"base": {"kind": "kl"}, "final": {"kind": "kl"}},
+    ),
     (
         "DSpineDraftModel",
         "dspine",
-        {"ce_weight": 0.3, "alignment_weight": 0.7},
+        {"ce_weight": 0.7, "alignment_weight": 0.25},
+        {"kind": "ce_l1", "options": {"ce_weight": 0.7, "l1_weight": 1 - 0.7}},
         {
-            "token": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
-            "refinement": {"options": {"ce_weight": 0.3, "l1_weight": 0.7}},
-            "alignment": {"coefficient": 0.7},
+            "token": {"options": {"ce_weight": 0.7, "l1_weight": 1 - 0.7}},
+            "refinement": {"options": {"ce_weight": 0.7, "l1_weight": 1 - 0.7}},
+            "alignment": {"coefficient": 0.25},
         },
     ),
-    ("MTPDraftModel", "mtp", {}, {}),
+    # an explicit flat ce_l1 kept the formula's own weights; ce_weight reached refinement only
+    (
+        "DSpineDraftModel",
+        "dspine",
+        {"ce_weight": 0.7},
+        {"kind": "ce_l1", "options": {}},
+        {
+            "token": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
+            "refinement": {"options": {"ce_weight": 0.7, "l1_weight": 1 - 0.7}},
+        },
+    ),
+    ("MTPDraftModel", "mtp", {}, {"kind": "ce", "options": {}}, {}),
 )
 
 
@@ -49,11 +71,13 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
         if not torch.distributed.is_initialized():
             harness.setUpClass()
             self.addCleanup(harness.tearDownClass)
-        for architecture, name, old_options, terms in CASES:
+        for architecture, name, old_options, flat, terms in CASES:
             for has_execution in (False, True):
                 with (
                     self.subTest(
-                        architecture=architecture, has_execution=has_execution
+                        architecture=architecture,
+                        flat=flat,
+                        has_execution=has_execution,
                     ),
                     tempfile.TemporaryDirectory() as temp,
                 ):
@@ -63,14 +87,6 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                     )
                     defaults = resolve_objective(architecture)
                     options = {**asdict(defaults.objective), **old_options}
-                    flat = {
-                        "kind": (
-                            next(iter(defaults.losses.terms.values())).loss.kind
-                            if has_execution
-                            else "default"
-                        ),
-                        "options": {},
-                    }
                     old = {
                         "canonical_draft_config": {"architectures": [architecture]},
                         "canonical_objective": name,
@@ -183,7 +199,10 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                 **asdict(resolved.objective),
                 "ce_weight": 0.1,
             },
-            "canonical_loss": {"kind": "default", "options": {}},
+            "canonical_loss": {
+                "kind": "ce_l1",
+                "options": {"ce_weight": 0.1, "l1_weight": 0.9},
+            },
             "canonical_loss_execution": asdict(resolved.execution) | {"fused": True},
             "canonical_loss_implementations": {
                 "0/compute/refinement:0": "token_ce",
