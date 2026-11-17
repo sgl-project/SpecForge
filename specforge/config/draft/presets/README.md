@@ -35,8 +35,10 @@ optional `training.frozen` prefixes freeze them independently of initialization.
 
 MTP training supports `training.attention_backend: eager` or `sdpa`.
 `training.objective_options.objective_chunk_size` defaults to 4096 token positions;
-0 disables chunking. Each chunk computes LM head and loss together and is
-recomputed during backward, bounding saved logits as well as forward temporaries.
+0 disables chunking. When the supervised positions exceed it, each chunk computes
+LM head and loss together and is recomputed during backward, bounding saved logits
+as well as forward temporaries. Contextual losses (the `lk_*` kinds) need the whole
+set and are not chunked.
 This does not bound attention or backbone activation memory.
 
 For continuation use `initialization.checkpoint`; for full training resume use
