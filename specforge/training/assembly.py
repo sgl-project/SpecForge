@@ -280,9 +280,6 @@ def _prompt_cache_key(
         "max_prompts": cfg.data.max_prompts,
         "target_model": cfg.model.target_model_path,
         "draft_config": cfg.draft,
-        "initialization": (
-            cfg.initialization.model_dump() if cfg.initialization else None
-        ),
         "strategy": cfg.training.objective,
         "input_modality": cfg.model.input_modality,
     }

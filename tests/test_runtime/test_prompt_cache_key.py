@@ -45,6 +45,18 @@ class TestPromptCacheKey(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_does_not_track_weight_initialization(self):
+        # A resume clears `initialization`; the prompts it needs are the same.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "prompts.jsonl")
+            path.write_text('{"text":"same"}\n', encoding="utf-8")
+            config = _cache_config(str(path))
+            started = _prompt_cache_key(config)
+            config.initialization = SimpleNamespace(
+                model_dump=lambda: {"checkpoint": "weights"}
+            )
+            self.assertEqual(_prompt_cache_key(config), started)
+
     def test_tracks_tokenizer_chat_template(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "prompts.jsonl")
