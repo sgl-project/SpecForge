@@ -1,4 +1,4 @@
-"""Select a reader by configuration/format, never by directory names."""
+"""Select a reader by configuration/format; run roots resolve by the run naming."""
 
 import glob
 import json
@@ -47,6 +47,11 @@ def resolve_run_directory(path: str) -> str:
         path = os.path.dirname(path)
     if os.path.isfile(os.path.join(path, "training_state.pt")):
         return path
+    if os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path} is not a training_state.pt; name the state file, its "
+            "checkpoint directory or the run root"
+        )
     if not os.path.isdir(path):
         raise FileNotFoundError(f"checkpoint path does not exist: {path}")
 
@@ -60,7 +65,7 @@ def resolve_run_directory(path: str) -> str:
         return latest[0]
     if len(latest) > 1:
         raise ValueError(
-            f"resume root {path} contains multiple complete *-latest runs: "
+            f"run root {path} contains multiple complete *-latest runs: "
             f"{latest}; select one checkpoint explicitly"
         )
 
@@ -76,22 +81,34 @@ def resolve_run_directory(path: str) -> str:
         raise FileNotFoundError(f"no complete checkpoint found under {path}")
     if len(by_run) > 1:
         raise ValueError(
-            f"resume root {path} contains multiple checkpoint runs: "
+            f"run root {path} contains multiple checkpoint runs: "
             f"{sorted(by_run)}; select one checkpoint explicitly"
         )
     candidates = next(iter(by_run.values()))
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def _is_run_root(path: Path) -> bool:
+    return any(
+        child.is_dir()
+        and (child.name.endswith("-latest") or re.fullmatch(r".+-step\d+", child.name))
+        for child in path.iterdir()
+    )
+
+
 def resolve_checkpoint_path(source, *, cache_dir=None, config_only=False):
     """Resolve model directories and training run roots without choosing a run silently."""
     path = resolve_directory(source, cache_dir=cache_dir, config_only=config_only)
-    if path.is_dir() and not any(
-        (path / name).exists() for name in ("config.json", "training_state.pt")
+    # positive evidence only: config-less model dirs and config-only snapshots
+    # hold neither config.json nor weights at their root
+    if (
+        path.is_dir()
+        and not any(
+            (path / name).exists() for name in ("config.json", "training_state.pt")
+        )
+        and _is_run_root(path)
     ):
-        # Config-less historical model directories remain valid with legacy_config.
-        if not any(path.glob("*.safetensors")) and not any(path.glob("*.bin")):
-            path = Path(resolve_run_directory(str(path)))
+        path = Path(resolve_run_directory(str(path)))
     return path
 
 
