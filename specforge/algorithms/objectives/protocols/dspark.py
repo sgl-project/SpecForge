@@ -4,14 +4,16 @@ from dataclasses import dataclass
 
 import torch
 
+from specforge.algorithms.metrics.dspark import measure
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
+from ..diagnostics import prediction_diagnostics
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
 
@@ -22,6 +24,7 @@ from .dflash import COMMON_MODULES
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
     ),
     requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),
@@ -119,4 +122,17 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        chunk_size = block_chunk_size(batch)
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            diagnostics=prediction_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                measure,
+                enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
+            ),
+            chunk_size=chunk_size,
+        )

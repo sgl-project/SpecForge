@@ -24,6 +24,7 @@ def sequence_inputs(
         query_positions=positions,
         key_positions=positions if key_positions is None else key_positions,
         visibility=visibility[:, None],
+        active_queries=visibility.any(-1),
     )
     return tuple(
         LayerInputs(
@@ -143,7 +144,10 @@ def prepare_blocks(
     visible = torch.cat((context_visible, draft_visible), dim=-1)
     visible &= keep.repeat_interleave(size, dim=1)[..., None]
     layout = AttentionLayout(
-        query_positions=query, key_positions=keys, visibility=visible[:, None]
+        query_positions=query,
+        key_positions=keys,
+        visibility=visible[:, None],
+        active_queries=keep.repeat_interleave(size, dim=1),
     )
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)

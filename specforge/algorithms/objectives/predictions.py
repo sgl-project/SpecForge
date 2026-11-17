@@ -180,6 +180,17 @@ class Predictions:
         )
 
 
+#: Proposal blocks projected per loss chunk for each batch row. The block
+#: objectives were tuned with this bound: it caps the vocabulary logits alive at
+#: once, and with checkpointing the logits saved for backward.
+BLOCK_CHUNK_BLOCKS = 128
+
+
+def block_chunk_size(batch):
+    """Default loss chunk for block objectives, in flattened row x block units."""
+    return BLOCK_CHUNK_BLOCKS * batch["input_ids"].shape[0]
+
+
 @dataclass(frozen=True)
 class PredictionBatch:
     """Protocol output consumed by the shared executor.
@@ -194,3 +205,6 @@ class PredictionBatch:
     predictions: Iterable[Predictions]
     reduction: str = "tokens"
     chunk_size: int = 0
+    diagnostics: Callable | None = (
+        None  # Detached (ratio pairs, additive counts), run once after loss.
+    )

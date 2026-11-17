@@ -309,6 +309,19 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            saved_options = state.get("canonical_objective_options")
+            if "canonical_objective" in resume_contract and isinstance(
+                saved_options, dict
+            ):
+                from specforge.algorithms.objectives import objective_record
+
+                # a record written while logging-only options were still saved
+                state = {
+                    **state,
+                    "canonical_objective_options": objective_record(
+                        resume_contract["canonical_objective"], saved_options
+                    ),
+                }
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
             saved_loss = state.get("canonical_loss")
@@ -325,8 +338,11 @@ class Trainer:
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
                     if saved is None:
-                        if state.get("canonical_loss_execution", {}).get(
-                            "fused", False
+                        if (
+                            state.get("canonical_loss_execution", {}).get(
+                                "fused", False
+                            )
+                            is not False
                         ):
                             raise ValueError(
                                 "checkpoint does not record resolved fused loss implementations"
@@ -337,6 +353,15 @@ class Trainer:
                     continue
                 persisted = state.get(key)
                 persisted_available = key in state
+                if (
+                    key == "canonical_loss_execution"
+                    and persisted_available
+                    and persisted != current
+                ):
+                    # An unset fused follows the checkpoint, and the checkpoints
+                    # this run writes keep recording what it follows.
+                    current = model.adopt_recorded_execution(persisted)
+                    persisted_contract[key] = current
                 comparison_current = current
                 comparison_persisted = persisted
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:

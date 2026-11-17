@@ -224,15 +224,17 @@ follow their bindings. Teacher heads
 and draft bindings use the same target key resolver and cached source tensors;
 a compatible bound head is shared directly.
 
-Canonical training uses PyTorch kernels by default. `model.use_liger_kernel: true`
-selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain their
-PyTorch implementation. This option does not change parameter names or canonical
-configuration and is recorded in the training resume contract.
+`model.use_liger_kernel` selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other
+activations retain their PyTorch implementation. Its default depends on the
+objective and is described under Loss execution. This option does not change
+parameter names or canonical configuration and is recorded in the training resume
+contract.
 
 ### Loss execution
 
 The preferred configuration names mathematical terms and uses one shared fusion
-switch. Omitting fused means reference calculation.
+switch. Omitting fused selects an optimized implementation where one applies and
+the reference calculation elsewhere.
 
 ```yaml
 training:
@@ -240,7 +242,6 @@ training:
   objective_options:
     num_anchors: 512
   loss:
-    fused: true
     terms:
       token:
         kind: ce_l1
@@ -344,11 +345,12 @@ configuration and reject formulas or scheduling they cannot execute.
 - `checkpoint` controls recomputation of chunk projections and losses during
   backward when the prediction set spans multiple chunks. A single chunk is
   not recomputed. It defaults to true and is independent of fused execution.
-- `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
+- `fused` is unset by default (see the three settings below). Registered CUDA
+  FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
-  corrections without constructing full corrected logits. Categorical fused
-  requests on CPU or FP64 raise. An eligible kernel path with missing Triton or
+  corrections without constructing full corrected logits. With `fused: true`,
+  categorical requests on CPU or FP64 raise. An eligible kernel path with missing Triton or
   Liger also raises. A projection that does not match a specialization can use
   another compatible kernel or a logged reference on a supported device/dtype.
   Empty inputs use the reference only to preserve zero gradients.
@@ -363,8 +365,19 @@ configuration and reject formulas or scheduling they cannot execute.
   teacher. It preserves full-vocabulary argmax and retained probability mass
   while projecting vocabulary tiles; no full-vocabulary logits are retained.
 
-For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
-retaining full logits. It requires a compatible Liger kernel that also returns
+`loss.fused` has three settings. Unset (auto) uses an optimized implementation
+wherever one applies and the reference formula elsewhere: off CUDA/ROCm, outside
+FP16/BF16/FP32, or without Triton, the run simply uses the reference. `true`
+requires optimized execution and raises where a categorical loss cannot be
+optimized. `false` always evaluates the reference. The implementations chosen for
+each loss group are logged once and recorded for resume. On resume an unset
+`fused` takes the setting the checkpoint recorded, so a run written with the
+reference formulas (including every checkpoint from before the auto setting
+existed) continues with them; an explicit `fused` must equal the recorded one.
+
+For plain DFlash/MTP linear heads, `fused: true` can also use Liger linear CE
+without retaining full logits. Auto never selects it: it was not part of the
+training paths the recipes were validated on. It requires a compatible Liger kernel that also returns
 predicted tokens. Its installed version is checked against the project's Liger
 requirement before loading the kernel; an out-of-range version raises, including
 after a no-deps installation. An unavailable kernel also raises for an eligible
@@ -376,10 +389,23 @@ chunks with the complete-chain weights. Only `lk_lambda` among the LK variants r
 execution, and DSpine retains it when no window alignment statistic is supplied.
 Thus requesting chunking does not promise bounded loss memory for those paths.
 
-`model.use_fused_conv` opts canonical grouped convolution into its existing Triton
-kernel. Enabling it without grouped convolution, or with unsupported weights or
-group sizes, fails during setup. Incompatible runtime input dtypes and compiled
-execution also raise. The selected path is logged during setup. Ordinary loading
+`model.use_fused_conv` selects the Triton kernel of the grouped convolution.
+Unset (auto) uses it when the draft has grouped convolutions and all of them
+support it: CUDA/ROCm FP16/BF16/FP32 weights, a power-of-two group size up to
+1024, and Triton installed. `true` fails during setup without a grouped
+convolution or where the kernel cannot run; `false` keeps the eager one.
+Incompatible runtime input dtypes and compiled execution raise while the kernel
+is selected. The selected path is logged during setup and recorded for resume.
+
+`model.use_liger_kernel` follows the same three settings. Unset enables Liger
+RMSNorm/SwiGLU on a CUDA/ROCm trainer for the objectives that declare it as
+their default (DFlash and DFlash2) when the draft's FFNs use `silu`/`swish`;
+`true` enables it for any objective and fails where it cannot run.
+
+The block objectives (DFlash, DFlash2, Domino, DSpark, DSpine) project and
+checkpoint 128 blocks per batch row at a time unless
+`loss.execution.chunk_size` says otherwise; the unit of an explicit value is
+flattened rows x blocks, so 128 blocks per row at batch size 2 is 256. Ordinary loading
 through specforge.loading and exported models use eager convolution by default;
 this training option is not stored in the model architecture.
 The fused kernel accumulates in FP32 and rounds once, so
@@ -451,8 +477,9 @@ entry chooses how to evaluate them:
 
 | Mode | Configuration | Selection |
 | --- | --- | --- |
+| Default | fused unset | A default-enabled optimization where one applies, otherwise the reference formula; nothing raises for an unsupported device, dtype or missing kernel package |
 | Reference | fused: false | Registered mathematical formulas |
-| Optimized | fused: true | Compatible joint or per-term optimization. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
+| Required | fused: true | Compatible joint or per-term optimization, including opt-in ones such as `linear_ce`. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
 
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,
@@ -579,9 +606,10 @@ objective by the declared argument name.
 `legacy_strategy` is separate registration metadata that preserves existing data
 and rendezvous identifiers; it does not select a legacy provider.
 `supports_vocab_mapping` declares draft-vocabulary support.
-Worker counts belong to `data.dataloader_num_workers`, not objective requirements.
-Canonical runs use a shared default of 4; set this explicitly to 8 to retain the
-previous DFlash-family/MTP default. Legacy provider defaults are unchanged.
+`dataloader_workers` is the objective's default worker count when
+`data.dataloader_num_workers` is unset: 8 for the block objectives (DFlash,
+DFlash2, Domino, DSpark, DSpine), the shared default of 4 otherwise. An explicit
+`data.dataloader_num_workers` always wins.
 
 Canonical parsing, training and capture read target metadata from the same raw
 `config.json` reader, including nested `text_config`. Transformers defaults are
@@ -657,3 +685,35 @@ Generate the implementation inventory directly from the registry:
 ```bash
 python -m specforge.algorithms.objectives.implementations
 ```
+
+
+### Diagnostic metrics
+
+The block objectives report the metrics of the training wrappers under the same
+names. Detailed diagnostics run only on logging steps, without gradients and in
+the loss's projection chunks (`loss.execution.chunk_size`; `0` keeps the set
+whole). They return additive counts and numerator/denominator pairs, which the
+trainer sums across accumulation and ranks before forming a ratio. They change
+neither the loss, the gradients nor the random state, and evaluation skips them.
+
+DFlash and DFlash2 report the hard-label, selector, prefix and sampled-anchor
+walk metrics, `ce_loss` (`lk_loss` for an LK token loss), `target_probability`
+and, for `lk_lambda` on hard labels, `objective/lk_kl_weight`. While the selector
+objective trains (a positive `loss.terms.selector.coefficient`), DFlash2 also
+reports `dflash2/selector/loss`, its per-position values, the covered-accuracy
+and gold-probability ratios and `selector_loss_alpha`. The teacher-distribution
+metrics (`dflash/teacher/*`,
+`dflash2/selector/self_conditioned_teacher_argmax_agreement`) are off by
+default: set `training.objective_options.teacher_metrics: true` to request them
+together with the target's final hidden state. Plain DFlash also accepts
+`metric_top_k` (default 16). Both options only select what is logged and are
+not part of the resume record.
+
+Domino reports `final_loss`, `base_loss`, `base_accuracy`, `accept_len`,
+`base_accept_len`, `lambda_base` and the two `domino/*/walk_accepted_length`
+ratios. DSpark reports its CE, L1 and confidence terms, per-position CE and
+accuracy, the teacher statistics and `dspark/hard_label/walk_accepted_length`;
+a draft without a confidence head omits the two confidence metrics. DSpine
+reports `dspine/backbone_ce`, `backbone_l1`, `refinement_loss`,
+`alignment_loss` and `candidate_coverage` on every step, from values its loss
+already computes.

@@ -1,4 +1,47 @@
-# Unified training recipe catalog
+# Training recipes
+
+All bundled recipes use canonical draft configuration. The top-level `draft`
+accepts an inline mapping or a path to a YAML/JSON file. Files in
+`specforge/config/draft/presets/` are ordinary configurations; their names do
+not select model code.
+
+```yaml
+draft: specforge/config/draft/presets/qwen3-8b-dflash.yaml
+model:
+  target_model_path: Qwen/Qwen3-8B
+training:
+  objective_options:
+    num_anchors: 512
+  loss:
+    terms:
+      token:
+        kind: ce
+```
+
+Left unset, the execution settings resolve to what the recipes were tuned with:
+fused loss kernels and, for DFlash2, the fused convolution on a CUDA/ROCm
+trainer (the reference elsewhere), Liger for DFlash/DFlash2, and for the block
+objectives 128 blocks per batch row per checkpointed loss chunk.
+
+The architecture selects its default objective. Set `training.objective` to
+choose another registered objective compatible with that architecture.
+Algorithm sampling/rollout options belong in `objective_options`; numerical
+losses, coefficients and execution settings belong in `loss`.
+
+Use `initialization.checkpoint` for weight import and `resume` for a canonical
+training checkpoint. These sources already record the draft configuration.
+Historical checkpoint weights remain importable through the legacy codec;
+their optimizer states are not portable across model layout changes.
+
+Offline EAGLE supports `attention_backend: usp` with Ulysses/Ring sequence
+parallelism. Online consumers use data parallelism; configure target TP on
+the capture server.
+
+## Configuration and migration reference
+
+The reference below also covers retained-wrapper options. Bundled recipes use
+the canonical entry above and put algorithm options under `training.objective_options`.
+
 
 Every draft model JSON under `configs/` has at least one typed YAML recipe in
 this catalog. Choose a recipe by answering three separate questions:
@@ -215,7 +258,7 @@ should make their training strategy and topology explicit.
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the online disaggregated path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
-| `model.use_fused_conv` | `false` | Opt canonical grouped convolution into its existing CUDA/ROCm fused kernel; independent of Liger. |
+| `model.use_fused_conv` | `null` (auto) | Triton kernel for grouped convolutions (DFlash2). Auto uses it on a CUDA/ROCm trainer when the draft's group sizes support it and keeps the eager convolution elsewhere; `true` fails where it cannot run; `false` forces eager. Independent of Liger. |
 | `model.use_liger_kernel` | `null` (auto) | Liger RMSNorm/SwiGLU for DFlash/DFlash2 drafts. Auto turns them on for `training.strategy: dflash` on CUDA/ROCm with a `silu`/`swish` draft and off elsewhere (CPU, NPU, XPU, other activations). `true` also enables Liger for Domino/DSpark/DSpine, which keep native kernels in auto mode. Explicit `true` fails instead of falling back and is rejected for other strategies; `false` keeps the native Qwen3 modules. Liger that resolves on but cannot be imported is an error: Linux installs include it, ROCm needs `pip install --no-deps "liger-kernel>=0.8.3,<0.9"`. Checkpoints are identical either way. Canonical runs (top-level `draft`, `initialization` or `resume`, or a canonical checkpoint in `training.resume_from`) use PyTorch kernels unless this is `true`; `true` swaps in Liger RMSNorm and SiLU-gated SwiGLU on CUDA/ROCm only and is recorded in the resume contract. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
@@ -290,7 +333,7 @@ Common fields:
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
 | `training.loss` | `{}` | Named loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
-| `training.loss.fused` | canonical: `false`; retained wrappers: `true` | Select compatible optimized implementations. Retained EAGLE3/P-EAGLE require `true`; explicit `false` is rejected. |
+| `training.loss.fused` | `null` (auto) | Auto uses optimized loss implementations where they apply (CUDA/ROCm, FP16/BF16/FP32, Triton installed) and the reference formulas elsewhere. `true` requires them and fails where they cannot run; `false` forces the reference. Retained EAGLE3/P-EAGLE wrappers require their fused kernel and reject `false`. |
 | `training.loss.execution` | `{}` | `chunk_size`, `checkpoint`, `trim`, and offline `teacher_chunk_size`; see [loss execution](../../docs/draft_training.md#loss-execution). |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |

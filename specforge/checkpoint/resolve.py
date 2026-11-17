@@ -151,6 +151,9 @@ def target_configuration(directory):
     text = dict(config.get("text_config", config))
     if "tie_word_embeddings" not in text and "tie_word_embeddings" in config:
         text["tie_word_embeddings"] = config["tie_word_embeddings"]
+    # Some targets (LongCat) store their depth as num_layers only.
+    if "num_hidden_layers" not in text and "num_layers" in text:
+        text["num_hidden_layers"] = text["num_layers"]
     return text
 
 

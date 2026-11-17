@@ -260,13 +260,10 @@ def preflight_draft_kernels(
     fails at startup. The trainer's ``build_draft`` still owns the resolution.
     """
 
-    from specforge.training.canonical import enabled
+    from specforge.training.canonical import enabled, preflight_kernels
 
     if enabled(cfg):
-        if cfg.model.use_liger_kernel is True:
-            from specforge.modeling.draft.layers.kernels import load_liger_kernels
-
-            load_liger_kernels()
+        preflight_kernels(cfg)
         return
     if (
         cfg.model.use_liger_kernel is False

@@ -3,16 +3,16 @@
 # Fill in the dataset path and replace the loopback capture addresses.
 model:
   target_model_path: MiniMaxAI/MiniMax-M3-MXFP8
-  draft_model_config: configs/minimax-m3-dspark.json
   target_backend: sglang
   trust_remote_code: true
   embedding_key: language_model.model.embed_tokens.weight
   lm_head_key: language_model.lm_head.weight
-  mask_token_id: 200063
   torch_dtype: bfloat16
   sglang_attention_backend: triton
   sglang_mem_fraction_static: 0.80
   sglang_context_length: 4608
+
+draft: specforge/config/draft/presets/minimax-m3-dspark.yaml
 
 data:
   train_data_path: ./cache/dataset/minimax-m3-dspark.jsonl
@@ -24,9 +24,9 @@ data:
 
 training:
   loss:
-    fused: true
     execution:
-      chunk_size: 128
+      # 128 blocks for each of the two batch rows
+      chunk_size: 256
     terms:
       token:
         options:
@@ -37,7 +37,6 @@ training:
   weighting:
     kind: exponential
     gamma: 4.5
-  strategy: dspark
   num_epochs: 6
   batch_size: 2
   accumulation_steps: 32
@@ -47,7 +46,8 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: flex_attention
-  num_anchors: 512
+  objective_options:
+    num_anchors: 512
   save_interval: 100
   max_checkpoints: 3
   log_interval: 1

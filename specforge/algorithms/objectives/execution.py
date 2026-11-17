@@ -392,7 +392,12 @@ def evaluate_chunks(
         selected.registration.scope == "prediction" for selected in losses
     ) or any(term.reduction == "scalar" for term in predictions.plan.terms)
     if whole_set or not predictions.chunk_safe or not predictions.projection.chunk_safe:
-        if chunk_size and chunk_size < predictions.hidden.shape[0]:
+        # A protocol's default bound that cannot apply is not a dropped request.
+        if (
+            execution.chunk_size is not None
+            and chunk_size
+            and chunk_size < predictions.hidden.shape[0]
+        ):
             warnings.warn(
                 "Loss chunking is disabled: the loss or projection requires "
                 "the complete prediction set.",
@@ -556,7 +561,7 @@ def execute_batch(
             not p.projection.chunk_safe or not p.projection.recompute_safe
             for p in predictions
         ):
-            if chunk_size:
+            if chunk_size and execution.chunk_size is not None:
                 warnings.warn(
                     "D-PACE loss chunking is disabled: the projection cannot "
                     "be safely chunked and replayed.",

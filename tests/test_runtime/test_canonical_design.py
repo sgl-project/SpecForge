@@ -85,7 +85,22 @@ class CanonicalDesignTest(unittest.TestCase):
                 cfg = run_config(Path("target"), draft)
                 cfg.data.dataloader_num_workers = None
                 run = resolve_run(cfg)
-                self.assertEqual(_dataloader_num_workers(run.config, run.algorithm), 4)
+                # the block objectives keep the loader default they were tuned with
+                expected = (
+                    8
+                    if draft.architecture
+                    in (
+                        "DFlashDraftModel",
+                        "DFlash2DraftModel",
+                        "DSparkDraftModel",
+                        "DominoDraftModel",
+                        "DSpineDraftModel",
+                    )
+                    else 4
+                )
+                self.assertEqual(
+                    _dataloader_num_workers(run.config, run.algorithm), expected
+                )
                 for workers in (0, 8):
                     run.config.data.dataloader_num_workers = workers
                     self.assertEqual(
@@ -103,6 +118,12 @@ class CanonicalDesignTest(unittest.TestCase):
             (target / "config.json").write_text(json.dumps({"text_config": metadata}))
             cfg = run_config(target, draft_config())
             self.assertEqual(training_target_config(cfg), read_target_config(target))
+            # a target that names its depth num_layers still has one for tap checks
+            depth = metadata.pop("num_hidden_layers")
+            (target / "config.json").write_text(
+                json.dumps({**metadata, "num_layers": depth})
+            )
+            self.assertEqual(read_target_config(target)["num_hidden_layers"], depth)
             with patch(
                 "transformers.AutoConfig.from_pretrained",
                 side_effect=AssertionError("HF defaults used"),

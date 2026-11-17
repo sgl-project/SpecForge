@@ -1,4 +1,8 @@
-"""Compare canonical training losses and gradients with the legacy wrappers."""
+"""Compare canonical training losses and gradients with the legacy wrappers.
+
+The same constructions are pinned to stored values, without the wrappers, in
+``test_objective_goldens.py``.
+"""
 
 import copy
 import importlib
@@ -17,6 +21,7 @@ from specforge.algorithms.common.dflash_family_model import (
 from specforge.algorithms.dspine.model import OnlineDSpineModel
 from specforge.algorithms.objectives import build_objective_model
 from specforge.modeling import build_draft_model
+from tests.test_algorithms.test_objective_goldens import assert_golden
 from tests.test_algorithms.test_objectives import (
     dflash2_config,
     domino_config,
@@ -177,6 +182,9 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                     new, old, names = block_pair(kind, shifted=shifted)
                     new.draft_model.train(not evaluation)
                     old.train(not evaluation)
+                    # Building the legacy wrapper draws random numbers; the
+                    # recorded values must not depend on how many.
+                    torch.manual_seed(13)
                     batch = training_batch(new.draft_model.config.draft)
                     batch["loss_mask"][0, 4:6] = 0
                     old_args = {
@@ -324,6 +332,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                             {"ttt_length": 3} if kind == "eagle3" else {"num_depths": 3}
                         )
                         new = build_objective_model(model, options=options)
+                        torch.manual_seed(13)
                         batch = {
                             k: v[:, :length].detach()
                             for k, v in training_batch(config).items()
@@ -363,6 +372,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                 torch.testing.assert_close(pooled, torch.stack(expected_losses).mean())
 
     def test_mtp_matches_explicit_shifted_loss_with_native_layers(self):
+        torch.manual_seed(7)  # the recorded values must not depend on test order
         from specforge.config.draft.norm import RMSNormSpec
         from specforge.config.draft.rope import DefaultRoPESpec
         from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -409,8 +419,10 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             expected,
             {n: n for n, _ in model.named_parameters()},
         )
+        assert_golden("mtp", new, actual)
 
     def test_dmtp_matches_explicit_suffix_loss(self):
+        torch.manual_seed(7)  # the recorded values must not depend on test order
         # DMTP has no legacy Online wrapper. Check its label alignment independently.
         from specforge.algorithms.objectives.inputs import gather
         from tests.test_algorithms.test_objectives import dmtp_config
@@ -447,3 +459,4 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             expected,
             {n: n for n, _ in model.named_parameters()},
         )
+        assert_golden("dmtp", runtime, actual)

@@ -12,6 +12,7 @@ class ObjectiveResult:
     numerator: Tensor
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    sums: dict[str, Tensor] = field(default_factory=dict)
 
     @property
     def loss(self):
@@ -28,7 +29,7 @@ def microbatch_mean(result, *, global_denominator=False):
         world_size = dist.get_world_size()
         dist.all_reduce(denominator)
     loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
+    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios, result.sums)
 
 
 class ObjectiveModel(nn.Module):
@@ -68,6 +69,30 @@ class ObjectiveModel(nn.Module):
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
+
+    def adopt_recorded_execution(self, recorded):
+        """Continue a resumed run with the fused setting its checkpoint recorded.
+
+        An unset ``fused`` has no request of its own, so on resume it takes the
+        recorded one: a run written with the reference formulas is not moved to
+        optimized kernels by resuming it, and the other way round. An explicit
+        setting is left alone and compared as it is.
+
+        Args:
+            recorded: The checkpoint's execution record, or None when it has none.
+
+        Returns:
+            The execution record this run now has.
+        """
+        from dataclasses import asdict, replace
+
+        if (
+            self.execution.fused is None
+            and isinstance(recorded, dict)
+            and recorded.get("fused") is not None
+        ):
+            self.execution = replace(self.execution, fused=recorded["fused"])
+        return asdict(self.execution)
 
     def train(self, mode=True):
         super().train(mode)
@@ -213,7 +238,7 @@ class ObjectiveModel(nn.Module):
         prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, **context
         )
-        return execute_batch(
+        result = execute_batch(
             prepared,
             None,
             self.weighting,
@@ -221,6 +246,12 @@ class ObjectiveModel(nn.Module):
             execution=self.execution,
             selection=self.loss_implementations,
         )
+        if prepared.diagnostics is not None:
+            with torch.no_grad():
+                ratios, sums = prepared.diagnostics()
+            result.ratios.update(ratios)
+            result.sums.update(sums)
+        return result
 
 
 def check_options(**groups):

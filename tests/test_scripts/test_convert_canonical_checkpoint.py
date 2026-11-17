@@ -9,7 +9,7 @@ from unittest.mock import patch
 import torch
 
 from scripts.convert_canonical_checkpoint import convert_checkpoint, convert_record
-from specforge.algorithms.objectives.registry import resolve_objective
+from specforge.algorithms.objectives.registry import objective_record, resolve_objective
 from tests.test_runtime import test_checkpoint_resume as resume_tests
 
 # (architecture, objective, old objective options, old flat loss as the old code
@@ -96,7 +96,9 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                     }
                     if has_execution:
                         old.update(
-                            canonical_loss_execution=asdict(defaults.execution),
+                            # the old default: reference formulas
+                            canonical_loss_execution=asdict(defaults.execution)
+                            | {"fused": False},
                             canonical_loss_implementations={},
                             canonical_use_fused_conv=False,
                         )
@@ -127,11 +129,15 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                         self.assertEqual(
                             (output / filename).read_bytes(), before[filename]
                         )
-                    expected = resolve_objective(architecture, loss={"terms": terms})
+                    # An old run evaluated the reference; the resumed one says so.
+                    expected = resolve_objective(
+                        architecture, loss={"terms": terms, "fused": False}
+                    )
                     saved = torch.load(output / "training_state.pt", weights_only=True)
                     self.assertEqual(saved["canonical_loss"], expected.losses.to_dict())
                     self.assertEqual(
-                        saved["canonical_objective_options"], asdict(expected.objective)
+                        saved["canonical_objective_options"],
+                        objective_record(name, asdict(expected.objective)),
                     )
                     original = torch.load(
                         source / "training_state.pt", weights_only=True
@@ -159,7 +165,9 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                     contract = {
                         **old,
                         "canonical_loss": expected.losses.to_dict(),
-                        "canonical_objective_options": asdict(expected.objective),
+                        "canonical_objective_options": objective_record(
+                            name, asdict(expected.objective)
+                        ),
                         "canonical_loss_execution": asdict(expected.execution),
                         "canonical_use_fused_conv": False,
                     }

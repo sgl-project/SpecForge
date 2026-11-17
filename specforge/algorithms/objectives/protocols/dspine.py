@@ -12,7 +12,7 @@ from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import LossContext, TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
 
 
@@ -22,6 +22,7 @@ from ..registry import TrainingRequirements, WindowStatistic, register_protocol
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
         window_statistic=WindowStatistic(
             ratio_name="dspine/backbone_ce", argument_name="alignment_ce"
         ),
@@ -187,6 +188,19 @@ class DSpineObjective:
             calc.add(1, refinement.values)
             calc.add(2, coefficient.detach() * alignment)
             calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
+            for name, values in (
+                ("backbone_l1", terms.statistics["teacher_l1"]),
+                ("refinement_loss", refinement.values),
+                ("alignment_loss", alignment),
+            ):
+                calc.ratios[f"dspine/{name}"] = (
+                    (values.detach() * calc.weights).sum(),
+                    denominator,
+                )
+            calc.ratios["dspine/candidate_coverage"] = (
+                (covered.any(-1) * predictions.mask).sum().detach(),
+                predictions.mask.sum().detach(),
+            )
 
         predictions = runtime.block_predictions(
             output,
@@ -209,4 +223,4 @@ class DSpineObjective:
                 "layer_features": output.layer_features.movedim(0, -2),
             },
         )
-        return PredictionBatch((predictions,))
+        return PredictionBatch((predictions,), chunk_size=block_chunk_size(batch))

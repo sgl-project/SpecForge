@@ -241,6 +241,10 @@ five target layers). The run then omits `dflash/teacher/*` and
 `dflash2/selector/self_conditioned_teacher_argmax_agreement`; every other
 metric and the loss are unchanged. Other strategies reject the setting.
 
+A canonical run (one with a `draft` config) does not request that hidden state
+unless `training.objective_options.teacher_metrics: true` is set; the default
+is `false`, and the same metrics are then omitted.
+
 The DFlash2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
 `selector_top_k` for candidate-path selection. The base draft head uses the

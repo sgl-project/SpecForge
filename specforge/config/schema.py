@@ -295,7 +295,11 @@ class ModelConfig(StrictConfigModel):
     #: fails when they cannot be used; ``false`` disables them. Resolved kernels
     #: that cannot be imported are an error in both the auto and explicit cases.
     use_liger_kernel: Optional[bool] = None
-    use_fused_conv: bool = False
+    #: Triton kernel for grouped causal convolutions (DFlash2). ``None`` (auto)
+    #: uses it when the draft has such a convolution and the trainer supports
+    #: it (CUDA/ROCm, FP16/BF16/FP32, power-of-two group size up to 1024);
+    #: ``true`` fails when it cannot be used; ``false`` keeps the eager one.
+    use_fused_conv: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -1020,7 +1024,11 @@ class LossConfig(StrictConfigModel):
     """Shared syntax for run files and programmatic objective construction."""
 
     terms: dict[str, LossTermConfig] = Field(default_factory=dict)
-    fused: bool = Field(default=False, strict=True)
+    #: ``None`` (auto) uses a default-enabled optimized implementation where
+    #: one applies and the reference formula otherwise; ``true`` requires
+    #: optimized execution and fails where it cannot run; ``false`` always
+    #: evaluates the reference.
+    fused: bool | None = Field(default=None, strict=True)
     execution: LossExecutionConfig = Field(default_factory=LossExecutionConfig)
 
 
@@ -1241,7 +1249,7 @@ class Config(StrictConfigModel):
             self.training.objective
             or self.training.objective_options
             or self.training.frozen
-            or self.model.use_fused_conv
+            or self.model.use_fused_conv is True
         ):
             raise ValueError(
                 "objective/options/frozen/use_fused_conv "
