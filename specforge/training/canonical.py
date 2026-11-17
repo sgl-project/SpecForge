@@ -230,6 +230,7 @@ def _validate_imported_objective(cfg, resolved):
         )
         directory = source.parent if source.is_file() else source
         payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    mismatches = {}
     for payload in payloads:
         if payload.get("model_type") == "specforge_draft" or payload.get(
             "architectures"
@@ -266,9 +267,17 @@ def _validate_imported_objective(cfg, resolved):
                 }
             for path, (current, expected) in values.items():
                 if current != expected:
-                    raise ValueError(
-                        f"legacy DSpine {name}={saved!r}; set training.{path}={expected!r} to preserve it"
-                    )
+                    mismatches[path] = (name, saved, expected)
+    if mismatches:
+        # Report every setting at once: the exact values (1 - 0.7 is not 0.3)
+        # are tedious to find one failed run at a time.
+        raise ValueError(
+            "legacy DSpine training settings must be restated to preserve them:\n"
+            + "\n".join(
+                f"  training.{path}={expected!r}  (recorded {name}={saved!r})"
+                for path, (name, saved, expected) in mismatches.items()
+            )
+        )
 
 
 def resolve_run(cfg, *, target_config=None):
