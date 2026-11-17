@@ -30,6 +30,7 @@ from specforge.modeling.draft.layers.residual import (
     StandardResidualConnection,
 )
 from specforge.modeling.draft.layers.rope import build_rotary
+from tests.test_modeling.attention_reference import context_layer
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
 
 
@@ -106,7 +107,7 @@ class TwoStreamConnection(ResidualConnection):
 
 class DecoderTest(unittest.TestCase):
     def _assert_reference(self, device, dtypes, autocast=False):
-        for kind in ("qwen3", "gated"):
+        for kind in ("qwen3", "gated", "context", "convolution"):
             gated = kind == "gated"
             node = make_node(output_gate=gated)
             rotary_dim = 4 if gated else 8
@@ -133,10 +134,6 @@ class DecoderTest(unittest.TestCase):
                         else Qwen3Config(**args)
                     )
                     config._attn_implementation = "eager"
-                    reference = (Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer)(
-                        config, 0
-                    )
-                    reference.to(device=device, dtype=dtype)
                     actual = make_layer(
                         node,
                         rotary_dim=rotary_dim,
@@ -145,7 +142,21 @@ class DecoderTest(unittest.TestCase):
                         dtype=dtype,
                         convolution=kind == "convolution",
                     )
-                    actual.load_state_dict(reference.state_dict(), strict=True)
+                    if kind in ("context", "convolution"):
+                        # No library layer has these; the reference is the
+                        # direct formula over a second copy of the weights.
+                        if kind == "convolution":
+                            with torch.no_grad():
+                                for conv in (actual.attention_conv, actual.mlp_conv):
+                                    for parameter in conv.parameters():
+                                        parameter.normal_(std=0.1)
+                        reference = copy.deepcopy(actual)
+                    else:
+                        reference = (
+                            Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer
+                        )(config, 0)
+                        reference.to(device=device, dtype=dtype)
+                        actual.load_state_dict(reference.state_dict(), strict=True)
                     hidden = torch.randn(
                         2,
                         8 if kind == "convolution" else 3,
@@ -217,28 +228,37 @@ class DecoderTest(unittest.TestCase):
                                 attention_mask=bias,
                             )
                         else:
-                            expected = reference(
-                                hidden_states=other,
-                                target_hidden=other_context,
-                                position_embeddings=embeddings,
-                                attention_mask=bias,
+                            expected = context_layer(
+                                reference,
+                                other,
+                                other_context,
+                                embeddings,
+                                mask,
+                                head_dim=node.head_dim,
+                                dropout=node.attention_dropout,
                             )
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    # The library layers run the same operations in the same
+                    # order; the formulas differ in operation order.
+                    close = (
+                        dict(rtol=0, atol=0)
+                        if context is None
+                        else dict(rtol=1e-5, atol=1e-6)
+                    )
+                    torch.testing.assert_close(output, expected, **close)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
                     expected.backward(upstream)
-                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+                    torch.testing.assert_close(hidden.grad, other.grad, **close)
                     if context is not None:
                         torch.testing.assert_close(
-                            context.grad, other_context.grad, rtol=0, atol=0
+                            context.grad, other_context.grad, **close
                         )
                     for name, parameter in actual.named_parameters():
                         self.assertIsNotNone(parameter.grad, name)
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(reference.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
+                            **close,
                         )
 
     def test_cpu_whole_layer_outputs_and_gradients(self):

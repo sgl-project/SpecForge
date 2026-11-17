@@ -227,7 +227,13 @@ class GQATest(unittest.TestCase):
                             )[0]
                         else:
                             expected = context_gqa(
-                                reference, other, other_context, embeddings, bias
+                                reference,
+                                other,
+                                other_context,
+                                embeddings,
+                                bias,
+                                head_dim=reference.head_dim,
+                                dropout=reference.attention_dropout,
                             )
                     # The reference is an independent formula (it repeats the
                     # grouped keys where the module expands a view), so equal

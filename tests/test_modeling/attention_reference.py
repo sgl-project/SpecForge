@@ -18,9 +18,9 @@ def attend(q, k, v, mask, scale, dropout):
     return (probabilities @ v.to(q.dtype)).masked_fill(~active, 0)
 
 
-def context_gqa(module, hidden, context, embeddings, mask):
+def context_gqa(module, hidden, context, embeddings, mask, *, head_dim, dropout):
     batch, length, _ = hidden.shape
-    width = module.head_dim
+    width = head_dim
     q = module.q_norm(module.q_proj(hidden).view(batch, length, -1, width)).transpose(
         1, 2
     )
@@ -37,9 +37,7 @@ def context_gqa(module, hidden, context, embeddings, mask):
     key = torch.cat(keys, 1)
     key = module.k_norm(key.view(batch, key.shape[1], -1, width)).transpose(1, 2)
     k = apply_mla_rope(key, cos, sin, interleaved=False)
-    output = attend(
-        q, k, torch.cat(values, 2), mask, width**-0.5, module.attention_dropout
-    )
+    output = attend(q, k, torch.cat(values, 2), mask, width**-0.5, dropout)
     return module.o_proj(output.transpose(1, 2).reshape(batch, length, -1))
 
 
@@ -93,26 +91,63 @@ def context_mla(module, hidden, context, embeddings, mask):
     return output.masked_fill(~mask.any(-1).squeeze(1).unsqueeze(-1), 0)
 
 
-def convolution_pair(module, hidden):
-    batch, length, width = hidden.shape
-    taps, groups = module.config.kernel_size, module.num_groups
-    coefficients = module.kernel_projection(hidden).reshape(
-        batch, length, 2, taps, groups
+def convolution_coefficients(module, hidden):
+    """Input- and output-side kernels, shaped [batch, length, 2, taps, groups]."""
+    batch, length, _ = hidden.shape
+    return module.kernel_projection(hidden).reshape(
+        batch, length, 2, module.config.kernel_size, module.num_groups
     )
 
-    def convolve(values, side):
-        blocks = values.reshape(
-            batch, -1, module.block_size, groups, module.config.group_size
-        )
-        weights = coefficients[:, :, side].reshape(
-            batch, -1, module.block_size, taps, groups, 1
-        )
-        weights = weights + module.base_kernel[side].reshape(1, 1, 1, taps, groups, -1)
-        output = weights[:, :, :, 0] * blocks
-        for tap in range(1, taps):
-            output = output + weights[:, :, :, tap] * F.pad(
-                blocks[:, :, :-tap], (0, 0, 0, 0, tap, 0)
-            )
-        return output.reshape(batch, length, width)
 
-    return convolve(torch.tanh(convolve(hidden, 0)), 1)
+def convolve(module, values, coefficients, side):
+    """One side of the block-local causal convolution with dynamic kernels."""
+    batch, length, width = values.shape
+    taps, groups = module.config.kernel_size, module.num_groups
+    blocks = values.reshape(
+        batch, -1, module.block_size, groups, module.config.group_size
+    )
+    weights = coefficients[:, :, side].reshape(
+        batch, -1, module.block_size, taps, groups, 1
+    )
+    weights = weights + module.base_kernel[side].reshape(1, 1, 1, taps, groups, -1)
+    output = weights[:, :, :, 0] * blocks
+    for tap in range(1, taps):
+        output = output + weights[:, :, :, tap] * F.pad(
+            blocks[:, :, :-tap], (0, 0, 0, 0, tap, 0)
+        )
+    return output.reshape(batch, length, width)
+
+
+def convolution_pair(module, hidden):
+    coefficients = convolution_coefficients(module, hidden)
+    return convolve(
+        module, torch.tanh(convolve(module, hidden, coefficients, 0)), coefficients, 1
+    )
+
+
+def context_layer(layer, hidden, context, embeddings, mask, *, head_dim, dropout):
+    """Pre-norm decoder layer with context attention and optional convolutions."""
+
+    def update(values, convolution, sublayer):
+        if convolution is None:
+            return sublayer(values)
+        coefficients = convolution_coefficients(convolution, values)
+        values = sublayer(convolve(convolution, values, coefficients, 0))
+        return convolve(convolution, values, coefficients, 1)
+
+    hidden = hidden + update(
+        layer.input_layernorm(hidden),
+        layer.attention_conv,
+        lambda values: context_gqa(
+            layer.self_attn,
+            values,
+            context,
+            embeddings,
+            mask,
+            head_dim=head_dim,
+            dropout=dropout,
+        ),
+    )
+    return hidden + update(
+        layer.post_attention_layernorm(hidden), layer.mlp_conv, layer.mlp
+    )

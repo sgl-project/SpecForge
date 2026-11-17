@@ -1,6 +1,7 @@
 """Node-driven MLA matches the existing eager projections and full-QK scaling."""
 
 import copy
+import math
 import unittest
 from dataclasses import dataclass, replace
 from typing import ClassVar
@@ -119,7 +120,12 @@ class MLATest(unittest.TestCase):
                 ):
                     actual = build(node, rope, device=device, dtype=dtype)
                     reference = copy.deepcopy(actual)
-                    self.assertEqual(actual.scaling, reference.scaling)
+                    # Full-QK scaling, written out here so a wrong production
+                    # value cannot agree with itself.
+                    scaling = (node.qk_nope_head_dim + node.qk_rope_head_dim) ** -0.5
+                    if rope_kind == "yarn":
+                        scaling *= (1.0 + 0.1 * 0.707 * math.log(4.0)) ** 2
+                    self.assertAlmostEqual(actual.scaling, scaling, places=12)
                     hidden = torch.randn(
                         2, 4, 16, device=device, dtype=dtype, requires_grad=True
                     )
