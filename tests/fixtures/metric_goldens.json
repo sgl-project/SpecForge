@@ -734,5 +734,15 @@
   "eval/ploss_1": 0.8336891342953938,
   "eval/ploss_2": 0.794684516220558,
   "eval/simulated_acc_len": 1.0875331564986737
+ },
+ "peagle": {
+  "acc": 0.6521739363670349,
+  "loss": 2.4579639434814453,
+  "position_0_acc_sum": 11.0,
+  "position_0_acc_total": 11.0,
+  "position_1_acc_sum": 2.0,
+  "position_1_acc_total": 7.0,
+  "position_2_acc_sum": 2.0,
+  "position_2_acc_total": 5.0
  }
 }

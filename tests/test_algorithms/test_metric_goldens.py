@@ -27,7 +27,11 @@ from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.base import StepContext
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_algorithms.test_objective_goldens import block_runtime
-from tests.test_algorithms.test_objectives import eagle_config, training_batch
+from tests.test_algorithms.test_objectives import (
+    eagle_config,
+    peagle_config,
+    training_batch,
+)
 from tests.test_modeling.test_canonical_eagle3 import install_mapping
 
 GOLDENS = Path(__file__).resolve().parents[1] / "fixtures/metric_goldens.json"
@@ -88,6 +92,7 @@ ROLLOUT_CASES = (
     RolloutCase("eagle3", "eagle3"),
     # An LK loss changes what a depth's loss is and the name it is logged under.
     RolloutCase("eagle3 lk_lambda", "eagle3", token="lk_lambda"),
+    RolloutCase("peagle", "peagle"),
 )
 ROLLOUT_DEPTHS = 3
 
@@ -257,7 +262,7 @@ def block_metrics(case, *, detailed=True):
 
 def rollout_runtime(case):
     """The canonical model and objective of one rollout case, before fitting."""
-    config = eagle_config()
+    config = eagle_config() if case.kind == "eagle3" else peagle_config()
     model = build_draft_model(config)
     install_mapping(model)
     loss = None
@@ -266,13 +271,15 @@ def rollout_runtime(case):
         loss = {"terms": {"token": token}}
     return build_objective_model(
         model,
-        options={"ttt_length": ROLLOUT_DEPTHS},
+        options={
+            "ttt_length" if case.kind == "eagle3" else "num_depths": ROLLOUT_DEPTHS
+        },
         target_head=torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False),
         loss=loss,
     )
 
 
-def rollout_batch(runtime):
+def rollout_batch(case, runtime):
     """Uneven supervision under a teacher that leaves the draft vocabulary.
 
     The draft vocabulary holds the even tokens and every input token is even.
@@ -280,15 +287,17 @@ def rollout_batch(runtime):
     token after it, which the draft can never propose.
     """
     head = runtime.target_head.weight.detach().float()
-    rows, length = 2, 16
+    # P-EAGLE samples its positions from a single row.
+    rows, length = (2, 16) if case.kind == "eagle3" else (1, 20)
     width = training_batch(runtime.draft_model.config.draft)["hidden_states"].shape[-1]
     ids = 2 * torch.randint(0, 6, (rows, length))
     loss_mask = torch.ones(rows, length)
     loss_mask[0, :2] = 0
     loss_mask[0, 9:11] = 0
     attention_mask = torch.ones(rows, length, dtype=torch.long)
-    loss_mask[1, 12:] = 0
-    attention_mask[1, 14:] = 0
+    if rows > 1:
+        loss_mask[1, 12:] = 0
+        attention_mask[1, 14:] = 0
     taught = ids.roll(-1, 1)
     taught[:, ::3] += 1
     states = head[taught]
@@ -306,8 +315,8 @@ def prepared_rollout(case):
     torch.manual_seed(7)
     runtime = rollout_runtime(case)
     torch.manual_seed(13)
-    tensors = rollout_batch(runtime)
-    # A rollout draft owns its output head: fit it with the rest.
+    tensors = rollout_batch(case, runtime)
+    # The rollout drafts own their output head: fit it with the rest.
     fit(runtime, tensors, frozen=())
     return runtime, tensors
 
@@ -357,14 +366,15 @@ class MetricGoldenTest(unittest.TestCase):
         measured = [(case.name, case, block_metrics) for case in CASES]
         for case in ROLLOUT_CASES:
             measured.append((case.name, case, rollout_metrics))
-            # its evaluation reports the depth losses and acceptance too
-            measured.append(
-                (
-                    f"{case.name} evaluation",
-                    case,
-                    lambda case: flattened(rollout_metrics(case, evaluation=True)),
+            if case.kind == "eagle3":
+                # its evaluation reports the depth losses and acceptance too
+                measured.append(
+                    (
+                        f"{case.name} evaluation",
+                        case,
+                        lambda case: flattened(rollout_metrics(case, evaluation=True)),
+                    )
                 )
-            )
         for name, case, measure in measured:
             with self.subTest(case=name):
                 actual = measure(case)
@@ -399,13 +409,15 @@ class MetricGoldenTest(unittest.TestCase):
         depths = range(ROLLOUT_DEPTHS)
         for case in ROLLOUT_CASES:
             # A depth's accuracy and loss come with the loss; its acceptance
-            # needs a second projection.
-            name = "lk_loss" if case.token else "kl_loss"
-            expected = ["acc", "loss", name] + [
-                f"{family}_{depth}"
-                for family in ("acc", "ploss", name)
-                for depth in depths
-            ]
+            # and the P-EAGLE counts need a second projection.
+            expected = ["acc", "loss"]
+            if case.kind == "eagle3":
+                name = "lk_loss" if case.token else "kl_loss"
+                expected += [name] + [
+                    f"{family}_{depth}"
+                    for family in ("acc", "ploss", name)
+                    for depth in depths
+                ]
             with self.subTest(case=case.name):
                 self.assertEqual(
                     sorted(rollout_metrics(case, detailed=False)), sorted(expected)

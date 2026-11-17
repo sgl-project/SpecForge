@@ -26,6 +26,7 @@ from tests.test_algorithms.test_metric_goldens import (
 
 
 def run(runtime, tensors, *, detailed=True):
+    # P-EAGLE samples its positions: every run draws the same ones.
     torch.manual_seed(48)
     return runtime(
         tensors, step=STEP, total_steps=TOTAL_STEPS, collect_detailed_metrics=detailed
@@ -116,7 +117,7 @@ class RolloutDiagnosticsTest(unittest.TestCase):
             with self.subTest(case=case.name):
                 runtime, tensors = prepared_rollout(case)
                 model = runtime.draft_model
-                sets = ROLLOUT_DEPTHS
+                sets = ROLLOUT_DEPTHS if case.kind == "eagle3" else 1
                 for detailed, projections in ((False, sets), (True, 2 * sets)):
                     with (
                         patch.object(model, "project", wraps=model.project) as project,
@@ -170,7 +171,7 @@ class RolloutDiagnosticsTest(unittest.TestCase):
         """The trainer sums a window as it sums ranks, so a window shows the rule.
 
         The wrappers weighted a rank's depth means by its loss token count,
-        rows times rollout length.
+        rows times rollout length, and averaged its P-EAGLE counts.
         """
         for case in ROLLOUT_CASES:
             with self.subTest(case=case.name):
@@ -179,14 +180,19 @@ class RolloutDiagnosticsTest(unittest.TestCase):
                 batches = evaluation_batches(tensors)
                 separate = step_metrics(strategy, batches, accumulation=1)
                 combined = step_metrics(strategy, batches, accumulation=2)[-1]
-                weights = [batch["input_ids"].numel() for batch in batches]
-                names = [
-                    name
-                    for name in combined
-                    if name not in ("loss", "acc") and not name.startswith("acc_")
-                ]
-                # depth losses under two names, acceptance under two, totals
-                self.assertEqual(len(names), 4 * ROLLOUT_DEPTHS + 3)
+                if case.kind == "eagle3":
+                    weights = [batch["input_ids"].numel() for batch in batches]
+                    names = [
+                        name
+                        for name in combined
+                        if name not in ("loss", "acc") and not name.startswith("acc_")
+                    ]
+                    # depth losses under two names, acceptance under two, totals
+                    self.assertEqual(len(names), 4 * ROLLOUT_DEPTHS + 3)
+                else:
+                    weights = [1, 1]
+                    names = [name for name in combined if name.startswith("position_")]
+                    self.assertEqual(len(names), 2 * ROLLOUT_DEPTHS)
                 for name in names:
                     expected = sum(
                         weight * step[name] for weight, step in zip(weights, separate)

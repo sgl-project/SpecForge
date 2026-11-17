@@ -17,3 +17,15 @@ def expected_acceptance(predictions, outputs, supervision):
     mask = supervision.mask.float()
     accepted = torch.minimum(teacher, draft).sum(-1)
     return {"accepted": (accepted * mask).sum(), "supervised": mask.sum()}
+
+
+def depth_accuracy(predictions, outputs, supervision, *, depths):
+    """Return one chunk's correct and supervised position counts by depth."""
+    supervised = supervision.mask > 0
+    correct = (outputs["logits"].argmax(-1) == supervision.labels) & supervised
+    depth = predictions.positions.flatten()
+    counts = torch.zeros(depths, device=depth.device)
+    return {
+        "correct": counts.index_add(0, depth, correct.flatten().float()),
+        "supervised": counts.index_add(0, depth, supervised.flatten().float()),
+    }

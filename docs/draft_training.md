@@ -731,3 +731,9 @@ of the probability mass the draft and the target share. `acceptance_rate` and
 `expected_acceptance` are the mean over the depths. Evaluation reports
 `eval/ploss_<depth>`, `eval/acceptance_rate_<depth>` and
 `eval/expected_acceptance_<depth>`.
+
+P-EAGLE reports, on a logging step, the correct and the supervised sampled
+positions of each depth as `position_<depth>_acc_sum` and
+`position_<depth>_acc_total`. The wrapper's `loss_sum`, `loss_total`,
+`full_acc_sum` and `full_acc_total` repeated `loss` and `acc` and are no longer
+logged.

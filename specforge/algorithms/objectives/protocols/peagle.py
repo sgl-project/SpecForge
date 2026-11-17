@@ -1,6 +1,7 @@
 """P-EAGLE COD sampling and vocabulary-aware parallel distillation."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
@@ -8,8 +9,10 @@ from specforge.algorithms.common.cod import (
     create_peagle_mask_mod,
     generate_cod_sample_indices,
 )
+from specforge.algorithms.metrics.rollout import depth_accuracy
 
 from ..base import check_options
+from ..diagnostics import measure_predictions
 from ..inputs import gather, sequence_inputs, valid_tokens
 from ..losses import TokenLoss
 from ..predictions import PredictionBatch
@@ -101,4 +104,30 @@ class PEagleObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="sum_means")
+        return PredictionBatch(
+            (predictions,),
+            reduction="sum_means",
+            diagnostics=(
+                partial(depth_counts, runtime, predictions, self.num_depths)
+                if context.get("collect_detailed_metrics", True)
+                else None
+            ),
+        )
+
+
+def depth_counts(runtime, predictions, depths):
+    """Count correct and supervised positions per depth under the wrapper's names.
+
+    The wrapper logged each count as a scalar, which accumulation and ranks
+    average: a ratio over one keeps that, and the two series still divide to
+    the depth's accuracy.
+    """
+    measured = measure_predictions(
+        runtime, predictions, partial(depth_accuracy, depths=depths)
+    )
+    one = measured["supervised"].new_ones(())
+    ratios = {}
+    for depth in range(depths):
+        ratios[f"position_{depth}_acc_sum"] = (measured["correct"][depth], one)
+        ratios[f"position_{depth}_acc_total"] = (measured["supervised"][depth], one)
+    return ratios, {}
