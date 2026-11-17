@@ -274,6 +274,7 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids: Optional[torch.Tensor] = None,
         target_hidden_for_compact: Optional[torch.Tensor] = None,
         target_head_weight: Optional[torch.Tensor] = None,
+        target_logit_softcap: Optional[float] = None,
         compact_teacher_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE,
         trim_loss_positions: bool = False,
     ) -> Tuple[
@@ -297,6 +298,8 @@ class OnlineEagle3Model(Eagle3Model):
             target_hidden_for_compact, target_head_weight, compact_teacher_chunk_size:
                 when the first two are given, the padded teacher is built from hidden
                 states in draft-vocab space and ``target`` is ignored.
+            target_logit_softcap: the target head's softcap (``TargetHead``), applied
+                to the compact teacher's streamed logits.
             trim_loss_positions: compute the teacher, draft logits and loss only at
                 supervised positions when the batch/objective supports it.
         """
@@ -315,6 +318,7 @@ class OnlineEagle3Model(Eagle3Model):
                 loss_mask=loss_mask,
                 length=self.length,
                 chunk_size=compact_teacher_chunk_size,
+                softcap=target_logit_softcap,
             )
             del target_hidden_for_compact
             trim_pack = None

@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from typing import Optional
 
@@ -5,6 +6,10 @@ import torch
 import torch.nn as nn
 
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
+from specforge.modeling.target.logit_transform import (
+    TargetLogitTransform,
+    resolve_target_logit_transform,
+)
 from specforge.modeling.target.target_utils import (
     load_target_config,
     target_hidden_size,
@@ -24,6 +29,7 @@ class TargetHead(nn.Module):
         self.vocab_size = target_vocab_size(self.config)
 
         self.fc = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+        self.logit_softcap: Optional[float] = None
 
     @classmethod
     def from_pretrained(
@@ -53,9 +59,26 @@ class TargetHead(nn.Module):
             tie_weights=tie_weights,
             cache_dir=cache_dir,
         )
+        instance.apply_logit_transform(resolve_target_logit_transform(config))
         instance.freeze_weights()
         instance = instance.eval().to(device=get_local_device(), dtype=dtype)
         return instance
+
+    @torch.no_grad()
+    def apply_logit_transform(self, transform: TargetLogitTransform) -> None:
+        """Make this head return the target's served logits.
+
+        The head only produces teacher logits, so every linear factor folds
+        into ``fc`` (the compact teacher streams ``fc.weight`` directly); the
+        softcap is applied after the projection.
+        """
+        folded = dataclasses.replace(
+            transform,
+            head_weight_scale=transform.head_weight_scale * transform.logit_scale,
+        )
+        if not folded.head_is_identity:
+            self.fc.weight.copy_(folded.fold_into_head(self.fc.weight))
+        self.logit_softcap = transform.softcap
 
     @torch.no_grad()
     def _load_weights(
@@ -114,7 +137,11 @@ class TargetHead(nn.Module):
             param.requires_grad = False
 
     def forward(self, hidden_states):
-        return self.fc(hidden_states)
+        logits = self.fc(hidden_states)
+        if self.logit_softcap is not None:
+            served = torch.tanh(logits.float() / self.logit_softcap)
+            logits = (served * self.logit_softcap).to(logits.dtype)
+        return logits
 
     def preprocess(self, input_ids, target, loss_mask):
         # Shift loss_mask with input_ids and final target states; auxiliary hidden
