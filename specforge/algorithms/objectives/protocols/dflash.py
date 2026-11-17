@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
-from ..diagnostics import block_diagnostics, diagnostic_requirements
+from ..diagnostics import block_diagnostics, diagnostic_requirements, report_token_loss
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..predictions import PredictionBatch, block_chunk_size
@@ -72,12 +72,19 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
+
+        def compute(calc):
+            calc.run()
+            report_token_loss(calc)
+
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
+            compute=compute,
             projection=LinearProjection(model.project, model.lm_head),
         )
+        chunk_size = block_chunk_size(batch)
         return PredictionBatch(
             (predictions,),
             diagnostics=block_diagnostics(
@@ -85,8 +92,9 @@ class DFlashObjective:
                 predictions,
                 blocks,
                 enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
                 teacher_metrics=self.teacher_metrics,
                 top_k=self.metric_top_k,
             ),
-            chunk_size=block_chunk_size(batch),
+            chunk_size=chunk_size,
         )

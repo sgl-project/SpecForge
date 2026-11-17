@@ -22,11 +22,17 @@ def block_diagnostics(
     blocks,
     *,
     enabled,
+    chunk_size,
     teacher_metrics=False,
     top_k=16,
     selector=None,
+    selector_alpha=None,
 ):
-    """Build a deferred report; no projection occurs when diagnostics are disabled."""
+    """Build a deferred report; no projection occurs when diagnostics are disabled.
+
+    chunk_size is the protocol's loss chunk. selector_alpha is the effective
+    selector coefficient, or None while the selector objective does not train.
+    """
     if not enabled:
         return None
     return partial(
@@ -34,10 +40,31 @@ def block_diagnostics(
         runtime,
         predictions,
         blocks,
+        chunk_size=chunk_size,
         top_k=selector.top_k if selector is not None else top_k,
         selector=selector,
+        selector_alpha=selector_alpha,
         teacher_metrics=teacher_metrics,
     )
+
+
+def report_token_loss(calc):
+    """Report the executed token term as the wrappers named it: ce_loss or lk_loss.
+
+    A loss the wrappers never ran is named after its kind, as ``<kind>_loss``.
+    """
+    term = calc.request.terms[0]
+    kind = term.loss.kind
+    name = "lk_loss" if kind.startswith("lk_") else f"{kind}_loss"
+    calc.ratios[name] = (calc.numerators[0].detach(), term.denominator)
+
+
+def diagnostic_slices(runtime, predictions, chunk_size):
+    """Split units as the loss does: an explicit size wins and zero means unsplit."""
+    explicit = runtime.execution.chunk_size
+    units = predictions.mask.shape[0]
+    size = (chunk_size if explicit is None else explicit) or units
+    return [slice(start, min(start + size, units)) for start in range(0, units, size)]
 
 
 def diagnostic_weights(runtime, predictions, slices):
@@ -62,15 +89,19 @@ def diagnostic_weights(runtime, predictions, slices):
 
 @torch.no_grad()
 def collect_block_metrics(
-    runtime, predictions, blocks, *, top_k, selector, teacher_metrics=True
+    runtime,
+    predictions,
+    blocks,
+    *,
+    chunk_size,
+    top_k,
+    selector,
+    selector_alpha=None,
+    teacher_metrics=True,
 ):
     """Project bounded chunks and return additive ratios/counts without changing loss."""
     units, size = predictions.mask.shape
-    chunk_size = runtime.execution.chunk_size or 128
-    slices = [
-        slice(start, min(start + chunk_size, units))
-        for start in range(0, units, chunk_size)
-    ]
+    slices = diagnostic_slices(runtime, predictions, chunk_size)
     weights = diagnostic_weights(runtime, predictions, slices)
     terms = None
     for part in slices:
@@ -140,6 +171,12 @@ def collect_block_metrics(
             else terms.selector_block_accepted
         ),
     )
+    token, kl_weight = predictions.plan.terms[0].loss, None
+    if token.kind == "lk_lambda" and token.options.get("target", "labels") == "labels":
+        kl_weight = (
+            token.options.get("kl_scale", 1.0),
+            token.options.get("kl_decay", 1.0),
+        )
     return format_block_metrics(
         terms,
         blocks.weights,
@@ -147,6 +184,8 @@ def collect_block_metrics(
         width,
         has_selector=selector is not None,
         has_teacher=teacher_metrics and predictions.teacher is not None,
+        selector_alpha=selector_alpha,
+        kl_weight=kl_weight,
     )
 
 
@@ -158,18 +197,26 @@ def diagnostic_requirements(objective):
 
 
 def prediction_diagnostics(
-    runtime, predictions, blocks, measure, *, enabled, slots=slice(None)
+    runtime, predictions, blocks, measure, *, enabled, chunk_size, slots=slice(None)
 ):
     """Defer algorithm metrics over whole prediction blocks until a logging step."""
     if not enabled:
         return None
     return partial(
-        collect_prediction_metrics, runtime, predictions, blocks, measure, slots=slots
+        collect_prediction_metrics,
+        runtime,
+        predictions,
+        blocks,
+        measure,
+        chunk_size=chunk_size,
+        slots=slots,
     )
 
 
 @torch.no_grad()
-def collect_prediction_metrics(runtime, predictions, blocks, measure, *, slots):
+def collect_prediction_metrics(
+    runtime, predictions, blocks, measure, *, chunk_size, slots
+):
     """Merge additive chunk reports before computing walks across sampled anchors.
 
     The measure callback receives projected outputs, labels, masks and optional
@@ -177,10 +224,8 @@ def collect_prediction_metrics(runtime, predictions, blocks, measure, *, slots):
     """
     from specforge.algorithms.metrics.blocks import compute_walk_accepted_length_terms
 
-    from .execution import prediction_slices
-
     ratios, prefixes = {}, {}
-    slices = list(prediction_slices(predictions, runtime.execution.chunk_size or 128))
+    slices = diagnostic_slices(runtime, predictions, chunk_size)
     weights = diagnostic_weights(runtime, predictions, slices)
     for part in slices:
         chunk = predictions.select(part)

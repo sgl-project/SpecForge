@@ -108,6 +108,7 @@ class DominoObjective:
                 spec.suffix_start,
             ),
         )
+        chunk_size = block_chunk_size(batch)
         return PredictionBatch(
             (predictions,),
             diagnostics=prediction_diagnostics(
@@ -116,7 +117,8 @@ class DominoObjective:
                 blocks,
                 partial(measure, base_weight=weight),
                 enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
                 slots=slice(None, -1) if spec.block.shift_label else slice(1, None),
             ),
-            chunk_size=block_chunk_size(batch),
+            chunk_size=chunk_size,
         )

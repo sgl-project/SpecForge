@@ -215,6 +215,77 @@ class CanonicalReviewTest(unittest.TestCase):
                 self.assertEqual(objective_record(name, {**saved, **logged}), saved)
         self.assertEqual(objective_record("dspark", saved), saved)
 
+    def test_built_resume_contract_is_the_record_written_before_logging_options(self):
+        from specforge.training.assembly import build_model_bundle
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for options in ({}, {"teacher_metrics": True, "metric_top_k": 4}):
+                with self.subTest(options=options):
+                    cfg = run_config(
+                        target,
+                        draft_config(),
+                        training={
+                            "attention_backend": "eager",
+                            "objective_options": options,
+                        },
+                    )
+                    resolved = resolve_run(cfg)
+                    bundle = build_model_bundle(
+                        resolved.config, algorithm=resolved.algorithm
+                    )
+                    self.assertEqual(
+                        bundle.strategy_kwargs.resume_contract[
+                            "canonical_objective_options"
+                        ],
+                        {"num_anchors": 512, "loss_decay_gamma": None},
+                    )
+
+    def test_resume_accepts_a_record_saved_with_logging_options(self):
+        from tests.test_runtime import test_checkpoint_resume as resume_tests
+
+        harness = resume_tests.TestTrainerResumeEntrypoint()
+        if not torch.distributed.is_initialized():
+            harness.setUpClass()
+            self.addCleanup(harness.tearDownClass)
+        trained = {"num_anchors": 8, "loss_decay_gamma": None}
+
+        def contract(options):
+            return {
+                "canonical_objective": "dflash",
+                "canonical_objective_options": options,
+            }
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            features = resume_tests._write_feature_files(str(root / "features"), n=4)
+            trainer, _, _ = harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=1,
+                checkpoint_extra=contract(
+                    {**trained, "teacher_metrics": True, "metric_top_k": 4}
+                ),
+            )
+            trainer.fit()
+            source = str((root / "run" / "rz-latest").resolve())
+            harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=2,
+                checkpoint_extra=contract(trained),
+                resume_from=source,
+            )
+            # the options that fix the trajectory are still compared
+            with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+                harness._make_trainer(
+                    str(root / "run"),
+                    feat_dir=features,
+                    max_steps=2,
+                    checkpoint_extra=contract({**trained, "num_anchors": 16}),
+                    resume_from=source,
+                )
+
     def test_legacy_compact_teacher_is_not_silently_accepted(self):
         from tests.test_modeling.test_canonical_eagle3 import (
             model_config as eagle_config,

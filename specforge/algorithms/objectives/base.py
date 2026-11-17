@@ -70,6 +70,30 @@ class ObjectiveModel(nn.Module):
             target_head.requires_grad_(False)
             target_head.eval()
 
+    def adopt_recorded_execution(self, recorded):
+        """Continue a resumed run with the fused setting its checkpoint recorded.
+
+        An unset ``fused`` has no request of its own, so on resume it takes the
+        recorded one: a run written with the reference formulas is not moved to
+        optimized kernels by resuming it, and the other way round. An explicit
+        setting is left alone and compared as it is.
+
+        Args:
+            recorded: The checkpoint's execution record, or None when it has none.
+
+        Returns:
+            The execution record this run now has.
+        """
+        from dataclasses import asdict, replace
+
+        if (
+            self.execution.fused is None
+            and isinstance(recorded, dict)
+            and recorded.get("fused") is not None
+        ):
+            self.execution = replace(self.execution, fused=recorded["fused"])
+        return asdict(self.execution)
+
     def train(self, mode=True):
         super().train(mode)
         if self.target_head is not None:

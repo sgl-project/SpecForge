@@ -973,6 +973,15 @@ class TestEvalMetricsFlow(unittest.TestCase):
         self.assertIn("eval/avg_acc", ctrl.last_metrics)
         self.assertIn("loss", ctrl.last_metrics)
 
+    def test_eval_does_not_request_the_detailed_metrics_it_discards(self):
+        strat = FakeStrategy()
+        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = TrainerController(core, run_id="r", output_dir=d, num_epochs=1)
+            metrics = ctrl.evaluate([_batch()])
+        self.assertIn("eval/avg_loss", metrics)
+        self.assertFalse(strat.last_ctx.collect_detailed_metrics)
+
     def test_each_interval_gets_a_fresh_managed_eval_stream(self):
         events = []
 

@@ -128,17 +128,6 @@ def add_prefix_metrics(
             add_position_counts(counts, f"dflash2/selector/greedy_{name}", values)
 
 
-def compute_accept_len(
-    pred_ids_4d: torch.Tensor,
-    target_ids_4d: torch.Tensor,
-    valid_mask_4d: torch.Tensor,
-) -> torch.Tensor:
-    """Compute per-block acceptance length."""
-    correct = (pred_ids_4d == target_ids_4d) | (~valid_mask_4d)
-    accept_prefix = correct.long().cumprod(dim=2) * valid_mask_4d.long()
-    return accept_prefix.sum(dim=2).float()
-
-
 @torch.no_grad()
 def _scatter_accepted_prefix(
     predicted_ids: Optional[torch.Tensor],

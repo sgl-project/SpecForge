@@ -1,5 +1,7 @@
 """Render additive block diagnostics using the historical metric names."""
 
+import torch
+
 from .blocks import (
     add_position_ratios,
     add_prefix_metrics,
@@ -9,9 +11,22 @@ from .blocks import (
 
 
 def format_block_metrics(
-    terms, weight_mask, anchor_positions, top_k, *, has_selector, has_teacher
+    terms,
+    weight_mask,
+    anchor_positions,
+    top_k,
+    *,
+    has_selector,
+    has_teacher,
+    selector_alpha=None,
+    kl_weight=None,
 ):
-    """Return ratio pairs and raw counts; normalization belongs to the trainer."""
+    """Return ratio pairs and raw counts; normalization belongs to the trainer.
+
+    selector_alpha is the effective selector coefficient while that objective
+    trains. kl_weight is the (kl_scale, kl_decay) of an LK-lambda token loss on
+    hard labels. Each adds its own keys and is None otherwise.
+    """
     ratio_metrics, sum_metrics = {}, {}
     block_valid = (weight_mask[..., 1:] > 0.5).any(dim=-1)
     ratio_metrics["dflash/hard_label/walk_accepted_length"] = (
@@ -32,6 +47,15 @@ def format_block_metrics(
         (f"dflash/hard_label/unary_top{top_k}_mass", terms.unary_topk_mass_num),
     ):
         add_ratio_family(ratio_metrics, name, numerators, terms.position_den)
+    ratio_metrics["target_probability"] = ratio_metrics[
+        "dflash/hard_label/unary_probability"
+    ]
+    if kl_weight is not None:
+        kl_scale, kl_decay = kl_weight
+        accepted, count = ratio_metrics["target_probability"]
+        # The CE share LK-lambda gave this prediction set, weighted by its size.
+        share = kl_scale * torch.exp(-kl_decay * accepted / count.clamp_min(1.0))
+        ratio_metrics["objective/lk_kl_weight"] = (share * count, count)
     add_position_ratios(
         ratio_metrics,
         "dflash/objective/loss_weight_share",
@@ -93,4 +117,25 @@ def format_block_metrics(
                 terms.teacher_selector_greedy_agreement_num,
                 terms.position_den,
             )
+    if selector_alpha is not None:
+        add_ratio_family(
+            ratio_metrics,
+            "dflash2/selector/loss",
+            terms.selector_ce_num,
+            terms.selector_weight_den,
+        )
+        weight = terms.selector_weight_den.sum().detach()
+        ratio_metrics["dflash2/objective/weighted_covered_accuracy"] = (
+            terms.selector_weighted_correct_num.sum().detach(),
+            weight,
+        )
+        ratio_metrics["dflash2/selector/teacher_forced_covered_gold_probability"] = (
+            terms.selector_probability_num.sum().detach(),
+            terms.selector_covered_den.sum().detach(),
+        )
+        # A ratio over one, so accumulation and ranks average it, not sum it.
+        ratio_metrics["selector_loss_alpha"] = (
+            selector_alpha * weight.new_ones(()),
+            weight.new_ones(()),
+        )
     return ratio_metrics, sum_metrics

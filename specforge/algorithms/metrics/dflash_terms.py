@@ -20,6 +20,8 @@ class DFlashMetricTerms(NamedTuple):
     unary_topk_mass_num: torch.Tensor
     selector_ce_num: torch.Tensor
     selector_weight_den: torch.Tensor
+    selector_weighted_correct_num: torch.Tensor
+    selector_probability_num: torch.Tensor
     selector_conditional_correct_num: torch.Tensor
     selector_covered_den: torch.Tensor
     selector_greedy_correct_num: torch.Tensor

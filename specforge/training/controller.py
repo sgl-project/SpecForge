@@ -1196,7 +1196,12 @@ class TrainerController:
         module.eval()
         # Use the train path's live context so schedule-dependent losses (for
         # example Domino's lambda_base) are not evaluated as if at step zero.
-        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        # The evaluator reads only loss and accuracy: skip the diagnostics.
+        ctx = StepContext(
+            global_step=self.global_step,
+            total_steps=self.total_steps,
+            collect_detailed_metrics=False,
+        )
         try:
             return Evaluator().run(
                 lambda batch: self.core.strategy.forward_loss(batch, ctx), data

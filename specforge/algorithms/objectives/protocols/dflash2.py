@@ -6,7 +6,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
-from ..diagnostics import block_diagnostics, diagnostic_requirements
+from ..diagnostics import block_diagnostics, diagnostic_requirements, report_token_loss
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -117,6 +117,7 @@ class DFlash2Objective:
 
         def compute(calc):
             calc.run((0,))
+            report_token_loss(calc)
             predictions, labels = calc.predictions, calc.labels
             terms = calc.evaluate(
                 "candidates",
@@ -155,6 +156,8 @@ class DFlash2Objective:
             plan=LossPlan((LossTerm(), LossTerm("selector", scale))),
             context_inputs={"predecessors": blocks.predecessors},
         )
+        chunk_size = block_chunk_size(batch)
+        coefficient = runtime.loss_configuration.terms["selector"].coefficient
         return PredictionBatch(
             (predictions,),
             diagnostics=block_diagnostics(
@@ -162,8 +165,11 @@ class DFlash2Objective:
                 predictions,
                 blocks,
                 enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
                 teacher_metrics=self.teacher_metrics,
                 selector=model.candidate_selector,
+                # a zero coefficient freezes the selector: no objective to report
+                selector_alpha=coefficient * scale if coefficient > 0 else None,
             ),
-            chunk_size=block_chunk_size(batch),
+            chunk_size=chunk_size,
         )

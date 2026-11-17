@@ -238,15 +238,24 @@ def reduce_dflash_metric_terms(
     if selector is None:
         selector_ce_num = position_zeros
         selector_weight_den = position_zeros
+        selector_weighted_correct_num = position_zeros
+        selector_probability_num = position_zeros
         selector_conditional_correct_num = position_zeros
     else:
+        selector_hit = (selector.selected_ids == target_ids).float()
         selector_ce_num = (selector.cross_entropy * selector.loss_weights).sum(
             dim=(0, 1)
         )
         selector_weight_den = selector.loss_weights.sum(dim=(0, 1))
-        selector_conditional_correct_num = (
-            (selector.selected_ids == target_ids).float() * selector.covered_mask
+        selector_weighted_correct_num = (selector_hit * selector.loss_weights).sum(
+            dim=(0, 1)
+        )
+        selector_probability_num = (
+            torch.exp(-selector.cross_entropy) * selector.covered_mask
         ).sum(dim=(0, 1))
+        selector_conditional_correct_num = (selector_hit * selector.covered_mask).sum(
+            dim=(0, 1)
+        )
     prefix = hard_label_prefix_counts(
         unary_hit=unary.predicted_ids[:, :, 1:] == target_ids[:, :, 1:],
         covered=unary.target_is_candidate[:, :, 1:],
@@ -272,6 +281,8 @@ def reduce_dflash_metric_terms(
         ).sum(dim=(0, 1)),
         selector_ce_num=selector_ce_num,
         selector_weight_den=selector_weight_den,
+        selector_weighted_correct_num=selector_weighted_correct_num,
+        selector_probability_num=selector_probability_num,
         selector_conditional_correct_num=selector_conditional_correct_num,
         selector_covered_den=covered_mask.sum(dim=(0, 1)),
         selector_greedy_correct_num=greedy.correct_num,

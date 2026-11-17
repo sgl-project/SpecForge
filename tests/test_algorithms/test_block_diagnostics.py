@@ -1,7 +1,8 @@
-"""Diagnostics are detached, chunk invariant and absent on non-logging steps."""
+"""Diagnostics are free, chunk invariant and absent on non-logging steps."""
 
 import unittest
 from dataclasses import replace
+from pkgutil import resolve_name
 from unittest.mock import patch
 
 import torch
@@ -10,21 +11,48 @@ from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
 
 
+def rng_states(device):
+    """Every generator a forward on this device can advance."""
+    states = [torch.get_rng_state()]
+    if device.type == "cuda":
+        states.append(torch.cuda.get_rng_state(device))
+    return states
+
+
+def wide_batch(config, *, rows=2, length=140):
+    """Fully supervised rows, long enough for more than 128 anchors each."""
+    reference = training_batch(config)
+    return dict(
+        input_ids=torch.randint(0, config.vocab_size, (rows, length)),
+        loss_mask=torch.ones(rows, length),
+        attention_mask=torch.ones(rows, length, dtype=torch.long),
+        **{
+            name: torch.randn(rows, length, reference[name].shape[-1])
+            for name in ("hidden_states", "target_last_hidden_states")
+        },
+    )
+
+
 class BlockDiagnosticsTest(unittest.TestCase):
-    def test_diagnostics_preserve_loss_and_gradients(self):
-        for architecture in (
-            "DFlashDraftModel",
-            "DFlash2DraftModel",
-            "DominoDraftModel",
-            "DSparkDraftModel",
+    def test_diagnostics_preserve_loss_gradients_and_rng(self):
+        for architecture, weighting in (
+            ("DFlashDraftModel", None),
+            ("DFlash2DraftModel", None),
+            # D-PACE diagnostics project a second time for the chain weights.
+            ("DFlash2DraftModel", {"kind": "dpace"}),
+            ("DominoDraftModel", None),
+            ("DSparkDraftModel", None),
         ):
-            with self.subTest(architecture=architecture):
+            with self.subTest(architecture=architecture, weighting=weighting):
                 options = {"num_anchors": 4}
                 if architecture in ("DFlashDraftModel", "DFlash2DraftModel"):
                     options["teacher_metrics"] = True
-                config, runtime = build_runtime(architecture, options=options)
+                config, runtime = build_runtime(
+                    architecture, options=options, weighting=weighting
+                )
                 batch = training_batch(config)
-                results, gradients = [], []
+                device = next(runtime.parameters()).device
+                results, gradients, generators = [], [], []
                 for enabled in (False, True):
                     runtime.zero_grad(set_to_none=True)
                     torch.manual_seed(48)
@@ -34,6 +62,7 @@ class BlockDiagnosticsTest(unittest.TestCase):
                         total_steps=10,
                         collect_detailed_metrics=enabled,
                     )
+                    generators.append(rng_states(device))
                     result.loss.backward()
                     results.append(result)
                     gradients.append(
@@ -43,8 +72,12 @@ class BlockDiagnosticsTest(unittest.TestCase):
                             if p.grad is not None
                         }
                     )
-                torch.testing.assert_close(results[0].loss, results[1].loss)
-                torch.testing.assert_close(gradients[0], gradients[1])
+                # Identical, not close: the report runs after the loss graph
+                # is built and may neither touch it nor draw random numbers.
+                exact = dict(rtol=0, atol=0)
+                torch.testing.assert_close(results[0].loss, results[1].loss, **exact)
+                torch.testing.assert_close(gradients[0], gradients[1], **exact)
+                torch.testing.assert_close(generators[0], generators[1], **exact)
                 self.assertFalse(results[0].sums)
                 self.assertTrue(
                     any(
@@ -60,6 +93,38 @@ class BlockDiagnosticsTest(unittest.TestCase):
                 chunked = runtime(batch, step=0, total_steps=10)
                 torch.testing.assert_close(chunked.ratios, results[1].ratios)
                 torch.testing.assert_close(chunked.sums, results[1].sums)
+
+    def test_diagnostic_chunks_follow_the_loss_chunk(self):
+        """Unset is the protocol's 128 blocks per row; an explicit zero is unsplit."""
+        for architecture, target, units in (
+            (
+                "DFlashDraftModel",
+                "specforge.algorithms.objectives.diagnostics.dflash_unary_diagnostics",
+                lambda call: call.args[0].shape[1],
+            ),
+            (
+                "DSparkDraftModel",
+                "specforge.algorithms.objectives.protocols.dspark.measure",
+                lambda call: call.args[1].shape[0],
+            ),
+        ):
+            config, runtime = build_runtime(architecture, options={"num_anchors": 130})
+            batch = wide_batch(config)
+            for chunk_size, expected in (
+                (None, [256, 4]),
+                (0, [260]),
+                (100, [100, 100, 60]),
+            ):
+                with self.subTest(architecture=architecture, chunk_size=chunk_size):
+                    runtime.execution = replace(
+                        runtime.execution, chunk_size=chunk_size
+                    )
+                    function = resolve_name(target)
+                    with patch(target, wraps=function) as measured, torch.no_grad():
+                        runtime(batch, step=0, total_steps=10)
+                    self.assertEqual(
+                        [units(call) for call in measured.call_args_list], expected
+                    )
 
     def test_teacher_metrics_extend_the_capture_contract(self):
         from specforge.algorithms.objectives.registry import resolve_objective

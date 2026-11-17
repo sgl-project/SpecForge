@@ -358,6 +358,94 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     checkpoint_extra={"canonical_loss": {"terms": {}}},
                 )
 
+    def test_unset_fused_follows_the_checkpoint(self):
+        """A run that leaves fused unset continues with what its checkpoint recorded."""
+        import types
+        from dataclasses import asdict
+
+        from specforge.algorithms.objectives.base import ObjectiveModel
+        from specforge.algorithms.objectives.execution_options import LossExecution
+        from specforge.algorithms.objectives.implementations.registry import (
+            ExecutionSelection,
+        )
+        from specforge.training.checkpoint import CheckpointManager
+
+        Composite, _, _ = _fake_seam()
+
+        def model_with(execution):
+            model = Composite()
+            model.loss_implementations = ExecutionSelection()
+            model.execution = execution
+            model.adopt_recorded_execution = types.MethodType(
+                ObjectiveModel.adopt_recorded_execution, model
+            )
+            return model
+
+        def contract(model):
+            return {
+                "canonical_loss_implementations": model.loss_implementations.names,
+                "canonical_loss_execution": asdict(model.execution),
+            }
+
+        for recorded in (False, True):
+            with self.subTest(recorded=recorded), tempfile.TemporaryDirectory() as work:
+                features = _write_feature_files(os.path.join(work, "features"), n=4)
+                out = os.path.join(work, "out")
+                writer = model_with(LossExecution(fused=recorded))
+                trainer, _, _ = self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=1,
+                    model=writer,
+                    checkpoint_extra=contract(writer),
+                )
+                if recorded:
+                    writer.loss_implementations.names["0:0"] = "token_ce"
+                trainer.fit()
+                checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
+
+                unset = model_with(LossExecution())
+                trainer, _, _ = self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    model=unset,
+                    checkpoint_extra=contract(unset),
+                    resume_from=checkpoint,
+                )
+                self.assertIs(unset.execution.fused, recorded)
+                if recorded:
+                    unset.loss_implementations.names["0:0"] = "token_ce"
+                trainer.fit()
+                state = CheckpointManager.read_resume_state(
+                    os.path.realpath(os.path.join(out, "rz-latest"))
+                )
+                self.assertEqual(state["global_step"], 2)
+                self.assertIs(state["canonical_loss_execution"]["fused"], recorded)
+
+                # An explicit setting is this run's own request and must match.
+                explicit = model_with(LossExecution(fused=not recorded))
+                with self.assertRaisesRegex(ValueError, "canonical_loss_execution"):
+                    self._make_trainer(
+                        out,
+                        feat_dir=features,
+                        max_steps=3,
+                        model=explicit,
+                        checkpoint_extra=contract(explicit),
+                        resume_from=checkpoint,
+                    )
+                # So must every other execution option.
+                chunked = model_with(LossExecution(chunk_size=1))
+                with self.assertRaisesRegex(ValueError, "canonical_loss_execution"):
+                    self._make_trainer(
+                        out,
+                        feat_dir=features,
+                        max_steps=3,
+                        model=chunked,
+                        checkpoint_extra=contract(chunked),
+                        resume_from=checkpoint,
+                    )
+
     def test_resume_continues_where_the_run_stopped(self):
         from specforge.training.checkpoint import CheckpointManager
 

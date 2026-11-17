@@ -360,7 +360,10 @@ wherever one applies and the reference formula elsewhere: off CUDA/ROCm, outside
 FP16/BF16/FP32, or without Triton, the run simply uses the reference. `true`
 requires optimized execution and raises where a categorical loss cannot be
 optimized. `false` always evaluates the reference. The implementations chosen for
-each loss group are logged once and recorded for resume.
+each loss group are logged once and recorded for resume. On resume an unset
+`fused` takes the setting the checkpoint recorded, so a run written with the
+reference formulas (including every checkpoint from before the auto setting
+existed) continues with them; an explicit `fused` must equal the recorded one.
 
 For plain DFlash/MTP linear heads, `fused: true` can also use Liger linear CE
 without retaining full logits. Auto never selects it: it was not part of the
@@ -676,14 +679,31 @@ python -m specforge.algorithms.objectives.implementations
 
 ### Diagnostic metrics
 
-The trainer computes detailed block diagnostics only on logging steps. These
-reports run without gradients, in bounded projection chunks, and preserve
-additive counts and numerator/denominator pairs across accumulation and ranks.
-They do not participate in loss checkpoint recomputation.
+The block objectives report the metrics of the training wrappers under the same
+names. Detailed diagnostics run only on logging steps, without gradients and in
+the loss's projection chunks (`loss.execution.chunk_size`; `0` keeps the set
+whole). They return additive counts and numerator/denominator pairs, which the
+trainer sums across accumulation and ranks before forming a ratio. They change
+neither the loss, the gradients nor the random state, and evaluation skips them.
 
-DFlash/DFlash2 retain hard-label, selector, prefix and sampled-anchor walk
-metrics. Set training.objective_options.teacher_metrics to true to request their
-teacher-distribution metrics and the required target features; the default is
-false. DFlash also accepts metric_top_k (default 16). Domino and DSpark retain
-sampled-anchor walk reports. DSpine reports backbone, refinement, alignment and
-candidate-coverage statistics from the objective's existing calculations.
+DFlash and DFlash2 report the hard-label, selector, prefix and sampled-anchor
+walk metrics, `ce_loss` (`lk_loss` for an LK token loss), `target_probability`
+and, for `lk_lambda` on hard labels, `objective/lk_kl_weight`. While the selector
+objective trains (a positive `loss.terms.selector.coefficient`), DFlash2 also
+reports `dflash2/selector/loss`, its per-position values, the covered-accuracy
+and gold-probability ratios and `selector_loss_alpha`. The teacher-distribution
+metrics (`dflash/teacher/*`,
+`dflash2/selector/self_conditioned_teacher_argmax_agreement`) are off by
+default: set `training.objective_options.teacher_metrics: true` to request them
+together with the target's final hidden state. Plain DFlash also accepts
+`metric_top_k` (default 16). Both options only select what is logged and are
+not part of the resume record.
+
+Domino reports `final_loss`, `base_loss`, `base_accuracy`, `accept_len`,
+`base_accept_len`, `lambda_base` and the two `domino/*/walk_accepted_length`
+ratios. DSpark reports its CE, L1 and confidence terms, per-position CE and
+accuracy, the teacher statistics and `dspark/hard_label/walk_accepted_length`;
+a draft without a confidence head omits the two confidence metrics. DSpine
+reports `dspine/backbone_ce`, `backbone_l1`, `refinement_loss`,
+`alignment_loss` and `candidate_coverage` on every step, from values its loss
+already computes.

@@ -311,6 +311,15 @@ class Trainer:
                     continue
                 persisted = state.get(key)
                 persisted_available = key in state
+                if (
+                    key == "canonical_loss_execution"
+                    and persisted_available
+                    and persisted != current
+                ):
+                    # An unset fused follows the checkpoint, and the checkpoints
+                    # this run writes keep recording what it follows.
+                    current = model.adopt_recorded_execution(persisted)
+                    persisted_contract[key] = current
                 comparison_current = current
                 comparison_persisted = persisted
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:

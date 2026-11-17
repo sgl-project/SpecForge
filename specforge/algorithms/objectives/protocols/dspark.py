@@ -123,6 +123,7 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
+        chunk_size = block_chunk_size(batch)
         return PredictionBatch(
             (predictions,),
             reduction="global_microbatch",
@@ -132,6 +133,7 @@ class DSparkObjective:
                 blocks,
                 measure,
                 enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
             ),
-            chunk_size=block_chunk_size(batch),
+            chunk_size=chunk_size,
         )
