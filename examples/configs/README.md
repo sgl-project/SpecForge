@@ -289,9 +289,9 @@ Common fields:
 | `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
 | `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
-| `training.loss` | `{}` | Named canonical loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
-| `training.loss.fused` | `false` | Select compatible optimized loss implementations for canonical objectives. |
-| `training.loss.execution` | `{}` | Canonical loss `chunk_size`, `checkpoint`, `trim`, and `teacher_chunk_size`; see [loss execution](../../docs/draft_training.md#loss-execution). |
+| `training.loss` | `{}` | Named loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
+| `training.loss.fused` | canonical: `false`; retained wrappers: `true` | Select compatible optimized implementations. Retained EAGLE3/P-EAGLE require `true`; explicit `false` is rejected. |
+| `training.loss.execution` | `{}` | `chunk_size`, `checkpoint`, `trim`, and offline `teacher_chunk_size`; see [loss execution](../../docs/draft_training.md#loss-execution). |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |
@@ -300,8 +300,6 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
-| `training.fused_logits_loss` | `true` | Optimized FP32 logits loss, including Domino's specialized CE. Enabled by default for all supported models. `false` uses eager losses. Independent of projection and checkpointing. |
-| `training.objective_checkpointing` | `true` | Recompute DFlash-family objective chunks during backward, including projection. With `objective_chunk_blocks=0`, checkpoints the whole objective. Without it, saved logits accumulate across chunks. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
@@ -317,9 +315,6 @@ Common fields:
 | `training.log_interval` | `50` | Positive optimizer-step logging interval. |
 | `training.max_checkpoints` | `0` | Keep the newest N checkpoints; 0 keeps all. |
 | `training.resume_from` | `null` | Full-run checkpoint/run root: draft, optimizer/scheduler, counters, data position, and RNG. Mutually exclusive with `model.draft_checkpoint_path`. |
-| `training.compact_teacher` | `false` | Exact lower-peak-memory teacher projection for offline text EAGLE3. |
-| `training.compact_teacher_chunk_size` | `null` | Positive vocabulary chunk size; requires `compact_teacher: true`. |
-| `training.trim_loss_positions` | `false` | EAGLE3 only. Compute the teacher target_p, draft logits, and loss only at supervised positions (batch size 1, plain KL loss); mathematically equivalent to the full-length path. |
 | `training.dflash_teacher_metrics` | `true` | DFlash/DFlash 2 only. `false` stops online capture of the target's final hidden state, which only feeds the `dflash/teacher/*` diagnostics; the loss is unchanged. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
@@ -329,11 +324,19 @@ Strategy-specific fields should be written only when tuning that objective:
 
 | Strategy | Fields and defaults |
 | --- | --- |
-| EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
-| DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
-| P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
-| MTP | `training.objective_options.objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). `training.mtp_objective_chunk_size` remains a compatibility alias; conflicting non-default values are rejected. |
+| EAGLE3 | `training.ttt_length` (`7`); choose `soft_ce` or an LK formula under `loss.terms.token`. |
+| DFlash / DFlash2 | `training.num_anchors` (`512`); CE/LK under `loss.terms`, uniform/exponential/D-PACE under `training.weighting`. |
+| Domino | CE only in retained wrappers; uniform/exponential weighting. `training.num_anchors` defaults to `512`. |
+| DFlash2 schedules | `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), `training.dflash2_selector_stop_gradient` (`false`). |
+| Domino schedule | `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`). |
+| DSpark | `loss.terms.token` defaults to CE/L1 weights 0.1/0.9; `loss.terms.confidence.coefficient` defaults to 1. Sampling stays in `num_anchors`. |
+| P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`). |
+| MTP | `training.loss.execution.chunk_size` controls projection/loss chunks; `0` disables splitting. |
+
+Old loss fields and flat loss dictionaries are rejected. Full resume requires
+current loss metadata. Canonical checkpoints with old records can use the
+[standalone converter](../../docs/draft_training.md#compatibility-boundary).
+See the migration notes below for retained-wrapper resume exceptions.
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or
@@ -568,7 +571,7 @@ unless tuning throughput or memory pressure.
   requires batch size 1.
 - VLM training, including Qwen2.5-VL, is not supported. Online capture accepts
   text inputs only.
-- `training.compact_teacher` is offline text EAGLE3 only.
+- `training.loss.execution.teacher_chunk_size` is offline text EAGLE3 only.
 - Online evaluation is not supported. Offline `data.eval_hidden_states_path`
   and `training.eval_interval` must be configured together.
 
@@ -606,31 +609,27 @@ For deeper lifecycle and recovery semantics, see the
 | DSpark | consumer DP | DP | consumer DP |
 | P-EAGLE | consumer DP, batch size 1 | No | No |
 
-`qwen3-8b-dpace.yaml` is the D-PACE recipe. It deliberately uses the
-shared DFlash strategy with `training.loss_type: dpace`; D-PACE is an objective
-selection inside the unified trainer, not another training entry.
+`qwen3-8b-dpace.yaml` uses the shared DFlash strategy and
+`training.weighting: {kind: dpace, alpha: 0.5}`.
 
-DFlash 2 treats the token objective and position weighting as independent A/B
-axes. `training.lk_loss_type: null` keeps hard-target CE, `tv` minimizes the
-one-hot total-variation objective, and `lambda` adaptively mixes CE with TV;
-`alpha` is equivalent to CE for these hard targets. Independently,
-`training.loss_type: dflash` uses `loss_decay_gamma`, while `dpace` applies one
-detached dynamic position weight to both the unary and candidate-selector
-objectives. For example, LK-lambda with D-PACE uses:
+DFlash2 selects the formula and position weighting independently. CE is the default;
+`lk_tv` uses one-hot total variation and `lk_lambda` mixes CE with TV.
+For example:
 
 ```yaml
 training:
-  lk_loss_type: lambda
-  kl_scale: 1.0
-  kl_decay: 1.0
-  loss_type: dpace
-  dpace_alpha: 0.5
+  loss:
+    terms:
+      token:
+        kind: lk_lambda
+        options: {kl_scale: 1.0, kl_decay: 1.0}
+  weighting: {kind: dpace, alpha: 0.5}
 ```
 
 Evaluation is currently offline-only and pairs `training.eval_interval` with
 `data.eval_hidden_states_path`. Best checkpoints are
 linked as `<run_id>-best`. Offline text EAGLE3 may enable
-`training.compact_teacher`; `tracking.report_to` selects `none`, W&B,
+`training.loss.execution.teacher_chunk_size`; `tracking.report_to` selects `none`, W&B,
 TensorBoard, SwanLab, or MLflow.
 
 ## Ascend NPU launch
@@ -685,3 +684,42 @@ Migration notes:
 - Qwen3-8B DTA still shares the DFlash trainer, as before. Its specialized
   behavior is encoded by the draft JSON (`training_mode: vp_drafter`); there is
   no second DTA training entry.
+
+## Migrating loss configuration
+
+Removed fields below are rejected, including CLI overrides. There is no automatic
+translation. Paths in this table are relative to `training`.
+
+| Removed field | Replacement |
+| --- | --- |
+| `fused_logits_loss` | `loss.fused` |
+| `lk_loss_type` | `loss.terms.token.kind: lk_alpha / lk_tv / lk_lambda`; omit for default CE. EAGLE3 LK also needs `options.target: teacher`. |
+| `kl_scale`, `kl_decay` | `loss.terms.token.options.kl_scale / kl_decay` with `kind: lk_lambda` |
+| `loss_decay_gamma` | Positive: `weighting: {kind: exponential, gamma: VALUE}`. Nonpositive: `{kind: uniform}`. Omit for protocol defaults. |
+| `loss_type`, `dpace_alpha` | `weighting: {kind: dpace, alpha: VALUE}` (or a supported D-PACE variant). Former `dflash` means uniform/exponential weighting. |
+| `objective_chunk_blocks`, `mtp_objective_chunk_size` | `loss.execution.chunk_size` |
+| `objective_checkpointing` | `loss.execution.checkpoint` |
+| `trim_loss_positions` | `loss.execution.trim` |
+| `compact_teacher`, `compact_teacher_chunk_size` | Positive `loss.execution.teacher_chunk_size` enables compact teacher; omit to disable. Use `32768` for the former implicit chunk size. |
+| `dflash2_selector_loss_alpha` | `loss.terms.selector.coefficient` |
+| `dspark_ce_loss_alpha`, `dspark_l1_loss_alpha` | `loss.terms.token.options.ce_weight / l1_weight` |
+| `dspark_confidence_head_alpha` | `loss.terms.confidence.coefficient` |
+
+Retained wrappers still use the five selector/Domino schedule fields above.
+Canonical runs put these under `training.objective_options`, with selector
+names `selector_warmup_ratio`, `selector_ramp_ratio`, `selector_stop_gradient`.
+
+If a historical DSpine draft records nondefault CE or alignment weights, set
+`loss.terms.token.options` and `loss.terms.refinement.options` explicitly
+(`ce_weight` and `l1_weight`, summing to one), and
+`loss.terms.alignment.coefficient`. Explicit overrides are allowed.
+
+For canonical checkpoints, use the standalone
+[`convert_canonical_checkpoint.py` command](../../docs/draft_training.md) before resuming
+a checkpoint with the old loss contract. Retained-wrapper full resume still
+checks the recorded effective settings. Two metadata differences can reject
+an otherwise equivalent run: historical D-PACE may record an unused
+`dflash_loss_decay_gamma=7` instead of `None`, and compact EAGLE3 teacher may
+record an implicit chunk size as `None` instead of `32768`.
+These are not silently rewritten; use weight-only initialization if the
+retained-wrapper resume contract differs.

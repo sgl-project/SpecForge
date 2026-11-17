@@ -205,6 +205,26 @@ def _apply_draft_overrides(
         provider.apply_overrides(cfg, draft_config)
 
 
+def load_explicit_draft_config(cfg: "Config") -> "PretrainedConfig | None":
+    """Read explicit draft metadata using the same sources as model loading.
+
+    Returns None for target-derived configuration. Checkpoint files and run
+    roots are resolved to their config; no weights or training state are read.
+    """
+    from specforge.modeling.draft.config import AutoDraftConfig
+
+    source = cfg.model.draft_model_config or _checkpoint_config_source(
+        cfg.model.draft_checkpoint_path
+    )
+    if source is None:
+        return None
+    return AutoDraftConfig.from_pretrained(
+        source,
+        cache_dir=cfg.model.cache_dir,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+
+
 def resolve_draft_config(
     cfg: "Config", *, provider: "DraftConfigProvider"
 ) -> "PretrainedConfig":
@@ -214,18 +234,8 @@ def resolve_draft_config(
 
     if enabled(cfg):
         return resolve_config(cfg)
-    from specforge.modeling.draft.config import AutoDraftConfig
-
-    source = cfg.model.draft_model_config
-    if not source:
-        source = _checkpoint_config_source(cfg.model.draft_checkpoint_path)
-    if source:
-        draft_config = AutoDraftConfig.from_pretrained(
-            source,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-    else:
+    draft_config = load_explicit_draft_config(cfg)
+    if draft_config is None:
         draft_config = _generate_draft_config(cfg, provider)
 
     expected = provider.architecture

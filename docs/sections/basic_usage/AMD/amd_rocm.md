@@ -397,7 +397,7 @@ linear-attention/Mamba target (`Qwen3_5ForConditionalGeneration`); its draft is 
 5-layer DFlash head (`hidden_size=2560`, `block_size=16`,
 `target_layer_ids=[1, 8, 15, 22, 29]`). Both runs used `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, a `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, a `flex_attention`
 trainer, and ~10 epochs (~680 optimizer steps).
 
 The SGLang side (offline capture and online capture server) runs the hybrid
@@ -470,7 +470,7 @@ The same **Qwen3.5-4B DFlash** recipe was reproduced end-to-end on a single AMD
 Instinct **MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x`
 container, using identical hyperparameters (offline and online, `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, `flex_attention`
 trainer, ~10 epochs). The ROCm requirements are the same as on MI355X: run the
 hybrid Mamba target under **AITER**
 (`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`,

@@ -140,16 +140,10 @@ class CanonicalReviewTest(unittest.TestCase):
                 ("fused_logits_loss", False),
                 ("mtp_objective_chunk_size", 1),
             ):
-                changed = cfg.model_copy(deep=True)
-                setattr(changed.training, name, value)
+                changed = cfg.model_dump()
+                changed["training"][name] = value
                 with self.assertRaisesRegex(ValueError, name):
-                    resolve_run(changed)
-            cfg.training.objective_chunk_blocks = 128
-            with self.assertLogs(
-                "specforge.training.canonical", level="WARNING"
-            ) as logs:
-                resolve_run(cfg)
-            self.assertIn("do not enable", logs.output[0])
+                    Config.model_validate(changed)
             for name in ("embedding_key", "lm_head_key"):
                 owned = run_config(
                     target,
@@ -195,9 +189,10 @@ class CanonicalReviewTest(unittest.TestCase):
                 with self.subTest(architecture=config.architecture):
                     cfg = run_config(target, config)
                     cfg.training.batch_size = 1
-                    cfg.training.compact_teacher = True
-                    with self.assertRaisesRegex(ValueError, "compact teacher"):
-                        resolve_run(cfg)
+                    raw = cfg.model_dump()
+                    raw["training"]["compact_teacher"] = True
+                    with self.assertRaisesRegex(ValueError, "compact_teacher"):
+                        Config.model_validate(raw)
 
     def test_weight_import_requires_matching_legacy_loss_settings(self):
         from specforge.algorithms.objectives import resolve_objective

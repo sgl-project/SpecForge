@@ -244,15 +244,20 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.fused_logits_loss` is a boolean, defaulting to `true` for all supported
-models, including DFlash2 and Domino. Set `false` to use eager losses.
-Unsupported devices and dtypes fall back to eager. Domino uses its specialized
-CE kernel under the same flag.
+`training.loss.fused` defaults to `false` for canonical objectives and `true`
+for retained training wrappers. DFlash-family wrappers accept `false` for eager
+losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
+On the canonical path a fused request for a categorical loss raises off
+CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
+[loss execution](../../draft_training.md#loss-execution)).
+Domino selects its specialized CE kernel under the same flag.
 
-`training.objective_chunk_blocks` sets the chunk size, and
-`training.objective_checkpointing` (default `true`) independently controls
-recomputation of each chunk's projection and objective. A zero chunk size treats
-the whole objective as one chunk; checkpointing still follows its own flag.
+`training.loss.execution.chunk_size` sets the chunk size, and
+`training.loss.execution.checkpoint` (default `true`) controls recomputation of
+each chunk's projection and objective. On the retained wrappers a zero chunk
+size treats the whole objective as one chunk and checkpointing still follows
+its own flag; the canonical executor checkpoints only when the prediction set
+is actually split.
 Without checkpointing, all chunks can retain
 logits until backward: smaller chunks do not bound total saved-logits memory.
 DFlash always skips its zero-weight anchor projection in multi-slot objectives;

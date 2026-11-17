@@ -15,7 +15,7 @@ KV prefix with explicit dense visibility; it does not add algorithm hooks or mut
 KV caches to the backbone.
 Reference and optimized loss implementations share the same executor.
 Training wrappers with capabilities not yet migrated, such as sequence parallelism,
-remain available with their existing configuration until the separate cutover. MTP/DMTP CE is evaluated
+remain available and read the same named loss configuration. MTP/DMTP CE is evaluated
 in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
 
 Loss and position weighting can be selected independently of the architecture:
@@ -333,10 +333,10 @@ Available formulas depend on the term input contract: built-in confidence uses
 `bce`, alignment uses `cosine`, and refinement uses `ce_l1`. Extensions must
 register compatible input kinds and required capabilities.
 
-Canonical objectives accept only the named configuration above. Flat loss
-dictionaries, separate `loss_execution`, and loss coefficients in
-`objective_options` are rejected. Retained training wrappers still use their
-existing top-level fields; their configuration cutover is a separate change.
+Only the named configuration above is accepted. Flat loss dictionaries,
+separate `loss_execution`, old top-level loss flags, and loss coefficients in
+`objective_options` are rejected. Retained training wrappers consume the same
+configuration and reject formulas or scheduling they cannot execute.
 
 - `chunk_size` counts complete prediction units (blocks for block protocols,
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
@@ -393,8 +393,7 @@ identities. Use the standalone converter below for pre-named-loss checkpoints.
 
 MTP uses `loss.execution.chunk_size` to control loss projection chunks.
 Its objective's default chunk size remains 4096; `objective_options.objective_chunk_size`
-sets that default. The existing top-level MTP
-chunk alias is retained until the training configuration cutover.
+sets that default.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
 path. Neither is copied into the other. A canonical checkpoint supplied through

@@ -1,6 +1,8 @@
 # coding=utf-8
 """Config-to-assembly reachability for retained training capabilities."""
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,7 +32,16 @@ OFFLINE_EAGLE3 = {
 
 
 class UnifiedFeatureReachabilityTest(unittest.TestCase):
-    def test_all_example_configs_validate_through_the_typed_entry(self):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        draft = Path(directory.name) / "config.json"
+        draft.write_text(json.dumps({"architectures": ["LlamaForCausalLMEagle3"]}))
+        patch = mock.patch.dict(OFFLINE_EAGLE3["model"], draft_model_config=str(draft))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_all_example_configs_validate_without_remote_target_downloads(self):
         paths = sorted(
             path
             for path in EXAMPLE_CONFIG_DIR.rglob("*.yaml")
@@ -40,16 +51,36 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
 
         for path in paths:
             with self.subTest(config=path.name):
-                resolve_run(Config.from_file(str(path)))
+                config = Config.from_file(str(path))
+                # Native MTP presets use matching local metadata, without a Hub call.
+                target = dict(
+                    model_type="qwen3_5",
+                    hidden_size=2560,
+                    vocab_size=248320,
+                    intermediate_size=9216,
+                    hidden_act="silu",
+                    rms_norm_eps=1e-6,
+                    num_attention_heads=16,
+                    num_key_value_heads=4,
+                    head_dim=256,
+                    max_position_embeddings=262144,
+                    attn_output_gate=True,
+                    rope_parameters=dict(
+                        rope_type="mrope",
+                        rope_theta=10000000.0,
+                        partial_rotary_factor=0.25,
+                        mrope_section=[11, 11, 10],
+                        mrope_interleaved=True,
+                    ),
+                )
+                resolve_run(config, target_config=target)
 
     def test_compact_teacher_reaches_the_eagle3_step_provider(self):
         cfg = Config.model_validate(
             {
                 **OFFLINE_EAGLE3,
                 "training": {
-                    "trim_loss_positions": True,
-                    "compact_teacher": True,
-                    "compact_teacher_chunk_size": 2048,
+                    "loss": {"execution": {"trim": True, "teacher_chunk_size": 2048}},
                 },
             }
         )
@@ -70,14 +101,14 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 **OFFLINE_EAGLE3,
                 "training": {
                     "strategy": "dflash",
-                    "trim_loss_positions": True,
+                    "loss": {"execution": {"trim": True}},
                 },
             }
         )
 
         with self.assertRaisesRegex(
             ValueError,
-            "algorithm 'dflash' does not support training.trim_loss_positions",
+            "algorithm 'dflash' does not support training.loss.execution.trim",
         ):
             resolve_run(cfg)
 
@@ -127,7 +158,10 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                 "target_backend": "sglang",
             },
             "data": {"train_data_path": "train.jsonl"},
-            "training": {"compact_teacher": True, "max_steps": 1},
+            "training": {
+                "loss": {"execution": {"teacher_chunk_size": 32768}},
+                "max_steps": 1,
+            },
             "deployment": {
                 "mode": "disaggregated",
                 "disaggregated": {
@@ -151,15 +185,13 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
                         **OFFLINE_EAGLE3,
                         "training": {
                             "strategy": "dflash",
-                            "compact_teacher": True,
+                            "loss": {"execution": {"teacher_chunk_size": 32768}},
                         },
                     }
                 )
             )
 
-        with self.assertRaisesRegex(
-            ValidationError, "requires training.compact_teacher=true"
-        ):
+        with self.assertRaisesRegex(ValidationError, "compact_teacher_chunk_size"):
             Config.model_validate(
                 {
                     **OFFLINE_EAGLE3,

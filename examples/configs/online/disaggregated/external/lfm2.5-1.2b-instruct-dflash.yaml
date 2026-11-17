@@ -11,6 +11,11 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
+  loss:
+    fused: true
+  weighting:
+    kind: exponential
+    gamma: 7
   strategy: "dflash"
   num_epochs: 6
   max_steps: 10000
@@ -21,7 +26,6 @@ training:
   max_grad_norm: 1
   attention_backend: "flex_attention"
   num_anchors: 512
-  loss_decay_gamma: 7
   save_interval: 10000
   log_interval: 50
   dist_timeout: 30

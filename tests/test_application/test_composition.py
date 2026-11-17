@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest import mock
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.application import resolve_run
@@ -53,11 +54,17 @@ def _payload(
 
 
 class ApplicationCompositionTest(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise composition policy, not draft source I/O.
+        patch = mock.patch(
+            "specforge.training.model_loading.load_explicit_draft_config",
+            return_value=None,
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_legacy_execution_options_are_rejected_with_or_without_resume(self):
-        for section, key, value in (
-            ("training", "loss", {"execution": {"chunk_size": 7}}),
-            ("model", "use_fused_conv", True),
-        ):
+        for section, key, value in (("model", "use_fused_conv", True),):
             for resume in (False, True):
                 with self.subTest(key=key, resume=resume), TemporaryDirectory() as temp:
                     payload = _payload("dflash", mode="offline")
