@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from specforge.algorithms.objectives.registry import resolve_objective
+from specforge.algorithms.objectives.registry import objective_record, resolve_objective
 
 
 def convert_record(state):
@@ -74,7 +74,9 @@ def convert_record(state):
     return {
         **state,
         "canonical_loss": resolved.losses.to_dict(),
-        "canonical_objective_options": asdict(resolved.objective),
+        "canonical_objective_options": objective_record(
+            state["canonical_objective"], asdict(resolved.objective)
+        ),
         "canonical_loss_execution": asdict(resolved.execution),
         "canonical_loss_implementations": implementations,
         "canonical_use_fused_conv": state.get("canonical_use_fused_conv", False),

@@ -6,6 +6,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
 from ..configuration import LossDefinition
+from ..diagnostics import block_diagnostics, diagnostic_requirements, report_token_loss
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
@@ -16,6 +17,7 @@ from .dflash import COMMON_MODULES
 
 @register_protocol(
     "dflash2",
+    resolve_requires=diagnostic_requirements,
     legacy_strategy="dflash",
     training=TrainingRequirements(
         capture_method="dflash",
@@ -38,6 +40,7 @@ from .dflash import COMMON_MODULES
 @dataclass
 class DFlash2Objective:
     num_anchors: int = 512
+    teacher_metrics: bool = False
     loss_decay_gamma: float | None = None
     selector_warmup_steps: int | None = None
     selector_ramp_steps: int | None = None
@@ -54,6 +57,7 @@ class DFlash2Objective:
             ),
         }
 
+    logging_options = ("teacher_metrics",)
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
 
@@ -112,6 +116,7 @@ class DFlash2Objective:
 
         def compute(calc):
             calc.run((0,))
+            report_token_loss(calc)
             predictions, labels = calc.predictions, calc.labels
             terms = calc.evaluate(
                 "candidates",
@@ -150,4 +155,20 @@ class DFlash2Objective:
             plan=LossPlan((LossTerm(), LossTerm("selector", scale))),
             context_inputs={"predecessors": blocks.predecessors},
         )
-        return PredictionBatch((predictions,), chunk_size=block_chunk_size(batch))
+        chunk_size = block_chunk_size(batch)
+        coefficient = runtime.loss_configuration.terms["selector"].coefficient
+        return PredictionBatch(
+            (predictions,),
+            diagnostics=block_diagnostics(
+                runtime,
+                predictions,
+                blocks,
+                enabled=context.get("collect_detailed_metrics", True),
+                chunk_size=chunk_size,
+                teacher_metrics=self.teacher_metrics,
+                selector=model.candidate_selector,
+                # a zero coefficient freezes the selector: no objective to report
+                selector_alpha=coefficient * scale if coefficient > 0 else None,
+            ),
+            chunk_size=chunk_size,
+        )

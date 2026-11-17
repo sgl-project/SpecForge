@@ -309,6 +309,19 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            saved_options = state.get("canonical_objective_options")
+            if "canonical_objective" in resume_contract and isinstance(
+                saved_options, dict
+            ):
+                from specforge.algorithms.objectives import objective_record
+
+                # a record written while logging-only options were still saved
+                state = {
+                    **state,
+                    "canonical_objective_options": objective_record(
+                        resume_contract["canonical_objective"], saved_options
+                    ),
+                }
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
             saved_loss = state.get("canonical_loss")

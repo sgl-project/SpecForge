@@ -188,6 +188,19 @@ class DSpineObjective:
             calc.add(1, refinement.values)
             calc.add(2, coefficient.detach() * alignment)
             calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
+            for name, values in (
+                ("backbone_l1", terms.statistics["teacher_l1"]),
+                ("refinement_loss", refinement.values),
+                ("alignment_loss", alignment),
+            ):
+                calc.ratios[f"dspine/{name}"] = (
+                    (values.detach() * calc.weights).sum(),
+                    denominator,
+                )
+            calc.ratios["dspine/candidate_coverage"] = (
+                (covered.any(-1) * predictions.mask).sum().detach(),
+                predictions.mask.sum().detach(),
+            )
 
         predictions = runtime.block_predictions(
             output,
