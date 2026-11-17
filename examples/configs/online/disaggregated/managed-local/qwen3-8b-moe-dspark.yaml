@@ -1,0 +1,101 @@
+model:
+  target_model_path: "Qwen/Qwen3-8B"
+  draft_model_config: "configs/qwen3-8b-moe-dspark.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  # Liger RMSNorm; the MoE FFN keeps its grouped_mm experts (no Liger expert kernel yet).
+  use_liger_kernel: true
+  mask_token_id: 151669
+  sglang_attention_backend: "triton"
+  sglang_mem_fraction_static: 0.85
+  sglang_disable_radix_cache: true
+  sglang_context_length: 8208
+  sglang_max_running_requests: 4
+  sglang_max_total_tokens: 65536
+
+data:
+  train_data_path: "./cache/dataset/perfectblend_train_regen_temperature0_no_think.jsonl"
+  max_length: 8192
+  chat_template: "qwen3-instruct"
+  cache_dir: "./cache/qwen3-8b-dspark-perfectblend-8192"
+  build_dataset_num_proc: 64
+  dataloader_num_workers: 8
+
+training:
+  strategy: "dspark"
+  num_epochs: 12
+  total_steps: null
+  max_steps: null
+  tp_size: 1
+  batch_size: 2
+  accumulation_steps: 11
+  fsdp_sharding: "NO_SHARD"
+  optimizer_cpu_offload: false
+  learning_rate: 0.0006
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: "flex_attention"
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  objective_chunk_blocks: 128
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 0.0
+  save_interval: 1196
+  max_checkpoints: 12
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+  prompt_seed: 42
+
+tracking:
+  report_to: "none"
+  wandb_project: "specforge-qwen3-8b-dspark"
+  wandb_name: "qwen3-8b-moe-dspark"
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 8
+  in_flight_high_watermark: 528
+  in_flight_low_watermark: 396
+  resident_high_watermark_bytes: 214748364800
+  resident_low_watermark_bytes: 128849018880
+  feature_store_max_resident_bytes: 274877906944
+
+run_id: "qwen3-8b-moe-dspark"
+output_dir: "./outputs/qwen3-8b-moe-dspark"
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 6
+  disaggregated:
+    control_dir: outputs/qwen3-8b-moe-dspark/control
+    backend: mooncake
+    client_buffer_size: 1073741824
+    managed_local:
+      trainer_cuda_visible_devices:
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "6"
+        - "7"
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 107374182400
+        local_buffer_size_bytes: 1073741824
+        default_kv_lease_ttl_ms: 300000
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+        - port: 30001
+          cuda_visible_devices:
+            - "1"
+          tp_size: 1
