@@ -202,9 +202,10 @@ Objective evaluation performs no collectives; the objective itself never reduces
 its alignment statistics across ranks. Transfer-space initialization and
 restoration remain owned by the public model loader.
 
-Historical draft checkpoints cannot be loaded or resumed. Canonical checkpoints
-support exact training resume; native target weights are copied through explicit
-`from_target` mappings.
+Historical draft checkpoints cannot be loaded or resumed; convert their weights
+first (see [Checkpoint and configuration boundary](#checkpoint-and-configuration-boundary)).
+Canonical checkpoints support exact training resume; native target weights are
+copied through explicit `from_target` mappings.
 
 For scratch training, `model.load_target_embedding: true` copies the target table
 into an owned embedding with shape validation. Like legacy `load_embedding`, this
@@ -662,6 +663,40 @@ Use the corresponding named settings in the run YAML:
 Both CE/L1 weights must be specified to preserve a non-default mixture; changing
 only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to
 both `base` and `final`.
+
+The package reads only the canonical draft format. A historical (pre-canonical)
+draft checkpoint is converted once, by a script that keeps the old configuration
+decoders outside the package:
+
+```bash
+PYTHONPATH=. python scripts/convert_legacy_checkpoint.py \
+  --checkpoint OLD_CHECKPOINT --target-model TARGET_MODEL \
+  --output-dir CANONICAL_CHECKPOINT
+```
+
+The output is a canonical draft directory for `initialization.checkpoint`,
+`initialization.weights_from` and `specforge export`: the decoded `config.json`
+and every weight under its canonical name, with values and dtypes unchanged.
+The source is only read, an existing output is refused, and optimizer, scheduler
+and RNG state are not converted. Supported sources are DFlash, DFlash2, Domino,
+DSpark, DSpine, EAGLE3, P-EAGLE and Qwen3.5 MTP checkpoints.
+
+- `--target-model` is the target the checkpoint was trained against. Its
+  configuration resolves target-derived settings. A saved copy of its embedding
+  or LM head must equal the target's table and is left out of the output; only
+  then are target weights read.
+- `--draft-config OLD.json` supplies the old configuration for a checkpoint
+  without `config.json` (a weights file, or a directory holding only
+  `training_state.pt`). Settings recorded in `training_state.pt` must agree
+  with it.
+- P-EAGLE needs `--mask-token-id` (the old `model.mask_token_id`) unless
+  `training_state.pt` records it. `--norm-before-residual` /
+  `--no-norm-before-residual` and `--capture-layers` supply the old
+  `training.norm_before_residual` and `model.aux_hidden_state_layer_ids`
+  (EAGLE3 and P-EAGLE) when the old configuration omits them; they may not
+  contradict recorded values.
+- DSpine training options stored in the old `dspine_config` are not part of a
+  draft directory. Set them in the run YAML.
 
 ### Inspecting loss implementations
 

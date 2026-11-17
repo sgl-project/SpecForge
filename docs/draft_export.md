@@ -52,8 +52,10 @@ Bundled code may import only torch, transformers and the standard library, so lo
 by Hub repo id needs nothing else; optional packages such as flash-attn are imported
 inside `try`, only when their backend is selected.
 
-Export accepts canonical checkpoints containing `config.json`. Historical
-weight imports and `--draft-config` are not supported. Token metadata
+Export accepts canonical checkpoints containing `config.json`. Convert a
+historical checkpoint first with `scripts/convert_legacy_checkpoint.py`
+([usage](/draft_training.md#checkpoint-and-configuration-boundary)); export
+itself has no `--draft-config`. Token metadata
 (`bos_token_id`, `eos_token_id`, `pad_token_id`) is preserved.
 Use `--converter sglang` for serving conversion and `--target-model` for
 target metadata or native merge-back.
