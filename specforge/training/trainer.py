@@ -309,24 +309,18 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
-            for key in ("canonical_objective_options", "canonical_loss"):
-                saved = state.get(key)
-                current = resume_contract.get(key)
-                if (
-                    current is not None
-                    and isinstance(saved, dict)
-                    and (
-                        (key == "canonical_loss" and "terms" not in saved)
-                        or (
-                            key == "canonical_objective_options"
-                            and saved.keys() - current.keys()
-                        )
-                    )
-                ):
-                    raise ValueError(
-                        f"checkpoint uses an old {key} record; convert it with "
-                        "scripts/convert_canonical_checkpoint.py before resuming"
-                    )
+            # Every checkpoint written before named loss terms stores a flat
+            # canonical_loss, whatever else its record holds.
+            saved_loss = state.get("canonical_loss")
+            if (
+                resume_contract.get("canonical_loss") is not None
+                and isinstance(saved_loss, dict)
+                and "terms" not in saved_loss
+            ):
+                raise ValueError(
+                    "checkpoint uses an old canonical_loss record; convert it with "
+                    "scripts/convert_canonical_checkpoint.py before resuming"
+                )
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)

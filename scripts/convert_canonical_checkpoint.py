@@ -12,6 +12,11 @@ from specforge.algorithms.objectives.registry import resolve_objective
 
 def convert_record(state):
     """Return current loss records; all other checkpoint fields are preserved."""
+    if "canonical_loss" not in state:
+        raise ValueError(
+            "Not a canonical training checkpoint: training_state.pt records no "
+            "canonical_loss"
+        )
     old_loss = state["canonical_loss"]
     if "terms" in old_loss:
         raise ValueError("Checkpoint already uses named loss terms")
@@ -26,27 +31,23 @@ def convert_record(state):
         if old in options:
             terms[term] = {"coefficient": options.pop(old)}
 
-    token_options = {}
-    for old, new in (("ce_loss_alpha", "ce_weight"), ("l1_loss_alpha", "l1_weight")):
-        if old in options:
-            token_options[new] = options.pop(old)
+    # DSpark's two weights only configured its default token loss, and the old record
+    # stores that loss resolved, so they are already in old_loss["options"].
+    for old in ("ce_loss_alpha", "l1_loss_alpha"):
+        options.pop(old, None)
+    # DSpine's ce_weight still mixes the refinement loss. The token loss is the
+    # recorded one: an explicit flat loss never took this weight.
     if "ce_weight" in options:
         weight = options.pop("ce_weight")
-        token_options = {"ce_weight": weight, "l1_weight": 1 - weight}
-        terms["refinement"] = {"options": token_options}
+        terms["refinement"] = {
+            "options": {"ce_weight": weight, "l1_weight": 1 - weight}
+        }
 
     defaults = resolve_objective(
         architecture, name=state["canonical_objective"], options=options
     )
     for name in ("base", "final") if "base" in defaults.losses.terms else ("token",):
-        kind = old_loss["kind"]
-        if kind == "default":
-            kind = defaults.losses.terms[name].loss.kind
-        formula = {
-            **(token_options if kind == "ce_l1" else {}),
-            **old_loss.get("options", {}),
-        }
-        terms[name] = {"kind": kind, "options": formula}
+        terms[name] = {"kind": old_loss["kind"], "options": dict(old_loss["options"])}
     policy = dict(state.get("canonical_loss_execution", {}))
     fused = policy.pop("fused", False)
     resolved = resolve_objective(
@@ -91,8 +92,18 @@ def convert_checkpoint(source, output):
         source / "training_state.pt", map_location="cpu", weights_only=True
     )
     converted = convert_record(state)
-    shutil.copytree(source, output)
-    torch.save(converted, output / "training_state.pt")
+    # Build the copy beside the destination and rename it last, so a failed
+    # conversion never leaves an unconverted checkpoint at the output path.
+    staging = output.with_name(output.name + ".converting")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        shutil.copytree(source, staging)
+        torch.save(converted, staging / "training_state.pt")
+        staging.rename(output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def main():
