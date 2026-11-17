@@ -1,4 +1,7 @@
-"""Replacement paths for removed training loss fields (no automatic conversion)."""
+"""Removed configuration fields and the settings that replace them.
+
+Nothing is converted here: a removed field is rejected with its replacement.
+"""
 
 REMOVED_LOSS_FIELDS = {
     "fused_logits_loss": "loss.fused",
@@ -21,14 +24,28 @@ REMOVED_LOSS_FIELDS = {
 }
 
 
-def reject_removed_loss_fields(fields):
-    """Reject retired keys with their replacement paths."""
+def reject_removed_loss_fields(fields, *, override=False):
+    """Reject retired keys with their replacement paths.
+
+    Args:
+        fields: Names present under ``training``.
+        override: The names come from a command-line override, which cannot
+            create a nested mapping the file lacks; the message then shows the
+            mapping form.
+    """
     removed = [
         f"training.{key} -> training.{replacement}"
         for key, replacement in REMOVED_LOSS_FIELDS.items()
         if key in fields
     ]
     if removed:
-        raise ValueError(
-            "Removed training loss fields; replace explicitly: " + "; ".join(removed)
+        message = "Removed training loss fields; replace explicitly: " + "; ".join(
+            removed
         )
+        if override:
+            message += (
+                ". As an override, pass the enclosing mapping unless the file "
+                "already has it, for example "
+                "'training.loss={execution: {chunk_size: 64}}'"
+            )
+        raise ValueError(message)

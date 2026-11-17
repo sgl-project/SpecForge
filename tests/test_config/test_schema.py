@@ -884,7 +884,7 @@ class ConfigSchemaTest(unittest.TestCase):
         )
 
     def test_removed_loss_keys_name_the_replacement(self):
-        from specforge.config.loss_migration import REMOVED_LOSS_FIELDS
+        from specforge.config.removed_fields import REMOVED_LOSS_FIELDS
 
         for key, replacement in REMOVED_LOSS_FIELDS.items():
             with self.subTest(key=key):
@@ -896,6 +896,13 @@ class ConfigSchemaTest(unittest.TestCase):
                         Config.model_validate(MINIMAL), [f"training.{key}=true"]
                     )
                 self.assertIn(replacement, str(caught.exception))
+                # a dotted override cannot create the nested mapping
+                self.assertIn("training.loss={", str(caught.exception))
+        config = apply_overrides(
+            Config.model_validate(MINIMAL),
+            ["training.loss={execution: {chunk_size: 64}}"],
+        )
+        self.assertEqual(config.training.loss, {"execution": {"chunk_size": 64}})
 
     def test_tv_is_a_supported_acceptance_loss_type(self):
         payload = _online_payload("dflash")

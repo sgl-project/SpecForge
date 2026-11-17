@@ -27,6 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
+from .removed_fields import reject_removed_loss_fields
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -1099,8 +1101,6 @@ class TrainingConfig(StrictConfigModel):
     @model_validator(mode="before")
     @classmethod
     def _reject_removed_loss_fields(cls, value):
-        from .loss_migration import reject_removed_loss_fields
-
         if isinstance(value, dict):
             reject_removed_loss_fields(value)
         return value
@@ -1568,9 +1568,7 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         path, value = item.split("=", 1)
         keys = path.split(".")
         if len(keys) > 1 and keys[0] == "training":
-            from .loss_migration import reject_removed_loss_fields
-
-            reject_removed_loss_fields({keys[1]})
+            reject_removed_loss_fields({keys[1]}, override=True)
         owner, node = config, raw
         for key in keys[:-1]:
             owner = _override_field(owner, key, path)
