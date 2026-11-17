@@ -96,7 +96,9 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                     }
                     if has_execution:
                         old.update(
-                            canonical_loss_execution=asdict(defaults.execution),
+                            # the old default: reference formulas
+                            canonical_loss_execution=asdict(defaults.execution)
+                            | {"fused": False},
                             canonical_loss_implementations={},
                             canonical_use_fused_conv=False,
                         )
@@ -127,7 +129,10 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                         self.assertEqual(
                             (output / filename).read_bytes(), before[filename]
                         )
-                    expected = resolve_objective(architecture, loss={"terms": terms})
+                    # An old run evaluated the reference; the resumed one says so.
+                    expected = resolve_objective(
+                        architecture, loss={"terms": terms, "fused": False}
+                    )
                     saved = torch.load(output / "training_state.pt", weights_only=True)
                     self.assertEqual(saved["canonical_loss"], expected.losses.to_dict())
                     self.assertEqual(

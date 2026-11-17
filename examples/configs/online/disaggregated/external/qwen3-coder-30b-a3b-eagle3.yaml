@@ -12,8 +12,6 @@ data:
   build_dataset_num_proc: 64
   cache_dir: "./cache"
 training:
-  loss:
-    fused: true
   num_epochs: 2
   max_steps: 10000
   batch_size: 1

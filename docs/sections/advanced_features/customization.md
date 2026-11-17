@@ -244,10 +244,11 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.loss.fused` defaults to `false` for canonical objectives and `true`
-for retained training wrappers. DFlash-family wrappers accept `false` for eager
+`training.loss.fused` is unset by default: canonical objectives then use an
+optimized implementation where one applies and the reference elsewhere, and
+retained training wrappers use their fused kernels. DFlash-family wrappers accept `false` for eager
 losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
-On the canonical path a fused request for a categorical loss raises off
+On the canonical path an explicit `fused: true` for a categorical loss raises off
 CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
 [loss execution](../../draft_training.md#loss-execution)).
 Domino selects its specialized CE kernel under the same flag.

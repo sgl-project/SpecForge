@@ -11,7 +11,7 @@ from ..configuration import LossDefinition
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
 
@@ -22,6 +22,7 @@ from .dflash import COMMON_MODULES
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
     ),
     requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),
@@ -119,4 +120,8 @@ class DSparkObjective:
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
-        return PredictionBatch((predictions,), reduction="global_microbatch")
+        return PredictionBatch(
+            (predictions,),
+            reduction="global_microbatch",
+            chunk_size=block_chunk_size(batch),
+        )

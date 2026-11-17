@@ -240,7 +240,6 @@ training:
   objective_options:
     num_anchors: 512
   loss:
-    fused: true
     terms:
       token:
         kind: ce_l1
@@ -363,8 +362,16 @@ configuration and reject formulas or scheduling they cannot execute.
   teacher. It preserves full-vocabulary argmax and retained probability mass
   while projecting vocabulary tiles; no full-vocabulary logits are retained.
 
-For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
-retaining full logits. It requires a compatible Liger kernel that also returns
+`loss.fused` has three settings. Unset (auto) uses an optimized implementation
+wherever one applies and the reference formula elsewhere: off CUDA/ROCm, outside
+FP16/BF16/FP32, or without Triton, the run simply uses the reference. `true`
+requires optimized execution and raises where a categorical loss cannot be
+optimized. `false` always evaluates the reference. The implementations chosen for
+each loss group are logged once and recorded for resume.
+
+For plain DFlash/MTP linear heads, `fused: true` can also use Liger linear CE
+without retaining full logits. Auto never selects it: it was not part of the
+training paths the recipes were validated on. It requires a compatible Liger kernel that also returns
 predicted tokens. Its installed version is checked against the project's Liger
 requirement before loading the kernel; an out-of-range version raises, including
 after a no-deps installation. An unavailable kernel also raises for an eligible
@@ -376,10 +383,23 @@ chunks with the complete-chain weights. Only `lk_lambda` among the LK variants r
 execution, and DSpine retains it when no window alignment statistic is supplied.
 Thus requesting chunking does not promise bounded loss memory for those paths.
 
-`model.use_fused_conv` opts canonical grouped convolution into its existing Triton
-kernel. Enabling it without grouped convolution, or with unsupported weights or
-group sizes, fails during setup. Incompatible runtime input dtypes and compiled
-execution also raise. The selected path is logged during setup. Ordinary loading
+`model.use_fused_conv` selects the Triton kernel of the grouped convolution.
+Unset (auto) uses it when the draft has grouped convolutions and all of them
+support it: CUDA/ROCm FP16/BF16/FP32 weights, a power-of-two group size up to
+1024, and Triton installed. `true` fails during setup without a grouped
+convolution or where the kernel cannot run; `false` keeps the eager one.
+Incompatible runtime input dtypes and compiled execution raise while the kernel
+is selected. The selected path is logged during setup and recorded for resume.
+
+`model.use_liger_kernel` follows the same three settings. Unset enables Liger
+RMSNorm/SwiGLU on a CUDA/ROCm trainer for the objectives that declare it as
+their default (DFlash and DFlash2) when the draft's FFNs use `silu`/`swish`;
+`true` enables it for any objective and fails where it cannot run.
+
+The block objectives (DFlash, DFlash2, Domino, DSpark, DSpine) project and
+checkpoint 128 blocks per batch row at a time unless
+`loss.execution.chunk_size` says otherwise; the unit of an explicit value is
+flattened rows x blocks, so 128 blocks per row at batch size 2 is 256. Ordinary loading
 through specforge.loading and exported models use eager convolution by default;
 this training option is not stored in the model architecture.
 The fused kernel accumulates in FP32 and rounds once, so
@@ -451,8 +471,9 @@ entry chooses how to evaluate them:
 
 | Mode | Configuration | Selection |
 | --- | --- | --- |
+| Default | fused unset | A default-enabled optimization where one applies, otherwise the reference formula; nothing raises for an unsupported device, dtype or missing kernel package |
 | Reference | fused: false | Registered mathematical formulas |
-| Optimized | fused: true | Compatible joint or per-term optimization. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
+| Required | fused: true | Compatible joint or per-term optimization, including opt-in ones such as `linear_ce`. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
 
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,

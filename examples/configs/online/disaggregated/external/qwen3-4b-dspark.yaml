@@ -10,7 +10,6 @@ data:
   build_dataset_num_proc: 32
 training:
   loss:
-    fused: true
     execution:
       chunk_size: 128
   weighting:

@@ -21,8 +21,6 @@ data:
   cache_dir: ./cache
 
 training:
-  loss:
-    fused: true
   num_epochs: 20
   batch_size: 1
   learning_rate: 6.0e-4

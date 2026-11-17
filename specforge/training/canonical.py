@@ -1,8 +1,11 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
+import logging
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def enabled(cfg):
@@ -496,7 +499,7 @@ def resolve_run(cfg, *, target_config=None):
         build_training_model=None,
         build_bundle=build_bundle,
         needs_input_tools=online_needs_input_tools,
-        default_dataloader_num_workers=None,
+        default_dataloader_num_workers=requirements.dataloader_workers,
         loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
         resolve_capture_layers=capture_layers,
@@ -522,6 +525,73 @@ def resolve_run(cfg, *, target_config=None):
     return cfg, make_registration(spec, providers)
 
 
+def liger_choice(requested, *, by_default, hidden_act, platform=None):
+    """Resolve model.use_liger_kernel for a trainer platform (default: this one).
+
+    An unset flag enables Liger only for objectives that declare it as their
+    default, on a CUDA/ROCm trainer with a silu/swish draft; ``true`` fails
+    where Liger cannot run.
+    """
+    from specforge.modeling.draft.dflash_kernels import (
+        LigerKernelChoice,
+        current_liger_platform,
+        resolve_liger_kernel_choice,
+    )
+
+    platform = platform or current_liger_platform()
+    if requested is None and not by_default:
+        return LigerKernelChoice(
+            False, "auto: not a default for this objective", platform
+        )
+    return resolve_liger_kernel_choice(
+        requested, platform=platform, hidden_act=hidden_act
+    )
+
+
+def preflight_kernels(cfg):
+    """Import the Liger kernels this run's draft build will resolve.
+
+    Called before services start or a consumer waits on its producer, so a
+    missing install fails at startup. build_bundle still owns the resolution.
+    """
+    requested = cfg.model.use_liger_kernel
+    if requested is False:
+        return
+    if requested is None:
+        from specforge.algorithms.objectives import resolve_objective
+        from specforge.config.draft.mlp.dense import DenseFFNSpec
+
+        draft = resolve_config(cfg)
+        acts = {
+            node.hidden_act
+            for node in draft.mlp_configs.values()
+            if isinstance(node, DenseFFNSpec)
+        }
+        resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+        choice = liger_choice(
+            None,
+            by_default=resolved.registration.training.liger_by_default,
+            hidden_act="silu" if acts <= {"silu", "swish"} and acts else "other",
+        )
+        if not choice.enabled:
+            return
+    from specforge.modeling.draft.layers.kernels import load_liger_kernels
+
+    load_liger_kernels()
+
+
+def _raise_flex_recompile_limit():
+    """Let compiled FlexAttention follow changing block-mask shapes.
+
+    Past the limit torch stops compiling the frame and runs it eagerly without
+    an error. The limit is process-wide; 64 is the value the block objectives
+    were tuned with.
+    """
+    import torch._dynamo as dynamo
+
+    dynamo.config.recompile_limit = max(dynamo.config.recompile_limit, 64)
+
+
 def build_bundle(cfg, algorithm):
     import torch
 
@@ -539,7 +609,10 @@ def build_bundle(cfg, algorithm):
     from specforge.config.schema import ModelConfig
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
-    from specforge.modeling.draft.layers.kernels import configure_kernels
+    from specforge.modeling.draft.layers.kernels import (
+        configure_kernels,
+        liger_hidden_act,
+    )
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
 
@@ -648,10 +721,18 @@ def build_bundle(cfg, algorithm):
                 f"draft vocab_size {model.vocabulary.vocab_size} must equal the "
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
-    use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(
+    liger = liger_choice(
+        cfg.model.use_liger_kernel,
+        by_default=resolved.registration.training.liger_by_default,
+        hidden_act=liger_hidden_act(model),
+    )
+    logger.info(liger.describe())
+    use_liger = liger.enabled
+    use_fused_conv = configure_kernels(
         model, use_liger=use_liger, use_fused_conv=cfg.model.use_fused_conv
     )
+    if cfg.training.attention_backend == "flex_attention":
+        _raise_flex_recompile_limit()
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -688,7 +769,7 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_use_liger_kernel": use_liger,
-        "canonical_use_fused_conv": cfg.model.use_fused_conv,
+        "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),

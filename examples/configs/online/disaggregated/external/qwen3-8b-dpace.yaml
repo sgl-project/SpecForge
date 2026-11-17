@@ -14,8 +14,6 @@ data:
   cache_dir: ./cache
 
 training:
-  loss:
-    fused: true
   weighting:
     kind: dpace
     alpha: 0.5

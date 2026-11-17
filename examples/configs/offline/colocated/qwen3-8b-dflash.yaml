@@ -13,8 +13,6 @@ data:
   cache_dir: ./cache
 
 training:
-  loss:
-    fused: true
   weighting:
     kind: exponential
     gamma: 7.0

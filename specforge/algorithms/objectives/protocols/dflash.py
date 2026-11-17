@@ -7,7 +7,7 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 from ..base import check_options
 from ..inputs import prepare_blocks
 from ..losses import TokenLoss, decay_weighting
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..projection import LinearProjection
 from ..registry import TrainingRequirements, register_protocol
 
@@ -20,6 +20,8 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
         capture_method="dflash",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
+        liger_by_default=True,
     ),
     architectures=("DFlashDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
@@ -71,5 +73,6 @@ class DFlashObjective:
                     batch,
                     projection=LinearProjection(model.project, model.lm_head),
                 ),
-            )
+            ),
+            chunk_size=block_chunk_size(batch),
         )

@@ -124,7 +124,7 @@ def distributed_reduction(rank, rendezvous):
             # Release DDP reducers and their autograd graphs while Gloo is alive.
             del wrapped, model, expected
             gc.collect()
-        # Resolve before compute: every rank sees mismatches and dependency errors.
+        # Ranks resolve independently; the trainer's agreement point sees a mismatch.
 
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
@@ -139,25 +139,27 @@ def distributed_reduction(rank, rendezvous):
                 return_value=entry,
             ):
                 selection = ExecutionSelection()
+                selection.resolve(request, (0,), 0)
                 if mismatch:
                     with unittest.TestCase().assertRaisesRegex(
                         ValueError, "differ across ranks"
                     ):
-                        selection.resolve(request, (0,), 0)
+                        selection.agree()
                 else:
-                    selection.resolve(request, (0,), 0)
+                    selection.agree()
                     assert selection.names == {"0:0": "kernel_0"}
-        with (
-            patch(
-                "specforge.algorithms.objectives.implementations.registry.select_implementation",
-                side_effect=ImportError("missing kernel dependency") if rank else None,
-                return_value=entry,
-            ),
-            unittest.TestCase().assertRaisesRegex(
-                ValueError, "missing kernel dependency"
-            ),
-        ):
-            ExecutionSelection().resolve(request, (0,), 0)
+        # A dependency error is raised by the rank that hits it, with no collective.
+        if rank:
+            with (
+                patch(
+                    "specforge.algorithms.objectives.implementations.registry.select_implementation",
+                    side_effect=ImportError("missing kernel dependency"),
+                ),
+                unittest.TestCase().assertRaisesRegex(
+                    ValueError, "missing kernel dependency"
+                ),
+            ):
+                ExecutionSelection().resolve(request, (0,), 0)
         dist.barrier()
     finally:
         dist.destroy_process_group()

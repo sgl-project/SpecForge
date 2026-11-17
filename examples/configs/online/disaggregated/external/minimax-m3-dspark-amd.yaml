@@ -24,9 +24,9 @@ data:
 
 training:
   loss:
-    fused: true
     execution:
-      chunk_size: 128
+      # 128 blocks for each of the two batch rows
+      chunk_size: 256
     terms:
       token:
         options:

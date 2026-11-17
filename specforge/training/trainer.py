@@ -325,8 +325,11 @@ class Trainer:
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
                     if saved is None:
-                        if state.get("canonical_loss_execution", {}).get(
-                            "fused", False
+                        if (
+                            state.get("canonical_loss_execution", {}).get(
+                                "fused", False
+                            )
+                            is not False
                         ):
                             raise ValueError(
                                 "checkpoint does not record resolved fused loss implementations"

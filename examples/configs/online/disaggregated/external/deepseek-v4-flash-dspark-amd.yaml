@@ -34,7 +34,6 @@ data:
 
 training:
   loss:
-    fused: true
     execution:
       chunk_size: 128
     terms:

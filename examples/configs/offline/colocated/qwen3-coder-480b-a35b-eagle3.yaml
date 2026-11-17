@@ -11,8 +11,6 @@ data:
   chat_template: "qwen"
   cache_dir: "./cache"
 training:
-  loss:
-    fused: true
   num_epochs: 10
   batch_size: 1
   learning_rate: 0.0001

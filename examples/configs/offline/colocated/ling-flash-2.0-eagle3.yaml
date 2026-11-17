@@ -12,8 +12,6 @@ data:
   chat_template: "ling-flash-2.0"
   cache_dir: "./cache"
 training:
-  loss:
-    fused: true
   num_epochs: 10
   batch_size: 1
   learning_rate: 0.00005

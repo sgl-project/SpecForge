@@ -13,7 +13,6 @@ data:
   cache_dir: "./cache"
 training:
   loss:
-    fused: true
     terms:
       selector:
         coefficient: 1.0

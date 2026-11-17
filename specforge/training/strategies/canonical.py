@@ -31,6 +31,13 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def trainable_module(self):
         return self.model
 
+    def before_checkpoint(self):
+        # What rank 0 records for resume has to hold for every rank.
+        model = self.model
+        if isinstance(model, DistributedDataParallel):
+            model = model.module
+        model.loss_implementations.agree()
+
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
         return {

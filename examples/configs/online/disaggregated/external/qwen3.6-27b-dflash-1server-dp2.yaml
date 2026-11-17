@@ -15,8 +15,6 @@ data:
   build_dataset_num_proc: 32
   cache_dir: "./cache"
 training:
-  loss:
-    fused: true
   weighting:
     kind: exponential
     gamma: 7

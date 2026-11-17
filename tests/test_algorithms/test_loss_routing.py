@@ -527,6 +527,79 @@ class LossRoutingTest(unittest.TestCase):
             ):
                 TokenLoss(kind, {name: 1.0})
 
+    def test_default_selection_never_raises_and_skips_opt_in_kernels(self):
+        from specforge.algorithms.objectives.execution_options import LossExecution
+
+        self.assertIsNone(LossExecution().fused)
+        with self.assertRaisesRegex(ValueError, "fused must be boolean or None"):
+            LossExecution(fused="auto")
+        self.assertFalse(implementation_registrations()["linear_ce"].auto)
+        self.assertTrue(implementation_registrations()["token_ce"].auto)
+        request = self.request()
+        # CPU inputs: the default uses the reference, an explicit request raises.
+        self.assertEqual(select_implementation(request, fused=None).name, "reference")
+        with self.assertRaisesRegex(ValueError, "requires CUDA/ROCm"):
+            select_implementation(request, fused=True)
+        with patch.dict(_IMPLEMENTATIONS):
+
+            def missing_dependency(request, group):
+                raise ImportError("kernel package is not installed")
+
+            register_implementation(
+                "needs_package",
+                supports=missing_dependency,
+                priority=30,
+                losses=("ce",),
+            )(lambda request, group: None)
+            register_implementation(
+                "opt_in",
+                supports=lambda request, group: None,
+                priority=20,
+                losses=("ce",),
+                auto=False,
+            )(lambda request, group: None)
+            register_implementation(
+                "validated",
+                supports=lambda request, group: None,
+                priority=10,
+                losses=("ce",),
+            )(lambda request, group: None)
+            skipped = []
+            entry = select_implementation(request, fused=None, rejections=skipped)
+            self.assertEqual(entry.name, "validated")
+            self.assertIn("needs_package: kernel package is not installed", skipped)
+            with self.assertRaisesRegex(ImportError, "not installed"):
+                select_implementation(request, fused=True)
+            del _IMPLEMENTATIONS["needs_package"]
+            self.assertEqual(select_implementation(request, fused=True).name, "opt_in")
+            self.assertEqual(
+                select_implementation(request, fused=False).name, "reference"
+            )
+
+    def test_rank_agreement_is_separate_from_selection(self):
+        from specforge.algorithms.objectives.implementations.registry import (
+            ExecutionSelection,
+        )
+
+        selection = ExecutionSelection()
+        with patch("torch.distributed.all_gather_object") as gather:
+            selection.resolve(self.request(), (0,), 0, fused=None)
+            gather.assert_not_called()
+        self.assertEqual(selection.names, {"0:0": "reference"})
+        selection.agree()  # no process group: nothing to compare
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda out, mine: out.__setitem__(
+                    slice(None), [mine, {"0:0": "token_ce"}]
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "differ across ranks"),
+        ):
+            selection.agree()
+
     def test_saved_implementation_names_are_checked_without_aliases(self):
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,

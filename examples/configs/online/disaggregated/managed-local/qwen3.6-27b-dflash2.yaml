@@ -17,7 +17,6 @@ data:
 
 training:
   loss:
-    fused: true
     execution:
       chunk_size: 128
       # Measured without objective checkpointing: keep each chunk's logits for

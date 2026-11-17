@@ -85,7 +85,22 @@ class CanonicalDesignTest(unittest.TestCase):
                 cfg = run_config(Path("target"), draft)
                 cfg.data.dataloader_num_workers = None
                 run = resolve_run(cfg)
-                self.assertEqual(_dataloader_num_workers(run.config, run.algorithm), 4)
+                # the block objectives keep the loader default they were tuned with
+                expected = (
+                    8
+                    if draft.architecture
+                    in (
+                        "DFlashDraftModel",
+                        "DFlash2DraftModel",
+                        "DSparkDraftModel",
+                        "DominoDraftModel",
+                        "DSpineDraftModel",
+                    )
+                    else 4
+                )
+                self.assertEqual(
+                    _dataloader_num_workers(run.config, run.algorithm), expected
+                )
                 for workers in (0, 8):
                     run.config.data.dataloader_num_workers = workers
                     self.assertEqual(
