@@ -12,6 +12,11 @@ from specforge.algorithms.objectives.registry import resolve_objective
 
 def convert_record(state):
     """Return current loss records; all other checkpoint fields are preserved."""
+    if "canonical_loss" not in state:
+        raise ValueError(
+            "Not a canonical training checkpoint: training_state.pt records no "
+            "canonical_loss"
+        )
     old_loss = state["canonical_loss"]
     if "terms" in old_loss:
         raise ValueError("Checkpoint already uses named loss terms")
@@ -87,8 +92,18 @@ def convert_checkpoint(source, output):
         source / "training_state.pt", map_location="cpu", weights_only=True
     )
     converted = convert_record(state)
-    shutil.copytree(source, output)
-    torch.save(converted, output / "training_state.pt")
+    # Build the copy beside the destination and rename it last, so a failed
+    # conversion never leaves an unconverted checkpoint at the output path.
+    staging = output.with_name(output.name + ".converting")
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        shutil.copytree(source, staging)
+        torch.save(converted, staging / "training_state.pt")
+        staging.rename(output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def main():

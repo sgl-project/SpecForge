@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -223,3 +224,20 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                 convert_checkpoint(temp, Path(temp) / "converted")
             with self.assertRaises(FileExistsError):
                 convert_checkpoint(Path(temp) / "source", temp)
+        # a legacy-wrapper checkpoint has no canonical record to convert
+        with self.assertRaisesRegex(ValueError, "Not a canonical training checkpoint"):
+            convert_record({"step": 1})
+        # a failed conversion leaves nothing behind, so the retry is not blocked
+        with tempfile.TemporaryDirectory() as temp:
+            source, output = Path(temp) / "source", Path(temp) / "converted"
+            source.mkdir()
+            torch.save(old, source / "training_state.pt")
+            with (
+                patch("torch.save", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                convert_checkpoint(source, output)
+            self.assertEqual([p.name for p in Path(temp).iterdir()], ["source"])
+            convert_checkpoint(source, output)
+            saved = torch.load(output / "training_state.pt", weights_only=True)
+            self.assertIn("terms", saved["canonical_loss"])
