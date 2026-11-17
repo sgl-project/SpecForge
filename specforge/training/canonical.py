@@ -77,28 +77,36 @@ def _reject_changed_legacy_settings(config, settings):
         if saved != value:
             raise ValueError(
                 f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"checkpoint's recorded {saved!r}; remove it or make it match"
+                f"draft's recorded {saved!r}; remove it or make it match"
             )
+
+
+def _read_draft_payload(draft):
+    if not isinstance(draft, str):
+        return draft
+    import json
+
+    import yaml
+
+    text = Path(draft).read_text()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return yaml.safe_load(text)
+
+
+def _is_legacy_payload(payload):
+    return isinstance(payload, dict) and payload.get("model_type") not in (
+        None,
+        "specforge_draft",
+    )
 
 
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
-    draft = cfg.draft
-    if isinstance(draft, str):
-        import json
-
-        import yaml
-
-        text = Path(draft).read_text()
-        try:
-            draft = json.loads(text)
-        except json.JSONDecodeError:
-            draft = yaml.safe_load(text)
-    legacy_draft = isinstance(draft, dict) and draft.get("model_type") not in (
-        None,
-        "specforge_draft",
-    )
+    draft = _read_draft_payload(cfg.draft)
+    legacy_draft = _is_legacy_payload(draft)
     if legacy_draft:
         from specforge.config.draft.codec import decode_legacy_config
 
@@ -129,7 +137,7 @@ def resolve_config(cfg, *, target_config=None):
         canonical = _is_canonical_checkpoint(cfg, source)
         if cfg.resume_path and not canonical:
             raise ValueError(
-                "legacy full resume uses the legacy training path; use initialization.checkpoint for canonical weight import"
+                "legacy full resume uses the legacy training path, which MTP no longer has; use initialization.checkpoint for canonical weight import"
             )
         loaded = read_draft(
             source,
@@ -146,14 +154,18 @@ def resolve_config(cfg, *, target_config=None):
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
+    settings = _legacy_settings(cfg)
     if (
-        _legacy_settings(cfg)
+        settings
         and not legacy_draft
         and not (initialization and initialization.weights_from)
     ):
-        raise ValueError(
-            "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-        )
+        if supplied is None:
+            raise ValueError(
+                "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
+            )
+        # a decoded legacy draft records them; resolve_run re-resolves that draft
+        _reject_changed_legacy_settings(supplied, settings)
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -207,12 +219,8 @@ def _validate_imported_objective(cfg, resolved):
     )
 
     payloads = []
-    draft = cfg.draft
-    if isinstance(draft, str):
-        import yaml
-
-        draft = yaml.safe_load(Path(draft).read_text())
-    if isinstance(draft, dict):
+    draft = _read_draft_payload(cfg.draft)
+    if _is_legacy_payload(draft):
         payloads.append(draft)
     init = cfg.initialization
     if init is not None and init.checkpoint is not None:
@@ -592,7 +600,9 @@ def build_bundle(cfg, algorithm):
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
-            legacy_settings=_legacy_settings(cfg),
+            legacy_settings=(
+                _source_legacy_settings(cfg, weights.checkpoint) if weights else None
+            ),
         )
     teacher = None
     if resolved.requires_teacher:

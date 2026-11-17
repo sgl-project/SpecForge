@@ -240,6 +240,19 @@ class CanonicalReviewTest(unittest.TestCase):
                                 "DSpineDraftModel", loss={"terms": changed}
                             ),
                         )
+            # the same JSON given as `draft:` must not drop its settings either
+            legacy = source / "old_dspine.json"
+            legacy.write_text(json.dumps(payload))
+            cfg = run_config(source, draft_config(), initialization={}).model_copy(
+                update={"draft": str(legacy)}
+            )
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
+                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            _validate_imported_objective(
+                cfg, resolve_objective("DSpineDraftModel", loss={"terms": terms})
+            )
 
     def test_scratch_embedding_key_survives_resume(self):
         """A scratch run that needed model.embedding_key must resume with it."""
@@ -551,6 +564,23 @@ class CanonicalReviewTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "legacy full resume"):
                     resolve_run(Config.model_validate(raw))
                 read.assert_not_called()
+
+    def test_resume_override_can_clear_a_recipe_initialization(self):
+        """The native MTP recipe sets initialization; resuming it needs no YAML copy."""
+        from specforge.config import load_config
+
+        recipe = Path(__file__).resolve().parents[2] / (
+            "examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml"
+        )
+        cfg = load_config(str(recipe))
+        self.assertIsNotNone(cfg.initialization)
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            apply_overrides(cfg, ["training.resume_from=out/run-latest"])
+        resumed = apply_overrides(
+            cfg, ["training.resume_from=out/run-latest", "initialization=null"]
+        )
+        self.assertIsNone(resumed.initialization)
+        self.assertEqual(resumed.resume_path, "out/run-latest")
 
     def test_cli_overrides_do_not_warn_about_unset_legacy_options(self):
         """apply_overrides marks every field set; only YAML values may warn."""
