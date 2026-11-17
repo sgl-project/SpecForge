@@ -15,7 +15,6 @@ import os
 import shutil
 import tempfile
 import unittest
-from dataclasses import replace
 
 import torch
 
@@ -45,19 +44,33 @@ class TestEquivTrimLossPositions(unittest.TestCase):
             map_location="cpu",
         )
 
-        tensors = {
-            "input_ids": batch["input_ids"].unsqueeze(0).cuda(),
-            "loss_mask": batch["loss_mask"].unsqueeze(0).cuda(),
-            "hidden_states": batch["aux_hidden_state"].cuda(),
-            "target_last_hidden_states": batch["hidden_state"].cuda(),
-        }
-        tensors["loss_mask"][:, :8] = 0
-        tensors["attention_mask"] = torch.ones_like(tensors["input_ids"])
+        # `hidden_state` is the target-side capture that the target head turns into
+        # the teacher distribution; `aux_hidden_state` is the draft backbone input.
+        input_ids, target, loss_mask = target_head.preprocess(
+            batch["input_ids"].unsqueeze(0),
+            batch["hidden_state"],
+            batch["loss_mask"].unsqueeze(0),
+        )
+        target = target_head(target.cuda())
+        hidden_states = batch["aux_hidden_state"].cuda()
+        input_ids = input_ids.cuda()
+
+        # Prompt-heavy mask so trimming is non-trivial: first half unsupervised.
+        loss_mask = loss_mask.cuda().clone()
+        loss_mask[:, : loss_mask.shape[1] // 2] = 0
+        attention_mask = torch.ones_like(input_ids)
 
         @torch.no_grad()
         def step_losses(trim: bool):
-            model.execution = replace(model.execution, trim=trim)
-            return [float(model(tensors, step=0, total_steps=1).loss)]
+            plosses, *_ = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                target=target,
+                hidden_states=hidden_states,
+                trim_loss_positions=trim,
+            )
+            return [float(p.item()) for p in plosses]
 
         full = step_losses(False)
         trimmed = step_losses(True)
