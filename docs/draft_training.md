@@ -364,7 +364,7 @@ entry chooses how to evaluate them:
 | Mode | Arguments | Selection |
 | --- | --- | --- |
 | Reference | fused=False | Registered mathematical formula |
-| Optimized | fused=True | Highest-priority compatible implementation, otherwise reference |
+| Optimized | fused=True | Highest-priority compatible implementation. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
 
 Generic kernels and projection-specific kernels participate in automatic selection.
 Support checks do not materialize projections. Missing required dependencies and
