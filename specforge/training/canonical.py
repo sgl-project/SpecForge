@@ -386,6 +386,8 @@ def preflight_kernels(cfg):
         from specforge.algorithms.objectives import resolve_objective
         from specforge.config.draft.mlp.dense import DenseFFNSpec
 
+        if trainer_platform() not in _LIGER_VALIDATED_PLATFORMS:
+            return  # auto never enables Liger here, so there is nothing to read
         draft = resolve_config(cfg)
         acts = {
             node.hidden_act
