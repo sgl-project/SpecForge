@@ -1,3 +1,6 @@
+# MiniMax-M3 DSpark. Sequence length 4,096, 6 epochs.
+# Global batch 512 = batch 2 x accumulation 32 x 8 ranks (1 node).
+# Fill in the dataset path and replace the loopback capture addresses.
 model:
   target_model_path: MiniMaxAI/MiniMax-M3-MXFP8
   target_backend: sglang
@@ -6,8 +9,11 @@ model:
   lm_head_key: language_model.lm_head.weight
   torch_dtype: bfloat16
   sglang_attention_backend: triton
-  sglang_mem_fraction_static: 0.8
+  sglang_mem_fraction_static: 0.80
   sglang_context_length: 4608
+
+draft: specforge/config/draft/presets/minimax-m3-dspark.yaml
+
 data:
   train_data_path: ./cache/dataset/minimax-m3-dspark.jsonl
   max_length: 4096
@@ -15,6 +21,7 @@ data:
   cache_dir: cache
   build_dataset_num_proc: 64
   dataloader_num_workers: 8
+
 training:
   loss:
     fused: true
@@ -39,19 +46,21 @@ training:
   warmup_ratio: 0.04
   max_grad_norm: 1
   attention_backend: flex_attention
+  objective_options:
+    num_anchors: 512
   save_interval: 100
   max_checkpoints: 3
   log_interval: 1
   dist_timeout: 10
   seed: 42
   prompt_seed: 1
-  objective_options:
-    num_anchors: 512
+
 tracking:
   report_to: tensorboard
   wandb_project: specforge-dspark
   wandb_name: minimax-m3-dspark
   wandb_dir: outputs/minimax-m3-dspark/tensorboard
+
 runtime:
   producer_lease: 16
   producer_concurrency: 4
@@ -60,8 +69,10 @@ runtime:
   resident_high_watermark_bytes: 184683593728
   resident_low_watermark_bytes: 92341796864
   feature_store_max_resident_bytes: 247390109696
+
 run_id: minimax-m3-dspark
 output_dir: outputs/minimax-m3-dspark
+
 deployment:
   mode: disaggregated
   trainer:
@@ -75,8 +86,8 @@ deployment:
     backend: mooncake
     store_id: minimax-m3-dspark
     server_urls:
-    - http://127.0.0.1:30000
-    - http://127.0.0.1:30001
+      - http://127.0.0.1:30000
+      - http://127.0.0.1:30001
     mooncake_metadata_server: http://127.0.0.1:35880/metadata
     mooncake_master_server_addr: 127.0.0.1:35551
     mooncake_local_hostname: 127.0.0.1
@@ -85,4 +96,3 @@ deployment:
     client_buffer_size: 1073741824
     idle_timeout_s: 7200
     peer_wait_timeout_s: 7200
-draft: specforge/config/draft/presets/minimax-m3-dspark.yaml
