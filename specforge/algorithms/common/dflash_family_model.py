@@ -7,6 +7,7 @@ from typing import Dict, Literal, NamedTuple, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging.version import InvalidVersion, Version
 
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core import fused_loss
@@ -30,6 +31,19 @@ except ImportError:
 # NPU workaround: flex_attention is not available on Ascend NPU.
 if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
+
+def _torch_at_least(minimum: str) -> bool:
+    """Compare torch against ``minimum`` as a version, not a string.
+
+    ``torch.__version__`` carries local suffixes ("2.11.0+cu128"), and plain
+    string comparison ranks "2.9" above "2.11". Unparseable builds assume the
+    older branch, which is the compatibility fallback.
+    """
+    try:
+        return Version(torch.__version__.split("+", 1)[0]) >= Version(minimum)
+    except InvalidVersion:
+        return False
+
 
 _VALID_LOSS_TYPES = {"dflash", *DPACE_LOSS_TYPES}
 _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
@@ -643,7 +657,10 @@ class OnlineDFlashModel(nn.Module):
             # compile (NameError: 'TRITON' is not defined), so we fall back to
             # FORCE_USE_FLEX_ATTENTION, which selects the same kernel and has
             # been supported since torch 2.5.
-            if torch.__version__ >= "2.11":
+            # Compare as versions, not strings: "2.9" >= "2.11" is True by
+            # lexicographic order but False as a version, which would send
+            # torch 2.9/2.10 down the BACKEND branch that only exists on 2.11.
+            if _torch_at_least("2.11"):
                 draft_kwargs["kernel_options"] = {"BACKEND": "TRITON"}
             else:
                 draft_kwargs["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}

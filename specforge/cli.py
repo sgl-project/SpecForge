@@ -27,6 +27,8 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import sys
+import traceback
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Iterator, Optional, Sequence
@@ -152,9 +154,26 @@ def _train(resolved) -> int:
         result = build_application_run(resolved).run()
         failed = False
         return result
+    except BaseException:
+        # Print before teardown: teardown talks to the NCCL backend and can block
+        # for the whole collective timeout (see destroy_distributed). If the
+        # traceback were left to the normal exit path, a blocked teardown would
+        # swallow it entirely and the job would die with no diagnosis at all.
+        traceback.print_exc()
+        raise
     finally:
         # On failure abort instead of collectively destroying; see destroy_distributed.
-        destroy_distributed(abort=failed)
+        clean = destroy_distributed(abort=failed)
+        if failed and not clean:
+            # The backend never finished aborting (peers are still inside a
+            # collective, so the abort waits on work that cannot complete).
+            # Returning to Python would let interpreter shutdown — atexit hooks,
+            # CUDA/NCCL finalizers — block on the same dead communicator and hang
+            # the job in the platform as "Running" forever. The traceback is
+            # already out, so leave the process now.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
 
 
 def _config_for_role(cfg: Config, role: str) -> Config:
