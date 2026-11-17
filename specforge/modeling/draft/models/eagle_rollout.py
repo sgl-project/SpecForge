@@ -71,7 +71,7 @@ class EagleRollout:
         self.keys, self.values = (), ()
 
     def step(self, input_ids, features, padding, positions):
-        input_embeds = self.model.embed_tokens(input_ids)
+        input_embeds = self.model.embed_tokens(input_ids).to(features.dtype)
         hidden_states, attention_mask, position_ids = features, padding, positions
         # Capture immutable cache tuples before checkpointing. Recompute must
         # neither append a branch twice nor observe a later rollout's cache.
