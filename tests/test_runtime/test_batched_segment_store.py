@@ -236,6 +236,50 @@ class TestBatchedSegmentStore(unittest.TestCase):
                 cleanup.adopt(ref);fixture.drain(cleanup,ref);cleanup.close()
                 fixture.close()
 
+    def test_proved_db_survives_failed_close_then_release_recovery_and_close_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env={'SPECFORGE_TRAINER_NODE_POOL':'1','SPECFORGE_TRAINER_NODE_POOL_DIR':directory+'/pool',
+                 'SPECFORGE_TRAINER_NODE_POOL_BYTES':str(1<<20)}
+            with mock.patch.dict(os.environ,env):
+                fixture=Fixture(directory)
+                acknowledged=fixture.publish('already-proved',n=9)
+                reader=fixture.reader(receive_buffers='pinned');reader.adopt(acknowledged)
+                fixture.drain(reader,acknowledged)
+                proofs=reader._terminal_proofs
+                self.assertEqual(proofs.db.execute("SELECT COUNT(*) FROM proofs WHERE phase='PROVED'").fetchone()[0],1)
+                self.assertFalse(proofs.closed)
+                ref=fixture.publish('close-retry-with-proof',n=9);reader.adopt(ref)
+                native_close=[];fixture.backend.close=lambda:native_close.append(1) or 0
+                reader._owns_store=True
+                pool=reader._node_pool;original=pool._transaction
+                failed=RuntimeError('release remains unavailable through first close')
+                @contextmanager
+                def failing_release(scope='unspecified'):
+                    with original(scope) as db:
+                        yield db
+                        if scope=='batch_release':raise failed
+                destination=torch.empty(ref.feature_specs['hidden_states'].shape,dtype=torch.float32)
+                with mock.patch.object(pool,'_transaction',failing_release):
+                    with self.assertRaises(RuntimeError) as caught:reader.get_into(ref,{'hidden_states':destination})
+                    self.assertIs(caught.exception,failed)
+                    with self.assertRaises(RuntimeError) as caught:reader.close()
+                    self.assertIs(caught.exception,failed)
+                self.assertTrue(proofs.closed)
+                cached_health=dict(reader._terminal_proof_health)
+                self.assertTrue(cached_health)
+                self.assertEqual(native_close,[])
+                self.assertIsNotNone(process_gate().current())
+                reader.close()
+                self.assertTrue(reader._closed)
+                self.assertEqual(reader._terminal_proof_health,cached_health)
+                self.assertEqual(native_close,[1])
+                self.assertIsNone(process_gate().current())
+                self.assertFalse((Path(directory)/'pool/data.mmap').exists())
+                reader.close()
+                self.assertEqual(native_close,[1])
+                cleanup=fixture.reader(node_pool_enabled=False)
+                cleanup.adopt(ref);fixture.drain(cleanup,ref);cleanup.close();fixture.close()
+
     def test_h2d_pending_cannot_use_native_shutdown_as_cuda_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             store,backend,receive,window,events=self.receive_window(directory,h2d=True)

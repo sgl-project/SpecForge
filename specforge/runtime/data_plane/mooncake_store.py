@@ -1200,7 +1200,7 @@ class MooncakeFeatureStore(FeatureStore):
         self._drain_h2d_quarantine()
         if self._terminal_cleanup_authority is not None:
             self._terminal_cleanup_authority.close()
-        if self._terminal_proofs is not None:
+        if self._terminal_proofs is not None and not self._terminal_proofs.closed:
             if self._terminal_proofs.owned_claims(self._terminal_proof_owner):
                 raise RuntimeError('cannot close with unresolved terminal ACK claims')
             self._terminal_proof_health = self._terminal_proofs.health()
