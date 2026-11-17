@@ -2171,29 +2171,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
             walk_accepted,
         ) = totals
 
-        global_loss_den = local_loss_den.detach().clone()
-        world_size = 1
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized():
-            world_size = dist.get_world_size()
-            if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-        # Device-side assert: a host-side float() here drains the stream per
-        # microbatch right after a collective, serializing all ranks.
-        torch._assert_async(
-            (global_loss_den > 0).any(),
-            "DSpark objective has no supervised target tokens",
+        loss_num = (
+            self.dspark_ce_loss_alpha * ce_num
+            + self.dspark_l1_loss_alpha * l1_num
+            + self.dspark_confidence_head_alpha * confidence_num
         )
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
-            )
-            / global_loss_den
-        )
+        # The trainer normalizes gradients by the denominator reduced over the
+        # whole optimizer window, so a micro-step issues no collective. A rank
+        # may see no supervised tokens in one micro-step; only the reduced
+        # window denominator must be positive.
+        denominator_floor = torch.finfo(local_loss_den.dtype).tiny
+        loss = loss_num / local_loss_den.clamp_min(denominator_floor)
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -2231,6 +2219,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 for name, (numerator, denominator) in ratio_metrics.items()
             },
             "accuracy_denom": eval_den.detach(),
+            "loss_terms": (loss_num, local_loss_den.detach()),
         }
         accuracy = correct_num / eval_den.clamp_min(1.0)
         return loss, {"accuracy": accuracy.detach(), **metrics}

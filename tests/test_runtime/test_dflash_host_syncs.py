@@ -190,6 +190,46 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
 
+    def test_dspark_micro_step_is_sync_free_with_host_loss_mask(self):
+        import tempfile
+
+        from tests.test_runtime import _fixtures as fx
+
+        with tempfile.TemporaryDirectory() as workdir:
+            model, width = fx.build_dspark(workdir, num_anchors=8)
+        strategy = DSparkTrainStrategy(model)
+
+        def batch(seed):
+            generator = torch.Generator().manual_seed(seed)
+            shape = (2, 128)
+            return TrainBatch(
+                sample_ids=["a", "b"],
+                strategy="dspark",
+                tensors={
+                    "input_ids": torch.randint(0, fx.V, shape, generator=generator),
+                    "loss_mask": (torch.rand(shape, generator=generator) > 0.2).long(),
+                    "hidden_states": torch.randn(*shape, width, generator=generator).to(
+                        "cuda", torch.bfloat16
+                    ),
+                    "target_last_hidden_states": torch.randn(
+                        *shape, fx.H, generator=generator
+                    ).to("cuda", torch.bfloat16),
+                },
+                metadata={},
+            )
+
+        for seed in range(2):  # allocator warm-up
+            _micro_step(strategy, batch(seed))
+        measured = batch(2)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            out = strategy.forward_loss(measured, _CTX)
+            out.loss_terms[0].backward()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        self.assertIsNotNone(out.loss_terms)
+
     def test_device_loss_mask_still_falls_back_to_a_detected_sync(self):
         strategy = DFlashTrainStrategy(_tiny_dflash2("sdpa", sliding=False))
         _micro_step(strategy, _batch("cpu"))
