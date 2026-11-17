@@ -197,6 +197,7 @@ def evaluate_predictions(
                     projected.teacher_mass,
                     fixed if denominator is None else None,
                     None if context_counts is None else context_counts[index],
+                    reduce_statistics=p.reduce_statistics,
                 ),
                 term.reduction,
             )
@@ -399,8 +400,21 @@ def evaluate_chunks(
                 stacklevel=2,
             )
         chunk_size = 0
+    # Ranks of one sequence must evaluate the same chunks: a contextual loss
+    # reduces its statistics over the group once per chunk.
+    reduced = predictions.reduce_statistics is not None and any(
+        selected.registration.contextual for selected in losses
+    )
+    if execution.trim and reduced and not whole_set:
+        warnings.warn(
+            "Loss trimming is disabled: the loss reduces statistics across "
+            "sequence-parallel ranks.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if (
         execution.trim
+        and not reduced
         and weighting.kind not in DPACE_LOSS_TYPES
         and not whole_set
         and predictions.chunk_safe

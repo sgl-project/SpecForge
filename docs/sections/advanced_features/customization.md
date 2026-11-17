@@ -292,6 +292,9 @@ can therefore differ numerically; acceptance impact must be measured before the
 training cutover.
 
 Runtime attention names are `eager`, `sdpa`, `flex_attention`, and `fa`, matching
-training configuration. Canonical `usp` is not implemented and fails explicitly.
+training configuration. `usp` is available for canonical EAGLE3 offline
+training: the objective's cached rollout selects it together with the
+sequence-parallel groups, and `resolve_attention_backend("usp")` itself still
+fails explicitly.
 Flex defaults to the general TRITON kernel for sparse short-query batches; an
 explicit `FlexAttentionBackend(kernel_backend="FLASH")` uses `(256, 128)` blocks.

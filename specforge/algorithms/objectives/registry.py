@@ -31,6 +31,7 @@ class TrainingRequirements:
     required_batch_size: int | None = None
     minimum_loss_tokens: int = 1
     loss_mask_filter: Callable[[object], bool] | None = None
+    supports_sequence_parallel: bool = False
     attention_backends: frozenset[str] = frozenset({"eager"})
     window_statistic: WindowStatistic | None = None
     host_inputs: Callable | None = (
