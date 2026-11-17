@@ -32,7 +32,7 @@ using the command above for capture workloads. SpecForge pins Torch `2.14.1`
 and Transformers `5.19.0`, but does not install SGLang automatically.
 Normal installer caches are reused. Online
 training and offline feature preparation use the capture plugin; see the
-[plugin guide](../../../plugins/sglang-spec-capture/README.md) for server setup.
+[plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md) for server setup.
 Offline training from existing features does not require a capture server.
 
 - **Install from PyPI**

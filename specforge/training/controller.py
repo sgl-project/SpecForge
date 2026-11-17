@@ -1230,6 +1230,7 @@ class TrainerController:
         # A checkpoint must never be ahead of its durable ack: resume requires
         # the ledger marker to equal the checkpoint step.
         self._flush_durable_ack()
+        self.core.strategy.before_checkpoint()
         # Every rank participates: FSDP model gathering is collective and every
         # rank persists its RNG. Sharded optimizer state stays rank-local; the
         # identical DDP optimizer is written once in the shared rank0 payload.

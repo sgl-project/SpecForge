@@ -33,7 +33,7 @@ true` tries it and logs a warning.
 ### Install the SGLang capture plugin (online and offline preparation)
 
 Use an Ascend-compatible SGLang build with the generic extension APIs required
-by [the plugin guide](../../../../plugins/sglang-spec-capture/README.md):
+by [the plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md):
 
 ```bash
 python -m pip install --no-deps plugins/sglang-spec-capture

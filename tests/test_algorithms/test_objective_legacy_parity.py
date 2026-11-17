@@ -1,4 +1,8 @@
-"""Compare canonical training losses and gradients with the legacy wrappers."""
+"""Compare canonical training losses and gradients with the legacy wrappers.
+
+The same constructions are pinned to stored values, without the wrappers, in
+``test_objective_goldens.py``.
+"""
 
 import copy
 import unittest
@@ -9,6 +13,7 @@ import torch
 from specforge.algorithms.objectives import build_objective_model
 from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import training_batch
+from tests.test_algorithms.test_objective_goldens import assert_golden
 
 
 def assert_loss_and_gradients(new, old, new_loss, old_loss, names):
@@ -75,6 +80,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             expected,
             {n: n for n, _ in model.named_parameters()},
         )
+        assert_golden("mtp", new, actual)
 
     def test_dmtp_matches_explicit_suffix_loss(self):
         # DMTP has no legacy Online wrapper. Check its label alignment independently.
@@ -113,3 +119,4 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             expected,
             {n: n for n, _ in model.named_parameters()},
         )
+        assert_golden("dmtp", runtime, actual)

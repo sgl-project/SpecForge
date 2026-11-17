@@ -98,8 +98,7 @@ specforge train \
   runtime.producer_lease=1 \
   run_id=${MODEL_NAME}-${SPEC_METHOD}-overfit \
   output_dir=outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer \
-  model.embedding_key="model.language_model.embed_tokens.weight" \
-  model.mask_token_id=248070
+  model.embedding_key="model.language_model.embed_tokens.weight"
 ```
 <span style="color: red;"><strong>Note:</strong></span> The training data must be inferenced by the target model use temperature=0 and corresponding thinking mode.</span>
 

@@ -31,6 +31,13 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def trainable_module(self):
         return self.model
 
+    def before_checkpoint(self):
+        # What rank 0 records for resume has to hold for every rank.
+        model = self.model
+        if isinstance(model, DistributedDataParallel):
+            model = model.module
+        model.loss_implementations.agree()
+
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
         return {
@@ -45,7 +52,14 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         device = next(self.model.parameters()).device
         inputs = batch.tensors
         if self.host_inputs is not None:
-            inputs = inputs | self.host_inputs(inputs, self.draft_config)
+            prepared = self.host_inputs(inputs, self.draft_config)
+            if device.type != "cpu":
+                # a pageable source makes the non_blocking copy wait for the host
+                prepared = {
+                    key: value.pin_memory() if value.device.type == "cpu" else value
+                    for key, value in prepared.items()
+                }
+            inputs = inputs | prepared
         tensors = {
             key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }

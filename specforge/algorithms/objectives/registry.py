@@ -37,6 +37,13 @@ class TrainingRequirements:
     host_inputs: Callable | None = (
         None  # (batch tensors, draft config) -> extra tensors
     )
+    #: Feature-loader workers when data.dataloader_num_workers is unset; None
+    #: leaves the trainer's own default.
+    dataloader_workers: int | None = None
+    #: Whether an unset model.use_liger_kernel enables Liger RMSNorm/SwiGLU on a
+    #: CUDA/ROCm trainer with a silu/swish draft. Only set where that
+    #: combination was validated.
+    liger_by_default: bool = False
 
 
 @dataclass(frozen=True)

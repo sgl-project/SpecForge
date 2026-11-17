@@ -232,7 +232,6 @@ training:
   objective_options:
     num_anchors: 512
   loss:
-    fused: true
     terms:
       token:
         kind: ce_l1
@@ -270,6 +269,14 @@ Loss term names are declared by the algorithm and must match the keys under
 `loss.terms`. They identify training purposes, not model output tensors or token
 positions. Model output names are defined by `project()`; `LossTerm` binds an
 output to a configured term, so the two names need not match.
+
+An algorithm declares its terms in the objective's `loss_terms` property: each
+name maps to a `LossDefinition` holding the default formula and coefficient.
+Objectives without the property have the single term `token`. A plan term whose
+name is not declared there is rejected when the plan is bound (`Algorithm loss
+terms ... do not match configured terms ...`), and a declared term's own `loss=`
+is replaced by the configured formula. An extension that adds a term, such as a
+MoE router loss, therefore adds an entry to `loss_terms` first.
 
 For Domino:
 
@@ -347,8 +354,16 @@ configuration and reject formulas or scheduling they cannot execute.
   teacher. It preserves full-vocabulary argmax and retained probability mass
   while projecting vocabulary tiles; no full-vocabulary logits are retained.
 
-For plain DFlash/MTP linear heads, `fused: true` can use Liger linear CE without
-retaining full logits. It requires a compatible Liger kernel that also returns
+`loss.fused` has three settings. Unset (auto) uses an optimized implementation
+wherever one applies and the reference formula elsewhere: off CUDA/ROCm, outside
+FP16/BF16/FP32, or without Triton, the run simply uses the reference. `true`
+requires optimized execution and raises where a categorical loss cannot be
+optimized. `false` always evaluates the reference. The implementations chosen for
+each loss group are logged once and recorded for resume.
+
+For plain DFlash/MTP linear heads, `fused: true` can also use Liger linear CE
+without retaining full logits. Auto never selects it: it was not part of the
+training paths the recipes were validated on. It requires a compatible Liger kernel that also returns
 predicted tokens. Its installed version is checked against the project's Liger
 requirement before loading the kernel; an out-of-range version raises, including
 after a no-deps installation. An unavailable kernel also raises for an eligible
@@ -360,10 +375,23 @@ chunks with the complete-chain weights. Only `lk_lambda` among the LK variants r
 execution, and DSpine retains it when no window alignment statistic is supplied.
 Thus requesting chunking does not promise bounded loss memory for those paths.
 
-`model.use_fused_conv` opts canonical grouped convolution into its existing Triton
-kernel. Enabling it without grouped convolution, or with unsupported weights or
-group sizes, fails during setup. Incompatible runtime input dtypes and compiled
-execution also raise. The selected path is logged during setup. Ordinary loading
+`model.use_fused_conv` selects the Triton kernel of the grouped convolution.
+Unset (auto) uses it when the draft has grouped convolutions and all of them
+support it: CUDA/ROCm FP16/BF16/FP32 weights, a power-of-two group size up to
+1024, and Triton installed. `true` fails during setup without a grouped
+convolution or where the kernel cannot run; `false` keeps the eager one.
+Incompatible runtime input dtypes and compiled execution raise while the kernel
+is selected. The selected path is logged during setup and recorded for resume.
+
+`model.use_liger_kernel` follows the same three settings. Unset enables Liger
+RMSNorm/SwiGLU on a CUDA/ROCm trainer for the objectives that declare it as
+their default (DFlash and DFlash2) when the draft's FFNs use `silu`/`swish`;
+`true` enables it for any objective and fails where it cannot run.
+
+The block objectives (DFlash, DFlash2, Domino, DSpark, DSpine) project and
+checkpoint 128 blocks per batch row at a time unless
+`loss.execution.chunk_size` says otherwise; the unit of an explicit value is
+flattened rows x blocks, so 128 blocks per row at batch size 2 is 256. Ordinary loading
 through specforge.loading and exported models use eager convolution by default;
 this training option is not stored in the model architecture.
 The fused kernel accumulates in FP32 and rounds once, so
@@ -433,8 +461,9 @@ entry chooses how to evaluate them:
 
 | Mode | Configuration | Selection |
 | --- | --- | --- |
+| Default | fused unset | A default-enabled optimization where one applies, otherwise the reference formula; nothing raises for an unsupported device, dtype or missing kernel package |
 | Reference | fused: false | Registered mathematical formulas |
-| Optimized | fused: true | Compatible joint or per-term optimization, otherwise reference |
+| Required | fused: true | Compatible joint or per-term optimization, including opt-in ones such as `linear_ce`. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
 
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,
@@ -473,7 +502,13 @@ Losses declare `context_statistics` separately from accepting `LossContext`:
 `supervised_count` requests a whole-set count, and `teacher_mass` requests the
 probability mass retained by vocabulary selection. CE/L1 uses component masks
 without requesting either statistic. Contextual extensions that omit this
-declaration retain both statistics for compatibility.
+declaration retain both statistics for compatibility. A declared statistic is
+always delivered. When the need depends on the selected options, the
+declaration is a callable `(options, *, fixed_denominator)`: the LK losses read
+the teacher mass only for a teacher target, and `lk_alpha` / `lk_tv` use the
+whole-set count only to rescale to a fixed denominator. A prediction set with a
+`compute` callback gets both statistics, because the callback may evaluate any
+registered formula.
 
 
 All objective terms live in `LossPlan.terms`. By default the executor runs its
@@ -519,7 +554,8 @@ that depend on whole-batch expert statistics require whole-set execution and
 explicit normalization; do not recompute them independently per chunk. Router
 statistics, cross-rank aggregation, and optimizer-step updates remain model/training
 responsibilities, not loss-kernel responsibilities. Scalar model losses use `LossTerm(..., loss=TokenLoss("value"), reduction="scalar")`
-and `calc.add(index, scalar)`. Such a plan runs unsplit and untrimmed, counts the scalar
+and `calc.add(index, scalar)`, with the term declared in the objective's
+`loss_terms` as `LossDefinition(TokenLoss("value"))`. Such a plan runs unsplit and untrimmed, counts the scalar
 once per prediction set, and applies no token mask or denominator. It requires
 sum_means or global_microbatch reduction. The latter averages local scalars across
 ranks; cross-rank expert statistics must be computed explicitly by the model.
@@ -541,8 +577,11 @@ need explicit compatible projection implementations before using these fused pat
 
 `register_protocol(..., training=TrainingRequirements(...))` declares capture
 method, vocabulary mapping, batch-size constraints, `attention_backends` and an
-optional `loss_mask_filter` callable. EAGLE3 also accepts `sdpa`; the other objectives keep eager attention;
-block objectives register the shared consecutive-supervision filter. Canonical
+optional `loss_mask_filter` callable. EAGLE3 and MTP also accept `sdpa`; the other objectives keep
+eager attention; block objectives register the shared consecutive-supervision filter.
+`explicit_initialization=True` makes training refuse to start without an
+initialization choice or resume, and `host_inputs` computes extra batch tensors on
+the host before the device copy (MTP precomputes its supervised rows there). Canonical
 composition builds providers directly from these requirements; it does not resolve
 a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
 requests accumulation-window reduction and replay, passing the result to the
@@ -587,8 +626,38 @@ canonical YAML selects the architecture, capture layers and output schema.
 Training accepts current canonical configuration and checkpoints only.
 Deployment settings belong under `deployment`; the former
 `training.deployment_mode`, `training.server_urls` and
-`training.metadata_db_path` fields are rejected. Historical checkpoint
-conversion scripts and training wrappers have been removed.
+`training.metadata_db_path` fields are rejected. The training
+wrappers have been removed.
+
+Resume reads only current records; it never converts old loss metadata.
+Convert a pre-named-loss canonical checkpoint into a new directory:
+
+```bash
+PYTHONPATH=. python scripts/convert_canonical_checkpoint.py \
+  --checkpoint CHECKPOINT_PATH --output-dir CONVERTED_PATH
+```
+
+The converter accepts the old flat `canonical_loss` record, with or without
+the execution metadata introduced later. It rewrites loss-related `canonical_*`
+fields in `training_state.pt` using the current objective resolver. Weights,
+optimizer state, counters, provenance, `config.json` and rank shards are preserved;
+the source directory is unchanged. Known DSpine refinement identities map from
+CE plus explicit L1 to CE/L1, and alignment gains its reference identity.
+Unknown refinement implementations are rejected.
+
+Use the corresponding named settings in the run YAML:
+
+| Previous objective option | Named setting |
+| --- | --- |
+| `selector_loss_alpha` | `loss.terms.selector.coefficient` |
+| `confidence_loss_alpha` | `loss.terms.confidence.coefficient` |
+| `alignment_weight` | `loss.terms.alignment.coefficient` |
+| `ce_loss_alpha` / `l1_loss_alpha` | `loss.terms.token.options.ce_weight` / `l1_weight` |
+| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement, and on token when the old run used the objective's default loss. An old run with an explicit flat `ce_l1` loss kept that loss's own weights on token |
+
+Both CE/L1 weights must be specified to preserve a non-default mixture; changing
+only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to
+both `base` and `final`.
 
 ### Inspecting loss implementations
 

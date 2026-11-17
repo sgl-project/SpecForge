@@ -26,6 +26,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
+from .removed_fields import reject_removed_loss_fields
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -277,7 +279,11 @@ class ModelConfig(StrictConfigModel):
     #: None/False keeps PyTorch RMSNorm/SwiGLU. True selects Liger kernels
     #: on CUDA/ROCm and fails for unsupported devices or activations.
     use_liger_kernel: Optional[bool] = None
-    use_fused_conv: bool = False
+    #: Triton kernel for grouped causal convolutions (DFlash2). ``None`` (auto)
+    #: uses it when the draft has such a convolution and the trainer supports
+    #: it (CUDA/ROCm, FP16/BF16/FP32, power-of-two group size up to 1024);
+    #: ``true`` fails when it cannot be used; ``false`` keeps the eager one.
+    use_fused_conv: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
@@ -996,7 +1002,11 @@ class LossConfig(StrictConfigModel):
     """Shared syntax for run files and programmatic objective construction."""
 
     terms: dict[str, LossTermConfig] = Field(default_factory=dict)
-    fused: bool = Field(default=False, strict=True)
+    #: ``None`` (auto) uses a default-enabled optimized implementation where
+    #: one applies and the reference formula otherwise; ``true`` requires
+    #: optimized execution and fails where it cannot run; ``false`` always
+    #: evaluates the reference.
+    fused: bool | None = Field(default=None, strict=True)
     execution: LossExecutionConfig = Field(default_factory=LossExecutionConfig)
 
 
@@ -1052,8 +1062,6 @@ class TrainingConfig(StrictConfigModel):
     @model_validator(mode="before")
     @classmethod
     def _reject_removed_loss_fields(cls, value):
-        from .loss_migration import reject_removed_loss_fields
-
         if isinstance(value, dict):
             reject_removed_loss_fields(value)
         return value
@@ -1402,7 +1410,7 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
 
     Only the file's own fields and the overridden ones count as set afterwards.
     Keys under an untyped mapping (``training.objective_options`` and the like)
-    may be new, and their values are parsed as YAML.
+    may be new, and their values are parsed as YAML. ``null`` clears a section.
     """
     import yaml
 
@@ -1413,9 +1421,7 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
         path, value = item.split("=", 1)
         keys = path.split(".")
         if len(keys) > 1 and keys[0] == "training":
-            from .loss_migration import reject_removed_loss_fields
-
-            reject_removed_loss_fields({keys[1]})
+            reject_removed_loss_fields({keys[1]}, override=True)
         owner, node = config, raw
         for key in keys[:-1]:
             owner = _override_field(owner, key, path)
@@ -1430,8 +1436,14 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             node = node[key]
         current = _override_field(owner, keys[-1], path)
         untyped = isinstance(owner, dict)
-        structured = isinstance(current, (dict, list)) or current is None
-        if untyped or (structured and value.lstrip().startswith(("[", "{"))):
+        structured = isinstance(current, (BaseModel, dict, list)) or current is None
+        # null clears a section, e.g. a recipe's initialization when resuming
+        if untyped or (
+            structured
+            and (
+                value.lstrip().startswith(("[", "{")) or value.strip() in ("null", "~")
+            )
+        ):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:

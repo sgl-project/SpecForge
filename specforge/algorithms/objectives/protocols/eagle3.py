@@ -68,7 +68,7 @@ class Eagle3Objective:
                 ring_group=getattr(runtime, "ring_group", None),
                 ulysses_group=getattr(runtime, "ulysses_group", None),
             )
-            if backend in ("fa", "usp")
+            if backend in ("fa", "usp", "flex_attention")
             else None
         )
         anchor = torch.arange(length, device=ids.device)

@@ -349,7 +349,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             state = torch.load(state_path, weights_only=False)
             state["canonical_loss"] = {"kind": "ce"}
             torch.save(state, state_path)
-            with self.assertRaisesRegex(ValueError, "unsupported canonical_loss"):
+            with self.assertRaisesRegex(ValueError, "convert_canonical_checkpoint"):
                 self._make_trainer(
                     out,
                     feat_dir=features,

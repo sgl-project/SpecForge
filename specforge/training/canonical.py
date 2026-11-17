@@ -1,8 +1,11 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
-from dataclasses import asdict, replace
+import logging
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_config(cfg, *, target_config=None):
@@ -163,6 +166,14 @@ def resolve_run(cfg, *, target_config=None):
         or cfg.training.attention_backend != "usp"
     ):
         raise ValueError("sequence parallelism requires an objective supporting USP")
+    if sequence_parallel:
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+            raise ValueError(
+                "D-PACE weighting is not supported with sequence parallelism: "
+                "chain weights are normalized within each sequence shard"
+            )
     # Retain the established strategy name for data/rendezvous identifiers.
     training = cfg.training.model_copy(
         update={"objective": objective, "objective_options": asdict(resolved.objective)}
@@ -259,7 +270,7 @@ def resolve_run(cfg, *, target_config=None):
     provider = ModelProvider(
         build_bundle=build_bundle,
         needs_input_tools=online_needs_input_tools,
-        default_dataloader_num_workers=None,
+        default_dataloader_num_workers=requirements.dataloader_workers,
         loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
         resolve_capture_layers=capture_layers,
@@ -285,6 +296,120 @@ def resolve_run(cfg, *, target_config=None):
     return cfg, make_registration(spec, providers)
 
 
+@dataclass(frozen=True)
+class LigerChoice:
+    """Resolved ``model.use_liger_kernel`` for one trainer platform."""
+
+    enabled: bool
+    reason: str
+
+    def describe(self):
+        return f"Liger kernels: {'on' if self.enabled else 'off'} ({self.reason})"
+
+
+#: Liger kernels are Triton programs. SpecForge validates them on CUDA and ROCm;
+#: Liger also ships Ascend and XPU backends that SpecForge has not validated.
+_LIGER_VALIDATED_PLATFORMS = ("cuda", "rocm")
+_LIGER_UNVALIDATED_PLATFORMS = ("npu", "xpu")
+
+
+def trainer_platform():
+    """This process's accelerator; PyTorch reports ROCm as ``cuda``."""
+    import torch
+
+    from specforge.utils import get_device_type
+
+    device_type = get_device_type()
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        return "rocm"
+    return device_type
+
+
+def liger_choice(requested, *, by_default, hidden_act, platform=None):
+    """Resolve model.use_liger_kernel for a trainer platform (default: this one).
+
+    An unset flag enables Liger only for objectives that declare it as their
+    default, on a CUDA/ROCm trainer with a silu/swish draft. ``true`` never
+    degrades silently: it raises where Liger cannot run.
+    """
+    platform = platform or trainer_platform()
+    if requested is False:
+        return LigerChoice(False, "model.use_liger_kernel=false")
+    supported_activation = hidden_act in ("silu", "swish")
+    if requested is None:
+        if not by_default:
+            return LigerChoice(False, "auto: not a default for this objective")
+        if platform not in _LIGER_VALIDATED_PLATFORMS:
+            return LigerChoice(
+                False, f"auto: trainer device {platform!r} is not CUDA/ROCm"
+            )
+        if not supported_activation:
+            return LigerChoice(
+                False, f"auto: draft hidden_act {hidden_act!r} is not silu/swish"
+            )
+        return LigerChoice(True, f"auto: {platform} trainer")
+    if platform not in _LIGER_VALIDATED_PLATFORMS + _LIGER_UNVALIDATED_PLATFORMS:
+        raise ValueError(
+            "model.use_liger_kernel=true requires a Triton GPU backend: CUDA or "
+            "ROCm, or Ascend NPU/XPU where it is unvalidated in SpecForge; this "
+            f"trainer's device is {platform!r}. Remove the key or set it to "
+            "false to use the PyTorch RMSNorm/SwiGLU."
+        )
+    if not supported_activation:
+        raise ValueError(
+            "model.use_liger_kernel=true requires the draft hidden_act to be "
+            f"'silu' or 'swish' (Liger SwiGLU); got {hidden_act!r}. Remove the "
+            "key or set it to false to use the PyTorch MLP."
+        )
+    if platform in _LIGER_UNVALIDATED_PLATFORMS:
+        return LigerChoice(True, f"explicit, unvalidated in SpecForge on {platform}")
+    return LigerChoice(True, "explicit")
+
+
+def preflight_kernels(cfg):
+    """Import the Liger kernels this run's draft build will resolve.
+
+    Called before services start or a consumer waits on its producer, so a
+    missing install fails at startup. build_bundle still owns the resolution.
+    """
+    requested = cfg.model.use_liger_kernel
+    if requested is False:
+        return
+    if requested is None:
+        from specforge.algorithms.objectives import resolve_objective
+        from specforge.config.draft.mlp.dense import DenseFFNSpec
+
+        draft = resolve_config(cfg)
+        acts = {
+            node.hidden_act
+            for node in draft.mlp_configs.values()
+            if isinstance(node, DenseFFNSpec)
+        }
+        resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+        choice = liger_choice(
+            None,
+            by_default=resolved.registration.training.liger_by_default,
+            hidden_act="silu" if acts <= {"silu", "swish"} and acts else "other",
+        )
+        if not choice.enabled:
+            return
+    from specforge.modeling.draft.layers.kernels import load_liger_kernels
+
+    load_liger_kernels()
+
+
+def _raise_flex_recompile_limit():
+    """Let compiled FlexAttention follow changing block-mask shapes.
+
+    Past the limit torch stops compiling the frame and runs it eagerly without
+    an error. The limit is process-wide; 64 is the value the block objectives
+    were tuned with.
+    """
+    import torch._dynamo as dynamo
+
+    dynamo.config.recompile_limit = max(dynamo.config.recompile_limit, 64)
+
+
 def build_bundle(cfg, algorithm):
     import torch
 
@@ -302,7 +427,10 @@ def build_bundle(cfg, algorithm):
     from specforge.config.schema import ModelConfig
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
-    from specforge.modeling.draft.layers.kernels import configure_kernels
+    from specforge.modeling.draft.layers.kernels import (
+        configure_kernels,
+        liger_hidden_act,
+    )
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
 
@@ -405,10 +533,18 @@ def build_bundle(cfg, algorithm):
                 f"draft vocab_size {model.vocabulary.vocab_size} must equal the "
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
-    use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(
+    liger = liger_choice(
+        cfg.model.use_liger_kernel,
+        by_default=resolved.registration.training.liger_by_default,
+        hidden_act=liger_hidden_act(model),
+    )
+    logger.info(liger.describe())
+    use_liger = liger.enabled
+    use_fused_conv = configure_kernels(
         model, use_liger=use_liger, use_fused_conv=cfg.model.use_fused_conv
     )
+    if cfg.training.attention_backend == "flex_attention":
+        _raise_flex_recompile_limit()
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -445,7 +581,7 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": asdict(runtime.objective),
         "canonical_use_liger_kernel": use_liger,
-        "canonical_use_fused_conv": cfg.model.use_fused_conv,
+        "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),

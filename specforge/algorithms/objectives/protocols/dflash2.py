@@ -10,7 +10,7 @@ from ..diagnostics import block_diagnostics, diagnostic_requirements
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..registry import TrainingRequirements, register_protocol
 from .dflash import COMMON_MODULES
 
@@ -24,6 +24,8 @@ from .dflash import COMMON_MODULES
         capture_method="dflash",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
+        liger_by_default=True,
     ),
     architectures=("DFlash2DraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
@@ -162,4 +164,5 @@ class DFlash2Objective:
                 teacher_metrics=self.teacher_metrics,
                 selector=model.candidate_selector,
             ),
+            chunk_size=block_chunk_size(batch),
         )

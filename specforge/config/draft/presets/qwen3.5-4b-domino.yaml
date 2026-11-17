@@ -63,11 +63,11 @@ spec_config:
     hidden_size: 2560
     mask_token_id: 248070
     target_layer_ids:
-    - 3
-    - 11
-    - 19
-    - 27
-    - 31
+    - 1
+    - 8
+    - 15
+    - 22
+    - 29
   gru:
     hidden_size: 1024
     projection_size: 256

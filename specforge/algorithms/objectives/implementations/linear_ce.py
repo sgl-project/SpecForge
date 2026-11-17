@@ -85,8 +85,11 @@ def _linear_support(request, group):
     return None
 
 
+# Not selected by default: Liger's fused linear CE was never part of the
+# training paths the recipes were validated on, and it has no comparison on a
+# real vocabulary yet. `training.loss.fused: true` opts in.
 @register_implementation(
-    "linear_ce", supports=_linear_support, priority=10, losses=("ce",)
+    "linear_ce", supports=_linear_support, priority=10, losses=("ce",), auto=False
 )
 def linear_ce(request, group):
     """Fuse a plain linear projection with hard-label cross entropy.

@@ -71,7 +71,7 @@ class EagleRollout:
         self.keys, self.values = (), ()
 
     def step(self, input_ids, features, padding, positions):
-        input_embeds = self.model.embed_tokens(input_ids)
+        input_embeds = self.model.embed_tokens(input_ids).to(features.dtype)
         hidden_states, attention_mask, position_ids = features, padding, positions
         # Capture immutable cache tuples before checkpointing. Recompute must
         # neither append a branch twice nor observe a later rollout's cache.
@@ -149,20 +149,9 @@ class EagleCachedStep:
         depth = len(keys)
         rotary = self.rotary
         if rotary is not None:
-            rope_positions = positions + depth
-            # Dynamic NTK must use the same global length on every SP rank.
-            if self.backend == "usp":
-                global_length = (
-                    length
-                    * dist.get_world_size(self.ring_group)
-                    * dist.get_world_size(self.ulysses_group)
-                    + depth
-                )
-                full = torch.arange(global_length, device=hidden.device)[None]
-                cos, sin = rotary(hidden, full)
-                embeddings = (cos[0, rope_positions], sin[0, rope_positions])
-            else:
-                embeddings = rotary(hidden, rope_positions)
+            # Canonical rotary modules use fixed frequencies, so the global
+            # positions give every SP rank the embeddings of the whole sequence.
+            embeddings = rotary(hidden, positions + depth)
             query = apply_rotary(
                 query, embeddings, interleaved=attention.rope.interleaved
             )

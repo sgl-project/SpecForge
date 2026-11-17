@@ -258,7 +258,7 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 ## Prepare offline target features
 
 First start a compatible SGLang plugin capture server and Mooncake using the
-[offline capture guide](../../../examples/offline/README.md). The commands below
+[offline capture guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md). The commands below
 are CPU clients; `--server-urls` must point to servers configured for the same
 target, capture method and layer IDs. TP and attention-backend flags belong to
 the server. Optional `torchrun --standalone --nproc_per_node=N` launches N CPU

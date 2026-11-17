@@ -109,6 +109,9 @@ class Implementation:
         losses: Mathematical definitions accepted by this implementation.
         compute: Callable(request, group) returning a GroupResult. Runtime
             failures propagate; they are not treated as applicability failures.
+        auto: Whether the default (fused=None) may select it. An implementation
+            that is not yet validated as a default registers False and runs
+            only when fused is True.
     """
 
     name: str
@@ -117,13 +120,14 @@ class Implementation:
     compute: Callable
     category: str = "generic"
     losses: tuple[str, ...] = ()
+    auto: bool = True
 
 
 _IMPLEMENTATIONS = {}
 
 
 def register_implementation(
-    name, *, supports, priority=0, category="generic", losses=()
+    name, *, supports, priority=0, category="generic", losses=(), auto=True
 ):
     """Register an optimized implementation for one or more loss terms.
 
@@ -137,6 +141,8 @@ def register_implementation(
         losses: Supported mathematical loss names. Without a declaration, optimizations
             receive only ordinary categorical prediction requests. The reference
             implementation may accept all request forms.
+        auto: False keeps the implementation out of default selection; it then
+            runs only when fused is True.
 
     Returns:
         A decorator that registers and returns the compute callable unchanged.
@@ -153,7 +159,7 @@ def register_implementation(
         if name in _IMPLEMENTATIONS:
             raise ValueError(f"Execution implementation {name!r} is already registered")
         _IMPLEMENTATIONS[name] = Implementation(
-            name, priority, supports, compute, category, tuple(losses)
+            name, priority, supports, compute, category, tuple(losses), auto
         )
         return compute
 
@@ -170,14 +176,24 @@ def implementation_registrations():
 def select_implementation(request, group=(0,), *, rejections=None, fused=False):
     """Choose the highest-priority compatible optimization or a reference.
 
-    Inapplicable optimizations fall back to reference calculation.
+    Args:
+        fused: False evaluates the reference. None considers the
+            implementations enabled by default and uses the reference where
+            none applies; an unsupported device or dtype and a missing optional
+            dependency are reasons to skip, not errors. True considers every
+            implementation, propagates their dependency errors, and raises
+            when a categorical loss can only be evaluated by the reference
+            off CUDA/ROCm or outside FP16/BF16/FP32.
+
     Support checks must not materialize predictions.
     """
     candidates = sorted(
         (
             entry
             for entry in implementation_registrations().values()
-            if fused or entry.category == "reference"
+            if entry.category == "reference"
+            or fused is True
+            or (fused is None and entry.auto)
         ),
         key=lambda entry: (entry.category == "reference", -entry.priority, entry.name),
     )
@@ -200,10 +216,15 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
         ):
             reason = "intermediate and non-categorical requests require declared losses"
         else:
-            reason = entry.supports(request, group)
+            try:
+                reason = entry.supports(request, group)
+            except (ImportError, ValueError) as error:
+                if fused is not None:
+                    raise
+                reason = str(error)
         if reason is None:
             if (
-                fused
+                fused is True
                 and entry.category == "reference"
                 and any(
                     request.terms[i].loss.registration.input_kind == "categorical"
@@ -228,7 +249,8 @@ def compute_loss(request, group=(0,), *, fused=False, selection=None, key=0):
     Args:
         request: Resolved supervision and direct or deferred prediction inputs.
         group: Term indices to compute together.
-        fused: Automatically select a compatible optimization.
+        fused: None selects a default-enabled optimization where one applies,
+            True requires optimized execution, False evaluates the reference.
         selection: Optional distributed/resume selection tracker.
         key: Stable request identity within the algorithm.
 
@@ -269,7 +291,7 @@ def compute_loss(request, group=(0,), *, fused=False, selection=None, key=0):
 
 
 class ExecutionSelection:
-    """Validate group selections and retain their distributed/resume identity.
+    """Validate group selections and retain their resume identity.
 
     The names dict is a live checkpoint mapping. Empty batches use the same
     selection, but the executor evaluates their zero-gradient reference path.
@@ -286,7 +308,7 @@ class ExecutionSelection:
 
     def resolve(self, request, group, prediction_index, *, fused=True):
         """Select on each call; log once per key and reject rank or resume disagreement."""
-        if not fused:
+        if fused is False:
             return select_implementation(request, group)
         key = f"{prediction_index}:" + ",".join(map(str, group))
         reasons, error, entry = [], None, None
@@ -299,6 +321,23 @@ class ExecutionSelection:
         name = entry.name if entry else ("split" if len(group) > 1 else "reference")
         self.record(key, name, error=error, reasons=reasons)
         return entry
+
+    def agree(self):
+        """Require every rank to have resolved the same implementations.
+
+        A collective: the training layer calls it at a point every rank
+        reaches, never from a forward. Ranks resolve independently, so a host
+        missing an optional kernel package would otherwise train with a
+        different implementation than the others.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            return
+        resolved = [None] * dist.get_world_size()
+        dist.all_gather_object(resolved, dict(self.names))
+        if any(names != resolved[0] for names in resolved):
+            raise ValueError(f"Loss implementations differ across ranks: {resolved}")
 
     def record(self, key, name, *, error=None, reasons=()):
         """Record a main or auxiliary implementation once and check consistency."""
@@ -319,18 +358,8 @@ class ExecutionSelection:
                 f"loss implementation {key} changed on resume: "
                 f"{self._expected.get(key)!r} -> {name!r}"
             )
-        # Agree before invoking a new kernel, including ranks missing a dependency.
-        import torch.distributed as dist
-
-        outcomes = [(key, name, error)]
-        if dist.is_initialized():
-            outcomes = [None] * dist.get_world_size()
-            dist.all_gather_object(outcomes, (key, name, error))
-        errors = [item[2] for item in outcomes if item[2] is not None]
-        if errors:
-            raise ValueError("; ".join(dict.fromkeys(errors)))
-        if any(item[:2] != (key, name) for item in outcomes):
-            raise ValueError(f"Loss implementations differ across ranks: {outcomes}")
+        if error is not None:
+            raise ValueError(error)
         self.names[key] = name
         logger.info(
             "Loss group %s uses %s%s",

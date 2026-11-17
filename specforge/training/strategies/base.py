@@ -80,5 +80,8 @@ class DraftTrainStrategy(abc.ABC):
         """Select the keys this strategy persists as draft weights."""
         return state_dict
 
+    def before_checkpoint(self) -> None:
+        """Runs on every rank before a checkpoint is written; may be collective."""
+
 
 __all__ = ["DraftTrainStrategy", "StepContext", "StepOutput"]

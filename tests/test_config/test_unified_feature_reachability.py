@@ -147,7 +147,8 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
 
         self.assertEqual(_dataloader_num_workers(eagle.config, eagle.algorithm), 4)
-        self.assertEqual(_dataloader_num_workers(dflash.config, dflash.algorithm), 4)
+        # the block objectives declare the loader default they were tuned with
+        self.assertEqual(_dataloader_num_workers(dflash.config, dflash.algorithm), 8)
         self.assertEqual(
             _dataloader_num_workers(explicit.config, explicit.algorithm), 2
         )

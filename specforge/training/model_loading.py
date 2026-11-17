@@ -8,10 +8,9 @@ def resolve_draft_config(cfg):
 
 
 def preflight_draft_kernels(cfg, *, algorithm):
-    if cfg.model.use_liger_kernel is True:
-        from specforge.modeling.draft.layers.kernels import load_liger_kernels
+    from .canonical import preflight_kernels
 
-        load_liger_kernels()
+    preflight_kernels(cfg)
 
 
 def draft_config_dict(cfg):

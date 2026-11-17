@@ -12,7 +12,7 @@ from ..configuration import LossDefinition
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import LossContext, TokenLoss, decay_weighting
 from ..plan import LossPlan, LossTerm
-from ..predictions import PredictionBatch
+from ..predictions import PredictionBatch, block_chunk_size
 from ..registry import TrainingRequirements, WindowStatistic, register_protocol
 
 
@@ -23,6 +23,7 @@ from ..registry import TrainingRequirements, WindowStatistic, register_protocol
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
+        dataloader_workers=8,
         window_statistic=WindowStatistic(
             ratio_name="dspine/backbone_ce", argument_name="alignment_ce"
         ),
@@ -223,4 +224,4 @@ class DSpineObjective:
                 "layer_features": output.layer_features.movedim(0, -2),
             },
         )
-        return PredictionBatch((predictions,))
+        return PredictionBatch((predictions,), chunk_size=block_chunk_size(batch))

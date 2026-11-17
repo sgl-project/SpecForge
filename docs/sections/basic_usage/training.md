@@ -653,8 +653,8 @@ replace checkpoint tensors.
 SGLang conversion supports DFlash, DFlash2, Domino, DSpark, EAGLE3 and native
 dense Qwen3.5 MTP within the pinned serving format's representable structures.
 DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
-exported. Mixed per-layer causality is also rejected by the current pin.
-See [draft export](../../draft_export.md) for restrictions and validation.
+exported. Mixed causality supports causal sliding layers with bidirectional full layers.
+See [draft export](/draft_export.md) for restrictions and validation.
 
 Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
 saved precision when tensors share one floating-point dtype; SGLang casts to
@@ -666,7 +666,7 @@ and attention computations. Do not resume those runs; retrain from native MTP
 weights under the corrected model. Historical draft checkpoint import is not supported.
 
 For native MTP, use the ordinary YAML preset and explicit target mapping in
-[the preset guide](../../../specforge/config/draft/presets/README.md). A complete
+[the preset guide](https://github.com/sgl-project/SpecForge/blob/main/specforge/config/draft/presets/README.md). A complete
 text-only offline recipe is available at
 `examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
