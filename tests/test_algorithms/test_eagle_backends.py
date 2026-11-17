@@ -1,6 +1,7 @@
 """Canonical EAGLE3 runs a configured objective step on each declared backend."""
 
 import unittest
+import warnings
 from unittest.mock import patch
 
 import torch
@@ -70,6 +71,37 @@ class EagleBackendTest(unittest.TestCase):
         torch.testing.assert_close(
             loss, forward_loss(*objective_model("sdpa")), rtol=1e-5, atol=1e-6
         )
+
+    def test_trimming_is_skipped_when_statistics_cross_ranks(self):
+        # Trimming leaves each sequence-parallel rank a different number of
+        # units; with a chunk size the ranks would then issue a different
+        # number of collectives. The reducer here stands in for the group's.
+        calls = []
+
+        def reduce(accepted, count, denominator):
+            calls.append(1)
+            return accepted, count, denominator
+
+        loss = {
+            "terms": {"token": {"kind": "lk_alpha", "options": {"target": "teacher"}}},
+            "execution": {"trim": True, "chunk_size": 2, "checkpoint": False},
+        }
+        results = {}
+        for name, reducer in (("local", None), ("reduced", reduce)):
+            config, runtime = objective_model("eager", loss=loss)
+            runtime.reduce_sequence_statistics = reducer
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                results[name] = forward_loss(config, runtime)
+            trimming_disabled = [
+                w for w in caught if "Loss trimming is disabled" in str(w.message)
+            ]
+            self.assertEqual(bool(trimming_disabled), reducer is not None)
+        # one reduction per chunk of the untrimmed units, for each rollout depth
+        length = training_batch(eagle_config())["input_ids"].shape[1]
+        depths = resolve_objective("Eagle3DraftModel").objective.ttt_length
+        self.assertEqual(len(calls), depths * -(-length // 2))
+        torch.testing.assert_close(results["reduced"], results["local"])
 
 
 if __name__ == "__main__":
