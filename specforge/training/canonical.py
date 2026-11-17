@@ -602,7 +602,11 @@ def build_bundle(cfg, algorithm):
         MODEL_PROVENANCE_CONTRACT_KEY,
         StepRuntimeConfig,
     )
-    from specforge.algorithms.objectives import build_objective_model, resolve_objective
+    from specforge.algorithms.objectives import (
+        build_objective_model,
+        objective_record,
+        resolve_objective,
+    )
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import (
@@ -770,7 +774,9 @@ def build_bundle(cfg, algorithm):
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
-        "canonical_objective_options": asdict(runtime.objective),
+        "canonical_objective_options": objective_record(
+            runtime.objective_name, asdict(runtime.objective)
+        ),
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),

@@ -55,6 +55,10 @@ jobs:
           tests.test_algorithms.test_acceptance_losses
           tests.test_algorithms.test_objective_legacy_parity
           tests.test_algorithms.test_objective_goldens
+          tests.test_algorithms.test_metric_goldens
+          tests.test_algorithms.test_legacy_metric_parity
+          tests.test_algorithms.test_block_diagnostics
+          tests.test_algorithms.test_block_metric_formulas
           tests.test_algorithms.test_chunked_reduction
           tests.test_algorithms.test_loss_execution
           tests.test_algorithms.test_loss_plan

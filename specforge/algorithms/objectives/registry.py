@@ -56,6 +56,7 @@ class ProtocolRegistration:
     requires: frozenset[str] = frozenset()
     training: TrainingRequirements = TrainingRequirements()
     legacy_strategy: str | None = None  # Preserve existing data/rendezvous identifiers.
+    resolve_requires: Callable | None = None
 
 
 _PROTOCOLS = {}
@@ -73,6 +74,7 @@ def register_protocol(
     default=True,
     training=TrainingRequirements(),
     legacy_strategy=None,
+    resolve_requires=None,
 ):
     """Register an algorithm objective and its training requirements.
 
@@ -89,6 +91,9 @@ def register_protocol(
 
     Returns:
         A decorator registering and returning the objective factory unchanged.
+
+    The optional resolve_requires callback receives the configured objective
+    and returns extra input capabilities, such as teacher logits for diagnostics.
 
     Raises:
         ValueError: The name or an architecture's default is already registered.
@@ -108,6 +113,7 @@ def register_protocol(
             frozenset(requires),
             training,
             legacy_strategy,
+            resolve_requires,
         )
         if default:
             _DEFAULTS.update(dict.fromkeys(architectures, name))
@@ -140,6 +146,16 @@ class ResolvedObjective:
         return "teacher_logits" in self.registration.requires | self.losses.requires
 
 
+def objective_record(name, options):
+    """Options that fix the training trajectory: what a resume compares.
+
+    An objective lists the options that only select what is logged in
+    ``logging_options``; they are left out, for a saved record as well.
+    """
+    logged = getattr(_PROTOCOLS[name].factory, "logging_options", ())
+    return {key: value for key, value in options.items() if key not in logged}
+
+
 def resolve_objective(
     architecture, *, name=None, options=None, loss=None, weighting=None
 ):
@@ -168,6 +184,10 @@ def resolve_objective(
         raise ValueError(f"objective {name!r} does not support {architecture}")
     options = dict(options or {})
     objective = entry.factory(**options)
+    if entry.resolve_requires is not None:
+        entry = replace(
+            entry, requires=entry.requires | entry.resolve_requires(objective)
+        )
     loss_configuration, execution = resolve_loss_configuration(
         objective, {} if loss is None else loss
     )
@@ -191,7 +211,17 @@ def resolve_objective(
         )
     entry = replace(
         entry,
-        inputs=tuple(dict.fromkeys(entry.inputs + loss_configuration.inputs)),
+        inputs=tuple(
+            dict.fromkeys(
+                entry.inputs
+                + loss_configuration.inputs
+                + (
+                    ("target_last_hidden_states",)
+                    if "teacher_logits" in entry.requires
+                    else ()
+                )
+            )
+        ),
     )
     return ResolvedObjective(
         name,

@@ -67,6 +67,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             tensors,
             step=ctx.global_step,
             total_steps=ctx.total_steps,
+            collect_detailed_metrics=ctx.collect_detailed_metrics,
             **(
                 {self.window_statistic.argument_name: window_value}
                 if self.window_statistic
@@ -76,7 +77,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         positions = sorted(
             int(name.split("_")[1])
             for name in result.ratios
-            if name.startswith("position_") and name.endswith("_accuracy")
+            if name.startswith("position_")
+            and name.endswith("_accuracy")
+            and name[len("position_") : -len("_accuracy")].isdigit()
         )
         counts = [
             result.ratios[f"position_{position}_accuracy"] for position in positions
@@ -93,6 +96,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             loss=result.loss,
             metrics=metrics,
             ratio_metrics=result.ratios,
+            sum_metrics=result.sums,
             loss_terms=(result.numerator, result.denominator),
         )
 
