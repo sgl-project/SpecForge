@@ -118,7 +118,10 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 target,
                 draft_config(),
-                training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                training={
+                    "attention_backend": "eager",
+                    "loss": {"terms": {"token": {"kind": "kl"}}},
+                },
             )
             resolved = resolve_run(cfg)
             bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
@@ -178,10 +181,31 @@ class CanonicalReviewTest(unittest.TestCase):
                 encode_config(draft_config()),
             )
 
-    def test_legacy_dspine_requires_explicit_matching_training_settings(self):
+    def test_legacy_compact_teacher_is_not_silently_accepted(self):
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+        from tests.test_modeling.test_canonical_peagle import (
+            model_config as peagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for config in (eagle_config(), peagle_config()):
+                with self.subTest(architecture=config.architecture):
+                    cfg = run_config(target, config)
+                    cfg.training.batch_size = 1
+                    cfg.training.compact_teacher = True
+                    with self.assertRaisesRegex(ValueError, "compact teacher"):
+                        resolve_run(cfg)
+
+    def test_weight_import_requires_matching_legacy_loss_settings(self):
         from specforge.algorithms.objectives import resolve_objective
         from specforge.training.canonical import _validate_imported_objective
         from tests.test_config.test_draft_legacy_dspine import dspine_payload
+        from tests.test_modeling.test_canonical_dspine import (
+            model_config as dspine_config,
+        )
 
         with TemporaryDirectory() as temp:
             source = Path(temp)
@@ -191,21 +215,90 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 source, draft_config(), initialization={"checkpoint": temp}
             )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
                 _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
+            inline = cfg.model_copy(update={"draft": payload, "initialization": None})
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
+                _validate_imported_objective(
+                    inline, resolve_objective("DSpineDraftModel")
+                )
+            # every setting to restate is reported at once, with its exact value
+            both = dspine_payload()
+            both["dspine_config"].update(ce_weight=0.7, alignment_weight=0.25)
+            with self.assertRaises(ValueError) as raised:
+                _validate_imported_objective(
+                    inline.model_copy(update={"draft": both}),
+                    resolve_objective("DSpineDraftModel"),
+                )
+            for line in (
+                "training.loss.terms.token.options.ce_weight=0.7",
+                f"training.loss.terms.token.options.l1_weight={1 - 0.7!r}",
+                "training.loss.terms.refinement.options.ce_weight=0.7",
+                f"training.loss.terms.refinement.options.l1_weight={1 - 0.7!r}",
+                "training.loss.terms.alignment.coefficient=0.25",
+            ):
+                self.assertIn(line, str(raised.exception))
+            # a canonical DSpine draft written without model_type is not legacy
+            canonical = {
+                key: value
+                for key, value in encode_config(dspine_config()).items()
+                if key != "model_type"
+            }
             _validate_imported_objective(
-                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+                cfg.model_copy(update={"draft": canonical, "initialization": None}),
+                resolve_objective("DSpineDraftModel"),
             )
+            # a `draft:` file is read as resolve_config reads it: JSON keeps
+            # 1e-05 a float where YAML would make it a string
+            small = dspine_payload()
+            small["dspine_config"]["candidate_mass_threshold"] = 1e-05
+            (source / "small.json").write_text(json.dumps(small))
+            _validate_imported_objective(
+                cfg.model_copy(
+                    update={"draft": str(source / "small.json"), "initialization": None}
+                ),
+                resolve_objective(
+                    "DSpineDraftModel", options={"candidate_mass_threshold": 1e-05}
+                ),
+            )
+            terms = {
+                name: {"options": {"ce_weight": 0.3, "l1_weight": 0.7}}
+                for name in ("token", "refinement")
+            }
+            _validate_imported_objective(
+                cfg, resolve_objective("DSpineDraftModel", loss={"terms": terms})
+            )
+            for term, setting, value in (
+                ("refinement", "options", {"ce_weight": 0.1, "l1_weight": 0.9}),
+                ("alignment", "coefficient", 0.7),
+            ):
+                with self.subTest(term=term):
+                    changed = {**terms, term: {setting: value}}
+                    with self.assertRaisesRegex(
+                        ValueError, f"training.loss.terms.{term}"
+                    ):
+                        _validate_imported_objective(
+                            inline,
+                            resolve_objective(
+                                "DSpineDraftModel", loss={"terms": changed}
+                            ),
+                        )
             # the same JSON given as `draft:` must not drop its settings either
             legacy = source / "old_dspine.json"
             legacy.write_text(json.dumps(payload))
             cfg = run_config(source, draft_config(), initialization={}).model_copy(
                 update={"draft": str(legacy)}
             )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
+            with self.assertRaisesRegex(
+                ValueError, "training.loss.terms.token.options.ce_weight"
+            ):
                 _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
             _validate_imported_objective(
-                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+                cfg, resolve_objective("DSpineDraftModel", loss={"terms": terms})
             )
 
     def test_scratch_embedding_key_survives_resume(self):
@@ -419,7 +512,7 @@ class CanonicalReviewTest(unittest.TestCase):
                     dspark(confidence=confidence),
                     training={
                         "attention_backend": "eager",
-                        "objective_options": {"confidence_loss_alpha": 0.0},
+                        "loss": {"terms": {"confidence": {"coefficient": 0.0}}},
                     },
                 )
                 resolved = resolve_run(cfg)

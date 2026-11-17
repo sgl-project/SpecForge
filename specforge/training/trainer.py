@@ -309,6 +309,18 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            # Every checkpoint written before named loss terms stores a flat
+            # canonical_loss, whatever else its record holds.
+            saved_loss = state.get("canonical_loss")
+            if (
+                resume_contract.get("canonical_loss") is not None
+                and isinstance(saved_loss, dict)
+                and "terms" not in saved_loss
+            ):
+                raise ValueError(
+                    "checkpoint uses an old canonical_loss record; convert it with "
+                    "scripts/convert_canonical_checkpoint.py before resuming"
+                )
             for key, current in resume_contract.items():
                 if key == "canonical_loss_implementations":
                     saved = state.get(key)
@@ -351,23 +363,6 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if not persisted_available and key in (
-                    "canonical_loss_execution",
-                    "canonical_use_fused_conv",
-                ):
-                    from dataclasses import asdict
-
-                    from specforge.algorithms.objectives.execution_options import (
-                        LossExecution,
-                    )
-
-                    # Older canonical runs used exactly these execution defaults.
-                    comparison_persisted = (
-                        asdict(LossExecution())
-                        if key == "canonical_loss_execution"
-                        else False
-                    )
-                    persisted_available = True
                 if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "

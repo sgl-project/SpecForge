@@ -55,7 +55,7 @@ def _payload(
 class ApplicationCompositionTest(unittest.TestCase):
     def test_legacy_execution_options_are_rejected_with_or_without_resume(self):
         for section, key, value in (
-            ("training", "loss_execution", {"chunk_size": 7}),
+            ("training", "loss", {"execution": {"chunk_size": 7}}),
             ("model", "use_fused_conv", True),
         ):
             for resume in (False, True):

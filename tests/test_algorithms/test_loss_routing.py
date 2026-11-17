@@ -32,9 +32,11 @@ class LossRoutingTest(unittest.TestCase):
         for kind in ("value", "bce", "cosine"):
             with (
                 self.subTest(kind=kind),
-                self.assertRaisesRegex(ValueError, "loss inputs"),
+                self.assertRaisesRegex(ValueError, "incompatible.*inputs"),
             ):
-                resolve_objective("MTPDraftModel", loss={"kind": kind})
+                resolve_objective(
+                    "MTPDraftModel", loss={"terms": {"token": {"kind": kind}}}
+                )
         with self.assertRaisesRegex(ValueError, "input kind"):
             register_loss("bad", input_kind="featurez")
         with self.assertRaisesRegex(ValueError, "unknown ce_l1 options"):

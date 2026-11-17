@@ -3,6 +3,7 @@
 from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
 from .computation import LossComputation
+from .configuration import LossDefinition
 from .implementations.registry import (
     compute_loss,
     implementation_registrations,
@@ -49,6 +50,7 @@ __all__ = [
     "PredictionBatch",
     "LossOutput",
     "LossComputation",
+    "LossDefinition",
     "LossTerm",
     "LossPlan",
     "Projection",

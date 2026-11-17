@@ -42,12 +42,14 @@ def selected_losses(predictions, loss):
 
     Args:
         predictions: Prediction set containing the plan and algorithm default.
-        loss: Runtime TokenLoss selection; kind="default" uses the algorithm default.
+        loss: Optional runtime selection; None or kind="default" uses the prediction default.
 
     Returns:
         A tuple of concrete TokenLoss selections in plan term order.
     """
-    default = predictions.default_loss if loss.kind == "default" else loss
+    default = (
+        predictions.default_loss if loss is None or loss.kind == "default" else loss
+    )
     return tuple(
         term.loss if term.loss is not None and term.loss.kind != "default" else default
         for term in predictions.plan.terms

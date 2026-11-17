@@ -192,6 +192,12 @@ class RetiredExportTest(unittest.TestCase):
             cfg.training.objective_options = {"objective_chunk_size": 64}
             with self.assertRaisesRegex(ValueError, "conflicting MTP"):
                 resolve_run(cfg)
+            cfg.training.objective_options = {}
+            cfg.training.loss = {"execution": {"chunk_size": 128}}
+            self.assertEqual(
+                resolve_run(cfg).config.training.loss,
+                {"execution": {"chunk_size": 128}},
+            )
 
 
 if __name__ == "__main__":

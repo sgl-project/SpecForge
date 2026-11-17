@@ -997,11 +997,35 @@ class InitializationConfig(StrictConfigModel):
         return self
 
 
+class LossTermConfig(StrictConfigModel):
+    """User-selected formula and coefficient; defaults belong to the protocol."""
+
+    kind: str = Field(default="default", strict=True)
+    options: dict[str, object] = Field(default_factory=dict)
+    coefficient: float = Field(default=1.0, strict=True, ge=0, allow_inf_nan=False)
+
+
+class LossExecutionConfig(StrictConfigModel):
+    """Projection chunking and recomputation, independent of the formula."""
+
+    chunk_size: int | None = Field(default=None, strict=True, ge=0)
+    checkpoint: bool = Field(default=True, strict=True)
+    trim: bool = Field(default=False, strict=True)
+    teacher_chunk_size: int | None = Field(default=None, strict=True, gt=0)
+
+
+class LossConfig(StrictConfigModel):
+    """Shared syntax for run files and programmatic objective construction."""
+
+    terms: dict[str, LossTermConfig] = Field(default_factory=dict)
+    fused: bool = Field(default=False, strict=True)
+    execution: LossExecutionConfig = Field(default_factory=LossExecutionConfig)
+
+
 class TrainingConfig(StrictConfigModel):
     objective: Optional[str] = None
     objective_options: dict = Field(default_factory=dict)
     loss: dict = Field(default_factory=dict)
-    loss_execution: dict = Field(default_factory=dict)
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
@@ -1105,6 +1129,11 @@ class TrainingConfig(StrictConfigModel):
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
+
+    @field_validator("loss")
+    @classmethod
+    def _validate_loss(cls, value):
+        return LossConfig.model_validate(value).model_dump(exclude_unset=True)
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
@@ -1240,12 +1269,11 @@ class Config(StrictConfigModel):
             or self.training.objective_options
             or self.training.frozen
             or self.training.loss
-            or self.training.loss_execution
             or self.model.use_fused_conv
             or self.training.weighting is not None
         ):
             raise ValueError(
-                "objective/options/frozen/loss/weighting/loss_execution/use_fused_conv "
+                "objective/options/frozen/loss/weighting/use_fused_conv "
                 "require the canonical draft loading path"
             )
 

@@ -209,11 +209,11 @@ def _objective_settings(cfg):
         options=cfg.training.objective_options,
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
-        execution=cfg.training.loss_execution,
     )
 
 
 def _validate_imported_objective(cfg, resolved):
+    """Require explicit preservation of recorded legacy DSpine training settings."""
     from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
     from specforge.config.draft.codec.legacy.dspine import (
         extract_dspine_training_settings,
@@ -230,16 +230,54 @@ def _validate_imported_objective(cfg, resolved):
         )
         directory = source.parent if source.is_file() else source
         payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    mismatches = {}
     for payload in payloads:
         if payload.get("model_type") == "specforge_draft" or payload.get(
             "architectures"
         ) != ["DSpineDraftModel"]:
             continue
         for name, saved in extract_dspine_training_settings(payload).items():
-            if getattr(resolved.objective, name) != saved:
-                raise ValueError(
-                    f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
-                )
+            if name == "ce_weight":
+                values = {
+                    f"loss.terms.{term}.options.{key}": (
+                        configured.loss.options[key],
+                        expected,
+                    )
+                    for term, configured in resolved.losses.terms.items()
+                    if term in {"token", "refinement"}
+                    and configured.loss.kind == "ce_l1"
+                    for key, expected in (
+                        ("ce_weight", saved),
+                        ("l1_weight", 1 - saved),
+                    )
+                }
+            elif name == "alignment_weight":
+                values = {
+                    "loss.terms.alignment.coefficient": (
+                        resolved.losses.terms["alignment"].coefficient,
+                        saved,
+                    )
+                }
+            else:
+                values = {
+                    f"objective_options.{name}": (
+                        getattr(resolved.objective, name),
+                        saved,
+                    )
+                }
+            for path, (current, expected) in values.items():
+                if current != expected:
+                    mismatches[path] = (name, saved, expected)
+    if mismatches:
+        # Report every setting at once: the exact values (1 - 0.7 is not 0.3)
+        # are tedious to find one failed run at a time.
+        raise ValueError(
+            "legacy DSpine training settings must be restated to preserve them:\n"
+            + "\n".join(
+                f"  training.{path}={expected!r}  (recorded {name}={saved!r})"
+                for path, (name, saved, expected) in mismatches.items()
+            )
+        )
 
 
 def resolve_run(cfg, *, target_config=None):
@@ -613,8 +651,7 @@ def build_bundle(cfg, algorithm):
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
-            require_loaded=tuple(cfg.training.frozen)
-            + getattr(resolved.objective, "frozen_parameters", ()),
+            require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
             legacy_config=init.legacy_config if init else None,
@@ -681,7 +718,7 @@ def build_bundle(cfg, algorithm):
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": cfg.model.use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
-        "canonical_loss": asdict(runtime.token_loss),
+        "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,
