@@ -178,7 +178,7 @@ Weights, masks and loss coefficients are applied outside the logits operators.
 
 ## Canonical draft component changes
 
-The canonical component path is still being introduced alongside legacy training.
+Legacy training is retired; the canonical component path is the only one.
 Its schema version 1 is provisional until the canonical-format cutover (design
 step 6). Intermediate configurations must include the current explicit structural
 fields, including RoPE `interleaved`, attention `qk_norm_*`, and RMSNorm
