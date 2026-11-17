@@ -92,12 +92,6 @@ def _objective_settings(cfg):
 
 def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
-    from specforge.algorithms.common.defaults import (
-        empty_options,
-        empty_resume_contract,
-        no_missing_checkpoint_keys,
-        online_needs_input_tools,
-    )
     from specforge.algorithms.common.providers import (
         AlgorithmProviders,
         DraftConfigProvider,
@@ -276,7 +270,6 @@ def resolve_run(cfg, *, target_config=None):
     )
     provider = ModelProvider(
         build_bundle=build_bundle,
-        needs_input_tools=online_needs_input_tools,
         default_dataloader_num_workers=requirements.dataloader_workers,
         loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
@@ -287,9 +280,6 @@ def resolve_run(cfg, *, target_config=None):
     )
     step = StepProvider(
         build=build_step,
-        options=empty_options,
-        resume_contract=empty_resume_contract,
-        allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
         uses_external_target_head=False,
     )
     providers = AlgorithmProviders(

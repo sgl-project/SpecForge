@@ -236,81 +236,12 @@ class StepProvider:
     """Factories and persistence hooks for one algorithm's training step."""
 
     build: Factory
-    options: Factory
-    resume_contract: Factory
-    allowed_missing_checkpoint_keys: Factory
     uses_external_target_head: bool
 
     def __post_init__(self) -> None:
-        _factories_are_callable(
-            (
-                ("build", self.build),
-                ("options", self.options),
-                ("resume_contract", self.resume_contract),
-                (
-                    "allowed_missing_checkpoint_keys",
-                    self.allowed_missing_checkpoint_keys,
-                ),
-            )
-        )
+        _factories_are_callable((("build", self.build),))
         if not isinstance(self.uses_external_target_head, bool):
             raise TypeError("uses_external_target_head must be a bool")
-
-    def bind_runtime(
-        self,
-        config: Any,
-        draft_model: Any,
-        training_model: Any,
-        *,
-        model_provenance: Mapping[str, Any] | None = None,
-    ) -> StepRuntimeConfig:
-        """Resolve algorithm checkpoint semantics against the live model."""
-
-        options = self.options(config)
-        if not isinstance(options, Mapping):
-            raise TypeError(
-                "step options must return a mapping, got " f"{type(options).__name__}"
-            )
-        provider_contract = self.resume_contract(config, draft_model, training_model)
-        if not isinstance(provider_contract, Mapping):
-            raise TypeError(
-                "step resume_contract must return a mapping, got "
-                f"{type(provider_contract).__name__}"
-            )
-        resume_contract = dict(provider_contract)
-        reserved = {
-            STEP_OPTIONS_CONTRACT_KEY,
-            MODEL_PROVENANCE_CONTRACT_KEY,
-            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
-        } & resume_contract.keys()
-        if reserved:
-            raise ValueError(
-                "provider resume_contract uses runtime-owned fields: "
-                f"{sorted(reserved)}"
-            )
-        resume_contract[STEP_OPTIONS_CONTRACT_KEY] = tuple(
-            (key, options[key]) for key in sorted(options)
-        )
-        if model_provenance is not None:
-            resume_contract[MODEL_PROVENANCE_CONTRACT_KEY] = tuple(
-                (key, model_provenance[key]) for key in sorted(model_provenance)
-            )
-        allowed_missing = frozenset(
-            self.allowed_missing_checkpoint_keys(
-                config,
-                draft_model,
-                training_model,
-            )
-        )
-        if allowed_missing:
-            resume_contract[OMITTED_STATE_FINGERPRINT_CONTRACT_KEY] = (
-                checkpoint_key_fingerprint(draft_model, allowed_missing)
-            )
-        return StepRuntimeConfig(
-            options=options,
-            resume_contract=resume_contract,
-            allowed_missing_checkpoint_keys=allowed_missing,
-        )
 
 
 @dataclass(frozen=True)
@@ -324,7 +255,6 @@ class ModelProvider:
     draft_config: DraftConfigProvider
     resolve_capture_layers: Factory
     minimum_loss_tokens: Factory
-    needs_input_tools: Factory
     default_dataloader_num_workers: int | None
     build_bundle: Factory
     loss_mask_filter: Factory | None = None
@@ -337,7 +267,6 @@ class ModelProvider:
             (
                 ("resolve_capture_layers", self.resolve_capture_layers),
                 ("minimum_loss_tokens", self.minimum_loss_tokens),
-                ("needs_input_tools", self.needs_input_tools),
             )
         )
         if self.default_dataloader_num_workers is not None and (

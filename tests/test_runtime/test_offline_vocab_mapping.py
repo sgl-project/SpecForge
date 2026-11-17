@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import torch
 
 from specforge.config import Config
+from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
     _install_dataset_vocab_mapping,
@@ -24,15 +25,9 @@ ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 class _DraftWithMapping(torch.nn.Module):
     def __init__(self, target_vocab_size=8, draft_vocab_size=4):
         super().__init__()
-        self.register_buffer("t2d", torch.zeros(target_vocab_size, dtype=torch.bool))
-        self.register_buffer("d2t", torch.zeros(draft_vocab_size, dtype=torch.long))
-        self.vocab_mapping_loaded = False
-
-    def load_vocab_mapping(self, path):
-        mapping = torch.load(path, weights_only=True)
-        self.t2d.copy_(mapping["t2d"])
-        self.d2t.copy_(mapping["d2t"])
-        self.vocab_mapping_loaded = True
+        self.vocabulary = DraftVocabulary(
+            vocab_size=target_vocab_size, draft_vocab_size=draft_vocab_size
+        )
 
 
 class OfflineVocabMappingTest(unittest.TestCase):
@@ -163,7 +158,7 @@ class OfflineVocabMappingTest(unittest.TestCase):
             _ensure_offline_vocab_mapping(cfg, first, ALGORITHM)
             cached = list((root / "cache" / "vocab_mapping").glob("*.pt"))
             self.assertEqual(len(cached), 1)
-            self.assertTrue(first_draft.vocab_mapping_loaded)
+            self.assertTrue(first_draft.vocabulary.ready)
 
             second_draft = _DraftWithMapping()
             second = SimpleNamespace(
@@ -173,9 +168,13 @@ class OfflineVocabMappingTest(unittest.TestCase):
             )
             _ensure_offline_vocab_mapping(cfg, second, ALGORITHM)
 
-        self.assertTrue(second_draft.vocab_mapping_loaded)
-        self.assertTrue(torch.equal(first_draft.t2d, second_draft.t2d))
-        self.assertTrue(torch.equal(first_draft.d2t, second_draft.d2t))
+        self.assertTrue(second_draft.vocabulary.ready)
+        self.assertTrue(
+            torch.equal(first_draft.vocabulary.t2d, second_draft.vocabulary.t2d)
+        )
+        self.assertTrue(
+            torch.equal(first_draft.vocabulary.d2t, second_draft.vocabulary.d2t)
+        )
 
 
 if __name__ == "__main__":
