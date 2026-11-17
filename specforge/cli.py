@@ -294,7 +294,6 @@ def train(
     help="Target checkpoint for binding validation or native merge-back.",
 )
 @click.option("--output-dir", required=True, metavar="PATH")
-@click.option("--vocab-mapping", default=None, metavar="PATH")
 @click.pass_context
 def export(
     ctx: click.Context,
@@ -304,7 +303,6 @@ def export(
     checkpoint: str,
     target_model: Optional[str],
     output_dir: str,
-    vocab_mapping: Optional[str],
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
     from specforge.export.model import check_export_options, export_draft
@@ -319,12 +317,7 @@ def export(
         check_export_options(**options)
     except ValueError as error:
         raise click.UsageError(str(error), ctx) from error
-    export_draft(
-        checkpoint,
-        output_dir,
-        **options,
-        vocab_mapping_path=vocab_mapping,
-    )
+    export_draft(checkpoint, output_dir, **options)
     return 0
 
 

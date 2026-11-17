@@ -27,7 +27,6 @@ def export_draft(
     converter=None,
     target_model=None,
     copy_target=False,
-    vocab_mapping_path=None,
 ):
     """Publish a standalone draft or merge it into a target checkpoint copy.
 
@@ -39,11 +38,7 @@ def export_draft(
         target_model=target_model,
         copy_target=copy_target,
     )
-    checkpoint, state, model_class = read_export(
-        checkpoint_path,
-        target=target_model,
-        vocab_mapping=vocab_mapping_path,
-    )
+    checkpoint, state, model_class = read_export(checkpoint_path, target=target_model)
     mode = export_mode or "standalone"
     if mode == "native":
         from specforge.checkpoint.formats.native.writer import export_native

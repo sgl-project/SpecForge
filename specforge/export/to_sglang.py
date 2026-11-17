@@ -9,28 +9,14 @@ from specforge.checkpoint.formats.sglang.converters import serving_weights
 from .model import export_draft
 
 
-def export_to_sglang(
-    checkpoint_path,
-    output_dir,
-    *,
-    target_model=None,
-    copy_target=False,
-    vocab_mapping_path=None,
-    weight_map=None,
-    export_mode=None,
-):
-    if weight_map is not None:
-        raise ValueError(
-            "arbitrary weight_map overrides are not supported by the serving format"
-        )
+def export_to_sglang(checkpoint_path, output_dir, *, target_model=None):
+    """Write a standalone SGLang serving directory.
+
+    Native merge-back keeps the target's own format and is a mode of
+    ``export_draft``, not of this converter.
+    """
     return export_draft(
-        checkpoint_path,
-        output_dir,
-        converter="sglang",
-        export_mode=export_mode,
-        target_model=target_model,
-        copy_target=copy_target,
-        vocab_mapping_path=vocab_mapping_path,
+        checkpoint_path, output_dir, converter="sglang", target_model=target_model
     )
 
 
@@ -53,15 +39,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--target-model")
-    parser.add_argument("--copy-target", action="store_true")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
-    export_to_sglang(
-        args.checkpoint,
-        args.output_dir,
-        target_model=args.target_model,
-        copy_target=args.copy_target,
-    )
+    export_to_sglang(args.checkpoint, args.output_dir, target_model=args.target_model)
     return 0
 
 

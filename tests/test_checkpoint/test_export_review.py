@@ -70,12 +70,35 @@ class ExportReviewTest(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             export.assert_called_once()
             export.reset_mock()
-            result = CliRunner().invoke(cli, args + ["--embedding-source", "target"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("No such option", result.output)
-            result = CliRunner().invoke(cli, args + ["--to", "sglang"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("No such option", result.output)
+            # options that could only raise are not offered at all
+            for removed in (
+                ["--embedding-source", "target"],
+                ["--vocab-mapping", "mapping.pt"],
+                ["--to", "sglang"],
+            ):
+                result = CliRunner().invoke(cli, args + removed)
+                self.assertEqual(result.exit_code, 2, removed)
+                self.assertIn("No such option", result.output)
+            export.assert_not_called()
+
+    def test_module_entry_points_offer_only_working_options(self):
+        from specforge.export import to_hf, to_sglang
+
+        base = ["--checkpoint", "checkpoint", "--output-dir", "out"]
+        for module, removed in (
+            (to_hf, ["--vocab-mapping", "m.pt"]),
+            (to_hf, ["--embedding-source", "target"]),
+            (to_hf, ["--embedding-key", "model.embed_tokens.weight"]),
+            (to_sglang, ["--copy-target"]),
+        ):
+            with (
+                self.subTest(module=module.__name__, option=removed[0]),
+                patch("specforge.export.model.export_draft") as export,
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as stopped,
+            ):
+                module.main(base + removed)
+            self.assertEqual(stopped.exception.code, 2)
             export.assert_not_called()
 
     def test_sglang_cli_options_and_forwarding(self):
@@ -106,7 +129,6 @@ class ExportReviewTest(unittest.TestCase):
             export.assert_called_once_with(
                 "checkpoint",
                 "out",
-                vocab_mapping_path=None,
                 target_model="target",
                 copy_target=False,
                 export_mode=None,

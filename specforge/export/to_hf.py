@@ -18,27 +18,19 @@ def export_to_hf(
     checkpoint_path: str,
     output_dir: str,
     *,
-    vocab_mapping_path: Optional[str] = None,
-    embedding_source: Optional[str] = None,
-    embedding_key: str = "model.embed_tokens.weight",
     target_model: Optional[str] = None,
 ) -> str:
-    """Publish canonical config, exact owned weights and standalone HF code."""
+    """Publish canonical config, exact owned weights and standalone HF code.
+
+    Target embeddings stay external; ``target_model`` only validates bindings.
+    """
     from .model import export_draft
 
-    if embedding_key != "model.embed_tokens.weight":
-        raise ValueError("custom embedding keys are not part of canonical export")
-    if embedding_source is not None:
-        raise ValueError(
-            "embedding_source is not supported for canonical export; use target_model "
-            "(--target-model). Target embeddings remain external."
-        )
     return export_draft(
         checkpoint_path,
         output_dir,
         export_mode="standalone",
         target_model=target_model,
-        vocab_mapping_path=vocab_mapping_path,
     )
 
 
@@ -61,22 +53,8 @@ def main(argv=None) -> int:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--target-model", default=None)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--vocab-mapping", default=None)
-    parser.add_argument(
-        "--embedding-source",
-        default=None,
-        help="Unsupported for canonical export; use --target-model instead.",
-    )
-    parser.add_argument("--embedding-key", default="model.embed_tokens.weight")
     args = parser.parse_args(argv)
-    out = export_to_hf(
-        args.checkpoint,
-        args.output_dir,
-        vocab_mapping_path=args.vocab_mapping,
-        embedding_source=args.embedding_source,
-        embedding_key=args.embedding_key,
-        target_model=args.target_model,
-    )
+    out = export_to_hf(args.checkpoint, args.output_dir, target_model=args.target_model)
     print(f"exported HF draft to {out}")
     return 0
 

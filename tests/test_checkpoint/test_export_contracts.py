@@ -68,11 +68,6 @@ class ExportContractTest(unittest.TestCase):
                     atol=0,
                 )
 
-    def test_export_rejects_mapping_replacement(self):
-        self.save()
-        with self.assertRaisesRegex(ValueError, "never replaces checkpoint tensors"):
-            export_draft(self.source, self.output, vocab_mapping_path="new.pt")
-
     def test_missing_mapping_and_other_weights_remain_strict(self):
         original = self.save()
         for missing in ("vocabulary.t2d", "vocabulary.d2t", "fusion.fc.weight"):

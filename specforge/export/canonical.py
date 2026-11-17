@@ -15,15 +15,11 @@ class _BindingMetadata:
     metadata: dict[str, TensorInfo]
 
 
-def read_export(checkpoint, *, target=None, vocab_mapping=None):
+def read_export(checkpoint, *, target=None):
     from specforge.checkpoint.resolve import resolve_checkpoint_path
 
     path = resolve_checkpoint_path(checkpoint)
     checkpoint = read_draft(path, target=target)
-    if vocab_mapping is not None:
-        raise ValueError(
-            "restore vocabulary mappings before export; export never replaces checkpoint tensors"
-        )
     # Meta construction validates every tensor name and shape. Bound modules
     # are intentionally absent from an artifact; no target tensor is read here.
     preview = build_draft_model(checkpoint.config, device="meta")
