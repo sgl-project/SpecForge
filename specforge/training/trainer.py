@@ -20,7 +20,6 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
-from dataclasses import asdict
 from typing import Callable, Mapping, Optional
 
 import torch
@@ -356,6 +355,7 @@ class Trainer:
                     "canonical_loss_execution",
                     "canonical_use_fused_conv",
                 ):
+                    from dataclasses import asdict
 
                     from specforge.algorithms.objectives.execution_options import (
                         LossExecution,
