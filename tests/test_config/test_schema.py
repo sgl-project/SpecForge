@@ -815,39 +815,73 @@ class ConfigSchemaTest(unittest.TestCase):
                 payload["training"].update(loss=loss, weighting=weighting)
                 resolve_run(Config.model_validate(payload))
 
-    def test_planning_reads_dflash2_and_dspine_metadata(self):
-        from pathlib import Path
+    def test_draft_dependent_loss_checks_run_on_the_loaded_draft(self):
+        from types import SimpleNamespace
 
-        with tempfile.TemporaryDirectory() as directory:
-            draft = Path(directory) / "config.json"
-            for strategy, architecture, metadata, terms in (
-                ("dflash", "DFlash2DraftModel", {}, {"selector": {"coefficient": 0.2}}),
-                (
-                    "dspine",
-                    "DSpineDraftModel",
-                    {"ce_weight": 0.3, "alignment_weight": 0.9},
-                    {
-                        "token": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
-                        "refinement": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
-                        "alignment": {"coefficient": 0.5},
-                    },
+        import torch
+
+        from specforge.algorithms import model_providers
+
+        def draft(**dspine_config):
+            return SimpleNamespace(
+                block_size=4,
+                target_layer_ids=[1, 3],
+                config=SimpleNamespace(
+                    vocab_size=32,
+                    dspine_config=dspine_config,
+                    dflash_config={"mask_token_id": 31},
+                ),
+            )
+
+        def build(strategy, model, loss):
+            payload = _online_payload(strategy)
+            # Planning must not need the draft file: this path does not exist.
+            payload["model"]["draft_model_config"] = "/training-host-only/draft.json"
+            payload["training"]["loss"] = loss
+            cfg = Config.model_validate(payload)
+            resolve_run(cfg)
+            module = (
+                "specforge.algorithms.dspine.model.OnlineDSpineModel"
+                if strategy == "dspine"
+                else "specforge.algorithms.common.dflash_family_model.OnlineDFlashModel"
+            )
+            with (
+                mock.patch(module),
+                mock.patch(
+                    "specforge.modeling.target.target_utils.TargetEmbeddingsAndHead.from_pretrained",
+                    return_value=SimpleNamespace(
+                        lm_head=object(), embed_tokens=object()
+                    ),
+                ),
+                mock.patch.object(
+                    model_providers, "_device", return_value=torch.device("cpu")
                 ),
             ):
-                with self.subTest(strategy=strategy):
-                    draft.write_text(
-                        json.dumps(
-                            {"architectures": [architecture], "dspine_config": metadata}
-                        )
-                    )
-                    payload = _online_payload(strategy)
-                    payload["model"]["draft_model_config"] = str(draft)
-                    if strategy == "dspine":
-                        with self.assertRaisesRegex(
-                            ValueError, "training.loss.terms.token.options"
-                        ):
-                            resolve_run(Config.model_validate(payload))
-                    payload["training"]["loss"] = {"terms": terms}
-                    resolve_run(Config.model_validate(payload))
+                getattr(model_providers, f"build_{strategy}_model")(
+                    cfg, model, None, None, None
+                )
+
+        selector = {"terms": {"selector": {"coefficient": 0.2}}}
+        dflash2 = draft()
+        dflash2.candidate_selector = object()
+        build("dflash", dflash2, selector)
+        with self.assertRaisesRegex(ValueError, "selector"):
+            build("dflash", draft(), selector)
+
+        historical = dict(ce_weight=0.3, alignment_weight=0.9)
+        with self.assertRaisesRegex(ValueError, "training.loss.terms.token.options"):
+            build("dspine", draft(**historical), {})
+        build(
+            "dspine",
+            draft(**historical),
+            {
+                "terms": {
+                    "token": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
+                    "refinement": {"options": {"ce_weight": 0.1, "l1_weight": 0.9}},
+                    "alignment": {"coefficient": 0.5},
+                }
+            },
+        )
 
     def test_removed_loss_keys_name_the_replacement(self):
         from specforge.config.loss_migration import REMOVED_LOSS_FIELDS
