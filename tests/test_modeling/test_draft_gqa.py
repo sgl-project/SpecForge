@@ -229,21 +229,24 @@ class GQATest(unittest.TestCase):
                             expected = context_gqa(
                                 reference, other, other_context, embeddings, bias
                             )
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    # The reference is an independent formula (it repeats the
+                    # grouped keys where the module expands a view), so equal
+                    # values can differ in the last bit on some BLAS builds.
+                    close = dict(rtol=1e-5, atol=1e-6)
+                    torch.testing.assert_close(output, expected, **close)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
                     expected.backward(upstream)
-                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+                    torch.testing.assert_close(hidden.grad, other.grad, **close)
                     if context is not None:
                         torch.testing.assert_close(
-                            context.grad, other_context.grad, rtol=0, atol=0
+                            context.grad, other_context.grad, **close
                         )
                     for name, parameter in actual.named_parameters():
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(reference.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
+                            **close,
                         )
                     self.assertIs(actual.config, node)
 

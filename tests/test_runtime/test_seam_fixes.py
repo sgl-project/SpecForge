@@ -13,6 +13,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
+from specforge.algorithms.objectives.implementations.registry import ExecutionSelection
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
 from specforge.training.backend import (
@@ -155,6 +156,8 @@ class _FakeBackend(TrainingBackend):
 class _FakeDFlashModel(nn.Module):
     def __init__(self):
         super().__init__()
+        # the strategy compares kernel selections across ranks before a checkpoint
+        self.loss_implementations = ExecutionSelection()
         from specforge.algorithms.objectives.registry import TrainingRequirements
 
         self.draft_model = nn.Module()
