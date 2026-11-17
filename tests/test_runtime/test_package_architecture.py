@@ -725,6 +725,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "minimax-m3-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3-8b-moe-dspark.json",
                 "qwen3.6-27b-dspark.json",
             },
         )
