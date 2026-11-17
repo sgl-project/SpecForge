@@ -230,7 +230,13 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             out = os.path.join(workdir, "out")
             model = Composite()
             model.loss_implementations = ExecutionSelection()
+            from dataclasses import asdict
+
+            from specforge.algorithms.objectives.protocols.domino import DominoObjective
+
+            model.objective = DominoObjective()
             contract = {
+                "canonical_objective_options": asdict(model.objective),
                 "canonical_loss_implementations": model.loss_implementations.names,
                 "canonical_loss_execution": {"fused": True},
             }
@@ -251,6 +257,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             )
             model = Composite()
             model.loss_implementations = ExecutionSelection()
+            model.objective = DominoObjective()
+            contract["canonical_objective_options"] = asdict(model.objective)
             contract["canonical_loss_implementations"] = (
                 model.loss_implementations.names
             )
@@ -268,6 +276,31 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     resume_from=checkpoint,
                 )
             restore.assert_called_once_with({"0:0": "token_ce"})
+            # Missing or unknown saved options must not be filled from current defaults.
+            saved_options = state["canonical_objective_options"]
+            for options in (
+                {
+                    key: value
+                    for key, value in saved_options.items()
+                    if key != "lambda_base_start"
+                },
+                {**saved_options, "removed_option": 1},
+            ):
+                state["canonical_objective_options"] = options
+                torch.save(state, os.path.join(checkpoint, "training_state.pt"))
+                with (
+                    self.subTest(options=options),
+                    self.assertRaisesRegex(ValueError, "canonical_objective_options"),
+                ):
+                    self._make_trainer(
+                        out,
+                        feat_dir=features,
+                        max_steps=2,
+                        model=model,
+                        checkpoint_extra=contract,
+                        resume_from=checkpoint,
+                    )
+            state["canonical_objective_options"] = saved_options
             # Old fused checkpoints cannot prove which implementation ran.
             state.pop("canonical_loss_implementations")
             torch.save(state, os.path.join(checkpoint, "training_state.pt"))

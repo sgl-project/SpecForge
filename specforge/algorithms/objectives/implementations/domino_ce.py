@@ -8,7 +8,7 @@ from .registry import GroupResult, register_implementation
 def _domino_suffix_support(request, group):
     """Return None or a reason the base/final CE pair cannot be fused."""
     p = request.predictions
-    if not isinstance(p.projection, DominoSuffixProjection):
+    if p is None or not isinstance(p.projection, DominoSuffixProjection):
         return "requires a Domino block-suffix projection"
     if p.hidden.shape[1] != p.projection.block_size:
         return "requires one complete Domino block per projection unit"
@@ -26,7 +26,11 @@ def _domino_suffix_support(request, group):
 
 
 @register_implementation(
-    "domino_suffix_ce", supports=_domino_suffix_support, priority=20
+    "domino_suffix_ce",
+    supports=_domino_suffix_support,
+    priority=20,
+    category="specialized",
+    losses=("ce",),
 )
 def domino_suffix_ce(request, group):
     """Compute base and corrected CE without materializing final logits.

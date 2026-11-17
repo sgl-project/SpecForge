@@ -53,7 +53,7 @@ def _linear_kernel():
 def _linear_support(request, group):
     """Return None or a reason the requested linear CE cannot be fused."""
     p = request.predictions
-    if not isinstance(p.projection, LinearProjection):
+    if p is None or not isinstance(p.projection, LinearProjection):
         return "requires an explicit linear projection"
     if (
         len(group) != 1
@@ -85,7 +85,9 @@ def _linear_support(request, group):
     return None
 
 
-@register_implementation("linear_ce", supports=_linear_support, priority=10)
+@register_implementation(
+    "linear_ce", supports=_linear_support, priority=10, losses=("ce",)
+)
 def linear_ce(request, group):
     """Fuse a plain linear projection with hard-label cross entropy.
 

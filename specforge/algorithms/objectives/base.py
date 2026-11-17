@@ -88,7 +88,7 @@ class ObjectiveModel(nn.Module):
         chain_ids=None,
         sequence_ids=None,
         projection_inputs=None,
-        auxiliary_inputs=None,
+        context_inputs=None,
         projection=None,
         **options,
     ):
@@ -105,7 +105,7 @@ class ObjectiveModel(nn.Module):
             chain_ids: Optional acceptance-chain IDs broadcastable to the unit layout.
             sequence_ids: Optional source-sequence IDs broadcastable to mask.
             projection_inputs: Extra aligned tensors passed to the projection.
-            auxiliary_inputs: Extra aligned tensors consumed by algorithm auxiliaries.
+            context_inputs: Extra aligned tensors consumed by the chunk computation.
             projection: Optional adapter; defaults to the draft's ordinary project.
             **options: Remaining Predictions fields, such as plan and denominator.
 
@@ -155,8 +155,8 @@ class ObjectiveModel(nn.Module):
             projection_inputs={
                 key: align(value) for key, value in (projection_inputs or {}).items()
             },
-            auxiliary_inputs={
-                key: align(value) for key, value in (auxiliary_inputs or {}).items()
+            context_inputs={
+                key: align(value) for key, value in (context_inputs or {}).items()
             },
             **options,
         )

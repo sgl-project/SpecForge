@@ -75,13 +75,17 @@ class DominoObjective:
             raise ValueError("Domino base-loss schedule requires total_steps")
         warmup = max(1, int((total_steps or 1) * self.lambda_base_decay_ratio))
         weight = self.lambda_base_start * max(0, 1 - step / warmup)
+
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
             plan=LossPlan(
-                terms=(LossTerm("base_logits", weight), LossTerm("logits", 1 - weight)),
+                terms=(
+                    LossTerm("base_logits", weight, name="base"),
+                    LossTerm("logits", 1 - weight, name="final"),
+                ),
                 joint_groups=((0, 1),),
             ),
             projection=DominoSuffixProjection(
