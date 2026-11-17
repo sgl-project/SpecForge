@@ -516,6 +516,16 @@ class CanonicalTrainingTest(unittest.TestCase):
             torch.save(old, checkpoint / "training_state.pt")
             with self.assertRaisesRegex(ValueError, "canonical_loss"):
                 build_application_run(Config.model_validate(raw))
+            # A checkpoint from before fused had an unset (auto) setting records
+            # False. A run that leaves fused unset continues it as it was written.
+            self.assertIsNone(saved["canonical_loss_execution"]["fused"])
+            saved = {
+                **saved,
+                "canonical_loss_execution": {
+                    **saved["canonical_loss_execution"],
+                    "fused": False,
+                },
+            }
             torch.save(saved, checkpoint / "training_state.pt")
             second = build_application_run(Config.model_validate(raw))
             second.run()
@@ -524,6 +534,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
+            self.assertIs(state["canonical_loss_execution"]["fused"], False)
             self.assertEqual(
                 state["canonical_loss"]["terms"]["token"]["kind"], "ce" if mtp else "kl"
             )
@@ -543,6 +554,8 @@ class CanonicalTrainingTest(unittest.TestCase):
             changes = [
                 ("loss", {"terms": {"token": {"kind": "tv"}}}),
                 ("loss", {**saved["canonical_loss"], "execution": {"chunk_size": 1}}),
+                # An explicit fused is this run's own request and must match.
+                ("loss", {**saved["canonical_loss"], "fused": True}),
             ]
             if not mtp:
                 changes.append(("weighting", {"kind": "uniform"}))

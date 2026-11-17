@@ -370,7 +370,10 @@ wherever one applies and the reference formula elsewhere: off CUDA/ROCm, outside
 FP16/BF16/FP32, or without Triton, the run simply uses the reference. `true`
 requires optimized execution and raises where a categorical loss cannot be
 optimized. `false` always evaluates the reference. The implementations chosen for
-each loss group are logged once and recorded for resume.
+each loss group are logged once and recorded for resume. On resume an unset
+`fused` takes the setting the checkpoint recorded, so a run written with the
+reference formulas (including every checkpoint from before the auto setting
+existed) continues with them; an explicit `fused` must equal the recorded one.
 
 For plain DFlash/MTP linear heads, `fused: true` can also use Liger linear CE
 without retaining full logits. Auto never selects it: it was not part of the
