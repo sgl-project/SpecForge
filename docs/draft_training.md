@@ -224,15 +224,17 @@ follow their bindings. Teacher heads
 and draft bindings use the same target key resolver and cached source tensors;
 a compatible bound head is shared directly.
 
-Canonical training uses PyTorch kernels by default. `model.use_liger_kernel: true`
-selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other activations retain their
-PyTorch implementation. This option does not change parameter names or canonical
-configuration and is recorded in the training resume contract.
+`model.use_liger_kernel` selects Liger RMSNorm and SiLU/SwiGLU on CUDA/ROCm; other
+activations retain their PyTorch implementation. Its default depends on the
+objective and is described under Loss execution. This option does not change
+parameter names or canonical configuration and is recorded in the training resume
+contract.
 
 ### Loss execution
 
 The preferred configuration names mathematical terms and uses one shared fusion
-switch. Omitting fused means reference calculation.
+switch. Omitting fused selects an optimized implementation where one applies and
+the reference calculation elsewhere.
 
 ```yaml
 training:
@@ -343,11 +345,12 @@ configuration and reject formulas or scheduling they cannot execute.
 - `checkpoint` controls recomputation of chunk projections and losses during
   backward when the prediction set spans multiple chunks. A single chunk is
   not recomputed. It defaults to true and is independent of fused execution.
-- `fused` defaults to false. Registered CUDA FP16/BF16/FP32 kernels implement CE,
+- `fused` is unset by default (see the three settings below). Registered CUDA
+  FP16/BF16/FP32 kernels implement CE,
   soft CE, CE/L1 and supported divergences. DFlash2 selector and DSpine refinement
   use the same CE/L1 kernel; Domino's CE path consumes base and compact GRU
-  corrections without constructing full corrected logits. Categorical fused
-  requests on CPU or FP64 raise. An eligible kernel path with missing Triton or
+  corrections without constructing full corrected logits. With `fused: true`,
+  categorical requests on CPU or FP64 raise. An eligible kernel path with missing Triton or
   Liger also raises. A projection that does not match a specialization can use
   another compatible kernel or a logged reference on a supported device/dtype.
   Empty inputs use the reference only to preserve zero gradients.
@@ -600,9 +603,10 @@ objective by the declared argument name.
 `legacy_strategy` is separate registration metadata that preserves existing data
 and rendezvous identifiers; it does not select a legacy provider.
 `supports_vocab_mapping` declares draft-vocabulary support.
-Worker counts belong to `data.dataloader_num_workers`, not objective requirements.
-Canonical runs use a shared default of 4; set this explicitly to 8 to retain the
-previous DFlash-family/MTP default. Legacy provider defaults are unchanged.
+`dataloader_workers` is the objective's default worker count when
+`data.dataloader_num_workers` is unset: 8 for the block objectives (DFlash,
+DFlash2, Domino, DSpark, DSpine), the shared default of 4 otherwise. An explicit
+`data.dataloader_num_workers` always wins.
 
 Canonical parsing, training and capture read target metadata from the same raw
 `config.json` reader, including nested `text_config`. Transformers defaults are
