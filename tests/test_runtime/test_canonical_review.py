@@ -179,6 +179,42 @@ class CanonicalReviewTest(unittest.TestCase):
                 encode_config(draft_config()),
             )
 
+    def test_explicit_weighting_survives_the_second_resolution(self):
+        """resolve_run writes the options back; build_bundle resolves them again."""
+        from specforge.algorithms.objectives import resolve_objective
+        from specforge.training.canonical import _objective_settings
+        from tests.test_modeling.test_canonical_dspine import (
+            model_config as dspine_config,
+        )
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for config in (eagle_config(), dspine_config()):
+                with self.subTest(architecture=config.architecture):
+                    cfg = run_config(
+                        target, config, training={"weighting": {"kind": "uniform"}}
+                    )
+                    run = resolve_run(cfg)
+                    again = resolve_objective(
+                        config.architecture, **_objective_settings(run.config)
+                    )
+                    self.assertEqual(again.weighting.kind, "uniform")
+
+    def test_logging_options_are_not_part_of_the_resume_record(self):
+        from specforge.algorithms.objectives import objective_record
+
+        saved = {"num_anchors": 8, "loss_decay_gamma": None}
+        for name, logged in (
+            ("dflash", {"teacher_metrics": True, "metric_top_k": 4}),
+            ("dflash2", {"teacher_metrics": True}),
+        ):
+            with self.subTest(objective=name):
+                self.assertEqual(objective_record(name, {**saved, **logged}), saved)
+        self.assertEqual(objective_record("dspark", saved), saved)
+
     def test_legacy_compact_teacher_is_not_silently_accepted(self):
         from tests.test_modeling.test_canonical_eagle3 import (
             model_config as eagle_config,

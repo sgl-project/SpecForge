@@ -175,8 +175,15 @@ def resolve_run(cfg, *, target_config=None):
                 "chain weights are normalized within each sequence shard"
             )
     # Retain the established strategy name for data/rendezvous identifiers.
+    options = asdict(resolved.objective)
+    if cfg.training.weighting is not None:
+        # An explicit weighting replaces these. build_bundle resolves this
+        # config again and must not read the objective's defaults as user input.
+        for name in getattr(resolved.objective, "default_weighting_options", ()):
+            if name not in cfg.training.objective_options:
+                del options[name]
     training = cfg.training.model_copy(
-        update={"objective": objective, "objective_options": asdict(resolved.objective)}
+        update={"objective": objective, "objective_options": options}
     )
     cfg = cfg.model_copy(update={"draft": encode_config(draft), "training": training})
     keys = tuple(entry.inputs)
@@ -417,7 +424,11 @@ def build_bundle(cfg, algorithm):
         MODEL_PROVENANCE_CONTRACT_KEY,
         StepRuntimeConfig,
     )
-    from specforge.algorithms.objectives import build_objective_model, resolve_objective
+    from specforge.algorithms.objectives import (
+        build_objective_model,
+        objective_record,
+        resolve_objective,
+    )
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import (
@@ -579,7 +590,9 @@ def build_bundle(cfg, algorithm):
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
-        "canonical_objective_options": asdict(runtime.objective),
+        "canonical_objective_options": objective_record(
+            runtime.objective_name, asdict(runtime.objective)
+        ),
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),

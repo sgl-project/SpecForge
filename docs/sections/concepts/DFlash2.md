@@ -112,7 +112,7 @@ does not need a different feature-capture protocol.
 | Draft architecture | `DFlash2DraftModel` |
 | Online server capture | `--speculative-algorithm DFLASH` |
 | Offline feature schema | DFlash inputs; final target states when teacher metrics are enabled |
-| Export target | `specforge export --format sglang` |
+| Export target | `specforge export --converter sglang` |
 | SGLang serving algorithm | `DFLASH` |
 
 The sections below retain the model configuration, selector schedule, online
@@ -241,7 +241,7 @@ training backends and the same full/sliding per-layer layouts.
 Export the runtime checkpoint as an SGLang serving directory:
 
 ```bash
-specforge export --format sglang \
+specforge export --converter sglang \
   --checkpoint ./outputs/qwen3.6-27b-dflash2-disaggregated-with-selector/qwen3.6-27b-dflash2-disaggregated-with-selector-latest \
   --output-dir ./exports/qwen3.6-27b-dflash2
 ```

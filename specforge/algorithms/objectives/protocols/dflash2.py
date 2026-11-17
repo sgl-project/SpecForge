@@ -58,6 +58,7 @@ class DFlash2Objective:
             ),
         }
 
+    logging_options = ("teacher_metrics",)
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
 

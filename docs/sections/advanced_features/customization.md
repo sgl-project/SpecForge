@@ -106,7 +106,7 @@ learned execution, fusion and heads; the objective owns supervision and loss.
 `training.objective_options` contains training-only settings. See
 [draft training](../../draft_training.md) for loading and optimization options.
 
-Export uses `specforge export --format sglang`. The converter checks the complete
+Export uses `specforge export --converter sglang`. The converter checks the complete
 structure against supported serving implementations and rejects incompatible
 component combinations.
 

@@ -44,6 +44,8 @@ class DFlashObjective:
     metric_top_k: int = 16
     loss_decay_gamma: float | None = None
 
+    #: Options that only select what is logged; not part of the resume record.
+    logging_options = ("teacher_metrics", "metric_top_k")
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
 

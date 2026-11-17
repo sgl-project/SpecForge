@@ -146,6 +146,16 @@ class ResolvedObjective:
         return "teacher_logits" in self.registration.requires | self.losses.requires
 
 
+def objective_record(name, options):
+    """Options that fix the training trajectory: what a resume compares.
+
+    An objective lists the options that only select what is logged in
+    ``logging_options``; they are left out, for a saved record as well.
+    """
+    logged = getattr(_PROTOCOLS[name].factory, "logging_options", ())
+    return {key: value for key, value in options.items() if key not in logged}
+
+
 def resolve_objective(
     architecture, *, name=None, options=None, loss=None, weighting=None
 ):
