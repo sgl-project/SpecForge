@@ -401,7 +401,13 @@ Losses declare `context_statistics` separately from accepting `LossContext`:
 `supervised_count` requests a whole-set count, and `teacher_mass` requests the
 probability mass retained by vocabulary selection. CE/L1 uses component masks
 without requesting either statistic. Contextual extensions that omit this
-declaration retain both statistics for compatibility.
+declaration retain both statistics for compatibility. A declared statistic is
+always delivered. When the need depends on the selected options, the
+declaration is a callable `(options, *, fixed_denominator)`: the LK losses read
+the teacher mass only for a teacher target, and `lk_alpha` / `lk_tv` use the
+whole-set count only to rescale to a fixed denominator. A prediction set with a
+`compute` callback gets both statistics, because the callback may evaluate any
+registered formula.
 
 
 All objective terms live in `LossPlan.terms`. By default the executor runs its
