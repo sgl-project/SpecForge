@@ -1,7 +1,7 @@
 # Shared numerical losses
 
-This package contains numerical functions used by both canonical objectives and
-legacy training. It does not register algorithms or choose execution policies.
+This package contains numerical functions used by canonical objectives. It does
+not register algorithms or choose execution policies.
 
 | Module | Purpose |
 | --- | --- |
