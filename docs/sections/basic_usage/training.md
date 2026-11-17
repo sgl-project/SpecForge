@@ -824,8 +824,11 @@ number of token positions passed through LM head and loss at once.
 this replacement. The online NPU MTP recipe now
 uses this canonical path and the native preset.
 
-Trainer TP/SP sizes remain one on the canonical path. Legacy implementations
-remain for other algorithms' unsupported backends and sequence parallelism;
+The trainer TP size remains one on the canonical path. Canonical EAGLE3 supports
+offline sequence parallelism with `training.attention_backend: usp` (batch size
+one; D-PACE weighting is refused because chain weights are normalized within a
+shard); every other canonical objective requires SP sizes of one. Legacy
+implementations remain for other algorithms' unsupported backends;
 the old Qwen3.5 MTP model and its training wrapper have been removed.
 Use `draft: OLD.json` to decode a historical configuration into the canonical trainer, or `initialization.checkpoint`
 for an existing draft; neither path constructs a legacy model. Legacy MTP decoding
