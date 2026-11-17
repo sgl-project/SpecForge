@@ -196,7 +196,6 @@ def main():
             dtype=torch.bfloat16,
         ),
         loss_mask=torch.ones(1, args.sequence, device="cuda"),
-        max_valid_anchors=args.sequence - 1,
     )
     if args.method == "dspark":
         batch["target_last_hidden_states"] = torch.randn(

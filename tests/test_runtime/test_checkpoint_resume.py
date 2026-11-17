@@ -56,7 +56,7 @@ def _fake_seam():
             self.w = nn.Parameter(torch.zeros(1))
 
     class Composite(nn.Module):
-        # mirrors OnlineEagle3Model's shape: the checkpointed unit is .draft_model
+        # mirrors ObjectiveModel's shape: the checkpointed unit is .draft_model
         def __init__(self):
             super().__init__()
             self.draft_model = Draft()

@@ -1,12 +1,5 @@
 # coding=utf-8
-"""Domino step schedule and offline launcher.
-
-Domino's immutable algorithm registration injects its concrete step provider.
-Its loss blends a base loss with a step-decayed weight, so
-DominoTrainStrategy reads the StepContext threaded through forward_loss. These
-tests prove the lambda schedule logic on CPU and that Domino trains end to end
-from precomputed features on GPU.
-"""
+"""Domino offline launcher: trains end to end from precomputed features on GPU."""
 
 import os
 import tempfile

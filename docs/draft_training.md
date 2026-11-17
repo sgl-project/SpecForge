@@ -14,9 +14,8 @@ sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiabl
 KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
 KV caches to the backbone.
 Reference and optimized loss implementations share the same executor.
-Training wrappers with capabilities not yet migrated, such as sequence parallelism,
-remain available and read the same named loss configuration. MTP/DMTP CE is evaluated
-in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
+MTP/DMTP CE is evaluated in FP32 for stable log-softmax; it need not match the
+legacy BF16 reduction bitwise.
 
 Loss and position weighting can be selected independently of the architecture:
 
@@ -328,8 +327,7 @@ register compatible input kinds and required capabilities.
 
 Only the named configuration above is accepted. Flat loss dictionaries,
 separate `loss_execution`, old top-level loss flags, and loss coefficients in
-`objective_options` are rejected. Retained training wrappers consume the same
-configuration and reject formulas or scheduling they cannot execute.
+`objective_options` are rejected.
 
 - `chunk_size` counts complete prediction units (blocks for block protocols,
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
@@ -585,13 +583,12 @@ eager attention; block objectives register the shared consecutive-supervision fi
 `explicit_initialization=True` makes training refuse to start without an
 initialization choice or resume, and `host_inputs` computes extra batch tensors on
 the host before the device copy (MTP precomputes its supervised rows there). Canonical
-composition builds providers directly from these requirements; it does not resolve
-a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
+composition builds providers directly from these requirements. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
 requests accumulation-window reduction and replay, passing the result to the
 objective by the declared argument name.
 
 `runtime_name` is separate registration metadata that preserves existing data
-and rendezvous identifiers; it does not select a legacy provider.
+and rendezvous identifiers; it does not select a provider.
 `supports_vocab_mapping` declares draft-vocabulary support.
 `dataloader_workers` is the objective's default worker count when
 `data.dataloader_num_workers` is unset: 8 for the block objectives (DFlash,

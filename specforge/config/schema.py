@@ -283,8 +283,11 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: None/False keeps PyTorch RMSNorm/SwiGLU. True selects Liger kernels
-    #: on CUDA/ROCm and fails for unsupported devices or activations.
+    #: Liger kernels for RMSNorm and SwiGLU. ``None`` (auto) uses them on a
+    #: CUDA/ROCm trainer when the objective declares ``liger_by_default`` and
+    #: the draft's dense FFNs use silu/swish; ``true`` uses them for any
+    #: objective and fails when the trainer device or the activation cannot
+    #: run them; ``false`` keeps the PyTorch modules.
     use_liger_kernel: Optional[bool] = None
     #: Triton kernel for grouped causal convolutions (DFlash2). ``None`` (auto)
     #: uses it when the draft has such a convolution and the trainer supports

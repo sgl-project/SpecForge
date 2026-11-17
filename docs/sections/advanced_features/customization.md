@@ -153,21 +153,18 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.loss.fused` is unset by default: canonical objectives then use an
-optimized implementation where one applies and the reference elsewhere, and
-retained training wrappers use their fused kernels. DFlash-family wrappers accept `false` for eager
-losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
-On the canonical path an explicit `fused: true` for a categorical loss raises off
+`training.loss.fused` is unset by default: objectives then use an
+optimized implementation where one applies and the reference elsewhere.
+`false` always evaluates the reference.
+An explicit `fused: true` for a categorical loss raises off
 CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
 [loss execution](../../draft_training.md#loss-execution)).
 Domino selects its specialized CE kernel under the same flag.
 
 `training.loss.execution.chunk_size` sets the chunk size, and
 `training.loss.execution.checkpoint` (default `true`) controls recomputation of
-each chunk's projection and objective. On the retained wrappers a zero chunk
-size treats the whole objective as one chunk and checkpointing still follows
-its own flag; the canonical executor checkpoints only when the prediction set
-is actually split.
+each chunk's projection and objective. The executor checkpoints only when the
+prediction set is actually split.
 Without checkpointing, all chunks can retain
 logits until backward: smaller chunks do not bound total saved-logits memory.
 DFlash always skips its zero-weight anchor projection in multi-slot objectives;
@@ -175,7 +172,7 @@ DSpark supervises every slot. Detailed diagnostics retain the full blocks.
 
 The selector consumes top-k candidates and hidden states, computes its own CE,
 and joins the logits backward only through candidate values. Its direct hidden
-state gradient is separate; `training.dflash2_selector_stop_gradient` detaches
+state gradient is separate; `training.objective_options.selector_stop_gradient` detaches
 both inputs.
 Weights, masks and loss coefficients are applied outside the logits operators.
 

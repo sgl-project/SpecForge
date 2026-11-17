@@ -1135,9 +1135,8 @@ class TestResumeDataPosition(unittest.TestCase):
 
 class TestStepContextThreading(unittest.TestCase):
     """Regression for the Domino schedule bug: fit() must thread a real schedule
-    horizon into StepContext.total_steps (falling back to max_steps), not None —
-    otherwise DominoTrainStrategy._lambda_base is pinned to 0 for the whole run and
-    the base-loss warmup silently never happens."""
+    horizon into StepContext.total_steps (falling back to max_steps), not None:
+    the Domino base-loss warmup is scheduled over it."""
 
     def _last_ctx(self, **controller_kw):
         strat = FakeStrategy()

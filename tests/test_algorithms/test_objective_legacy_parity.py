@@ -1,7 +1,6 @@
-"""Compare canonical training losses and gradients with the legacy wrappers.
+"""Compare MTP and DMTP training losses and gradients with explicit references.
 
-The same constructions are pinned to stored values, without the wrappers, in
-``test_objective_goldens.py``.
+Both are also pinned to the stored values of ``test_objective_goldens.py``.
 """
 
 import copy
@@ -85,7 +84,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
 
     def test_dmtp_matches_explicit_suffix_loss(self):
         torch.manual_seed(7)  # the recorded values must not depend on test order
-        # DMTP has no legacy Online wrapper. Check its label alignment independently.
+        # Check DMTP's label alignment independently.
         from specforge.algorithms.objectives.inputs import gather
         from tests.test_algorithms.test_objectives import dmtp_config
 

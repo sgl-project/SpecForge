@@ -108,6 +108,6 @@ not guarantees of throughput improvement.
 | `TrainerController` | `FeatureDataLoader.__iter__` | compute |
 | `TrainerController` | `TrainerCore.train_step` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
-| `TrainerCore` | `Eagle3TrainStrategy.forward_loss` | compute |
+| `TrainerCore` | `CanonicalTrainStrategy.forward_loss` | compute |
 | `TrainerCore` | `FSDPTrainingBackend.backward` | compute |
 | `TrainerCore` | `FSDPTrainingBackend.step` | compute |

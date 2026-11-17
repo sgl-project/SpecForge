@@ -51,8 +51,7 @@ class CanonicalDesignTest(unittest.TestCase):
                 draft_config(),
                 training={"attention_backend": "sdpa", "objective": "custom"},
             )
-            with patch.dict("sys.modules", {"specforge.algorithms.builtin": None}):
-                resolved = resolve_run(cfg)
+            resolved = resolve_run(cfg)
             self.assertEqual(resolved.algorithm.name, "custom")
             self.assertEqual(
                 resolved.algorithm.spec.capabilities.attention_backends,

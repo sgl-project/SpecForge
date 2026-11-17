@@ -36,7 +36,7 @@ def register_draft_model(cls: type[DraftPreTrainedModel]) -> type[DraftPreTraine
 
 
 def resolve_draft_model(architecture: str) -> type[DraftPreTrainedModel]:
-    """Resolve a registered implementation; never fall back to legacy models."""
+    """Resolve a registered implementation; there is no fallback."""
     architecture_spec(architecture)
     try:
         return _MODELS[architecture]

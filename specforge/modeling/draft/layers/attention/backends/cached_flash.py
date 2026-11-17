@@ -22,7 +22,7 @@ else:
 
 def _raise_standard_flash_attn_unavailable() -> None:
     raise RuntimeError(
-        "LlamaFlashAttention requires the standard flash-attn interface "
+        "cached Flash/USP requires the standard flash-attn interface "
         f"(import error: {_std_flash_attn_import_error!r})"
     )
 

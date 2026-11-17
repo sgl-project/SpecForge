@@ -22,7 +22,7 @@ def small_payload(name, **overrides):
 
     from specforge.config.draft.codec import parse_draft
 
-    payload = yaml.safe_load((CONFIGS / name.replace(".json", ".yaml")).read_text())
+    payload = yaml.safe_load((CONFIGS / name).read_text())
     config = parse_draft(payload, target_config=None)
     attentions = {
         key: replace(
@@ -159,23 +159,23 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
 
     def test_bundled_recipes_match_explicit_visibility_under_training_layouts(self):
         for name in (
-            "qwen3.6-27b-dflash.json",  # sliding causal + full bidirectional
-            "qwen3.6-27b-dflash2.json",  # bidirectional sliding window
-            "qwen3.8-27b-dflash2.json",
-            "qwen3-8b-dflash.json",  # full bidirectional
+            "qwen3.6-27b-dflash.yaml",  # sliding causal + full bidirectional
+            "qwen3.6-27b-dflash2.yaml",  # bidirectional sliding window
+            "qwen3.8-27b-dflash2.yaml",
+            "qwen3-8b-dflash.yaml",  # full bidirectional
         ):
             for dtype in (torch.float32, torch.bfloat16):
                 with self.subTest(recipe=name, dtype=dtype):
                     self._parity(small_payload(name), dtype=dtype)
 
     def test_mla_attention_matches_explicit_visibility_under_training_layouts(self):
-        payload = mla(small_payload("qwen3.8-27b-dflash2.json"))
+        payload = mla(small_payload("qwen3.8-27b-dflash2.yaml"))
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._parity(copy.deepcopy(payload), dtype=dtype)
 
     def _mha_bfloat16_matches_explicit_visibility(self):
-        for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
+        for name in ("qwen3-8b-dflash.yaml", "qwen3.8-27b-dflash2.yaml"):
             with self.subTest(recipe=name):
                 payload = small_payload(name, num_key_value_heads=4)
                 self._parity(payload, dtype=torch.bfloat16)
@@ -203,7 +203,7 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
     def test_explicit_causality_matches_explicit_visibility(self):
         for causal in (True, False):
             with self.subTest(is_causal=causal):
-                self._parity(small_payload("qwen3.6-27b-dflash.json", is_causal=causal))
+                self._parity(small_payload("qwen3.6-27b-dflash.yaml", is_causal=causal))
 
 
 if __name__ == "__main__":
