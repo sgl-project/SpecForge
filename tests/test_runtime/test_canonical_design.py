@@ -118,6 +118,12 @@ class CanonicalDesignTest(unittest.TestCase):
             (target / "config.json").write_text(json.dumps({"text_config": metadata}))
             cfg = run_config(target, draft_config())
             self.assertEqual(training_target_config(cfg), read_target_config(target))
+            # a target that names its depth num_layers still has one for tap checks
+            depth = metadata.pop("num_hidden_layers")
+            (target / "config.json").write_text(
+                json.dumps({**metadata, "num_layers": depth})
+            )
+            self.assertEqual(read_target_config(target)["num_hidden_layers"], depth)
             with patch(
                 "transformers.AutoConfig.from_pretrained",
                 side_effect=AssertionError("HF defaults used"),
