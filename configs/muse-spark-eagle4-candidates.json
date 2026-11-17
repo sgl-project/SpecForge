@@ -1,0 +1,56 @@
+{
+  "architectures": [
+    "LlamaForCausalLMEagle4"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 200000,
+  "draft_vocab_size": 202048,
+  "dtype": "bfloat16",
+  "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [
+      1,
+      29,
+      57
+    ],
+    "use_aux_hidden_state": true
+  },
+  "efficient_lm_head_config": {
+    "num_candidates": 128,
+    "rank": 128,
+    "type": "low_rank"
+  },
+  "eos_token_id": 200001,
+  "fc_norm": true,
+  "head_dim": 128,
+  "hidden_act": "silu",
+  "hidden_size": 8192,
+  "initializer_range": 0.02,
+  "intermediate_size": 16384,
+  "layer_types": [
+    "sliding_attention"
+  ],
+  "max_position_embeddings": 1048576,
+  "mlp_bias": false,
+  "model_type": "llama",
+  "norm_output": true,
+  "num_attention_heads": 64,
+  "num_aux_hidden_states": 3,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 64,
+  "pad_token_id": 200018,
+  "pretraining_tp": 1,
+  "rms_norm_eps": 1e-05,
+  "rope_parameters": {
+    "rope_theta": 500000.0,
+    "rope_type": "default"
+  },
+  "sliding_window": 4096,
+  "target_hidden_size": 8192,
+  "tie_word_embeddings": false,
+  "use_cache": true,
+  "use_sliding_window": true,
+  "vocab_size": 202048,
+  "torch_dtype": "bfloat16",
+  "eagle4_training_stage": "stage2"
+}

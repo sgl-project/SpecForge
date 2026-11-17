@@ -1,7 +1,7 @@
 # Qwen3-4B EAGLE-4 dense stage-1 offline smoke test.
 #
-# Stage 1 trains a full-vocab dense lm_head (no efficient_lm_head_config).
-# SVD conversion for serving is separate from this training recipe.
+# Stage 1 trains a full-vocab dense lm_head. efficient_lm_head_config is used
+# only by inference export to derive SVD factors; see docs/eagle4.md.
 #
 # Qwen3-4B is a dense target. Capture uses the stock SGLang eagle3 layer hook
 # (no --sglang-disable-radix-cache).

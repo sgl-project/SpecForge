@@ -1,8 +1,9 @@
 # EAGLE-4 training
 
-Stage 1 trains a dense, full-vocabulary draft head. Candidate-factor training and
-SVD conversion are described separately below for the stage-2 branch. For stage 1, do not set
-`efficient_lm_head_config` or `model.vocab_mapping_path`: the draft creates its
+Stage 1 trains a dense, full-vocabulary draft head and remains the default.
+`efficient_lm_head_config` alone describes stage-1 SVD export and does not change
+the training objective. Set `eagle4_training_stage: stage2` in the draft JSON to
+train candidate factors. Omit `model.vocab_mapping_path`; the draft creates its
 full-vocabulary identity buffers directly.
 
 The Qwen3-4B architecture is defined in `configs/qwen3-4b-eagle4.json`: one draft
@@ -124,10 +125,12 @@ candidate-only dense scoring is the inference path.
 ### Configuration and running
 
 On this branch, `training.strategy: eagle4` together with
-`efficient_lm_head_config` in the draft JSON selects candidate-factor training.
+`eagle4_training_stage: stage2` and `efficient_lm_head_config` in the draft JSON
+selects candidate-factor training.
 For example:
 
 ```json
+"eagle4_training_stage": "stage2",
 "efficient_lm_head_config": {
   "type": "low_rank",
   "rank": 128,
@@ -181,3 +184,17 @@ Implementation references: [head and loss](../specforge/modeling/draft/eagle4.py
 [positive-count rule](../specforge/modeling/draft/eagle4_structure.py),
 [loading and freezing](../specforge/algorithms/model_providers.py), and
 [TTT loss integration](../specforge/algorithms/eagle3/model.py).
+
+## Stage-1 and stage-2 export compatibility
+
+Legacy stage-1 draft configs remain dense, including those with export head
+metadata. Both `specforge export --to hf` and `--to sglang` support EAGLE4.
+For stage 1, export derives FP32 SVD factors from the trained dense head when
+`efficient_lm_head_config` is present, retaining the dense weights. For stage 2,
+export preserves the two learned factors and does not recompute SVD. Keep the
+stage-2 draft JSON with the stage-2 checkpoint when exporting or warm-starting.
+
+For Muse Spark, `configs/muse-spark-eagle4-candidates.json` matches the full-vocabulary
+8192-wide dense drafter and auxiliary layers `[1, 29, 57]`. It explicitly selects
+stage 2. Supply a matching trained stage-1 checkpoint with
+`model.draft_checkpoint_path`; the image does not include model weights.

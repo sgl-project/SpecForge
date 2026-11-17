@@ -22,7 +22,9 @@ from specforge.modeling.draft.base import Eagle3DraftModel
 from specforge.modeling.draft.eagle4_moe import Eagle4Router, update_eagle4_router_bias
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
+    candidate_training_enabled,
     draft_sliding_window,
+    efficient_head_export_config,
     parse_efficient_lm_head_config,
     retrieval_positive_count,
 )
@@ -33,10 +35,7 @@ _CANDIDATE_HEAD_PARAM_NAMES = frozenset(
         "efficient_lm_head_down_proj.weight",
     }
 )
-from specforge.modeling.draft.llama3_eagle import (
-    LlamaDecoderLayer,
-    LlamaRMSNorm,
-)
+from specforge.modeling.draft.llama3_eagle import LlamaDecoderLayer, LlamaRMSNorm
 from specforge.modeling.draft.registry import register_draft
 from specforge.utils import print_with_rank
 
@@ -158,9 +157,13 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         if config.num_hidden_layers != 1:
             raise ValueError("EAGLE-4 supports one draft layer")
         self.vocab_size = config.vocab_size
-        self.draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
+        self.draft_vocab_size = (
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
         if self.draft_vocab_size != self.vocab_size:
-            raise ValueError("EAGLE-4 uses a full-vocab head; require draft_vocab_size == vocab_size")
+            raise ValueError(
+                "EAGLE-4 uses a full-vocab head; require draft_vocab_size == vocab_size"
+            )
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -186,7 +189,12 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         self.norm_output = getattr(config, "norm_output", False)
         self.lm_head = nn.Linear(config.hidden_size, self.draft_vocab_size, bias=False)
 
-        self.efficient_lm_head_config = parse_efficient_lm_head_config(config)
+        candidate_stage = candidate_training_enabled(config)
+        if not candidate_stage:
+            efficient_head_export_config(config)
+        self.efficient_lm_head_config = (
+            parse_efficient_lm_head_config(config) if candidate_stage else None
+        )
         if self.efficient_lm_head_config is not None:
             if self.draft_vocab_size != self.vocab_size:
                 raise ValueError(
@@ -353,7 +361,9 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         u, s, vh = torch.linalg.svd(weight, full_matrices=False)
         scores = u[:, :rank] * s[:rank]
         down = vh[:rank]
-        self.efficient_lm_head.weight.copy_(scores.to(self.efficient_lm_head.weight.dtype))
+        self.efficient_lm_head.weight.copy_(
+            scores.to(self.efficient_lm_head.weight.dtype)
+        )
         self.efficient_lm_head_down_proj.weight.copy_(
             down.to(self.efficient_lm_head_down_proj.weight.dtype)
         )

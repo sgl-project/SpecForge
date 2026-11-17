@@ -15,6 +15,39 @@ from typing import Any, Optional
 EAGLE4_ARCH = "LlamaForCausalLMEagle4"
 
 
+def candidate_training_enabled(config: Any) -> bool:
+    """Keep legacy stage-1 configs dense; candidate training is explicit."""
+    stage = getattr(config, "eagle4_training_stage", "stage1")
+    if stage not in ("stage1", "stage2"):
+        raise ValueError("eagle4_training_stage must be 'stage1' or 'stage2'")
+    if stage == "stage2" and not getattr(config, "efficient_lm_head_config", None):
+        raise ValueError("stage2 requires efficient_lm_head_config")
+    return stage == "stage2"
+
+
+def efficient_head_export_config(config: Any) -> Optional[dict]:
+    """Validate inference-export metadata; stage-1 training stays dense."""
+    head = getattr(config, "efficient_lm_head_config", None)
+    if head is None:
+        return None
+    if not isinstance(head, dict) or head.get("type") != "low_rank":
+        raise ValueError("efficient_lm_head_config must specify type='low_rank'")
+    for key, maximum in (
+        ("rank", min(config.hidden_size, config.vocab_size)),
+        ("num_candidates", config.vocab_size),
+    ):
+        value = head.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= maximum
+        ):
+            raise ValueError(
+                f"efficient_lm_head_config.{key} must be in [1, {maximum}]"
+            )
+    return dict(head)
+
+
 def draft_uses_rope(config: Any) -> bool:
     """RoPE is off if any of the three position settings disables it."""
 
@@ -100,9 +133,7 @@ def retrieval_positive_count(num_candidates: int, vocab_size: int) -> int:
     """
 
     if not isinstance(num_candidates, int) or isinstance(num_candidates, bool):
-        raise ValueError(
-            f"num_candidates must be an int, got {num_candidates!r}"
-        )
+        raise ValueError(f"num_candidates must be an int, got {num_candidates!r}")
     if num_candidates < 4:
         raise ValueError(
             "retrieval loss requires num_candidates >= 4 so m = min(32, "

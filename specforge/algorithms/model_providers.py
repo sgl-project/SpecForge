@@ -103,12 +103,14 @@ def _require_identity_vocab_mapping(draft_model: Any) -> None:
 
 def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
-    from specforge.modeling.draft.eagle4_structure import parse_efficient_lm_head_config
+    from specforge.modeling.draft.eagle4_structure import candidate_training_enabled
 
     if cfg.model.vocab_mapping_path:
-        raise ValueError("EAGLE-4 uses the full vocabulary; omit model.vocab_mapping_path")
+        raise ValueError(
+            "EAGLE-4 uses the full vocabulary; omit model.vocab_mapping_path"
+        )
 
-    if parse_efficient_lm_head_config(draft_config) is not None:
+    if candidate_training_enabled(draft_config):
         if not cfg.model.draft_checkpoint_path:
             raise ValueError(
                 "efficient_lm_head_config trains the low-rank candidate head "
