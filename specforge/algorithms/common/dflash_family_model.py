@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from specforge.losses import fused as fused_loss
+from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.dflash_mask import (
     create_dflash_block_mask,
@@ -1684,7 +1684,7 @@ class OnlineDominoModel(OnlineDFlashModel):
         total_blocks: int = 0,
     ) -> Tuple[torch.Tensor, ...]:
         """Return additive Domino loss and telemetry terms for one block slice."""
-        from specforge.core.domino_loss import domino_weighted_cross_entropy
+        from specforge.losses.domino import domino_weighted_cross_entropy
 
         block_size = hidden.shape[2]
         base_logits = self._project_logits(hidden)

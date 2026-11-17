@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
-from specforge.core.position_weights import DPACE_LOSS_TYPES
 from specforge.losses import fused as fused_loss
+from specforge.losses.position_weights import DPACE_LOSS_TYPES
 
 from .base import check_options
 

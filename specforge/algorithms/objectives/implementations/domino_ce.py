@@ -39,7 +39,7 @@ def domino_suffix_ce(request, group):
         GroupResult containing each weighted CE sum and final predicted IDs.
         Coefficients and normalization are applied later by the executor.
     """
-    from specforge.core.domino_loss import domino_weighted_cross_entropy
+    from specforge.losses.domino import domino_weighted_cross_entropy
 
     p, projection = request.predictions, request.predictions.projection
     base, correction = projection.project_parts(p.hidden, **p.projection_inputs)

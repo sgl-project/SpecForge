@@ -78,9 +78,7 @@ def domino_weighted_cross_entropy(
         )
 
     try:
-        from specforge.core.domino_loss_triton import (
-            domino_weighted_cross_entropy_fused,
-        )
+        from specforge.losses._domino_triton import domino_weighted_cross_entropy_fused
     except ModuleNotFoundError as exc:
         if exc.name == "triton" or exc.name.startswith("triton."):
             raise ImportError(
