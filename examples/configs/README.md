@@ -30,8 +30,8 @@ losses, coefficients and execution settings belong in `loss`.
 
 Use `initialization.checkpoint` for weight import and `resume` for a canonical
 training checkpoint. These sources already record the draft configuration.
-Historical checkpoint weights remain importable through the legacy codec;
-their optimizer states are not portable across model layout changes.
+Historical checkpoint weights are imported after conversion with
+`scripts/convert_legacy_checkpoint.py`; their optimizer states are not converted.
 
 Offline EAGLE supports `attention_backend: usp` with Ulysses/Ring sequence
 parallelism. Online consumers use data parallelism; configure target TP on

@@ -62,4 +62,5 @@ jobs:
           tests.test_algorithms.test_loss_plan
           tests.test_algorithms.test_loss_routing
           tests.test_algorithms.test_named_loss_config
-          tests.test_scripts.test_convert_canonical_checkpoint -v
+          tests.test_scripts.test_convert_canonical_checkpoint
+          tests.test_scripts.test_convert_legacy_checkpoint -v

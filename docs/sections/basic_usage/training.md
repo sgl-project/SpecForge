@@ -667,7 +667,8 @@ public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
 MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
 and attention computations. Do not resume those runs; retrain from native MTP
-weights under the corrected model. Historical draft checkpoint import is not supported.
+weights under the corrected model. A historical draft checkpoint is imported only
+after conversion with `scripts/convert_legacy_checkpoint.py`.
 
 For native MTP, use the ordinary YAML preset and explicit target mapping in
 [the preset guide](https://github.com/sgl-project/SpecForge/blob/main/specforge/config/draft/presets/README.md). A complete
@@ -682,7 +683,8 @@ specforge export --export-mode native \
 ```
 
 Native export rewrites shards containing old MTP tensors and links unchanged
-shards; add `--copy-target` for a self-contained directory. Historical checkpoint import is not supported.
+shards; add `--copy-target` for a self-contained directory. A historical checkpoint
+must be converted to the canonical format first.
 Target computation mismatches
 fail instead of rewriting the target's settings to fit a draft.
 
@@ -698,7 +700,10 @@ remains unsupported. See [objective and backend options](../../draft_training.md
 The old model implementations and training wrappers have been removed.
 
 Historical draft checkpoints and configuration formats are no longer accepted.
-Use canonical presets or inline canonical configurations for new training.
+Convert an old checkpoint's weights with `scripts/convert_legacy_checkpoint.py`
+(see [checkpoint boundary](../../draft_training.md#checkpoint-and-configuration-boundary))
+and import them through `initialization.checkpoint`. Use canonical presets or
+inline canonical configurations for new training.
 
 ## Troubleshooting
 

@@ -25,7 +25,8 @@ Hugging Face repositories; custom Python code is never imported from them.
 Canonical model classes use names such as `DFlashDraftModel`, `DSpineDraftModel`
 and `Eagle3DraftModel`. `model_type: specforge_draft` identifies the canonical
 configuration. Use the public loading functions above; the old auto-model
-and legacy checkpoint APIs have been removed.
+and legacy checkpoint APIs have been removed from the package
+(`scripts/convert_legacy_checkpoint.py` converts historical checkpoints).
 
 `load_draft` infers a single floating dtype from the stored weights; pass `dtype`
 explicitly for mixed-dtype checkpoints or an intentional conversion. It returns
@@ -69,8 +70,9 @@ are transformed. Copies cannot overlap warm-start assignments or `allow_new`.
 Current components use separate checkpoint tensors. A future component with
 fused parameters must supply its layout rather than relying on family guesses.
 
-Historical draft checkpoints are not supported. Every draft source must contain
-a canonical `config.json`.
+The package reads canonical checkpoints only: every draft source must contain a
+canonical `config.json`. Convert a historical draft checkpoint once with
+`scripts/convert_legacy_checkpoint.py`, then load the directory it writes.
 Continuing a reduced-vocabulary EAGLE checkpoint requires its saved `t2d` and
 `d2t` mapping. A weights-only warm start can explicitly allow a new `vocabulary`;
 the caller must install its mapping before using logits.
