@@ -42,6 +42,10 @@ class SequenceParallelTest(unittest.TestCase):
             )
             run = resolve_run(cfg)
             self.assertEqual(run.config.training.sp_ulysses_size, 2)
+            # chain weights are normalized inside each shard
+            cfg.training.weighting = {"kind": "dpace"}
+            with self.assertRaisesRegex(ValueError, "D-PACE weighting"):
+                resolve_run(cfg)
 
 
 if __name__ == "__main__":

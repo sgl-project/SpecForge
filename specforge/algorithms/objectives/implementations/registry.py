@@ -170,8 +170,10 @@ def implementation_registrations():
 def select_implementation(request, group=(0,), *, rejections=None, fused=False):
     """Choose the highest-priority compatible optimization or a reference.
 
-    Inapplicable optimizations fall back to reference calculation.
-    Support checks must not materialize predictions.
+    With fused set, a categorical loss that only the reference can evaluate
+    raises unless the inputs are CUDA/ROCm FP16/BF16/FP32; loss kinds without an
+    optimized implementation use their reference formula. Support checks must
+    not materialize predictions.
     """
     candidates = sorted(
         (

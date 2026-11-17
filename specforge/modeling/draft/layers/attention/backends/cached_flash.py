@@ -1,7 +1,5 @@
 """Tensor-only EAGLE branch-cache kernels, shared by FlashAttention and USP."""
 
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 
@@ -134,18 +132,6 @@ def _cached_merge_dims(q: torch.Tensor, cache_k: torch.Tensor):
 
 def _kernel_lse(lse: torch.Tensor, bsz: int, q_len: int, num_heads: int):
     return lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
-
-
-def _current_valid_lengths(
-    attention_mask: Optional[torch.Tensor],
-    bsz: int,
-    q_len: int,
-    lck: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if attention_mask is None or attention_mask.dim() != 2:
-        return torch.full((bsz,), q_len, dtype=torch.long, device=device)
-    return attention_mask.sum(dim=-1, dtype=torch.long).sub(lck).clamp_(0, q_len)
 
 
 class _FlashCachedMergeFunc(torch.autograd.Function):

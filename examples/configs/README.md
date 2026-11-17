@@ -333,7 +333,7 @@ Common fields:
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
 | `training.loss` | `{}` | Named loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
 | `training.loss.fused` | canonical: `false`; retained wrappers: `true` | Select compatible optimized implementations. Retained EAGLE3/P-EAGLE require `true`; explicit `false` is rejected. |
-| `training.loss.execution` | `{}` | `chunk_size`, `checkpoint`, `trim`, and offline `teacher_chunk_size`. |
+| `training.loss.execution` | `{}` | `chunk_size`, `checkpoint`, `trim`, and offline `teacher_chunk_size`; see [loss execution](../../docs/draft_training.md#loss-execution). |
 | `training.weighting` | `null` | Canonical position weighting, for example `{kind: exponential, gamma: 7.0}`; `null` keeps the objective's default. Persisted in the resume contract. |
 | `training.num_epochs` | `1` | Positive passes over a finite source. |
 | `training.max_steps` | `null` | Positive hard stop in optimizer steps. If it is set while `total_steps` is omitted, it is also the fallback schedule horizon. |

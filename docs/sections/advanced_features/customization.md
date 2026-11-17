@@ -247,13 +247,17 @@ CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 `training.loss.fused` defaults to `false` for canonical objectives and `true`
 for retained training wrappers. DFlash-family wrappers accept `false` for eager
 losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
-Canonical optimized implementations fall back to the reference when unsupported.
+On the canonical path a fused request for a categorical loss raises off
+CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
+[loss execution](../../draft_training.md#loss-execution)).
 Domino selects its specialized CE kernel under the same flag.
 
 `training.loss.execution.chunk_size` sets the chunk size, and
-`training.loss.execution.checkpoint` (default `true`) independently controls
-recomputation of each chunk's projection and objective. A zero chunk size treats
-the whole objective as one chunk; checkpointing still follows its own flag.
+`training.loss.execution.checkpoint` (default `true`) controls recomputation of
+each chunk's projection and objective. On the retained wrappers a zero chunk
+size treats the whole objective as one chunk and checkpointing still follows
+its own flag; the canonical executor checkpoints only when the prediction set
+is actually split.
 Without checkpointing, all chunks can retain
 logits until backward: smaller chunks do not bound total saved-logits memory.
 DFlash always skips its zero-weight anchor projection in multi-slot objectives;
@@ -288,6 +292,9 @@ can therefore differ numerically; acceptance impact must be measured before the
 training cutover.
 
 Runtime attention names are `eager`, `sdpa`, `flex_attention`, and `fa`, matching
-training configuration. Canonical `usp` is not implemented and fails explicitly.
+training configuration. `usp` is available for canonical EAGLE3 offline
+training: the objective's cached rollout selects it together with the
+sequence-parallel groups, and `resolve_attention_backend("usp")` itself still
+fails explicitly.
 Flex defaults to the general TRITON kernel for sparse short-query batches; an
 explicit `FlexAttentionBackend(kernel_backend="FLASH")` uses `(256, 128)` blocks.

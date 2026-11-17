@@ -142,20 +142,24 @@ def validate_dspine_weights(training, recorded):
 def wrapper_loss_validator(architecture, *, execution=(), compatible=()):
     """Build a planning hook using the same loss resolver as model assembly.
 
-    Reuse model loading's config source resolution to distinguish DFlash2 and
-    historical weights, without loading target weights or constructing a model.
+    Planning sees only the run config, so it rejects what no architecture of
+    this strategy accepts. Checks that need the draft (DFlash2 terms, weights a
+    historical DSpine draft records) run in the builder, on the loaded draft.
     """
 
     def validate(config):
-        from specforge.training.model_loading import load_explicit_draft_config
-
-        draft = load_explicit_draft_config(config)
-        recorded = draft.to_dict() if draft is not None else {}
-        selected = recorded.get("architectures", [architecture])[0]
-        if selected not in (architecture, *compatible):
-            selected = architecture
-        resolve_wrapper_loss(config.training, selected, execution=execution)
-        if selected == "DSpineDraftModel":
-            validate_dspine_weights(config.training, recorded.get("dspine_config", {}))
+        errors = {}
+        for candidate in (architecture, *compatible):
+            try:
+                resolve_wrapper_loss(config.training, candidate, execution=execution)
+            except ValueError as error:
+                errors[candidate] = error
+            else:
+                return
+        if len({str(error) for error in errors.values()}) == 1:
+            raise errors[architecture]
+        raise ValueError(
+            "; ".join(f"{candidate}: {error}" for candidate, error in errors.items())
+        )
 
     return validate

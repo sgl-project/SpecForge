@@ -229,6 +229,7 @@ def _validate_imported_objective(cfg, resolved):
         )
         directory = source.parent if source.is_file() else source
         payloads.append(read_json(init.legacy_config or directory / "config.json"))
+    mismatches = {}
     for payload in payloads:
         if payload.get("model_type") == "specforge_draft" or payload.get(
             "architectures"
@@ -265,9 +266,17 @@ def _validate_imported_objective(cfg, resolved):
                 }
             for path, (current, expected) in values.items():
                 if current != expected:
-                    raise ValueError(
-                        f"legacy DSpine {name}={saved!r}; set training.{path}={expected!r} to preserve it"
-                    )
+                    mismatches[path] = (name, saved, expected)
+    if mismatches:
+        # Report every setting at once: the exact values (1 - 0.7 is not 0.3)
+        # are tedious to find one failed run at a time.
+        raise ValueError(
+            "legacy DSpine training settings must be restated to preserve them:\n"
+            + "\n".join(
+                f"  training.{path}={expected!r}  (recorded {name}={saved!r})"
+                for path, (name, saved, expected) in mismatches.items()
+            )
+        )
 
 
 def resolve_run(cfg, *, target_config=None):
@@ -379,6 +388,14 @@ def resolve_run(cfg, *, target_config=None):
         or cfg.training.attention_backend != "usp"
     ):
         raise ValueError("sequence parallelism requires an objective supporting USP")
+    if sequence_parallel:
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+            raise ValueError(
+                "D-PACE weighting is not supported with sequence parallelism: "
+                "chain weights are normalized within each sequence shard"
+            )
     # Retain the established strategy name for data/rendezvous identifiers.
     training = cfg.training.model_copy(
         update={"strategy": family, "objective": objective}

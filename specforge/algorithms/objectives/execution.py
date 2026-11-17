@@ -92,9 +92,10 @@ def prepare_supervision(predictions, loss, weighting, execution):
             teacher = predictions.teacher.logits()
             teacher_ids = teacher.argmax(-1)
             if predictions.vocab_mask is not None:
-                if any(
-                    "teacher_mass" in selected.registration.context_statistics
-                    and selected.requires_teacher
+                # A callback may request a formula that reads the mass.
+                if predictions.compute is not None or any(
+                    "teacher_mass"
+                    in selected.context_statistics(fixed_denominator=True)
                     for selected in losses
                 ):
                     mass = (
@@ -399,8 +400,21 @@ def evaluate_chunks(
                 stacklevel=2,
             )
         chunk_size = 0
+    # Ranks of one sequence must evaluate the same chunks: a contextual loss
+    # reduces its statistics over the group once per chunk.
+    reduced = predictions.reduce_statistics is not None and any(
+        selected.registration.contextual for selected in losses
+    )
+    if execution.trim and reduced and not whole_set:
+        warnings.warn(
+            "Loss trimming is disabled: the loss reduces statistics across "
+            "sequence-parallel ranks.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if (
         execution.trim
+        and not reduced
         and weighting.kind not in DPACE_LOSS_TYPES
         and not whole_set
         and predictions.chunk_safe
@@ -418,17 +432,23 @@ def evaluate_chunks(
             RuntimeWarning,
             stacklevel=2,
         )
-    # Contextual per-position formulas keep the whole-set supervised count,
-    # even when their values are evaluated in smaller chunks. Callbacks may
-    # request contextual formulas for terms declared as precomputed values.
+    # Per-position formulas that read the whole-set supervised count keep it
+    # when their values are evaluated in smaller chunks. Callbacks may request
+    # such formulas for terms declared as precomputed values. Complete-chain
+    # weighting supplies its own denominators, so no term is rescaled there.
     context_counts = None
-    if split and any(
-        (
-            "supervised_count" in selected.registration.context_statistics
-            or predictions.compute is not None
+    if split and (
+        predictions.compute is not None
+        or any(
+            "supervised_count"
+            in selected.context_statistics(
+                fixed_denominator=denominator is None
+                and (
+                    term.denominator is not None or predictions.denominator is not None
+                )
+            )
+            for term, selected in zip(predictions.plan.terms, losses)
         )
-        and (term.denominator is not None or predictions.denominator is not None)
-        for term, selected in zip(predictions.plan.terms, losses)
     ):
         eligibility = None
         if predictions.vocab_mask is not None:
