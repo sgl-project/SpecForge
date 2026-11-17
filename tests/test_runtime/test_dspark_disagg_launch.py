@@ -14,7 +14,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
 
 CUDA = torch.cuda.is_available()
@@ -36,7 +36,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
         )
-        from specforge.training.strategies.base import DSparkTrainStrategy
+        from specforge.training.strategies.canonical import CanonicalTrainStrategy
 
         torch.manual_seed(17)
         torch.cuda.manual_seed_all(17)
@@ -86,11 +86,11 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         )
 
         strategy = trainer.core.strategy
-        self.assertIsInstance(strategy, DSparkTrainStrategy)
-        self.assertIsInstance(strategy.trainable_module(), FSDP)
+        self.assertIsInstance(strategy, CanonicalTrainStrategy)
+        self.assertIsInstance(strategy.model, FSDP)
         self.assertEqual(
             {cls.__name__ for cls in trainer.backend.auto_wrap_block_classes},
-            {"Qwen3DFlashDecoderLayer"},
+            {"DecoderLayer"},
         )
         before = [
             parameter.detach().float().clone()

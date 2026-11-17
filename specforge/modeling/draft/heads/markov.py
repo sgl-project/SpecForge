@@ -274,7 +274,7 @@ def build_markov_head(
     device=None,
     dtype=None,
 ) -> VanillaMarkovHead | None:
-    """Construct the explicitly selected head without legacy configuration rules."""
+    """Construct the explicitly selected head."""
     if config is None:
         return None
     if type(config) is not MarkovHeadSpec:

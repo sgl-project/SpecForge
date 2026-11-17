@@ -7,19 +7,11 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-from transformers import LlamaConfig
 
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
 from specforge.modeling.draft.models import PEagleDraftModel
-from specforge.modeling.draft.peagle import PEagleDraftModel as LegacyPEagleDraftModel
-from tests.test_modeling.legacy_rope_reference import (
-    eager_legacy_reference,
-    legacy_fp32_rope,
-)
 from tests.test_modeling.test_canonical_eagle3 import install_mapping, model_inputs
 from tests.test_modeling.test_draft_eagle_backbone import config_for
-from tests.test_modeling.test_draft_eagle_fusion import eager_reference
 
 
 def model_config(*, normalized=False, bound=False, target_width=48):
@@ -42,130 +34,7 @@ def feature_mask(device="cpu"):
     )
 
 
-def legacy_name(name):
-    for prefix, target in (
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-        ("fusion.", ""),
-        ("vocabulary.", ""),
-    ):
-        if name.startswith(prefix):
-            return target + name[len(prefix) :]
-    return name
-
-
-def peagle_eager_reference(*, query, key, value, **kwargs):
-    # Legacy applies RoPE inline; cast after rotation, as canonical RoPE does.
-    return eager_reference(
-        query=query.to(value.dtype), key=key.to(value.dtype), value=value, **kwargs
-    )
-
-
 class CanonicalPEagleTest(unittest.TestCase):
-    @eager_legacy_reference()
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        torch.manual_seed(0)
-        for normalized in (False, True):
-            with self.subTest(device=device, dtype=dtype, normalized=normalized):
-                config = model_config(normalized=normalized)
-                config = replace(
-                    config, spec_config=replace(config.spec_config, pad_token_id=0)
-                )
-                actual = build_draft_model(config, device=device, dtype=dtype)
-                install_mapping(actual)
-                with torch.no_grad():
-                    actual.backbone.final_norm.weight.uniform_(0.5, 1.5)
-                legacy = LlamaConfig(
-                    hidden_size=32,
-                    target_hidden_size=48,
-                    intermediate_size=64,
-                    num_attention_heads=4,
-                    num_key_value_heads=2,
-                    head_dim=8,
-                    num_hidden_layers=3,
-                    vocab_size=64,
-                    draft_vocab_size=32,
-                    max_position_embeddings=128,
-                    rms_norm_eps=1e-6,
-                    hidden_act="silu",
-                    pretraining_tp=1,
-                    norm_before_residual=normalized,
-                    pad_token_id=config.spec_config.pad_token_id,
-                    rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
-                )
-                reference = LegacyPEagleDraftModel(legacy).to(
-                    device=device, dtype=dtype
-                )
-                reference.rotary_emb = LlamaRotaryEmbedding(
-                    8, max_position_embeddings=128, base=10000, device=device
-                )
-                # Compute the legacy inline rotation in FP32 without changing
-                # projection weights or the attention/MLP arithmetic.
-                for layer in reference.layers:
-                    for projection in (layer.self_attn.q_proj, layer.self_attn.k_proj):
-                        projection.register_forward_hook(
-                            lambda module, args, output: output.float()
-                        )
-                reference.load_state_dict(
-                    {legacy_name(n): v for n, v in actual.state_dict().items()},
-                    strict=True,
-                )
-                ids, features, entries = model_inputs(config, device, dtype)
-                other = features.detach().clone().requires_grad_()
-                masked = feature_mask(device)
-                output = actual(ids, features, entries, feature_mask=masked)
-                visibility = (
-                    entries[0].attention_layout.key_positions[:, None, None, :]
-                    <= entries[0].attention_layout.query_positions[:, None, :, None]
-                )
-                # Legacy training performs feature replacement outside the model.
-                selected = torch.where(
-                    masked[..., None], reference.mask_hidden.to(dtype), other
-                )
-                with patch(
-                    "specforge.modeling.draft.peagle.compile_friendly_flex_attention",
-                    peagle_eager_reference,
-                ):
-                    hidden = reference(
-                        selected,
-                        reference.embed_tokens(
-                            ids.masked_fill(masked, config.spec_config.mask_token_id)
-                        ),
-                        attention_mask=visibility,
-                        position_ids=entries[0].position_ids,
-                    )
-                logits = reference.lm_head(hidden)
-                torch.testing.assert_close(
-                    output.hidden_states, hidden, rtol=tolerance, atol=tolerance
-                )
-                torch.testing.assert_close(
-                    output.logits, logits, rtol=tolerance, atol=tolerance
-                )
-                upstream = torch.randn_like(logits)
-                output.logits.backward(upstream)
-                logits.backward(upstream)
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=tolerance, atol=tolerance
-                )
-                self.assertEqual(torch.count_nonzero(features.grad[masked]).item(), 0)
-                self.assertGreater(
-                    torch.count_nonzero(actual.mask_hidden.grad).item(), 0
-                )
-                for name, parameter in actual.named_parameters():
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad,
-                        dict(reference.named_parameters())[legacy_name(name)].grad,
-                        rtol=tolerance,
-                        atol=tolerance,
-                    )
 
     def test_linear_initialization_matches_pytorch_default(self):
         model = build_draft_model(model_config())
@@ -197,15 +66,6 @@ class CanonicalPEagleTest(unittest.TestCase):
         module = CustomLinear(4, 4, bias=False)
         model._init_weights(module)
         torch.testing.assert_close(module.weight, torch.full_like(module.weight, 0.25))
-
-    def test_cpu_legacy_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_checkpointing_binding_and_hf_restore_keep_learned_mask(self):
         config = model_config(bound=True, target_width=32)

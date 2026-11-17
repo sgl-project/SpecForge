@@ -2,9 +2,9 @@
 
 ``tests/fixtures/metric_goldens.json`` holds every metric a logging step hands
 to the tracker, for each case below. The values were recorded while the legacy
-training wrappers still existed and agreed with them key by key
-(``test_legacy_metric_parity``), so they keep that reference after the wrappers
-are gone. A changed value means a metric changed: regenerate with
+training wrappers still existed and agreed with them key by key, so they keep
+that reference now that the wrappers are gone. A changed value means a metric
+changed: regenerate with
 ``SPECFORGE_UPDATE_GOLDENS=1`` and say in the commit what moved and why.
 """
 

@@ -69,10 +69,7 @@ class KernelDefaultsTest(unittest.TestCase):
 
         cfg = SimpleNamespace(model=SimpleNamespace(use_liger_kernel=None))
         with (
-            patch(
-                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                return_value="cpu",
-            ),
+            patch.object(canonical, "trainer_platform", return_value="cpu"),
             patch.object(canonical, "resolve_config") as resolve,
         ):
             canonical.preflight_kernels(cfg)

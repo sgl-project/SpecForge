@@ -21,7 +21,6 @@ from specforge.config.draft.codec import parse_draft
 from specforge.export import export_draft
 from specforge.loading import initialize_draft
 from specforge.modeling import build_draft_model
-from tests.test_config.test_draft_legacy_mtp import mtp_payload
 
 PRESETS = Path(__file__).resolve().parents[2] / "specforge/config/draft/presets/native"
 NATIVE_MAPPING = {
@@ -113,7 +112,6 @@ class NativePresetTest(unittest.TestCase):
                 ):
                     export_draft(
                         str(root / "draft"),
-                        None,
                         str(root / "export"),
                         target_model=str(target),
                         export_mode="native",
@@ -127,39 +125,6 @@ class NativePresetTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(
                     restored.state_dict(), copied.state_dict(), rtol=0, atol=0
-                )
-                legacy = root / "legacy"
-                legacy.mkdir()
-                raw = mtp_payload() | {
-                    name: payload[name]
-                    for name in (
-                        "hidden_size",
-                        "vocab_size",
-                        "intermediate_size",
-                        "num_attention_heads",
-                        "num_key_value_heads",
-                        "head_dim",
-                        "max_position_embeddings",
-                        "partial_rotary_factor",
-                        "rope_theta",
-                    )
-                }
-                (legacy / "config.json").write_text(json.dumps(raw))
-                save_file(
-                    {k: v for k, v in weights.items() if k.startswith("mtp.")},
-                    legacy / "model.safetensors",
-                )
-                export_draft(
-                    str(legacy),
-                    None,
-                    str(root / "legacy-export"),
-                    target_model=str(target),
-                    export_mode="native",
-                )
-                exported = json.loads((root / "legacy-export/config.json").read_text())
-                self.assertEqual(
-                    exported["text_config"]["rope_parameters"],
-                    payload["rope_parameters"],
                 )
                 # Extra, quantized and incomplete native tensors fail before data reads.
                 for bad in (

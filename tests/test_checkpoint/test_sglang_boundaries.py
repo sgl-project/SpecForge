@@ -5,11 +5,13 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+import yaml
+
 from specforge.checkpoint.formats.sglang import convert_config
 from specforge.checkpoint.formats.sglang.models.qwen3_5 import (
     convert_config as convert_qwen3_5_config,
 )
-from specforge.config.draft.codec.legacy import decode_legacy_config
+from specforge.config.draft.codec import parse_draft
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.config.draft.rope import MultiAxisRoPESpec
@@ -167,7 +169,7 @@ class ServingBoundariesTest(unittest.TestCase):
             )
 
     def test_recipe_causality_tokens_and_auxiliary_layers(self):
-        root = Path(__file__).resolve().parents[2] / "configs"
+        root = Path(__file__).resolve().parents[2] / "tests/fixtures/serving_configs"
         for name in (
             "minimax-m3-dspark",
             "qwen3.6-27b-dflash",
@@ -176,13 +178,13 @@ class ServingBoundariesTest(unittest.TestCase):
         ):
             payload = json.loads((root / (name + ".json")).read_text())
             with self.subTest(recipe=name):
-                config = decode_legacy_config(
-                    payload,
-                    target_config={
-                        "hidden_size": payload["hidden_size"],
-                        "vocab_size": payload["vocab_size"],
-                        "num_hidden_layers": payload.get("num_target_layers", 96),
-                    },
+                config = parse_draft(
+                    yaml.safe_load(
+                        (
+                            Path("specforge/config/draft/presets") / (name + ".yaml")
+                        ).read_text()
+                    ),
+                    target_config=None,
                 )
                 fields = convert_config(config)
                 if "eagle_config" in payload:
@@ -230,14 +232,18 @@ class ServingBoundariesTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         for name in ("qwen3.8-27b-dflash2", "qwen3.6-27b-dflash2"):
             with self.subTest(recipe=name):
-                payload = json.loads((root / "configs" / (name + ".json")).read_text())
-                config = decode_legacy_config(
-                    payload,
-                    target_config={
-                        "hidden_size": payload["hidden_size"],
-                        "vocab_size": payload["vocab_size"],
-                        "num_hidden_layers": 64,
-                    },
+                payload = json.loads(
+                    (
+                        root / "tests/fixtures/serving_configs" / (name + ".json")
+                    ).read_text()
+                )
+                config = parse_draft(
+                    yaml.safe_load(
+                        (
+                            Path("specforge/config/draft/presets") / (name + ".yaml")
+                        ).read_text()
+                    ),
+                    target_config=None,
                 )
                 fields = convert_config(config)
                 for key in (
