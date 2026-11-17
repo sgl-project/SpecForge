@@ -340,13 +340,20 @@ def _accepted_options(compute):
         ).parameters.values()
     except (TypeError, ValueError):
         return None
+    parameters = list(parameters)
     if any(p.kind is p.VAR_KEYWORD for p in parameters):
         return None
+    # The executor binds the data inputs by position: (logits, labels, teacher)
+    # for a registered formula, (logits, targets) for a wrapped divergence.
+    positional = [
+        p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    data = {p.name for p in positional[: 2 if hasattr(compute, "_options_from") else 3]}
     return {
         p.name
         for p in parameters
         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-        and p.name not in _RESERVED_OPTIONS
+        and p.name not in _RESERVED_OPTIONS | data
     }
 
 

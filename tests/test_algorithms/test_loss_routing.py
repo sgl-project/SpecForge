@@ -311,6 +311,22 @@ class LossRoutingTest(unittest.TestCase):
                         expected_grad,
                     )
 
+    def test_data_inputs_are_not_loss_options(self):
+        for kind, name in (
+            ("kl", "targets"),
+            ("reverse_kl", "targets"),
+            ("js", "targets"),
+            ("tv", "targets"),
+            ("nla", "targets"),
+            ("lk", "targets"),
+            ("value", "values"),
+        ):
+            with (
+                self.subTest(kind=kind),
+                self.assertRaisesRegex(ValueError, f"unknown {kind} options"),
+            ):
+                TokenLoss(kind, {name: 1.0})
+
     def test_saved_implementation_names_are_checked_without_aliases(self):
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
