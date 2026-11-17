@@ -372,6 +372,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                 torch.testing.assert_close(pooled, torch.stack(expected_losses).mean())
 
     def test_mtp_matches_explicit_shifted_loss_with_native_layers(self):
+        torch.manual_seed(7)  # the recorded values must not depend on test order
         from specforge.config.draft.norm import RMSNormSpec
         from specforge.config.draft.rope import DefaultRoPESpec
         from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -421,6 +422,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
         assert_golden("mtp", new, actual)
 
     def test_dmtp_matches_explicit_suffix_loss(self):
+        torch.manual_seed(7)  # the recorded values must not depend on test order
         # DMTP has no legacy Online wrapper. Check its label alignment independently.
         from specforge.algorithms.objectives.inputs import gather
         from tests.test_algorithms.test_objectives import dmtp_config
