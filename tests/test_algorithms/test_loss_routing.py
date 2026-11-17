@@ -20,6 +20,11 @@ from specforge.algorithms.objectives.losses import LossContext, TokenLoss
 
 class LossRoutingTest(unittest.TestCase):
 
+    def setUp(self):
+        # Built-in implementations register on first use. Do it before any test
+        # patches the registry, or the patch exit drops them for later tests.
+        implementation_registrations()
+
     def test_loss_input_kinds_and_reserved_options_fail_at_construction(self):
         from specforge.algorithms.objectives.losses import _LOSSES, register_loss
         from specforge.algorithms.objectives.registry import resolve_objective
@@ -312,6 +317,215 @@ class LossRoutingTest(unittest.TestCase):
                         torch.autograd.grad(actual.loss, hidden)[0],
                         expected_grad,
                     )
+
+    def test_declared_context_statistics_are_delivered(self):
+        import math
+
+        from specforge.algorithms.objectives.execution import execute_batch
+        from specforge.algorithms.objectives.execution_options import LossExecution
+        from specforge.algorithms.objectives.losses import (
+            _LOSSES,
+            PositionWeighting,
+            register_loss,
+        )
+        from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+        from specforge.algorithms.objectives.predictions import (
+            PredictionBatch,
+            Predictions,
+            Teacher,
+        )
+        from specforge.algorithms.objectives.projection import Projection
+
+        def run(prediction, chunk=0):
+            return execute_batch(
+                PredictionBatch((prediction,), reduction="sum_means"),
+                TokenLoss("ce"),
+                PositionWeighting(),
+                training=True,
+                execution=LossExecution(chunk_size=chunk, checkpoint=False),
+            ).loss
+
+        def cross_entropy(logits, labels):
+            return (
+                -logits.float()
+                .log_softmax(-1)
+                .gather(-1, labels[..., None])
+                .squeeze(-1)
+            )
+
+        # Draft probabilities (0.6, 0.4); a uniform three-token teacher of which
+        # the draft vocabulary keeps two, so the retained teacher mass is 2/3.
+        def masked(plan, compute=None):
+            labels = torch.zeros(2, 1, dtype=torch.long)
+            return Predictions(
+                hidden=torch.tensor([[[0.6, 0.4]], [[0.6, 0.4]]]).log(),
+                projection=Projection(lambda x: {"logits": x}),
+                labels=labels,
+                mask=torch.ones(2, 1),
+                positions=labels,
+                teacher=Teacher(torch.zeros(2, 1, 3)),
+                requires=frozenset({"teacher_logits"}),
+                vocab_mask=torch.tensor([True, True, False]),
+                plan=plan,
+                compute=compute,
+            )
+
+        with patch.dict(_LOSSES):
+            seen = []
+
+            def read_mass(logits, labels, teacher, *, context):
+                seen.append(context.teacher_mass)
+                return cross_entropy(logits, labels) * context.teacher_mass
+
+            register_loss("mass_default", contextual=True, scope="positions")(read_mass)
+            register_loss(
+                "mass_declared",
+                contextual=True,
+                scope="positions",
+                context_statistics=("teacher_mass",),
+            )(read_mass)
+            # The protocol, not the loss, supplies the teacher.
+            for kind in ("mass_default", "mass_declared"):
+                with self.subTest(kind=kind):
+                    seen.clear()
+                    loss = run(masked(LossPlan((LossTerm(loss=TokenLoss(kind)),))))
+                    self.assertEqual(len(seen), 1)
+                    torch.testing.assert_close(seen[0], torch.full((2, 1), 2 / 3))
+                    self.assertAlmostEqual(
+                        loss.item(), -math.log(0.6) * 2 / 3, places=6
+                    )
+
+            # A callback evaluates a formula that no declared term selects.
+            # min(p, q) sums to 1/3 + 1/3 with the mass and to 0.5 + 0.4 without.
+            teacher_tv = TokenLoss("lk_tv", {"target": "teacher"})
+
+            def compute(calc):
+                calc.run((0,))
+                out = calc.evaluate(
+                    "lk",
+                    teacher_tv,
+                    calc.outputs()["logits"],
+                    calc.labels,
+                    teacher=calc.teacher,
+                )
+                calc.add(1, out.values)
+
+            declared = run(masked(LossPlan((LossTerm(loss=teacher_tv),))))
+            self.assertAlmostEqual(declared.item(), 1 / 3, places=6)
+            for main in ("ce", "ce_l1"):
+                with self.subTest(intermediate_after=main):
+                    plan = LossPlan(
+                        (
+                            LossTerm(loss=TokenLoss(main), coefficient=0.0),
+                            LossTerm("computed", loss=TokenLoss("value")),
+                        )
+                    )
+                    torch.testing.assert_close(run(masked(plan, compute)), declared)
+
+            # A declared whole-set count does not depend on a fixed denominator,
+            # and it counts only positions the vocabulary mapping keeps.
+            counts = []
+
+            def read_count(logits, labels, teacher, *, context):
+                counts.append(context.supervised_count)
+                count = context.supervised_count
+                return cross_entropy(logits, labels) / (
+                    context.mask.sum() if count is None else count
+                )
+
+            register_loss(
+                "count_declared",
+                contextual=True,
+                scope="positions",
+                context_statistics=("supervised_count",),
+            )(read_count)
+            plan = LossPlan((LossTerm(loss=TokenLoss("count_declared")),))
+            for fixed in (None, 2.0):
+                with self.subTest(fixed_denominator=fixed):
+                    labels = torch.zeros(2, 1, dtype=torch.long)
+                    prediction = Predictions(
+                        hidden=torch.zeros(2, 1, 2),
+                        projection=Projection(lambda x: {"logits": x}),
+                        labels=labels,
+                        mask=torch.ones(2, 1),
+                        positions=labels,
+                        denominator=None if fixed is None else torch.tensor(fixed),
+                        plan=plan,
+                    )
+                    whole = run(prediction)
+                    counts.clear()
+                    torch.testing.assert_close(run(prediction, chunk=1), whole)
+                    self.assertEqual([float(count) for count in counts], [2.0, 2.0])
+                    self.assertAlmostEqual(whole.item(), math.log(2) / 2, places=6)
+
+            # The third unit's teacher prefers a token outside the draft
+            # vocabulary, so only two supervised positions remain.
+            teacher = torch.zeros(3, 1, 3)
+            teacher[2, 0, 2] = 5.0
+            labels = torch.zeros(3, 1, dtype=torch.long)
+            prediction = Predictions(
+                hidden=torch.zeros(3, 1, 2),
+                projection=Projection(lambda x: {"logits": x}),
+                labels=labels,
+                mask=torch.ones(3, 1),
+                positions=labels,
+                teacher=Teacher(teacher),
+                requires=frozenset({"teacher_logits"}),
+                vocab_mask=torch.tensor([True, True, False]),
+                plan=plan,
+            )
+            counts.clear()
+            run(prediction, chunk=1)
+            self.assertEqual([float(count) for count in counts], [2.0, 2.0, 2.0])
+
+    def test_conditional_statistics_declarations_follow_the_options(self):
+        from specforge.algorithms.objectives.losses import _LOSSES, register_loss
+
+        for mode, target, fixed, expected in (
+            ("alpha", "labels", False, set()),
+            ("alpha", "labels", True, {"supervised_count"}),
+            ("tv", "teacher", False, {"teacher_mass"}),
+            ("tv", "teacher", True, {"teacher_mass", "supervised_count"}),
+            ("lambda", "labels", False, {"supervised_count"}),
+            ("lambda", "teacher", False, {"teacher_mass", "supervised_count"}),
+        ):
+            with self.subTest(mode=mode, target=target, fixed=fixed):
+                loss = TokenLoss("lk_" + mode, {"target": target})
+                self.assertEqual(
+                    loss.context_statistics(fixed_denominator=fixed), expected
+                )
+        self.assertEqual(
+            TokenLoss("ce_l1").context_statistics(fixed_denominator=True), frozenset()
+        )
+        with patch.dict(_LOSSES):
+            register_loss(
+                "bad_statistics",
+                contextual=True,
+                context_statistics=lambda options, *, fixed_denominator: {"mean"},
+            )(lambda logits, labels, teacher, *, context: logits[..., 0])
+            with self.assertRaisesRegex(ValueError, "context statistics"):
+                TokenLoss("bad_statistics").context_statistics(fixed_denominator=True)
+            with self.assertRaisesRegex(ValueError, "contextual loss"):
+                register_loss(
+                    "uncontextual",
+                    context_statistics=lambda options, *, fixed_denominator: (),
+                )
+
+    def test_data_inputs_are_not_loss_options(self):
+        for kind, name in (
+            ("kl", "targets"),
+            ("reverse_kl", "targets"),
+            ("js", "targets"),
+            ("tv", "targets"),
+            ("nla", "targets"),
+            ("lk", "targets"),
+            ("value", "values"),
+        ):
+            with (
+                self.subTest(kind=kind),
+                self.assertRaisesRegex(ValueError, f"unknown {kind} options"),
+            ):
+                TokenLoss(kind, {name: 1.0})
 
     def test_saved_implementation_names_are_checked_without_aliases(self):
         from specforge.algorithms.objectives.implementations.registry import (

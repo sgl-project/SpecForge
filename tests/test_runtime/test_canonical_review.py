@@ -198,6 +198,9 @@ class CanonicalReviewTest(unittest.TestCase):
         from specforge.algorithms.objectives import resolve_objective
         from specforge.training.canonical import _validate_imported_objective
         from tests.test_config.test_draft_legacy_dspine import dspine_payload
+        from tests.test_modeling.test_canonical_dspine import (
+            model_config as dspine_config,
+        )
 
         with TemporaryDirectory() as temp:
             source = Path(temp)
@@ -218,6 +221,45 @@ class CanonicalReviewTest(unittest.TestCase):
                 _validate_imported_objective(
                     inline, resolve_objective("DSpineDraftModel")
                 )
+            # every setting to restate is reported at once, with its exact value
+            both = dspine_payload()
+            both["dspine_config"].update(ce_weight=0.7, alignment_weight=0.25)
+            with self.assertRaises(ValueError) as raised:
+                _validate_imported_objective(
+                    inline.model_copy(update={"draft": both}),
+                    resolve_objective("DSpineDraftModel"),
+                )
+            for line in (
+                "training.loss.terms.token.options.ce_weight=0.7",
+                f"training.loss.terms.token.options.l1_weight={1 - 0.7!r}",
+                "training.loss.terms.refinement.options.ce_weight=0.7",
+                f"training.loss.terms.refinement.options.l1_weight={1 - 0.7!r}",
+                "training.loss.terms.alignment.coefficient=0.25",
+            ):
+                self.assertIn(line, str(raised.exception))
+            # a canonical DSpine draft written without model_type is not legacy
+            canonical = {
+                key: value
+                for key, value in encode_config(dspine_config()).items()
+                if key != "model_type"
+            }
+            _validate_imported_objective(
+                cfg.model_copy(update={"draft": canonical, "initialization": None}),
+                resolve_objective("DSpineDraftModel"),
+            )
+            # a `draft:` file is read as resolve_config reads it: JSON keeps
+            # 1e-05 a float where YAML would make it a string
+            small = dspine_payload()
+            small["dspine_config"]["candidate_mass_threshold"] = 1e-05
+            (source / "small.json").write_text(json.dumps(small))
+            _validate_imported_objective(
+                cfg.model_copy(
+                    update={"draft": str(source / "small.json"), "initialization": None}
+                ),
+                resolve_objective(
+                    "DSpineDraftModel", options={"candidate_mass_threshold": 1e-05}
+                ),
+            )
             terms = {
                 name: {"options": {"ce_weight": 0.3, "l1_weight": 0.7}}
                 for name in ("token", "refinement")

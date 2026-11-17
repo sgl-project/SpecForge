@@ -35,7 +35,9 @@ class LossRegistration:
         inputs: Additional batch/capture fields needed by the loss.
         contextual: Whether the mathematical formula receives LossContext.
         scope: Whether statistics require a whole prediction set.
-        context_statistics: Names of the count/mass statistics consumed by the formula.
+        context_statistics: Names of the count/mass statistics consumed by the
+            formula, or a callable(options, *, fixed_denominator) returning them
+            when the need depends on the selected options.
     """
 
     compute: Callable
@@ -46,11 +48,12 @@ class LossRegistration:
     scope: str = "positions"
     input_kind: str = "categorical"
     capabilities: frozenset[str] = frozenset()
-    context_statistics: frozenset[str] = frozenset()
+    context_statistics: frozenset[str] | Callable = frozenset()
 
 
 _LOSSES = {}
 _RESERVED_OPTIONS = {"logits", "labels", "teacher", "context"}
+_CONTEXT_STATISTICS = frozenset(("supervised_count", "teacher_mass"))
 
 
 def loss_registrations():
@@ -82,6 +85,9 @@ def register_loss(
             (logits, labels, teacher, options, requested_outputs, context).
         context_statistics: Required context statistics: supervised_count and/or
             teacher_mass. Contextual extensions default to both for compatibility.
+            A callable(options, *, fixed_denominator) may return them instead
+            when the need depends on the selected options; a declared
+            statistic is always delivered.
         contextual: Whether compute also accepts LossContext. scope separately
             declares whether values depend on whole-set statistics.
 
@@ -97,13 +103,16 @@ def register_loss(
 
     if input_kind not in {"categorical", "binary", "features", "value"}:
         raise ValueError(f"Unknown loss input kind: {input_kind!r}")
-    statistics = frozenset(
-        ("supervised_count", "teacher_mass")
-        if context_statistics is None and contextual
-        else context_statistics or ()
-    )
-    if statistics - {"supervised_count", "teacher_mass"} or (
-        statistics and not contextual
+    if callable(context_statistics):
+        statistics = context_statistics
+    else:
+        statistics = frozenset(
+            _CONTEXT_STATISTICS
+            if context_statistics is None and contextual
+            else context_statistics or ()
+        )
+    if (statistics and not contextual) or (
+        not callable(statistics) and statistics - _CONTEXT_STATISTICS
     ):
         raise ValueError(
             "Context statistics require a contextual loss and supported names"
@@ -331,11 +340,31 @@ def lk_loss(mode, *, ce_compute=None):
     return compute
 
 
+def _lk_statistics(mode):
+    """Statistics an LK selection reads.
+
+    The teacher mass rescales teacher probabilities, so only a teacher target
+    reads it. lk_lambda averages acceptance over the whole set; lk_alpha and
+    lk_tv use the whole-set count only to rescale to a fixed denominator.
+    """
+
+    def statistics(options, *, fixed_denominator):
+        needed = set()
+        if options.get("target", "labels") == "teacher":
+            needed.add("teacher_mass")
+        if mode == "lambda" or fixed_denominator:
+            needed.add("supervised_count")
+        return needed
+
+    return statistics
+
+
 for _mode in ("alpha", "tv", "lambda"):
     register_loss(
         f"lk_{_mode}",
         contextual=True,
         scope="prediction" if _mode == "lambda" else "positions",
+        context_statistics=_lk_statistics(_mode),
     )(lk_loss(_mode))
 
 
@@ -347,13 +376,20 @@ def _accepted_options(compute):
         ).parameters.values()
     except (TypeError, ValueError):
         return None
+    parameters = list(parameters)
     if any(p.kind is p.VAR_KEYWORD for p in parameters):
         return None
+    # The executor binds the data inputs by position: (logits, labels, teacher)
+    # for a registered formula, (logits, targets) for a wrapped divergence.
+    positional = [
+        p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    data = {p.name for p in positional[: 2 if hasattr(compute, "_options_from") else 3]}
     return {
         p.name
         for p in parameters
         if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-        and p.name not in _RESERVED_OPTIONS
+        and p.name not in _RESERVED_OPTIONS | data
     }
 
 
@@ -417,6 +453,25 @@ class TokenLoss:
         if self.registration.contextual and self.options.get("target") == "teacher":
             required |= {"teacher_logits"}
         return required
+
+    def context_statistics(self, *, fixed_denominator):
+        """Context statistics the executor has to prepare for this selection.
+
+        Args:
+            fixed_denominator: Whether the term is normalized by a denominator
+                fixed for the whole prediction set.
+        """
+        declared = self.registration.context_statistics
+        if callable(declared):
+            declared = frozenset(
+                declared(self.options, fixed_denominator=fixed_denominator)
+            )
+            if declared - _CONTEXT_STATISTICS:
+                raise ValueError(
+                    f"unknown {self.kind} context statistics: "
+                    f"{sorted(declared - _CONTEXT_STATISTICS)}"
+                )
+        return declared
 
     @property
     def inputs(self):

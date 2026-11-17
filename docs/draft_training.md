@@ -279,6 +279,14 @@ Loss term names are declared by the algorithm and must match the keys under
 positions. Model output names are defined by `project()`; `LossTerm` binds an
 output to a configured term, so the two names need not match.
 
+An algorithm declares its terms in the objective's `loss_terms` property: each
+name maps to a `LossDefinition` holding the default formula and coefficient.
+Objectives without the property have the single term `token`. A plan term whose
+name is not declared there is rejected when the plan is bound (`Algorithm loss
+terms ... do not match configured terms ...`), and a declared term's own `loss=`
+is replaced by the configured formula. An extension that adds a term, such as a
+MoE router loss, therefore adds an entry to `loss_terms` first.
+
 For Domino:
 
 | Loss term | Model output | Purpose |
@@ -444,7 +452,7 @@ entry chooses how to evaluate them:
 | Mode | Configuration | Selection |
 | --- | --- | --- |
 | Reference | fused: false | Registered mathematical formulas |
-| Optimized | fused: true | Compatible joint or per-term optimization, otherwise reference |
+| Optimized | fused: true | Compatible joint or per-term optimization. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
 
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,
@@ -483,7 +491,13 @@ Losses declare `context_statistics` separately from accepting `LossContext`:
 `supervised_count` requests a whole-set count, and `teacher_mass` requests the
 probability mass retained by vocabulary selection. CE/L1 uses component masks
 without requesting either statistic. Contextual extensions that omit this
-declaration retain both statistics for compatibility.
+declaration retain both statistics for compatibility. A declared statistic is
+always delivered. When the need depends on the selected options, the
+declaration is a callable `(options, *, fixed_denominator)`: the LK losses read
+the teacher mass only for a teacher target, and `lk_alpha` / `lk_tv` use the
+whole-set count only to rescale to a fixed denominator. A prediction set with a
+`compute` callback gets both statistics, because the callback may evaluate any
+registered formula.
 
 
 All objective terms live in `LossPlan.terms`. By default the executor runs its
@@ -529,7 +543,8 @@ that depend on whole-batch expert statistics require whole-set execution and
 explicit normalization; do not recompute them independently per chunk. Router
 statistics, cross-rank aggregation, and optimizer-step updates remain model/training
 responsibilities, not loss-kernel responsibilities. Scalar model losses use `LossTerm(..., loss=TokenLoss("value"), reduction="scalar")`
-and `calc.add(index, scalar)`. Such a plan runs unsplit and untrimmed, counts the scalar
+and `calc.add(index, scalar)`, with the term declared in the objective's
+`loss_terms` as `LossDefinition(TokenLoss("value"))`. Such a plan runs unsplit and untrimmed, counts the scalar
 once per prediction set, and applies no token mask or denominator. It requires
 sum_means or global_microbatch reduction. The latter averages local scalars across
 ranks; cross-rank expert statistics must be computed explicitly by the model.
@@ -621,7 +636,7 @@ Use the corresponding named settings in the run YAML:
 | `confidence_loss_alpha` | `loss.terms.confidence.coefficient` |
 | `alignment_weight` | `loss.terms.alignment.coefficient` |
 | `ce_loss_alpha` / `l1_loss_alpha` | `loss.terms.token.options.ce_weight` / `l1_weight` |
-| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement and on token when it uses CE/L1 |
+| DSpine `ce_weight: x` | `options: {ce_weight: x, l1_weight: 1-x}` on refinement, and on token when the old run used the objective's default loss. An old run with an explicit flat `ce_l1` loss kept that loss's own weights on token |
 
 Both CE/L1 weights must be specified to preserve a non-default mixture; changing
 only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to

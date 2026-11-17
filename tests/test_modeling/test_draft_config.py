@@ -35,7 +35,7 @@ class DraftConfigTest(unittest.TestCase):
     def write(self, payload):
         self.path.write_text(json.dumps(payload), encoding="utf-8")
 
-    def test_planning_and_model_loading_share_config_sources(self):
+    def test_model_loading_resolves_every_config_source(self):
         from specforge.application import resolve_run
         from specforge.config import Config
         from specforge.training.model_loading import resolve_draft_config
@@ -94,14 +94,8 @@ class DraftConfigTest(unittest.TestCase):
                     with mock.patch.object(
                         PretrainedConfig, "get_config_dict", return_value=(payload, {})
                     ) as hub:
-                        if strategy == "dspine":
-                            missing = cfg.model_copy(deep=True)
-                            missing.training.loss = {}
-                            with self.assertRaisesRegex(
-                                ValueError, "training.loss.terms.token.options"
-                            ):
-                                resolve_run(missing)
                         resolved = resolve_run(cfg)
+                        hub.assert_not_called()  # planning does not read the draft
                         loaded = resolve_draft_config(
                             cfg,
                             provider=resolved.algorithm.providers.model.draft_config,
@@ -113,9 +107,10 @@ class DraftConfigTest(unittest.TestCase):
                         else:
                             hub.assert_not_called()
 
-    def test_planning_does_not_default_a_missing_explicit_config(self):
+    def test_model_loading_does_not_default_a_missing_explicit_config(self):
         from specforge.application import resolve_run
         from specforge.config import Config
+        from specforge.training.model_loading import resolve_draft_config
 
         cfg = Config.model_validate(
             {
@@ -127,10 +122,13 @@ class DraftConfigTest(unittest.TestCase):
                 "training": {"strategy": "dflash"},
             }
         )
+        resolved = resolve_run(cfg)  # the plan renders without the draft file
         with self.assertRaisesRegex(
             FileNotFoundError, "draft model config does not exist"
         ):
-            resolve_run(cfg)
+            resolve_draft_config(
+                cfg, provider=resolved.algorithm.providers.model.draft_config
+            )
 
     def test_sources_and_legacy_entry_points_are_equivalent(self):
         self.write(self.payload)
