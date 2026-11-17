@@ -71,6 +71,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from specforge.runtime.data_plane.pool_diagnostics import get_diagnostics
 from specforge.runtime.contracts import SCHEMA_VERSION, FeatureHandle, SampleRef
 from specforge.runtime.data_plane.disaggregated import AuthPolicy
 from specforge.runtime.data_plane.feature_store import (
@@ -644,6 +645,8 @@ class MooncakeFeatureStore(FeatureStore):
             'segment_materialized_features', 'node_pool_staging_copy_bytes',
             'transport_get_requested_bytes', 'transport_get_completed_bytes',
             'receive_to_pageable_copy_bytes', 'manifest_ack_puts', 'manifest_receipt_drains'), 0)
+        self._diagnostics = get_diagnostics()
+        self._diag = self._diagnostics.component("store")
         self._node_pool = None
         self._terminal_proofs = None
         self._terminal_proof_owner = uuid.uuid4().hex
@@ -1276,13 +1279,15 @@ class MooncakeFeatureStore(FeatureStore):
         slot, pooled = pool.acquire(max(nbytes, 1), device)
         try:
             self._segment_counters["transport_get_requested_bytes"] += nbytes
-            rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
+            with self._diag.span("rdma_get_into"):
+                rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
         except Exception:
             pool.release(slot, pooled, quarantine=True)
             raise
         if rc is None or int(rc) < 0 or int(rc) != nbytes:
             pool.release(slot, pooled, quarantine=True)
             _check_get_result(key, rc, nbytes)
+        self._diag.count("rdma_get_into_completed_bytes", nbytes)
         self._segment_counters["transport_get_completed_bytes"] += nbytes
         view = slot.storage[:nbytes].view(dtype).view(shape)
         target = torch.device(device)
@@ -1298,19 +1303,23 @@ class MooncakeFeatureStore(FeatureStore):
                     with torch.cuda.stream(stream):
                         out.copy_(view, non_blocking=True)
                     # Source and registered receive slot remain owned until DMA ends.
-                    stream.synchronize()
+                    with self._diag.span("h2d_existing_sync"):
+                        stream.synchronize()
                     out.record_stream(torch.cuda.current_stream(out.device))
                 else:
                     out.copy_(view, non_blocking=False)
             elif target.type == "cpu" and not view.is_cuda:
-                out = view.clone()
+                with self._diag.span("receive_to_pageable_copy"):
+                    out = view.clone()
+                self._diag.count("receive_to_pageable_copy_bytes", nbytes)
                 self._segment_counters["receive_to_pageable_copy_bytes"] += nbytes
             else:
                 stream = pool.copy_stream(view.device if view.is_cuda else target)
                 with torch.cuda.stream(stream):
                     out = view.to(target, non_blocking=True, copy=True)
                 # RDMA cannot wait on a CUDA event before reusing this slot.
-                stream.synchronize()
+                with self._diag.span("h2d_existing_sync"):
+                    stream.synchronize()
                 if out.is_cuda:
                     out.record_stream(torch.cuda.current_stream(target))
         except Exception:
@@ -1357,13 +1366,18 @@ class MooncakeFeatureStore(FeatureStore):
                 staged = source
             else:
                 staged = slot.storage[:nbytes].view(source.dtype).view(source.shape)
-                staged.copy_(source, non_blocking=False)
+                with self._diag.span("pageable_to_pinned_copy"):
+                    staged.copy_(source, non_blocking=False)
+                self._diag.count("pageable_to_pinned_copy_bytes", nbytes)
                 self._segment_counters['node_pool_staging_copy_bytes'] += nbytes
             stream.wait_stream(torch.cuda.current_stream(destination.device))
             destination.record_stream(stream)
             with torch.cuda.stream(stream):
-                destination.copy_(staged, non_blocking=True)
-            stream.synchronize()
+                with self._diag.span("h2d_enqueue"):
+                    destination.copy_(staged, non_blocking=True)
+                self._diag.count("h2d_enqueued_bytes", nbytes)
+            with self._diag.span("h2d_existing_sync"):
+                stream.synchronize()
         except BaseException:
             self._quarantine_h2d(destination, source, stream, pin)
             if slot is not None:
@@ -1383,8 +1397,10 @@ class MooncakeFeatureStore(FeatureStore):
         slot, pooled = pool.acquire(max(1, nbytes), 'cpu')
         try:
             self._segment_counters['transport_get_requested_bytes'] += nbytes
-            rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
+            with self._diag.span("rdma_get_into"):
+                rc = self._store.get_into(key, slot.storage.data_ptr(), nbytes)
             _check_get_result(key, rc, nbytes)
+            self._diag.count('rdma_get_into_completed_bytes', nbytes)
             self._segment_counters['transport_get_completed_bytes'] += nbytes
         except BaseException:
             pool.release(slot, pooled, quarantine=True)
@@ -1400,23 +1416,47 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _get_segments(self, ref, name, destination):
         from dataclasses import replace
-        for segment in self._segment_manifests[ref.sample_id]['features'][name]:
+        manifest = self._segment_manifests[ref.sample_id]
+        for segment in manifest['features'][name]:
             spec = replace(ref.feature_specs[name], shape=tuple(segment['shape']))
+            op = self._diagnostics.begin_block({
+                'namespace': manifest['namespace'],
+                'load_epoch': ref.metadata.get('capture_fence', {}).get('server_epoch'),
+                'owner_epoch': manifest['owner_epoch'],
+                'schema_signature': manifest['schema_signature'], 'feature': name,
+                'logical_key': segment['logical_key'], 'physical_key': segment['key'],
+                'publication_generation': segment['publication_generation'],
+                'nbytes': segment['nbytes'], 'dtype': spec.dtype, 'shape': list(spec.shape),
+            })
+            fetched = False
             def fetch():
+                nonlocal fetched
+                fetched = True
+                self._diagnostics.event('miss_fetch', op)
                 self._segment_counters['segment_get_bytes'] += segment['nbytes']
                 self._segment_counters['segment_get_objects'] += 1
                 return self._fetch_segment_source(segment['key'], spec)
-            pin = self._node_pool.acquire(segment['logical_key'], segment['nbytes'], fetch) if self._node_pool is not None else None
+            pin = None
             source = None
             source_release = None
+            completed = False
             try:
+                pin = self._node_pool.acquire(segment['logical_key'], segment['nbytes'], fetch) if self._node_pool is not None else None
+                self._diagnostics.event('pin', op, {'pooled': pin is not None, 'fetched': fetched,
+                                                   'generation': pin.generation if pin is not None else None})
                 if pin is not None:
                     source = pin.tensor.view(_TORCH_DTYPES[spec.dtype]).view(spec.shape)
                 else:
                     source = fetch()
                     if isinstance(source, tuple):
                         source, source_release = source
+                self._diag.count('lookup_bytes', segment['nbytes'])
+                self._diag.count('miss_bytes' if fetched else 'hit_bytes', segment['nbytes'])
+                self._diag.count('miss_blocks' if fetched else 'hit_blocks')
+                self._diag.count('fallback_blocks', int(pin is None))
                 self._copy_segment_into(source, destination[:,segment['start']:segment['end']], pin)
+                completed = True
+                self._diagnostics.event('copy_complete', op)
             finally:
                 if source_release is not None:
                     uncertain = any(item['source'] is source for item in self._h2d_quarantined)
@@ -1424,6 +1464,8 @@ class MooncakeFeatureStore(FeatureStore):
                 source = None
                 if pin is not None and not any(item['pin'] is pin for item in self._h2d_quarantined):
                     pin.release()
+                self._diagnostics.event('finish', op, {'copy_completed': completed,
+                    'pin_released': pin is None or pin.token is None})
         self._segment_counters['segment_materialized_features'] += 1
 
     def _put_manifest_ack(self, manifest):
@@ -1463,8 +1505,8 @@ class MooncakeFeatureStore(FeatureStore):
                 raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
             root = Path(directory)
             capacity = int(os.environ.get('SPECFORGE_TRAINER_NODE_POOL_BYTES', str(8 << 30)))
-            metadata = min(32 << 20, capacity // 128) if capacity >= (64 << 20) else 0
-            proof_budget = (metadata - metadata // 8) // 2 if metadata else (1 << 20)  # tiny CPU pools
+            from specforge.runtime.data_plane.node_content_pool import node_pool_budgets
+            proof_budget = node_pool_budgets(capacity)['terminal_proof_budget_bytes'] or (1 << 20)  # existing tiny CPU-test exception
             self._terminal_proofs = TerminalReceiptProofs(root.parent / (root.name + '.terminal.sqlite'), proof_budget)
         return self._terminal_proofs
 
@@ -1532,8 +1574,10 @@ class MooncakeFeatureStore(FeatureStore):
         drained = False
         try:
             self._segment_counters["transport_get_requested_bytes"] += nb
-            rc = self._store.get_into(key, out.data_ptr(), nb)
+            with self._diag.span("rdma_get_into"):
+                rc = self._store.get_into(key, out.data_ptr(), nb)
             _check_get_result(key, rc, nb)
+            self._diag.count("rdma_get_into_completed_bytes", nb)
             self._segment_counters["transport_get_completed_bytes"] += nb
             drained = True
         finally:

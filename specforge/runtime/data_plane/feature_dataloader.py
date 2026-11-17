@@ -17,6 +17,7 @@ immediately, so prefetch can never race a release.
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.pool_diagnostics import get_diagnostics
 from specforge.runtime.data_plane.feature_store import abort_feature_ref
 
 import json
@@ -351,7 +352,9 @@ class FeatureDataLoader:
 
     def _timed_make_batch(self, refs: List[SampleRef], batch_index=None) -> TrainBatch:
         started = time.perf_counter()
-        batch = self._make_batch(refs, batch_index=batch_index)
+        diag = get_diagnostics()
+        with diag.batch(batch_index), diag.component("loader").span("fetch_materialize"):
+            batch = self._make_batch(refs, batch_index=batch_index)
         self._perf_add(
             fetch_s=time.perf_counter() - started,
             fetch_bytes=float(sum(int(ref.estimated_bytes or 0) for ref in refs)),
