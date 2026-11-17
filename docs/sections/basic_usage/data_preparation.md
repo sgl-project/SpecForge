@@ -292,10 +292,12 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 | Domino | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-domino.yaml` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
 | DSpark | `Qwen/Qwen3-4B` | `specforge/config/draft/presets/qwen3-4b-dspark.yaml` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
-`--draft` is required and accepts the same canonical YAML/JSON as training.
-Capture layers and output feature names are resolved from that complete draft.
-Use `--objective-options` for options that change required teacher features, such
-as `'{"teacher_metrics": false}'` for DFlash or a P-EAGLE `mask_token_id`.
+Pass either `--draft` (a canonical draft YAML, including the presets; the
+architecture's default objective and loss apply) or `-c RUN.yaml` (a canonical
+run file; capture then follows its draft, objective options, loss and
+weighting). Capture layers and output feature names are resolved from that
+complete draft. Options that change the required teacher features, such as
+DFlash's `objective_options.teacher_metrics`, are set in the run file.
 
 ```bash
 python scripts/prepare_hidden_states.py \
