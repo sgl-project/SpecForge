@@ -2,6 +2,7 @@
 
 import unittest
 import warnings
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
@@ -21,6 +22,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def objective_model(backend, **selection):
     config = eagle_config()
+    # FlexAttention's CUDA kernel needs head dimensions of at least 16.
+    config = replace(
+        config,
+        attention_configs={
+            name: replace(node, head_dim=16)
+            for name, node in config.attention_configs.items()
+        },
+    )
     torch.manual_seed(0)
     model = build_draft_model(config, backend=backend, device=DEVICE)
     install_mapping(model)
