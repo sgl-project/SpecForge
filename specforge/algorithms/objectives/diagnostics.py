@@ -1,4 +1,4 @@
-"""Detached, chunked diagnostics for anchored DFlash predictions."""
+"""Detached, chunked diagnostics of deferred predictions."""
 
 from functools import partial
 
@@ -252,3 +252,27 @@ def collect_prediction_metrics(
             torch.cat(chunks).view_as(blocks.anchors), blocks.anchors, valid
         )
     return ratios, {}
+
+
+@torch.no_grad()
+def measure_predictions(runtime, predictions, measure):
+    """Sum a measure over the supervised units of one unsplit prediction set.
+
+    An explicit loss chunk size bounds the units projected at once here too.
+    The measure receives each chunk, its projected outputs and the supervision
+    the loss resolves for it (labels, vocabulary-eligible mask, teacher logits
+    and teacher mass in the draft vocabulary) and returns additive tensors by
+    name.
+    """
+    from .execution import prediction_slices, prepare_supervision
+
+    supervised = predictions.select(predictions.mask.any(-1).nonzero().flatten())
+    totals = {}
+    for part in prediction_slices(supervised, runtime.execution.chunk_size or 0):
+        chunk = supervised.select(part)
+        supervision = prepare_supervision(
+            chunk, None, runtime.weighting, runtime.execution, teacher_mass=True
+        )
+        for name, value in measure(chunk, chunk.project(), supervision).items():
+            totals[name] = totals[name] + value if name in totals else value
+    return totals

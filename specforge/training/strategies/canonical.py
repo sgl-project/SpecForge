@@ -9,6 +9,17 @@ from torch.nn.parallel import DistributedDataParallel
 from .base import DraftTrainStrategy, StepContext, StepOutput
 
 
+def depth_ratios(ratios, prefix):
+    """Ratio pairs named ``<prefix>_<depth>``, in depth order."""
+    start = len(prefix) + 1
+    depths = sorted(
+        int(name[start:])
+        for name in ratios
+        if name.startswith(f"{prefix}_") and name[start:].isdigit()
+    )
+    return [ratios[f"{prefix}_{depth}"] for depth in depths]
+
+
 class CanonicalTrainStrategy(DraftTrainStrategy):
     def __init__(self, model, *, name, objective, required_features):
         self.model = model
@@ -20,6 +31,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         inner = model.module if isinstance(model, DistributedDataParallel) else model
         self.window_statistic = inner.registration.training.window_statistic
         self.host_inputs = inner.registration.training.host_inputs
+        self.evaluation_diagnostics = inner.registration.training.evaluation_diagnostics
         self.draft_config = inner.draft_model.config.draft
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
@@ -74,16 +86,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
                 else {}
             ),
         )
-        positions = sorted(
-            int(name.split("_")[1])
-            for name in result.ratios
-            if name.startswith("position_")
-            and name.endswith("_accuracy")
-            and name[len("position_") : -len("_accuracy")].isdigit()
-        )
-        counts = [
-            result.ratios[f"position_{position}_accuracy"] for position in positions
-        ]
+        counts = depth_ratios(result.ratios, "acc")
         metrics = (
             {
                 "acc_corrects": [n for n, _ in counts],
@@ -92,6 +95,16 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             if counts
             else {}
         )
+        if not self.model.training:
+            # The evaluator takes each depth's mean and weights a batch by its
+            # loss token count, which the acceptance pairs carry.
+            losses = depth_ratios(result.ratios, "ploss")
+            acceptance = depth_ratios(result.ratios, "acceptance_rate")
+            if losses:
+                metrics["plosses"] = [n / d.where(d > 0, 1) for n, d in losses]
+            if acceptance:
+                metrics["acceptance_rates"] = [n / d for n, d in acceptance]
+                metrics["metric_loss_denoms"] = [d for _, d in acceptance]
         return StepOutput(
             loss=result.loss,
             metrics=metrics,

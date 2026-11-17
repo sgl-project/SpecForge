@@ -44,6 +44,9 @@ class TrainingRequirements:
     #: CUDA/ROCm trainer with a silu/swish draft. Only set where that
     #: combination was validated.
     liger_by_default: bool = False
+    #: Whether evaluation runs the objective's diagnostics, for an objective
+    #: whose evaluation reports them.
+    evaluation_diagnostics: bool = False
 
 
 @dataclass(frozen=True)
