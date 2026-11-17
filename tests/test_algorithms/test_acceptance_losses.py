@@ -77,7 +77,14 @@ class AcceptanceLossTest(unittest.TestCase):
                     actual = runtime(batch, step=1, total_steps=10).loss
                     torch.manual_seed(11)
                     expected = legacy(**args, collect_detailed_metrics=False)[0]
-                    assert_loss_and_gradients(runtime, legacy, actual, expected, names)
+                    assert_loss_and_gradients(
+                        runtime,
+                        legacy,
+                        actual,
+                        expected,
+                        names,
+                        case=f"dflash-lk_{mode}-{weighting}",
+                    )
 
     def test_teacher_lk_preserves_vocabulary_mass_and_normalization(self):
         torch.manual_seed(9)

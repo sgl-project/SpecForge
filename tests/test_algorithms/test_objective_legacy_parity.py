@@ -1,7 +1,16 @@
-"""Compare canonical training losses and gradients with the legacy wrappers."""
+"""Compare canonical training losses and gradients with the legacy wrappers.
+
+Each case also pins the canonical loss and gradient size to
+``tests/fixtures/objective_goldens.json``. The values were recorded while the
+case matched the legacy wrapper, so they stay a reference once the wrappers
+are gone. Regenerate after a deliberate numerical change with
+``SPECFORGE_UPDATE_GOLDENS=1`` and say in the commit what moved and why.
+"""
 
 import copy
 import importlib
+import json
+import os
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -142,10 +151,42 @@ def block_pair(kind, *, shifted=False, loss=None):
     return new, old, parameter_names
 
 
-def assert_loss_and_gradients(new, old, new_loss, old_loss, names):
+GOLDENS = Path(__file__).resolve().parents[1] / "fixtures/objective_goldens.json"
+
+
+def assert_golden(case, model, loss):
+    """Pin the canonical loss and gradients of one case to the recorded values."""
+    gradients = [p.grad for p in model.draft_model.parameters() if p.grad is not None]
+    actual = {
+        "loss": loss.item(),
+        "gradient_norm": torch.cat([g.double().flatten() for g in gradients])
+        .norm()
+        .item(),
+        "gradient_tensors": len(gradients),
+    }
+    recorded = json.loads(GOLDENS.read_text()) if GOLDENS.exists() else {}
+    if os.environ.get("SPECFORGE_UPDATE_GOLDENS"):
+        recorded[case] = actual
+        GOLDENS.write_text(json.dumps(recorded, indent=1, sort_keys=True) + "\n")
+        return
+    expected = recorded[case]
+    assert actual["gradient_tensors"] == expected["gradient_tensors"], case
+    # Loose enough for another BLAS; a changed formula moves these by percents.
+    for name in ("loss", "gradient_norm"):
+        torch.testing.assert_close(
+            torch.tensor(actual[name]),
+            torch.tensor(expected[name]),
+            rtol=1e-4,
+            atol=1e-6,
+            msg=lambda message: f"{case} {name}: {message}",
+        )
+
+
+def assert_loss_and_gradients(new, old, new_loss, old_loss, names, *, case):
     torch.testing.assert_close(new_loss, old_loss, rtol=2e-5, atol=2e-6)
     new_loss.backward()
     old_loss.backward()
+    assert_golden(case, new, new_loss)
     parameters = dict(old.named_parameters())
     for name, parameter in new.draft_model.named_parameters():
         if name in names:
@@ -204,7 +245,15 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                         torch.manual_seed(11)
                         expected = old(**old_args)[0]
                     torch.testing.assert_close(torch.get_rng_state(), rng)
-                    assert_loss_and_gradients(new, old, result.loss, expected, names)
+                    assert_loss_and_gradients(
+                        new,
+                        old,
+                        result.loss,
+                        expected,
+                        names,
+                        case=f"{kind}{'-shifted' if shifted else ''}"
+                        f"-step{step}-{'eval' if evaluation else 'train'}",
+                    )
 
     @legacy_fp32_rope()
     def test_eagle_losses_gradients_and_microbatch_means(self):
@@ -353,7 +402,12 @@ class LegacyObjectiveParityTest(unittest.TestCase):
                                 0.8**depth * loss for depth, loss in enumerate(expected)
                             )
                         assert_loss_and_gradients(
-                            new, old, result.loss, expected, names
+                            new,
+                            old,
+                            result.loss,
+                            expected,
+                            names,
+                            case=f"{kind}-length{length}",
                         )
                         results.append(result)
                         expected_losses.append(expected.detach())
@@ -408,6 +462,7 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             actual,
             expected,
             {n: n for n, _ in model.named_parameters()},
+            case="mtp",
         )
 
     def test_dmtp_matches_explicit_suffix_loss(self):
@@ -446,4 +501,5 @@ class LegacyObjectiveParityTest(unittest.TestCase):
             actual,
             expected,
             {n: n for n, _ in model.named_parameters()},
+            case="dmtp",
         )
