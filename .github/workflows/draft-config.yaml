@@ -56,4 +56,5 @@ jobs:
           tests.test_algorithms.test_objective_legacy_parity
           tests.test_algorithms.test_chunked_reduction
           tests.test_algorithms.test_loss_execution
-          tests.test_algorithms.test_loss_plan -v
+          tests.test_algorithms.test_loss_plan
+          tests.test_algorithms.test_loss_routing -v

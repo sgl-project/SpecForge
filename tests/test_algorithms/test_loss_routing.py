@@ -20,6 +20,11 @@ from specforge.algorithms.objectives.losses import LossContext, TokenLoss
 
 class LossRoutingTest(unittest.TestCase):
 
+    def setUp(self):
+        # Built-in implementations register on first use. Do it before any test
+        # patches the registry, or the patch exit drops them for later tests.
+        implementation_registrations()
+
     def test_loss_input_kinds_and_reserved_options_fail_at_construction(self):
         from specforge.algorithms.objectives.losses import _LOSSES, register_loss
         from specforge.algorithms.objectives.registry import resolve_objective
