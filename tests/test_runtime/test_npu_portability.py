@@ -222,16 +222,28 @@ class NPURNGTest(unittest.TestCase):
         accelerator.set_rng_state.assert_not_called()
 
 
-class NPUEvaluatorTest(unittest.TestCase):
-    def test_hccl_collectives_use_the_bound_npu(self):
-        from specforge.eval import Evaluator
+class NPUReductionTest(unittest.TestCase):
+    def test_host_values_are_reduced_on_the_models_device(self):
+        """An empty evaluation shard builds its sums on the host; HCCL needs the NPU."""
+        from specforge.training.runner import DataParallelRunner
 
         device = SimpleNamespace(type="npu")
+        module = SimpleNamespace(
+            parameters=lambda: iter([SimpleNamespace(device=device)])
+        )
+        strategy = SimpleNamespace(trainable_module=lambda: module)
+        runner = DataParallelRunner(strategy, SimpleNamespace(process_group=None))
+        values = mock.Mock()
         with (
-            mock.patch("torch.distributed.get_backend", return_value="hccl"),
-            mock.patch("specforge.utils.get_local_device", return_value=device),
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce") as reduce,
         ):
-            self.assertIs(Evaluator._comm_device(), device)
+            reduced = runner.reduce_sum(values)
+        values.to.assert_called_once_with(device)
+        self.assertIs(reduced, values.to.return_value)
+        self.assertIs(reduce.call_args.args[0], reduced)
 
 
 if __name__ == "__main__":
