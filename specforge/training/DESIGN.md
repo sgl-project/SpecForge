@@ -86,6 +86,27 @@ and the error gathers to `runner.agree`; rank 0's two broadcast verdicts
 way to distribute a decision or every rank computing it, which the contract
 does not have yet.
 
+### Conformance
+
+`tests/test_runtime/conformance.py` is what a step runner is held to:
+
+- `declaration_cases()`: one recorded training case for each thing a program
+  declares to a runner (each reduction, a replay statistic, evaluation
+  diagnostics). A runner of the `exact` class reproduces the reference's
+  recording of them on the same machine (`tests/test_runtime/trajectories.py`).
+- `MUTATIONS`: three broken references (gradients scaled by the world size,
+  clipping skipped, the learning-rate schedule shifted by one step). Each has
+  to change the recording, or the replay proves nothing.
+- `ProtocolChecks`: the run loop over the runner with a stream that is read
+  once and a ledger. The window spans the epoch boundary; samples are
+  committed after the update that consumed them, in order; an incomplete
+  window is never committed; commits are flushed before a checkpoint.
+- `RunnerChecks`: one job per declaration in one process, compared with the
+  reference runner's losses, gradient norms and weights bit for bit, plus the
+  single-use handle, evaluation and resume.
+
+A new runner adds two test classes that set `make_runner`.
+
 ## Internal mechanics
 
 ```mermaid
