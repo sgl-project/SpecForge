@@ -719,7 +719,8 @@ names. Detailed diagnostics run only on logging steps, without gradients and in
 the loss's projection chunks (`loss.execution.chunk_size`; `0` keeps the set
 whole). They return additive counts and numerator/denominator pairs, which the
 trainer sums across accumulation and ranks before forming a ratio. They change
-neither the loss, the gradients nor the random state, and evaluation skips them.
+neither the loss, the gradients nor the random state. Evaluation skips them,
+except for EAGLE3, whose evaluation reports them.
 
 DFlash and DFlash2 report the hard-label, selector, prefix and sampled-anchor
 walk metrics, `ce_loss` (`lk_loss` for an LK token loss), `target_probability`
@@ -742,3 +743,22 @@ a draft without a confidence head omits the two confidence metrics. DSpine
 reports `dspine/backbone_ce`, `backbone_l1`, `refinement_loss`,
 `alignment_loss` and `candidate_coverage` on every step, from values its loss
 already computes.
+
+EAGLE3 reports the metrics of its wrapper too. On every step, from what its
+loss computes: the accuracy of each depth (`acc_<depth>`) and of all depths
+together (`acc`), and each depth's mean loss before its depth weight, as
+`ploss_<depth>` and `kl_loss_<depth>` (`lk_loss_<depth>` for an LK token loss);
+`kl_loss` or `lk_loss` is their weighted sum. D-PACE weighting, whose loss is
+not a sum of depth means, reports no depth losses. A logging step adds the
+expected acceptance of each depth, `acceptance_rate_<depth>` and
+`expected_acceptance_<depth>`: the mean over the depth's supervised positions
+of the probability mass the draft and the target share. `acceptance_rate` and
+`expected_acceptance` are the mean over the depths. Evaluation reports
+`eval/ploss_<depth>`, `eval/acceptance_rate_<depth>` and
+`eval/expected_acceptance_<depth>`.
+
+P-EAGLE reports, on a logging step, the correct and the supervised sampled
+positions of each depth as `position_<depth>_acc_sum` and
+`position_<depth>_acc_total`. The wrapper's `loss_sum`, `loss_total`,
+`full_acc_sum` and `full_acc_total` repeated `loss` and `acc` and are no longer
+logged.

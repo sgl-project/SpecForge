@@ -228,8 +228,10 @@ class ObjectiveContractTest(unittest.TestCase):
             torch.testing.assert_close(
                 entry.attention_layout.query_positions, torch.arange(9)[None] + depth
             )
-        self.assertEqual(result.ratios["acc"][0].item(), 0)
-        self.assertEqual(result.ratios["acc"][1].item(), 6)
+        # six supervised positions at each depth; acc pools the depths
+        for name, supervised in (("acc_0", 6), ("acc_1", 6), ("acc", 12)):
+            self.assertEqual(result.ratios[name][0].item(), 0)
+            self.assertEqual(result.ratios[name][1].item(), supervised)
         self.assertEqual(result.denominator.item(), 1)
         with self.assertRaisesRegex(ValueError, "unpacked"):
             runtime(
@@ -351,7 +353,10 @@ class ObjectiveContractTest(unittest.TestCase):
         batch["target_logits"] = torch.randn(1, 9, config.vocab_size)
         runtime = build_objective_model(model, options={"ttt_length": 3})
         projected = capture_projections(model)
-        default_loss = runtime(batch, step=0, total_steps=None).loss
+        # the diagnostics would project every depth a second time
+        default_loss = runtime(
+            batch, step=0, total_steps=None, collect_detailed_metrics=False
+        ).loss
         expected = []
         valid = batch["loss_mask"].bool() & batch["attention_mask"].bool()
         for depth, output in enumerate(projected):

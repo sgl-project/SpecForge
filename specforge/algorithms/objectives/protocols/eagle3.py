@@ -1,10 +1,14 @@
 """EAGLE recurrent distillation with an explicit, differentiable rollout tree."""
 
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 
+from specforge.algorithms.metrics.rollout import expected_acceptance
+
 from ..base import check_options
+from ..diagnostics import measure_predictions
 from ..inputs import gather, sequence_inputs, valid_tokens
 from ..losses import TokenLoss
 from ..predictions import PredictionBatch
@@ -18,6 +22,8 @@ from ..registry import TrainingRequirements, register_protocol
         supports_vocab_mapping=True,
         attention_backends=frozenset({"eager", "sdpa", "flex_attention", "fa", "usp"}),
         supports_sequence_parallel=True,
+        # evaluation reports the expected acceptance of every depth
+        evaluation_diagnostics=True,
     ),
     requires=("teacher_logits",),
     architectures=("Eagle3DraftModel",),
@@ -50,9 +56,25 @@ class Eagle3Objective:
         return {"kind": "geometric", "factor": self.depth_decay}
 
     def __call__(self, runtime, batch, **context):
-        return PredictionBatch(self.rollout(runtime, batch), reduction="sum_means")
+        deferred = [] if context.get("collect_detailed_metrics", True) else None
+        return PredictionBatch(
+            self.rollout(runtime, batch, deferred),
+            reduction="sum_means",
+            set_metrics=partial(depth_losses, runtime),
+            diagnostics=(
+                None
+                if deferred is None
+                else partial(depth_acceptance, runtime, deferred)
+            ),
+        )
 
-    def rollout(self, runtime, batch):
+    def rollout(self, runtime, batch, deferred=None):
+        """Yield each depth's predictions as the rollout reaches it.
+
+        A list passed as ``deferred`` receives one builder per depth: the
+        diagnostics rebuild a depth from it, so no depth's gathered teacher
+        outlives its loss.
+        """
         model, ids = runtime.draft_model, batch["input_ids"]
         valid = valid_tokens(batch)
         if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
@@ -120,7 +142,8 @@ class Eagle3Objective:
                 prefix = output.kv.prepend(prefix)
             model.vocabulary.require_ready()
             supervised = gather(valid, original) & (original < ids.shape[1])
-            yield runtime.predictions(
+            build = partial(
+                runtime.predictions,
                 hidden,
                 batch,
                 original,
@@ -133,7 +156,57 @@ class Eagle3Objective:
                 denominator=torch.tensor(
                     float(ids.shape[0] * length), device=ids.device
                 ),
-                accuracy_name=f"position_{depth}_accuracy",
-                report_accuracy=depth == 0,
+                # every depth also counts toward the pooled ``acc``
+                accuracy_name=f"acc_{depth}",
                 reduce_statistics=getattr(runtime, "reduce_sequence_statistics", None),
             )
+            if deferred is not None:
+                deferred.append(build)
+            yield build()
+
+
+def depth_losses(runtime, results):
+    """Name what each depth's loss computed as the training wrappers did.
+
+    ``ploss_<depth>`` is the depth's mean loss before its depth weight, which
+    moves to the denominator here; a depth the weighting zeroes reports zero.
+    The same ratios, and their weighted sum, carry the token loss's own name:
+    ``kl_loss`` for soft cross entropy and ``lk_loss`` for an LK loss.
+    """
+    kind = runtime.loss_configuration.terms["token"].loss.kind
+    name = (
+        "lk_loss"
+        if kind.startswith("lk_")
+        else "kl_loss" if kind == "soft_ce" else f"{kind}_loss"
+    )
+    ratios, total = {}, 0
+    for depth, result in enumerate(results):
+        term = result.terms[0]
+        numerator = term.numerator.detach()
+        weight = float(runtime.weighting(torch.ones(()), torch.tensor(depth)))
+        pair = (numerator, term.denominator * weight)
+        ratios[f"ploss_{depth}"] = ratios[f"{name}_{depth}"] = pair
+        total = total + numerator
+    ratios[name] = (total, results[0].terms[0].denominator)
+    return ratios
+
+
+def depth_acceptance(runtime, deferred):
+    """Measure the expected acceptance of every rollout depth.
+
+    The wrappers reported each depth's mean over its supervised positions and
+    weighted it by the loss's token count wherever depths, micro-batches or
+    ranks are combined. The pairs returned here do the same.
+    """
+    ratios, accepted, tokens = {}, 0, 0
+    for depth, build in enumerate(deferred):
+        predictions = build()
+        measured = measure_predictions(runtime, predictions, expected_acceptance)
+        rate = measured["accepted"] / measured["supervised"].clamp_min(1e-8)
+        pair = (rate * predictions.denominator, predictions.denominator)
+        ratios[f"acceptance_rate_{depth}"] = ratios[f"expected_acceptance_{depth}"] = (
+            pair
+        )
+        accepted, tokens = accepted + pair[0], tokens + pair[1]
+    ratios["acceptance_rate"] = ratios["expected_acceptance"] = (accepted, tokens)
+    return ratios, {}
