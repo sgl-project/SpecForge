@@ -11,7 +11,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from specforge.config.draft.mlp import MoEExpertSpec, MoEFFNSpec, MoERouterSpec
-from specforge.modeling.draft.layers.kernels import configure_kernels
+from specforge.modeling.draft.layers.kernels import configure_kernels, liger_hidden_act
 from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
 from specforge.modeling.draft.layers.mlp.moe import RoutedExperts, Router, TopKRouter
 
@@ -248,6 +248,14 @@ class MoEFFNTest(unittest.TestCase):
         self.assertEqual([m.experts_kernel for m in aligned], ["loop"] * 2)
         with self.assertRaisesRegex(ValueError, "unknown moe_experts_kernel 'triton'"):
             configure_kernels(aligned, moe_experts_kernel="triton")
+        # Liger's SwiGLU sees the shared expert; routed-only FFNs leave it the RMSNorm.
+        self.assertEqual(liger_hidden_act(aligned), "silu")
+        self.assertEqual(liger_hidden_act(aligned[0]), "silu")
+        relu2 = MoEFFN(
+            moe_spec(shared_expert=expert_spec(hidden_act="relu2", gated=False)),
+            hidden_size=H,
+        )
+        self.assertEqual(liger_hidden_act(relu2), "relu2")
         # torch accepts F.grouped_mm only with 16-byte strides; the probe reports
         # the layer and torch's reason, and points at the loop kernel.
         for dtype, hidden_size, intermediate_size in (
