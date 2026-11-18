@@ -1,10 +1,11 @@
 # Training backends: program, step runner, trainer (`specforge.training`)
 
-**Status: proposal, fourth revision.** Nothing in this note is implemented and nothing in it was
+**Status: proposal, fifth revision.** Nothing in this note is implemented and nothing in it was
 run. The design that runs today is [`DESIGN.md`](DESIGN.md); the cross-plane picture is
 [`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md). Symbols cited as "today" were read on
-`main` at `c0f0a39c`. The section [Decisions for maintainers](#decisions-for-maintainers) lists the
-choices this note does not make.
+`main` at `d4391211`, after the canonical training migration removed the legacy step paths. The
+section [Decisions for maintainers](#decisions-for-maintainers) lists the choices this note does
+not make.
 
 ## Goals
 
@@ -16,7 +17,8 @@ choices this note does not make.
    conformance test.
 
 Out of scope: fault tolerance, a run controller, changes to capture or transport, and how a loss
-is executed inside a program (chunking, fused kernels).
+is executed inside a program (chunking, which kernel computes a term). The note fixes only how
+that choice is requested, recorded and agreed.
 
 **Not yet shown.** No measurement in the repository shows that the step mechanics, rather than the
 data path, bound training throughput, and no gain has been attributed to torchtitan for a small
@@ -38,7 +40,7 @@ coverage alone justifies the work, and whether such an engine is meant to become
 | 4 | The unit a backend can treat uniformly is a program: `program(tensors, ctx) -> ObjectiveResult`. An objective may drive the draft several times per batch (the EAGLE3 rollout, the DSpine two-pass window) and may or may not materialize full logits. A backend cannot assume logits exist | workload |
 | 5 | The frozen target tables are large and are never sharded or optimized; the trainable draft is a few layers. Today the default wraps the draft with FSDP `SHARD_GRAD_OP` (`training.fsdp_sharding`); `NO_SHARD` selects DDP | fact about today |
 | 6 | The artifact is the product: a canonical draft directory goes to export and to SGLang. Which trainer produced it must not show | decision |
-| 7 | Canonical training is data-parallel only: trainer tensor- and sequence-parallel sizes must be one (`training/canonical.py`), and no bundled recipe sets one above one. The repository also has code that communicates inside a forward: ring / Ulysses attention on the legacy EAGLE3 path (`modeling/draft/llama3_eagle.py`), and a tensor-parallel embedding and LM head (`layers/embedding.py`, `lm_head.py`) that no training path constructs | fact about today |
+| 7 | Canonical training has one model-parallel axis: sequence parallelism (ring and Ulysses attention) for an objective that declares `supports_sequence_parallel`, which is EAGLE3, under `attention_backend: usp`. The trainer's tensor-parallel size must be one (`training/canonical.py`). Four things happen in four places: the data plane cuts each sequence into per-rank shards; attention exchanges data on groups attached to the model as attributes (`training/sequence_parallel.py`); the LK losses sum per-sequence statistics over the sequence-parallel group inside the objective; and the accumulation count is multiplied by the sequence-parallel size (`training/assembly.py`) while the wrapper synchronises gradients over the whole world. No bundled recipe sets a sequence-parallel size above one | fact about today |
 
 ## Process model
 
@@ -68,14 +70,15 @@ already initialized. An adapter has to make each of those either a no-op or the 
 
 ## Today
 
-`Trainer -> TrainerController -> TrainerCore -> DraftTrainStrategy -> FSDPTrainingBackend`
-([`DESIGN.md`](DESIGN.md)). A `TrainingBackend` ABC exists and has one implementation. What keeps
-a second one out:
+`Trainer -> TrainerController -> TrainerCore -> CanonicalTrainStrategy -> FSDPTrainingBackend`
+([`DESIGN.md`](DESIGN.md)). There is one strategy and one producer of models,
+`training.canonical.build_bundle`. A `TrainingBackend` ABC exists and has one implementation. What
+keeps a second one out:
 
 | Coupling | Where |
 |---|---|
-| The model tells the backend what it needs through attributes set after construction | `build_bundle` sets `frozen_target_modules` and `fsdp_param_dtype`; `FSDPTrainingBackend` reads them and `_no_split_modules` with `getattr` |
-| Collectives are issued outside the backend | `objectives.base.microbatch_mean`, the window replay in `CanonicalTrainStrategy`, `TrainerCore._normalize_gradients`, `BF16Optimizer`, the evaluator, `CheckpointManager` |
+| The model learns and tells facts through attributes set after construction | `build_bundle` sets `frozen_target_modules` and `fsdp_param_dtype`, and under sequence parallelism `ring_group`, `ulysses_group` and a reduction callable; `FSDPTrainingBackend` reads the first two and `_no_split_modules` with `getattr`, and the EAGLE3 objective reads the groups the same way |
+| Collectives are issued outside the backend | `objectives.base.microbatch_mean`, the window replay in `CanonicalTrainStrategy`, `ExecutionSelection.agree`, `TrainerCore._normalize_gradients`, `BF16Optimizer`, the evaluator, `CheckpointManager` |
 | The step core rescales gradients assuming the wrapper averages across ranks | `TrainerCore._normalize_gradients` multiplies by world size |
 | Structure, weights, target tables and kernels are built in one call | `training.canonical.build_bundle` |
 | A checkpoint mixes the draft weights with the backend's state | `training_state.pt` holds the draft weights, the loop counters and, under DDP, the optimizer; `training_state_rank{r}.pt` holds FSDP optimizer state and every rank's RNG |
@@ -96,7 +99,7 @@ flowchart TB
   subgraph REF["Reference trainer"]
     direction TB
     LOOP["Run loop<br/>windows, cadence, commits, checkpoint sequence"]
-    FRAME["Step frame<br/>window walk, replay, metrics"]
+    FRAME["Step frame<br/>window walk, replay order"]
     LOOP --> FRAME
     FRAME --> FSDP["DDP / FSDP runner<br/>today's backend"]
     FRAME --> PLAIN["Plain runner<br/>one process"]
@@ -118,30 +121,33 @@ flowchart TB
 class ProgramSpec:                               # pure data; recorded; available without building a model
     draft: DraftConfig
     objective: ObjectiveSelection                # objective, loss, weighting, options
-    kernels: Kernels                             # every implementation choice, resolved at startup
+    kernels: Kernels                             # the requested policy for every implementation choice
     requires: DataRequirements                   # features, capture layers, batch constraint, host inputs, sample cost
     reduction: Literal["window", "microbatch"]   # how the loss is normalised; see "Reductions"
     statistics: tuple[StatisticSpec, ...]        # name and delivery point of each declared statistic
     partition: PartitionHints                    # indivisible blocks; tensors pinned to their own dtype
-    axes: Mapping[str, Literal["copy", "part", "own"]]   # model-parallel axes it communicates on; empty today
+    axes: Mapping[str, Literal["copy", "part", "own"]]   # model-parallel axes it communicates on
 
 class TrainingProgram(Protocol):                 # today's ObjectiveModel
     draft: nn.Module                             # trainable; its state dict is the artifact, under canonical keys
     frozen: tuple[nn.Module, ...]                # target tables, teacher head: never sharded or optimized
     def forward(self, tensors: Mapping[str, Tensor], ctx: StepContext) -> ObjectiveResult: ...
     def apply_statistic(self, name: str, value: Tensor) -> None: ...   # no collective; same on every rank
+    def kernel_record(self) -> Mapping[str, str]: ...                  # realised loss kernels so far
+    def expect_kernels(self, record: Mapping[str, str]) -> None: ...   # on resume; checked when inputs arrive
 
 class ProgramFactory(Protocol):
     spec: ProgramSpec
     def build(self, *, device, precision: PrecisionSpec,
-              groups: Mapping[str, ProcessGroup]) -> TrainingProgram   # structure only; draws no random numbers
-    def initial_state(self, *, device,
-                      precision: PrecisionSpec) -> Iterator[tuple[str, Tensor]]   # canonical keys, full tensors
+              groups: Mapping[str, ProcessGroup]) -> TrainingProgram   # construction; reads no weights
+    def load(self, program: TrainingProgram) -> None   # weights, target bindings, teacher head
 
 @dataclass(frozen=True)
 class StepContext:                               # values only; no callables, no process groups
     step: int
     total_steps: int
+    accumulation_steps: int                      # micro-batches per update
+    collect_detailed_metrics: bool               # true on logging steps; in evaluation, what the objective declares
     replay_values: Mapping[str, Tensor]          # pooled `replay` statistics by name; empty outside a replay
 
 class StepRunner(Protocol):
@@ -150,12 +156,13 @@ class StepRunner(Protocol):
                  topology: Topology, run: RunSpec) -> Supported | Unsupported: ...
     def prepare(self, factory: ProgramFactory, optim: OptimSpec, precision: PrecisionSpec,
                 topology: Topology, run: RunSpec) -> None: ...
-    def forward_backward(self, window: Sequence[TrainBatch], ctx: StepContext) -> PendingStep: ...
+    def forward_backward(self, batch: TrainBatch, ctx: StepContext, *,
+                         is_boundary: bool) -> PendingStep | None: ...   # one micro-batch
     def apply_step(self, pending: PendingStep) -> StepMetrics: ...    # consumes the handle
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> ObjectiveResult: ...   # training mode, no gradients
     def evaluate(self, batch: TrainBatch, ctx: StepContext) -> ObjectiveResult: ...  # eval mode, no gradients
     def reduce_sum(self, values: Tensor) -> Tensor: ...
-    def agree(self, error: str | None) -> None: ...                   # raises on every rank if any rank reported an error
+    def agree(self, error: str | None, *, value: object = None) -> None: ...   # see "Rank symmetry"
     def draft_state(self) -> dict[str, Tensor]: ...                   # full on rank 0, empty elsewhere
     def save_resume(self, out: Path) -> None: ...
     def load_resume(self, src: Path) -> None: ...
@@ -171,14 +178,20 @@ these values and in `ProgramSpec`, so the verdict needs no model.
 
 | Value | Holds | Today |
 |---|---|---|
-| `Kernels` | every implementation choice that leaves the math alone but may move rounding or memory: attention backend, loss execution (chunking, checkpointing, fused kernels), component kernels | `training.attention_backend`, `model.use_liger_kernel`, the objective's chunk size; on the legacy path also `fused_logits_loss`, `objective_chunk_blocks`, `objective_checkpointing` |
+| `Kernels` | the requested policy for every implementation choice that leaves the math alone but may move rounding or memory: attention backend, loss chunking and checkpointing, and for each kernel family on, off or auto | `training.attention_backend`, `training.loss.execution`, and three tri-state switches where unset means auto: `training.loss.fused`, `model.use_fused_conv`, `model.use_liger_kernel` |
 | `PrecisionSpec` | five dtypes: `parameter` (as stored), `compute` (the forward), `reduce` (gradient communication), `master` (optimizer copies, or none), `buffer` (a cast applied by the wrapper, or none) | bf16, bf16, bf16, fp32 for the default `model.torch_dtype`; buffers are cast to fp32 under FSDP and left as built under DDP. See the last row of the table in [Today](#today) |
 | `Topology` | `world_size`; for the data-parallel axis and each model-parallel axis, its size and the group index of every rank | the arguments of `init_distributed` and the two meshes it builds in rank order, read back through getters |
 | `OptimSpec` | learning rate, schedule and warmup, total steps, clip norm, master-weight placement | `training.*`; `BF16Optimizer` |
 | `RunSpec` | accumulation window, horizon, seed, cadences | `training.*` |
 
-- **A kernel that cannot run is an error, never a fallback.** Because `Kernels` is compared across
-  ranks at startup, no forward needs a collective to agree on which kernel ran.
+- **Requested at startup, realised when the facts exist.** `Kernels` is the request, compared across
+  ranks at startup. An explicit request that cannot run is an error, never a fallback. Under auto,
+  Liger and the fused convolution are resolved at startup in `build_bundle`; the loss kernel is
+  resolved for each prediction and term group when the first real input arrives, as
+  `ExecutionSelection` does today, and may depend only on facts that are equal on every rank. The
+  realised loss kernels are recorded locally (`program.kernel_record()`), compared across ranks as
+  the `value` of `runner.agree` in the checkpoint sequence, and stored in the run record. No forward
+  issues a collective to agree on a kernel.
 - **An implementation variant of a component is a kernel.** It is registered next to the component
   and selected through `Kernels`, and it carries a parity test against the reference
   implementation. If it stores parameters differently (fused, or split along a model-parallel
@@ -192,22 +205,65 @@ these values and in `ProgramSpec`, so the verdict needs no model.
   batch, who acknowledges), the frame and the runner. A runner asserts in `prepare` that the groups
   it uses, whether created at startup or by its engine, match the value.
 
-The remaining names: `DataRequirements` is the union of what the draft, the objective and the loss
-need from the data plane. `StatisticSpec` is a name and a delivery point. `PendingStep` is the
-single-use handle from `forward_backward`: the window's reduced denominators, metric sums and
-statistic sums. `StepMetrics` is the reduced loss, the reduced metric pairs, the pre-clip gradient
-norm, the learning rate applied and the pooled `after_step` statistics. `Supported` carries the
-numerics class; `Unsupported` carries the reason.
+The remaining names: `ProgramSpec` is derived from the objective registry (`ResolvedObjective` and
+`TrainingRequirements`) wherever the registry holds the fact. Two facts are not there yet and move
+in step 3: the reduction, a literal on the `PredictionBatch` a protocol returns on every call, and
+the indivisible blocks, which the backend reads from `_no_split_modules`. `DataRequirements` is the
+union of what the draft, the objective and the loss need from the data plane. `StatisticSpec` is a
+name and a delivery point. `PendingStep` is the single-use handle that the boundary call of
+`forward_backward` returns: the window's reduced denominators, metric sums and statistic sums.
+`StepMetrics` is the reduced loss, the reduced metric pairs, the pre-clip gradient norm, the
+learning rate applied and the pooled `after_step` statistics; metrics keep both the ratio pairs and
+the raw sums a program reports. `Supported` carries the numerics class; `Unsupported` carries the
+reason.
+
+### The window
+
+One optimizer update consumes a window of `ctx.accumulation_steps` micro-batches. **The frame is the
+only part that walks it.** It takes micro-batches one at a time from a single-pass stream and hands
+each to the runner as soon as it arrives:
+
+```python
+def run_window(runner, window: Iterator[TrainBatch], ctx) -> StepMetrics:   # the frame, shared by every runner
+    pending = None
+    for index, batch in enumerate(window, start=1):
+        pending = runner.forward_backward(batch, ctx, is_boundary=index == ctx.accumulation_steps)
+    if pending is None:
+        raise IncompleteWindow     # the stream ended inside a window: no step, no commit
+    return runner.apply_step(pending)
+```
+
+This is the path without a `replay` statistic; [Step statistics](#step-statistics) has the other.
+
+- **Nothing is collected first.** A batch already holds tensors, and an online loader may deliver
+  them on the training device, so holding a window would raise peak memory and delay the first
+  backward. Five bundled recipes accumulate 512 micro-batches.
+- **One call covers one micro-batch's forward and backward**, so a runner's synchronisation scope
+  (`no_sync` under DDP) encloses both, and under `microbatch` the reduction sits between them.
+- **Only a program that declares a `replay` statistic pays for buffering.** The frame then keeps
+  host copies of the window's inputs, as `CanonicalTrainStrategy` and
+  `TrainerCore._prepare_and_replay` do today.
+- **A short window is an error.** If the stream ends inside a window the frame raises and the run
+  loop stops, as `TrainerController` does today: no partial step is applied and nothing is
+  committed.
+- **The boundary call returns the handle.** `forward_backward` returns `None` until `is_boundary`,
+  then the `PendingStep` that `apply_step` consumes. The run loop commits the window's samples after
+  `apply_step` returns.
+
+This is today's shape: `TrainerCore.train_step` computes one micro-batch inside
+`backend.accumulation_context(is_boundary=...)`. The consequence is that a runner executes
+micro-batches and does not schedule them. An engine that wants to schedule a whole window itself
+belongs to the [dedicated-trainer](#a-dedicated-trainer) level, not to this one.
 
 ### Reductions
 
-`ObjectiveResult` carries the loss, metric pairs and the local sums of the program's declared
-statistics. `ProgramSpec.reduction` declares one **reduction** for the program:
+`ObjectiveResult` carries the loss, metric pairs, raw metric sums and the local sums of the
+program's declared statistics. `ProgramSpec.reduction` declares one **reduction** for the program:
 
 | Reduction | The program returns | The update's objective over a window of `A` micro-batches and the data-parallel ranks | Who reduces |
 |---|---|---|---|
-| `window` (default) | one numerator, the coefficient-weighted sum of its terms, and **one** denominator | `sum(numerator) / sum(denominator)`, both sums over every micro-batch and rank | the runner, once, after the last backward |
-| `microbatch` | terms `(coefficient, numerator, denominator)`, each with its own denominator | the mean over the `A` micro-batches of `sum_t c_t * (sum over ranks of numerator_t) / (sum over ranks of denominator_t)` | the runner, per micro-batch, between that micro-batch's forward and backward, in one reduction for all terms |
+| `window` (default) | one numerator, the coefficient-weighted sum of its terms, and **one** denominator | `sum(numerator) / sum(denominator)`, both sums over every micro-batch and rank | the runner, once, in the boundary call |
+| `microbatch` | terms `(coefficient, numerator, denominator)`, each with its own denominator | the mean over the `A` micro-batches of `sum_t c_t * (sum over ranks of numerator_t) / (sum over ranks of denominator_t)` | the runner, inside every call, between forward and backward, in one reduction for all terms |
 
 **One denominator per window.** Under `window` the gradient is accumulated first and rescaled once,
 so it can carry one denominator only. An objective whose terms need different denominators has
@@ -238,7 +294,7 @@ group reaches the program.
 
 | Delivery | The pooled sums come back | Today |
 |---|---|---|
-| `replay` | through `ctx.replay_values`, to a second pass over the same window. The frame calls `prepass` for each micro-batch, pools the sums with `reduce_sum`, then calls `forward_backward` with the values. The runner remembers the RNG state each `prepass` started from and restores it before that micro-batch's replayed forward | the DSpine window statistic (`WindowStatistic`, `CanonicalTrainStrategy`), where the strategy also forms the ratio |
+| `replay` | through `ctx.replay_values`, to a second pass over the same window. The frame calls `prepass` for each micro-batch and keeps a host copy of its inputs, pools the sums with `reduce_sum`, then calls `forward_backward` for each kept micro-batch, in the same order, with the values. Prepass and replay are paired by position in the window: the runner keeps the RNG state each `prepass` started from and restores it before the replayed forward at the same position | the DSpine window statistic (`WindowStatistic`): `CanonicalTrainStrategy.forward_loss` makes the host copy and forms the ratio, and `TrainerCore._prepare_and_replay` buffers the window |
 | `after_step` | through `program.apply_statistic(name, value)`, which the runner calls on every rank inside `apply_step`, after the optimizer update | nothing on `main`; the intended use is updating a draft buffer from pooled counts |
 
 `apply_statistic` issues no collective and computes the same result on every rank, so the draft
@@ -275,17 +331,36 @@ legal under four conditions:
   | Kind | Ranks of a group | A rank's returned sums | Example |
   |---|---|---|---|
   | `copy` | receive the same batch | are the whole; count one rank | tensor parallelism |
-  | `part` | receive the same batch | are a shard; add them | sequence parallelism |
+  | `part` | receive their own shard of the same samples, cut by the data plane | are a shard; add them | sequence parallelism |
   | `own` | receive different batches | are their own samples; add them | expert parallelism, where only the parameters are split |
 
 - **Same sequence.** Every rank of a group runs the same forwards in the same order.
+
+A kind says how to count a rank's sums. It does not say where each quantity is handled, and for a
+`part` axis four things happen in four places. Sequence parallelism, the one axis canonical
+training has today, shows them:
+
+| Quantity | Handled over | By |
+|---|---|---|
+| The sequence | cut into one shard per rank, with lookahead overlap | the data plane |
+| Per-sequence loss statistics, for the LK losses | the sequence-parallel group | the program, inside the forward |
+| Gradients | every rank of the world | the runner's wrapper |
+| The accumulation window | whole sequences: the configured count times the axis size | the composition root, in `RunSpec` |
+
+Sequence parallelism uses three groups today: ring, Ulysses, and their product for statistics and
+dispatch. `groups` carries each under its own key, and `Topology` holds the ring and Ulysses sizes.
+Of the four rows, the runner's own are the gradient group and honouring the accumulation count it
+is given; a job on this axis needs all four in place. [Conformance](#conformance) names the case
+that checks them.
 
 A reduction over a model-parallel group that completes one sample's value, such as a per-sequence
 statistic whose sequence is split across ranks, belongs to the component. A reduction across
 samples never does.
 
-Canonical training has no model-parallel axis today (statement 7), so `axes` is empty for every
-bundled recipe, and these rules first bind the objective that adds one. Which axes are in scope is
+Today's sequence-parallel code meets the counting rules and not the binding rule: the groups are
+attached to the model as attributes read from process-global getters, together with a callable that
+performs the per-sequence reduction (`training/sequence_parallel.py`). Passing them through
+`build(groups=...)` is part of step 3. Which further axes are in scope is
 [decision 10](#decisions-for-maintainers).
 
 ### Rank symmetry
@@ -300,7 +375,7 @@ Every method runs on every rank in the same order. Collectives and failure handl
 | `prepass`, `evaluate` | yes under sharding or with a model-parallel axis; every rank receives the same number of batches | as for `forward_backward` |
 | `reduce_sum`, `apply_step` | yes | a check on a reduced value reaches the same verdict on every rank, so all ranks raise together; any other failure raises on that rank and the launcher tears the world down |
 | `draft_state`, `save_resume`, `load_resume` | yes | reported through `agree`, never raised between two collectives |
-| `agree` | yes: one gather of error strings | raises the combined error on every rank |
+| `agree` | yes: one gather of an error string and an optional value per rank | raises on every rank if any rank reported an error or the values differ |
 | `close` | no | — |
 
 `draft_state()` is legal only between `apply_step` and the next `forward_backward`.
@@ -316,8 +391,8 @@ reduced, in the single host read `BF16Optimizer` makes today.
 |---|---|---|
 | Composition root (`application`) | resolving the specs and the [resolved values](#resolved-values) once; comparing them across ranks; choosing the runner | anything a runner does after `prepare` |
 | Program | supervision, the draft forward, loss terms, the declared reduction and statistics; model-parallel communication inside its components | the data-parallel size, the optimizer, how it is wrapped |
-| Step frame | walking the window; for a `replay` statistic, the order of prepass, pooling and replay; pooling evaluation results through the runner | gradients, process groups, the optimizer, RNG |
-| Step runner | wrapping and placing the program, and passing it its model-parallel groups; writing the initial state into it; backward; every collective across samples, the training metrics included; normalisation; clipping; the optimizer and LR schedule; `after_step` statistics; RNG, with the restore for a replay; its resume state | the loss math; where data comes from |
+| Step frame | walking the window one micro-batch at a time and marking its boundary; for a `replay` statistic, buffering the window's inputs and ordering prepass, pooling and replay; pooling evaluation results through the runner | gradients, process groups, the optimizer, RNG |
+| Step runner | wrapping and placing the program, passing it its model-parallel groups, and deciding when `factory.load` runs; one micro-batch's forward and backward per call; every collective across samples, the training metrics included; normalisation; clipping; the optimizer and LR schedule; `after_step` statistics; RNG, with the restore for a replay; its resume state | the loss math; where data comes from |
 | Run loop | the horizon; windows and the incomplete tail; repositioning the stream on resume; logging and checkpoint cadence; evaluation data, cadence and best-checkpoint tracking; the checkpoint sequence; sample commits | `torch.distributed`; model internals |
 
 `OptimSpec` is a frozen value with today's fields (learning rate, schedule and warmup, total steps,
@@ -325,15 +400,24 @@ clip norm, master-weight placement). A runner honours it or refuses in `supports
 field when a second optimizer needs one. Where master copies are placed is in `OptimSpec`; their
 dtype is in `PrecisionSpec`.
 
-The initial state is handed over the same way as every other fact: the factory yields full tensors
-under canonical keys, the same for every runner and world size on a given device type and
-`PrecisionSpec`, and the runner writes them into the program it placed. Storage has two owners.
-Replication and sharding are the runner's, so a runner that shards before it initializes slices each
-tensor itself. Tensors are yielded one at a time, so the transient cost on a rank is the largest
-single parameter, not the draft. Fused or model-parallel storage is the component's, converted in
-its own state-dict load and save. Both `initial_state` and `draft_state` therefore speak canonical
-keys. All random draws happen in `initial_state`, on today's device and dtype and in today's order;
-`build` draws none.
+Weights are handed over as a plan, not as tensors. `factory.load(program)` does what `load_draft`,
+`initialize_draft` and `build_bundle` do today after construction. Through `WeightPlan`
+(`checkpoint/weight_plan.py`) it copies the draft's weights under canonical keys and installs the
+bound target tables, which are deliberately absent from the draft's state dict. It then binds the
+teacher head, which is either the draft's own LM head or a separate `BoundLMHead` that is loaded
+today by a direct full read outside the plan. It ends with `finalize_initialization`, which may
+derive draft tensors from a bound table (DSpine's transfer codes) and so has to come after the
+bindings. The factory owns what all of this means and the runner owns when it runs. Today's DDP /
+FSDP path loads before wrapping, which `apply_weight_plan` requires of an FSDP1 model, and keeps the
+bound modules out of the wrapper so the bindings survive. An engine that shards first calls `load`
+after materialising: the plan already writes rank-local slices into sharded and replicated
+placements and refuses meta tensors, so no layout passes from the runner to the factory. Whatever a
+runner does to storage after `load` has to keep the bindings, or the first forward finds an unbound
+head. The separate teacher head is outside the plan's rank-local path; it is a frozen table and
+never sharded (statement 5), so a full read stays correct. Fused or model-parallel storage is the
+component's, converted in its own state-dict load and save, so `load` and `draft_state` both speak
+canonical keys. Random initialization happens at construction; an engine that constructs on a meta
+device has to run it after materialising, and the prototype in step 2 has to show that.
 
 ### Checkpoints
 
@@ -343,18 +427,24 @@ A checkpoint has three parts and one commit point.
 |---|---|---|---|
 | Resume state | everything needed to continue: every draft parameter and buffer as the runner stores them, optimizer and scheduler state, RNG | `runner.save_resume`, every rank | the same runner under the same `Topology` |
 | Artifact | the canonical draft directory, under canonical keys: a view derived from the resume state at the draft's declared dtype | rank 0, from `runner.draft_state()` | export, SGLang conversion, `initialization.checkpoint`, the conformance kit |
-| Run record | step, epoch, samples consumed, the resolved `Kernels`, `PrecisionSpec` and `Topology`, the per-key resume contract and model provenance compared today, runner name and version | rank 0, **last** | the run loop on resume |
+| Run record | step, epoch, samples consumed, the requested `Kernels` and the realised kernel selection, `PrecisionSpec` and `Topology`, the per-key resume contract and model provenance compared today, runner name and version | rank 0, **last** | the run loop on resume |
 
 Sequence, on every rank: flush sample commits up to this step → `draft_state()` → rank 0 writes the
 artifact → `save_resume()` → `agree(errors)` → rank 0 writes the run record → rank 0 moves the
 `latest` link. A checkpoint exists if and only if its run record exists. A checkpoint is never ahead
 of its durable commit, as today (`TrainerController.save_checkpoint`), and online resume keeps
-requiring the ledger marker to equal the checkpoint step.
+requiring the ledger marker to equal the checkpoint step. The same `agree` carries
+`program.kernel_record()` as its value and so compares the realised loss kernels across ranks,
+where `CanonicalTrainStrategy.before_checkpoint` calls `ExecutionSelection.agree` today.
 
 The resume state is the truth for continuing; the artifact is derived. The step counter has one
 owner, the run loop; a runner whose engine keeps its own counter takes it from the run record.
-Resuming with a different runner, `Topology`, `Kernels` or `PrecisionSpec` is refused, naming both
-values; starting from the artifact always works and restarts the optimizer.
+Resuming with a different runner, `Topology` or `PrecisionSpec`, or with an explicit kernel request
+that contradicts the record, is refused, naming both values. An unset request adopts the
+recorded request, as `adopt_recorded_execution` does today; the realised loss kernels are then
+checked against the record when real inputs arrive (`program.expect_kernels`), and a mismatch
+raises. Starting from the artifact always works and
+restarts the optimizer.
 
 ### Numerics classes
 
@@ -362,8 +452,8 @@ values; starting from the artifact always works and restarts the optimizer.
 executes depend on configuration.
 
 - **`exact`**: bit-identical to the stored trajectory of the reference runner **for the same
-  topology** (same runner family, `Topology`, `Kernels`, `PrecisionSpec`, device type and torch
-  build). Bit-equality across
+  topology** (same runner family, `Topology`, realised kernels, `PrecisionSpec`, device type and
+  torch build). Bit-equality across
   wrappers or world sizes is not defined: DDP and FSDP divide gradients at different points, and a
   single process cannot reproduce several ranks drawing from the same seed.
 - **`equivalent`**: a different numerical program for the same objective. It is a numerics change.
@@ -390,21 +480,20 @@ selected.
 | Today | Becomes |
 |---|---|
 | `TrainerController` | the run loop |
-| `TrainerCore` and `CanonicalTrainStrategy` | the step frame |
+| `TrainerCore` and `CanonicalTrainStrategy` | the step frame; `train_step` already computes one micro-batch per call |
 | `FSDPTrainingBackend`, with `BF16Optimizer` behind it | the DDP / FSDP runner; the reference |
 | (none) | the plain runner: one process, no wrapper. New code; it takes the reference-runner role for CPU only after it is shown bit-identical to the DDP / FSDP runner at one rank |
-| `build_bundle` | `ProgramFactory.build` and `initial_state`; the artifact keeps its writer in `specforge.checkpoint` |
+| `build_bundle` | `ProgramFactory.build` and `load`; the artifact keeps its writer in `specforge.checkpoint` |
 | attributes set on the model after construction | declarations on `ProgramSpec` and the fields of `PrecisionSpec` |
-| getters of `specforge.distributed` read by layers, data utilities and the trainer | `Topology` as a value; groups passed by the runner to `build` |
+| getters of `specforge.distributed` read by layers, data utilities, the trainer and `sequence_parallel.py` | `Topology` as a value; groups passed by the runner to `build` |
 | `microbatch_mean` and the DSpine replay calling `torch.distributed` | the declared reductions and the frame's prepass |
-| `CheckpointManager._all_ok` | `runner.agree` |
+| `CheckpointManager._all_ok`, and `ExecutionSelection.agree` called from `before_checkpoint` | `runner.agree` |
 
 What the current backend provides implicitly, and a new runner must provide or refuse: `no_sync`
 around forward and backward for DDP, backward only for FSDP; the loss-denominator check folded into
 the optimizer's single host read; frozen target modules kept out of sharding and out of the state
-dict; per-rank RNG and FSDP optimizer state; failing when the stream ends inside a window instead of
-stepping unreduced gradients; gradient reduction in the parameter dtype, and fp32 buffers under
-sharding.
+dict; per-rank RNG and FSDP optimizer state; gradient reduction in the parameter dtype, and fp32
+buffers under sharding.
 
 ## Attaching torchtitan
 
@@ -420,9 +509,9 @@ the reference has to be re-recorded on whichever build is chosen.
 
 | Contract | torchtitan | What the adapter has to solve |
 |---|---|---|
-| `prepare` | `TrainingEngine.initialize`: `model_config.build()` on the meta device → `model.parallelize(...)` → `to_empty` → `init_weights` → optimizer → checkpointer | Every stateful child must implement torchtitan's `Module` protocol; `_parallelize` raises on a plain `nn.Module` that owns parameters or buffers. The adapter has to meet that protocol for any component generically; a second implementation per component is not part of this design unless decision 11 allows it. Parameters are sharded before `init_weights`, while `initial_state` yields full tensors under canonical keys, so the adapter slices each one for its shards; torchtitan's own route for initial weights is its checkpointer with a state-dict adapter. `Config` must provide `max_context_length`, `get_parameter_counts` and `build_flops_estimator` |
+| `prepare` | `TrainingEngine.initialize`: `model_config.build()` on the meta device → `model.parallelize(...)` → `to_empty` → `init_weights` → optimizer → checkpointer | Every stateful child must implement torchtitan's `Module` protocol; `_parallelize` raises on a plain `nn.Module` that owns parameters or buffers. The adapter has to meet that protocol for any component generically; a second implementation per component is not part of this design unless decision 11 allows it. Parameters are sharded before `init_weights`; `factory.load` then writes rank-local slices, which `apply_weight_plan` already does for sharded and replicated placements. torchtitan's own route for initial weights is its checkpointer with a state-dict adapter. `Config` must provide `max_context_length`, `get_parameter_counts` and `build_flops_estimator` |
 | Process model | the constructor binds the device, applies NUMA binding, seeds RNG and sets group timeouts | make each a no-op or the single owner |
-| `forward_backward` | `engine.forward_backward` expects its micro-batch type, `global_loss_token_counts` before the forward, and `preprocess_inputs`; accelerator-graph capture is on by default and forbids host syncs and varying shapes | miles bypasses it and drives `model_parts`, `loss_fn` and `engine.loss` itself, with a stateful loss object. Either route depends on engine internals; say which |
+| `forward_backward` | `engine.forward_backward` expects its micro-batch type, `global_loss_token_counts` before the forward, and `preprocess_inputs`; accelerator-graph capture is on by default and forbids host syncs and varying shapes | the contract calls the runner once per micro-batch and the denominator is unknown before the forward, so the adapter drives `model_parts` and the loss itself, as miles does with a stateful loss object. The engine's own whole-window `forward_backward` is not usable here. The route depends on engine internals |
 | Reduction | stock FSDP2 divides; torchtitan turns the division off in each model's own FSDP setup (`apply_fsdp_to_decoder`, and the flux and Transformers-backend equivalents), not in the engine; deferring the reduction to the last micro-batch is opt-in | the adapter's own `_apply_fsdp` decides, and `apply_step` scales accordingly |
 | `apply_step` | `engine.optim_step()`: clip, finite check by `torch._assert_async`, step, scheduler | scale the reduced gradients before it |
 | `save_resume`, `load_resume` | its checkpointer saves on its own interval, model-only at the last step by default, rotates, and loads the newest step in its folder. It saves no RNG | drive it explicitly; add RNG; reconcile its step counter with the run record |
@@ -453,10 +542,12 @@ What is fixed now, because it comes from the other planes:
 ## Conformance
 
 - **Numerics, by replay.** Recorded feature streams in the offline feature format: small ones for
-  CPU, one at recipe scale. Features do not depend on the draft, so one recording serves every
-  runner. An `exact` runner reproduces the stored trajectory for its topology (loss sequence, final
-  weights, optimizer state). An `equivalent` one passes the first-update check and the end-to-end
-  band.
+  CPU, one at recipe scale. Today's fixtures hold losses and gradient norms per objective
+  (`tests/fixtures/objective_goldens.json`) and an end-to-end resume test; they do not yet hold
+  parameter updates, optimizer and RNG state or the data position. Features do not depend on the
+  draft, so one recording serves every runner. An `exact` runner reproduces the stored trajectory
+  for its topology (loss sequence, final weights, optimizer state). An `equivalent` one passes the
+  first-update check and the end-to-end band.
 - **Protocol, by a fake stream.** A consume-once stream with a recording ledger checks what a
   recording cannot: commit order across ranks, no commit for an incomplete window, commits flushed
   before a checkpoint, the run record written last.
@@ -465,6 +556,10 @@ What is fixed now, because it comes from the other planes:
 - **One case per declaration, not per recipe.** A runner is exercised with one job for each thing it
   claims in `supports()`: each reduction, each statistic delivery, each model-parallel axis. A
   recipe is a combination of these, so new drafts and losses need no new runner tests.
+- **Sequence parallelism is in the first version.** An EAGLE3 job with data-parallel and
+  sequence-parallel sizes above one, accumulation above one and an LK loss, so that the
+  per-sequence reduction runs, must reproduce its stored trajectory: loss, gradients and the step
+  at which the optimizer moves. It needs `flash_attn`, so it is a GPU recording.
 - **End metric.** The repository's evaluator reports a teacher-forced proxy for acceptance length.
   Serving acceptance length, measured through SGLang, is the metric for a default change.
 
@@ -483,26 +578,28 @@ What is fixed now, because it comes from the other planes:
 
 ## Delivery
 
-Prerequisites, both unmet at `c0f0a39c` and owned by the canonical-training migration: one step path
-(the legacy strategies removed), and trajectories recorded through the CLI while the legacy path
-exists, at every world size the bundled recipes use.
+Prerequisite, met on `main` at `d4391211`: one step path. The legacy strategies are gone, and
+`CanonicalTrainStrategy` over `FSDPTrainingBackend` is the only route.
 
 | # | Change | Kind | Gate |
 |---|---|---|---|
 | 0 | Measure where step time goes on one recipe per family: data wait, forward, loss, backward, optimizer | measurement | a table in this note; it settles the throughput argument for the remaining steps, and decision 9 settles the coverage argument |
-| 1 | Declarations replace attributes set after construction; `DataRequirements` on the spec; `Kernels`, `PrecisionSpec` and `Topology` resolved once and compared across ranks; `build_bundle` split into `build` and `initial_state` | behaviour-preserving | stored trajectories unchanged |
-| 2 | Step frame, run loop and `StepRunner` over today's backend: the DDP / FSDP runner only; declared reductions and statistics; `agree` | behaviour-preserving | stored trajectories, bitwise, per topology |
-| 3 | Plain runner | new | bit-identical to the DDP / FSDP runner at one rank on CPU, or the difference explained |
-| 4 | Checkpoint parts and commit point | on-disk change | a census of every reader of `training_state.pt`; a reader for existing run directories |
-| 5 | `application` as the only composition root for training | behaviour-preserving | the import scan |
-| 6 | Conformance kit: replay, fake stream, mutations | tests | the three mutations fail |
-| 7 | A spike: one canonical draft built and stepped under torchtitan at the chosen revision and torch build | measurement | a go or no-go with the adapter's size and throughput, and whether one generic adapter meets its `Module` protocol |
-| 8 | torchtitan runner | new, `equivalent` | the kit; serving acceptance length; throughput and memory |
+| 1 | Record the reference: trajectories of the DDP / FSDP path through the CLI at every world size the bundled recipes use, holding parameter updates, optimizer and RNG state and the data position as well as losses, with the sequence-parallel case included | tests | a second recording reproduces the first bitwise |
+| 2 | A prototype: one canonical draft under torchtitan at the chosen revision and torch build, through initialization, one update, export and resume | measurement | a go or no-go with the adapter's size and throughput, whether one generic adapter meets its `Module` protocol, and what the prototype makes the contract change |
+| 3 | The minimal runner: `run_window` as the frame and `StepRunner` over today's backend; `ProgramSpec` derived from the objective registry; declarations replace attributes set after construction; `factory.load`; groups passed to `build` | behaviour-preserving | stored trajectories, bitwise, per topology |
+| 4 | `Kernels`, `PrecisionSpec` and `Topology` resolved once and compared across ranks; kernel agreement through `runner.agree`; `application` as the only composition root for training | behaviour-preserving | stored trajectories; the import scan |
+| 5 | Conformance kit: replay, fake stream, mutations | tests | the three mutations fail |
+| 6 | torchtitan runner | new, `equivalent` | the kit; serving acceptance length; throughput and memory |
+| 7 | Plain runner | new | bit-identical to the DDP / FSDP runner at one rank on CPU, or the difference explained |
+| 8 | Checkpoint parts and commit point | on-disk change | a census of every reader of `training_state.pt`; a reader for existing run directories |
 | 9 | `Trainer` and `TrainJob`, with the first dedicated trainer | new | the kit; serving acceptance length |
 
-Order: 0 first. 1 → 2 → 3. 4, 5 and 6 after 2. 7 before 8. 9 after 6.
+Order: 0, 1 and 2 come first, in any order, and the contract is fixed only after 2. Then
+3 → 4 → 5 → 6. Steps 7 and 8 need only step 3 and can be scheduled separately; step 9 needs the
+kit (5). The kit's check that the run record is written last arrives with step 8. Decision 6 has
+to be taken before a second runner (step 6 or 7) can be selected.
 
-The first change a user can see is step 4. Step 2 changes the shape of the public
+The first change a user can see is step 8. Step 3 changes the shape of the public
 `specforge.training.Trainer` only if maintainers choose so.
 
 ## Decisions for maintainers
@@ -513,13 +610,13 @@ The first change a user can see is step 4. Step 2 changes the shape of the publi
 | 2 | The torchtitan revision and the torch build | a dependency and numerics choice; SpecForge and torchtitan target different torch versions |
 | 3 | Accepting torchtitan as `equivalent`, the first-update tolerance, and who sets the end-to-end band | a numerics trade |
 | 4 | The artifact's dtype rule: written at the draft's declared dtype, cast by the same rounding the reference uses when it copies masters to parameters | a precision decision; a runner with fp32 parameters would otherwise produce a different artifact |
-| 5 | The run-directory layout in step 4, and whether existing directories get a reader or a documented break | a user-visible on-disk contract |
+| 5 | The run-directory layout in step 8, and whether existing directories get a reader or a documented break | a user-visible on-disk contract |
 | 6 | The config field that selects a runner, its default, and its relation to `training.fsdp_sharding` | a user-visible key |
 | 7 | Whether `specforge.training.Trainer` keeps its public shape | a public API |
 | 8 | Whether a dedicated trainer is in scope now | no implementation exists |
-| 9 | Whether an external engine is meant to become the default runner and take the reference role, with the DDP / FSDP runner retired | a strategy choice. It decides whether coverage alone justifies steps 7 and 8, whether the plain runner (step 3) is worth building, and how early decision 2 has to be taken |
-| 10 | Which model-parallel axes canonical training supports | none today, and no bundled recipe uses one; each axis needs a declaration, a bound group and a data-plane rule |
-| 11 | Whether a backend may carry its own implementation of a component when no generic adapter satisfies its engine | it multiplies implementations by backends, and each one needs its own parity evidence; step 7 supplies the facts |
+| 9 | Whether an external engine is meant to become the default runner and take the reference role, with the DDP / FSDP runner retired | a strategy choice. It decides whether coverage alone justifies steps 2 and 6, whether the plain runner (step 7) is worth building, and how early decision 2 has to be taken |
+| 10 | Which model-parallel axes canonical training supports beyond sequence parallelism for the objectives that declare it | each further axis needs a declaration, a bound group, a data-plane rule and a regression case of its own |
+| 11 | Whether a backend may carry its own implementation of a component when no generic adapter satisfies its engine | it multiplies implementations by backends, and each one needs its own parity evidence; step 2 supplies the facts |
 
 ## Prior art
 
