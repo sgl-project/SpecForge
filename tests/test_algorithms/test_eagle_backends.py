@@ -118,17 +118,92 @@ class EagleBackendTest(unittest.TestCase):
         from specforge.training import sequence_parallel
 
         with (
-            patch("specforge.distributed.get_sp_ring_group", return_value="ring"),
-            patch("specforge.distributed.get_sp_ulysses_group", return_value="ulysses"),
-            patch("specforge.distributed.get_draft_sp_group", return_value="draft"),
+            patch("specforge.distributed.get_sp_ring_group", return_value="ring") as a,
+            patch(
+                "specforge.distributed.get_sp_ulysses_group", return_value="ulysses"
+            ) as b,
+            patch(
+                "specforge.distributed.get_draft_sp_group", return_value="draft"
+            ) as c,
             patch.object(
                 sequence_parallel, "reduce_statistics", return_value="reduced"
             ) as reduce,
         ):
             groups = sequence_parallel.sequence_parallel_groups()
             self.assertEqual(groups.reduce_statistics(1, 2, 3), "reduced")
+            self.assertEqual(groups.reduce_statistics(4, 5, 6), "reduced")
         self.assertEqual((groups.ring_group, groups.ulysses_group), ("ring", "ulysses"))
-        reduce.assert_called_once_with(1, 2, 3, group="draft")
+        reduce.assert_called_with(4, 5, 6, group="draft")
+        for getter in (a, b, c):
+            getter.assert_called_once_with()
+
+    def test_missing_sequence_group_is_refused(self):
+        """A statistic reduced over no group would be pooled over every sample."""
+        from specforge.training import sequence_parallel
+
+        with (
+            patch("specforge.distributed.get_sp_ring_group", return_value="ring"),
+            patch("specforge.distributed.get_sp_ulysses_group", return_value="ulysses"),
+            patch("specforge.distributed.get_draft_sp_group", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "no draft sequence process group"),
+        ):
+            sequence_parallel.sequence_parallel_groups()
+
+    def test_objective_refuses_a_backend_or_axis_it_does_not_declare(self):
+        from tests.test_algorithms.test_objective_contracts import build_runtime
+
+        with self.assertRaisesRegex(ValueError, "does not train with attention.*'usp'"):
+            build_runtime("PEagleDraftModel", attention_backend="usp")
+        groups = SequenceParallel("ring", "ulysses", lambda *statistics: statistics)
+        with self.assertRaisesRegex(ValueError, "does not support sequence parallel"):
+            build_runtime("PEagleDraftModel", sequence_parallel=groups)
+
+    def test_assembled_usp_run_hands_the_process_groups_to_the_objective(self):
+        """The handoff in ``build_bundle``, up to the objective model's construction."""
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from specforge.application.composition import resolve_run
+        from specforge.config import load_config
+        from specforge.training.assembly import build_model_bundle
+        from specforge.training.model_loading import training_target_config
+        from tests.test_runtime.test_canonical_end_to_end import drafts, write_run
+
+        class Reached(Exception):
+            pass
+
+        received = {}
+
+        def construction(model, **arguments):
+            received.update(arguments)
+            raise Reached
+
+        groups = SequenceParallel("ring", "ulysses", lambda *statistics: statistics)
+        draft = next(d for d in drafts() if d.architecture == "Eagle3DraftModel")
+        with TemporaryDirectory() as temp:
+            cfg = load_config(
+                str(write_run(Path(temp), draft)),
+                [
+                    "training.attention_backend=usp",
+                    "training.sp_ring_size=2",
+                    "training.batch_size=1",
+                ],
+            )
+            resolved = resolve_run(cfg, None, target_config=training_target_config(cfg))
+            with (
+                patch(
+                    "specforge.training.sequence_parallel.sequence_parallel_groups",
+                    return_value=groups,
+                ),
+                patch(
+                    "specforge.algorithms.objectives.build_objective_model",
+                    construction,
+                ),
+                self.assertRaises(Reached),
+            ):
+                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+        self.assertEqual(received["attention_backend"], "usp")
+        self.assertIs(received["sequence_parallel"], groups)
 
     def test_trimming_is_skipped_when_statistics_cross_ranks(self):
         # Trimming leaves each sequence-parallel rank a different number of
