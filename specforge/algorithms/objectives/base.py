@@ -253,22 +253,40 @@ class ObjectiveModel(nn.Module):
             if key.startswith(prefix) and key[len(prefix) :] not in repeated
         }
 
-    def forward(
-        self, batch, *, step, total_steps, replay_values=None, prepass=False, **context
-    ):
+    def replay_arguments(self, replay_values):
+        """The forward's keyword arguments for a replayed micro-batch.
+
+        The value of the declared window statistic: the ratio of its sums over
+        the whole optimizer window and every rank, guarded against an empty
+        denominator and detached. A runner calls this outside its wrapper, so
+        the division is done in the precision the sums were pooled in and a
+        wrapper that casts the forward's inputs casts the ratio.
+
+        Args:
+            replay_values: The pooled sums by statistic name; empty outside a
+                replay.
+        """
+        statistic = (
+            self.registration.training.window_statistic if self.registration else None
+        )
+        if statistic is None or not replay_values:
+            return {}
+        numerator, denominator = replay_values[statistic.argument_name]
+        denominator = denominator.where(denominator > 0, 1)
+        return {statistic.argument_name: (numerator / denominator).detach()}
+
+    def forward(self, batch, *, step, total_steps, prepass=False, **context):
         """Run the objective on one batch.
 
         Args:
             batch: Captured batch tensors.
             step: Optimizer updates applied so far.
             total_steps: The schedule's horizon, or None.
-            replay_values: For an objective that declares a window statistic,
-                its sums over the whole optimizer window and every rank. The
-                ratio the objective uses, and its guard, are formed here.
             prepass: Collect the window statistic only: the objective runs
                 with the statistic's value at zero and the result carries this
                 rank's sums of it.
-            **context: Passed to the objective.
+            **context: Passed to the objective; in a replay, what
+                ``replay_arguments`` returned.
         """
         from .inputs import valid_tokens
 
@@ -278,10 +296,6 @@ class ObjectiveModel(nn.Module):
         if statistic is not None and prepass:
             device = next(self.parameters()).device
             context[statistic.argument_name] = torch.zeros((), device=device)
-        elif statistic is not None and replay_values:
-            numerator, denominator = replay_values[statistic.argument_name]
-            denominator = denominator.where(denominator > 0, 1)
-            context[statistic.argument_name] = (numerator / denominator).detach()
         valid_tokens(batch)
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
@@ -302,6 +316,16 @@ class ObjectiveModel(nn.Module):
         prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, **context
         )
+        if self.registration is not None:
+            declared = self.registration.training.reduction
+            if (prepared.reduction == "global_microbatch") != (
+                declared == "microbatch"
+            ):
+                # In evaluation no runner is there to notice.
+                raise ValueError(
+                    f"{self.objective_name} declares the {declared!r} reduction and "
+                    f"returned a {prepared.reduction!r} prediction batch"
+                )
         result = execute_batch(
             prepared,
             None,
