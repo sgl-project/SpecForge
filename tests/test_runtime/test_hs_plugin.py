@@ -198,6 +198,121 @@ class HSPluginTests(unittest.TestCase):
                 hs.shutdown()
                 self.runtimes.remove(hs)
 
+    def test_publication_trace_matches_reclamation_and_sibling(self):
+        from pathlib import Path
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        from specforge.runtime.data_plane.publication_timing import IDENTITY
+
+        deleting, unlock, trying, second_put, finish = (threading.Event() for _ in range(5))
+        class Backend(_FakeMooncakeStore):
+            def remove(self, key, **kwargs):
+                if '/seed/' in key and not deleting.is_set():
+                    deleting.set()
+                    if not unlock.wait(8):
+                        raise TimeoutError('fixture cleanup gate')
+                return super().remove(key)
+            def put_from(self, key, *args):
+                if '/second/' in key and not second_put.is_set():
+                    second_put.set()
+                    if not finish.wait(8):
+                        raise TimeoutError('fixture sibling gate')
+                return super().put_from(key, *args)
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {
+            'SPECFORGE_HS_REMOTE_LEDGER_DIR':root, 'SHORT_TEACHER_RUN_DIR':root,
+            'SPECFORGE_HS_REMOTE_BUDGET_BYTES':str(1<<24), 'SPECFORGE_HS_PUBLISH_TIMING':'1'}):
+            backend=Backend()
+            hs=self.runtime(store=backend,segmented=True)
+            def forward(names):
+                reqs=[self.request(hs,n,tokens=tuple(range(9)),layout='hs-prefix-v2') for n in names]
+                for req in reqs:
+                    self.admit(hs,req,lawful=0)
+                self.forward(hs,reqs,[9]*len(reqs),wait_materialize=True)
+                hs.poll()
+                return reqs
+            seed,=forward(['seed'])
+            self.spin(hs,lambda:hs.deferred[0][1].done())
+            owner=hs.capture.sink._manifest_owner
+            real_lock=owner.lock
+            class NotifyLock:
+                def __enter__(self):
+                    if deleting.is_set() and threading.current_thread().name.startswith('spec-capture-batch-put'):
+                        trying.set()
+                    return real_lock.__enter__()
+                def __exit__(self,*args):
+                    return real_lock.__exit__(*args)
+            owner.lock=NotifyLock()
+            def ack(req):
+                next(f for r,f in hs.deferred if r is req).result()
+                manifest=hs.capture.results[req.rid]['segment_manifest']
+                hs.capture.sink._managed_put({manifest['ack_key']:torch.tensor(list(bytes.fromhex(manifest['digest'])),dtype=torch.uint8)})
+                return manifest['receipt_key']
+            receipts=[ack(seed)]
+            try:
+                self.assertTrue(deleting.wait(5))
+                first,second=forward(['first','second'])
+                self.assertTrue(trying.wait(5))
+                unlock.set()
+                self.assertTrue(second_put.wait(5))
+                self.assertFalse(hs.deferred[1][1].done())
+                self.assertFalse(hs.deferred[2][1].done())
+            finally:
+                unlock.set()
+                finish.set()
+            self.spin(hs,lambda:all(f.done() for _,f in hs.deferred))
+            receipts.extend(ack(req) for req in (first,second))
+            owner.progress()
+            for key in receipts:
+                self.assertTrue(backend.is_exist(key))
+                backend.remove(key)
+            owner.progress()
+            hs.shutdown()
+            self.runtimes.remove(hs)
+            path,=Path(root).glob('publication-timing-*.jsonl')
+            packets=[json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(packets[-1]['final'])
+            self.assertTrue(all(p['dropped']==0 for p in packets))
+            rows=[r for p in packets for r in p['rows']]
+            holds={r['identity']['sample_id']:r for r in rows if r.get('phase')=='publish'}
+            one,two=holds['first'],holds['second']
+            batch=one['sample'][0]
+            self.assertEqual(one['sample'],[batch,0])
+            self.assertEqual(two['sample'],[batch,1])
+            for req,h in [(first,one),(second,two)]:
+                result=hs.capture.results[req.rid]
+                self.assertEqual(h['identity'],{k:result[k] for k in IDENTITY})
+                self.assertEqual(h['owner'],result['segment_manifest']['owner_epoch'])
+                for name in ('ledger_reserve','ledger_state','native_register','native_put','native_unregister'):
+                    self.assertGreater(h['component_ns'][name],0)
+                obs,=[r for r in rows if r['event']=='observed' and r['identity']==h['identity']]
+                self.assertEqual([obs['batch'],obs['index']],h['sample'])
+            self.assertLessEqual(one['end_ns'],two['acquired_ns'])
+            returned,=[r['ns'] for r in rows if r['event']=='batch_return' and r['batch']==batch]
+            self.assertGreaterEqual(returned,two['end_ns'])
+            self.assertTrue(any(r.get('phase')=='progress' and r['owner']==one['owner']
+                                and r['acquired_ns']<=one['attempt_ns']<r['end_ns']<=one['acquired_ns']
+                                and r['component_ns'].get('native_remove',0)>0
+                                and r['component_ns'].get('ledger_forget',0)>0 for r in rows))
+            if os.environ.get('CPU_TIMING_EXAMPLE'):
+                Path(os.environ['CPU_TIMING_EXAMPLE']).write_bytes(path.read_bytes())
+
+    def test_publication_trace_is_off_by_default(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop('SPECFORGE_HS_PUBLISH_TIMING',None)
+            writer=sink.SpecCaptureSink([1,3])
+            self.assertIsNone(writer._publish_trace)
+            writer.close()
+
+    def test_publication_trace_full_buffer_reports_loss(self):
+        from specforge.runtime.data_plane.publication_timing import PublicationTrace
+        with tempfile.TemporaryDirectory() as root:
+            trace=PublicationTrace(root,limit=0)
+            trace.emit('enqueue',batch='discarded',count=1,ns=time.monotonic_ns())
+            trace.close()
+            packet=json.loads(trace.path.read_text())
+            self.assertTrue(packet['final'])
+            self.assertEqual(packet['dropped'],1)
+            self.assertEqual(packet['rows'],[])
+
     def test_committed_proposal_H_survives_shrink_into_wire_manifest(self):
         from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {

@@ -35,6 +35,7 @@ import select
 import socket
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -331,6 +332,12 @@ class SpecCaptureSink:
         self._uncertain_lock = threading.Lock()
         self._closed = False
         self.require_hard_pin = False
+        self._publish_trace = None
+        if os.environ.get("SPECFORGE_HS_PUBLISH_TIMING") == "1":
+            from specforge.runtime.data_plane.publication_timing import PublicationTrace
+            root = os.environ.get("SHORT_TEACHER_RUN_DIR") or os.environ.get("SPECFORGE_HS_REMOTE_LEDGER_DIR")
+            if root:
+                self._publish_trace = PublicationTrace(root)
         self._manifest_owner = None
         self._manifest_owner_lock = threading.Lock()
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
@@ -599,6 +606,8 @@ class SpecCaptureSink:
             raise RuntimeError("capture sink retains native writes whose drain is unproven")
         if self._manifest_owner is not None:
             self._manifest_owner.close()
+        if self._publish_trace is not None:
+            self._publish_trace.close()
         if self._control_listener is not None and self._nvlink is None:
             self._control_listener.close()
         if self._owns_store and self._store is not None:
@@ -611,6 +620,9 @@ class SpecCaptureSink:
         if not objects:
             return
         store = self._connect()
+        if self._publish_trace is not None:
+            from specforge.runtime.data_plane.publication_timing import TimedCalls, NATIVE
+            store = TimedCalls(store, self._publish_trace, NATIVE)
         registered, submitted, uncertain = [], False, False
         tensors = list(objects.values())
         keys = list(objects)
@@ -667,7 +679,7 @@ class SpecCaptureSink:
                 store = self._connect()
                 self._manifest_owner = RemoteManifestOwner(
                     store, self._managed_put, directory=directory, capacity=budget,
-                    hard_pin=getattr(self._put_config, 'with_hard_pin', False) is True)
+                    hard_pin=getattr(self._put_config, 'with_hard_pin', False) is True, trace=self._publish_trace)
             return self._manifest_owner
 
     def manifest_stats(self):
@@ -678,11 +690,19 @@ class SpecCaptureSink:
             raise RuntimeError('capture sink is closed')
         owned = list(samples)
         samples.clear()
+        trace = self._publish_trace
+        batch = uuid.uuid4().hex if trace else None
+        if trace:
+            trace.emit('enqueue', batch=batch, count=len(owned), ns=time.monotonic_ns())
         def publish():
+            if trace:
+                trace.emit('batch_start', batch=batch, ns=time.monotonic_ns())
             try:
                 owner = self._get_manifest_owner()
                 results = []
-                for spec, sample, schema, namespace in owned:
+                for index, (spec, sample, schema, namespace) in enumerate(owned):
+                    if trace:
+                        trace.local.sample = (batch, index)
                     # Explicit full-object fallback still uses the same owner/ledger.
                     if os.environ.get('SPECFORGE_HS_SEGMENT_FORCE_FULL', '0') == '1':
                         from types import SimpleNamespace
@@ -699,7 +719,14 @@ class SpecCaptureSink:
                 return results
             finally:
                 owned.clear()
-        return self._executor.submit(publish)
+                if trace:
+                    trace.local.sample = None
+                    trace.emit('batch_return', batch=batch, ns=time.monotonic_ns())
+        future = self._executor.submit(publish)
+        if trace:
+            future.publication_timing = (trace, batch)
+            future.add_done_callback(lambda _: trace.emit('future_done', batch=batch, ns=time.monotonic_ns()))
+        return future
 
     def put_samples(self, samples: List[Sample]) -> List[Dict[str, Any]]:
         """Publish samples with one batched Mooncake call; return their results.

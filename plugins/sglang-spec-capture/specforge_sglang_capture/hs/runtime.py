@@ -769,7 +769,13 @@ class HSCaptureRuntime:
         for job in tuple(self.jobs.values()):
             if job.sink is None or not job.sink.done() or job.cleanup is not None:
                 continue
-            observed_ns = time.monotonic_ns() if job.diagnostic is not None else 0
+            timing = getattr(job.sink, 'publication_timing', None)
+            observed_ns = time.monotonic_ns() if timing or job.diagnostic is not None else 0
+            if timing:
+                trace, batch = timing
+                from specforge.runtime.data_plane.publication_timing import IDENTITY
+                trace.emit('observed', batch=batch, index=job.sink_index, ns=observed_ns,
+                           identity={k:job.spec.get(k) for k in IDENTITY})
             try:
                 results = job.sink.result()
                 if len(results) != job.sink_count:

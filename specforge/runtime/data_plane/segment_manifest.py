@@ -243,12 +243,17 @@ class RemoteManifestOwner:
     through the object store. A receipt waits only for objects whose *last*
     dependency this ACK removed, never for a later manifest's completion.
     """
-    def __init__(self, store, put, *, directory, capacity, hard_pin):
+    def __init__(self, store, put, *, directory, capacity, hard_pin, trace=None):
         if hard_pin is not True:
             raise RuntimeError('segmented publication requires verified native hard pin')
         self.store, self.put = store, put
         self.epoch = uuid.uuid4().hex
         self.ledger = RemoteObjectLedger(directory, capacity, self.epoch)
+        self.trace = trace
+        if trace is not None:
+            from .publication_timing import TimedCalls, NATIVE, LEDGER
+            self.store = TimedCalls(self.store, trace, NATIVE)
+            self.ledger = TimedCalls(self.ledger, trace, LEDGER)
         self.lock = threading.RLock()
         self.objects, self.manifests = {}, {}
         self.stats = dict.fromkeys(('manifest_published', 'manifest_dependencies', 'block_new',
@@ -316,7 +321,8 @@ class RemoteManifestOwner:
                     raise RuntimeError(f'protected shared block verification failed: {key} status={result!r}')
 
     def publish(self, spec, sample, schema, namespace, sample_key):
-        with self.lock, self._timed('publish_service_ns'):
+        lock = self.trace.hold(self.lock, self.epoch, 'publish', spec) if self.trace else self.lock
+        with lock, self._timed('publish_service_ns'):
             if self.error:
                 raise self.error
             token = str(spec['reservation_token'])
@@ -457,7 +463,7 @@ class RemoteManifestOwner:
             self.ledger.state(rec['delete'], 'DELETING')
 
     def cancel(self, token):
-        with self.lock:
+        with (self.trace.hold(self.lock, self.epoch, 'cancel') if self.trace else self.lock):
             rec = self.manifests.get(token)
             if rec is None:
                 return
@@ -500,15 +506,21 @@ class RemoteManifestOwner:
                 self.ledger.state([rec['ack_key']], 'QUARANTINED')
 
     def progress(self):
-        with self.lock:
+        with (self.trace.hold(self.lock, self.epoch, 'progress') if self.trace else self.lock):
             for token, rec in tuple(self.manifests.items()):
+                if self.trace:
+                    self.trace.end_cleanup()
                 if rec['phase'] == 'READY' and int(self.store.is_exist(rec['ack_key'])) == 1:
+                    if self.trace:
+                        self.trace.begin_cleanup(token)
                     self._ack_matches(rec)
                     self.ledger.state([rec['ack_key']], 'READY')
                     self._detach(token, rec)
                     rec['phase'] = 'ACKED'
                     self.stats['manifest_acked'] += 1
                 if rec['phase'] in ('ACKED', 'ABORTED'):
+                    if self.trace:
+                        self.trace.begin_cleanup(token)
                     for key in tuple(rec['delete']):
                         if self._absent_after_remove(key):
                             self.ledger.forget(key)
@@ -534,13 +546,17 @@ class RemoteManifestOwner:
                     self.ledger.state([rec['receipt_key']], 'READY')
                     rec['phase'] = 'RECEIPT'
                 elif rec['phase'] == 'RECEIPT' and int(self.store.is_exist(rec['receipt_key'])) == 0:
+                    if self.trace:
+                        self.trace.begin_cleanup(token)
                     self.ledger.forget(rec['receipt_key'])
                     self.manifests.pop(token)
                     self.stats['receipt_completed'] += 1
 
     def health(self):
         with self.lock:
-            return {**self.stats, **self.ledger.health(), 'active_manifests': len(self.manifests),
+            return {**self.stats, **self.ledger.health(),
+                    **({'publication_trace_dropped':self.trace.dropped, 'publication_trace_write_errors':self.trace.write_errors}
+                       if self.trace else {}), 'active_manifests': len(self.manifests),
                     'active_shared_objects': len(self.objects),
                     'active_dependencies': sum(len(obj['dependencies']) for obj in self.objects.values()),
                     'owner_epoch': self.epoch, 'owner_error': str(self.error) if self.error else None,
