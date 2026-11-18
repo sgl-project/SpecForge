@@ -555,6 +555,8 @@ def build_bundle(cfg, algorithm):
         **_objective_settings(cfg),
         frozen=cfg.training.frozen,
         target_head=teacher,
+        frozen_modules=[model.get_submodule(name) for name in draft.target_bindings]
+        + ([teacher] if teacher is not None else []),
     )
     runtime.attention_backend = cfg.training.attention_backend
     if cfg.training.attention_backend == "usp":
