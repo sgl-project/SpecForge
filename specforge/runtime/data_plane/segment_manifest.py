@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -237,7 +238,10 @@ class RemoteManifestOwner:
         self.stats = dict.fromkeys(('manifest_published', 'manifest_dependencies', 'block_new',
                                     'block_reused', 'logical_feature_bytes', 'physical_put_bytes',
                                     'manifest_acked', 'receipt_completed', 'publication_failures',
-                                    'ready_manifest_cancelled'), 0)
+                                    'ready_manifest_cancelled', 'ready_descriptors', 'ready_unique_keys',
+                                    'ready_batch_calls', 'ready_scalar_calls', 'ready_probe_ns',
+                                    'attach_visits', 'detach_visits', 'detach_calls', 'attach_ns',
+                                    'detach_ns', 'publish_service_ns'), 0)
         self.stop = threading.Event()
         self.error = None
         self.closed = False
@@ -266,8 +270,37 @@ class RemoteManifestOwner:
         except Exception:
             return False
 
+    @contextmanager
+    def _timed(self, counter):
+        start = time.monotonic_ns()
+        try:
+            yield
+        finally:
+            self.stats[counter] += time.monotonic_ns() - start
+
+    def _verify_ready(self, keys):
+        if not keys:
+            return
+        self.stats['ready_unique_keys'] += len(keys)
+        with self._timed('ready_probe_ns'):
+            missing = object()
+            batch = getattr(self.store, 'batch_is_exist', missing)
+            if batch is missing:
+                for key in keys:
+                    self.stats['ready_scalar_calls'] += 1
+                    if int(self.store.is_exist(key)) != 1:
+                        raise RuntimeError(f'protected shared block disappeared: {key}')
+                return
+            self.stats['ready_batch_calls'] += 1
+            results = batch(keys)
+            if not isinstance(results, list) or len(results) != len(keys):
+                raise RuntimeError('protected shared block batch result length/type mismatch')
+            for key, result in zip(keys, results):
+                if type(result) is not int or result != 1:
+                    raise RuntimeError(f'protected shared block verification failed: {key} status={result!r}')
+
     def publish(self, spec, sample, schema, namespace, sample_key):
-        with self.lock:
+        with self.lock, self._timed('publish_service_ns'):
             if self.error:
                 raise self.error
             token = str(spec['reservation_token'])
@@ -275,7 +308,9 @@ class RemoteManifestOwner:
                 raise ValueError('manifest attempt already published')
             base = sample_key(spec, '__manifest').rsplit('/', 1)[0]
             ack_key, receipt_key = base + '/__segment_ack', base + '/__segment_receipt'
-            new, dependencies, features = {}, set(), {}
+            new, dependencies, features = {}, {}, {}
+            ready_keys = {}
+            reused = 0
             tensors = {}
             full_bytes = 0
             layout = spec.get('feature_layout', MANIFEST_LAYOUT)
@@ -298,9 +333,10 @@ class RemoteManifestOwner:
                     full_bytes += nbytes
                     obj = self.objects.get(logical)
                     if obj is not None and obj['state'] == 'READY':
-                        if int(self.store.is_exist(obj['key'])) != 1:
-                            raise RuntimeError('protected shared block disappeared; remote owner cannot recover old manifests')
-                        self.stats['block_reused'] += 1
+                        reused += 1
+                        ready_keys[obj['key']] = None
+                    elif logical in new:
+                        obj = new[logical]
                     else:
                         generation = uuid.uuid4().hex
                         key = 'specforge-hs-block/' + hashlib.sha256(logical.encode()).hexdigest() + '/' + generation
@@ -308,7 +344,7 @@ class RemoteManifestOwner:
                                'state': 'WRITING', 'dependencies': set(), 'logical': logical}
                         new[logical] = obj
                         tensors[key] = tensor
-                    dependencies.add(obj['key'])
+                    dependencies[obj['key']] = obj
                     descriptors.append({'logical_key': logical, 'key': obj['key'],
                                         'publication_generation': obj['generation'],
                                         'start': start, 'end': end,
@@ -317,6 +353,9 @@ class RemoteManifestOwner:
                                         'shape': list(tensor.shape), 'dtype': feature.dtype,
                                         'nbytes': nbytes})
                 features[name] = descriptors
+            self.stats['ready_descriptors'] += reused
+            self._verify_ready(list(ready_keys))
+            self.stats['block_reused'] += reused
             manifest = {**(header or {}), 'layout': layout, 'namespace': namespace,
                         'owner_epoch': self.epoch, 'token': token, 'features': features,
                         'schema_signature': schema.signature,
@@ -344,8 +383,9 @@ class RemoteManifestOwner:
             self.manifests[token] = rec
             for logical, obj in new.items():
                 self.objects[logical] = obj
-            for obj in self.objects.values():
-                if obj['key'] in dependencies:
+            with self._timed('attach_ns'):
+                self.stats['attach_visits'] += len(dependencies)
+                for obj in dependencies.values():
                     obj['dependencies'].add(token)
             try:
                 block_tensors = {obj['key']: tensors[obj['key']] for obj in new.values()}
@@ -384,17 +424,21 @@ class RemoteManifestOwner:
                     'feature_layout': layout, 'segment_manifest': manifest}
 
     def _detach(self, token, rec):
-        rec['delete'].update(rec['private'])
-        rec['delete'].add(rec['ack_key'])
-        for logical, obj in tuple(self.objects.items()):
-            if token in obj['dependencies']:
+        with self._timed('detach_ns'):
+            rec['delete'].update(rec['private'])
+            rec['delete'].add(rec['ack_key'])
+            self.stats['detach_calls'] += 1
+            self.stats['detach_visits'] += len(rec['dependencies'])
+            for physical_key, obj in rec['dependencies'].items():
                 obj['dependencies'].remove(token)
                 if not obj['dependencies']:
                     obj['state'] = 'DELETING'
-                    rec['delete'].add(obj['key'])
-                    # A subsequent manifest gets a different physical generation.
-                    self.objects.pop(logical)
-        self.ledger.state(rec['delete'], 'DELETING')
+                    rec['delete'].add(physical_key)
+                    logical = obj['logical']
+                    if self.objects.get(logical) is obj:
+                        del self.objects[logical]
+            rec['dependencies'].clear()
+            self.ledger.state(rec['delete'], 'DELETING')
 
     def cancel(self, token):
         with self.lock:
