@@ -105,14 +105,11 @@ def moe_draft_config(intermediate_size=16):
     )
 
 
-def moe_run_config(target, draft, bias_update_rate=0.0):
+def moe_run_config(target, draft, bias_update_rate=0.0, aux_loss_coef=0.0):
     return run_config(
         target,
         draft,
-        model={
-            "target_model_path": str(target),
-            "torch_dtype": "float32",
-        },
+        model={"target_model_path": str(target), "torch_dtype": "float32"},
         training={
             "attention_backend": "eager",
             "max_steps": 1,
@@ -122,7 +119,9 @@ def moe_run_config(target, draft, bias_update_rate=0.0):
             "objective_options": {
                 "num_anchors": 2,
                 "bias_update_rate": bias_update_rate,
+                "aux_loss_type": "batch_wise",
             },
+            "loss": {"terms": {"moe_balance": {"coefficient": aux_loss_coef}}},
         },
     )
 
@@ -595,12 +594,12 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
 
-    def _train_and_resume_moe(self, root, bias_update_rate=0.0):
+    def _train_and_resume_moe(self, root, bias_update_rate=0.0, aux_loss_coef=0.0):
         self._init_group(root)
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, bias_update_rate)
+        cfg = moe_run_config(target, draft, bias_update_rate, aux_loss_coef)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
@@ -643,6 +642,17 @@ class CanonicalTrainingTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
             build_application_run(Config.model_validate(raw)).run()
+        # The balance term's coefficient is part of the named loss record; turning
+        # the term on also brings the statistics' settings into the record.
+        raw["training"]["objective_options"]["bias_update_rate"] = bias_update_rate
+        raw["training"]["loss"]["terms"]["moe_balance"]["coefficient"] = (
+            0.0 if aux_loss_coef else 0.01
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical_loss" if aux_loss_coef else "canonical_objective_options",
+        ):
+            build_application_run(Config.model_validate(raw)).run()
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
@@ -674,10 +684,21 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertTrue(
                 set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
             )
+            # A record from before the balance term existed resumes with it off.
+            terms = state["canonical_loss"]["terms"]
+            self.assertEqual(terms["moe_balance"]["coefficient"], 0.0)
+            old = {
+                **state,
+                "canonical_loss": {
+                    **state["canonical_loss"],
+                    "terms": {k: v for k, v in terms.items() if k != "moe_balance"},
+                },
+            }
+            torch.save(old, checkpoint / "training_state.pt")
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(checkpoint))
             raw["training"]["max_steps"] = 2
-            raw["training"]["objective_options"].update(bias_update_rate=0.0)
+            raw["training"]["objective_options"].update(aux_loss_type="microbatch_wise")
             build_application_run(Config.model_validate(raw)).run()
             final = torch.load(
                 root / "output" / "specforge-run-step2" / "training_state.pt",
@@ -688,9 +709,11 @@ class CanonicalTrainingTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_moe_draft_trains_saves_and_resumes(self):
-        # The bias moves, is saved and moves again after resume.
+        # The bias moves, is saved and moves again after resume; the term is on.
         with TemporaryDirectory() as temp:
-            self._train_and_resume_moe(Path(temp), bias_update_rate=0.001)
+            self._train_and_resume_moe(
+                Path(temp), bias_update_rate=0.001, aux_loss_coef=0.01
+            )
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model
