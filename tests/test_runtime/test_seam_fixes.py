@@ -122,6 +122,7 @@ class TestParallelConfigHandles(unittest.TestCase):
 
 
 class _FakeBackend(TrainingBackend):
+    process_group = None
     name = "fake"
 
     def __init__(self, model):

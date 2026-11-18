@@ -53,6 +53,20 @@ class RecordingRunner:
         return values.mul_(2)
 
 
+class StepMetricsTest(unittest.TestCase):
+    def test_gradient_norm_is_the_optimizers_only(self):
+        reported = StepMetrics({"loss": 1.0, "grad_norm": 42.0})
+        self.assertIsNone(reported.grad_norm)
+        measured = StepMetrics({"loss": 1.0, "grad_norm": 0.5}, has_grad_norm=True)
+        self.assertEqual(measured.grad_norm, 0.5)
+
+    def test_learning_rate_is_converted_on_access(self):
+        self.assertIsNone(StepMetrics({}).learning_rate)
+        rate = StepMetrics({}, learning_rate=torch.tensor(0.25)).learning_rate
+        self.assertIsInstance(rate, float)
+        self.assertEqual(rate, 0.25)
+
+
 class RunWindowTest(unittest.TestCase):
     def test_hands_each_micro_batch_over_as_it_arrives(self):
         runner = RecordingRunner()
@@ -111,6 +125,18 @@ class RunWindowTest(unittest.TestCase):
         with self.assertRaisesRegex(IncompleteWindow, "received 1 of 2"):
             run_window(runner, [batch(1)], StepContext(accumulation_steps=2))
         self.assertNotIn("apply_step", [call[0] for call in runner.calls])
+
+    def test_boundary_without_a_step_is_refused(self):
+        class ForgetfulRunner(RecordingRunner):
+            def forward_backward(self, batch, ctx, *, is_boundary):
+                super().forward_backward(batch, ctx, is_boundary=is_boundary)
+
+        for statistics in ((), ("count",)):
+            with self.subTest(replay_statistics=statistics):
+                runner = ForgetfulRunner(replay_statistics=statistics)
+                with self.assertRaisesRegex(RuntimeError, "no step for the window"):
+                    run_window(runner, [batch(1)], StepContext())
+                self.assertNotIn("apply_step", [call[0] for call in runner.calls])
 
     def test_window_longer_than_the_accumulation_is_refused(self):
         for statistics in ((), ("count",)):
@@ -193,6 +219,32 @@ class RunnerRefusalTest(unittest.TestCase):
             runner.forward_backward(
                 batch(2), StepContext(accumulation_steps=2), is_boundary=True
             )
+
+    def test_replayed_window_keeps_the_length_of_its_first_prepass(self):
+        runner = runner_over(_ReplayStrategy())
+        runner.prepass(batch(1), StepContext(accumulation_steps=3))
+        with self.assertRaisesRegex(RuntimeError, "accumulates 3 micro-batches"):
+            runner.prepass(batch(2), StepContext(accumulation_steps=2))
+
+    def test_malformed_metric_raises_before_the_update(self):
+        class Strategy(_Strategy):
+            def forward_loss(self, batch, ctx=None):
+                output = super().forward_loss(batch, ctx)
+                count = torch.ones(())
+                return replace(
+                    output,
+                    ratio_metrics={"seen": (count, count)},
+                    sum_metrics={"seen": count},
+                )
+
+        strategy = Strategy()
+        runner = runner_over(strategy)
+        before = strategy.model.weight.detach().clone()
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            run_window(runner, [batch(1), batch(2)], StepContext(accumulation_steps=2))
+        # Found at the first micro-batch: no backward, no optimizer step.
+        self.assertIsNone(strategy.model.weight.grad)
+        torch.testing.assert_close(strategy.model.weight, before, rtol=0, atol=0)
 
     def test_failed_step_blocks_the_next_window(self):
         class Strategy(_Strategy):

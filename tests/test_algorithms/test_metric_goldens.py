@@ -102,6 +102,7 @@ ROLLOUT_DEPTHS = 3
 class NullBackend(TrainingBackend):
     """Runs the trainer's metric reduction without gradients or an optimizer."""
 
+    process_group = None
     name = "null"
 
     def prepare_model(self, model):

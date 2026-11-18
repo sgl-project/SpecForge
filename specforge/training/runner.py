@@ -238,6 +238,7 @@ class DataParallelRunner:
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
+        self._hold_window_length(ctx, opening=not self._prepass_rng)
         device = next(self.strategy.trainable_module().parameters()).device
         accelerator = None
         if device.type != "cpu":
@@ -258,13 +259,9 @@ class DataParallelRunner:
             raise RuntimeError(
                 "the previous window's optimizer step has not been applied"
             )
-        if self._micro == 0:
-            self._window_steps = ctx.accumulation_steps
-        elif ctx.accumulation_steps != self._window_steps:
-            raise RuntimeError(
-                f"the open window accumulates {self._window_steps} micro-batches, "
-                f"not {ctx.accumulation_steps}"
-            )
+        self._hold_window_length(
+            ctx, opening=self._micro == 0 and not self._prepass_rng
+        )
         remaining = ctx.accumulation_steps - self._micro
         if self.replay_statistics:
             # A program that declares a replay statistic has no other gradient
@@ -303,6 +300,16 @@ class DataParallelRunner:
                     numerator.detach().reshape(()),
                     denominator.detach().reshape(()),
                 )
+            # Reduced locally only for its checks of names and shapes: found
+            # at the boundary, a malformed metric would raise after the update
+            # was applied and before it was counted or acknowledged.
+            _reduce_ratio_metrics(
+                ratio_metrics,
+                device=out.loss.device,
+                process_group=None,
+                reduce=False,
+                sums=out.sum_metrics,
+            )
             self._accumulate_ratio_metrics(ratio_metrics)
             for name, value in out.sum_metrics.items():
                 self._sum_totals[name] = (
@@ -387,7 +394,11 @@ class DataParallelRunner:
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm)
             )
-        return StepMetrics(metrics, learning_rate=self.backend.learning_rate())
+        return StepMetrics(
+            metrics,
+            has_grad_norm=grad_norm is not None,
+            learning_rate=self.backend.learning_rate(),
+        )
 
     @staticmethod
     def _scalar_metrics(window: _Window, *, reduced: Dict[str, Any]) -> Dict[str, Any]:
@@ -414,6 +425,16 @@ class DataParallelRunner:
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
                 scalars[key] = float(value)
         return scalars
+
+    def _hold_window_length(self, ctx: StepContext, *, opening: bool) -> None:
+        """Keep the length the window's first call gave it, prepass or backward."""
+        if opening:
+            self._window_steps = ctx.accumulation_steps
+        elif ctx.accumulation_steps != self._window_steps:
+            raise RuntimeError(
+                f"the open window accumulates {self._window_steps} micro-batches, "
+                f"not {ctx.accumulation_steps}"
+            )
 
     @contextlib.contextmanager
     def _replayed_rng(self):
