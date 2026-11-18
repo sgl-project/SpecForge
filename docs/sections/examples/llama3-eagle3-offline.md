@@ -16,7 +16,7 @@ Feature preparation is a data-processing step, not a second training entry
 point:
 
 Start the plugin server and Mooncake as described in the
-[offline capture guide](../../../examples/offline/README.md), using the same
+[offline capture guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), using the same
 Llama target and EAGLE3 layer IDs. Then run the CPU preparation client:
 
 ```bash
@@ -68,7 +68,7 @@ For long sequences, EAGLE3 offline can instead use USP by setting
 `training.sp_ulysses_size`/`training.sp_ring_size`. Offline feature training
 also supports DFlash, DFlash2, Domino, and DSpark when the feature
 checkpoints and draft config use that strategy's contract.
-`training.compact_teacher: true` enables
+`training.loss.execution.teacher_chunk_size: 32768` enables
 the exact lower-memory teacher projection for offline text EAGLE3. See
 [Parallel topologies](../basic_usage/training.md#parallel-topologies) for the
 multi-process launch contract.

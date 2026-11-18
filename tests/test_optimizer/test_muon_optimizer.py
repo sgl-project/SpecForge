@@ -568,15 +568,11 @@ class TestAdamWPathUnchanged(_ProcessGroup, unittest.TestCase):
 
 
 class TestFactoryAndSchema(unittest.TestCase):
-    MINIMAL = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft.json"},
-        "data": {"hidden_states_path": "/features"},
-    }
-
     def _config(self, **training):
         from specforge.config import Config
+        from tests.test_config.test_schema import MINIMAL
 
-        payload = copy.deepcopy(self.MINIMAL)
+        payload = copy.deepcopy(MINIMAL)
         payload["training"] = {"max_steps": TOTAL, "learning_rate": LR, **training}
         return Config.model_validate(payload)
 
@@ -678,75 +674,82 @@ class TestFactoryAndSchema(unittest.TestCase):
 
 
 class TestRealDrafts(unittest.TestCase):
-    """The rule on the shipped DFlash-family drafts."""
+    """The rule on the canonical drafts the trainer builds."""
+
+    LAYER_MATRICES = (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    )
+
+    def _layout(self, config):
+        from specforge.modeling import build_draft_model
+
+        return capture_parameter_layout(build_draft_model(config))
+
+    def _layer_matrices(self, layers):
+        return {
+            f"backbone.layers.{i}.{name}.weight"
+            for i in range(layers)
+            for name in self.LAYER_MATRICES
+        }
+
+    def test_domino_backbone_on_muon_gru_head_on_adamw(self):
+        from tests.test_modeling.test_canonical_domino import model_config
+
+        layout = self._layout(model_config())
+        muon = {name for name, info in layout.items() if info.muon}
+        self.assertEqual(muon, self._layer_matrices(2))
+        for name in (
+            "fusion.fc.weight",
+            "lm_head.weight",
+            "gru_head.prefix_gru.weight_ih_l0",
+            "gru_head.embed_proj.0.weight",
+            "gru_head.embed_proj.2.weight",
+        ):
+            self.assertFalse(layout[name].muon, name)
 
     def test_dspark_backbone_on_muon_heads_on_adamw(self):
-        from transformers import Qwen3Config
+        from tests.test_modeling.test_canonical_dspark import model_config
 
-        from specforge.modeling.draft.dspark import DSparkDraftModel
-
-        config = Qwen3Config(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=4,
-            max_position_embeddings=128,
-            block_size=4,
-            num_target_layers=4,
-            dflash_config={
-                "attention_mode": "gqa",
-                "projector_type": "dspark",
-                "target_layer_ids": [0],
-                "markov_rank": 4,
-                "markov_head_type": "vanilla",
-                "enable_confidence_head": True,
-                "confidence_head_with_markov": True,
-            },
-        )
-        layout = capture_parameter_layout(DSparkDraftModel(config))
+        layout = self._layout(model_config())
         muon = {name for name, info in layout.items() if info.muon}
-        self.assertEqual(
-            muon,
-            {
-                f"layers.{i}.{name}.weight"
-                for i in range(2)
-                for name in (
-                    "self_attn.q_proj",
-                    "self_attn.k_proj",
-                    "self_attn.v_proj",
-                    "self_attn.o_proj",
-                    "mlp.gate_proj",
-                    "mlp.up_proj",
-                    "mlp.down_proj",
-                )
-            },
-        )
+        self.assertEqual(muon, self._layer_matrices(2))
         for name in (
-            "fc.weight",
+            "fusion.fc.weight",
             "markov_head.markov_w2.weight",
+            "markov_head.joint_proj.weight",
             "confidence_head.proj.weight",
         ):
             self.assertFalse(layout[name].muon, name)
 
-    def test_dflash2_layer_convolutions_on_muon_selector_on_adamw(self):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test_modeling"))
-        from test_dflash2 import _tiny_config
+    def test_eagle3_backbone_on_muon_fusion_and_heads_on_adamw(self):
+        from tests.test_modeling.test_canonical_eagle3 import model_config
 
-        from specforge.modeling.draft.dflash2 import DFlash2DraftModel
-
-        layout = capture_parameter_layout(DFlash2DraftModel(_tiny_config()))
+        layout = self._layout(model_config())
         muon = {name for name, info in layout.items() if info.muon}
-        self.assertIn("layers.0.self_attn.q_proj.weight", muon)
-        self.assertIn("layers.0.mlp.down_proj.weight", muon)
+        self.assertEqual(muon, self._layer_matrices(1))
+        for name in ("fusion.fc.weight", "embed_tokens.weight", "lm_head.weight"):
+            self.assertFalse(layout[name].muon, name)
+
+    def test_dflash2_layer_convolutions_on_muon_selector_on_adamw(self):
+        from tests.test_modeling.test_canonical_dflash2 import dflash2_config
+
+        layout = self._layout(dflash2_config())
+        muon = {name for name, info in layout.items() if info.muon}
+        self.assertLessEqual(self._layer_matrices(2), muon)
         # Zero-initialized per-layer convolution projections are layer matrices.
-        self.assertIn("layers.0.attention_conv.kernel_projection.weight", muon)
-        self.assertIn("layers.0.mlp_conv.kernel_projection.weight", muon)
+        convolutions = {
+            name for name in muon if name.endswith("conv.kernel_projection.weight")
+        }
+        self.assertTrue(convolutions)
+        self.assertEqual(muon, self._layer_matrices(2) | convolutions)
         for name in (
-            "fc.weight",
-            "layers.0.attention_conv.base_kernel",
+            "fusion.fc.weight",
             "candidate_selector.hidden_projection.weight",
             "candidate_selector.predecessor_codebook",
             "candidate_selector.successor_codebook",

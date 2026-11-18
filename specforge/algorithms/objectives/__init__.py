@@ -1,25 +1,26 @@
 """Canonical objectives, independent of launch topology and file formats."""
 
-from . import (  # noqa: F401
-    dflash,
-    dflash2,
-    dmtp,
-    domino,
-    dspark,
-    dspine,
-    eagle3,
-    mtp,
-    peagle,
-)
+from . import protocols  # noqa: F401
 from .base import ObjectiveModel, ObjectiveResult
-from .losses import register_loss
-from .predictions import LossTerm, PredictionBatch, Predictions
+from .computation import LossComputation
+from .configuration import LossDefinition
+from .implementations.registry import (
+    compute_loss,
+    implementation_registrations,
+    register_implementation,
+)
+from .implementations.token_kernels import register_token_kernel
+from .losses import LossOutput, loss_registrations, register_loss
+from .plan import LossPlan, LossTerm
+from .predictions import PredictionBatch, Predictions
+from .projection import DominoSuffixProjection, LinearProjection, Projection
 from .registry import (
     TrainingRequirements,
     WindowStatistic,
     build_objective_model,
     default_objective,
     default_protocol,
+    objective_record,
     objective_registrations,
     protocol_registrations,
     register_objective,
@@ -34,14 +35,27 @@ __all__ = [
     "ObjectiveResult",
     "build_objective_model",
     "default_objective",
+    "objective_record",
     "objective_registrations",
     "register_objective",
     "register_loss",
+    "loss_registrations",
+    "register_implementation",
+    "compute_loss",
+    "implementation_registrations",
+    "register_token_kernel",
     "register_protocol",
     "resolve_objective",
     "protocol_registrations",
     "default_protocol",
     "Predictions",
     "PredictionBatch",
+    "LossOutput",
+    "LossComputation",
+    "LossDefinition",
     "LossTerm",
+    "LossPlan",
+    "Projection",
+    "LinearProjection",
+    "DominoSuffixProjection",
 ]

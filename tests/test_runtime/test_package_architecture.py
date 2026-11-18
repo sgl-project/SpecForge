@@ -650,6 +650,12 @@ class TestPackageArchitecture(unittest.TestCase):
             }
             self.assertIs(controller_keywords["enable_sample_queue"].value, False, name)
 
+    def test_modeling_exports_only_canonical_construction(self):
+        self.assertEqual(
+            {"build_draft_model"},
+            _literal_all(REPO_ROOT / "specforge/modeling/__init__.py"),
+        )
+
     def test_aggregate_packages_stay_doc_only(self):
         for relative_path in DOC_ONLY_PACKAGE_INITIALIZERS:
             body = _module_tree(REPO_ROOT / relative_path).body

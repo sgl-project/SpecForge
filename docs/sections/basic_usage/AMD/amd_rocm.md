@@ -91,7 +91,7 @@ python -m pip install --no-deps tensorboard tensorboard-data-server absl-py mark
 
 The images' stock SGLang 0.5.18 lacks the generic capture extension APIs.
 Use a separate ROCm-compatible SGLang environment with the APIs documented in
-[the plugin guide](../../../../plugins/sglang-spec-capture/README.md), then install:
+[the plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md), then install:
 
 ```bash
 python -m pip install --no-deps plugins/sglang-spec-capture
@@ -150,7 +150,7 @@ radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
 Start the compatible plugin server and Mooncake following the
-[offline guide](../../../../examples/offline/README.md), with
+[offline guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), with
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`
 and server flags `--attention-backend aiter --disable-radix-cache
 --mem-fraction-static 0.8 --context-length 2560`. Then run the CPU client:
@@ -397,7 +397,7 @@ linear-attention/Mamba target (`Qwen3_5ForConditionalGeneration`); its draft is 
 5-layer DFlash head (`hidden_size=2560`, `block_size=16`,
 `target_layer_ids=[1, 8, 15, 22, 29]`). Both runs used `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, a `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, a `flex_attention`
 trainer, and ~10 epochs (~680 optimizer steps).
 
 The SGLang side (offline capture and online capture server) runs the hybrid
@@ -470,7 +470,7 @@ The same **Qwen3.5-4B DFlash** recipe was reproduced end-to-end on a single AMD
 Instinct **MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x`
 container, using identical hyperparameters (offline and online, `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, `flex_attention`
 trainer, ~10 epochs). The ROCm requirements are the same as on MI355X: run the
 hybrid Mamba target under **AITER**
 (`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`,

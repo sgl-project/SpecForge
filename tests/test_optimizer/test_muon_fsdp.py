@@ -174,14 +174,11 @@ def _run_manual_slices(rank, init_file):
 # ------------------------------------------------------------------- real FSDP1
 def _config():
     from specforge.config import Config
+    from tests.test_config.test_schema import MINIMAL
 
     return Config.model_validate(
         {
-            "model": {
-                "target_model_path": "target",
-                "draft_model_config": "draft.json",
-            },
-            "data": {"hidden_states_path": "/features"},
+            **copy.deepcopy(MINIMAL),
             "training": {
                 "max_steps": STEPS,
                 "learning_rate": LR,

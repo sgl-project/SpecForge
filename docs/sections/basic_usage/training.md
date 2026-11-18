@@ -88,13 +88,14 @@ misspelled or retired option from being silently ignored.
 ## Hybrid Muon optimizer
 
 Set `training.optimizer: muon` to train the draft's decoder-layer matrices
-with Muon. Every 2-D `nn.Linear` weight inside `layers.<i>.` (DFlash, DFlash 2,
-Domino, DSpark, P-EAGLE, MTP) or `midlayer.` (EAGLE3) is on Muon: attention
-q/k/v/o, MLP gate/up/down, and DFlash 2's per-layer convolution kernel
-projections. Everything else stays on AdamW at
-`training.learning_rate`, including `fc`, embedding projections, norms,
-biases, and the selector, Markov, confidence, and LM heads. AdamW remains the
-default, so existing recipes are unchanged.
+with Muon. Every 2-D `nn.Linear` weight inside a decoder layer is on Muon:
+attention q/k/v/o, MLP gate/up/down, and DFlash 2's per-layer convolution
+kernel projections. Canonical drafts name those layers `backbone.layers.<i>.`,
+and the legacy EAGLE3 draft names its single layer `midlayer.`. Everything
+else stays on AdamW at `training.learning_rate`, including `fusion.fc`,
+embeddings, norms, biases, the Domino GRU head, and the selector, Markov,
+confidence, and LM heads. AdamW remains the default, so existing recipes are
+unchanged.
 
 ```yaml
 training:
@@ -261,9 +262,8 @@ Explicit training masks work with eager, SDPA, and Flex Attention. Native
 draft inference without a supplied mask supports these settings through
 eager/SDPA and Flex Attention, including cached decoding. HF exports preserve
 `is_causal`.
-The SGLang normalization gate rejects bidirectional sliding-window exports
-until that external serving path is validated; it does not silently fall back
-to a causal mask. These settings do not change CE/L1 losses or kernel optimizations.
+The SGLang converter supports bidirectional sliding windows when the window
+covers the draft block. A window of size 1 is rejected. These settings do not change CE/L1 losses or kernel optimizations.
 
 DSpine requires causal attention for both full and sliding layers and rejects
 `is_causal: false`. It uses the shared DFlash attention masks.
@@ -284,6 +284,10 @@ five target layers). The run then omits `dflash/teacher/*` and
 `dflash2/selector/self_conditioned_teacher_argmax_agreement`; every other
 metric and the loss are unchanged. Other strategies reject the setting.
 
+A canonical run (one with a `draft` config) does not request that hidden state
+unless `training.objective_options.teacher_metrics: true` is set; the default
+is `false`, and the same metrics are then omitted.
+
 The DFlash2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
 `selector_top_k` for candidate-path selection. The base draft head uses the
@@ -295,7 +299,7 @@ Both objectives receive the configured fixed-decay or D-PACE position weight,
 and their combined numerator is normalized by the sum of valid effective token
 weights rather than by batch or anchor count.
 
-Set `training.dflash2_selector_loss_alpha` to scale the selector objective.
+Set `training.loss.terms.selector.coefficient` to scale the selector objective.
 `training.dflash2_selector_warmup_ratio` keeps that scale at zero for an initial
 fraction of optimizer steps, and `training.dflash2_selector_ramp_ratio` then
 ramps it linearly to the configured value. Both schedule ratios default to
@@ -447,7 +451,7 @@ specforge train \
   model.target_model_path=/path/to/Qwen3.6-27B
 ```
 
-Export the result with `specforge export --to hf`. Serving requires an SGLang
+Export for serving with `specforge export --converter sglang`. Serving requires an SGLang
 version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
 name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
 new path automatically.
@@ -647,8 +651,9 @@ instead of materializing full-vocabulary fp32 logits:
 ```yaml
 training:
   strategy: eagle3
-  compact_teacher: true
-  compact_teacher_chunk_size: 4096
+  loss:
+    execution:
+      teacher_chunk_size: 4096
 ```
 
 This lowers peak memory without changing the teacher distribution, at the cost
@@ -761,77 +766,125 @@ Runtime checkpoints contain training state and are not serving model
 directories. Export the final checkpoint before loading it with SGLang or
 Transformers.
 
-For EAGLE3 SGLang serving:
+Canonical checkpoints carry their model configuration. Export them without a
+training YAML:
 
 ```bash
-specforge export --to sglang \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --output-dir ./exports/qwen3-8b-eagle3-sglang
+specforge export --converter sglang --checkpoint /path/to/checkpoint --output-dir ./serving
+specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 ```
 
-`--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
-For an EAGLE-family self-contained Hugging Face directory, provide the target model as
-the source of the frozen embedding when it is absent from the runtime
-checkpoint:
+Historical checkpoints without `config.json` additionally require
+`--draft-config OLD.json --target-model TARGET` for canonical export. Legacy
+`--to hf` and `--to sglang` retain their original exporters and require
+`--draft-config`; they are not aliases for canonical export. They no longer
+export MTP, whose legacy model was removed; use the canonical command for it. Default HF exports
+contain canonical configuration and bundled code for
+Transformers, and cannot be served directly by SGLang. Except for native merge-back,
+both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
+running the model. Restore vocabulary mappings before export; export does not
+replace checkpoint tensors.
 
-Serving weight names are a fail-silent boundary in SGLang: an unrecognized key
-may be skipped while the server still starts. The exporter therefore validates
-the required `fc.weight`, `norm.weight`, `lm_head.weight`, `t2d`, and `d2t`
-keys and rejects any remaining trainer prefix. `LlamaForCausalLMEagle3` uses an
-identity map for its `midlayer.*` and required keys; `embed_tokens.weight` is
-deliberately omitted because serving reuses the target model embedding. A new
-architecture (including a future MLA draft) must add an explicit, loader-version
-matched weight map and required-key contract before SGLang export is enabled.
-The export tests cover key structure and tensor round-trip; loading the result
-in a real speculative-decoding server and measuring acceptance remains a GPU
-serving validation step.
+SGLang conversion supports DFlash, DFlash2, Domino, DSpark and EAGLE3 within
+the pinned serving format's representable structures. Dense Qwen3.5 MTP uses
+`--export-mode native --target-model TARGET` for native merge-back.
+DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
+exported. Mixed causality supports causal sliding layers with bidirectional full layers.
+See [draft export](/draft_export.md) for restrictions and validation.
 
-```bash
-specforge export --to hf \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --embedding-source Qwen/Qwen3-8B \
-  --output-dir ./exports/qwen3-8b-eagle3-hf
-```
+Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
+saved precision when tensors share one floating-point dtype; SGLang casts to
+its serving dtype. Mixed-dtype HF artifacts retain the original tensors, but
+public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
 
-Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
-mapping buffers or when you intentionally need to refresh them.
-
-Both exporters preserve the dtype and values of the draft weights stored in the
-checkpoint. When all floating-point tensors share one dtype (FP32, FP16, or
-BF16), that dtype is written into the exported `config.json`, so
-`AutoDraftModel.from_pretrained` without an explicit dtype restores the saved
-precision and values. SGLang casts the served draft to its own dtype at load
-time.
-
-For checkpoints with mixed floating-point dtypes, the exported weight tensors
-retain their original dtypes, but the exported config falls back to BF16.
-Default reloading therefore does not guarantee restoration of each tensor's
-original precision. Native mixed-precision or quantized MTP models require
-model-specific loading and export support beyond this precision guarantee.
+For native MTP merge-back, use `--export-mode native --target-model TARGET`. It rewrites
+shards containing old native tensors and links unchanged shards; add
+`--copy-target` for a self-contained directory.
 
 MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
 and attention computations. Do not resume those runs; retrain from native MTP
 weights under the corrected model. The legacy codec follows the corrected model.
 
-MTP is deployed by merging its trained native head back into the target model.
-The merge command accepts the same runtime checkpoint shapes as the generic
-exporter (`training_state.pt`, a step/latest directory, or the run output
-directory):
+For native MTP, use the ordinary YAML preset and explicit target mapping in
+[the preset guide](https://github.com/sgl-project/SpecForge/blob/main/specforge/config/draft/presets/README.md). A complete
+text-only offline recipe is available at
+`examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
 ```bash
-python scripts/merge_mtp_to_base.py \
-  --base-model-path Qwen/Qwen3.5-4B \
-  --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
-  --draft-config configs/qwen3.5-4b-mtp.json \
-  --output-path ./exports/Qwen3.5-4B-MTP
+specforge export --export-mode native \
+  --checkpoint ./outputs/native-mtp/native-mtp-latest \
+  --target-model Qwen/Qwen3.5-4B \
+  --output-dir ./exports/Qwen3.5-4B-MTP
 ```
 
-An already-exported HF MTP draft directory can also be passed as
-`--mtp-checkpoint-path`; in that case its own `config.json` is used and
-`--draft-config` may be omitted.
+Native export rewrites shards containing old MTP tensors and links unchanged
+shards; add `--copy-target` for a self-contained directory. Historical checkpoints
+use the same importer, with `--draft-config OLD.json` when configuration is absent.
+The `scripts/merge_mtp_to_base.py` CLI copies target shards by default for a
+self-contained directory; `--no-copy-target` opts into links. It is a compatibility
+wrapper for this exporter;
+there is no separate legacy merge implementation. Target computation mismatches
+fail instead of rewriting the target's settings to fit a draft.
+
+Prepare records with the same run configuration, against a capture server configured
+for its resolved capture contract:
+
+```bash
+python scripts/prepare_hidden_states.py \
+  -c examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml \
+  --chat-template qwen3.5 --max-length 512 \
+  --server-urls http://localhost:30000 \
+  --data-path /data/train.jsonl --output-path /data/mtp-features
+```
+
+MTP migration changes:
+
+- Replace old `model.draft_*` recipes with `draft` and `initialization`. Training
+  requires an explicit initialization choice; use `initialization: {}` for random
+  weights, `from_target` for native weights, or `checkpoint` for an existing draft.
+  Capture planning does not require weight initialization.
+- The former MTP JSON is retained at `tests/fixtures/legacy_mtp/original_config.json`
+  for compatibility tests. New runs should use the ordinary native YAML preset.
+- `model.embedding_key` and `model.lm_head_key` still select target binding tensors;
+  they do not replace explicit `from_target` mappings for owned parameters.
+- An owned LM head can be saved and exported as a standalone canonical draft.
+  Native Qwen3.5 merge-back requires the matching native structure and target bindings;
+  standalone SGLang MTP serving is not implemented.
+- CE computes in FP32 rather than the old BF16 reduction. Small loss/gradient
+  differences are intentional. Only supervised rows are projected, in bounded chunks.
+- Old optimizer state cannot resume under the canonical implementation. Import
+  model weights instead. Canonical resume validates the recorded loss execution settings.
+  Canonical MTP checkpoints written before this change recorded no objective
+  options and cannot resume either; import their weights the same way.
+- `initialization` and resume are mutually exclusive. To resume a run started from
+  a recipe that sets `initialization`, clear it in the same command:
+  `specforge train -c RECIPE training.resume_from=OUTPUT/RUN-latest initialization=null`.
+- `draft: OLD.json` uses the registered legacy codecs for all supported architectures,
+  not only MTP; required recorded settings such as P-EAGLE's mask token stay explicit.
+
+The canonical MTP trainer supports eager and SDPA attention. Set
+`training.loss.execution.chunk_size` (0 disables chunking; when unset, MTP uses
+`training.objective_options.objective_chunk_size`, default 4096) to bound the
+number of token positions passed through LM head and loss at once.
+`loss.execution.checkpoint` controls recomputation during backward. The old
+`training.mtp_objective_chunk_size` option is rejected with a message naming
+this replacement. The online NPU MTP recipe now
+uses this canonical path and the native preset.
+
+The trainer TP size remains one on the canonical path. Canonical EAGLE3 supports
+offline sequence parallelism with `training.attention_backend: usp` (batch size
+one; D-PACE weighting is refused because chain weights are normalized within a
+shard); every other canonical objective requires SP sizes of one. Legacy
+implementations remain for other algorithms' unsupported backends;
+the old Qwen3.5 MTP model and its training wrapper have been removed.
+Use `draft: OLD.json` to decode a historical configuration into the canonical trainer, or `initialization.checkpoint`
+for an existing draft; neither path constructs a legacy model. Legacy MTP decoding
+uses the declared RoPE theta and the corrected #1014 computation. Use the native preset when initializing
+from the target's own MTP weights. Old MTP recipes using `model.draft_*` must
+switch to `draft`/`initialization` as shown in the native example. Historical
+MTP model weights remain importable; optimizer-state resume across the old/new
+training implementations is not supported. Use `resume` for checkpoints saved
+by the canonical trainer.
 
 ## Troubleshooting
 

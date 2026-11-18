@@ -19,6 +19,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self._duplicate_parameters = set()
         inner = model.module if isinstance(model, DistributedDataParallel) else model
         self.window_statistic = inner.registration.training.window_statistic
+        self.host_inputs = inner.registration.training.host_inputs
+        self.draft_config = inner.draft_model.config.draft
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
@@ -28,6 +30,13 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
 
     def trainable_module(self):
         return self.model
+
+    def before_checkpoint(self):
+        # What rank 0 records for resume has to hold for every rank.
+        model = self.model
+        if isinstance(model, DistributedDataParallel):
+            model = model.module
+        model.loss_implementations.agree()
 
     def checkpoint_state_filter(self, state_dict):
         prefix = "draft_model."
@@ -41,14 +50,24 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
     def _forward(self, batch, ctx, window_value=None):
         self.validate_batch(batch)
         device = next(self.model.parameters()).device
+        inputs = batch.tensors
+        if self.host_inputs is not None:
+            prepared = self.host_inputs(inputs, self.draft_config)
+            if device.type != "cpu":
+                # a pageable source makes the non_blocking copy wait for the host
+                prepared = {
+                    key: value.pin_memory() if value.device.type == "cpu" else value
+                    for key, value in prepared.items()
+                }
+            inputs = inputs | prepared
         tensors = {
-            key: value.to(device, non_blocking=True)
-            for key, value in batch.tensors.items()
+            key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }
         result = self.model(
             tensors,
             step=ctx.global_step,
             total_steps=ctx.total_steps,
+            collect_detailed_metrics=ctx.collect_detailed_metrics,
             **(
                 {self.window_statistic.argument_name: window_value}
                 if self.window_statistic
@@ -58,7 +77,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         positions = sorted(
             int(name.split("_")[1])
             for name in result.ratios
-            if name.startswith("position_") and name.endswith("_accuracy")
+            if name.startswith("position_")
+            and name.endswith("_accuracy")
+            and name[len("position_") : -len("_accuracy")].isdigit()
         )
         counts = [
             result.ratios[f"position_{position}_accuracy"] for position in positions
@@ -75,6 +96,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             loss=result.loss,
             metrics=metrics,
             ratio_metrics=result.ratios,
+            sum_metrics=result.sums,
             loss_terms=(result.numerator, result.denominator),
         )
 

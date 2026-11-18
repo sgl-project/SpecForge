@@ -1,18 +1,9 @@
-from .base import Eagle3DraftModel
-from .dflash import (
-    DFlashDraftModel,
-    build_target_layer_ids,
-    extract_context_feature,
-    sample,
-)
-from .dflash2 import DFlash2DraftModel
-from .domino import DominoDraftModel
-from .dspark import DSparkDraftModel
-from .dspine import DSpineDraftModel
-from .llama3_eagle import LlamaForCausalLMEagle3
-from .mtp import Qwen3_5MTPDraftModel
-from .peagle import PEagleDraftModel
-from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
+"""Draft components and composed models, with lazy historical API compatibility.
+
+New callers use modeling.build_draft_model and loading.load_draft. Historical
+training still has backend/parallelism features absent from the canonical path.
+Import those implementations only when the old API is explicitly used.
+"""
 
 __all__ = [
     "Eagle3DraftModel",
@@ -23,7 +14,6 @@ __all__ = [
     "DSpineDraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
-    "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
     "extract_context_feature",
     "sample",
@@ -32,3 +22,13 @@ __all__ = [
     "resolve_draft",
     "available_drafts",
 ]
+
+
+def __getattr__(name):
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import legacy
+
+    value = getattr(legacy, name)
+    globals()[name] = value
+    return value

@@ -122,11 +122,11 @@ the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
 `attention_mode` preserves the existing GQA path; `"mha"` requires equal
 query/KV head counts.
 
-MLA is a training-side mode: checkpoints train, evaluate through
-`spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
-drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly. DFlash2 otherwise follows the same mode selection; its convolution
-and selector do not change the attention projection contract.
+MLA checkpoints can be exported as canonical HF artifacts. Use `--converter sglang`
+for serving; the converter validates the projection and rotary settings against
+the pinned loader, and rejects unsupported combinations. DFlash2 follows the
+same mode selection; its convolution and selector do not change the attention
+projection contract.
 
 ## Draft architectures
 
@@ -203,7 +203,7 @@ model-specific constraints or allocate model weights.
 
 ## Fused token losses
 
-Import losses from `specforge.core.fused_loss`. Unprefixed functions are eager.
+Import losses from `specforge.losses.fused`. Unprefixed functions are eager.
 
 | API pair (eager / fused) | Label input | Per-token objective |
 | --- | --- | --- |
@@ -218,7 +218,7 @@ draft normalization and combines both loss gradients before casting to the
 input dtype. This is useful when CE and teacher L1/TV train the same logits.
 
 ```python
-from specforge.core.fused_loss import fused_ce_l1_loss
+from specforge.losses.fused import fused_ce_l1_loss
 
 logits = lm_head(hidden)                    # [..., V], BF16/FP16/FP32 on CUDA
 terms = fused_ce_l1_loss(
@@ -244,15 +244,21 @@ fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
 Importing the public module does not require Triton. The eager reference promotes low-precision
 CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-`training.fused_logits_loss` is a boolean, defaulting to `true` for all supported
-models, including DFlash2 and Domino. Set `false` to use eager losses.
-Unsupported devices and dtypes fall back to eager. Domino uses its specialized
-CE kernel under the same flag.
+`training.loss.fused` is unset by default: canonical objectives then use an
+optimized implementation where one applies and the reference elsewhere, and
+retained training wrappers use their fused kernels. DFlash-family wrappers accept `false` for eager
+losses; retained EAGLE3/P-EAGLE always use their fused kernel and reject `false`.
+On the canonical path an explicit `fused: true` for a categorical loss raises off
+CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
+[loss execution](../../draft_training.md#loss-execution)).
+Domino selects its specialized CE kernel under the same flag.
 
-`training.objective_chunk_blocks` sets the chunk size, and
-`training.objective_checkpointing` (default `true`) independently controls
-recomputation of each chunk's projection and objective. A zero chunk size treats
-the whole objective as one chunk; checkpointing still follows its own flag.
+`training.loss.execution.chunk_size` sets the chunk size, and
+`training.loss.execution.checkpoint` (default `true`) controls recomputation of
+each chunk's projection and objective. On the retained wrappers a zero chunk
+size treats the whole objective as one chunk and checkpointing still follows
+its own flag; the canonical executor checkpoints only when the prediction set
+is actually split.
 Without checkpointing, all chunks can retain
 logits until backward: smaller chunks do not bound total saved-logits memory.
 DFlash always skips its zero-weight anchor projection in multi-slot objectives;
@@ -287,6 +293,9 @@ can therefore differ numerically; acceptance impact must be measured before the
 training cutover.
 
 Runtime attention names are `eager`, `sdpa`, `flex_attention`, and `fa`, matching
-training configuration. Canonical `usp` is not implemented and fails explicitly.
+training configuration. `usp` is available for canonical EAGLE3 offline
+training: the objective's cached rollout selects it together with the
+sequence-parallel groups, and `resolve_attention_backend("usp")` itself still
+fails explicitly.
 Flex defaults to the general TRITON kernel for sparse short-query batches; an
 explicit `FlexAttentionBackend(kernel_backend="FLASH")` uses `(256, 128)` blocks.

@@ -13,6 +13,7 @@ from specforge.algorithms.common.hidden_states_data import (
     build_dspark_offline_normalizer,
     build_dspark_offline_reader,
 )
+from specforge.algorithms.common.loss_settings import wrapper_loss_validator
 from specforge.algorithms.common.providers import (
     AlgorithmProviders,
     DraftConfigProvider,
@@ -85,7 +86,7 @@ def resume_contract(_config, draft_model, training_model):
             draft_model.sliding_window,
             True,
         ),
-        "dspine_options": tuple(sorted(asdict(draft_model.dspine_config).items())),
+        "dspine_options": tuple(sorted(asdict(training_model.dspine_config).items())),
         "dspine_block_size": draft_model.block_size,
         "dspine_target_layer_ids": tuple(draft_model.target_layer_ids),
         "dspine_num_hidden_layers": len(draft_model.layers),
@@ -167,6 +168,11 @@ def algorithm_providers() -> AlgorithmProviders:
             uses_external_target_head=False,
         ),
         model=ModelProvider(
+            validate_config=wrapper_loss_validator(
+                "DSpineDraftModel",
+                execution=("chunk_size", "checkpoint"),
+                compatible=(),
+            ),
             draft_config=DraftConfigProvider(
                 architecture="DSpineDraftModel",
                 compatible_architectures=frozenset({"DSpineDraftModel"}),

@@ -51,6 +51,9 @@ def _map(value, path, decode):
     return result
 
 
+_BUILTIN_PACKAGE = "specforge"
+
+
 def _extension_packages(config: DraftConfig) -> set[str]:
     """Top-level packages that define the configuration's out-of-tree nodes."""
     packages, pending = set(), [config]
@@ -62,7 +65,9 @@ def _extension_packages(config: DraftConfig) -> set[str]:
             pending.extend(value)
         elif is_dataclass(value) and not isinstance(value, type):
             module = type(value).__module__
-            if module != "specforge" and not module.startswith("specforge."):
+            if module != _BUILTIN_PACKAGE and not module.startswith(
+                _BUILTIN_PACKAGE + "."
+            ):
                 packages.add(module.split(".")[0])
             pending.extend(getattr(value, field.name) for field in fields(value))
     return packages

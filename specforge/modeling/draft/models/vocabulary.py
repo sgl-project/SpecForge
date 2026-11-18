@@ -72,6 +72,10 @@ class DraftVocabulary(nn.Module):
                 self.t2d, self.d2t, allow_unmapped=True
             )
 
+    def validate_export_state(self, state) -> None:
+        """Export requires a complete mapping, including reduced vocabularies."""
+        self._validate_mapping(state["t2d"], state["d2t"])
+
     @torch.no_grad()
     def load_mapping(self, *, t2d: Tensor, d2t: Tensor) -> None:
         """Validate the entire mapping before copying into existing buffers."""

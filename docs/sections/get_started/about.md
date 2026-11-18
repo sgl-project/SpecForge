@@ -14,7 +14,8 @@ Speculative decoding is an important and powerful technique for speeding up infe
 
 As SpecForge is built by the SGLang team, draft models trained with SpecForge
 can be exported for [SGLang](https://github.com/sgl-project/sglang) serving.
-Runtime checkpoints retain training state, so materialize a serving directory
-with the shared `specforge export` command. SGLang and Hugging Face export
-targets use the same checkpoint surface; there are no method-specific
-conversion scripts.
+Runtime checkpoints retain training state, so export them with the shared
+`specforge export` command: by default it publishes a canonical Hugging Face
+directory, and `--to hf` / `--to sglang` (EAGLE3 only) write the directories
+SGLang serves today. MTP drafts are deployed by merging them into the target
+with `scripts/merge_mtp_to_base.py`.

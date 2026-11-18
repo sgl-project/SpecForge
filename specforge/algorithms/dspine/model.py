@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
 from specforge.core.chunking import checkpointed_chunk_reduce
-from specforge.core.fused_loss import ce_l1_loss
+from specforge.losses.fused import ce_l1_loss
 
 
 class OnlineDSpineModel(OnlineDFlashModel):
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, *, ce_weight=0.1, alignment_weight=0.5, **kwargs) -> None:
         if kwargs.get("loss_decay_gamma") is None:
             kwargs["loss_decay_gamma"] = 7.0
         super().__init__(**kwargs)
@@ -21,7 +23,11 @@ class OnlineDSpineModel(OnlineDFlashModel):
         self.embed_tokens.requires_grad_(False)
         if self.block_size != self.draft_model.block_size:
             raise ValueError("DSpine training block_size must match the draft")
-        self.dspine_config = self.draft_model.dspine_config
+        self.dspine_config = replace(
+            self.draft_model.dspine_config,
+            ce_weight=ce_weight,
+            alignment_weight=alignment_weight,
+        )
         if not self.draft_model.transfer_ready.item():
             self.draft_model.initialize_transfer_space(self.lm_head.weight)
 

@@ -23,54 +23,59 @@ from specforge.algorithms.objectives.predictions import (
     Predictions,
     Teacher,
 )
-from specforge.core.lk_loss import compute_lk_loss
-from specforge.core.position_weights import DPACE_LOSS_TYPES, dpace_weights
-from tests.test_algorithms.test_objective_legacy_parity import (
-    assert_loss_and_gradients,
-    block_pair,
-)
+from specforge.algorithms.objectives.projection import Projection
+from specforge.losses.lk import compute_lk_loss
+from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objectives import training_batch
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 
 
 class AcceptanceLossTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def test_dflash_lk_and_dpace_match_legacy(self):
+    def test_label_lk_and_dpace_match_formulas(self):
+        torch.manual_seed(7)
+        logits = torch.randn(2, 4, 7, requires_grad=True)
+        labels = torch.randint(7, (2, 4))
+        mask = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]).float()
         for weighting in ("uniform", *sorted(DPACE_LOSS_TYPES)):
             for mode in ("alpha", "tv", "lambda"):
-                with self.subTest(weighting=weighting, mode=mode):
-                    torch.manual_seed(7)
-                    runtime, legacy, names = block_pair("dflash")
-                    runtime.token_loss = TokenLoss(
-                        kind=f"lk_{mode}",
-                        options=(
-                            {"kl_scale": 0.7, "kl_decay": 1.3}
-                            if mode == "lambda"
-                            else {}
-                        ),
+                probability = (
+                    logits.softmax(-1).gather(-1, labels[..., None]).squeeze(-1)
+                )
+                weights = (
+                    mask
+                    if weighting == "uniform"
+                    else mask
+                    * dpace_weights(
+                        probability.detach(), mask, alpha=0.1, mode=weighting
                     )
-                    runtime.weighting = PositionWeighting(kind=weighting)
-                    legacy.lk_loss_type, legacy.kl_scale, legacy.kl_decay = (
-                        mode,
-                        0.7,
-                        1.3,
+                )
+                denominator = weights.sum()
+                ce = -probability.log()
+                expected = compute_lk_loss(
+                    kl_loss=(ce * weights).sum() / denominator,
+                    acceptance_rate=(probability * weights).sum() / denominator,
+                    log_acceptance_rate=(probability.log() * weights).sum()
+                    / denominator,
+                    lk_loss_type=mode,
+                    kl_scale=0.7,
+                    kl_decay=1.3,
+                )
+                loss = TokenLoss(
+                    f"lk_{mode}",
+                    {"kl_scale": 0.7, "kl_decay": 1.3} if mode == "lambda" else {},
+                )
+                actual = (
+                    loss(
+                        logits,
+                        labels,
+                        context=LossContext(weights, denominator=denominator),
                     )
-                    legacy.loss_type = "dflash" if weighting == "uniform" else weighting
-                    batch = {
-                        k: v.repeat(2, *([1] * (v.ndim - 1)))
-                        for k, v in training_batch(
-                            runtime.draft_model.config.draft
-                        ).items()
-                    }
-                    batch["loss_mask"][1, 3:] = 0  # unequal valid anchor counts
-                    args = {
-                        k: batch[k] for k in ("input_ids", "hidden_states", "loss_mask")
-                    }
-                    torch.manual_seed(11)
-                    actual = runtime(batch, step=1, total_steps=10).loss
-                    torch.manual_seed(11)
-                    expected = legacy(**args, collect_detailed_metrics=False)[0]
-                    assert_loss_and_gradients(runtime, legacy, actual, expected, names)
+                    * weights
+                ).sum() / denominator
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(
+                    torch.autograd.grad(actual, logits, retain_graph=True)[0],
+                    torch.autograd.grad(expected, logits, retain_graph=True)[0],
+                )
 
     def test_teacher_lk_preserves_vocabulary_mass_and_normalization(self):
         torch.manual_seed(9)
@@ -121,7 +126,7 @@ class AcceptanceLossTest(unittest.TestCase):
         mask = torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]])
         prediction = Predictions(
             hidden=logits,
-            projector=lambda x: {"logits": x},
+            projection=Projection(lambda x: {"logits": x}),
             mask=mask,
             positions=torch.arange(3).expand(3, 3),
             labels=labels,
@@ -300,7 +305,7 @@ class AcceptanceLossTest(unittest.TestCase):
         teacher[0, 0, 0] = teacher[0, 1, 3] = teacher[0, 2, 1] = 5.0
         prediction = Predictions(
             hidden=torch.zeros(1, 3, 3),
-            projector=lambda hidden: {"logits": hidden},
+            projection=Projection(lambda hidden: {"logits": hidden}),
             mask=torch.ones(1, 3),
             positions=torch.arange(3)[None],
             chain_ids=torch.zeros(1, 3, dtype=torch.long),
@@ -322,7 +327,7 @@ class AcceptanceLossTest(unittest.TestCase):
         torch.manual_seed(13)
         prediction = Predictions(
             hidden=torch.randn(3, 3, 5),
-            projector=lambda x: {"logits": x},
+            projection=Projection(lambda x: {"logits": x}),
             mask=torch.tensor([[1, 0, 1], [1, 1, 0], [0, 1, 1]]),
             positions=torch.arange(3).expand(3, 3),
             labels=torch.arange(9).reshape(3, 3) % 5,

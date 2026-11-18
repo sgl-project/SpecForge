@@ -480,20 +480,16 @@ class FSDPTrainingBackend(TrainingBackend):
         return {
             "torch": torch.get_rng_state(),
             "device_type": device_type,
-            # Named keys keep old CUDA checkpoints readable and make NPU state
-            # inspectable without understanding a new opaque payload.
             "cuda": accelerator_state if device_type == "cuda" else None,
             "npu": accelerator_state if device_type == "npu" else None,
         }
 
     @staticmethod
     def _set_rng_state(rng: dict) -> None:
+        if "device_type" not in rng:
+            raise ValueError("Checkpoint RNG state does not record device_type")
+        device_type = rng["device_type"]
         torch.set_rng_state(rng["torch"])
-        # ``device_type``/``npu`` are new. Falling back to the legacy ``cuda``
-        # key preserves every checkpoint written before NPU support.
-        device_type = rng.get("device_type")
-        if device_type is None:
-            device_type = "cuda" if rng.get("cuda") is not None else None
         state = rng.get(device_type) if device_type is not None else None
         module = getattr(torch, device_type, None) if device_type is not None else None
         if state is None or module is None or not module.is_available():

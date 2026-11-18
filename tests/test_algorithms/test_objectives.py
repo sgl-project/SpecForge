@@ -171,7 +171,7 @@ class ObjectiveTest(unittest.TestCase):
         result = build_objective_model(model)(batch, step=0, total_steps=None)
         labels = batch["input_ids"][:, 2:8]
         reference = torch.nn.functional.cross_entropy(
-            captured[0]["logits"].reshape(1, 8, -1)[:, :6].flatten(0, 1),
+            captured[0]["logits"].flatten(0, 1),
             labels.flatten(),
         )
         torch.testing.assert_close(result.loss, reference)
@@ -188,7 +188,7 @@ class ObjectiveTest(unittest.TestCase):
             runtime = build_objective_model(model, options={"num_anchors": 2})
             with (
                 patch(
-                    "specforge.algorithms.objectives.domino.prepare_blocks",
+                    "specforge.algorithms.objectives.protocols.domino.prepare_blocks",
                     return_value=blocks,
                 ),
                 patch.object(model, "forward", wraps=model.forward) as forward,
@@ -196,7 +196,9 @@ class ObjectiveTest(unittest.TestCase):
                     model.lm_head, "forward", wraps=model.lm_head.forward
                 ) as projection,
             ):
-                result = runtime(batch, step=1, total_steps=11)
+                result = runtime(
+                    batch, step=1, total_steps=11, collect_detailed_metrics=False
+                )
                 result.loss.backward()
                 self.assertEqual(projection.call_count, 1)
                 torch.testing.assert_close(

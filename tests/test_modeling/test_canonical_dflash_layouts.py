@@ -1,67 +1,84 @@
-"""Canonical DFlash/DFlash2 match legacy under multi-block training layouts."""
+"""Canonical DFlash layouts match explicit causal/window visibility per layer."""
 
 import copy
-import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
-from transformers import Qwen3Config
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
-from specforge.config.draft.codec.legacy import decode_legacy_config
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dflash import DFlashDraftModel as LegacyDFlash
-from specforge.modeling.draft.dflash import _rope_config, apply_rotary_pos_emb
-from specforge.modeling.draft.dflash2 import DFlash2DraftModel as LegacyDFlash2
-from specforge.modeling.draft.dflash_mask import create_dflash_sdpa_mask
 from specforge.modeling.draft.layers.attention import gqa
 from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
 
-CONFIGS = Path(__file__).resolve().parents[2] / "configs"
+CONFIGS = Path(__file__).resolve().parents[2] / "specforge/config/draft/presets"
 HIDDEN, VOCAB, MASK, WINDOW, CONTEXT = 32, 64, 60, 6, 48
 
 
 def small_payload(name, **overrides):
-    payload = json.loads((CONFIGS / name).read_text())
-    payload.update(
-        hidden_size=HIDDEN,
-        intermediate_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        vocab_size=VOCAB,
-        bos_token_id=None,
-        eos_token_id=None,
-        pad_token_id=None,
+    import yaml
+
+    from specforge.config.draft.codec import parse_draft
+
+    payload = yaml.safe_load((CONFIGS / name).read_text())
+    config = parse_draft(payload, target_config=None)
+    attentions = {
+        key: replace(
+            value,
+            num_attention_heads=4,
+            num_key_value_heads=overrides.get("num_key_value_heads", 2),
+            head_dim=8,
+            is_causal=overrides.get("is_causal", value.is_causal),
+            sliding_window=WINDOW if value.sliding_window else None,
+        )
+        for key, value in config.attention_configs.items()
+    }
+    spec = replace(
+        config.spec_config,
+        target_features=replace(
+            config.spec_config.target_features, hidden_size=HIDDEN, mask_token_id=MASK
+        ),
     )
-    if payload.get("use_sliding_window"):
-        # A window much shorter than the context, so anchors straddle it.
-        payload["sliding_window"] = WINDOW
-    method = dict(payload["dflash_config"], mask_token_id=MASK)
-    if "conv_group_size" in method:
-        method.update(conv_group_size=4, selector_rank=4, selector_top_k=3)
-    payload["dflash_config"] = method
-    return payload | overrides
+    if config.architecture == "DFlash2DraftModel":
+        spec = replace(spec, selector_rank=4, selector_top_k=3)
+    return replace(
+        config,
+        hidden_size=HIDDEN,
+        vocab_size=VOCAB,
+        draft_vocab_size=VOCAB,
+        attention_configs=attentions,
+        mlp_configs={
+            k: replace(v, intermediate_size=64) for k, v in config.mlp_configs.items()
+        },
+        conv_configs={
+            k: replace(v, group_size=4) for k, v in config.conv_configs.items()
+        },
+        spec_config=spec,
+    )
 
 
-def mla(payload):
-    payload = copy.deepcopy(payload)
-    payload["dflash_config"]["attention_mode"] = "mla"
-    payload.pop("head_dim")
-    payload.update(
+def mla(config):
+    from specforge.config.draft.attention import MLASpec
+
+    attention = next(iter(config.attention_configs.values()))
+    node = MLASpec(
+        num_attention_heads=4,
         q_lora_rank=None,
         kv_lora_rank=16,
         qk_nope_head_dim=8,
         qk_rope_head_dim=8,
         v_head_dim=8,
-        rope_interleave=True,
+        attention_bias=False,
+        attention_dropout=0.0,
+        is_causal=attention.is_causal,
+        sliding_window=attention.sliding_window,
+        rope_parameters=None,
     )
-    return payload
+    return replace(
+        config, attention_configs={k: node for k in config.attention_configs}
+    )
 
 
 def training_layout(anchors, keep, block):
@@ -87,16 +104,8 @@ def training_layout(anchors, keep, block):
 class CanonicalDFlashLayoutTest(unittest.TestCase):
     # Compare attention layout, not fused versus unfused convolution rounding.
     @patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"})
-    @legacy_fp32_rope()
     def _parity(self, payload, dtype=torch.float32):
-        layer_count = payload.get("num_target_layers") or 64
-        target = {
-            "hidden_size": HIDDEN,
-            "num_hidden_layers": layer_count,
-            "vocab_size": VOCAB,
-        }
-        config = decode_legacy_config(payload, target_config=target)
-        is_dflash2 = config.architecture == "DFlash2DraftModel"
+        config = payload
         block = config.spec_config.block.block_size
         torch.manual_seed(0)
         model = build_draft_model(config, dtype=dtype)
@@ -106,19 +115,7 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
         embedding, head = (torch.randn(VOCAB, HIDDEN, dtype=dtype) for _ in range(2))
         model.embed_tokens.load_target_weight(embedding)
         model.lm_head.load_target_weight(head)
-        legacy_config = Qwen3Config.from_dict(payload)
-        legacy_config._attn_implementation = "eager"
-        legacy = (LegacyDFlash2 if is_dflash2 else LegacyDFlash)(legacy_config).to(
-            dtype=dtype
-        )
-        # Same FP32 frequency rule as canonical RoPE.
-        legacy.rotary_emb = Qwen3RotaryEmbedding(
-            _rope_config(legacy_config, legacy.attention_mode)
-        )
-        legacy.load_state_dict(
-            {legacy_name(n) or n: v for n, v in model.state_dict().items()},
-            strict=True,
-        )
+        reference = copy.deepcopy(model)
         anchors = torch.tensor([[1, 9, 20, 30], [0, 15, 25, 33]])
         keep = torch.tensor([[True] * 4, [True, False, True, True]])
         layout, keys = training_layout(anchors, keep, block)
@@ -135,78 +132,78 @@ class CanonicalDFlashLayoutTest(unittest.TestCase):
             for _ in config.layer_types
         ]
         output = model(ids, features, entries)
-        args = dict(
-            anchor_positions=anchors,
-            block_keep_mask=keep,
-            S=CONTEXT,
-            block_size=block,
-            device=features.device,
-            is_causal=getattr(legacy_config, "is_causal", None),
-        )
-        masks = {}
-        if "full_attention" in legacy.layer_types:
-            masks["full_attention"] = create_dflash_sdpa_mask(**args)
-        if legacy.sliding_window is not None:
-            masks["sliding_attention"] = create_dflash_sdpa_mask(
-                **args, sliding_window=legacy.sliding_window
+        explicit = []
+        q = layout.query_positions[:, None, :, None]
+        k = keys[:, None, None, :]
+        for layer in reference.backbone.layers:
+            attention = layer.self_attn
+            spec = attention.config
+            visible = layout.visibility.clone()
+            if spec.is_causal:
+                visible &= k <= q
+            if spec.sliding_window is not None:
+                visible &= (k - q).abs() < spec.sliding_window
+            # All visibility rules are now expressed in the independent mask.
+            attention.config = replace(spec, is_causal=False, sliding_window=None)
+            explicit.append(
+                LayerInputs(
+                    attention_layout=replace(layout, visibility=visible),
+                    position_ids=keys,
+                )
             )
-        hidden = legacy(
-            keys,
-            attention_mask=masks,
-            noise_embedding=torch.nn.functional.embedding(ids, embedding),
-            target_hidden=features,
+        expected = reference(ids, features, explicit)
+        torch.testing.assert_close(
+            output.hidden_states, expected.hidden_states, rtol=0, atol=0
         )
-        logits = hidden @ head.T
-        if is_dflash2:
-            logits = legacy.transform_unary_logits(logits)
-        torch.testing.assert_close(output.hidden_states, hidden, rtol=0, atol=0)
-        torch.testing.assert_close(output.logits, logits, rtol=0, atol=0)
+        torch.testing.assert_close(output.logits, expected.logits, rtol=0, atol=0)
 
-    def test_bundled_recipes_match_legacy_under_training_layouts(self):
+    def test_bundled_recipes_match_explicit_visibility_under_training_layouts(self):
         for name in (
-            "qwen3.6-27b-dflash.json",  # sliding causal + full bidirectional
-            "qwen3.6-27b-dflash2.json",  # bidirectional sliding window
-            "qwen3.8-27b-dflash2.json",
-            "qwen3-8b-dflash.json",  # full bidirectional
+            "qwen3.6-27b-dflash.yaml",  # sliding causal + full bidirectional
+            "qwen3.6-27b-dflash2.yaml",  # bidirectional sliding window
+            "qwen3.8-27b-dflash2.yaml",
+            "qwen3-8b-dflash.yaml",  # full bidirectional
         ):
             for dtype in (torch.float32, torch.bfloat16):
                 with self.subTest(recipe=name, dtype=dtype):
                     self._parity(small_payload(name), dtype=dtype)
 
-    def test_mla_attention_matches_legacy_under_training_layouts(self):
-        payload = mla(small_payload("qwen3.8-27b-dflash2.json"))
+    def test_mla_attention_matches_explicit_visibility_under_training_layouts(self):
+        payload = mla(small_payload("qwen3.8-27b-dflash2.yaml"))
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 self._parity(copy.deepcopy(payload), dtype=dtype)
 
-    def _mha_bfloat16_matches_legacy(self):
-        for name in ("qwen3-8b-dflash.json", "qwen3.8-27b-dflash2.json"):
+    def _mha_bfloat16_matches_explicit_visibility(self):
+        for name in ("qwen3-8b-dflash.yaml", "qwen3.8-27b-dflash2.yaml"):
             with self.subTest(recipe=name):
                 payload = small_payload(name, num_key_value_heads=4)
-                payload["dflash_config"]["attention_mode"] = "mha"
                 self._parity(payload, dtype=torch.bfloat16)
 
-    def test_mha_rotary_preserves_legacy_layout(self):
+    def test_mha_rotary_preserves_fp32_layout(self):
         key = torch.randn(2, 16, 4, 8, dtype=torch.bfloat16).transpose(1, 2)
         cos, sin = torch.randn(2, 16, 8), torch.randn(2, 16, 8)
-        _, expected = apply_rotary_pos_emb(key.float(), key.float(), cos, sin)
+        first, second = key.float().chunk(2, dim=-1)
+        expected = (
+            key.float() * cos[:, None] + torch.cat((-second, first), -1) * sin[:, None]
+        )
         expected = expected.to(key.dtype)
         actual = gqa.apply_rotary(key, (cos, sin))
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         self.assertEqual(actual.stride(), expected.stride())
 
-    def test_cpu_mha_bfloat16_matches_legacy(self):
-        self._mha_bfloat16_matches_legacy()
+    def test_cpu_mha_bfloat16_matches_explicit_visibility(self):
+        self._mha_bfloat16_matches_explicit_visibility()
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_mha_bfloat16_matches_legacy(self):
+    def test_cuda_mha_bfloat16_matches_explicit_visibility(self):
         with torch.device("cuda"):
-            self._mha_bfloat16_matches_legacy()
+            self._mha_bfloat16_matches_explicit_visibility()
 
-    def test_explicit_causality_matches_legacy(self):
+    def test_explicit_causality_matches_explicit_visibility(self):
         for causal in (True, False):
             with self.subTest(is_causal=causal):
-                self._parity(small_payload("qwen3.6-27b-dflash.json", is_causal=causal))
+                self._parity(small_payload("qwen3.6-27b-dflash.yaml", is_causal=causal))
 
 
 if __name__ == "__main__":

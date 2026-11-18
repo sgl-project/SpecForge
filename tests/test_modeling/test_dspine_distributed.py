@@ -4,6 +4,7 @@ import unittest
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -12,16 +13,16 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-from specforge.algorithms.dspine.strategy import DSpineTrainStrategy
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.controller import TrainerCore
 from specforge.training.strategies.base import StepContext
-from tests.test_modeling.test_dspine import training_inputs, training_model
+from tests.test_modeling.dspine_fixtures import training_inputs, training_model
+from tests.test_runtime._fixtures import build_strategy
 
 
-def fixed_anchors(sequence_length, loss_mask, device, max_valid_anchors=None):
-    batch = loss_mask.shape[0]
+def fixed_anchors(valid, num_anchors, available=None):
+    batch, device = valid.shape[0], valid.device
     return torch.ones(batch, 1, dtype=torch.long, device=device), torch.ones(
         batch, 1, dtype=torch.bool, device=device
     )
@@ -56,7 +57,10 @@ def distributed_step(rank, directory, accumulation_steps):
     )
     try:
         model = training_model(chunk_size=1)
-        model._sample_anchor_positions = fixed_anchors
+        anchor_patch = patch(
+            "specforge.algorithms.objectives.inputs.sample_anchors", fixed_anchors
+        )
+        anchor_patch.start()
         inputs = combined_batch(accumulation_steps)
         backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="NO_SHARD"))
         wrapped = backend.prepare_model(model)
@@ -65,7 +69,7 @@ def distributed_step(rank, directory, accumulation_steps):
         communication_counts = []
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
         core = TrainerCore(
-            DSpineTrainStrategy(wrapped), backend, accumulation_steps=accumulation_steps
+            build_strategy(wrapped), backend, accumulation_steps=accumulation_steps
         )
         for microstep in range(accumulation_steps):
             index = 2 * microstep + rank
@@ -102,7 +106,7 @@ def fsdp_mixed_precision_step(rank, directory):
         "gloo", init_method=f"file://{directory}/rendezvous", rank=rank, world_size=1
     )
     try:
-        model = training_model(chunk_size=1).to(torch.bfloat16)
+        model = training_model(chunk_size=1, dtype=torch.bfloat16)
         wrapped = FSDP(
             model,
             device_id=torch.device("cpu"),
@@ -110,16 +114,20 @@ def fsdp_mixed_precision_step(rank, directory):
             mixed_precision=MixedPrecision(
                 param_dtype=torch.bfloat16, buffer_dtype=torch.float32
             ),
-            ignored_modules=[model.lm_head, model.embed_tokens],
+            ignored_modules=[
+                model.target_head,
+                model.draft_model.embed_tokens,
+                model.draft_model.lm_head,
+            ],
             auto_wrap_policy=partial(
                 transformer_auto_wrap_policy,
-                transformer_layer_cls={type(model.draft_model.layers[0])},
+                transformer_layer_cls={type(model.draft_model.backbone.layers[0])},
             ),
         )
         backend = FSDPTrainingBackend(ParallelConfig())
         backend.prepare_model(wrapped, wrap=False)
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
-        core = TrainerCore(DSpineTrainStrategy(wrapped), backend, accumulation_steps=2)
+        core = TrainerCore(build_strategy(wrapped), backend, accumulation_steps=2)
         inputs = training_inputs()
         for name in ("hidden_states", "target_last_hidden_states"):
             inputs[name] = inputs[name].to(torch.bfloat16)
@@ -143,6 +151,7 @@ def fsdp_mixed_precision_step(rank, directory):
             assert all(
                 parameter.grad is not None and torch.isfinite(parameter.grad).all()
                 for parameter in model.draft_model.parameters()
+                if parameter.requires_grad
             )
     finally:
         dist.destroy_process_group()
@@ -157,16 +166,20 @@ class DSpineDistributedTest(unittest.TestCase):
                 with TemporaryDirectory() as directory:
                     tmp_path = Path(directory)
                     model = training_model(chunk_size=1)
-                    model._sample_anchor_positions = fixed_anchors
-                    (loss, _, _) = model(
-                        **combined_batch(accumulation_steps),
-                        global_step=300,
-                        total_steps=600,
+                    self.enterContext(
+                        patch(
+                            "specforge.algorithms.objectives.inputs.sample_anchors",
+                            fixed_anchors,
+                        )
                     )
+                    loss = model(
+                        combined_batch(accumulation_steps), step=300, total_steps=600
+                    ).loss
                     loss.backward()
                     expected = {
                         name: parameter.grad
                         for (name, parameter) in model.draft_model.named_parameters()
+                        if parameter.requires_grad
                     }
                     mp.spawn(
                         distributed_step,

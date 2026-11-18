@@ -1,0 +1,24 @@
+{
+  "architectures": [
+    "Qwen3_5MTPDraftModel"
+  ],
+  "model_type": "qwen3",
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 8,
+  "num_hidden_layers": 1,
+  "vocab_size": 64,
+  "max_position_embeddings": 64,
+  "rms_norm_eps": 1e-06,
+  "attn_output_gate": true,
+  "attention_dropout": 0.0,
+  "attention_bias": false,
+  "partial_rotary_factor": 0.5,
+  "rope_theta": 10000000.0,
+  "mtp_config": {
+    "share_lm_head": false
+  },
+  "pad_token_id": 0
+}

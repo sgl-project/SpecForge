@@ -432,9 +432,9 @@ def _build_consumer(work, *, resume_from=None, env=None, dist_patches=None):
     """
     from contextlib import ExitStack
 
-    from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.launch import build_disagg_online_consumer
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+    from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
     captured = {}
     channel = StreamingRefChannel(os.path.join(work, "refs.jsonl"))

@@ -33,7 +33,7 @@ true` tries it and logs a warning.
 ### Install the SGLang capture plugin (online and offline preparation)
 
 Use an Ascend-compatible SGLang build with the generic extension APIs required
-by [the plugin guide](../../../../plugins/sglang-spec-capture/README.md):
+by [the plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md):
 
 ```bash
 python -m pip install --no-deps plugins/sglang-spec-capture
@@ -181,7 +181,7 @@ Notes specific to DFlash 2 on Ascend:
   inside each proposal block independently of the attention mask. The checked-in
   4B draft uses `full_attention` layers only, so no sliding-window mask is
   involved.
-- **Selector knobs keep their defaults** (`dflash2_selector_loss_alpha: 1.0`,
+- **Selector knobs keep their defaults** (`loss.terms.selector.coefficient: 1.0`,
   zero warmup/ramp). The selector and convolutions are stock torch ops and need
   no NPU-specific settings.
 - **Serving the export** still requires an SGLang build with DFlash 2 support

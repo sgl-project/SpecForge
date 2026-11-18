@@ -15,6 +15,8 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             raise ValueError(
                 "canonical drafts must use build_draft_model or load_draft"
             )
+        from .draft import legacy  # noqa: F401
+
         archs = getattr(config, "architectures", None) or []
         if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
             raise ValueError(

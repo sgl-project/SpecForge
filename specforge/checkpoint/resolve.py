@@ -1,16 +1,17 @@
-"""Select a reader by configuration/format, never by directory names."""
+"""Select a reader by configuration/format; run roots resolve by the run naming."""
 
+import glob
 import json
-from dataclasses import dataclass, field
+import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from specforge.config.draft import DraftConfig
-from specforge.config.draft.codec.legacy import LEGACY_ARCHITECTURES
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling.draft.hf_config import _METADATA, SpecForgeDraftConfig
 
 from .draft_dir import read_artifact_metadata
-from .formats.legacy import read_legacy
 from .tensors import TensorStore
 
 _ADAPTERS = {}
@@ -23,6 +24,90 @@ def register_adapter(name, matches, read):
     if not callable(matches) or not callable(read):
         raise TypeError("adapter detection and reader must be callable")
     _ADAPTERS[name] = (matches, read)
+
+
+def resolve_run_directory(path: str) -> str:
+    """Resolve one unambiguous resume target to its checkpoint directory.
+
+    A run output directory is convenient in declarative configs, but it
+    must never choose between unrelated runs silently.  Prefer its single
+    complete ``*-latest`` pointer; when symlinks are unavailable, fall back
+    to the highest complete ``<run-id>-stepN`` directory only if all
+    candidates belong to the same run id.
+    """
+    path = str(path)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.basename(path) == "training_state.pt":
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
+        path = os.path.dirname(path)
+    if os.path.isfile(os.path.join(path, "training_state.pt")):
+        return path
+    if os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path} is not a training_state.pt; name the state file, its "
+            "checkpoint directory or the run root"
+        )
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"checkpoint path does not exist: {path}")
+
+    latest = []
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
+        resolved = os.path.realpath(candidate)
+        if os.path.isfile(os.path.join(resolved, "training_state.pt")):
+            latest.append(resolved)
+    latest = sorted(set(latest))
+    if len(latest) == 1:
+        return latest[0]
+    if len(latest) > 1:
+        raise ValueError(
+            f"run root {path} contains multiple complete *-latest runs: "
+            f"{latest}; select one checkpoint explicitly"
+        )
+
+    by_run: dict[str, list[tuple[int, str]]] = {}
+    pattern = re.compile(r"^(.+)-step(\d+)$")
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
+        match = pattern.match(os.path.basename(candidate))
+        if match and os.path.isfile(os.path.join(candidate, "training_state.pt")):
+            by_run.setdefault(match.group(1), []).append(
+                (int(match.group(2)), candidate)
+            )
+    if not by_run:
+        raise FileNotFoundError(f"no complete checkpoint found under {path}")
+    if len(by_run) > 1:
+        raise ValueError(
+            f"run root {path} contains multiple checkpoint runs: "
+            f"{sorted(by_run)}; select one checkpoint explicitly"
+        )
+    candidates = next(iter(by_run.values()))
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _is_run_root(path: Path) -> bool:
+    return any(
+        child.is_dir()
+        and (child.name.endswith("-latest") or re.fullmatch(r".+-step\d+", child.name))
+        for child in path.iterdir()
+    )
+
+
+def resolve_checkpoint_path(source, *, cache_dir=None, config_only=False):
+    """Resolve model directories and training run roots without choosing a run silently."""
+    path = resolve_directory(source, cache_dir=cache_dir, config_only=config_only)
+    # positive evidence only: config-less model dirs and config-only snapshots
+    # hold neither config.json nor weights at their root
+    if (
+        path.is_dir()
+        and not any(
+            (path / name).exists() for name in ("config.json", "training_state.pt")
+        )
+        and _is_run_root(path)
+    ):
+        path = Path(resolve_run_directory(str(path)))
+    return path
 
 
 def resolve_directory(source, *, cache_dir=None, config_only=False):
@@ -64,6 +149,9 @@ def target_configuration(directory):
     text = dict(config.get("text_config", config))
     if "tie_word_embeddings" not in text and "tie_word_embeddings" in config:
         text["tie_word_embeddings"] = config["tie_word_embeddings"]
+    # Some targets (LongCat) store their depth as num_layers only.
+    if "num_hidden_layers" not in text and "num_layers" in text:
+        text["num_hidden_layers"] = text["num_layers"]
     return text
 
 
@@ -73,7 +161,6 @@ class DraftCheckpoint:
     weights: dict
     hf_metadata: dict
     source: str
-    bound_copies: dict = field(default_factory=dict)
 
 
 def _canonical(payload, store, target):
@@ -87,42 +174,24 @@ def _canonical(payload, store, target):
 register_adapter(
     "canonical", lambda p: p.get("model_type") == "specforge_draft", _canonical
 )
-register_adapter(
-    "legacy",
-    lambda p: p.get("model_type") != "specforge_draft"
-    and isinstance(p.get("architectures"), list)
-    and len(p["architectures"]) == 1
-    and p["architectures"][0] in LEGACY_ARCHITECTURES,
-    read_legacy,
-)
 
 
 def read_checkpoint(
     source,
     *,
     target_config=None,
-    legacy_config=None,
-    legacy_settings=None,
     adapter=None,
     cache_dir=None,
     check_target=True,
 ):
-    path = resolve_directory(source, cache_dir=cache_dir)
+    path = resolve_checkpoint_path(source, cache_dir=cache_dir)
     directory = path.parent if path.is_file() else path
     config_path = directory / "config.json"
-    if config_path.exists():
-        if legacy_config is not None:
-            raise ValueError(
-                "legacy_config is only for checkpoints without config.json"
-            )
-        payload = read_json(config_path)
-    elif legacy_config is not None:
-        payload = read_json(legacy_config)
-    else:
+    if not config_path.is_file():
         raise ValueError(
-            f"{directory} has no config.json: point at a checkpoint directory "
-            "rather than a run output directory, or supply legacy_config"
+            f"{directory} has no config.json; select a canonical checkpoint directory"
         )
+    payload = read_json(config_path)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint config must be an object")
     artifact = read_artifact_metadata(payload)
@@ -135,26 +204,10 @@ def read_checkpoint(
         matches = [adapter]
     if len(matches) != 1:
         raise ValueError(
-            f"expected one checkpoint adapter, found {matches}; select adapter explicitly if ambiguous"
+            f"Expected one checkpoint adapter, found {matches}; provide a canonical SpecForge checkpoint or a registered adapter"
         )
     store = TensorStore(path)
-    bound_copies = {}
-    if matches[0] == "legacy":
-        config, weights, metadata = read_legacy(
-            payload,
-            store,
-            target_config,
-            check_target=check_target,
-            settings=legacy_settings,
-        )
-        for name in config.target_bindings:
-            key = name + ".weight"
-            if key in weights:
-                bound_copies[name] = weights.pop(key)
-    else:
-        if legacy_settings:
-            raise ValueError("legacy_settings apply only to legacy checkpoints")
-        config, weights, metadata = _ADAPTERS[matches[0]][1](
-            payload, store, target_config if check_target else None
-        )
-    return DraftCheckpoint(config, weights, metadata, str(path), bound_copies)
+    config, weights, metadata = _ADAPTERS[matches[0]][1](
+        payload, store, target_config if check_target else None
+    )
+    return DraftCheckpoint(config, weights, metadata, str(path))

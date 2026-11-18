@@ -124,7 +124,13 @@ class FlashAttentionBackend(AttentionBackend):
             value_head_dim=value.shape[-1],
             dropout_p=dropout_p if training else 0.0,
         )
-        from flash_attn import flash_attn_varlen_func
+        # in try, Transformers' remote-code import check treats it as optional
+        try:
+            from flash_attn import flash_attn_varlen_func
+        except ImportError as error:
+            raise ImportError(
+                f"backend='flash' requires flash-attn: {error}"
+            ) from error
 
         def unpad(tensor, indices):
             return tensor.transpose(1, 2).flatten(0, 1)[indices]

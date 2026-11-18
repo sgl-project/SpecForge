@@ -11,10 +11,7 @@ import torch
 from safetensors.torch import save_file
 
 from specforge.checkpoint import save_draft
-from specforge.checkpoint.initialization import (
-    make_initialization_plan,
-    resolve_bindings,
-)
+from specforge.checkpoint.initialization import resolve_bindings
 from specforge.checkpoint.resolve import target_configuration
 from specforge.checkpoint.target import _TARGET_KEYS
 from specforge.checkpoint.tensors import TensorStore
@@ -22,8 +19,6 @@ from specforge.loading import initialize_draft, load_draft, read_draft
 from specforge.modeling import build_draft_model
 from tests.test_checkpoint.test_loading import write_target
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_config.test_draft_legacy_eagle3 import eagle_payload
-from tests.test_config.test_draft_legacy_mtp import mtp_payload
 
 
 class LoadingReviewTest(unittest.TestCase):
@@ -169,33 +164,6 @@ class LoadingReviewTest(unittest.TestCase):
                     },
                 )
 
-    def test_warm_start_uses_or_reports_stored_bound_tables(self):
-        """A stored bound table fills an owned module, else is reported unused."""
-        owned = draft_config(target_bindings=(), target_logit_transform=None)
-        with TemporaryDirectory() as tmp:
-            source, target = Path(tmp) / "source", Path(tmp) / "target"
-            save_draft(build_draft_model(owned), source)
-            write_target(target)
-            checkpoint = read_draft(source)
-            weights = dict(checkpoint.weights)
-            legacy = replace(
-                checkpoint,
-                weights=weights,
-                bound_copies={"lm_head": weights.pop("lm_head.weight")},
-            )
-            plan = make_initialization_plan(
-                build_draft_model(owned, device="meta"), weights_from=legacy
-            )
-            self.assertIn("lm_head.weight", dict(plan.weights))
-            with self.assertLogs("specforge.checkpoint.initialization", "WARNING"):
-                plan = make_initialization_plan(
-                    build_draft_model(draft_config(), device="meta"),
-                    weights_from=legacy,
-                    target_store=TensorStore(target),
-                    target_config=target_configuration(target),
-                )
-            self.assertIn("lm_head.weight", plan.unused)
-
     def test_fp8_unselected_weights_bind_but_selected_weights_fail(self):
         with TemporaryDirectory() as tmp:
             target = Path(tmp) / "target"
@@ -250,30 +218,6 @@ class LoadingReviewTest(unittest.TestCase):
                 "embed.weight",
             )
 
-    def test_pre_dataflow_training_state_beside_hf_weights_is_ignored(self):
-        """Old epoch dirs pickled argparse args next to save_pretrained weights."""
-        from argparse import Namespace
-        from datetime import datetime
-        from pickle import UnpicklingError
-
-        payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
-        with TemporaryDirectory() as tmp:
-            target, source = Path(tmp) / "target", Path(tmp) / "source"
-            weights = write_target(target)
-            source.mkdir()
-            (source / "config.json").write_text(json.dumps(payload))
-            save_file(
-                {"mtp.lm_head.weight": weights["lm_head.weight"]},
-                source / "model.safetensors",
-            )
-            torch.save({"args": Namespace(lr=1e-4)}, source / "training_state.pt")
-            with self.assertLogs("specforge.checkpoint.formats.legacy", "WARNING"):
-                read_draft(source, target=target)
-            # any other non-allowlisted object still fails loudly
-            torch.save({"saved_at": datetime(2026, 1, 1)}, source / "training_state.pt")
-            with self.assertRaises(UnpicklingError):
-                read_draft(source, target=target)
-
     def test_source_directory_metadata_does_not_follow_the_model(self):
         """Re-saving a loaded export must not carry its auto_map without its code."""
         with TemporaryDirectory() as tmp:
@@ -289,79 +233,6 @@ class LoadingReviewTest(unittest.TestCase):
             saved = json.loads((out / "config.json").read_text())
             self.assertNotIn("auto_map", saved)
             self.assertEqual(saved["specforge_artifact"], artifact)
-
-    def test_legacy_contract_and_saved_bound_table_are_checked(self):
-        payload = mtp_payload() | dict(hidden_size=32, vocab_size=64)
-        with TemporaryDirectory() as tmp:
-            target, source = Path(tmp) / "target", Path(tmp) / "source"
-            weights = write_target(target)
-            source.mkdir()
-            (source / "config.json").write_text(json.dumps(payload))
-            # read_draft exposes the old bound tables without loading a model.
-            save_file(
-                {"mtp.lm_head.weight": weights["lm_head.weight"]},
-                source / "model.safetensors",
-            )
-            torch.save({"mtp_share_lm_head": False}, source / "training_state.pt")
-            with self.assertRaisesRegex(ValueError, "mtp_share_lm_head"):
-                read_draft(source, target=target)
-            torch.save(
-                {"specforge_model_provenance": (("load_target_embedding", False),)},
-                source / "training_state.pt",
-            )
-            # main ignores the flag for MTP; only EAGLE3 honors it
-            read_draft(source, target=target)
-            eagle = Path(tmp) / "eagle"
-            eagle.mkdir()
-            (eagle / "config.json").write_text(
-                json.dumps(
-                    eagle_payload()
-                    | dict(
-                        hidden_size=32,
-                        intermediate_size=64,
-                        num_attention_heads=4,
-                        num_key_value_heads=2,
-                        head_dim=8,
-                        vocab_size=64,
-                        draft_vocab_size=64,
-                        target_hidden_size=32,
-                        bos_token_id=None,
-                        eos_token_id=None,
-                        pad_token_id=None,
-                    )
-                )
-            )
-            save_file({"fc.weight": torch.zeros(32, 96)}, eagle / "model.safetensors")
-            torch.save(
-                {"specforge_model_provenance": (("load_target_embedding", False),)},
-                eagle / "training_state.pt",
-            )
-            with self.assertRaisesRegex(ValueError, "load_target_embedding"):
-                read_draft(eagle, target=target)
-            torch.save({}, source / "training_state.pt")
-            checkpoint = read_draft(source, target=target)
-            model = build_draft_model(checkpoint.config)
-            state = {
-                "mtp."
-                + k.replace("backbone.final_norm.", "norm.")
-                .removeprefix("backbone.")
-                .removeprefix("fusion."): v
-                for k, v in model.state_dict().items()
-            }
-            state["mtp.lm_head.weight"] = weights["lm_head.weight"]
-            save_file(state, source / "model.safetensors")
-            load_draft(source, target=target)
-            state["mtp.lm_head.weight"] = state["mtp.lm_head.weight"] + 1
-            save_file(state, source / "model.safetensors")
-            with self.assertRaisesRegex(ValueError, "mtp.lm_head.weight differs"):
-                load_draft(source, target=target)
-            with patch(
-                "huggingface_hub.snapshot_download", return_value=str(source)
-            ) as download:
-                read_draft("test/draft", target=target)
-                self.assertIn(
-                    "training_state.pt", download.call_args.kwargs["allow_patterns"]
-                )
 
     def test_tied_target_whose_config_omits_the_tie_flag(self):
         """Diff-mode configs drop tie_word_embeddings when it equals the default."""
@@ -385,10 +256,25 @@ class LoadingReviewTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "lm_head"):
                             store.resolve("lm_head")
 
-    def test_run_output_directory_error_names_the_checkpoint_directory(self):
-        """A run root has no config.json; the error must not only ask for a legacy config."""
+    def test_run_root_without_complete_checkpoint_is_rejected(self):
+        """An empty step directory is not a loadable training checkpoint."""
         with TemporaryDirectory() as temp:
             run = Path(temp) / "run"
             (run / "run-step2").mkdir(parents=True)
-            with self.assertRaisesRegex(ValueError, "rather than a run output"):
+            with self.assertRaisesRegex(
+                FileNotFoundError, "no complete checkpoint found"
+            ):
                 read_draft(run)
+
+    def test_config_less_model_directories_are_not_run_roots(self):
+        """Config-only hub snapshots and subfolder shards resolve to themselves."""
+        from specforge.checkpoint.resolve import resolve_checkpoint_path
+
+        with TemporaryDirectory() as temp:
+            snapshot = Path(temp) / "snapshot"
+            snapshot.mkdir()
+            sharded = Path(temp) / "sharded"
+            (sharded / "shards").mkdir(parents=True)
+            (sharded / "model.safetensors.index.json").write_text("{}")
+            for path in (snapshot, sharded):
+                self.assertEqual(resolve_checkpoint_path(path), path)

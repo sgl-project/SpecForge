@@ -38,6 +38,9 @@ dependencies = [
 [project.scripts]
 specforge = "specforge.cli:main"
 
+[tool.setuptools.package-data]
+"specforge.config.draft" = ["presets/**/*.yaml"]
+
 [tool.setuptools.packages.find]
 include = ["specforge*"]
 
