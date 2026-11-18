@@ -20,11 +20,19 @@ commits are flushed before a checkpoint.
 
 ``RunnerChecks`` holds a runner to the reference runner's updates in one
 process, bit for bit, for each declaration.
+
+The recorded cases train the runner that ``specforge train`` assembles, which
+is the reference: no configuration key selects another. A candidate is
+recorded by entering a substitution around every rank's run
+(``record(cases, around_training=...)``); until a runner of several ranks has
+one, the two mixins are what hold it, in one process.
 """
 
 from __future__ import annotations
 
+import copy
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from unittest.mock import patch
@@ -41,7 +49,7 @@ from specforge.training.controller import TrainerController
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
 from tests.test_runtime._fixtures import FakeProgram, fake_spec
-from tests.test_runtime.trajectories import Case
+from tests.test_runtime.trajectories import Case, differences
 
 # The architecture whose objective makes each declaration.
 DECLARATIONS = {
@@ -160,18 +168,30 @@ class KitProgram(FakeProgram):
 
     Under ``window`` its denominator is the batch's ``x``, so micro-batches
     weigh differently. Under ``microbatch`` it returns two terms with
-    denominators of their own. With ``replay`` its loss is scaled by the
-    window's pooled statistic, and a prepass reports that statistic. Its
+    denominators of their own and a numerator that carries no graph, so a
+    runner that took the numerator for the loss has nothing to differentiate.
+    With ``replay`` its loss is scaled by a function of the window's pooled
+    sums that is not their ratio alone, and a prepass reports those sums. Its
     forward draws from the generator, so a replay that restored the wrong RNG
     state shows in the update.
     """
 
-    def __init__(self, *, reduction="window", replay=False):
+    def __init__(
+        self,
+        *,
+        reduction="window",
+        replay=False,
+        diagnostics=False,
+        dtype=torch.float32,
+    ):
         super().__init__()
         torch.manual_seed(11)
-        self.linear = nn.Linear(1, 2, bias=False)
+        self.linear = nn.Linear(1, 2, bias=False).to(dtype)
         self.reduction = reduction
         self.replay = replay
+        self.diagnostics = diagnostics
+        #: ``collect_detailed_metrics`` as each forward received it.
+        self.detailed = []
 
     def spec(self):
         return fake_spec(
@@ -179,43 +199,59 @@ class KitProgram(FakeProgram):
             name="kit",
             reduction=self.reduction,
             replay_statistics=("scale",) if self.replay else (),
+            evaluation_diagnostics=self.diagnostics,
         )
 
-    def forward(self, tensors, *, prepass=False, replay_values=None, **context):
-        x = tensors["x"]
-        noise = torch.rand(2) if self.training else torch.zeros(2)
-        first, second = (self.linear(x) * (1 + noise)).unbind()
+    def forward(
+        self,
+        tensors,
+        *,
+        collect_detailed_metrics=True,
+        prepass=False,
+        replay_values=None,
+        **context,
+    ):
+        self.detailed.append(collect_detailed_metrics)
+        weight = self.linear.weight
+        x = tensors["x"].to(weight.dtype)
+        noise = (
+            torch.rand(2, device=weight.device)
+            if self.training
+            else torch.zeros(2, device=weight.device)
+        )
+        first, second = (self.linear(x) * (1 + noise).to(weight.dtype)).unbind()
         if replay_values:
             count, total = replay_values["scale"]
-            first = first * (count / total)
-        result = ObjectiveResult(first + 0.5 * second * second, x.sum().detach())
-        result.ratios["acc"] = (x.sum().detach(), x.sum().detach() + 1)
+            # Not their ratio alone: means in place of sums would show.
+            first = first * (count / (total + 1)).to(weight.dtype)
+        size = x.sum().detach().float()
+        result = ObjectiveResult(first + 0.5 * second * second, size)
+        result.ratios["acc"] = (size, size + 1)
         if prepass:
-            result.statistics["scale"] = torch.stack(
-                (x.sum().detach(), x.sum().detach() + 2)
-            )
+            result.statistics["scale"] = torch.stack((size, size + 2))
         if self.reduction == "microbatch":
-            terms = (
-                (1.0, first, x.sum().detach()),
-                (0.5, second * second, x.sum().detach() + 1),
-            )
+            terms = ((1.0, first, size), (0.5, second * second, size + 1))
             result = replace(
                 result,
-                numerator=sum(c * n / d for c, n, d in terms),
-                denominator=torch.ones(()),
+                numerator=sum(c * n / d for c, n, d in terms).detach(),
+                denominator=size.new_ones(()),
                 terms=terms if self.training else (),
             )
         return result
 
 
 class _Observed:
-    """A runner as given, with every applied update written to a ledger."""
+    """A runner as given, with what it was handed and applied written to a ledger."""
 
     def __init__(self, runner, ledger):
         self._runner, self._ledger = runner, ledger
 
     def __getattr__(self, name):
         return getattr(self._runner, name)
+
+    def forward_backward(self, batch, ctx, *, is_boundary):
+        self._ledger.append(("forward", *batch.sample_ids))
+        return self._runner.forward_backward(batch, ctx, is_boundary=is_boundary)
 
     def apply_step(self, pending):
         metrics = self._runner.apply_step(pending)
@@ -251,12 +287,21 @@ def protocol_ledger(
 ):
     """Run the run loop over ``runner`` and return what happened, in order.
 
-    Entries: ``("batch", id)`` as the stream hands a batch out, ``("update",)``
-    as the runner returns from an optimizer step, ``("commit", ids, step)`` as
-    samples are acknowledged, ``("checkpoint", step)`` as a checkpoint is
-    written, and ``("raised", type name)`` if the run ended in an exception.
+    Entries: ``("batch", id)`` as the stream hands a batch out,
+    ``("forward", id)`` as the runner is handed it, ``("update",)`` as the
+    runner returns from an optimizer step, ``("commit", ids, step)`` as
+    samples are acknowledged, ``("checkpoint", step)`` as a checkpoint starts
+    to be written, and ``("raised", type name)`` if the run ended in an
+    exception. An asynchronous acknowledgement takes a moment here, so a
+    checkpoint that did not wait for it is written first.
     """
     ledger = []
+
+    def acknowledge(ids, step):
+        if async_ack:
+            time.sleep(0.02)
+        ledger.append(("commit", tuple(ids), step))
+
     with tempfile.TemporaryDirectory() as directory:
         controller = TrainerController(
             _Observed(runner, ledger),
@@ -266,7 +311,7 @@ def protocol_ledger(
             output_dir=directory,
             num_epochs=epochs,
             save_interval=1,
-            ack_fn=lambda ids, step: ledger.append(("commit", tuple(ids), step)),
+            ack_fn=acknowledge,
             async_ack=async_ack,
             checkpoint_manager=_LedgerCheckpoints(directory, "kit", ledger),
         )
@@ -280,30 +325,46 @@ def protocol_ledger(
 def protocol_violations(ledger, *, accumulation_steps=2):
     """What a ledger shows that the commit contract forbids.
 
-    A sample is committed only after the update that consumed it; commits
-    follow the stream's order, one whole window each, so an incomplete window
-    is never committed; every commit up to a checkpoint's step precedes it.
+    An update consumes one whole window. A commit names exactly what the
+    update of its step consumed, follows it, and comes in step order. Nothing
+    is committed once the run has raised. Every commit up to a checkpoint's
+    step precedes it. A run that ended without raising committed every update.
     """
     found = []
-    handed_out = [entry[1] for entry in ledger if entry[0] == "batch"]
-    updates = committed = 0
+    forwarded, consumed = [], []
+    committed, raised = 0, False
     for entry in ledger:
-        if entry[0] == "update":
-            updates += 1
-        elif entry[0] == "commit":
+        kind = entry[0]
+        if kind == "forward":
+            forwarded.append(entry[1])
+        elif kind == "update":
+            if len(forwarded) != accumulation_steps:
+                found.append(
+                    f"update {len(consumed) + 1} consumed {tuple(forwarded)}, "
+                    f"not a window of {accumulation_steps}"
+                )
+            consumed.append(tuple(forwarded))
+            forwarded = []
+        elif kind == "raised":
+            raised = True
+        elif kind == "commit":
             _, ids, step = entry
-            window = tuple(
-                handed_out[committed * accumulation_steps :][:accumulation_steps]
-            )
+            if raised:
+                found.append(f"step {step} was committed after the run raised")
             if step != committed + 1:
                 found.append(f"commit of step {step} follows {committed} commits")
-            if ids != window or len(window) != accumulation_steps:
-                found.append(f"step {step} committed {ids}, not the window {window}")
-            if updates < step:
-                found.append(f"step {step} was committed after {updates} updates")
+            if step > len(consumed):
+                found.append(f"step {step} was committed after {len(consumed)} updates")
+            elif ids != consumed[step - 1]:
+                found.append(
+                    f"step {step} committed {ids}; its update consumed "
+                    f"{consumed[step - 1]}"
+                )
             committed += 1
-        elif entry[0] == "checkpoint" and committed < entry[1]:
+        elif kind == "checkpoint" and committed < entry[1]:
             found.append(f"checkpoint {entry[1]} was written after {committed} commits")
+    if not raised and committed != len(consumed):
+        found.append(f"{len(consumed)} updates were applied and {committed} committed")
     return found
 
 
@@ -324,10 +385,11 @@ class ProtocolChecks:
         """Three batches an epoch, two epochs, a window of two: three updates."""
         ledger = self.ledger()
         self.assertEqual(ledger.count(("update",)), 3)
-        self.assertEqual(
-            [entry[1] for entry in ledger if entry[0] == "batch"],
-            [f"s{index}" for index in range(6)],
-        )
+        for kind in ("batch", "forward"):
+            self.assertEqual(
+                [entry[1] for entry in ledger if entry[0] == kind],
+                [f"s{index}" for index in range(6)],
+            )
 
     def test_samples_are_committed_after_their_update_in_order(self):
         ledger = self.ledger()
@@ -364,55 +426,66 @@ class ProtocolChecks:
                 self.assertEqual(protocol_violations(ledger), [])
 
 
-def _train(runner, program, windows):
-    """Run ``windows``; return every update's loss, gradient norm and weights."""
-    torch.manual_seed(5)
+def _train(runner, program, windows, *, first_step=0):
+    """Run ``windows``; return what every update reported and left."""
     trajectory = []
-    for step, window in enumerate(windows):
+    for step, window in enumerate(windows, start=first_step):
         ctx = StepContext(global_step=step, accumulation_steps=len(window))
         metrics = run_window(runner, iter(window), ctx)
         trajectory.append(
-            (
-                metrics.loss,
-                # Before clipping: a gradient scaled wrongly shows here even
-                # where the clip then hides it from the weights.
-                metrics.grad_norm,
-                program.linear.weight.detach().clone(),
-            )
+            {
+                # Every metric, the pre-clip gradient norm among them: a
+                # gradient scaled wrongly shows there even where the clip
+                # then hides it from the weights.
+                "metrics": dict(metrics.materialize()),
+                "learning_rate": metrics.learning_rate,
+                "weights": program.linear.weight.detach().clone(),
+            }
         )
-    return trajectory
+    state = runner.checkpoint_state()
+    optimizer = (
+        state.rank["optimizer"] if state.replicated is None else state.replicated
+    )
+    return {
+        "updates": trajectory,
+        # Moments, step counts, the schedule's position and the fp32 masters.
+        "optimizer": copy.deepcopy(optimizer),
+        "generator": torch.get_rng_state(),
+    }
 
 
 class RunnerChecks:
-    """A runner reproduces the reference runner's updates in one process.
+    """A runner reproduces the reference runner in one process.
 
     Mix into a ``unittest.TestCase`` and set ``make_runner``. One job per
-    declaration; each compares losses and weights after every update with the
+    declaration; each compares every update's metrics, learning rate and
+    weights, and the optimizer and generator state at the end, with the
     reference runner's, bit for bit.
     """
 
     make_runner = staticmethod(reference_runner)
 
-    #: Two windows of two micro-batches with different weights.
+    #: Windows of two micro-batches with different weights.
     windows = (
         (batch(0, 1.0), batch(1, 3.0)),
         (batch(2, 2.0), batch(3, 0.5)),
+        (batch(4, 1.5), batch(5, 2.5)),
     )
 
     def assert_reproduces_the_reference(self, **declarations):
         candidate, reference = KitProgram(**declarations), KitProgram(**declarations)
+        torch.manual_seed(5)
         expected = _train(
             reference_runner(reference, reference.spec()), reference, self.windows
         )
+        torch.manual_seed(5)
         actual = _train(
             self.make_runner(candidate, candidate.spec()), candidate, self.windows
         )
-        self.assertEqual(len(actual), len(expected))
-        for update, reference_update in zip(actual, expected):
-            self.assertEqual(update[:2], reference_update[:2])
-            torch.testing.assert_close(update[2], reference_update[2], rtol=0, atol=0)
+        self.assertEqual(differences(actual, expected), [])
         # The job is not vacuous: the weights moved, and differently each update.
-        self.assertFalse(torch.equal(expected[0][2], expected[1][2]))
+        first, second = (update["weights"] for update in expected["updates"][:2])
+        self.assertFalse(torch.equal(first, second))
 
     def test_window_reduction(self):
         self.assert_reproduces_the_reference()
@@ -431,27 +504,53 @@ class RunnerChecks:
         with self.assertRaises(RuntimeError):
             runner.apply_step(pending)
 
-    def test_evaluation_leaves_training_untouched(self):
+    def test_batch_without_a_declared_input_is_refused(self):
         program = KitProgram()
         runner = self.make_runner(program, program.spec())
-        before = program.linear.weight.detach().clone()
-        generator = torch.get_rng_state()
-        with runner.evaluation():
-            self.assertFalse(program.training)
-            result = runner.evaluate(batch(0), StepContext())
-        self.assertFalse(result.numerator.requires_grad)
-        self.assertTrue(program.training)
-        torch.testing.assert_close(program.linear.weight, before, rtol=0, atol=0)
-        self.assertTrue(torch.equal(torch.get_rng_state(), generator))
+        unfit = TrainBatch(["s0"], "kit", {"y": torch.ones(1)})
+        with self.assertRaisesRegex(ValueError, "missing required features"):
+            runner.forward_backward(unfit, StepContext(), is_boundary=True)
+
+    def test_evaluation_reports_what_the_program_computed(self):
+        for diagnostics in (False, True):
+            with self.subTest(diagnostics=diagnostics):
+                results = []
+                for make_runner in (reference_runner, self.make_runner):
+                    program = KitProgram(diagnostics=diagnostics)
+                    runner = make_runner(program, program.spec())
+                    before = program.linear.weight.detach().clone()
+                    generator = torch.get_rng_state()
+                    # The declaration decides, not what the caller asks for.
+                    ctx = StepContext(collect_detailed_metrics=not diagnostics)
+                    with runner.evaluation():
+                        self.assertFalse(program.training)
+                        result = runner.evaluate(batch(0, 3.0), ctx)
+                    self.assertEqual(program.detailed, [diagnostics])
+                    self.assertFalse(result.numerator.requires_grad)
+                    self.assertTrue(program.training)
+                    torch.testing.assert_close(
+                        program.linear.weight, before, rtol=0, atol=0
+                    )
+                    self.assertTrue(torch.equal(torch.get_rng_state(), generator))
+                    results.append(
+                        {
+                            "loss": (result.numerator, result.denominator),
+                            **result.ratios,
+                        }
+                    )
+                self.assertEqual(differences(results[1], results[0]), [])
 
     def test_resume_continues_the_same_trajectory(self):
-        uninterrupted = KitProgram()
+        """In bfloat16: the optimizer's fp32 masters hold bits the weights do not."""
+        dtype = torch.bfloat16
+        uninterrupted = KitProgram(dtype=dtype)
+        torch.manual_seed(5)
         expected = _train(
             self.make_runner(uninterrupted, uninterrupted.spec()),
             uninterrupted,
             self.windows,
         )
-        first, second = KitProgram(), KitProgram()
+        first, second = KitProgram(dtype=dtype), KitProgram(dtype=dtype)
         runner = self.make_runner(first, first.spec())
         torch.manual_seed(5)
         run_window(
@@ -469,11 +568,8 @@ class RunnerChecks:
             saved["optimizer"] = state.replicated
         # The optimizer logs its restore on rank 0 of a process group.
         with patch("specforge.optimizer.print_on_rank0"):
-            resumed.load_resume(saved)
-        metrics = run_window(
-            resumed,
-            iter(self.windows[1]),
-            StepContext(global_step=1, accumulation_steps=2),
-        )
-        self.assertEqual((metrics.loss, metrics.grad_norm), expected[1][:2])
-        torch.testing.assert_close(second.linear.weight, expected[1][2], rtol=0, atol=0)
+            resumed.load_resume(copy.deepcopy(saved))
+        # Two more updates: the second one runs at the schedule's next rate.
+        actual = _train(resumed, second, self.windows[1:], first_step=1)
+        actual["updates"] = expected["updates"][:1] + actual["updates"]
+        self.assertEqual(differences(actual, expected), [])

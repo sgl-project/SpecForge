@@ -92,20 +92,30 @@ does not have yet.
 
 - `declaration_cases()`: one recorded training case for each thing a program
   declares to a runner (each reduction, a replay statistic, evaluation
-  diagnostics). A runner of the `exact` class reproduces the reference's
-  recording of them on the same machine (`tests/test_runtime/trajectories.py`).
+  diagnostics), at two ranks. They train the runner `specforge train`
+  assembles, which is the reference: no configuration key selects another.
+  A candidate is recorded by substituting it around every rank's run
+  (`record(cases, around_training=...)`), and a runner of the `exact` class
+  then reproduces the reference's recording on the same machine.
 - `MUTATIONS`: three broken references (gradients scaled by the world size,
   clipping skipped, the learning-rate schedule shifted by one step). Each has
   to change the recording, or the replay proves nothing.
 - `ProtocolChecks`: the run loop over the runner with a stream that is read
-  once and a ledger. The window spans the epoch boundary; samples are
-  committed after the update that consumed them, in order; an incomplete
-  window is never committed; commits are flushed before a checkpoint.
+  once and a ledger of what was read, handed to the runner, applied,
+  committed and checkpointed. An update consumes one whole window; a commit
+  names exactly what the update of its step consumed and follows it; nothing
+  is committed for an incomplete window; commits are flushed before a
+  checkpoint, slow asynchronous ones included.
 - `RunnerChecks`: one job per declaration in one process, compared with the
-  reference runner's losses, gradient norms and weights bit for bit, plus the
-  single-use handle, evaluation and resume.
+  reference runner bit for bit: every update's metrics, learning rate and
+  weights, and the optimizer state at the end. Plus the single-use handle, a
+  refused batch, evaluation, and resume in bfloat16 through two further
+  updates.
 
-A new runner adds two test classes that set `make_runner`.
+A new runner adds two test classes that set `make_runner`; those hold it in
+one process. Not in the kit: a recorded case with sequence parallelism (it
+needs `flash_attn` and accelerators), the order of commits across ranks, and
+frozen modules and partition blocks, which only a sharding runner acts on.
 
 ## Internal mechanics
 
