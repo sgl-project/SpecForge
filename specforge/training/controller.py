@@ -28,9 +28,8 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.contracts import StepMetrics, StepRunner
+from specforge.training.contracts import StepContext, StepMetrics, StepRunner
 from specforge.training.frame import run_window
-from specforge.training.strategies.base import StepContext
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +241,7 @@ class TrainerController:
         self.max_steps = max_steps
         # Schedule horizon for step-dependent losses (Domino's lambda_base decay);
         # distinct from max_steps, an optional early-stop CAP. Falls back to
-        # max_steps; None means schedule-reading strategies decay nothing.
+        # max_steps; None means schedule-reading objectives decay nothing.
         self.total_steps = total_steps if total_steps is not None else max_steps
         self.num_epochs = num_epochs
         self.logger = logger

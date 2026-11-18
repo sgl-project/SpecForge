@@ -36,7 +36,6 @@ class TestEquivTrainerSplit(unittest.TestCase):
         fx.build_single_rank_distributed(port="29562")
         from specforge.launch import build_offline_runtime
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.runner import DataParallelRunner
         from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         algorithm = builtin_algorithm_registry().resolve("eagle3")
@@ -86,13 +85,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     wrap=True,
                     optimizer_target=runner_model.draft_model,
                 )
-                runner = DataParallelRunner(
-                    algorithm.providers.step.build(
-                        wrapped,
-                        target_head=runner_head,
-                    ),
-                    backend,
-                )
+                runner = fx.build_runner(wrapped, backend)
                 batch = next(
                     iter(
                         fx.build_offline_eagle3_loader(
@@ -113,12 +106,8 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     logged[0][1]["grad_norm"], runner_metrics.grad_norm, places=3
                 )
 
-                fit_state = trainer.runner.strategy.checkpoint_state_filter(
-                    trainer.backend.state_dict()["model"]
-                )
-                runner_state = runner.strategy.checkpoint_state_filter(
-                    backend.state_dict()["model"]
-                )
+                fit_state = fit_model.draft_state(trainer.backend.state_dict()["model"])
+                runner_state = runner_model.draft_state(backend.state_dict()["model"])
                 self.assertEqual(set(fit_state), set(runner_state))
                 for name in sorted(fit_state):
                     self.assertTrue(

@@ -24,7 +24,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.strategies.canonical import CanonicalTrainStrategy
+        from specforge.training.program import program_spec
 
         hidden, sequence_length = 64, 12
         workdir = tempfile.mkdtemp(prefix="dspark_offline_")
@@ -64,10 +64,10 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
             total_steps=2,
         )
 
-        strategy = trainer.runner.strategy
-        self.assertIsInstance(strategy, CanonicalTrainStrategy)
-        module = strategy.trainable_module()
-        self.assertIsInstance(strategy.model, FSDP)
+        module = trainer.runner.program
+        self.assertIsInstance(module, FSDP)
+        self.assertIs(module.module, model)
+        self.assertEqual(trainer.runner.spec, program_spec(model))
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 

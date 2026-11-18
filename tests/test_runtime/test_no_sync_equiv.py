@@ -26,11 +26,8 @@ def _worker(rank, world_size, workdir, results_dir):
 
     fx.init_rank_distributed(rank, world_size, port="29581")
 
-    from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.training.runner import DataParallelRunner
-    from tests.test_runtime._fixtures import build_strategy
 
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True, warn_only=True)
@@ -49,7 +46,6 @@ def _worker(rank, world_size, workdir, results_dir):
     model_a = build_model()
     model_b = build_model()
     model_b.draft_model.load_state_dict(model_a.draft_model.state_dict())  # identical
-    head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
 
     # DISTINCT shard per rank — with identical shards a broken (skipped/no-op)
     # cross-rank reduction would be invisible.
@@ -84,16 +80,14 @@ def _worker(rank, world_size, workdir, results_dir):
         return _orig_no_sync(*args, **kwargs)
 
     backend_a.module.no_sync = _counting_no_sync
-    strat_a = build_strategy(backend_a.module, target_head=head)
-    runner_a = DataParallelRunner(strat_a, backend_a)
+    runner_a = fx.build_runner(backend_a.module, backend_a)
     rep_a = fx.train_window(runner_a, [batch] * ACC)
 
     # Path B: force the reduction on every micro-step (is_boundary=True), same math.
     backend_b = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
     backend_b.prepare_model(model_b, wrap=True, optimizer_target=model_b.draft_model)
-    strat_b = build_strategy(backend_b.module, target_head=head)
     for _ in range(ACC):
-        out = strat_b.forward_loss(batch)
+        out = fx.forward_program(backend_b.module, batch)
         backend_b.backward(out.loss / ACC, is_boundary=True)
     gn_b = backend_b.step()
 
@@ -103,8 +97,8 @@ def _worker(rank, world_size, workdir, results_dir):
     full_b = backend_b.state_dict()["model"]
     max_diff = None
     if full_a:
-        sd_a = strat_a.checkpoint_state_filter(full_a)
-        sd_b = strat_b.checkpoint_state_filter(full_b)
+        sd_a = model_a.draft_state(full_a)
+        sd_b = model_b.draft_state(full_b)
         max_diff = max(
             float((sd_a[k].float() - sd_b[k].float()).abs().max()) for k in sd_a
         )

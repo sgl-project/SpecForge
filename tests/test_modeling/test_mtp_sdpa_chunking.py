@@ -111,8 +111,8 @@ class MTPBackendObjectiveTest(unittest.TestCase):
 
     def test_host_rows_and_empty_backward(self):
         from specforge.runtime.contracts import TrainBatch
-        from specforge.training.strategies.base import StepContext
-        from specforge.training.strategies.canonical import CanonicalTrainStrategy
+        from specforge.training.contracts import StepContext
+        from tests.test_runtime._fixtures import forward_program
 
         config = owned_mtp_config()
         for empty in (False, True):
@@ -124,11 +124,9 @@ class MTPBackendObjectiveTest(unittest.TestCase):
                 batch["loss_mask"].zero_()
             host = prepare_supervised_rows(batch, config)
             expected = runtime(batch, step=0, total_steps=None)
-            strategy = CanonicalTrainStrategy(
-                runtime, name="mtp", objective="mtp", required_features=batch
-            )
             with patch.object(runtime, "forward", wraps=runtime.forward) as forward:
-                actual = strategy.forward_loss(
+                actual = forward_program(
+                    runtime,
                     TrainBatch(sample_ids=["test"], strategy="mtp", tensors=batch),
                     StepContext(),
                 )

@@ -3,7 +3,7 @@
 
 Exercises ``build_offline_runtime(algorithm=eagle3_registration)`` end to end with
 accumulation_steps=2, which the equivalence tests (wrap=False) do not cover:
-- the strategy must run forward through the FSDP-wrapped module (Issue 1);
+- the runner must run forward through the FSDP-wrapped module (Issue 1);
 - fit's global_step counts OPTIMIZER steps, micro_step counts micro-batches (Issue 2).
 
 GPU-only. Run on the H200 box via rcli.
@@ -64,11 +64,9 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
             max_steps=MAX_OPT_STEPS,
         )
 
-        # Issue 1: the strategy runs forward through the FSDP-wrapped module
-        module = trainer.runner.strategy.trainable_module()
-        self.assertIsInstance(
-            module, FSDP, "strategy must hold the FSDP-wrapped module"
-        )
+        # Issue 1: the runner runs forward through the FSDP-wrapped module
+        module = trainer.runner.program
+        self.assertIsInstance(module, FSDP, "runner must hold the FSDP-wrapped module")
         self.assertIsNotNone(trainer.runner.backend.optimizer)
 
         step = trainer.fit()

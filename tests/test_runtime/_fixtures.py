@@ -78,26 +78,55 @@ def tiny_config(
     )
 
 
-def build_strategy(model, target_head=None, **kwargs):
+def build_runner(model, backend):
+    """A step runner over an objective model, as ``backend`` wrapped it or bare."""
     from torch.nn.parallel import DistributedDataParallel
 
-    from specforge.training.strategies.canonical import CanonicalTrainStrategy
+    from specforge.training.program import program_spec
+    from specforge.training.runner import DataParallelRunner
 
     runtime = model.module if isinstance(model, DistributedDataParallel) else model
-    return CanonicalTrainStrategy(
-        model,
-        name=runtime.objective_name,
-        objective=runtime.objective_name,
-        required_features=runtime.registration.inputs,
-    )
+    return DataParallelRunner(model, backend, program_spec(runtime))
+
+
+def forward_program(model, batch, ctx=None, **replay):
+    """One forward of an objective model on ``batch``, placed as a runner places it.
+
+    Required inputs are checked, host inputs derived and tensors moved to the
+    model's device; the model's mode and gradients are the caller's.
+    """
+    from specforge.training.contracts import StepContext
+
+    runner = build_runner(model, backend=None)
+    return runner._forward(batch, ctx or StepContext(), **replay)
+
+
+class FakeProgram(torch.nn.Module):
+    """Base of test programs: a subclass's forward returns an ``ObjectiveResult``."""
+
+    def host_inputs(self, tensors):
+        return {}
+
+    def kernel_record(self):
+        return {}
+
+    def draft_state(self, state):
+        return dict(state)
+
+
+def fake_spec(*inputs, name="test", **declarations):
+    """The declarations of a test program that requires ``inputs``."""
+    from specforge.training.contracts import ProgramSpec
+
+    return ProgramSpec(name=name, inputs=tuple(inputs), **declarations)
 
 
 def train_window(runner, batches, ctx=None):
     """Run ``batches`` as one optimizer window and return the update's metrics."""
     from dataclasses import replace
 
+    from specforge.training.contracts import StepContext
     from specforge.training.frame import run_window
-    from specforge.training.strategies.base import StepContext
 
     ctx = replace(ctx or StepContext(), accumulation_steps=len(batches))
     return run_window(runner, iter(batches), ctx)

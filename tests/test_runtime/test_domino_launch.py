@@ -66,8 +66,8 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             total_steps=2,
         )
 
-        module = trainer.runner.strategy.trainable_module()
-        self.assertIsInstance(trainer.runner.strategy.model, FSDP)
+        module = trainer.runner.program
+        self.assertIsInstance(module, FSDP)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 

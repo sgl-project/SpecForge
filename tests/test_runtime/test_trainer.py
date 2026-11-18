@@ -14,6 +14,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
@@ -23,93 +24,84 @@ from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.contracts import (
     IncompleteWindow,
+    StepContext,
     StepMetrics,
     materialize_metrics,
 )
 from specforge.training.controller import Checkpoint, TrainerController
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner, _reduce_ratio_metrics
-from specforge.training.strategies.base import (
-    DraftTrainStrategy,
-    StepContext,
-    StepOutput,
-)
-from tests.test_runtime._fixtures import train_window
+from tests.test_runtime._fixtures import FakeProgram, fake_spec, train_window
 
 
-class TinyModel(nn.Module):
+class TinyProgram(FakeProgram):
+    """One weight: the loss is ``|w * sum(x)|`` and the accuracy one half."""
+
     def __init__(self):
         super().__init__()
         self.w = nn.Parameter(torch.ones(1))
-
-
-class FakeStrategy(DraftTrainStrategy):
-    name = "fake"
-    required_features = {"x"}
-
-    def __init__(self):
-        self.model = TinyModel()
-        self.last_ctx = None
+        # The schedule keywords of every forward: what fit() threads in.
         self.contexts = []
 
-    def trainable_module(self):
-        return self.model
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ):
+        self.contexts.append(
+            {
+                "step": step,
+                "total_steps": total_steps,
+                "collect_detailed_metrics": collect_detailed_metrics,
+            }
+        )
+        loss = (self.w * tensors["x"].sum()).abs()
+        one = torch.ones(())
+        return ObjectiveResult(loss, one, ratios={"acc": (torch.tensor(0.5), one)})
 
-    def forward_loss(self, batch: TrainBatch, ctx=None) -> StepOutput:
-        self.validate_batch(batch)
-        self.last_ctx = ctx  # capture what fit() threads in (StepContext regression)
-        self.contexts.append(ctx)
-        loss = (self.model.w * batch.tensors["x"].sum()).abs()
-        return StepOutput(loss=loss, metrics={"accuracy": torch.tensor(0.5)})
 
+class RecordingProgram(TinyProgram):
+    """Records the ``index`` of every batch it runs."""
 
-class RecordingStrategy(FakeStrategy):
     def __init__(self):
         super().__init__()
         self.seen = []
 
-    def forward_loss(self, batch, ctx=None):
-        self.seen.append(batch.sample_ids[0])
-        return super().forward_loss(batch, ctx)
+    def forward(self, tensors, **context):
+        self.seen.append(int(tensors["index"]))
+        return super().forward(tensors, **context)
 
 
-class WeightedStrategy(FakeStrategy):
-    def forward_loss(self, batch, ctx=None):
-        self.validate_batch(batch)
-        coefficient = batch.tensors["x"].reshape(())
-        denominator = batch.tensors["denominator"].reshape(())
-        correct = batch.tensors["correct"].reshape(())
-        numerator = self.model.w.reshape(()) * coefficient
-        return StepOutput(
-            loss=numerator / denominator,
-            metrics={"accuracy": correct / denominator},
-            ratio_metrics={
-                "acc": (correct, denominator),
-            },
-            loss_terms=(numerator, denominator),
-            sum_metrics={"correct_count": correct, "sample_count": denominator},
+class WeightedProgram(TinyProgram):
+    """The batch gives the loss numerator's coefficient and the counts."""
+
+    def forward(self, tensors, **context):
+        coefficient = tensors["x"].reshape(())
+        denominator = tensors["denominator"].reshape(())
+        correct = tensors["correct"].reshape(())
+        numerator = self.w.reshape(()) * coefficient
+        return ObjectiveResult(
+            numerator,
+            denominator,
+            ratios={"acc": (correct, denominator)},
+            sums={"correct_count": correct, "sample_count": denominator},
         )
 
 
-class ReplayStrategy(WeightedStrategy):
+class ReplayProgram(WeightedProgram):
     """Pools the accuracy counts over a window before its gradient pass."""
-
-    replay_statistics = ("acc",)
 
     def __init__(self):
         super().__init__()
         self.replayed_values = []
 
-    def prepass(self, batch, ctx):
-        output = super().forward_loss(batch, ctx)
-        return replace(
-            output, statistics={"acc": torch.stack(output.ratio_metrics["acc"])}
-        )
-
-    def forward_loss(self, batch, ctx=None):
-        if ctx is not None and ctx.replay_values:
-            self.replayed_values.append(ctx.replay_values["acc"])
-        return super().forward_loss(batch, ctx)
+    def forward(self, tensors, *, prepass=False, replay_values=None, **context):
+        result = super().forward(tensors, **context)
+        if prepass:
+            return replace(
+                result, statistics={"acc": torch.stack(result.ratios["acc"])}
+            )
+        if replay_values:
+            self.replayed_values.append(replay_values["acc"])
+        return result
 
 
 class FakeBackend(TrainingBackend):
@@ -173,25 +165,33 @@ def _weighted_batch(coefficient, denominator, correct):
     )
 
 
-def _controller(strategy, backend, **options):
-    """A run loop that drives ``strategy`` and ``backend`` through the step runner."""
-    return TrainerController(
-        DataParallelRunner(strategy, backend),
-        strategy_name=strategy.name,
-        **options,
+def _runner(program, backend, **declarations):
+    """The step runner over ``program``, which requires ``x`` of a batch."""
+    return DataParallelRunner(
+        program, backend, fake_spec("x", name="fake", **declarations)
     )
+
+
+def _controller(program, backend, **options):
+    """A run loop that drives ``program`` and ``backend`` through the step runner."""
+    runner = _runner(program, backend)
+    return TrainerController(runner, strategy_name=runner.spec.name, **options)
 
 
 class TestDataParallelRunner(unittest.TestCase):
     def test_window_order_follows_the_declared_replay_statistics(self):
         for replayed in (False, True):
             with self.subTest(replayed=replayed):
-                strategy = ReplayStrategy() if replayed else WeightedStrategy()
-                backend = FakeBackend(strategy.model)
-                runner = DataParallelRunner(strategy, backend)
+                program = ReplayProgram() if replayed else WeightedProgram()
+                backend = FakeBackend(program)
+                runner = _runner(
+                    program,
+                    backend,
+                    replay_statistics=("acc",) if replayed else (),
+                )
                 ctx = StepContext(accumulation_steps=2)
                 for window in range(3):
-                    strategy.model.zero_grad(set_to_none=True)
+                    program.zero_grad(set_to_none=True)
                     progress_at_pull = []
 
                     def batches():
@@ -217,20 +217,18 @@ class TestDataParallelRunner(unittest.TestCase):
                     self.assertEqual(metrics.loss, 8.0)
                     self.assertEqual(metrics.materialize()["acc"], 0.5)
                     self.assertEqual(metrics.materialize()["sample_count"], 4.0)
-                    torch.testing.assert_close(
-                        strategy.model.w.grad, torch.tensor([8.0])
-                    )
+                    torch.testing.assert_close(program.w.grad, torch.tensor([8.0]))
                 self.assertEqual(backend.boundaries, [False, True] * 3)
                 if replayed:
                     # Every replayed forward sees the counts of its whole window.
-                    self.assertEqual(len(strategy.replayed_values), 6)
-                    for values in strategy.replayed_values:
+                    self.assertEqual(len(program.replayed_values), 6)
+                    for values in program.replayed_values:
                         torch.testing.assert_close(values, torch.tensor([2.0, 4.0]))
 
     def test_accumulation_boundary(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
-        runner = DataParallelRunner(strat, backend)
+        program = TinyProgram()
+        backend = FakeBackend(program)
+        runner = _runner(program, backend)
         ctx = StepContext(accumulation_steps=2)
         # no optimizer step yet
         self.assertIsNone(runner.forward_backward(_batch(), ctx, is_boundary=False))
@@ -246,11 +244,11 @@ class TestDataParallelRunner(unittest.TestCase):
         self.assertEqual(backend.boundaries, [False, True])
 
     def test_metrics_reduce_once_at_accumulation_boundary(self):
-        strat = FakeStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        program = TinyProgram()
+        runner = _runner(program, FakeBackend(program))
         ctx = StepContext(accumulation_steps=2)
 
-        def reduce_sum(tensor):
+        def reduce_sum(tensor, **collective):
             tensor.mul_(2)
 
         with (
@@ -265,44 +263,40 @@ class TestDataParallelRunner(unittest.TestCase):
             self.assertEqual(reduce.call_count, 0)
             runner.apply_step(runner.forward_backward(_batch(), ctx, is_boundary=True))
 
-        self.assertEqual(reduce.call_count, 1)
-        self.assertEqual(reduce.call_args.args[0].numel(), 2)
+        # The loss denominator, then the pairs of the loss and the accuracy
+        # in one collective.
+        self.assertEqual(
+            [call.args[0].numel() for call in reduce.call_args_list], [1, 4]
+        )
 
     def test_metrics_carry_no_mode(self):
-        strat = FakeStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        program = TinyProgram()
+        runner = _runner(program, FakeBackend(program))
         metrics = train_window(runner, [_batch()])
         self.assertNotIn("mode", metrics.materialize())
 
     def test_global_loss_normalization_matches_combined_batch(self):
-        split_strategy = WeightedStrategy()
-        split_runner = DataParallelRunner(
-            split_strategy, FakeBackend(split_strategy.model)
-        )
+        split_program = WeightedProgram()
+        split_runner = _runner(split_program, FakeBackend(split_program))
         split_result = train_window(
             split_runner, [_weighted_batch(2, 1, 1), _weighted_batch(30, 3, 1)]
         )
 
-        combined_strategy = WeightedStrategy()
-        combined_runner = DataParallelRunner(
-            combined_strategy, FakeBackend(combined_strategy.model)
-        )
+        combined_program = WeightedProgram()
+        combined_runner = _runner(combined_program, FakeBackend(combined_program))
         combined_result = train_window(combined_runner, [_weighted_batch(32, 4, 2)])
 
-        torch.testing.assert_close(
-            split_strategy.model.w.grad,
-            combined_strategy.model.w.grad,
-        )
-        self.assertEqual(split_strategy.model.w.grad.item(), 8.0)
+        torch.testing.assert_close(split_program.w.grad, combined_program.w.grad)
+        self.assertEqual(split_program.w.grad.item(), 8.0)
         self.assertEqual(split_result.loss, combined_result.loss)
         self.assertEqual(split_result.materialize()["acc"], 0.5)
         self.assertEqual(combined_result.materialize()["acc"], 0.5)
 
     def test_global_loss_normalization_compensates_rank_averaging(self):
-        strategy = WeightedStrategy()
-        backend = FakeBackend(strategy.model)
+        program = WeightedProgram()
+        backend = FakeBackend(program)
         backend.process_group = "dp"
-        runner = DataParallelRunner(strategy, backend)
+        runner = _runner(program, backend)
 
         def add_remote_denominator(tensor, *, group, op=None):
             self.assertEqual(group, "dp")
@@ -324,54 +318,22 @@ class TestDataParallelRunner(unittest.TestCase):
             # This rank's gradient is 9 over a local denominator of 3.
             train_window(runner, [_weighted_batch(9, 3, 0)])
 
-        torch.testing.assert_close(
-            strategy.model.w.grad,
-            torch.tensor([1.8]),
-        )
+        torch.testing.assert_close(program.w.grad, torch.tensor([1.8]))
 
     def test_global_loss_normalization_rejects_invalid_denominator(self):
         for denominator in (0.0, -1.0, float("nan"), float("inf")):
             with self.subTest(denominator=denominator):
-                strategy = WeightedStrategy()
-                backend = FakeBackend(strategy.model)
-                runner = DataParallelRunner(strategy, backend)
+                program = WeightedProgram()
+                backend = FakeBackend(program)
+                runner = _runner(program, backend)
                 with self.assertRaisesRegex(ValueError, "finite and positive"):
                     train_window(runner, [_weighted_batch(2, denominator, 0)])
                 self.assertEqual(backend.steps, 0)
-                torch.testing.assert_close(strategy.model.w.grad, torch.tensor([2.0]))
-
-    def test_strategy_scalar_metrics_are_preserved(self):
-        class ScalarStrategy(FakeStrategy):
-            def forward_loss(self, batch, ctx=None):
-                return StepOutput(
-                    loss=(self.model.w * 2.0).sum(),
-                    metrics={
-                        "loss": torch.tensor(99.0),
-                        "accuracy": torch.tensor(0.5),
-                        "accuracy_denom": torch.tensor(4.0),
-                        "ce_loss": torch.tensor(1.25),
-                        "lambda_base": 0.75,
-                        "non_scalar_debug": torch.tensor([1.0, 2.0]),
-                    },
-                )
-
-        strat = ScalarStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
-        result = train_window(runner, [_batch()])
-        metrics = result.materialize()
-
-        self.assertEqual(metrics["loss"], 2.0)
-        self.assertEqual(metrics["acc"], 0.5)
-        self.assertEqual(metrics["ce_loss"], 1.25)
-        self.assertEqual(metrics["lambda_base"], 0.75)
-        self.assertIsInstance(result._values["lambda_base"], float)
-        self.assertFalse(result._values["loss"].requires_grad)
-        self.assertNotIn("accuracy_denom", metrics)
-        self.assertNotIn("non_scalar_debug", metrics)
+                torch.testing.assert_close(program.w.grad, torch.tensor([2.0]))
 
     def test_metrics_are_materialized_lazily_and_cached(self):
-        strat = FakeStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        program = TinyProgram()
+        runner = _runner(program, FakeBackend(program))
 
         with mock.patch(
             "specforge.training.contracts.materialize_metrics",
@@ -386,13 +348,12 @@ class TestDataParallelRunner(unittest.TestCase):
             self.assertEqual(metrics.grad_norm, 1.0)
             materialize.assert_called_once()
 
-    def test_ratio_metrics_override_mean_of_means_accuracy(self):
-        class RatioStrategy(FakeStrategy):
-            def forward_loss(self, batch, ctx=None):
+    def test_ratio_metrics_are_reported_by_name_and_position(self):
+        class RatioProgram(TinyProgram):
+            def forward(self, tensors, **context):
                 return replace(
-                    super().forward_loss(batch, ctx),
-                    metrics={"accuracy": torch.tensor(0.99)},
-                    ratio_metrics={
+                    super().forward(tensors, **context),
+                    ratios={
                         "acc": (torch.tensor(2.0), torch.tensor(4.0)),
                         "ce_position": (
                             torch.tensor([1.0, 3.0]),
@@ -401,8 +362,8 @@ class TestDataParallelRunner(unittest.TestCase):
                     },
                 )
 
-        strat = RatioStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        program = RatioProgram()
+        runner = _runner(program, FakeBackend(program))
         metrics = train_window(runner, [_batch()]).materialize()
 
         self.assertEqual(metrics["acc"], 0.5)
@@ -463,8 +424,8 @@ class TestDataParallelRunner(unittest.TestCase):
         self.assertEqual(metrics["ce_position_1"], 0.5)
 
     def test_additive_telemetry_accumulates_and_resets_each_optimizer_window(self):
-        strat = WeightedStrategy()
-        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        program = WeightedProgram()
+        runner = _runner(program, FakeBackend(program))
         second = train_window(
             runner, [_weighted_batch(2, 1, 1), _weighted_batch(30, 3, 1)]
         ).materialize()
@@ -522,24 +483,27 @@ class TestDataParallelRunner(unittest.TestCase):
         )
         self.assertEqual(metrics["count"], 7)
 
-    def test_validate_batch_missing_feature(self):
-        strat = FakeStrategy()
+    def test_batch_missing_a_required_feature_is_refused(self):
+        program = TinyProgram()
+        runner = _runner(program, FakeBackend(program))
         bad = TrainBatch(sample_ids=["s"], strategy="fake", tensors={}, metadata={})
-        with self.assertRaises(ValueError):
-            strat.forward_loss(bad)
+        with self.assertRaisesRegex(
+            ValueError, r"fake batch missing required features \['x'\]"
+        ):
+            train_window(runner, [bad])
 
 
 class TestTrainerController(unittest.TestCase):
     def test_failed_optimizer_step_does_not_advance_or_ack(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         backend.step = mock.Mock(
             side_effect=FloatingPointError("non-finite global grad norm")
         )
         acknowledged = []
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -556,8 +520,8 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(acknowledged, [])
 
     def test_training_log_reports_pipeline_throughput_breakdown(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         logged = []
         with (
             tempfile.TemporaryDirectory() as d,
@@ -567,7 +531,7 @@ class TestTrainerController(unittest.TestCase):
             ) as materialize,
         ):
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -605,7 +569,7 @@ class TestTrainerController(unittest.TestCase):
             4.0,
         )
         self.assertEqual(
-            [ctx.collect_detailed_metrics for ctx in strat.contexts],
+            [context["collect_detailed_metrics"] for context in program.contexts],
             [False, True],
         )
 
@@ -622,13 +586,13 @@ class TestTrainerController(unittest.TestCase):
                     "fetch_samples": 4.0,
                 }
 
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         data = PerfData([_batch()])
         logged = []
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -643,8 +607,8 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(logged[0][0]["perf/fetch_seconds_per_sample"], 2.0)
 
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         progress = mock.Mock()
         with (
             tempfile.TemporaryDirectory() as d,
@@ -656,7 +620,7 @@ class TestTrainerController(unittest.TestCase):
             mock.patch("tqdm.tqdm", return_value=progress) as build_progress,
         ):
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -672,8 +636,8 @@ class TestTrainerController(unittest.TestCase):
         progress.close.assert_called_once_with()
 
     def test_progress_bar_is_disabled_off_rank_zero(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with (
             tempfile.TemporaryDirectory() as d,
             mock.patch(
@@ -685,7 +649,7 @@ class TestTrainerController(unittest.TestCase):
             mock.patch("tqdm.tqdm") as build_progress,
         ):
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -697,11 +661,11 @@ class TestTrainerController(unittest.TestCase):
         build_progress.assert_not_called()
 
     def test_fit_and_checkpoint(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -718,12 +682,13 @@ class TestTrainerController(unittest.TestCase):
             self.assertEqual(ckpt.global_step, 3)
 
     def test_checkpoint_is_written_only_once_the_ranks_agree(self):
-        strat = FakeStrategy()
-        strat.kernels = lambda: {"0:0": "reference"}
+        class Program(TinyProgram):
+            def kernel_record(self):
+                return {"0:0": "reference"}
+
+        program = Program()
         with tempfile.TemporaryDirectory() as d:
-            ctrl = _controller(
-                strat, FakeBackend(strat.model), run_id="r", output_dir=d
-            )
+            ctrl = _controller(program, FakeBackend(program), run_id="r", output_dir=d)
             with mock.patch.object(
                 ctrl.runner, "agree", side_effect=RuntimeError("ranks disagree")
             ) as agree:
@@ -735,8 +700,8 @@ class TestTrainerController(unittest.TestCase):
             self.assertEqual(os.listdir(d), [])
 
     def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             for index in range(4):
                 torch.save(
@@ -767,7 +732,7 @@ class TestTrainerController(unittest.TestCase):
                 queue.ack([refs_by_id[sample_id] for sample_id in ids])
 
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -788,11 +753,11 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(list(inspect.signature(Trainer.fit).parameters), ["self"])
 
     def test_natural_eos_rejects_incomplete_accumulation(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat, backend, accumulation_steps=2, run_id="r", output_dir=d
+                program, backend, accumulation_steps=2, run_id="r", output_dir=d
             )
             progress = mock.Mock()
             with (
@@ -815,18 +780,21 @@ class TestTrainerController(unittest.TestCase):
         self.assertEqual(ctrl.global_step, 1)
 
     def test_window_that_raised_ends_the_run(self):
-        class FailingStrategy(FakeStrategy):
-            def forward_loss(self, batch, ctx=None):
-                if batch.sample_ids == ["bad"]:
+        class FailingProgram(TinyProgram):
+            def forward(self, tensors, **context):
+                if "bad" in tensors:
                     raise ValueError("bad batch")
-                return super().forward_loss(batch, ctx)
+                return super().forward(tensors, **context)
 
-        strat = FailingStrategy()
-        backend = FakeBackend(strat.model)
-        bad = replace(_batch(), sample_ids=["bad"])
+        program = FailingProgram()
+        backend = FakeBackend(program)
+        good = _batch()
+        bad = replace(
+            good, sample_ids=["bad"], tensors={**good.tensors, "bad": torch.ones(())}
+        )
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat, backend, accumulation_steps=2, run_id="r", output_dir=d
+                program, backend, accumulation_steps=2, run_id="r", output_dir=d
             )
             with self.assertRaisesRegex(ValueError, "bad batch"):
                 ctrl.fit([_batch(), _batch(), _batch(), bad])
@@ -844,11 +812,11 @@ class TestTrainerController(unittest.TestCase):
         def ack(sample_ids, step):
             raise OSError("ledger unavailable")
 
-        strat = FakeStrategy()
+        program = TinyProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -892,11 +860,10 @@ class TestTrainerController(unittest.TestCase):
                         yield handed.pop()
 
                 Runner.replay_statistics = replay_statistics
-                strat = FakeStrategy()
                 with tempfile.TemporaryDirectory() as d:
                     ctrl = TrainerController(
                         Runner(),
-                        strategy_name=strat.name,
+                        strategy_name="fake",
                         accumulation_steps=3,
                         run_id="r",
                         output_dir=d,
@@ -909,11 +876,11 @@ class TestTrainerController(unittest.TestCase):
 
 class TestBestTracking(unittest.TestCase):
     def test_best_checkpoint_does_not_require_periodic_saves(self):
-        strat = FakeStrategy()
+        program = TinyProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
@@ -929,11 +896,11 @@ class TestBestTracking(unittest.TestCase):
     def test_best_fires_on_misaligned_eval_and_save_intervals(self):
         # eval_interval=1, save_interval=2: the first eval is still checkpointed
         # on demand as the best even though it is not a periodic-save step.
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -953,12 +920,12 @@ class TestBestTracking(unittest.TestCase):
 
 class TestEvalMetricsFlow(unittest.TestCase):
     def test_eval_metrics_reach_logger_and_last_metrics(self):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         logged = []
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -970,7 +937,7 @@ class TestEvalMetricsFlow(unittest.TestCase):
                 logger=lambda metrics, step: logged.append((dict(metrics), step)),
             )
             ctrl.fit([_batch() for _ in range(3)])
-        self.assertTrue(strat.model.training)
+        self.assertTrue(program.training)
         self.assertEqual([step for _, step in logged], [1, 2])
         for metrics, _ in logged:
             self.assertIn("eval/avg_loss", metrics)
@@ -979,14 +946,14 @@ class TestEvalMetricsFlow(unittest.TestCase):
         self.assertIn("loss", ctrl.last_metrics)
 
     def test_eval_does_not_request_the_detailed_metrics_it_discards(self):
-        strat = FakeStrategy()
+        program = TinyProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat, FakeBackend(strat.model), run_id="r", output_dir=d, num_epochs=1
+                program, FakeBackend(program), run_id="r", output_dir=d, num_epochs=1
             )
             metrics = ctrl.evaluate([_batch()])
         self.assertIn("eval/avg_loss", metrics)
-        self.assertFalse(strat.last_ctx.collect_detailed_metrics)
+        self.assertFalse(program.contexts[-1]["collect_detailed_metrics"])
 
     def test_each_interval_gets_a_fresh_managed_eval_stream(self):
         events = []
@@ -1009,11 +976,11 @@ class TestEvalMetricsFlow(unittest.TestCase):
             pass_id = sum(event[0] == "enter" for event in events) + 1
             return ManagedEval(pass_id)
 
-        strat = FakeStrategy()
+        program = TinyProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
@@ -1031,7 +998,7 @@ def _named_batch(i):
     return TrainBatch(
         sample_ids=[f"b{i}"],
         strategy="fake",
-        tensors={"x": torch.ones(2)},
+        tensors={"x": torch.ones(2), "index": torch.tensor(i)},
         metadata={},
     )
 
@@ -1040,11 +1007,11 @@ class TestResumeDataPosition(unittest.TestCase):
     def test_start_batch_skips_consumed_prefix(self):
         # Resume mid-epoch: start_batch=k drops the first k batches of the FIRST
         # epoch only; later epochs iterate in full.
-        strat = RecordingStrategy()
+        program = RecordingProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 num_epochs=2,
@@ -1053,15 +1020,15 @@ class TestResumeDataPosition(unittest.TestCase):
             )
             ctrl.fit([_named_batch(i) for i in range(5)])
         # epoch 0 resumes at b3; epoch 1 is complete
-        self.assertEqual(strat.seen, ["b3", "b4", "b0", "b1", "b2", "b3", "b4"])
+        self.assertEqual(program.seen, [3, 4, 0, 1, 2, 3, 4])
         self.assertEqual(ctrl._epoch_batch, 0)  # reset when the epoch completes
 
     def test_natural_exhaustion_checkpoint_records_completed_epochs(self):
-        strat = RecordingStrategy()
-        backend = FakeBackend(strat.model)
+        program = RecordingProgram()
+        backend = FakeBackend(program)
         data = [_named_batch(i) for i in range(2)]
         with tempfile.TemporaryDirectory() as d:
-            ctrl = _controller(strat, backend, run_id="r", output_dir=d, num_epochs=2)
+            ctrl = _controller(program, backend, run_id="r", output_dir=d, num_epochs=2)
             step = ctrl.fit(data)
             self.assertEqual(ctrl.epoch, 2)
             checkpoint = ctrl.save_checkpoint(step)
@@ -1071,10 +1038,10 @@ class TestResumeDataPosition(unittest.TestCase):
             self.assertEqual(state["epoch_batch"], 0)
             self.assertEqual(state["epoch_samples"], 0)
 
-            resumed = RecordingStrategy()
+            resumed = RecordingProgram()
             resumed_ctrl = _controller(
                 resumed,
-                FakeBackend(resumed.model),
+                FakeBackend(resumed),
                 run_id="r2",
                 output_dir=d,
                 num_epochs=2,
@@ -1089,19 +1056,21 @@ class TestResumeDataPosition(unittest.TestCase):
     def test_ctor_rejects_half_specified_position(self):
         # start_batch/start_samples describe ONE position; one without the other
         # is a corrupt resume.
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         for kw in ({"start_batch": 3}, {"start_samples": 3}):
             with self.assertRaisesRegex(ValueError, "zero or nonzero together"):
-                _controller(strat, backend, run_id="r", output_dir="/tmp-unused", **kw)
+                _controller(
+                    program, backend, run_id="r", output_dir="/tmp-unused", **kw
+                )
 
     def test_islice_skip_past_end_raises(self):
         # plain-iterable fallback: a silent empty epoch is banned.
-        strat = FakeStrategy()
+        program = TinyProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 num_epochs=1,
@@ -1113,11 +1082,11 @@ class TestResumeDataPosition(unittest.TestCase):
 
     def test_islice_skip_of_exactly_all_batches_is_allowed(self):
         # skip == available means the epoch was fully consumed pre-restart.
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
+                program,
                 backend,
                 run_id="r",
                 output_dir=d,
@@ -1132,12 +1101,12 @@ class TestResumeDataPosition(unittest.TestCase):
     def test_reentry_after_max_steps_does_not_retrain_prefix(self):
         # a mid-epoch max_steps return keeps the live position; re-entering
         # fit() continues from it instead of re-training the prefix.
-        strat = RecordingStrategy()
+        program = RecordingProgram()
         data = [_named_batch(i) for i in range(5)]
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat,
-                FakeBackend(strat.model),
+                program,
+                FakeBackend(program),
                 run_id="r",
                 output_dir=d,
                 num_epochs=1,
@@ -1146,37 +1115,43 @@ class TestResumeDataPosition(unittest.TestCase):
             self.assertEqual(ctrl.fit(data), 2)
             ctrl.max_steps = 4
             self.assertEqual(ctrl.fit(data), 4)
-        self.assertEqual(strat.seen, ["b0", "b1", "b2", "b3"])
+        self.assertEqual(program.seen, [0, 1, 2, 3])
 
 
 class TestStepContextThreading(unittest.TestCase):
     """Regression for the Domino schedule bug: fit() must thread a real schedule
-    horizon into StepContext.total_steps (falling back to max_steps), not None:
-    the Domino base-loss warmup is scheduled over it."""
+    horizon through StepContext.total_steps to the program (falling back to
+    max_steps), not None: the Domino base-loss warmup is scheduled over it."""
 
-    def _last_ctx(self, **controller_kw):
-        strat = FakeStrategy()
-        backend = FakeBackend(strat.model)
+    def _last_context(self, **controller_kw):
+        program = TinyProgram()
+        backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
-                strat, backend, run_id="r", output_dir=d, num_epochs=1, **controller_kw
+                program,
+                backend,
+                run_id="r",
+                output_dir=d,
+                num_epochs=1,
+                **controller_kw,
             )
             ctrl.fit([_batch() for _ in range(3)])
-        return strat.last_ctx
+        return program.contexts[-1]
 
     def test_explicit_total_steps_is_threaded(self):
-        ctx = self._last_ctx(total_steps=10, max_steps=3)
-        self.assertEqual(ctx.total_steps, 10)  # explicit horizon wins over the cap
+        context = self._last_context(total_steps=10, max_steps=3)
+        # explicit horizon wins over the cap
+        self.assertEqual(context["total_steps"], 10)
 
     def test_total_steps_falls_back_to_max_steps(self):
         # the common case: only max_steps set -> use it as the horizon so a
         # schedule-dependent loss is NOT silently disabled.
-        ctx = self._last_ctx(max_steps=5)
-        self.assertEqual(ctx.total_steps, 5)
+        context = self._last_context(max_steps=5)
+        self.assertEqual(context["total_steps"], 5)
 
     def test_total_steps_none_when_unbounded(self):
-        ctx = self._last_ctx()  # neither total_steps nor max_steps set
-        self.assertIsNone(ctx.total_steps)
+        context = self._last_context()  # neither total_steps nor max_steps set
+        self.assertIsNone(context["total_steps"])
 
 
 if __name__ == "__main__":

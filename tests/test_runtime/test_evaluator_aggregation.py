@@ -15,8 +15,9 @@ from datetime import timedelta
 
 import torch
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import StepOutput
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 
 def _batch():
@@ -28,87 +29,89 @@ def _batch():
     )
 
 
-class _ScriptedStrategy:
-    """Hands out prepared outputs, one for each batch it is asked to evaluate."""
+class _ScriptedProgram(FakeProgram):
+    """Hands out prepared results, one for each batch it is asked to evaluate."""
 
-    evaluation_diagnostics = False
-    replay_statistics = ()
+    def __init__(self, results):
+        super().__init__()
+        self.results = iter(results)
+        self.linear = torch.nn.Linear(1, 1)
 
-    def __init__(self, outputs):
-        self.outputs = iter(outputs)
-        self.model = torch.nn.Linear(1, 1)
-
-    def trainable_module(self):
-        return self.model
-
-    def forward_loss(self, batch, ctx=None):
-        return next(self.outputs)
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ):
+        return next(self.results)
 
 
-def _evaluate(outputs, batches=()):
-    """Pool the outputs as one evaluation pass of this rank, through the step runner."""
+def _evaluate(results, batches=()):
+    """Pool the results as one evaluation pass of this rank, through the step runner."""
     from specforge.eval import Evaluator
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.contracts import StepContext
     from specforge.training.runner import DataParallelRunner
-    from specforge.training.strategies.base import StepContext
 
     runner = DataParallelRunner(
-        _ScriptedStrategy(outputs), FSDPTrainingBackend(ParallelConfig())
+        _ScriptedProgram(results), FSDPTrainingBackend(ParallelConfig()), fake_spec()
     )
     if batches == ():
-        batches = [_batch() for _ in outputs]
+        batches = [_batch() for _ in results]
     return Evaluator().run(runner, batches, StepContext())
 
 
-def _step_output(loss, corrects, denoms, acceptance_rates=None, plosses=None):
-    t = lambda xs: [torch.tensor(float(x)) for x in xs]  # noqa: E731
-    metrics = {
-        "acc_corrects": t(corrects),
-        "acc_denoms": t(denoms),
-        "metric_loss_denoms": t(denoms),
+def _pairs(name, numerators, denominators):
+    return {
+        f"{name}_{depth}": (torch.tensor(float(n)), torch.tensor(float(d)))
+        for depth, (n, d) in enumerate(zip(numerators, denominators))
     }
-    if acceptance_rates is not None:
-        metrics["acceptance_rates"] = t(acceptance_rates)
-    if plosses is not None:
-        metrics["plosses"] = t(plosses)
-    return StepOutput(loss=torch.tensor(float(loss)), metrics=metrics)
 
 
-def _scalar_out(loss, acc, tokens, denom=None):
-    # DFlash/Domino-shaped output; accuracy_denom (the accuracy's own count)
-    # need not equal the loss-token count.
-    metrics = {
-        "accuracy": torch.tensor(float(acc)),
-        "metric_loss_denoms": [torch.tensor(float(tokens))],
-    }
-    if denom is not None:
-        metrics["accuracy_denom"] = torch.tensor(float(denom))
-    return StepOutput(loss=torch.tensor(float(loss)), metrics=metrics)
+def _per_depth_result(loss, corrects, denoms, acceptance_rates=None, plosses=None):
+    """Per-depth accuracy counts, with ``loss`` and the per-depth rates as means.
+
+    The loss is a mean over the summed ``denoms``; a depth's acceptance rate
+    and loss are means over that depth's denominator.
+    """
+    ratios = _pairs("acc", corrects, denoms)
+    for name, means in (("acceptance_rate", acceptance_rates), ("ploss", plosses)):
+        if means is not None:
+            sums = [mean * denom for mean, denom in zip(means, denoms)]
+            ratios.update(_pairs(name, sums, denoms))
+    tokens = float(sum(denoms))
+    return ObjectiveResult(
+        torch.tensor(loss * tokens), torch.tensor(tokens), ratios=ratios
+    )
 
 
-def _additive_scalar_out(loss_num, loss_den, accuracy_num, accuracy_den):
-    loss_num = torch.tensor(float(loss_num))
-    loss_den = torch.tensor(float(loss_den))
-    accuracy_num = torch.tensor(float(accuracy_num))
-    accuracy_den = torch.tensor(float(accuracy_den))
-    return StepOutput(
-        loss=loss_num / loss_den,
-        metrics={"accuracy": accuracy_num / accuracy_den},
-        ratio_metrics={"acc": (accuracy_num, accuracy_den)},
-        loss_terms=(loss_num, loss_den),
+def _scalar_result(loss, acc, tokens, denom):
+    # DFlash/Domino-shaped result: a mean loss over ``tokens`` and a mean
+    # accuracy over ``denom``, its own count, which need not equal the
+    # loss-token count.
+    return _additive_scalar_result(loss * tokens, tokens, acc * denom, denom)
+
+
+def _additive_scalar_result(loss_num, loss_den, accuracy_num, accuracy_den):
+    return ObjectiveResult(
+        torch.tensor(float(loss_num)),
+        torch.tensor(float(loss_den)),
+        ratios={
+            "acc": (
+                torch.tensor(float(accuracy_num)),
+                torch.tensor(float(accuracy_den)),
+            )
+        },
     )
 
 
 class TestEvaluatorAggregation(unittest.TestCase):
-    def _run(self, outputs):
-        return _evaluate(outputs)
+    def _run(self, results):
+        return _evaluate(results)
 
     def test_aggregates_counts_before_geometric_sum(self):
         # pos0: (3+1)/(4+1)=0.8 ; pos1: (2+0)/(4+1)=0.4  -- NOT the mean of ratios.
         m = self._run(
             [
-                _step_output(2.0, corrects=[3, 2], denoms=[4, 4]),
-                _step_output(8.0, corrects=[1, 0], denoms=[1, 1]),
+                _per_depth_result(2.0, corrects=[3, 2], denoms=[4, 4]),
+                _per_depth_result(8.0, corrects=[1, 0], denoms=[1, 1]),
             ]
         )
         self.assertAlmostEqual(m["eval/avg_acc"], 0.8, places=6)
@@ -122,8 +125,8 @@ class TestEvaluatorAggregation(unittest.TestCase):
         # count-aggregated value is 0.8.
         m = self._run(
             [
-                _step_output(1.0, corrects=[3], denoms=[4]),
-                _step_output(1.0, corrects=[1], denoms=[1]),
+                _per_depth_result(1.0, corrects=[3], denoms=[4]),
+                _per_depth_result(1.0, corrects=[1], denoms=[1]),
             ]
         )
         self.assertAlmostEqual(m["eval/avg_acc"], 0.8, places=6)
@@ -132,11 +135,11 @@ class TestEvaluatorAggregation(unittest.TestCase):
     def test_batch_size_invariance(self):
         split = self._run(
             [
-                _step_output(1.0, corrects=[3, 2], denoms=[4, 4]),
-                _step_output(1.0, corrects=[1, 0], denoms=[1, 1]),
+                _per_depth_result(1.0, corrects=[3, 2], denoms=[4, 4]),
+                _per_depth_result(1.0, corrects=[1, 0], denoms=[1, 1]),
             ]
         )
-        combined = self._run([_step_output(1.0, corrects=[4, 2], denoms=[5, 5])])
+        combined = self._run([_per_depth_result(1.0, corrects=[4, 2], denoms=[5, 5])])
         self.assertAlmostEqual(
             split["eval/simulated_acc_len"],
             combined["eval/simulated_acc_len"],
@@ -156,47 +159,34 @@ class TestEvaluatorAggregation(unittest.TestCase):
         # perfect 1.0 here; float64 keeps the counts exact.
         big = 2**24
         m = self._run(
-            [_step_output(1.0, corrects=[big], denoms=[big])]
-            + [_step_output(1.0, corrects=[0], denoms=[1]) for _ in range(3)]
+            [_per_depth_result(1.0, corrects=[big], denoms=[big])]
+            + [_per_depth_result(1.0, corrects=[0], denoms=[1]) for _ in range(3)]
         )
         self.assertLess(m["eval/avg_acc"], 1.0)
         self.assertAlmostEqual(m["eval/avg_acc"], big / (big + 3), places=12)
 
-    def test_scalar_strategy_degenerates_gracefully(self):
-        # equal token counts -> the token-weighted fallback equals the plain mean.
-        outs = [
-            StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.5)}),
-            StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.7)}),
+    def test_scalar_accuracy_degenerates_gracefully(self):
+        # equal counts -> the count-weighted accuracy equals the plain mean.
+        results = [
+            _scalar_result(1.0, 0.5, tokens=4, denom=4),
+            _scalar_result(1.0, 0.7, tokens=4, denom=4),
         ]
-        m = _evaluate(outs)
+        m = _evaluate(results)
         self.assertAlmostEqual(m["eval/avg_acc"], 0.6, places=6)
         self.assertAlmostEqual(m["eval/simulated_acc_len"], 0.6, places=6)
-
-    def test_scalar_fallback_weights_by_loss_tokens(self):
-        # No accuracy_denom -> fall back to loss-token weights: (3-of-4) +
-        # (1-of-2) regrouped as one 4-of-6 batch must agree; a plain mean of
-        # per-batch means would not ((0.75+0.5)/2 = 0.625).
-        split = [
-            _scalar_out(1.0, 3 / 4, tokens=4),
-            _scalar_out(1.0, 1 / 2, tokens=2),
-        ]
-        combined = [_scalar_out(1.0, 4 / 6, tokens=6)]
-        for outs in (split, combined):
-            m = _evaluate(outs)
-            self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
-            self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
 
     def test_scalar_accuracy_weighted_by_accuracy_denom(self):
         # Realistic DFlash shapes: the accuracy denominator (anchor-block eval
         # positions) differs from the loss-token count. Invariance must come
-        # from accuracy_denom: 3-of-4 + 1-of-2 == 4-of-6 regardless of grouping.
+        # from the accuracy's own denominator: 3-of-4 + 1-of-2 == 4-of-6
+        # regardless of grouping.
         split = [
-            _scalar_out(1.0, 3 / 4, tokens=10, denom=4),
-            _scalar_out(1.0, 1 / 2, tokens=50, denom=2),
+            _scalar_result(1.0, 3 / 4, tokens=10, denom=4),
+            _scalar_result(1.0, 1 / 2, tokens=50, denom=2),
         ]
-        combined = [_scalar_out(1.0, 4 / 6, tokens=60, denom=6)]
-        for outs in (split, combined):
-            m = _evaluate(outs)
+        combined = [_scalar_result(1.0, 4 / 6, tokens=60, denom=6)]
+        for results in (split, combined):
+            m = _evaluate(results)
             self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
             self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
             # loss-token weighting would skew to (0.75*10 + 0.5*50)/60 ~ 0.542
@@ -205,18 +195,18 @@ class TestEvaluatorAggregation(unittest.TestCase):
     def test_additive_scalar_terms_are_partition_invariant(self):
         split = self._run(
             [
-                _additive_scalar_out(2, 1, 1, 1),
-                _additive_scalar_out(30, 3, 1, 3),
+                _additive_scalar_result(2, 1, 1, 1),
+                _additive_scalar_result(30, 3, 1, 3),
             ]
         )
-        combined = self._run([_additive_scalar_out(32, 4, 2, 4)])
+        combined = self._run([_additive_scalar_result(32, 4, 2, 4)])
 
         self.assertEqual(split, combined)
         self.assertEqual(split["eval/avg_loss"], 8.0)
         self.assertEqual(split["eval/avg_acc"], 0.5)
 
     def test_reports_per_position_acceptance(self):
-        m = self._run([_step_output(1.0, corrects=[3, 2], denoms=[4, 4])])
+        m = self._run([_per_depth_result(1.0, corrects=[3, 2], denoms=[4, 4])])
         self.assertAlmostEqual(m["eval/per_position_acc"][0], 0.75, places=6)
         self.assertAlmostEqual(m["eval/per_position_acc"][1], 0.5, places=6)
         self.assertEqual(len(m["eval/per_position_acc"]), 2)
@@ -224,17 +214,17 @@ class TestEvaluatorAggregation(unittest.TestCase):
     def test_emits_token_weighted_acceptance_rate_and_ploss(self):
         # eval/acceptance_rate_i and eval/ploss_i are token-weighted means over
         # the eval set (batch weights 8 and 2 here), emitted only when the
-        # strategy provides them.
+        # objective reports them.
         m = self._run(
             [
-                _step_output(
+                _per_depth_result(
                     2.0,
                     corrects=[3, 2],
                     denoms=[4, 4],
                     acceptance_rates=[0.8, 0.6],
                     plosses=[1.0, 2.0],
                 ),
-                _step_output(
+                _per_depth_result(
                     8.0,
                     corrects=[1, 0],
                     denoms=[1, 1],
@@ -249,7 +239,7 @@ class TestEvaluatorAggregation(unittest.TestCase):
         self.assertAlmostEqual(m["eval/expected_acceptance_1"], 0.52, places=6)
         self.assertAlmostEqual(m["eval/ploss_0"], 1.4, places=6)
         self.assertAlmostEqual(m["eval/ploss_1"], 2.4, places=6)
-        m2 = self._run([_step_output(1.0, corrects=[1], denoms=[2])])
+        m2 = self._run([_per_depth_result(1.0, corrects=[1], denoms=[2])])
         self.assertNotIn("eval/acceptance_rate_0", m2)
         self.assertNotIn("eval/expected_acceptance_0", m2)
         self.assertNotIn("eval/ploss_0", m2)
@@ -272,22 +262,24 @@ def _dp_worker(rank, world_size, port, results_dir):
         world_size=world_size,
         timeout=timedelta(seconds=60),
     )
-    # Scenario 1 — scalar accuracy, uneven shards, accuracy_denom != tokens:
-    # both weight sets must be reduced across ranks independently.
+    # Scenario 1 — scalar accuracy, uneven shards, accuracy denominator != loss
+    # tokens: both weight sets must be reduced across ranks independently.
     if rank == 0:
-        outs = [_scalar_out(2.0, 0.5, tokens=8, denom=4)]
+        results = [_scalar_result(2.0, 0.5, tokens=8, denom=4)]
     else:
-        outs = [
-            _scalar_out(8.0, 0.7, tokens=2, denom=1),
-            _scalar_out(4.0, 0.9, tokens=10, denom=5),
+        results = [
+            _scalar_result(8.0, 0.7, tokens=2, denom=1),
+            _scalar_result(4.0, 0.9, tokens=10, denom=5),
         ]
-    scalar = _evaluate(outs)
+    scalar = _evaluate(results)
 
     # Scenario 2 — ragged per-position shards: rank 1's shard is EMPTY. This
     # gates the pooling's collectives only; a collective forward (FSDP) would
     # additionally need equal per-rank batch counts — out of scope.
-    outs2 = [_step_output(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
-    ragged = _evaluate(outs2)
+    results2 = (
+        [_per_depth_result(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
+    )
+    ragged = _evaluate(results2)
 
     # Scenario 3 — zero batches on EVERY rank: the {} verdict is global too.
     empty = _evaluate([])
@@ -295,7 +287,7 @@ def _dp_worker(rank, world_size, port, results_dir):
     # Scenario 4 — ranks with different numbers of positions: the buffer every
     # rank pads to is as wide as the widest rank, not as wide as their sum.
     widths = _evaluate(
-        [_step_output(1.0, corrects=[1] * (2 + rank), denoms=[2] * (2 + rank))]
+        [_per_depth_result(1.0, corrects=[1] * (2 + rank), denoms=[2] * (2 + rank))]
     )
 
     with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:

@@ -270,10 +270,10 @@ def _stays_on_host(dtype: torch.dtype) -> bool:
     """Whether a pooled device read still delivers this feature to the host.
 
     Integer features (token ids, loss and attention masks) are a few bytes per
-    token, and strategies read them on the host: DFlash-family anchor sizing
+    token, and objectives read them on the host: DFlash-family anchor sizing
     counts valid anchors from the CPU loss mask. Delivering them on the device
     forces a CUDA synchronization per micro-step, while their non-blocking H2D
-    in the strategy is negligible. Hidden states stay on the device.
+    in the step runner is negligible. Hidden states stay on the device.
     """
     return not (dtype.is_floating_point or dtype.is_complex)
 
