@@ -79,14 +79,15 @@ def drafts():
     ]
 
 
-def write_run(root, draft):
+def write_run(root, draft, *, records=3):
     """Write a synthetic target, offline features and the run YAML; return its path."""
     torch.manual_seed(0)
     target = target_directory(root)
     features = root / "features"
     features.mkdir()
-    # Three records over two epochs: a four-step run crosses an epoch boundary.
-    for index in range(3):
+    # Read over two epochs; with the default three records a four-step run
+    # crosses the epoch boundary.
+    for index in range(records):
         record = {
             name: value[0].detach() for name, value in training_batch(draft).items()
         }
