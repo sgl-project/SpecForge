@@ -494,7 +494,9 @@ and fallback reasons, and distributed/resume validation retains the actual name.
 
 Term statistics are combined across chunks before normalization. Independent
 masks/denominators require `sum_means` (normalize each prediction set) or
-`global_microbatch` (normalize each term across ranks during training). The existing
+`global_microbatch` (normalize each term across ranks during training; the protocol
+declares `TrainingRequirements(reduction="microbatch")` and the step runner pools the
+denominators, so the forward issues no collective). The existing
 `tokens` contract and D-PACE require shared term reduction. Differentiable
 denominators and arbitrary accumulation-window normalization are not implemented.
 Existing trainer accumulation and protocol semantics are unchanged.

@@ -537,7 +537,8 @@ def execute_batch(
         batch: PredictionBatch with prediction sets, reduction and chunk default.
         loss: Runtime mathematical loss selection.
         weighting: Runtime position weights or complete-chain weighting policy.
-        training: Whether global_microbatch synchronizes denominators across ranks.
+        training: Whether a global_microbatch result carries its terms, for
+            the runner to pool each denominator over the ranks.
         execution: Overrides for chunking, checkpointing and optimized execution.
         selection: Persistent implementation choices; standalone calls use a local selection.
 
@@ -673,7 +674,7 @@ def execute_batch(
         )
     result = combine_results(results)
     if batch.reduction == "global_microbatch":
-        return result.objective_result(global_denominator=training, normalize=True)
+        return result.objective_result(normalize=True, with_terms=training)
     if batch.reduction not in ("tokens", "sum_means"):
         raise ValueError(f"unknown protocol reduction: {batch.reduction!r}")
     if not result.shared_reduction:

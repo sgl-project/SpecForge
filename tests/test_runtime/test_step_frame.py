@@ -314,6 +314,96 @@ class RunnerReductionTest(unittest.TestCase):
         reduce.assert_not_called()
 
 
+class _TermsProgram(_Program):
+    """Two terms with denominators of their own, as the ``microbatch`` reduction takes them."""
+
+    def forward(self, tensors, **context):
+        value = self.linear(tensors["x"]).sum()
+        result = ObjectiveResult(value.detach(), torch.ones(()))
+        if self.training:
+            result.terms = (
+                (1.0, value, torch.tensor(2.0)),
+                (0.5, value * value, torch.tensor(0.0)),
+            )
+        return result
+
+
+class RunnerMicrobatchReductionTest(unittest.TestCase):
+    def test_denominators_are_pooled_between_forward_and_backward(self):
+        program = _TermsProgram()
+        with torch.no_grad():
+            program.linear.weight.fill_(3.0)
+        runner = runner_over(program, reduction="microbatch")
+        pooled = []
+
+        def all_reduce(values, *, op, group):
+            pooled.append((values.clone(), program.linear.weight.grad))
+            if len(pooled) == 1:
+                # The other rank holds denominators of 4 and 0.
+                values.add_(torch.tensor([4.0, 0.0]))
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+        # One reduction carries every term's denominator, before any gradient;
+        # the window's own denominator follows the backward.
+        self.assertEqual(len(pooled), 2)
+        self.assertEqual(pooled[0][0].tolist(), [2.0, 0.0])
+        self.assertIsNone(pooled[0][1])
+        self.assertIsNotNone(pooled[1][1])
+        # d/dw of 2 * (w / 6 + 0.5 * w**2 / 1) at w = 3, x = 1: the world size
+        # undoes the wrapper's average, a pooled zero divides by one.
+        torch.testing.assert_close(
+            program.linear.weight.grad, torch.tensor([[2 * (1 / 6 + 3.0)]])
+        )
+
+    def test_one_rank_normalizes_by_its_own_denominators(self):
+        program = _TermsProgram()
+        with torch.no_grad():
+            program.linear.weight.fill_(3.0)
+        runner = runner_over(program, reduction="microbatch")
+        with mock.patch("torch.distributed.all_reduce") as reduce:
+            metrics = run_window(runner, [batch(1)], StepContext())
+        reduce.assert_not_called()
+        # 3 / 2 + 0.5 * 9 / 1, reported over a denominator of one.
+        self.assertEqual(metrics.loss, 6.0)
+
+    def test_window_averages_the_micro_batch_means(self):
+        program = _TermsProgram()
+        with torch.no_grad():
+            program.linear.weight.fill_(1.0)
+        runner = runner_over(program, reduction="microbatch")
+        metrics = run_window(
+            runner, [batch(2), batch(4)], StepContext(accumulation_steps=2)
+        )
+        # (2 / 2 + 0.5 * 4) and (4 / 2 + 0.5 * 16), as means and not pooled.
+        self.assertEqual(metrics.loss, (3.0 + 10.0) / 2)
+
+    def test_declaration_and_result_have_to_agree(self):
+        runner = runner_over(_Program(), reduction="microbatch")
+        with self.assertRaisesRegex(ValueError, "returned 0 loss terms"):
+            runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+        runner = runner_over(_TermsProgram())
+        with self.assertRaisesRegex(ValueError, "'window' reduction and returned 2"):
+            runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+
+    def test_evaluation_returns_what_the_program_computed(self):
+        program = _TermsProgram()
+        runner = runner_over(program, reduction="microbatch")
+        with (
+            mock.patch("torch.distributed.all_reduce") as reduce,
+            runner.evaluation(),
+        ):
+            result = runner.evaluate(batch(1), StepContext())
+        reduce.assert_not_called()
+        self.assertEqual(result.terms, ())
+        self.assertEqual(result.denominator.item(), 1.0)
+
+
 class RunnerAgreementTest(unittest.TestCase):
     def gathered(self, others):
         """Two ranks: this one's outcome and the given one for the other."""
