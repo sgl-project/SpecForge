@@ -149,12 +149,17 @@ class MoEBalancer:
         return moe_balance_loss(output, keep, PreparedLoad(counts))
 
     def step(self, *, process_group=None) -> dict[str, Tensor]:
-        """At the optimizer step: pool the window's counts over ranks, move the biases, reset."""
+        """At the optimizer step: the window's counts over ranks, move the biases, reset."""
         if any(counts is None for counts in self.counts):
             return {}
-        loads = [
-            load.float() for load in self._sum_over_ranks(self.counts, process_group)
-        ]
+        # batch_wise balancing pooled this window over ranks forward by forward: a
+        # forward counts and is pooled under the same condition (training, grad on).
+        loads = (
+            self.pooled
+            if self.pooled is not None
+            else self._sum_over_ranks(self.counts, process_group)
+        )
+        loads = [load.float() for load in loads]
         self.counts, self.pooled = [None] * len(self.layers), None
         if self.rate:
             for layer, load in zip(self.layers, loads):

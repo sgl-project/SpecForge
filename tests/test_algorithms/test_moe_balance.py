@@ -349,12 +349,29 @@ class MoEBalanceTest(unittest.TestCase):
                     )
                 else:
                     self.assertIsNone(balancer.pooled)
-                # Without pooling (evaluation) every forward balances against its own load.
-                torch.testing.assert_close(
-                    balancer.balance(outputs[1], keep=keep, pooled=False), own[1]
+                # Without pooling (evaluation: no grad, so not counted) every forward
+                # balances against its own load.
+                with torch.no_grad():
+                    torch.testing.assert_close(
+                        balancer.balance(outputs[1], keep=keep, pooled=False), own[1]
+                    )
+                # The optimizer step takes the pooled load as it is (batch_wise) and
+                # pools the window's counts itself otherwise; rate 0 moves no bias.
+                reduce, reductions = balancer._sum_over_ranks, []
+
+                def counted_reduce(counts, group):
+                    reductions.append(counts)
+                    return reduce(counts, group)
+
+                balancer._sum_over_ranks = counted_reduce
+                metrics = balancer.step()
+                self.assertEqual(set(metrics), {"moe/step_balance"})
+                self.assertEqual(
+                    len(reductions), 0 if aux_loss_type == "batch_wise" else 1
                 )
-                # The optimizer step resets the pooled load; rate 0 moves no bias.
-                self.assertEqual(set(balancer.step()), {"moe/step_balance"})
+                torch.testing.assert_close(
+                    metrics["moe/step_balance"], dispatch_balance(counts[0] + counts[1])
+                )
                 self.assertIsNone(balancer.pooled)
         # No balancer while the bias stays and no balance term is on; the term alone needs one.
         settings = {"bias_update_rate": 0.0, "aux_loss_type": "batch_wise"}
