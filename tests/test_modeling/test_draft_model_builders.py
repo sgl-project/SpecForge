@@ -16,7 +16,6 @@ from specforge.modeling.draft.hf_config import SpecForgeDraftConfig
 from specforge.modeling.draft.models import register_draft_model, resolve_draft_model
 from specforge.modeling.draft.models.registry import _MODELS
 from specforge.modeling.draft.pretrained import DraftPreTrainedModel
-from specforge.modeling.draft.registry import DRAFT_REGISTRY
 from tests.test_config.draft_fixtures import draft_config
 
 
@@ -50,15 +49,13 @@ class ModelBuilderTest(unittest.TestCase):
         meta = build_draft_model(config, device="meta")
         self.assertTrue(all(parameter.is_meta for parameter in meta.parameters()))
 
-    def test_registration_is_idempotent_conflicts_fail_and_legacy_is_independent(self):
-        before = dict(DRAFT_REGISTRY)
+    def test_registration_is_idempotent_and_conflicts_fail(self):
         register_draft_model(DFlashDraftModel)
         register_draft_model(DFlashDraftModel)
         self.assertIs(resolve_draft_model("DFlashDraftModel"), DFlashDraftModel)
         conflicting = type("DFlashDraftModel", (DraftPreTrainedModel,), {})
         with self.assertRaisesRegex(ValueError, "already registered"):
             register_draft_model(conflicting)
-        self.assertEqual(DRAFT_REGISTRY, before)
 
     def test_extension_schema_and_model_register_separately(self):
         class ExternalDraft(DraftPreTrainedModel):
