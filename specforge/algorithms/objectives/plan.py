@@ -111,6 +111,19 @@ class LossPlan:
             for term in self.terms
         )
 
+    @property
+    def shared_positions(self):
+        """Return whether every positional term inherits the prediction's reduction inputs; scalar terms may stand beside them."""
+        return all(
+            term.reduction == "scalar"
+            or (
+                term.mask is None
+                and term.weighting is None
+                and term.denominator is None
+            )
+            for term in self.terms
+        )
+
     def select(self, units):
         """Return a plan whose per-term masks select the given complete units.
 

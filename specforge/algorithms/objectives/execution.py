@@ -219,6 +219,9 @@ def evaluate_predictions(
     )
 
     computation = LossComputation(request, selection, execution, prediction_index)
+    for index in p.term_values:
+        # the value is added once after chunking; this chunk contributes nothing
+        computation.numerators[index] = p.hidden.new_zeros(())
     if p.compute is None:
         computation.run()
     else:
@@ -247,7 +250,25 @@ def evaluate_predictions(
         for i, item in enumerate(inputs)
     )
     coefficients = tuple(term.coefficient for term in p.plan.terms)
-    return PlanResult(terms, coefficients, p.plan.shared_reduction, ratios)
+    return PlanResult(
+        terms,
+        coefficients,
+        p.plan.shared_reduction,
+        ratios,
+        tuple(i for i, term in enumerate(p.plan.terms) if term.reduction == "scalar"),
+        p.plan.shared_positions,
+    )
+
+
+def add_term_values(result, predictions):
+    """Add each supplied scalar term once, after chunking, and report it under the term's name."""
+    for index, value in predictions.term_values.items():
+        result.terms[index].numerator = value
+        result.terms[index].denominator = value.new_ones(())
+        name = predictions.plan.terms[index].name
+        if name:
+            result.ratios[name] = (value.detach(), value.new_ones(()))
+    return result
 
 
 @dataclass
@@ -395,7 +416,10 @@ def evaluate_chunks(
     losses = selected_losses(predictions, loss)
     whole_set = any(
         selected.registration.scope == "prediction" for selected in losses
-    ) or any(term.reduction == "scalar" for term in predictions.plan.terms)
+    ) or any(
+        term.reduction == "scalar" and index not in predictions.term_values
+        for index, term in enumerate(predictions.plan.terms)
+    )
     if whole_set or not predictions.chunk_safe or not predictions.projection.chunk_safe:
         # A protocol's default bound that cannot apply is not a dropped request.
         if (
@@ -525,7 +549,7 @@ def evaluate_chunks(
                 ].denominator.new_ones(())
             elif fixed is not None:
                 result.terms[index].denominator = fixed
-    return result
+    return add_term_values(result, predictions)
 
 
 def execute_batch(
@@ -558,7 +582,7 @@ def execute_batch(
         requested_split = any(0 < chunk_size < p.hidden.shape[0] for p in predictions)
         if not predictions:
             raise ValueError("protocol must produce at least one prediction set")
-        if any(not p.plan.shared_reduction for p in predictions):
+        if any(not p.plan.shared_positions for p in predictions):
             raise ValueError(
                 "D-PACE currently requires shared loss masks and weighting"
             )
@@ -587,16 +611,19 @@ def execute_batch(
             ]
             weighted = chain_weights(predictions, projected, weighting)
             results = [
-                evaluate_predictions(
+                add_term_values(
+                    evaluate_predictions(
+                        p,
+                        loss,
+                        weighting,
+                        projected=q,
+                        execution=execution,
+                        selection=selection,
+                        prediction_index=index,
+                        weights=w.reshape_as(p.mask),
+                        denominator=d.sum(),
+                    ),
                     p,
-                    loss,
-                    weighting,
-                    projected=q,
-                    execution=execution,
-                    selection=selection,
-                    prediction_index=index,
-                    weights=w.reshape_as(p.mask),
-                    denominator=d.sum(),
                 )
                 for index, (p, q, (w, d)) in enumerate(
                     zip(predictions, projected, weighted)
@@ -679,7 +706,7 @@ def execute_batch(
             )
         elif batch.reduction not in ("tokens", "sum_means"):
             raise ValueError(f"unknown protocol reduction: {batch.reduction!r}")
-        elif not combined.shared_reduction:
+        elif not combined.shared_reduction and not combined.shared_positions:
             raise ValueError(
                 "Independent term reductions require sum_means or global_microbatch"
             )

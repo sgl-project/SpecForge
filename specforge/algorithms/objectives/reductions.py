@@ -14,12 +14,17 @@ class PlanResult:
         coefficients: Multipliers aligned with terms.
         shared_reduction: Whether terms share the same normalization contract.
         ratios: Named metric numerator/denominator pairs, independent of loss.
+        scalar_terms: Indices of terms holding one already normalized scalar.
+        shared_positions: Whether the positional terms share one denominator,
+            which the scalar terms then join.
     """
 
     terms: tuple[ObjectiveResult, ...]
     coefficients: tuple[float, ...]
     shared_reduction: bool
     ratios: dict
+    scalar_terms: tuple[int, ...] = ()
+    shared_positions: bool = False
 
     @property
     def loss(self):
@@ -55,6 +60,19 @@ class PlanResult:
                 self.terms[0].denominator,
                 self.ratios,
             )
+        positional = [i for i in range(len(self.terms)) if i not in self.scalar_terms]
+        if self.shared_positions and positional:
+            # the scalar terms join the positional mean, scaled by its denominator
+            denominator = self.terms[positional[0]].denominator
+            return ObjectiveResult(
+                sum(self.coefficients[i] * self.terms[i].numerator for i in positional)
+                + sum(
+                    self.coefficients[i] * self.terms[i].loss * denominator
+                    for i in self.scalar_terms
+                ),
+                denominator,
+                self.ratios,
+            )
         return ObjectiveResult(
             self.loss, self.terms[0].denominator.new_ones(()), self.ratios
         )
@@ -78,6 +96,7 @@ def combine_results(results):
     if any(
         result.coefficients != first.coefficients
         or result.shared_reduction != first.shared_reduction
+        or result.scalar_terms != first.scalar_terms
         for result in results[1:]
     ):
         raise ValueError("Additive prediction sets must use the same loss plan")
@@ -96,4 +115,11 @@ def combine_results(results):
         )
         for i in range(len(first.terms))
     )
-    return PlanResult(terms, first.coefficients, first.shared_reduction, ratios)
+    return PlanResult(
+        terms,
+        first.coefficients,
+        first.shared_reduction,
+        ratios,
+        first.scalar_terms,
+        first.shared_positions,
+    )
