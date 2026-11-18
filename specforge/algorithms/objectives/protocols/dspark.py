@@ -52,6 +52,8 @@ class DSparkObjective:
             "confidence": LossDefinition(
                 TokenLoss("bce"), modules=("confidence_head",)
             ),
+            # the MoE balance term, off by default; the training layer prepares its load
+            "moe_balance": LossDefinition(TokenLoss("value"), coefficient=0.0),
         }
 
     default_weighting_options = ("loss_decay_gamma",)
@@ -84,7 +86,6 @@ class DSparkObjective:
             predecessor_ids=blocks.predecessors.flatten(1),
             output_logits=False,
         )
-        runtime.observe_statistics(output, blocks.kept_tokens)
 
         def compute(calc):
             calc.run((0,))
@@ -108,20 +109,15 @@ class DSparkObjective:
             values = calc.evaluate_term(1, confidence, acceptance).values
             calc.add(1, values)
 
+        balance, value = runtime.balance_term(output, blocks.kept_tokens, context)
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             projection_inputs={"predecessor_ids": blocks.predecessors},
             compute=compute,
-            plan=LossPlan(
-                (
-                    LossTerm(),
-                    LossTerm(
-                        "confidence",
-                    ),
-                )
-            ),
+            plan=LossPlan((LossTerm(), LossTerm("confidence"), balance)),
+            term_values={2: value},
             requires=frozenset({"teacher_logits"}),
             default_loss=self.default_loss,
         )
