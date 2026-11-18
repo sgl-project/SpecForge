@@ -77,6 +77,7 @@ class _Strategy(DraftTrainStrategy):
 
 
 class _Backend(TrainingBackend):
+    process_group = None
     name = "fake"
 
     def __init__(self, model, on_step=None):

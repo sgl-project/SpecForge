@@ -29,7 +29,7 @@ import torch
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
-from specforge.training.contracts import IncompleteWindow, StepMetrics, StepRunner
+from specforge.training.contracts import StepMetrics, StepRunner
 from specforge.training.frame import run_window
 from specforge.training.strategies.base import DraftTrainStrategy, StepContext
 
@@ -276,9 +276,10 @@ class TrainerController:
         self._last_result: Optional[StepMetrics] = None
         self._pending_ack: List[str] = []
         self._perf = _PerfWindow()
-        # Set once the stream has ended inside a window: those micro-batches
-        # were consumed and never committed, so the run cannot continue.
-        self._incomplete_window: Optional[str] = None
+        # Set once a window has failed, whether the stream ended inside it or
+        # a micro-batch raised: its micro-batches were consumed and never
+        # committed, so the run cannot continue.
+        self._failed_window: Optional[str] = None
         self._last_eval_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
         from specforge.training.profiling import ProfilingOptions, StepProfiler
@@ -366,8 +367,12 @@ class TrainerController:
             self._ack_flush_wait_s += time.perf_counter() - started
 
     def _fit(self, data: Iterable[TrainBatch], progress: Optional[Any]) -> int:
-        if self._incomplete_window is not None:
-            raise IncompleteWindow(self._incomplete_window)
+        if self._failed_window is not None:
+            raise RuntimeError(
+                "training cannot continue: an optimizer window of this run "
+                "failed after consuming micro-batches that were never "
+                f"committed ({self._failed_window})"
+            )
         if self.max_steps is not None and self.global_step >= self.max_steps:
             logger.info(
                 "fit: global_step=%d already at max_steps=%d; nothing to train",
@@ -400,8 +405,8 @@ class TrainerController:
             stream_before = perf.stream_s
             try:
                 result = run_window(self.runner, window, ctx)
-            except IncompleteWindow as error:
-                self._incomplete_window = str(error)
+            except BaseException as error:
+                self._failed_window = f"{type(error).__name__}: {error}"
                 raise
             perf.train_compute_s += (time.perf_counter() - window_started) - (
                 perf.stream_s - stream_before
@@ -574,8 +579,11 @@ class TrainerController:
                     self._pending_ack.extend(batch.sample_ids)
                 self._step_profiler.before_micro_step(self.global_step)
                 self._perf.stream_s += time.perf_counter() - resumed
-                yield batch
+                # Suspended here until the next batch is asked for, which may
+                # be a whole replay later: hold no reference meanwhile.
+                handed = [batch]
                 del batch
+                yield handed.pop()
                 resumed = time.perf_counter()
             self._epoch_batch = 0
             self._epoch_samples = 0

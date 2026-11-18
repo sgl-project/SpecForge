@@ -86,6 +86,7 @@ def _fake_seam():
             }
 
     class Backend(TrainingBackend):
+        process_group = None
         name = "fake"
 
         def __init__(self, model):

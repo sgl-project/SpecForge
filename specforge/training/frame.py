@@ -15,11 +15,16 @@ the runner's. It decides only the order in which a runner sees the window.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 
-from specforge.training.contracts import IncompleteWindow, StepMetrics, StepRunner
+from specforge.training.contracts import (
+    IncompleteWindow,
+    PendingStep,
+    StepMetrics,
+    StepRunner,
+)
 
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
@@ -58,7 +63,7 @@ def run_window(
     # The frame's own count decides, whatever a runner returned on the way.
     if received != ctx.accumulation_steps:
         raise _incomplete(received, ctx)
-    return runner.apply_step(pending)
+    return runner.apply_step(_boundary_step(pending))
 
 
 def _bounded(
@@ -109,7 +114,13 @@ def _run_replayed_window(
         pending = runner.forward_backward(
             batch, replay, is_boundary=index == ctx.accumulation_steps
         )
-    return runner.apply_step(pending)
+    return runner.apply_step(_boundary_step(pending))
+
+
+def _boundary_step(pending: Optional[PendingStep]) -> PendingStep:
+    if pending is None:
+        raise RuntimeError("the runner returned no step for the window's boundary")
+    return pending
 
 
 def _incomplete(received: int, ctx: "StepContext") -> IncompleteWindow:

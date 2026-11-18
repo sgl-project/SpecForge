@@ -39,9 +39,6 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
             seen.add(id(value))
-        # The window's pooled statistic and the ratio formed from it.
-        self._pooled = None
-        self._window_value = None
 
     def trainable_module(self):
         return self.model
@@ -133,12 +130,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         ctx = ctx or StepContext()
         if self.window_statistic is None or not ctx.replay_values:
             return self._forward(batch, ctx)
-        pooled = ctx.replay_values[self.window_statistic.argument_name]
-        if self._pooled is not pooled:
-            # The pooled sums arrive unchanged; the ratio and its guard are
-            # formed here, once for the window's replayed forwards.
-            numerator, denominator = pooled
-            denominator = denominator.where(denominator > 0, 1)
-            self._window_value = (numerator / denominator).detach()
-            self._pooled = pooled
-        return self._forward(batch, ctx, self._window_value)
+        # The pooled sums arrive unchanged; the ratio and its guard are formed
+        # here, from the values and not from which tensor carries them.
+        numerator, denominator = ctx.replay_values[self.window_statistic.argument_name]
+        denominator = denominator.where(denominator > 0, 1)
+        return self._forward(batch, ctx, (numerator / denominator).detach())

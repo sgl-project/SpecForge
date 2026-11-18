@@ -26,10 +26,8 @@ class _Strategy:
         return self.model
 
     def forward_loss(self, batch, ctx=None):
-        squares = self.model(batch.tensors["input"]).square()
-        count = torch.tensor(float(squares.numel()))
         return StepOutput(
-            loss=squares.mean(), metrics={}, loss_terms=(squares.sum(), count)
+            loss=self.model(batch.tensors["input"]).square().mean(), metrics={}
         )
 
 
@@ -43,8 +41,9 @@ class _ReplayStrategy(_Strategy):
     replay_statistics = ("count",)
 
     def prepass(self, batch, ctx):
-        output = self.forward_loss(batch, ctx)
-        return replace(output, statistics={"count": output.loss_terms[1]})
+        return replace(
+            self.forward_loss(batch, ctx), statistics={"count": torch.ones(1)}
+        )
 
 
 def _count_allreduce(state, bucket):

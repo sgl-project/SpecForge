@@ -60,13 +60,22 @@ class StepMetrics:
         self,
         values: Mapping[str, Any],
         *,
-        learning_rate: Optional[float] = None,
+        has_grad_norm: bool = False,
+        learning_rate: Any = None,
     ) -> None:
         self._values = dict(values)
-        #: The optimizer's rate once this update is applied; None when the
-        #: optimizer does not report one.
-        self.learning_rate = learning_rate
+        self._has_grad_norm = has_grad_norm
+        self._learning_rate = learning_rate
         self._host_values: Optional[Dict[str, float]] = None
+
+    @property
+    def learning_rate(self) -> Optional[float]:
+        """The optimizer's rate once this update is applied.
+
+        None when the optimizer does not report one. Converted on access: an
+        optimizer may report a device scalar.
+        """
+        return None if self._learning_rate is None else float(self._learning_rate)
 
     def materialize(self) -> Dict[str, float]:
         """Copy every metric to the host in one synchronization, once."""
@@ -80,8 +89,10 @@ class StepMetrics:
 
     @property
     def grad_norm(self) -> Optional[float]:
-        """The gradient norm before clipping; None when the runner has none."""
-        return self.materialize().get("grad_norm")
+        """The optimizer's gradient norm before clipping; None when it reports none."""
+        if not self._has_grad_norm:
+            return None
+        return self.materialize()["grad_norm"]
 
 
 def materialize_metrics(values: Mapping[str, Any]) -> Dict[str, float]:

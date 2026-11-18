@@ -113,6 +113,7 @@ class ReplayStrategy(WeightedStrategy):
 
 
 class FakeBackend(TrainingBackend):
+    process_group = None
     name = "fake"
 
     def __init__(self, model):
@@ -793,40 +794,76 @@ class TestTrainerController(unittest.TestCase):
         progress.close.assert_called_once_with()
         # The third batch was consumed and never committed: a retry finds the
         # stream exhausted and must not report the run as complete.
-        with self.assertRaisesRegex(IncompleteWindow, "received 1 of 2"):
+        with self.assertRaisesRegex(RuntimeError, "received 1 of 2"):
             ctrl.fit([])
+        self.assertEqual(ctrl.global_step, 1)
+
+    def test_window_that_raised_ends_the_run(self):
+        class FailingStrategy(FakeStrategy):
+            def forward_loss(self, batch, ctx=None):
+                if batch.sample_ids == ["bad"]:
+                    raise ValueError("bad batch")
+                return super().forward_loss(batch, ctx)
+
+        strat = FailingStrategy()
+        backend = FakeBackend(strat.model)
+        bad = replace(_batch(), sample_ids=["bad"])
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, backend, accumulation_steps=2, run_id="r", output_dir=d
+            )
+            with self.assertRaisesRegex(ValueError, "bad batch"):
+                ctrl.fit([_batch(), _batch(), _batch(), bad])
+            # The third batch's backward ran; skipping to the end of the data
+            # on a retry would save a checkpoint that never trained on it.
+            with self.assertRaisesRegex(RuntimeError, "never committed.*bad batch"):
+                ctrl.fit([])
         self.assertEqual(ctrl.global_step, 1)
 
     def test_window_holds_one_micro_batch_at_a_time(self):
         """A batch may live on the training device; none outlives its turn."""
-        alive = []
+        for replay_statistics in ((), ("count",)):
+            with self.subTest(replay_statistics=replay_statistics):
+                alive = []
+                streamed = []
 
-        class Runner:
-            replay_statistics = ()
+                class Runner:
+                    def forward_backward(self, batch, ctx, *, is_boundary):
+                        gc.collect()
+                        alive.append(sum(ref() is not None for ref in streamed))
+                        return "pending" if is_boundary else None
 
-            def forward_backward(self, batch, ctx, *, is_boundary):
-                gc.collect()
-                alive.append(sum(ref() is not None for ref in references))
-                references.append(weakref.ref(batch))
-                return "pending" if is_boundary else None
+                    def apply_step(self, pending):
+                        return StepMetrics({"loss": 0.0})
 
-            def apply_step(self, pending):
-                return StepMetrics({"loss": 0.0})
+                    def prepass(self, batch, ctx):
+                        return {"count": torch.ones(1)}
 
-        references = []
-        strat = FakeStrategy()
-        with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                Runner(),
-                strategy=strat,
-                backend=FakeBackend(strat.model),
-                accumulation_steps=3,
-                run_id="r",
-                output_dir=d,
-            )
-            ctrl.fit(_batch() for _ in range(6))
-        # Entering a forward, no earlier micro-batch is referenced any more.
-        self.assertEqual(alive, [0] * 6)
+                    def reduce_sum(self, values):
+                        return values
+
+                def stream():
+                    for _ in range(6):
+                        # Hold nothing while suspended, as a loader would not.
+                        handed = [_batch()]
+                        streamed.append(weakref.ref(handed[0]))
+                        yield handed.pop()
+
+                Runner.replay_statistics = replay_statistics
+                strat = FakeStrategy()
+                with tempfile.TemporaryDirectory() as d:
+                    ctrl = TrainerController(
+                        Runner(),
+                        strategy=strat,
+                        backend=FakeBackend(strat.model),
+                        accumulation_steps=3,
+                        run_id="r",
+                        output_dir=d,
+                    )
+                    ctrl.fit(stream())
+                # Entering a forward, only the batch it is handed is alive; a
+                # replayed forward is handed a host copy and none is.
+                self.assertEqual(alive, [0 if replay_statistics else 1] * 6)
 
 
 class TestBestTracking(unittest.TestCase):

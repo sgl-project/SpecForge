@@ -150,10 +150,18 @@ class TrainingBackend(abc.ABC):
     #: denominator inside the optimizer's single host read, letting the step
     #: runner skip its own synchronizing check.
     checks_loss_denominator: bool = False
-    #: The group of the data-parallel ranks; None is the default group.
-    process_group: Any = None
 
-    def learning_rate(self) -> Optional[float]:
+    @property
+    @abc.abstractmethod
+    def process_group(self) -> Any:
+        """The group whose ranks share an update; None is the default group.
+
+        The loss denominator, the world-size rescale and the metrics are
+        reduced over it, so it has to be the group the gradients synchronize
+        over. It has no default: a wrong group trains on wrong gradients.
+        """
+
+    def learning_rate(self) -> Any:
         """The optimizer's current rate, or None when it does not report one."""
         return None
 
@@ -208,9 +216,9 @@ class FSDPTrainingBackend(TrainingBackend):
     def process_group(self) -> Any:
         return self.parallel_config.fsdp_process_group
 
-    def learning_rate(self) -> Optional[float]:
+    def learning_rate(self) -> Any:
         get_learning_rate = getattr(self.optimizer, "get_learning_rate", None)
-        return float(get_learning_rate()) if callable(get_learning_rate) else None
+        return get_learning_rate() if callable(get_learning_rate) else None
 
     @property
     def optimizer_state_is_replicated(self) -> bool:
