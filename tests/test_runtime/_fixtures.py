@@ -92,6 +92,17 @@ def build_strategy(model, target_head=None, **kwargs):
     )
 
 
+def train_window(runner, batches, ctx=None):
+    """Run ``batches`` as one optimizer window and return the update's metrics."""
+    from dataclasses import replace
+
+    from specforge.training.frame import run_window
+    from specforge.training.strategies.base import StepContext
+
+    ctx = replace(ctx or StepContext(), accumulation_steps=len(batches))
+    return run_window(runner, iter(batches), ctx)
+
+
 def build_single_rank_distributed(port="29561"):
     import torch.distributed as dist
 

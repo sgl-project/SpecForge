@@ -20,7 +20,7 @@ from torch import nn
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.strategies.base import StepContext, StepOutput
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
-from tests.test_runtime._fixtures import build_strategy
+from tests.test_runtime._fixtures import build_strategy, train_window
 
 CUDA = torch.cuda.is_available()
 _CTX = StepContext(global_step=5, total_steps=100, collect_detailed_metrics=False)
@@ -244,6 +244,7 @@ class _WeightedStrategy:
     """Scalar-loss strategy with ``loss_terms`` and a host schedule metric."""
 
     name = "weighted"
+    replay_statistics = ()
 
     def __init__(self, model, denominator):
         self.model = model
@@ -263,10 +264,10 @@ class _WeightedStrategy:
         )
 
 
-def _boundary_core(*, denominator=4.0, accumulation_steps=2):
+def _boundary_runner(*, denominator=4.0):
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.training.controller import TrainerCore
+    from specforge.training.runner import DataParallelRunner
 
     torch.manual_seed(0)
     model = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).to(
@@ -280,7 +281,7 @@ def _boundary_core(*, denominator=4.0, accumulation_steps=2):
     )
     backend.prepare_model(model, wrap=False)
     strategy = _WeightedStrategy(model, denominator)
-    return TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
+    return DataParallelRunner(strategy, backend)
 
 
 def _x_batch():
@@ -294,42 +295,45 @@ def _x_batch():
 
 @unittest.skipUnless(CUDA, "requires CUDA")
 class TestOptimizerBoundarySyncs(unittest.TestCase):
-    def _boundary_syncs(self, core):
+    def _boundary_syncs(self, runner):
+        """Count the synchronizations inside a window and at its boundary."""
+        ctx = StepContext(accumulation_steps=2)
         for _ in range(2):  # warm up fused AdamW state and the allocator
-            for _ in range(core.accumulation_steps):
-                core.train_step(_x_batch())
-        batches = [_x_batch() for _ in range(core.accumulation_steps)]
+            train_window(runner, [_x_batch(), _x_batch()])
+        batches = [_x_batch(), _x_batch()]
         with _CountSyncs() as micro:
-            core.train_step(batches[0])
+            inside = runner.forward_backward(batches[0], ctx, is_boundary=False)
         with _CountSyncs() as boundary:
-            result = core.train_step(batches[1])
-        self.assertTrue(result.optimizer_stepped)
+            pending = runner.forward_backward(batches[1], ctx, is_boundary=True)
+            runner.apply_step(pending)
+        self.assertIsNone(inside)
+        self.assertIsNotNone(pending)
         return micro.count, boundary.count
 
     def test_optimizer_step_synchronizes_the_host_once(self):
-        core = _boundary_core()
-        self.assertTrue(core.backend.checks_loss_denominator)
-        self.assertEqual(self._boundary_syncs(core), (0, 1))
+        runner = _boundary_runner()
+        self.assertTrue(runner.backend.checks_loss_denominator)
+        self.assertEqual(self._boundary_syncs(runner), (0, 1))
 
     def test_dp_boundary_reduces_host_scalars_without_extra_syncs(self):
-        core = _boundary_core()
+        runner = _boundary_runner()
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
             mock.patch("torch.distributed.get_world_size", return_value=2),
             mock.patch("torch.distributed.all_reduce"),
         ):
-            self.assertEqual(self._boundary_syncs(core), (0, 1))
+            self.assertEqual(self._boundary_syncs(runner), (0, 1))
 
     def test_invalid_denominator_still_refuses_to_step(self):
         for denominator in (0.0, -1.0, float("nan"), float("inf")):
             with self.subTest(denominator=denominator):
-                core = _boundary_core(denominator=denominator, accumulation_steps=1)
-                optimizer = core.backend.optimizer
+                runner = _boundary_runner(denominator=denominator)
+                optimizer = runner.backend.optimizer
                 weights = [p.detach().clone() for p in optimizer.model_params]
                 scheduler_epoch = optimizer.scheduler.last_epoch
                 with self.assertRaisesRegex(ValueError, "finite and positive"):
-                    core.train_step(_x_batch())
+                    train_window(runner, [_x_batch()])
                 self.assertFalse(optimizer.optimizer.state)
                 self.assertEqual(optimizer.scheduler.last_epoch, scheduler_epoch)
                 for before, param in zip(weights, optimizer.model_params):

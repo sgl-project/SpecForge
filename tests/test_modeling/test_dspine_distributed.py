@@ -15,10 +15,10 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-from specforge.training.controller import TrainerCore
+from specforge.training.runner import DataParallelRunner
 from specforge.training.strategies.base import StepContext
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
-from tests.test_runtime._fixtures import build_strategy
+from tests.test_runtime._fixtures import build_strategy, train_window
 
 
 def fixed_anchors(valid, num_anchors, available=None):
@@ -67,6 +67,20 @@ def count_gradient_allreduce(state, bucket):
     return future
 
 
+class CountingRunner(DataParallelRunner):
+    """Notes the gradient all-reduces issued by the end of each micro-batch."""
+
+    def __init__(self, strategy, backend, communication):
+        super().__init__(strategy, backend)
+        self.communication = communication
+        self.communication_counts = []
+
+    def forward_backward(self, batch, ctx, *, is_boundary):
+        pending = super().forward_backward(batch, ctx, is_boundary=is_boundary)
+        self.communication_counts.append(self.communication["calls"])
+        return pending
+
+
 def distributed_step(rank, directory, accumulation_steps):
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -83,14 +97,12 @@ def distributed_step(rank, directory, accumulation_steps):
         wrapped = backend.prepare_model(model)
         communication = {"calls": 0}
         wrapped.register_comm_hook(communication, count_gradient_allreduce)
-        communication_counts = []
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
-        core = TrainerCore(
-            build_strategy(wrapped), backend, accumulation_steps=accumulation_steps
-        )
-        for microstep in range(accumulation_steps):
-            index = 2 * microstep + rank
-            core.train_step(
+        strategy = build_strategy(wrapped)
+        runner = CountingRunner(strategy, backend, communication)
+        train_window(
+            runner,
+            [
                 TrainBatch(
                     [str(index)],
                     "dspine",
@@ -98,17 +110,18 @@ def distributed_step(rank, directory, accumulation_steps):
                         name: tensor[index : index + 1]
                         for name, tensor in inputs.items()
                     },
-                ),
-                StepContext(global_step=300, total_steps=600),
-            )
-            communication_counts.append(communication["calls"])
+                )
+                for index in range(rank, 2 * accumulation_steps, 2)
+            ],
+            StepContext(global_step=300, total_steps=600),
+        )
         torch.save(
             {
                 "gradients": {
                     name: parameter.grad
                     for name, parameter in model.draft_model.named_parameters()
                 },
-                "communication_counts": communication_counts,
+                "communication_counts": runner.communication_counts,
                 "sync_restored": wrapped.require_backward_grad_sync,
             },
             Path(directory) / f"gradients-{rank}.pt",
@@ -144,26 +157,27 @@ def fsdp_mixed_precision_step(rank, directory):
         backend = FSDPTrainingBackend(ParallelConfig())
         backend.prepare_model(wrapped, wrap=False)
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
-        core = TrainerCore(build_strategy(wrapped), backend, accumulation_steps=2)
+        strategy = build_strategy(wrapped)
+        runner = DataParallelRunner(strategy, backend)
         inputs = training_inputs()
         for name in ("hidden_states", "target_last_hidden_states"):
             inputs[name] = inputs[name].to(torch.bfloat16)
+        batches = [
+            TrainBatch(
+                [str(index)],
+                "dspine",
+                {name: tensor[index : index + 1] for name, tensor in inputs.items()},
+            )
+            for index in range(2)
+        ]
         for step in (100, 300):
             wrapped.zero_grad(set_to_none=True)
-            for index in range(2):
-                result = core.train_step(
-                    TrainBatch(
-                        [str(index)],
-                        "dspine",
-                        {
-                            name: tensor[index : index + 1]
-                            for name, tensor in inputs.items()
-                        },
-                    ),
-                    StepContext(global_step=step, total_steps=600),
-                )
-            assert result.optimizer_stepped
-            assert torch.isfinite(torch.tensor(result.loss))
+            metrics = train_window(
+                runner,
+                batches,
+                StepContext(global_step=step, total_steps=600),
+            )
+            assert torch.isfinite(torch.tensor(metrics.loss))
             assert model.draft_model.transfer_codes.dtype == torch.float32
             assert all(
                 parameter.grad is not None and torch.isfinite(parameter.grad).all()

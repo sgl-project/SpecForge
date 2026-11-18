@@ -543,6 +543,9 @@ class CanonicalTrainingTest(unittest.TestCase):
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.frame import run_window
+        from specforge.training.runner import DataParallelRunner
         from tests.test_modeling.test_canonical_dspine import initialized_model
 
         model = initialized_model()
@@ -551,39 +554,56 @@ class CanonicalTrainingTest(unittest.TestCase):
             options={"num_anchors": 2, "alignment_warmup_steps": 0},
             target_head=torch.nn.Linear(32, 64, bias=False),
         )
-        strategy = CanonicalTrainStrategy(
+
+        class Strategy(CanonicalTrainStrategy):
+            """Keeps the outputs of the replayed forwards."""
+
+            replayed = []
+
+            def forward_loss(self, batch, ctx=None):
+                output = super().forward_loss(batch, ctx)
+                if ctx.replay_values:
+                    self.replayed.append(output)
+                return output
+
+        class Runner(DataParallelRunner):
+            """Pools to fixed sums and records when, as other ranks would change them."""
+
+            pooled = []
+
+            def reduce_sum(self, values):
+                if values.numel() == 2:
+                    self.pooled.append(torch.get_rng_state().clone())
+                    # A fractional denominator must remain exact.
+                    return torch.tensor([0.1, 0.2])
+                return values
+
+        strategy = Strategy(
             runtime,
             name="dspine",
             objective="dspine",
             required_features=runtime.registration.inputs,
         )
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(runtime, wrap=False)
+        backend.set_optimizer(torch.optim.SGD(model.parameters(), lr=0.0))
+        runner = Runner(strategy, backend)
         batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
         for accumulation in (1, 2):
             with self.subTest(accumulation=accumulation):
+                strategy.replayed.clear()
+                runner.pooled.clear()
+                model.zero_grad(set_to_none=True)
                 initial_rng = torch.get_rng_state().clone()
                 ctx = StepContext(
                     global_step=1, total_steps=10, accumulation_steps=accumulation
                 )
-                with (
-                    patch(
-                        "specforge.training.strategies.canonical.dist.is_initialized",
-                        return_value=True,
-                    ),
-                    patch(
-                        "specforge.training.strategies.canonical.dist.all_reduce"
-                    ) as reduce,
-                ):
-                    output = strategy.forward_loss(batch, ctx)
-                    reduce.assert_not_called()
-                    state = torch.get_rng_state().clone()
-                    # A fractional denominator must remain exact.
-                    window = {
-                        "dspine/backbone_ce": (torch.tensor(0.1), torch.tensor(0.2))
-                    }
-                    replayed = output.replay_loss(window)
-                    output.replay_loss(window)
-                    reduce.assert_called_once()
-                torch.testing.assert_close(state, torch.get_rng_state())
+                run_window(runner, [batch] * accumulation, ctx)
+                # One reduction for the window, after its prepasses; the replay
+                # leaves the generator where they left it.
+                self.assertEqual(len(runner.pooled), 1)
+                torch.testing.assert_close(runner.pooled[0], torch.get_rng_state())
+                self.assertEqual(len(strategy.replayed), accumulation)
                 with torch.random.fork_rng():
                     torch.set_rng_state(initial_rng)
                     expected = runtime(
@@ -592,8 +612,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                         total_steps=10,
                         alignment_ce=torch.tensor(0.5),
                     )
-                torch.testing.assert_close(replayed.loss, expected.loss)
-                replayed.loss.backward()
+                torch.testing.assert_close(strategy.replayed[0].loss, expected.loss)
                 self.assertTrue(
                     all(
                         p.grad is not None
@@ -603,10 +622,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 )
         strategy.trainable_module().eval()
         self.assertFalse(runtime.training)
-        with patch("specforge.training.strategies.canonical.dist.all_reduce") as reduce:
-            evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
-            self.assertIsNone(evaluated.replay_loss)
-            reduce.assert_not_called()
+        evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
+        self.assertEqual(evaluated.statistics, {})
+        self.assertEqual(len(runner.pooled), 1)
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""

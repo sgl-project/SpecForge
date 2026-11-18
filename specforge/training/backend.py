@@ -147,9 +147,15 @@ class ParallelConfig:
 class TrainingBackend(abc.ABC):
     name: str
     #: Whether ``step(loss_denominator=...)`` validates the global loss
-    #: denominator inside the optimizer's single host read, letting
-    #: ``TrainerCore`` skip its own synchronizing check.
+    #: denominator inside the optimizer's single host read, letting the step
+    #: runner skip its own synchronizing check.
     checks_loss_denominator: bool = False
+    #: The group of the data-parallel ranks; None is the default group.
+    process_group: Any = None
+
+    def learning_rate(self) -> Optional[float]:
+        """The optimizer's current rate, or None when it does not report one."""
+        return None
 
     def accumulation_context(self, *, is_boundary: bool = True):
         return contextlib.nullcontext()
@@ -197,6 +203,14 @@ class FSDPTrainingBackend(TrainingBackend):
         self._wrapper_kind = "none"
         self.auto_wrap_block_classes = set()
         self.ignored_frozen_modules = tuple()
+
+    @property
+    def process_group(self) -> Any:
+        return self.parallel_config.fsdp_process_group
+
+    def learning_rate(self) -> Optional[float]:
+        get_learning_rate = getattr(self.optimizer, "get_learning_rate", None)
+        return float(get_learning_rate()) if callable(get_learning_rate) else None
 
     @property
     def optimizer_state_is_replicated(self) -> bool:
