@@ -31,6 +31,7 @@ def program_spec(model) -> ProgramSpec:
         inputs=tuple(registration.inputs),
         replay_statistics=() if statistic is None else (statistic.argument_name,),
         evaluation_diagnostics=registration.training.evaluation_diagnostics,
+        reduction=registration.training.reduction,
     )
 
 

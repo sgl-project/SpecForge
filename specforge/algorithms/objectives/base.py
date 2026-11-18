@@ -16,23 +16,15 @@ class ObjectiveResult:
     #: This rank's sums of each statistic the objective needs pooled over a
     #: window, by name; filled by a prepass only.
     statistics: dict[str, Tensor] = field(default_factory=dict)
+    #: Under the ``microbatch`` reduction, in training: every loss term as
+    #: ``(coefficient, numerator, denominator)``, the last two this rank's.
+    #: The numerator and denominator above then hold the loss with every term
+    #: normalized on this rank alone.
+    terms: tuple[tuple[float, Tensor, Tensor], ...] = ()
 
     @property
     def loss(self):
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
-
-
-def microbatch_mean(result, *, global_denominator=False):
-    """Preserve mean-of-microbatch losses; DDP averages rank gradients."""
-    import torch.distributed as dist
-
-    denominator = result.denominator.detach().clone()
-    world_size = 1
-    if global_denominator and dist.is_initialized():
-        world_size = dist.get_world_size()
-        dist.all_reduce(denominator)
-    loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios, result.sums)
 
 
 class ObjectiveModel(nn.Module):

@@ -23,6 +23,7 @@ from typing import (
     ContextManager,
     Dict,
     Iterator,
+    Literal,
     Mapping,
     Optional,
     Protocol,
@@ -67,6 +68,13 @@ class ProgramSpec:
     replay_statistics: Tuple[str, ...] = ()
     #: Whether its evaluation reports the detailed metrics.
     evaluation_diagnostics: bool = False
+    #: How the loss is normalized. "window": the update's objective is
+    #: ``sum(numerator) / sum(denominator)`` over the window's micro-batches
+    #: and the ranks. "microbatch": it is the mean over the micro-batches of
+    #: ``sum_t c_t * sum(numerator_t) / sum(denominator_t)``, the inner sums
+    #: over the ranks; the program returns the terms and the runner pools
+    #: their denominators between each forward and its backward.
+    reduction: Literal["window", "microbatch"] = "window"
 
 
 class TrainingProgram(Protocol):
@@ -103,12 +111,14 @@ class TrainingProgram(Protocol):
     ) -> "ObjectiveResult":
         """Run the objective on one placed batch.
 
-        The result's numerator and denominator are this rank's; the update's
-        objective is their sums' ratio over the window and the ranks. A
-        program that declares a replay statistic also takes ``prepass=True``,
-        which asks for this rank's sums of each statistic in
-        ``result.statistics``, and in every call the keyword arguments that
-        ``replay_arguments`` returned for it.
+        The result's numerator and denominator are this rank's; under the
+        ``window`` reduction the update's objective is their sums' ratio over
+        the window and the ranks. Under ``microbatch`` a training call also
+        returns ``result.terms``. No collective across samples is issued
+        here. A program that declares a replay statistic also takes
+        ``prepass=True``, which asks for this rank's sums of each statistic
+        in ``result.statistics``, and in every call the keyword arguments
+        that ``replay_arguments`` returned for it.
         """
 
     def replay_arguments(

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from .base import ObjectiveResult, microbatch_mean
+from .base import ObjectiveResult
 
 
 @dataclass
@@ -27,28 +27,21 @@ class PlanResult:
         """Return the sum of individually normalized, coefficient-scaled losses."""
         return sum(c * term.loss for c, term in zip(self.coefficients, self.terms))
 
-    def objective_result(self, *, global_denominator=False, normalize=False):
+    def objective_result(self, *, normalize=False, with_terms=False):
         """Convert term statistics to the trainer's scalar-result contract.
 
         Args:
-            global_denominator: All-reduce each denominator when distributed is
-                initialized, with scaling to compensate for averaged rank gradients.
-            normalize: Normalize each term now even without global synchronization.
+            normalize: Normalize each term by its own denominator on this rank,
+                even when the terms share one.
+            with_terms: Also return every term, for a runner that pools each
+                denominator over the ranks before the backward.
 
         Returns:
             ObjectiveResult retaining a shared denominator when possible, otherwise
             storing the already-normalized loss with denominator one. Metrics are
             preserved and remain the caller's responsibility to aggregate.
         """
-        if normalize or global_denominator:
-            loss = sum(
-                c * microbatch_mean(term, global_denominator=global_denominator).loss
-                for c, term in zip(self.coefficients, self.terms)
-            )
-            return ObjectiveResult(
-                loss, self.terms[0].denominator.new_ones(()), self.ratios
-            )
-        if self.shared_reduction:
+        if self.shared_reduction and not normalize:
             return ObjectiveResult(
                 sum(
                     c * term.numerator for c, term in zip(self.coefficients, self.terms)
@@ -56,9 +49,15 @@ class PlanResult:
                 self.terms[0].denominator,
                 self.ratios,
             )
-        return ObjectiveResult(
+        result = ObjectiveResult(
             self.loss, self.terms[0].denominator.new_ones(()), self.ratios
         )
+        if with_terms:
+            result.terms = tuple(
+                (c, term.numerator, term.denominator.detach())
+                for c, term in zip(self.coefficients, self.terms)
+            )
+        return result
 
 
 def combine_results(results):
