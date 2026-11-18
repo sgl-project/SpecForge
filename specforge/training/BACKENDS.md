@@ -1,6 +1,6 @@
 # Training backends: program, step runner, trainer (`specforge.training`)
 
-**Status: proposal, fifth revision.** Nothing in this note is implemented and nothing in it was
+**Status: proposal, sixth revision.** Nothing in this note is implemented and nothing in it was
 run. The design that runs today is [`DESIGN.md`](DESIGN.md); the cross-plane picture is
 [`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md). Symbols cited as "today" were read on
 `main` at `d4391211`, after the canonical training migration removed the legacy step paths. The
@@ -47,7 +47,8 @@ coverage alone justifies the work, and whether such an engine is meant to become
 This is fixed outside the training plane and a backend must fit inside it.
 
 - **Ranks are launched before any trainer code runs**, by the launcher (`torchrun`). Training is
-  SPMD: every protocol method below runs on every rank, in the same order.
+  SPMD: every protocol method below runs on every rank, in the same order, with one exception for
+  `evaluate` (see [Rank symmetry](#rank-symmetry)).
 - **The world is initialized once**, in `specforge.cli`: `init_distributed` creates the process
   groups, including the tensor- and sequence-parallel ones, and keeps them as module state in
   `specforge.distributed`; `set_seed(training.seed)` seeds every rank with the same seed. The data
@@ -129,11 +130,11 @@ class ProgramSpec:                               # pure data; recorded; availabl
     axes: Mapping[str, Literal["copy", "part", "own"]]   # model-parallel axes it communicates on
 
 class TrainingProgram(Protocol):                 # today's ObjectiveModel
-    draft: nn.Module                             # trainable; its state dict is the artifact, under canonical keys
+    draft: nn.Module                             # trainable; `draft_state` exports it under canonical keys
     frozen: tuple[nn.Module, ...]                # target tables, teacher head: never sharded or optimized
     def forward(self, tensors: Mapping[str, Tensor], ctx: StepContext) -> ObjectiveResult: ...
     def apply_statistic(self, name: str, value: Tensor) -> None: ...   # no collective; same on every rank
-    def kernel_record(self) -> Mapping[str, str]: ...                  # realised loss kernels so far
+    def kernel_record(self) -> Mapping[str, str]: ...                  # realised kernels so far
     def expect_kernels(self, record: Mapping[str, str]) -> None: ...   # on resume; checked when inputs arrive
 
 class ProgramFactory(Protocol):
@@ -160,12 +161,13 @@ class StepRunner(Protocol):
                          is_boundary: bool) -> PendingStep | None: ...   # one micro-batch
     def apply_step(self, pending: PendingStep) -> StepMetrics: ...    # consumes the handle
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> ObjectiveResult: ...   # training mode, no gradients
-    def evaluate(self, batch: TrainBatch, ctx: StepContext) -> ObjectiveResult: ...  # eval mode, no gradients
+    def evaluate(self, batch: TrainBatch, ctx: StepContext) -> ObjectiveResult: ...  # eval mode; see "Reductions"
     def reduce_sum(self, values: Tensor) -> Tensor: ...
+    def reduce_max(self, values: Tensor) -> Tensor: ...               # sizes a buffer when a rank's shard is empty
     def agree(self, error: str | None, *, value: object = None) -> None: ...   # see "Rank symmetry"
     def draft_state(self) -> dict[str, Tensor]: ...                   # full on rank 0, empty elsewhere
-    def save_resume(self, out: Path) -> None: ...
-    def load_resume(self, src: Path) -> None: ...
+    def save_resume(self, out: Path) -> ResumeRecord: ...             # this rank's record; the next `agree` compares
+    def load_resume(self, src: Path, record: ResumeRecord) -> None: ...
     def close(self) -> None: ...
 ```
 
@@ -185,19 +187,22 @@ these values and in `ProgramSpec`, so the verdict needs no model.
 | `RunSpec` | accumulation window, horizon, seed, cadences | `training.*` |
 
 - **Requested at startup, realised when the facts exist.** `Kernels` is the request, compared across
-  ranks at startup. An explicit request that cannot run is an error, never a fallback. Under auto,
-  Liger and the fused convolution are resolved at startup in `build_bundle`; the loss kernel is
-  resolved for each prediction and term group when the first real input arrives, as
-  `ExecutionSelection` does today, and may depend only on facts that are equal on every rank. The
-  realised loss kernels are recorded locally (`program.kernel_record()`), compared across ranks as
-  the `value` of `runner.agree` in the checkpoint sequence, and stored in the run record. No forward
-  issues a collective to agree on a kernel.
+  ranks at startup. An explicit request that cannot run is an error, never a fallback. Build-time
+  kernels are realised in `build_bundle`. Liger under auto follows facts that are equal on every
+  rank and raises if its package is missing. The fused convolution under auto falls back to the
+  eager kernel where it cannot run, so two ranks with the same unset request can differ when one of
+  them lacks Triton; `prepare` therefore ends by comparing the realised build-time kernels across
+  ranks. The loss kernel is resolved for each prediction and term group when the first real input
+  arrives, as `ExecutionSelection` does today, and may depend only on facts that are equal on every
+  rank. `save_resume` returns this rank's realised kernels in its `ResumeRecord`, and the `agree`
+  that follows compares the records. No forward issues a collective to agree on a kernel.
 - **An implementation variant of a component is a kernel.** It is registered next to the component
-  and selected through `Kernels`, and it carries a parity test against the reference
-  implementation. If it stores parameters differently (fused, or split along a model-parallel
-  axis), it converts to and from canonical keys in its own state-dict load and save, exactly, both
-  ways. In this design a runner does not bring its own implementation of a component; whether that
-  can hold for an engine with its own module protocol is decision 11.
+  and selected through `Kernels`, and it carries a parity test against the reference implementation.
+  If it stores parameters differently, each canonical entry of its state dict still has to be a
+  writable view of the stored parameter, or the component provides an explicit import and export. A
+  conversion hidden inside `state_dict` is not enough, because the weight plan writes through the
+  tensors that call returns. In this design a runner does not bring its own implementation of a
+  component; whether that can hold for an engine with its own module protocol is decision 11.
 - **No dtype is inferred.** A parameter or buffer that keeps a dtype of its own (an fp32 buffer
   inside a bf16 draft) is pinned by its component through `PartitionHints`, and a runner that
   cannot keep a pin refuses.
@@ -215,13 +220,18 @@ name and a delivery point. `PendingStep` is the single-use handle that the bound
 `StepMetrics` is the reduced loss, the reduced metric pairs, the pre-clip gradient norm, the
 learning rate applied and the pooled `after_step` statistics; metrics keep both the ratio pairs and
 the raw sums a program reports. `Supported` carries the numerics class; `Unsupported` carries the
-reason.
+reason. `ResumeRecord` is what a runner returns from `save_resume` and takes back in `load_resume`:
+the runner's name and version and the realised kernels, build-time and loss. The run loop passes it
+as the `value` of the next `agree`, which is where a difference between ranks raises, and stores it
+in the run record.
 
 ### The window
 
-One optimizer update consumes a window of `ctx.accumulation_steps` micro-batches. **The frame is the
-only part that walks it.** It takes micro-batches one at a time from a single-pass stream and hands
-each to the runner as soon as it arrives:
+One optimizer update consumes a window: a lazy, non-empty stream of at most `ctx.accumulation_steps`
+micro-batches that the run loop forms across epoch boundaries, so accumulation does not restart at
+an epoch. Three batches per epoch, two epochs and an accumulation of two give three updates. **The
+frame is the only part that walks a window.** It takes micro-batches one at a time and hands each to
+the runner as soon as it arrives:
 
 ```python
 def run_window(runner, window: Iterator[TrainBatch], ctx) -> StepMetrics:   # the frame, shared by every runner
@@ -243,9 +253,9 @@ This is the path without a `replay` statistic; [Step statistics](#step-statistic
 - **Only a program that declares a `replay` statistic pays for buffering.** The frame then keeps
   host copies of the window's inputs, as `CanonicalTrainStrategy` and
   `TrainerCore._prepare_and_replay` do today.
-- **A short window is an error.** If the stream ends inside a window the frame raises and the run
-  loop stops, as `TrainerController` does today: no partial step is applied and nothing is
-  committed.
+- **A short window is an error.** A window is short only when the whole training stream ends inside
+  it, never at an epoch boundary. The frame then raises and the run loop stops, as
+  `TrainerController` does today: no partial step is applied and nothing is committed.
 - **The boundary call returns the handle.** `forward_backward` returns `None` until `is_boundary`,
   then the `PendingStep` that `apply_step` consumes. The run loop commits the window's samples after
   `apply_step` returns.
@@ -283,6 +293,16 @@ wrapper averages over ranks, and the gradients are rescaled by world size x accu
 denominator. Under `microbatch`, the denominator is reduced before the backward and the later
 rescale is by one. How a runner gets there (averaging or summing across ranks, where it divides) is
 its own business. The formula does not fix rounding: see [Numerics classes](#numerics-classes).
+
+**Evaluation is reduced differently.** `evaluate` returns the result as the program computes it
+outside training: a `microbatch` program normalises each term on its own rank and returns a
+denominator of one, and no reduction happens inside the call. The evaluator sums numerators and
+denominators over the pass and pools them once at the end through `reduce_sum`, with one
+`reduce_max` over the per-position length so that a rank with an empty shard can size its buffer, as
+`Evaluator.run` does today. Applying a training reduction would change results: with two ranks
+holding 1/1 and 0/9, today's DSpark evaluation loss is 0.5 and the training rule gives 0.1, which
+moves `eval/avg_loss`. A rank may hold fewer evaluation batches than another, or none, whenever the
+wrapper's forward is not itself a collective.
 
 ### Step statistics
 
@@ -365,25 +385,28 @@ performs the per-sequence reduction (`training/sequence_parallel.py`). Passing t
 
 ### Rank symmetry
 
-Every method runs on every rank in the same order. Collectives and failure handling:
+Every method runs on every rank in the same order; `evaluate` is the one exception, in its row.
+Collectives and failure handling:
 
 | Method | Collective | A rank-local failure |
 |---|---|---|
 | `supports` | no; pure, and the verdicts are compared across ranks at startup together with the resolved values | a disagreement stops the run before `prepare` |
-| `prepare` | yes | raises on that rank before the first collective of the step path; the launcher tears the world down |
+| `prepare` | yes; it ends with one `agree` on the realised build-time kernels | a build failure raises on that rank and the launcher tears the world down; a kernel difference raises on every rank through the closing `agree` |
 | `forward_backward` | yes in every multi-rank run: gradient synchronisation and the reductions; every rank receives the same number of batches | raises on that rank and the launcher tears the world down; a failure inside a step is not agreed, as today |
-| `prepass`, `evaluate` | yes under sharding or with a model-parallel axis; every rank receives the same number of batches | as for `forward_backward` |
-| `reduce_sum`, `apply_step` | yes | a check on a reduced value reaches the same verdict on every rank, so all ranks raise together; any other failure raises on that rank and the launcher tears the world down |
+| `prepass` | yes under sharding or with a model-parallel axis; every rank receives the same number of batches | as for `forward_backward` |
+| `evaluate` | only when the wrapper's forward is one (sharding, or a model-parallel axis); otherwise ranks may hold different numbers of evaluation batches, or none | as for `forward_backward` |
+| `reduce_sum`, `reduce_max`, `apply_step` | yes | a check on a reduced value reaches the same verdict on every rank, so all ranks raise together; any other failure raises on that rank and the launcher tears the world down |
 | `draft_state`, `save_resume`, `load_resume` | yes | reported through `agree`, never raised between two collectives |
 | `agree` | yes: one gather of an error string and an optional value per rank | raises on every rank if any rank reported an error or the values differ |
 | `close` | no | — |
 
 `draft_state()` is legal only between `apply_step` and the next `forward_backward`.
 
-**`agree` is never called inside a step.** It runs in the checkpoint sequence and after
-`load_resume`, where `CheckpointManager._all_ok` runs today. A step adds no gather and no host
-read: its checks (the loss denominator, a finite gradient norm) use values that are already
-reduced, in the single host read `BF16Optimizer` makes today.
+**`agree` is never called inside a step.** It runs at the end of `prepare`, in the checkpoint
+sequence and after `load_resume`; today `CheckpointManager._all_ok` is the call in the checkpoint
+sequence, and `read_resume_state` gathers once on resume. A step adds no gather and no host read:
+its checks (the loss denominator, a finite gradient norm) use values that are already reduced, in
+the single host read `BF16Optimizer` makes today.
 
 ### What each part owns
 
@@ -414,10 +437,13 @@ after materialising: the plan already writes rank-local slices into sharded and 
 placements and refuses meta tensors, so no layout passes from the runner to the factory. Whatever a
 runner does to storage after `load` has to keep the bindings, or the first forward finds an unbound
 head. The separate teacher head is outside the plan's rank-local path; it is a frozen table and
-never sharded (statement 5), so a full read stays correct. Fused or model-parallel storage is the
-component's, converted in its own state-dict load and save, so `load` and `draft_state` both speak
-canonical keys. Random initialization happens at construction; an engine that constructs on a meta
-device has to run it after materialising, and the prototype in step 2 has to show that.
+never sharded (statement 5), so a full read stays correct. The plan copies into the tensors the
+draft's `state_dict` returns, so each canonical entry has to be a writable view of the stored
+parameter. A component that rearranges data for its canonical form would return a temporary copy,
+and the load would silently change nothing; such a layout needs an explicit import, and the plan has
+to refuse it until it has one. `load` and `draft_state` both speak canonical keys. Random
+initialization happens at construction; an engine that constructs on a meta device has to run it
+after materialising, and the prototype in step 2 has to show that.
 
 ### Checkpoints
 
@@ -427,24 +453,30 @@ A checkpoint has three parts and one commit point.
 |---|---|---|---|
 | Resume state | everything needed to continue: every draft parameter and buffer as the runner stores them, optimizer and scheduler state, RNG | `runner.save_resume`, every rank | the same runner under the same `Topology` |
 | Artifact | the canonical draft directory, under canonical keys: a view derived from the resume state at the draft's declared dtype | rank 0, from `runner.draft_state()` | export, SGLang conversion, `initialization.checkpoint`, the conformance kit |
-| Run record | step, epoch, samples consumed, the requested `Kernels` and the realised kernel selection, `PrecisionSpec` and `Topology`, the per-key resume contract and model provenance compared today, runner name and version | rank 0, **last** | the run loop on resume |
+| Run record | step, epoch, samples consumed, the requested `Kernels`, the runner's `ResumeRecord` with the realised kernels, `PrecisionSpec` and `Topology`, the per-key resume contract and model provenance compared today, without the kernel keys, which move into the record | rank 0, **last** | the run loop on resume |
 
 Sequence, on every rank: flush sample commits up to this step → `draft_state()` → rank 0 writes the
-artifact → `save_resume()` → `agree(errors)` → rank 0 writes the run record → rank 0 moves the
-`latest` link. A checkpoint exists if and only if its run record exists. A checkpoint is never ahead
-of its durable commit, as today (`TrainerController.save_checkpoint`), and online resume keeps
-requiring the ledger marker to equal the checkpoint step. The same `agree` carries
-`program.kernel_record()` as its value and so compares the realised loss kernels across ranks,
-where `CanonicalTrainStrategy.before_checkpoint` calls `ExecutionSelection.agree` today.
+artifact → `save_resume()`, which returns this rank's record → `agree(errors, value=record)` → rank
+0 writes the run record atomically, with the record inside → `agree` again, so every rank sees a
+failed write → rank 0 moves the `latest` link. A checkpoint exists if and only if its run record
+exists. A checkpoint is never ahead of its durable commit, as today
+(`TrainerController.save_checkpoint`), and online resume keeps requiring the ledger marker to equal
+the checkpoint step. The run loop never reaches into the program: the runner reads the realised
+kernels and returns them in its record, and the first `agree` is where a difference between ranks
+raises, as `ExecutionSelection.agree` does from `CanonicalTrainStrategy.before_checkpoint` today. A
+rank-local failure of `draft_state` or `save_resume` is caught and passed to that `agree` as its
+error. Today's save agrees once and then moves the link (`CheckpointManager.save`); the second
+agreement is new.
 
 The resume state is the truth for continuing; the artifact is derived. The step counter has one
 owner, the run loop; a runner whose engine keeps its own counter takes it from the run record.
 Resuming with a different runner, `Topology` or `PrecisionSpec`, or with an explicit kernel request
-that contradicts the record, is refused, naming both values. An unset request adopts the
-recorded request, as `adopt_recorded_execution` does today; the realised loss kernels are then
-checked against the record when real inputs arrive (`program.expect_kernels`), and a mismatch
-raises. Starting from the artifact always works and
-restarts the optimizer.
+that contradicts the record, is refused, naming both values. An unset request adopts the recorded
+request, as `adopt_recorded_execution` does today; the runner receives the record in `load_resume`
+and owns both checks: the build-time kernels it realised in `prepare` against the record at once,
+and the loss kernels when real inputs arrive (`program.expect_kernels`). A mismatch raises, as the
+per-key comparison in `Trainer` does today. Starting from the artifact always works and restarts the
+optimizer.
 
 ### Numerics classes
 
@@ -487,7 +519,7 @@ selected.
 | attributes set on the model after construction | declarations on `ProgramSpec` and the fields of `PrecisionSpec` |
 | getters of `specforge.distributed` read by layers, data utilities, the trainer and `sequence_parallel.py` | `Topology` as a value; groups passed by the runner to `build` |
 | `microbatch_mean` and the DSpine replay calling `torch.distributed` | the declared reductions and the frame's prepass |
-| `CheckpointManager._all_ok`, and `ExecutionSelection.agree` called from `before_checkpoint` | `runner.agree` |
+| `CheckpointManager._all_ok`, and `ExecutionSelection.agree` called from `before_checkpoint` | `runner.agree`, with the runner's `ResumeRecord` as its value |
 
 What the current backend provides implicitly, and a new runner must provide or refuse: `no_sync`
 around forward and backward for DDP, backward only for FSDP; the loss-denominator check folded into
@@ -550,16 +582,19 @@ What is fixed now, because it comes from the other planes:
   first-update check and the end-to-end band.
 - **Protocol, by a fake stream.** A consume-once stream with a recording ledger checks what a
   recording cannot: commit order across ranks, no commit for an incomplete window, commits flushed
-  before a checkpoint, the run record written last.
+  before a checkpoint, the run record written last. It also pins the window: three batches per
+  epoch, two epochs and an accumulation of two must give three updates.
 - **The kit must be able to fail.** Three mutations of the reference are part of it and each must be
   caught: gradients scaled by the world size, clipping skipped, the LR schedule shifted by one step.
 - **One case per declaration, not per recipe.** A runner is exercised with one job for each thing it
   claims in `supports()`: each reduction, each statistic delivery, each model-parallel axis. A
   recipe is a combination of these, so new drafts and losses need no new runner tests.
 - **Sequence parallelism is in the first version.** An EAGLE3 job with data-parallel and
-  sequence-parallel sizes above one, accumulation above one and an LK loss, so that the
-  per-sequence reduction runs, must reproduce its stored trajectory: loss, gradients and the step
-  at which the optimizer moves. It needs `flash_attn`, so it is a GPU recording.
+  sequence-parallel sizes above one, accumulation above one and an LK loss, so that the per-sequence
+  reduction runs, must reproduce its stored trajectory: loss, gradients and the step at which the
+  optimizer moves. It needs `flash_attn`, so it is a GPU recording.
+- **Evaluation is pinned separately.** A two-rank case with unequal denominators and one with an
+  empty evaluation shard must reproduce today's `eval/avg_loss`.
 - **End metric.** The repository's evaluator reports a teacher-forced proxy for acceptance length.
   Serving acceptance length, measured through SGLang, is the metric for a default change.
 
@@ -585,7 +620,7 @@ Prerequisite, met on `main` at `d4391211`: one step path. The legacy strategies 
 |---|---|---|---|
 | 0 | Measure where step time goes on one recipe per family: data wait, forward, loss, backward, optimizer | measurement | a table in this note; it settles the throughput argument for the remaining steps, and decision 9 settles the coverage argument |
 | 1 | Record the reference: trajectories of the DDP / FSDP path through the CLI at every world size the bundled recipes use, holding parameter updates, optimizer and RNG state and the data position as well as losses, with the sequence-parallel case included | tests | a second recording reproduces the first bitwise |
-| 2 | A prototype: one canonical draft under torchtitan at the chosen revision and torch build, through initialization, one update, export and resume | measurement | a go or no-go with the adapter's size and throughput, whether one generic adapter meets its `Module` protocol, and what the prototype makes the contract change |
+| 2 | A prototype: one canonical draft under torchtitan at the chosen revision and torch build, through initialization, one update, export and resume | measurement | a go or no-go with the adapter's size and throughput, whether one generic adapter meets its `Module` protocol, a load of asymmetric weights followed by a forward, and what the prototype makes the contract change |
 | 3 | The minimal runner: `run_window` as the frame and `StepRunner` over today's backend; `ProgramSpec` derived from the objective registry; declarations replace attributes set after construction; `factory.load`; groups passed to `build` | behaviour-preserving | stored trajectories, bitwise, per topology |
 | 4 | `Kernels`, `PrecisionSpec` and `Topology` resolved once and compared across ranks; kernel agreement through `runner.agree`; `application` as the only composition root for training | behaviour-preserving | stored trajectories; the import scan |
 | 5 | Conformance kit: replay, fake stream, mutations | tests | the three mutations fail |
