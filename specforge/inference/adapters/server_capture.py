@@ -401,7 +401,7 @@ class SGLangServerCaptureAdapter:
             feature_keys=(dict(result["physical_keys"]) if result.get("publication_ownership") == "attempt-v1" else {n: f"{sample_id}/{n}" for n in specs}),
             feature_specs=specs,
             strategy=self.strategy,
-            schema_version=(2 if result.get("feature_layout") == "hs-manifest-v1" else SCHEMA_VERSION),
+            schema_version={"hs-manifest-v1":2,"hs-prefix-v2":3}.get(result.get("feature_layout"), SCHEMA_VERSION),
             target_model_version=self.target_model_version,
             tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
             num_tokens=num_tokens,
@@ -424,10 +424,14 @@ class SGLangServerCaptureAdapter:
                 ),
             },
         )
-        if result.get('feature_layout') == 'hs-manifest-v1':
+        if result.get('feature_layout') in ('hs-manifest-v1', 'hs-prefix-v2'):
             from specforge.runtime.data_plane.segment_manifest import validate_manifest
             ref.metadata['feature_layout'] = result['feature_layout']
             ref.metadata['segment_manifest'] = validate_manifest(result['segment_manifest'], specs, num_tokens)
+            if result['feature_layout'] == 'hs-prefix-v2':
+                manifest = ref.metadata['segment_manifest']
+                if any(result.get(k) != manifest[k] for k in ('H','L','N')):
+                    raise CaptureMismatchError('committed H/L/N differs from published range')
             ref.metadata['full_object_fallback'] = bool(result.get('full_object_fallback'))
         if result.get("protocol_version") == 1:
             ref.metadata["capture_fence"] = {
@@ -495,6 +499,8 @@ class SGLangServerCaptureAdapter:
             payloads = [self._spec_capture_payload(task) for task in tasks]
             if capability is not None:
                 layout = 'hs-manifest-v1' if os.environ.get('SPECFORGE_HS_SEGMENTED', '0') == '1' else 'full-v1'
+                if layout == 'hs-manifest-v1' and os.environ.get('SPECFORGE_HS_H_PREFIX') == '1':
+                    layout = 'hs-prefix-v2'
                 if layout not in capability.get('feature_layouts', ['full-v1']):
                     raise RuntimeError('capture feature layout capability mismatch')
                 for payload in payloads:

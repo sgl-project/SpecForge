@@ -438,7 +438,7 @@ class ReceiveBufferPool:
                 )
         return _PoolSlot(storage, registered)
 
-    def acquire(self, nbytes: int, device) -> Tuple[_PoolSlot, bool]:
+    def acquire(self, nbytes: int, device, *, allow_overflow=True) -> Tuple[_PoolSlot, bool]:
         """Return ``(slot, pooled)``; ``pooled`` False means a one-off buffer."""
         target = self._device_for(device)
         with self._lock:
@@ -458,6 +458,8 @@ class ReceiveBufferPool:
                 self.stats["hits"] += 1
                 return best, True
             pooled = self._allocated_bytes + nbytes <= self.max_bytes
+            if not pooled and not allow_overflow:
+                raise MemoryError("private tail exceeds available registered receive budget")
             # Serialize registration and account only for successful allocations.
             slot = self._new_slot(nbytes, target)
             self._active.append(slot)
@@ -647,6 +649,8 @@ class MooncakeFeatureStore(FeatureStore):
         self._segment_receipt_seen = set()
         self._segment_counters = dict.fromkeys(('segment_get_bytes', 'segment_get_objects',
             'segment_materialized_features', 'node_pool_staging_copy_bytes',
+            'prefix_get_calls', 'prefix_get_bytes', 'tail_get_calls', 'tail_get_bytes',
+            'prefix_fill_bytes', 'tail_receive_staging_bytes',
             'transport_get_requested_bytes', 'transport_get_completed_bytes',
             'receive_to_pageable_copy_bytes', 'manifest_ack_puts', 'manifest_receipt_drains'), 0)
         self._diagnostics = get_diagnostics()
@@ -967,18 +971,18 @@ class MooncakeFeatureStore(FeatureStore):
     def _capture_from_ref(self, ref, *, validate_remote=False):
         wire = ref.metadata.get("capture_fence")
         layout = ref.metadata.get('feature_layout', 'full-v1')
-        if layout not in ('full-v1', 'hs-manifest-v1'):
+        if layout not in ('full-v1', 'hs-manifest-v1', 'hs-prefix-v2'):
             raise ValueError('unknown capture feature layout')
-        if layout == 'hs-manifest-v1':
+        if layout in ('hs-manifest-v1', 'hs-prefix-v2'):
             if not os.environ.get('SPECFORGE_TRAINER_NODE_POOL_DIR'):
                 raise ValueError('segmented clients require NODE_POOL_DIR as their shared terminal-proof anchor, even with caching disabled')
             from specforge.runtime.data_plane.segment_manifest import validate_manifest
-            if ref.schema_version != 2 or wire is None or wire.get('feature_layout') != layout:
+            if ref.schema_version != (3 if layout == 'hs-prefix-v2' else 2) or wire is None or wire.get('feature_layout') != layout:
                 raise ValueError('segmented capture requires explicit versioned ownership')
             if getattr(self._put_config, 'with_hard_pin', False) is not True:
                 raise RuntimeError('manifest ACK protocol requires true native hard pin')
             manifest = validate_manifest(ref.metadata['segment_manifest'], ref.feature_specs, ref.num_tokens)
-            if wire.get('segment_manifest') != manifest or manifest['token'] != wire.get('reservation_token'):
+            if manifest['layout'] != layout or wire.get('segment_manifest') != manifest or manifest['token'] != wire.get('reservation_token'):
                 raise ValueError('manifest differs from immutable ownership certificate')
         elif ref.schema_version != SCHEMA_VERSION:
             raise ValueError('unknown full capture schema version')
@@ -1008,7 +1012,7 @@ class MooncakeFeatureStore(FeatureStore):
         # A returned complete SampleRef is emitted only after writer completion.
         fence.writer_drained = True
         fence.adopted = True
-        if layout == 'hs-manifest-v1':
+        if layout in ('hs-manifest-v1', 'hs-prefix-v2'):
             with self._lock:
                 self._segment_manifests[sid] = manifest
         return fence
@@ -1024,7 +1028,7 @@ class MooncakeFeatureStore(FeatureStore):
             fence.drain(cancel=True)
             # Lost /generate responses have no SampleRef. The exact transfer
             # certificate must still seed manifest cleanup, including shared deps.
-            if fence.wire.get('feature_layout') == 'hs-manifest-v1':
+            if fence.wire.get('feature_layout') in ('hs-manifest-v1', 'hs-prefix-v2'):
                 manifest = fence.wire.get('segment_manifest')
                 from specforge.runtime.data_plane.segment_manifest import digest_manifest
                 if (not isinstance(manifest, dict) or manifest.get('token') != fence.token
@@ -1423,14 +1427,14 @@ class MooncakeFeatureStore(FeatureStore):
             if slot is not None:
                 pool.release(slot, pooled)
 
-    def _fetch_segment_source(self, key, spec):
+    def _fetch_segment_source(self, key, spec, *, private_tail=False):
         """Lease existing pinned receive storage; no per-miss pageable clone."""
         pool = self._receive_pool
         if pool is None or pool.kind != 'pinned':
             return self._fetch_tensor(key, spec, 'cpu')
         dtype = _TORCH_DTYPES[spec.dtype]
         nbytes = torch.empty((), dtype=dtype).element_size() * int(torch.Size(spec.shape).numel())
-        slot, pooled = pool.acquire(max(1, nbytes), 'cpu')
+        slot, pooled = pool.acquire(max(1, nbytes), 'cpu', allow_overflow=not private_tail)
         try:
             self._segment_counters['transport_get_requested_bytes'] += nbytes
             with self._diag.span("rdma_get_into"):
@@ -1451,6 +1455,9 @@ class MooncakeFeatureStore(FeatureStore):
         return tensor, release
 
     def _get_segments(self, ref, name, destination):
+        if self._segment_manifests[ref.sample_id].get('layout') == 'hs-prefix-v2' and (
+                self._node_pool is None or not self._node_pool.batch_enabled):
+            raise ValueError('H-prefix reads require a bounded pinned transfer window')
         if self._node_pool is not None and self._node_pool.batch_enabled:
             return self._get_segments_batched(ref, name, destination)
         from dataclasses import replace
@@ -1530,12 +1537,13 @@ class MooncakeFeatureStore(FeatureStore):
                 if size > self._node_pool.batch_limits['extent_bytes']:
                     raise ValueError('segment exceeds hard batch/fallback extent bound before native fetch')
                 oversized = segment['nbytes'] > NORMAL_BLOCK_BYTES
-                if group and (oversized or extent + size > self._node_pool.batch_limits['extent_bytes']):
+                direct = segment.get('kind') == 'tail'
+                if group and (direct or oversized or extent + size > self._node_pool.batch_limits['extent_bytes']):
                     pending = segment
                     break
                 group.append(segment)
                 extent += size
-                if oversized:
+                if direct or oversized:
                     break
             if not group:
                 break
@@ -1556,7 +1564,17 @@ class MooncakeFeatureStore(FeatureStore):
                     self._segment_counters['segment_get_bytes'] += record['segment']['nbytes']
                     self._segment_counters['segment_get_objects'] += 1
                     try:
-                        value = self._fetch_segment_source(record['segment']['key'], record['spec'])
+                        if record['segment'].get('kind') == 'tail':
+                            value = self._fetch_segment_source(record['segment']['key'], record['spec'], private_tail=True)
+                        else:
+                            value = self._fetch_segment_source(record['segment']['key'], record['spec'])
+                        kind = record['segment'].get('kind')
+                        if kind in ('tail', 'prefix'):
+                            size = record['segment']['nbytes']
+                            self._segment_counters[kind + '_get_calls'] += 1
+                            self._segment_counters[kind + '_get_bytes'] += size
+                            if kind == 'tail':
+                                self._segment_counters['tail_receive_staging_bytes'] += size
                         if isinstance(value, tuple):
                             source, release = value
                             def safe_release(*args, **kwargs):
@@ -1574,7 +1592,12 @@ class MooncakeFeatureStore(FeatureStore):
                         raise
                 record['fetch'] = fetch
                 records.append(record)
-            window = self._node_pool.acquire_many((r['segment']['logical_key'], r['segment']['nbytes'], r['fetch']) for r in records)
+            if group[0].get('kind') == 'tail':
+                from .node_pool_batch import BatchWindow
+                r = records[0]
+                window = BatchWindow(self._node_pool, [(r['segment']['logical_key'], r['segment']['nbytes'], r['fetch'])], direct_only=True)
+            else:
+                window = self._node_pool.acquire_many((r['segment']['logical_key'], r['segment']['nbytes'], r['fetch']) for r in records)
             copies_drained = False
             try:
                 with window:
@@ -1586,6 +1609,8 @@ class MooncakeFeatureStore(FeatureStore):
                             'fetched': record['fetched'], 'generation': pin.generation if pin is not None else None})
                         try:
                             if pin is not None:
+                                if record['fetched'] and record['segment'].get('kind') == 'prefix':
+                                    self._segment_counters['prefix_fill_bytes'] += record['segment']['nbytes']
                                 source = pin.tensor.view(_TORCH_DTYPES[record['spec'].dtype]).view(record['spec'].shape)
                             else:
                                 source = record['fetch']()

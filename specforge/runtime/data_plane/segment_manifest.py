@@ -13,6 +13,8 @@ from pathlib import Path
 import torch
 
 MANIFEST_LAYOUT = 'hs-manifest-v1'
+PREFIX_LAYOUT = 'hs-prefix-v2'
+TAIL_BYTES = 64 << 20
 MANIFEST_SCHEMA_VERSION = 2
 MARKER_BYTES = 32
 
@@ -21,8 +23,40 @@ def digest_manifest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+def validate_attempt(manifest, wire):
+    expected = {k:wire[k] for k in ('store_id','sample_id','gen','server_epoch','attempt_id')}
+    base = f"{wire['store_id']}/{wire['sample_id']}/g{wire['gen']}/attempt/{wire['server_epoch']}/{wire['reservation_token']}"
+    if (manifest.get('layout') != PREFIX_LAYOUT or manifest.get('attempt') != expected
+            or manifest.get('token') != wire['reservation_token']
+            or manifest.get('ack_key') != base + '/__segment_ack'
+            or manifest.get('receipt_key') != base + '/__segment_receipt'
+            or manifest.get('digest') != digest_manifest({k:v for k,v in manifest.items() if k != 'digest'})):
+        raise ValueError('manifest attempt/receipt identity mismatch')
+
+
+def _tail_logical(manifest, feature, start, end):
+    identity = [manifest['owner_epoch'], manifest['token'], feature, start, end]
+    return f"{manifest['namespace']}/{manifest['schema_signature']}/tail/{digest_manifest(identity)}"
+
+
+def _publication_segments(sample, feature, namespace, schema, token, header):
+    for block in sample.segments:
+        logical = f'{namespace}/{schema.signature}/{block.digest}/{feature.name}'
+        if not block.complete:
+            logical += '/' + token
+        yield block.start, block.end, block.features[feature.name], logical, 'prefix'
+    if header is not None:
+        start = header['H']
+        for piece in sample.tails[feature.name]:
+            end = start + piece.shape[0]
+            yield start, end, piece, _tail_logical(header, feature.name, start, end), 'tail'
+            start = end
+        if start != sample.n_tokens:
+            raise ValueError("owned tail does not cover its committed token range")
+
+
 def validate_manifest(manifest, specs, num_tokens):
-    if not isinstance(manifest, dict) or manifest.get('layout') != MANIFEST_LAYOUT:
+    if not isinstance(manifest, dict) or manifest.get('layout') not in (MANIFEST_LAYOUT, PREFIX_LAYOUT):
         raise ValueError('unknown hidden-state manifest layout')
     if not manifest.get('namespace') or not manifest.get('owner_epoch') or not manifest.get('token') or not manifest.get('schema_signature'):
         raise ValueError('manifest omitted namespace/owner/attempt identity')
@@ -35,6 +69,17 @@ def validate_manifest(manifest, specs, num_tokens):
     expected = {name for name,spec in specs.items() if len(spec.shape) == 3 and spec.dtype in ('float16','bfloat16','float32','float64')}
     if not isinstance(features, dict) or set(features) != expected:
         raise ValueError('manifest names do not match feature schema')
+    split = manifest['layout'] == PREFIX_LAYOUT
+    if split:
+        H, L, chunk = (manifest.get(k) for k in ('H','L','chunk_tokens'))
+        roles = manifest.get('feature_roles', {})
+        if set(roles) != expected or set(roles.values()) != {'aux','last_hidden'}:
+            raise ValueError('manifest feature roles mismatch')
+        if (any(type(v) is not int for v in (H,L,chunk)) or manifest.get('N') != num_tokens
+                or not 0 <= L <= H < num_tokens or chunk <= 0 or H % chunk
+                or type(manifest.get('N')) is not int or not isinstance(manifest.get('plan_digest'), str)
+                or len(manifest['plan_digest']) != 64):
+            raise ValueError('manifest committed range mismatch')
     for name, segments in features.items():
         spec = specs[name]
         if len(spec.shape) != 3 or spec.shape[:2] != (1, num_tokens):
@@ -53,6 +98,16 @@ def validate_manifest(manifest, specs, num_tokens):
                     or not segment.get('publication_generation')):
                 raise ValueError('manifest segment byte layout/identity mismatch')
             logical = segment['logical_key']
+            if split:
+                feature = manifest['feature_roles'][name]
+                if end <= H:
+                    if (segment.get('kind') != 'prefix' or end-start != chunk
+                            or len(str(segment.get('block_digest'))) != 64
+                            or logical != f"{manifest['namespace']}/{manifest['schema_signature']}/{segment.get('block_digest')}/{feature}"):
+                        raise ValueError('invalid shared prefix identity/range')
+                elif (segment.get('kind') != 'tail' or start < H or segment['nbytes'] > TAIL_BYTES
+                      or logical != _tail_logical(manifest, feature, start, end)):
+                    raise ValueError('invalid attempt-private tail identity/range')
             expected_key = 'specforge-hs-block/' + hashlib.sha256(logical.encode()).hexdigest() + '/' + segment['publication_generation']
             if (not logical.startswith(manifest['namespace'] + '/' + manifest['schema_signature'] + '/')
                     or segment['key'] != expected_key):
@@ -223,16 +278,24 @@ class RemoteManifestOwner:
             new, dependencies, features = {}, set(), {}
             tensors = {}
             full_bytes = 0
+            layout = spec.get('feature_layout', MANIFEST_LAYOUT)
+            header = None
+            if layout == PREFIX_LAYOUT:
+                H, L, chunk, plan_digest = sample.prefix_layout
+                header = dict(namespace=namespace, schema_signature=schema.signature,
+                              owner_epoch=self.epoch, token=token, N=sample.n_tokens, H=H, L=L,
+                              chunk_tokens=chunk, plan_digest=plan_digest,
+                              feature_roles={spec['features'][f.name]:f.name for f in schema.features},
+                              attempt={k:spec[k] for k in ('store_id','sample_id','gen','server_epoch','attempt_id')})
+            elif layout != MANIFEST_LAYOUT or getattr(sample, 'prefix_layout', None) is not None:
+                raise ValueError('unnegotiated segmented layout')
             for feature in schema.features:
                 name = spec['features'][feature.name]
                 descriptors = []
-                for block in sample.segments:
-                    tensor = block.features[feature.name].unsqueeze(0)
+                for start, end, rows, logical, kind in _publication_segments(sample, feature, namespace, schema, token, header):
+                    tensor = rows.unsqueeze(0)
                     nbytes = tensor.numel() * tensor.element_size()
                     full_bytes += nbytes
-                    logical = f'{namespace}/{schema.signature}/{block.digest}/{feature.name}'
-                    if not block.complete:
-                        logical += '/' + token
                     obj = self.objects.get(logical)
                     if obj is not None and obj['state'] == 'READY':
                         if int(self.store.is_exist(obj['key'])) != 1:
@@ -248,11 +311,13 @@ class RemoteManifestOwner:
                     dependencies.add(obj['key'])
                     descriptors.append({'logical_key': logical, 'key': obj['key'],
                                         'publication_generation': obj['generation'],
-                                        'start': block.start, 'end': block.end,
+                                        'start': start, 'end': end,
+                                        **({'kind':kind} if header else {}),
+                                        **({'block_digest':logical.rsplit('/',2)[1]} if header and kind == 'prefix' else {}),
                                         'shape': list(tensor.shape), 'dtype': feature.dtype,
                                         'nbytes': nbytes})
                 features[name] = descriptors
-            manifest = {'layout': MANIFEST_LAYOUT, 'namespace': namespace,
+            manifest = {**(header or {}), 'layout': layout, 'namespace': namespace,
                         'owner_epoch': self.epoch, 'token': token, 'features': features,
                         'schema_signature': schema.signature,
                         'ack_key': ack_key, 'receipt_key': receipt_key}
@@ -316,7 +381,7 @@ class RemoteManifestOwner:
             return {'sample_id': str(spec['sample_id']), 'store_id': str(spec['store_id']),
                     'gen': int(spec['gen']), 'features': result_features,
                     'aux_layer_ids': list(schema.features[0].layer_ids),
-                    'feature_layout': MANIFEST_LAYOUT, 'segment_manifest': manifest}
+                    'feature_layout': layout, 'segment_manifest': manifest}
 
     def _detach(self, token, rec):
         rec['delete'].update(rec['private'])

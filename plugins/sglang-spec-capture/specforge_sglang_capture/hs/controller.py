@@ -247,14 +247,16 @@ class CaptureController:
 
     def freeze_plan(self, execution: ExecutionIdentity, namespace: str, tokens: tuple[int, ...],
                     N: int, L: int, lease: PrefixLease,
-                    reservation: OutputReservation) -> CapturePlan:
+                    reservation: OutputReservation, *, H: int | None = None) -> CapturePlan:
         _token_tuple(tokens)
         if len(tokens) != N:
             raise CaptureContractError("plan tokens do not match N")
+        if H is not None and (type(H) is not int or not 0 <= L <= H < N or H % self.cache.chunk_tokens):
+            raise CaptureContractError("invalid committed HS coverage")
         self.cache._validate_plan_lease(lease, L, namespace, tokens)
         digest = canonical_digest(["spec-plan-v1", execution.server_epoch, execution.request_id,
                   execution.attempt_id, execution.execution_epoch, namespace, self.schema.signature,
-                  N, L, tokens])
+                  N, L, tokens] + ([] if H is None else [H]))
         with self._lock:
             rec = self._reservation(reservation)
             state = self._executions.get(execution)
@@ -264,7 +266,7 @@ class CaptureController:
             if state.plan is not None:
                 raise CaptureContractError("execution already has a frozen plan")
             plan = CapturePlan(execution, namespace, tokens, N, L, self.schema.signature,
-                               lease, reservation, digest)
+                               lease, reservation, digest, H)
             state.plan = plan
             return plan
 
@@ -635,10 +637,34 @@ class CaptureController:
             borrowed, release_prefix = self.cache.borrow_prefix_blocks(job.plan.lease, job.plan.L)
             prefix = {key.start: (key, features) for key, features in borrowed}
             complete = self.cache.block_keys(job.plan.namespace, job.plan.tokens)
-            fresh = reused = assembled = filled = 0
+            H = job.plan.H
+            tail = {}
+            if H is not None:
+                # Own the tail under the existing N-row output reservation.
+                # D2H staging is released before the sink reads this storage.
+                from specforge.runtime.data_plane.segment_manifest import TAIL_BYTES
+                for name, rows in staging.items():
+                    piece_rows = TAIL_BYTES // (rows.shape[1] * rows.element_size())
+                    if not piece_rows:
+                        raise CaptureContractError("tail row exceeds physical transfer budget")
+                    tail[name] = tuple(piece.clone(memory_format=torch.contiguous_format)
+                                       for piece in rows[H-job.plan.L:].split(piece_rows))
+
+            fresh = reused = filled = 0
+            assembled = sum(t.numel() * t.element_size() for pieces in tail.values() for t in pieces)
             for start in range(0, job.plan.N, self.cache.chunk_tokens):
                 end = min(start + self.cache.chunk_tokens, job.plan.N)
                 key = complete[start // self.cache.chunk_tokens] if end - start == self.cache.chunk_tokens else None
+                if H is not None and start >= H:
+                    if key is not None and self.cache.capacity_bytes:
+                        fill = self.cache.reserve_fill(key, job.plan.execution)
+                        if fill is not None:
+                            try:
+                                if self.cache.publish_ready(fill, {name: t[start-job.plan.L:end-job.plan.L] for name,t in staging.items()}):
+                                    filled += self.cache._chunk_bytes
+                            finally:
+                                self.cache.abort_fill(fill)
+                    continue
                 if end <= job.plan.L:
                     values = prefix[start][1]
                     reused += 1
@@ -675,13 +701,16 @@ class CaptureController:
                     raise CaptureCancelledError(job.state.reason or "execution released")
                 job.state.borrowed_release = release_prefix
                 release_prefix = None
+                if H is not None:
+                    self._segment_stats['private_tail_objects'] = self._segment_stats.get('private_tail_objects', 0) + sum(len(parts) for parts in tail.values())
                 self._segment_stats['segmented_samples'] += 1
                 self._segment_stats['segment_new_blocks'] += fresh
                 self._segment_stats['segment_reused_blocks'] += reused
                 self._segment_stats['segment_assembly_bytes'] += assembled
                 self._segment_stats['segment_cache_fill_bytes'] += filled
             sample = MaterializedSample(job.plan.execution, {}, job.plan.N,
-                        lambda: self._sample_released(job.plan.reservation), segments=blocks,
+                        lambda: self._sample_released(job.plan.reservation), segments=blocks, tails=tail,
+                        prefix_layout=(H, job.plan.L, self.cache.chunk_tokens, job.plan.plan_digest) if H is not None else None,
                         timings={**job.diagnostics, 'd2h_wait_ms': (copied-started)*1000,
                                  'assembly_ms': (perf_counter()-copied)*1000,
                                  'segment_assembly_bytes': assembled})

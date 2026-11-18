@@ -331,7 +331,7 @@ class HSCaptureRuntime:
                 "capture_namespace": self.namespace, "capture_signature": self.signature,
                 "schema": self.schema_wire, "cache_enabled": self.enabled,
                 "transport": "host", "no_oversize_fallback": True,
-                "feature_layouts": (["hs-manifest-v1"] if self.config.segmented else ["full-v1"]),
+                "feature_layouts": (["hs-manifest-v1", "hs-prefix-v2"] if self.config.segmented else ["full-v1"]),
                 "segment_hard_pin_required": self.config.segmented,
                 "support": {"nonchunked": True, "host_publication": True,
                             "causal_text_only": True, "pp_size": 1, "dp_size": 1,
@@ -351,8 +351,8 @@ class HSCaptureRuntime:
                                ("capture_signature", self.signature)):
             if spec.get(name) != expected:
                 raise CaptureContractError("capture " + name + " mismatch")
-        expected_layout = 'hs-manifest-v1' if self.config.segmented else 'full-v1'
-        if spec.get('feature_layout', 'full-v1') != expected_layout:
+        layouts = ('hs-manifest-v1', 'hs-prefix-v2') if self.config.segmented else ('full-v1',)
+        if spec.get('feature_layout', 'full-v1') not in layouts:
             raise CaptureContractError('capture feature layout was not negotiated')
         if spec.get("object_key_layout") != "attempt-v1":
             raise CaptureContractError("HS capture requires negotiated immutable attempt keys")
@@ -469,9 +469,12 @@ class HSCaptureRuntime:
         if candidate.L != lawful_prefix_len:
             raise CaptureContractError("native recovery prefix changed before commit")
         if self.writer:
+            from specforge_sglang_capture.capture import request_spec
+            split_tail = request_spec(req).get('feature_layout') == 'hs-prefix-v2'
             req._specforge_hs_plan = self.controller.freeze_plan(
                 candidate.execution, self.namespace, candidate.tokens, len(candidate.tokens),
-                lawful_prefix_len, candidate.lease, candidate.reservation)
+                lawful_prefix_len, candidate.lease, candidate.reservation,
+                H=proposal.max_prefix_len if split_tail else None)
         candidate.entry.state = "ADMITTED"
         candidate.entry.last_plan = {"N": len(candidate.tokens), "L": lawful_prefix_len,
             "H": proposal.max_prefix_len, "span": [lawful_prefix_len, len(candidate.tokens)],

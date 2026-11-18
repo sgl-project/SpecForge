@@ -38,15 +38,16 @@ class Fixture:
         self.controller = CaptureController(self.cache, schema(), 4096, 8192, 4096, segmented=True)
         self.sequence = 0
 
-    def publish(self, name, n=9, l=0, mask=1):
+    def publish(self, name, n=9, l=0, mask=1, *, h_prefix=False, suffix_values=None):
         self.sequence += 1
         execution = identity(self.sequence)
         tokens = tuple(range(n))
-        lease = self.cache.lookup_and_pin('epoch-ns', tokens, n)
+        lease = self.cache.lookup_and_pin('epoch-ns', tokens, n-1 if h_prefix else n)
+        H = lease.coverage_end if h_prefix else None
         lease = self.cache.shrink_lease(lease, l)
         reservation = self.controller.try_reserve_output(execution, n, l, n * 16)
-        plan = self.controller.freeze_plan(execution, 'epoch-ns', tokens, n, l, lease, reservation)
-        sample = self.controller.submit(plan, CapturedSpan(execution, l, n, features(n-l, l), None)).result(5)
+        plan = self.controller.freeze_plan(execution, 'epoch-ns', tokens, n, l, lease, reservation, H=H)
+        sample = self.controller.submit(plan, CapturedSpan(execution, l, n, suffix_values or features(n-l, l), None)).result(5)
         spec = {'store_id': 'run0', 'sample_id': name, 'gen': 1,
                 'server_epoch': 'epoch', 'attempt_id': 'attempt-' + name + '-' + str(self.sequence),
                 'reservation_token': 'reservation-' + name + '-' + str(self.sequence), 'object_key_layout': 'attempt-v1',
@@ -54,6 +55,8 @@ class Fixture:
                 'passthrough': [
                     {'name': 'input_ids', 'dtype': 'int64', 'shape': [1,n], 'data': list(range(n))},
                     {'name': 'loss_mask', 'dtype': 'int64', 'shape': [1,n], 'data': [mask] * n}]}
+        layout = 'hs-prefix-v2' if h_prefix else 'hs-manifest-v1'
+        spec['feature_layout'] = layout
         try:
             result = self.owner.publish(spec, sample, schema(), 'epoch-ns', sample_object_key)
         finally:
@@ -65,11 +68,11 @@ class Fixture:
         wire = {name: spec[name] for name in ('store_id','sample_id','gen','server_epoch','attempt_id','reservation_token')}
         wire.update(protocol_version=1, object_key_layout='attempt-v1', publication_ownership='attempt-v1',
                     physical_keys=keys, writer_drained=True, state='PUBLISHED',
-                    feature_layout='hs-manifest-v1', segment_manifest=result['segment_manifest'])
+                    feature_layout=layout, segment_manifest=result['segment_manifest'])
         return SampleRef(name, 'run', None, 'mooncake://run0/' + name, keys, specs, 'dflash',
-                         schema_version=2, num_tokens=n,
+                         schema_version=(3 if h_prefix else 2), num_tokens=n,
                          estimated_bytes=n * 32,
-                         metadata={'generation': 1, 'feature_layout': 'hs-manifest-v1',
+                         metadata={'generation': 1, 'feature_layout': layout,
                                    'segment_manifest': result['segment_manifest'], 'capture_fence': wire})
 
     def reader(self, **kwargs):

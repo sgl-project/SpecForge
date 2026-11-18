@@ -85,7 +85,8 @@ class _Claim:
 
 
 class BatchWindow:
-    def __init__(self, pool, requests, *, cancelled=None):
+    def __init__(self, pool, requests, *, cancelled=None, direct_only=False):
+        self.direct_only = direct_only
         self.pool, self.cancelled = pool, cancelled
         self.deadline = time.monotonic() + pool.wait_timeout
         self.id = uuid.uuid4().hex
@@ -184,9 +185,10 @@ class BatchWindow:
             self.pool._diag.count('batch_requested_blocks', len(self.order))
             self.pool._diag.count('batch_requested_extent_bytes', self.charge)
             self.observe()
-            self._admit()
-            self._fill_owned()
-            self._wait_foreign()
+            if not self.direct_only:
+                self._admit()
+                self._fill_owned()
+                self._wait_foreign()
             self.pins = [entry['pin'] for entry in self.order]
             return self
         except BaseException as exc:
@@ -414,7 +416,8 @@ class BatchWindow:
             deferred_keys = {self.order[index]['key'] for index in self.deferred}
             claims = [entry['pin'] or _Claim(self, entry) for entry in self.entries.values()
                       if entry['token'] is not None and entry['key'] not in deferred_keys]
-            self.pool.release_many(claims)
+            if claims:
+                self.pool.release_many(claims)
             self.poisoned = bool(self.external or self.deferred or self.source_releases)
             self._maybe_done()
             self.observe()

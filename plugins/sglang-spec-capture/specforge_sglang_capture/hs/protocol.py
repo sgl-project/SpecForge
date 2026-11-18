@@ -182,6 +182,7 @@ class CapturePlan:
     lease: PrefixLease
     reservation: OutputReservation
     plan_digest: str
+    H: int | None = None
 
 
 @dataclass(frozen=True)
@@ -210,11 +211,13 @@ class MaterializedSample:
     """
 
     def __init__(self, execution: ExecutionIdentity, features: Mapping[str, torch.Tensor],
-                 n_tokens: int, on_release: Callable[[], None], *, timings=None, segments=()):
+                 n_tokens: int, on_release: Callable[[], None], *, timings=None, segments=(), prefix_layout=None, tails=None):
         self.execution = execution
         self.n_tokens = n_tokens
         self.timings = MappingProxyType(dict(timings or {}))
         self._features = MappingProxyType(dict(features))
+        self.tails = MappingProxyType(dict(tails or {}))
+        self.prefix_layout = prefix_layout
         self.segments = tuple(segments)
         self._on_release = on_release
         self._lock = threading.Lock()
@@ -233,6 +236,7 @@ class MaterializedSample:
                 return
             self._released = True
             self._features = MappingProxyType({})
+            self.tails = MappingProxyType({})
             self.segments = ()
             callback, self._on_release = self._on_release, lambda: None
         callback()

@@ -108,13 +108,13 @@ class HSPluginTests(unittest.TestCase):
         self.runtimes.append(hs)
         return hs
 
-    def request(self, hs, sample="s", *, tokens=tuple(range(8)), mask=1):
+    def request(self, hs, sample="s", *, tokens=tuple(range(8)), mask=1, layout="hs-manifest-v1"):
         spec = {"store_id": "store", "sample_id": sample, "gen": 1, "replace": True,
                 "features": {"aux": "hidden_states", "last_hidden": "target"},
                 "passthrough": [{"name": "loss_mask", "data": [[mask] * len(tokens)],
                                   "shape": [1, len(tokens)], "dtype": "int64"}]}
         if hs.config.segmented:
-            spec["feature_layout"] = "hs-manifest-v1"
+            spec["feature_layout"] = layout
         digest = digest_request(tokens, spec)
         body = {"protocol_version": 1, "action": "begin", "server_epoch": hs.epoch,
                 "store_id": "store", "sample_id": sample, "gen": 1,
@@ -197,6 +197,33 @@ class HSPluginTests(unittest.TestCase):
                 self.assertFalse(backend._d)
                 hs.shutdown()
                 self.runtimes.remove(hs)
+
+    def test_committed_proposal_H_survives_shrink_into_wire_manifest(self):
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {
+            'SPECFORGE_HS_REMOTE_LEDGER_DIR':root, 'SPECFORGE_HS_REMOTE_BUDGET_BYTES':str(1<<24),
+            'SPECFORGE_HS_SEGMENT_FORCE_FULL':'0'}):
+            backend = _FakeMooncakeStore()
+            hs = self.runtime(store=backend, segmented=True)
+            self.assertIn('hs-prefix-v2', hs.capability()['feature_layouts'])
+            for i, (h, l) in enumerate([(0,0), (8,5)]):
+                req = self.request(hs, 'v2-'+str(i), tokens=tuple(range(9)), layout='hs-prefix-v2')
+                proposal,_ = self.admit(hs, req, lawful=l)
+                self.assertEqual(proposal.max_prefix_len,h)
+                self.forward(hs,[req],[9-l])
+                self.spin(hs,lambda:hs.deferred[i][1].done())
+                hs.deferred[i][1].result()
+                result = hs.capture.results[req.rid]
+                m = result['segment_manifest']
+                self.assertEqual((m['H'],m['L'],m['N'],m['layout']),(h,l,9,'hs-prefix-v2'))
+                hs.capture.sink._managed_put({m['ack_key']:torch.tensor(list(bytes.fromhex(m['digest'])),dtype=torch.uint8)})
+                owner = hs.capture.sink._manifest_owner
+                owner.progress()
+                backend.remove(m['receipt_key'])
+                owner.progress()
+                self.assertEqual(owner.health()['remote_owner_charged_bytes'],0)
+            hs.shutdown()
+            self.runtimes.remove(hs)
 
     def test_native_complete_n_rows_from_nonaligned_prefix_and_loss_mask_independent_identity(self):
         hs = self.runtime(parallel=SimpleNamespace(tp_size=1, tp_rank=0))
