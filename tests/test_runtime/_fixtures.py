@@ -107,6 +107,10 @@ class FakeProgram(torch.nn.Module):
     def host_inputs(self, tensors):
         return {}
 
+    def replay_arguments(self, replay_values):
+        """The pooled sums as they came, under ``replay_values``."""
+        return {"replay_values": dict(replay_values)} if replay_values else {}
+
     def kernel_record(self):
         return {}
 

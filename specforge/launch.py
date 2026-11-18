@@ -112,13 +112,36 @@ def _assemble_trainer(
             f"the {MODEL_PROVENANCE_CONTRACT_KEY!r} resume contract"
         )
 
+    spec = program_spec(model)
+    # The step options are recorded for resume. They used to construct the
+    # step; each still has to describe the program that trains.
+    options = dict(strategy_kwargs)
+    unknown = sorted(set(options) - {"name", "objective", "required_features"})
+    if unknown:
+        raise ValueError(
+            f"step options {unknown} configure nothing: the step reads what its "
+            "program declares"
+        )
+    if "objective" in options and options["objective"] != spec.name:
+        raise ValueError(
+            f"step option objective={options['objective']!r} does not name the "
+            f"program's objective {spec.name!r}"
+        )
+    if "required_features" in options and set(options["required_features"]) != set(
+        spec.inputs
+    ):
+        raise ValueError(
+            f"step option required_features={sorted(options['required_features'])} "
+            f"differs from the inputs the program declares, {sorted(spec.inputs)}"
+        )
+
     trainer = Trainer(
         algorithm_name=algorithm.name,
         controller=controller,
         store=store,
         ref_source=ref_source,
         model=model,
-        program_spec=program_spec(model),
+        program_spec=spec,
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,

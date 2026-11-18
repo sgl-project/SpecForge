@@ -340,6 +340,10 @@ class DataParallelRunner:
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()
+        if not self.replay_statistics:
+            # Its RNG state would be kept for a replay that never comes and
+            # handed to the next gradient pass instead.
+            raise RuntimeError("this program declares no replay statistic")
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
         self._hold_window_length(ctx, opening=not self._prepass_rng)
@@ -415,8 +419,14 @@ class DataParallelRunner:
     ) -> None:
         """One micro-batch's forward, its share of the window's totals, its backward."""
         self._train_mode()
-        # A program that declares a replay statistic takes the pooled sums.
-        replay = {"replay_values": ctx.replay_values} if self.replay_statistics else {}
+        # A program that declares a replay statistic turns the pooled sums
+        # into its forward's arguments; that arithmetic stays out of the
+        # wrapper, which may cast what passes through its forward.
+        replay = (
+            self._unwrapped.replay_arguments(ctx.replay_values)
+            if self.replay_statistics
+            else {}
+        )
         # DDP defers its gradient synchronization only when the scope encloses
         # the forward as well as the backward.
         with self.backend.accumulation_context(is_boundary=is_boundary):
@@ -474,7 +484,9 @@ class DataParallelRunner:
         # Ratios and sums are reduced as counts, in one collective.
         metrics: Dict[str, Any] = _reduce_ratio_metrics(
             window.ratio_totals,
-            device=denominator.device,
+            # Where the program computes: a metric side it built on the host
+            # would otherwise pull every other one there.
+            device=self._device(),
             process_group=self.backend.process_group,
             reduce=True,
             sums=window.sum_totals,
