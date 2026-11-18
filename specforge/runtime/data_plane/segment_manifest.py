@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from itertools import islice
 from pathlib import Path
 
 import torch
@@ -187,9 +188,24 @@ class RemoteObjectLedger:
                 raise
 
     def state(self, keys, state):
+        sql = 'UPDATE objects SET state=? WHERE key=? AND owner=?'
         with self.lock:
-            self.db.executemany('UPDATE objects SET state=? WHERE key=? AND owner=?',
-                                ((state, key, self.owner) for key in keys))
+            iterator = iter(keys)
+            while batch := tuple(islice(iterator, 64)):
+                if len(batch) == 1:
+                    self.db.execute(sql, (state, batch[0], self.owner))
+                    continue
+                self.db.execute('BEGIN IMMEDIATE')
+                try:
+                    self.db.executemany(sql, ((state, key, self.owner) for key in batch))
+                    self.db.execute('COMMIT')
+                except BaseException as primary:
+                    if self.db.in_transaction:
+                        try:
+                            self.db.execute('ROLLBACK')
+                        except BaseException as rollback:
+                            primary.add_note(f'ledger state rollback also failed: {rollback!r}')
+                    raise
 
     def forget(self, key):
         with self.lock:
