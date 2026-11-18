@@ -18,6 +18,7 @@ those, floating-point results differ in the last bits.
 
 import argparse
 import os
+import random
 import re
 import socket
 import struct
@@ -145,9 +146,19 @@ def _vary_records(features):
 
 
 def _free_port():
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+    """A free port below the range the system hands out on its own.
+
+    The port is released before the run binds it. A port the system assigned
+    could be assigned again in between, to any process that asks for one.
+    """
+    while True:
+        port = random.randrange(10000, 30000)
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:
+            try:
+                listener.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
 
 
 def _rendezvous_port(output, rank):
