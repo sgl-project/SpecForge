@@ -90,10 +90,13 @@ training entry. For a save the run loop asks the runner for its
 rank 0), this rank's own optimizer and RNG state, the optimizer state that is
 the same on every rank (DDP), and the loss kernels this rank has realised. The
 ranks compare those kernels through `runner.agree` before anything is written,
-so what rank 0 records for resume holds for every rank. All saves then delegate
-to `CheckpointManager`; the shared draft state is written by rank 0 while every
-rank writes its own optimizer/RNG state. On resume the trainer hands each
-rank's saved state back through `runner.load_resume`.
+so what rank 0 records for resume holds for every rank; a rank that failed to
+collect its state reports that through the same agreement. All saves then
+delegate to `CheckpointManager`. Rank 0 writes the shared file: the draft
+state and, under DDP, the one optimizer state every rank holds. Every rank
+writes its own file: its RNG state and, under FSDP, its shard of the optimizer
+state. On resume the trainer hands each rank's saved state back through
+`runner.load_resume` and the ranks agree that it restored.
 
 DSpine declares a replay statistic: its alignment CE is normalized over the
 whole optimizer window and every rank. For such a window the frame first calls

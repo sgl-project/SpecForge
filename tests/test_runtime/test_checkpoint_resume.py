@@ -925,10 +925,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
 
-        def runtime(model, *, objective_scale=1.0):
+        def runtime(model, *, name="eagle3"):
             allowed_missing = {"embed_tokens.weight"}
             return StepRuntimeConfig(
-                options={"objective_scale": objective_scale},
+                options={"name": name},
                 resume_contract={
                     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
                         checkpoint_key_fingerprint(
@@ -1044,9 +1044,44 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=checkpoint,
                 strategy_runtime=runtime(
                     unchanged_model,
-                    objective_scale=2.0,
+                    name="eagle3-other",
                 ),
             )
+        # An option is recorded for resume, so one that describes nothing of
+        # the program is refused before anything trains.
+        for options, message in (
+            ({"objective_scale": 2.0}, r"\['objective_scale'\] configure nothing"),
+            ({"objective": "dflash"}, "does not name the program's objective 'eagle3'"),
+            (
+                {"required_features": ("x", "teacher")},
+                r"differs from the inputs the program declares, \['x'\]",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                assemble(
+                    Composite(),
+                    output_dir=os.path.join(workdir, "refused"),
+                    max_steps=1,
+                    strategy_runtime=StepRuntimeConfig(
+                        options=options,
+                        resume_contract={},
+                        allowed_missing_checkpoint_keys=frozenset(),
+                    ),
+                )
+        described = StepRuntimeConfig(
+            options={"objective": "eagle3", "required_features": ("x",)},
+            resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        assemble(
+            Composite(),
+            output_dir=os.path.join(workdir, "described"),
+            max_steps=1,
+            strategy_runtime=described,
+        )
 
         changed_model = Composite()
         with torch.no_grad():
@@ -1099,6 +1134,47 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 feat_dir=feat_dir,
                 max_steps=2,
                 max_grad_norm=2.0,
+                resume_from=checkpoint,
+            )
+
+    def test_rank_that_cannot_restore_its_state_tells_the_others(self):
+        from specforge.training.runner import DataParallelRunner
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_agreed_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        source, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"), feat_dir=feat_dir, max_steps=1
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "source", "rz-latest"))
+        original = DataParallelRunner.agree
+        told = []
+
+        def agree(runner, error, *, value=None):
+            told.append(error)
+            return original(runner, error, value=value)
+
+        resume = dict(
+            feat_dir=feat_dir, max_steps=2, max_grad_norm=2.0, resume_from=checkpoint
+        )
+        with (
+            mock.patch.object(DataParallelRunner, "agree", agree),
+            # This rank raises what it failed with, after the agreement.
+            self.assertRaisesRegex(ValueError, "max_grad_norm=1.0 but this run has"),
+        ):
+            self._make_trainer(os.path.join(workdir, "changed"), **resume)
+        self.assertEqual(len(told), 1)
+        self.assertRegex(told[0], "^ValueError: .*max_grad_norm=1.0 but this run has")
+        # A rank that restored hears of it and raises as well.
+        told_by_peer = RuntimeError("rank 1: ValueError: wrong master shape")
+        with (
+            mock.patch.object(DataParallelRunner, "agree", side_effect=told_by_peer),
+            self.assertRaisesRegex(RuntimeError, "rank 1: ValueError"),
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "peer"),
+                feat_dir=feat_dir,
+                max_steps=2,
                 resume_from=checkpoint,
             )
 
