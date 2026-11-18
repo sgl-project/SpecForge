@@ -237,8 +237,9 @@ MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `so
 `sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
 that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
 `experts.down_proj`).
-`configs/canonical/qwen3-8b-moe-dspark.json` with its recipe trains a DSpark draft
-whose every FFN is a MoE of 8 experts with top-1 routing.
+The preset `specforge/config/draft/presets/qwen3-8b-moe-dspark.yaml` with its
+recipe trains a DSpark draft whose every FFN is a MoE of 8 experts with top-1
+routing.
 
 ### Loss execution
 
