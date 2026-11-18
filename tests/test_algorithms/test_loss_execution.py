@@ -508,6 +508,83 @@ class LossExecutionTest(unittest.TestCase):
         self.assertEqual(fallback.names, {"0:0": "reference"})
         self.assertIn("reference", logs.output[0])
 
+    def test_supplied_scalar_terms_join_the_mean_once_and_keep_chunking(self):
+        from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+        from tests.test_algorithms.test_loss_plan import run
+
+        torch.manual_seed(0)
+        hidden = torch.randn(6, 1, 4, requires_grad=True)
+        labels = torch.randint(4, (6, 1))
+        mask = torch.ones(6, 1)
+        source = torch.randn(4, requires_grad=True)  # what the regularizer reads
+        value = source.square().mean()  # one already normalized scalar
+        calls = []
+
+        def compute(calc):
+            calls.append(calc.predictions.hidden.shape[0])
+            calc.run()
+
+        plan = LossPlan(
+            (
+                LossTerm(),
+                LossTerm(
+                    name="moe/aux_loss",
+                    coefficient=0.3,
+                    loss=TokenLoss("value"),
+                    reduction="scalar",
+                ),
+            )
+        )
+        p = Predictions(
+            hidden=hidden,
+            projection=Projection(lambda x: {"logits": x}),
+            labels=labels,
+            mask=mask,
+            positions=torch.zeros_like(labels),
+            compute=compute,
+            plan=plan,
+            term_values={1: value},
+        )
+        expected = (TokenLoss("ce")(hidden, labels) * mask).sum() / mask.sum()
+        expected = expected + 0.3 * value
+        reference = torch.autograd.grad(expected, (hidden, source), retain_graph=True)
+        for reduction in ("tokens", "global_microbatch", "sum_means"):
+            for chunk in (0, 2):
+                with self.subTest(reduction=reduction, chunk=chunk):
+                    calls.clear()
+                    actual = run(p, chunk=chunk, reduction=reduction)
+                    # chunking stays on; the value is added once, not per chunk
+                    self.assertEqual(calls, [2, 2, 2] if chunk else [6])
+                    torch.testing.assert_close(actual.loss, expected)
+                    torch.testing.assert_close(
+                        actual.ratios["moe/aux_loss"][0], value.detach()
+                    )
+                    grads = torch.autograd.grad(
+                        actual.loss, (hidden, source), retain_graph=True
+                    )
+                    torch.testing.assert_close(grads, reference)
+        # a scalar term computed by the procedure still needs the whole set
+        calls.clear()
+        computed = replace(
+            p,
+            term_values={},
+            compute=lambda calc: (calc.run((0,)), calc.add(1, source.square().mean())),
+        )
+        torch.testing.assert_close(run(computed, chunk=2).loss, expected)
+        self.assertEqual(calls, [])
+        # positional terms with their own inputs stay independent reductions
+        with self.assertRaisesRegex(ValueError, "Independent term reductions"):
+            run(
+                replace(p, plan=LossPlan((LossTerm(mask=mask), plan.terms[1]))),
+                reduction="tokens",
+            )
+        with self.assertRaisesRegex(ValueError, "scalar terms"):
+            replace(p, term_values={0: value})
+        with self.assertRaisesRegex(ValueError, "normalized scalar"):
+            replace(p, term_values={1: source})
+        with self.assertRaisesRegex(ValueError, "came with the predictions"):
+            run(replace(p, compute=lambda calc: calc.add(1, value)))
+
     def test_execution_options_reject_invalid_values(self):
         for values in (
             {"chunk_size": -1},
