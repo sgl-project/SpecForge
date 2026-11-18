@@ -207,14 +207,16 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def observe_statistics(self, output, blocks) -> None:
-        """Hand this forward and its kept slots to the statistics, when there are any."""
+    def observe_statistics(self, output, keep) -> None:
+        """Hand this forward and its counted tokens to the statistics, when there are any.
+
+        ``keep`` marks the forward's tokens that count, in the routing's token
+        order (any shape that flattens to it): a block protocol's kept-block
+        tokens, a sequence protocol's supervised positions.
+        """
         if self.statistics is None:
             return
-        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
-        # Every token of a kept block went through the model; padded blocks did not.
-        keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
-        self.statistics.observe(output, keep=keep)
+        self.statistics.observe(output, keep=keep.reshape(-1))
 
     def block_predictions(self, output, blocks, batch, **options):
         """Build deferred predictions for complete algorithm proposal blocks.

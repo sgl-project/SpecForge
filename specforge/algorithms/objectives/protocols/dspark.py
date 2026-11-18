@@ -84,7 +84,7 @@ class DSparkObjective:
             predecessor_ids=blocks.predecessors.flatten(1),
             output_logits=False,
         )
-        runtime.observe_statistics(output, blocks)
+        runtime.observe_statistics(output, blocks.kept_tokens)
 
         def compute(calc):
             calc.run((0,))
