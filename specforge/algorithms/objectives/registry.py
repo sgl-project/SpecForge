@@ -55,7 +55,7 @@ class ProtocolRegistration:
     trains: tuple[str, ...]
     requires: frozenset[str] = frozenset()
     training: TrainingRequirements = TrainingRequirements()
-    legacy_strategy: str | None = None  # Preserve existing data/rendezvous identifiers.
+    runtime_name: str | None = None  # Preserve existing data/rendezvous identifiers.
     resolve_requires: Callable | None = None
 
 
@@ -73,7 +73,7 @@ def register_protocol(
     requires=(),
     default=True,
     training=TrainingRequirements(),
-    legacy_strategy=None,
+    runtime_name=None,
     resolve_requires=None,
 ):
     """Register an algorithm objective and its training requirements.
@@ -87,7 +87,7 @@ def register_protocol(
         requires: Capabilities required regardless of the selected common loss.
         default: Whether this becomes the default for the listed architectures.
         training: Data, capture and execution requirements used by composition.
-        legacy_strategy: Optional existing data/rendezvous strategy identifier.
+        runtime_name: Stable data/checkpoint identifier, when different from the objective.
 
     Returns:
         A decorator registering and returning the objective factory unchanged.
@@ -112,7 +112,7 @@ def register_protocol(
             tuple(trains),
             frozenset(requires),
             training,
-            legacy_strategy,
+            runtime_name,
             resolve_requires,
         )
         if default:

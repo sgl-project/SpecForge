@@ -56,7 +56,7 @@ def _fake_seam():
             self.w = nn.Parameter(torch.zeros(1))
 
     class Composite(nn.Module):
-        # mirrors OnlineEagle3Model's shape: the checkpointed unit is .draft_model
+        # mirrors ObjectiveModel's shape: the checkpointed unit is .draft_model
         def __init__(self):
             super().__init__()
             self.draft_model = Draft()
@@ -336,6 +336,26 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     checkpoint_extra={
                         "canonical_loss_execution": asdict(LossExecution())
                     },
+                )
+
+    def test_resume_rejects_old_loss_metadata(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            features = _write_feature_files(os.path.join(workdir, "features"), n=4)
+            out = os.path.join(workdir, "out")
+            trainer, _, _ = self._make_trainer(out, feat_dir=features, max_steps=1)
+            trainer.fit()
+            checkpoint = os.path.realpath(os.path.join(out, "rz-latest"))
+            state_path = os.path.join(checkpoint, "training_state.pt")
+            state = torch.load(state_path, weights_only=False)
+            state["canonical_loss"] = {"kind": "ce"}
+            torch.save(state, state_path)
+            with self.assertRaisesRegex(ValueError, "convert_canonical_checkpoint"):
+                self._make_trainer(
+                    out,
+                    feat_dir=features,
+                    max_steps=2,
+                    resume_from=checkpoint,
+                    checkpoint_extra={"canonical_loss": {"terms": {}}},
                 )
 
     def test_unset_fused_follows_the_checkpoint(self):
@@ -625,7 +645,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=checkpoint,
             )
 
-    def test_legacy_checkpoint_recovers_horizon_from_scheduler_state(self):
+    def test_resume_rejects_missing_schedule_horizon(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_legacy_horizon_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
         source_dir = os.path.join(workdir, "source")
@@ -642,24 +662,14 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         state.pop("effective_total_steps")
         torch.save(state, state_path)
 
-        resumed, _, _ = self._make_trainer(
-            os.path.join(workdir, "same"),
-            feat_dir=feat_dir,
-            max_steps=2,
-            total_steps=6,
-            resume_from=checkpoint,
-        )
-        self.assertEqual(resumed._controller.total_steps, 6)
-
         with self.assertRaisesRegex(
-            ValueError,
-            "effective_total_steps=6 but this run has effective_total_steps=7",
+            ValueError, "does not record effective_total_steps"
         ):
             self._make_trainer(
-                os.path.join(workdir, "changed"),
+                os.path.join(workdir, "same"),
                 feat_dir=feat_dir,
                 max_steps=2,
-                total_steps=7,
+                total_steps=6,
                 resume_from=checkpoint,
             )
 
@@ -916,6 +926,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         )
                     ),
                     MODEL_PROVENANCE_CONTRACT_KEY: (
+                        ("source_identity_format", "stat-v2"),
                         ("test_model_source", "fixture-v1"),
                     ),
                 },
@@ -1277,13 +1288,11 @@ class TestCheckpointResume(unittest.TestCase):
 
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -1293,19 +1302,10 @@ class TestCheckpointResume(unittest.TestCase):
         feat_dir = fx.write_offline_files(os.path.join(workdir, "features"), n=N)
         out_dir = os.path.join(workdir, "out")
 
-        draft_config = AutoDraftModelConfig.from_file(cfg)
-
         def build_model():
-            dm = AutoDraftModel.from_config(
-                draft_config,
-                attention_backend="flex_attention",
-                torch_dtype=torch.bfloat16,
-            ).cuda()
-            dm.load_vocab_mapping(vocab_path)
-            dm.freeze_embedding()
-            return OnlineEagle3Model(
-                dm, length=TTT, attention_backend="flex_attention"
-            ).cuda()
+            return fx.load_eagle3(
+                cfg, target_dir, vocab_path, ttt=TTT, backend="flex_attention"
+            )
 
         head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
         loader = fx.build_offline_eagle3_loader(
@@ -1327,7 +1327,7 @@ class TestCheckpointResume(unittest.TestCase):
         backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
-        strategy = Eagle3TrainStrategy(model, target_head=head)
+        strategy = build_strategy(model, target_head=head)
         core = TrainerCore(strategy, backend)
         ctrl = TrainerController(
             core, run_id="r", output_dir=out_dir, max_steps=3, num_epochs=2
@@ -1380,20 +1380,18 @@ class TestCheckpointResume(unittest.TestCase):
         self.assertIsInstance(rng["cuda"], torch.Tensor)
         self.assertIsNone(rng["npu"])
 
-        # Filter contract, checked against the LIVE trained module (not by
-        # re-applying the filter): frozen-embed keys and nothing else dropped.
+        # Canonical checkpoints retain frozen embeddings as well as trainable
+        # parameters, so reload does not depend on a separate target directory.
         trained_sd = {
             k: v.detach().cpu() for k, v in model.draft_model.state_dict().items()
         }
-        embed_keys = {k for k in trained_sd if "embed" in k.lower()}
-        self.assertTrue(embed_keys)  # the fixture freezes a real embedding
         persisted = ckpt["draft_state_dict"]
-        self.assertEqual(set(persisted), set(trained_sd) - embed_keys)
+        self.assertEqual(set(persisted), set(trained_sd))
 
         fresh = build_model()
-        missing, unexpected = fresh.draft_model.load_state_dict(persisted, strict=False)
+        missing, unexpected = fresh.draft_model.load_state_dict(persisted, strict=True)
         self.assertEqual(unexpected, [])
-        self.assertEqual(set(missing), embed_keys)
+        self.assertEqual(missing, [])
         fresh_sd = fresh.draft_model.state_dict()
         for k, v in persisted.items():
             self.assertTrue(
@@ -1412,7 +1410,7 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController, TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
+        from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
@@ -1445,7 +1443,7 @@ class TestCheckpointResume(unittest.TestCase):
                     total_steps=100,
                 )
             )
-            core = TrainerCore(Eagle3TrainStrategy(model, target_head=head), backend)
+            core = TrainerCore(build_strategy(model, target_head=head), backend)
             return model, backend, core
 
         # Reference: one uninterrupted run of TOTAL steps (loss + lr per step).

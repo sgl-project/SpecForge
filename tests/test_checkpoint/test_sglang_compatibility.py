@@ -697,7 +697,7 @@ class SGLangCompatibilityTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             save_draft(build_draft_model(serving_configs()[0]), root / "draft")
-            export_to_hf(str(root / "draft"), None, str(root / "hf"))
+            export_to_hf(str(root / "draft"), str(root / "hf"))
             hf = AutoConfig.from_pretrained(root / "hf", trust_remote_code=True)
             config = SimpleNamespace(
                 hf_config=hf,

@@ -5,6 +5,8 @@ None of them changes checkpoint parameters.
 
 import logging
 
+LIGER_REQUIREMENT = "liger-kernel>=0.8.3,<0.9"
+
 import torch
 
 from .conv.grouped_causal import GroupedCausalConv

@@ -70,17 +70,35 @@ class ExportReviewTest(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             export.assert_called_once()
             export.reset_mock()
-            result = CliRunner().invoke(cli, args + ["--embedding-source", "target"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("--target-model", result.output)
-            result = CliRunner().invoke(cli, args + ["--vocab-mapping", "map.pt"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("--vocab-mapping belongs to legacy --to", result.output)
+            # options that could only raise are not offered at all
+            for removed in (
+                ["--embedding-source", "target"],
+                ["--vocab-mapping", "mapping.pt"],
+                ["--to", "sglang"],
+            ):
+                result = CliRunner().invoke(cli, args + removed)
+                self.assertEqual(result.exit_code, 2, removed)
+                self.assertIn("No such option", result.output)
             export.assert_not_called()
-        with patch("specforge.export.legacy_sglang.export_to_sglang") as export:
-            result = CliRunner().invoke(cli, args + ["--to", "sglang"])
-            self.assertEqual(result.exit_code, 2)
-            self.assertIn("--draft-config", result.output)
+
+    def test_module_entry_points_offer_only_working_options(self):
+        from specforge.export import to_hf, to_sglang
+
+        base = ["--checkpoint", "checkpoint", "--output-dir", "out"]
+        for module, removed in (
+            (to_hf, ["--vocab-mapping", "m.pt"]),
+            (to_hf, ["--embedding-source", "target"]),
+            (to_hf, ["--embedding-key", "model.embed_tokens.weight"]),
+            (to_sglang, ["--copy-target"]),
+        ):
+            with (
+                self.subTest(module=module.__name__, option=removed[0]),
+                patch("specforge.export.model.export_draft") as export,
+                patch("sys.stderr"),
+                self.assertRaises(SystemExit) as stopped,
+            ):
+                module.main(base + removed)
+            self.assertEqual(stopped.exception.code, 2)
             export.assert_not_called()
 
     def test_sglang_cli_options_and_forwarding(self):
@@ -88,8 +106,10 @@ class ExportReviewTest(unittest.TestCase):
         with patch("specforge.export.model.export_draft") as export:
             for options, error in (
                 (["--copy-target"], "requires native export"),
-                (["--converter", "sglang", "--to", "hf"], "mutually exclusive"),
-                (["--to", "hf", "--copy-target"], "cannot be combined"),
+                (["--converter", "sglang", "--copy-target"], "requires native export"),
+                (["--draft-config", "old.json"], "No such option"),
+                (["--converter", "sglang", "--to", "hf"], "No such option"),
+                (["--to", "hf", "--copy-target"], "No such option"),
             ):
                 result = CliRunner().invoke(cli, args + options)
                 self.assertEqual(result.exit_code, 2, result.output)
@@ -101,21 +121,16 @@ class ExportReviewTest(unittest.TestCase):
                 + [
                     "--converter",
                     "sglang",
-                    "--draft-config",
-                    "old.json",
                     "--target-model",
                     "target",
-                    "--copy-target",
                 ],
             )
             self.assertEqual(result.exit_code, 0, result.output)
             export.assert_called_once_with(
                 "checkpoint",
-                "old.json",
                 "out",
-                vocab_mapping_path=None,
                 target_model="target",
-                copy_target=True,
+                copy_target=False,
                 export_mode=None,
                 converter="sglang",
             )

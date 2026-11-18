@@ -16,7 +16,6 @@ overrides both re-validate through the same schema.
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -27,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
-from .removed_fields import reject_removed_loss_fields
+from .removed_fields import reject_removed_fields, reject_removed_loss_fields
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
@@ -264,19 +263,14 @@ class StrictConfigModel(BaseModel):
 
 
 class ModelConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("model", value)
+        return value
+
     target_model_path: str
-    #: Draft config as a local JSON file, a directory containing config.json,
-    #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
-    #: from the target when omitted.
-    draft_model_config: Optional[str] = None
-    #: Load draft weights only. Unlike training.resume_from, this never restores
-    #: optimizer/scheduler state, counters, data position, or RNG state.
-    draft_checkpoint_path: Optional[str] = None
-    #: Optional architecture override. Auto-generated defaults preserve the
-    #: former trainers: EAGLE3=1, P-EAGLE=4, DFlash=1.
-    draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
-    #: Optional DFlash block-size override (auto-generated default: 16).
-    draft_block_size: Optional[int] = Field(default=None, gt=0)
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.
@@ -289,11 +283,11 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
-    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
-    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
-    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
-    #: that cannot be imported are an error in both the auto and explicit cases.
+    #: Liger kernels for RMSNorm and SwiGLU. ``None`` (auto) uses them on a
+    #: CUDA/ROCm trainer when the objective declares ``liger_by_default`` and
+    #: the draft's dense FFNs use silu/swish; ``true`` uses them for any
+    #: objective and fails when the trainer device or the activation cannot
+    #: run them; ``false`` keeps the PyTorch modules.
     use_liger_kernel: Optional[bool] = None
     #: Triton kernel for grouped causal convolutions (DFlash2). ``None`` (auto)
     #: uses it when the draft has such a convolution and the trainer supports
@@ -306,13 +300,10 @@ class ModelConfig(StrictConfigModel):
     vocab_mapping_path: str = ""
     #: copy the frozen target embedding into the draft before training.
     load_target_embedding: bool = True
-    #: aux hidden-state layer ids to capture (None = backend defaults).
-    aux_hidden_state_layer_ids: Optional[List[int]] = None
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     cache_dir: Optional[str] = None
     #: DFlash-family and P-EAGLE mask token. ``None`` resolves it from the
     #: draft config, then the target tokenizer.
-    mask_token_id: Optional[int] = None
     #: Explicit tokenizer padding ID for released targets whose tokenizer
     #: metadata omits it or whose padding row is outside the unpadded vocab.
     tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
@@ -431,7 +422,7 @@ class DataConfig(StrictConfigModel):
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
     #: Ordered background feature-loader workers. ``None`` uses the shared
-    #: default (4) for canonical runs, or the provider default for legacy runs.
+    #: default (4) when unspecified.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -984,11 +975,17 @@ class WeightsFromConfig(StrictConfigModel):
 
 
 class InitializationConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("initialization", value)
+        return value
+
     checkpoint: Optional[str] = None
     weights_from: Optional[WeightsFromConfig] = None
     from_target: Optional[dict] = None
     adapter: Optional[str] = None
-    legacy_config: Optional[str] = None
 
     @model_validator(mode="after")
     def _exclusive_sources(self):
@@ -998,8 +995,6 @@ class InitializationConfig(StrictConfigModel):
             )
         if self.adapter and not self.checkpoint:
             raise ValueError("adapter requires initialization.checkpoint")
-        if self.legacy_config and not (self.checkpoint or self.weights_from):
-            raise ValueError("legacy_config requires a checkpoint source")
         return self
 
 
@@ -1041,7 +1036,6 @@ class TrainingConfig(StrictConfigModel):
     weighting: Optional[dict] = None
     frozen: List[str] = Field(default_factory=list)
 
-    strategy: str = "eagle3"
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -1056,7 +1050,6 @@ class TrainingConfig(StrictConfigModel):
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
-    ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
@@ -1066,29 +1059,6 @@ class TrainingConfig(StrictConfigModel):
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
-    #: DFlash-family objective/model knobs.
-    num_anchors: int = Field(default=512, gt=0)
-    #: Fraction of optimizer steps that train only the DFlash2 base objective.
-    dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Fraction of optimizer steps used to ramp the selector weight to its target.
-    dflash2_selector_ramp_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Stop selector gradients at the unary/backbone boundary while preserving
-    #: the primary DFlash/D-PACE/LK gradient path.
-    dflash2_selector_stop_gradient: bool = False
-    #: Online DFlash/DFlash2 only: capture the target's final hidden state for
-    #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
-    #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
-    #: objective never reads it; ``false`` stops the capture server from
-    #: writing it and the trainer from fetching it (one ``hidden_size`` row per
-    #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
-    dflash_teacher_metrics: bool = True
-    lambda_base_start: float = 1.0
-    lambda_base_decay_ratio: float = 0.5
-    #: P-EAGLE COD sampling/model knobs.
-    num_depths: int = Field(default=8, gt=0)
-    down_sample_ratio: float = 0.8
-    down_sample_ratio_min: float = 0.2
-    norm_before_residual: Optional[bool] = None
     save_interval: int = Field(default=0, ge=0)
     #: Run a full evaluation pass every N optimizer steps (0 = disabled).
     eval_interval: int = Field(default=0, ge=0)
@@ -1108,9 +1078,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _reject_removed_loss_fields(cls, value):
+    def _reject_removed_fields(cls, value):
         if isinstance(value, dict):
             reject_removed_loss_fields(value)
+            reject_removed_fields("training", value)
         return value
 
     @field_validator("loss")
@@ -1120,13 +1091,6 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
-        if not 0.0 < self.down_sample_ratio <= 1.0:
-            raise ValueError("training.down_sample_ratio must be in (0, 1]")
-        if not 0.0 < self.down_sample_ratio_min <= self.down_sample_ratio:
-            raise ValueError(
-                "training.down_sample_ratio_min must be in "
-                "(0, training.down_sample_ratio]"
-            )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:
@@ -1143,72 +1107,6 @@ class TrainingConfig(StrictConfigModel):
                 "training.attention_backend=usp"
             )
         return self
-
-
-def migrate_legacy_config(values: dict) -> dict:
-    """Translate legacy deployment keys before constructing the domain config.
-
-    Compatibility exists only at this raw loader boundary. The returned domain
-    model never projects canonical deployment state back into ``training``.
-    """
-
-    if not isinstance(values, dict):
-        return values
-    raw = copy.deepcopy(values)
-    training = raw.get("training")
-    if not isinstance(training, dict):
-        return raw
-
-    has_legacy_mode = "deployment_mode" in training
-    has_legacy_urls = "server_urls" in training
-    has_legacy_database = "metadata_db_path" in training
-    if not (has_legacy_mode or has_legacy_urls or has_legacy_database):
-        return raw
-
-    legacy_mode = training.pop("deployment_mode", None)
-    legacy_urls = training.pop("server_urls", None)
-    legacy_database = training.pop("metadata_db_path", None)
-    deployment = raw.setdefault("deployment", {})
-    if not isinstance(deployment, dict):
-        return raw
-
-    canonical_mode = deployment.get("mode")
-    if legacy_mode is not None:
-        if canonical_mode is not None and canonical_mode != legacy_mode:
-            raise ValueError(
-                "deployment.mode conflicts with legacy training.deployment_mode"
-            )
-        deployment["mode"] = legacy_mode
-    elif canonical_mode is None and (legacy_urls or legacy_database):
-        deployment["mode"] = "disaggregated"
-
-    if legacy_urls is not None or legacy_database is not None:
-        disaggregated = deployment.setdefault("disaggregated", {})
-        if not isinstance(disaggregated, dict):
-            return raw
-        if legacy_urls is not None:
-            canonical_urls = disaggregated.get("server_urls")
-            if canonical_urls is not None and canonical_urls != legacy_urls:
-                raise ValueError(
-                    "deployment.disaggregated.server_urls conflicts with legacy "
-                    "training.server_urls"
-                )
-            disaggregated["server_urls"] = legacy_urls
-        if legacy_database:
-            if os.path.basename(legacy_database) != "consumer.sqlite":
-                raise ValueError(
-                    "legacy training.metadata_db_path must end in consumer.sqlite; "
-                    "use deployment.disaggregated.consumer_state_dir instead"
-                )
-            state_dir = os.path.dirname(legacy_database) or "."
-            canonical_state_dir = disaggregated.get("consumer_state_dir")
-            if canonical_state_dir is not None and canonical_state_dir != state_dir:
-                raise ValueError(
-                    "deployment.disaggregated.consumer_state_dir conflicts with "
-                    "legacy training.metadata_db_path"
-                )
-            disaggregated["consumer_state_dir"] = state_dir
-    return raw
 
 
 class Config(StrictConfigModel):
@@ -1243,47 +1141,20 @@ class Config(StrictConfigModel):
     def resume_path(self) -> Optional[str]:
         return self.resume or self.training.resume_from
 
-    def validate_legacy_training_options(self):
-        """Reject canonical-only options after the loading path is resolved."""
-        if (
-            self.training.objective
-            or self.training.objective_options
-            or self.training.frozen
-            or self.model.use_fused_conv is True
-        ):
-            raise ValueError(
-                "objective/options/frozen/use_fused_conv "
-                "require the canonical draft loading path"
-            )
-
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
         if self.resume:
             if self.training.resume_from and self.training.resume_from != self.resume:
                 raise ValueError("resume and training.resume_from disagree")
-        canonical = (
-            self.draft is not None
-            or self.initialization is not None
-            or self.resume is not None
-        )
-        if canonical:
-            if self.model.draft_model_config or self.model.draft_checkpoint_path:
-                raise ValueError(
-                    "draft/initialization/resume cannot mix with legacy model.draft_* sources"
-                )
-            if self.initialization is not None and self.resume_path:
-                raise ValueError("initialization and resume are mutually exclusive")
-            if self.draft is None and not (
-                self.resume
-                or self.resume_path
-                or (self.initialization and self.initialization.checkpoint)
-            ):
-                raise ValueError(
-                    "scratch/weights_from/from_target requires draft structure"
-                )
-        elif not self.resume_path:
-            self.validate_legacy_training_options()
+        if self.initialization is not None and self.resume_path:
+            raise ValueError("initialization and resume are mutually exclusive")
+        if self.draft is None and not (
+            self.resume_path or (self.initialization and self.initialization.checkpoint)
+        ):
+            raise ValueError(
+                "Training requires draft, initialization.checkpoint or resume"
+            )
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
@@ -1332,14 +1203,6 @@ class Config(StrictConfigModel):
                 "training.role=auto, producer, or consumer"
             )
 
-        if (
-            self.model.draft_checkpoint_path is not None
-            and self.resume_path is not None
-        ):
-            raise ValueError(
-                "model.draft_checkpoint_path (weights-only warm start) and "
-                "training.resume_from (full resume) are mutually exclusive"
-            )
         if self.training.role == "producer" and self.profiling.enabled:
             raise ValueError(
                 "profiling.enabled applies to trainer roles, not a capture-only "
@@ -1557,7 +1420,7 @@ class Config(StrictConfigModel):
                 raw = yaml.safe_load(f)
             else:
                 raw = json.load(f)
-        return cls.model_validate(migrate_legacy_config(raw))
+        return cls.model_validate(raw)
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
@@ -1575,8 +1438,10 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
         keys = path.split(".")
-        if len(keys) > 1 and keys[0] == "training":
-            reject_removed_loss_fields({keys[1]}, override=True)
+        if len(keys) > 1:
+            if keys[0] == "training":
+                reject_removed_loss_fields({keys[1]}, override=True)
+            reject_removed_fields(keys[0], {keys[1]})
         owner, node = config, raw
         for key in keys[:-1]:
             owner = _override_field(owner, key, path)
@@ -1638,7 +1503,6 @@ __all__ = [
     "DeploymentConfig",
     "TrainingConfig",
     "Config",
-    "migrate_legacy_config",
     "load_config",
     "apply_overrides",
 ]

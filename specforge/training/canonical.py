@@ -1,133 +1,30 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def enabled(cfg):
-    if (
-        cfg.draft is not None
-        or cfg.initialization is not None
-        or cfg.resume is not None
-    ):
-        return True
-    if cfg.resume_path:
-        from specforge.checkpoint.resolve import read_json
-        from specforge.training.checkpoint import CheckpointManager
-
-        try:
-            directory = CheckpointManager.resolve_resume_dir(cfg.resume_path)
-        except FileNotFoundError:
-            return False  # Legacy launch planning need not have a local checkpoint.
-        path = Path(directory) / "config.json"
-        return path.is_file() and read_json(path).get("model_type") == "specforge_draft"
-    return False
-
-
-_LEGACY_SETTING_FIELDS = {
-    "mask_token_id": "model.mask_token_id",
-    "norm_before_residual": "training.norm_before_residual",
-    "capture_layers": "model.aux_hidden_state_layer_ids",
-}
-
-
-def _legacy_settings(cfg):
-    return {
-        name: value
-        for name, value in {
-            "mask_token_id": cfg.model.mask_token_id,
-            "norm_before_residual": cfg.training.norm_before_residual,
-            "capture_layers": cfg.model.aux_hidden_state_layer_ids,
-        }.items()
-        if value is not None
-    }
-
-
-def _is_canonical_checkpoint(cfg, source):
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-
-    path = resolve_checkpoint_path(
-        source, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    config = (path.parent if path.is_file() else path) / "config.json"
-    return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
-
-
-def _source_legacy_settings(cfg, source):
-    """Legacy imports apply the YAML settings; canonical sources already record them."""
-    return None if _is_canonical_checkpoint(cfg, source) else _legacy_settings(cfg)
-
-
-def _reject_changed_legacy_settings(config, settings):
-    spec = config.spec_config
-    features = spec.target_features
-    # each setting lives on the spec node of the architectures that have it
-    recorded = {
-        "mask_token_id": getattr(
-            spec, "mask_token_id", getattr(features, "mask_token_id", None)
-        ),
-        "norm_before_residual": getattr(spec, "norm_before_residual", None),
-        "capture_layers": getattr(features, "target_layer_ids", None),
-    }
-    for name, value in settings.items():
-        saved = recorded[name]
-        if name == "capture_layers" and saved is not None:
-            saved, value = list(saved), list(value)
-        if saved != value:
-            raise ValueError(
-                f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"draft's recorded {saved!r}; remove it or make it match"
-            )
-
-
-def _read_draft_payload(draft):
-    if not isinstance(draft, str):
-        return draft
-    import json
-
-    import yaml
-
-    text = Path(draft).read_text()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return yaml.safe_load(text)
-
-
-def _is_legacy_payload(payload):
-    return isinstance(payload, dict) and payload.get("model_type") not in (
-        None,
-        "specforge_draft",
-    )
-
-
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
-    draft = _read_draft_payload(cfg.draft)
-    legacy_draft = _is_legacy_payload(draft)
-    if legacy_draft:
-        from specforge.config.draft.codec import decode_legacy_config
+    draft = cfg.draft
+    if isinstance(draft, str):
+        import json
 
-        if target_config is None:
-            from specforge.checkpoint.resolve import read_target_config
+        import yaml
 
-            target_config = read_target_config(
-                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
-            )
-        supplied = decode_legacy_config(
-            draft, target_config=target_config, **_legacy_settings(cfg)
-        )
-    else:
-        supplied = (
-            parse_draft(draft, target_config=target_config)
-            if draft is not None
-            else None
-        )
+        text = Path(draft).read_text()
+        try:
+            draft = json.loads(text)
+        except json.JSONDecodeError:
+            draft = yaml.safe_load(text)
+    supplied = (
+        parse_draft(draft, target_config=target_config) if draft is not None else None
+    )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.resume_path:
@@ -137,38 +34,17 @@ def resolve_config(cfg, *, target_config=None):
     if source:
         from specforge.loading import read_draft
 
-        canonical = _is_canonical_checkpoint(cfg, source)
-        if cfg.resume_path and not canonical:
-            raise ValueError(
-                "legacy full resume uses the legacy training path, which MTP no longer has; use initialization.checkpoint for canonical weight import"
-            )
         loaded = read_draft(
             source,
             target=cfg.model.target_model_path,
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
-            legacy_config=initialization.legacy_config if initialization else None,
-            legacy_settings=None if canonical else _legacy_settings(cfg),
         ).config
-        if canonical:
-            _reject_changed_legacy_settings(loaded, _legacy_settings(cfg))
         if supplied is not None and supplied != loaded:
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
-    settings = _legacy_settings(cfg)
-    if (
-        settings
-        and not legacy_draft
-        and not (initialization and initialization.weights_from)
-    ):
-        if supplied is None:
-            raise ValueError(
-                "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-            )
-        # a decoded legacy draft records them; resolve_run re-resolves that draft
-        _reject_changed_legacy_settings(supplied, settings)
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -214,82 +90,8 @@ def _objective_settings(cfg):
     )
 
 
-def _validate_imported_objective(cfg, resolved):
-    """Require explicit preservation of recorded legacy DSpine training settings."""
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-    from specforge.config.draft.codec.legacy.dspine import (
-        extract_dspine_training_settings,
-    )
-
-    payloads = []
-    draft = _read_draft_payload(cfg.draft)
-    if _is_legacy_payload(draft):
-        payloads.append(draft)
-    init = cfg.initialization
-    if init is not None and init.checkpoint is not None:
-        source = resolve_checkpoint_path(
-            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-        )
-        directory = source.parent if source.is_file() else source
-        payloads.append(read_json(init.legacy_config or directory / "config.json"))
-    mismatches = {}
-    for payload in payloads:
-        if payload.get("model_type") == "specforge_draft" or payload.get(
-            "architectures"
-        ) != ["DSpineDraftModel"]:
-            continue
-        for name, saved in extract_dspine_training_settings(payload).items():
-            if name == "ce_weight":
-                values = {
-                    f"loss.terms.{term}.options.{key}": (
-                        configured.loss.options[key],
-                        expected,
-                    )
-                    for term, configured in resolved.losses.terms.items()
-                    if term in {"token", "refinement"}
-                    and configured.loss.kind == "ce_l1"
-                    for key, expected in (
-                        ("ce_weight", saved),
-                        ("l1_weight", 1 - saved),
-                    )
-                }
-            elif name == "alignment_weight":
-                values = {
-                    "loss.terms.alignment.coefficient": (
-                        resolved.losses.terms["alignment"].coefficient,
-                        saved,
-                    )
-                }
-            else:
-                values = {
-                    f"objective_options.{name}": (
-                        getattr(resolved.objective, name),
-                        saved,
-                    )
-                }
-            for path, (current, expected) in values.items():
-                if current != expected:
-                    mismatches[path] = (name, saved, expected)
-    if mismatches:
-        # Report every setting at once: the exact values (1 - 0.7 is not 0.3)
-        # are tedious to find one failed run at a time.
-        raise ValueError(
-            "legacy DSpine training settings must be restated to preserve them:\n"
-            + "\n".join(
-                f"  training.{path}={expected!r}  (recorded {name}={saved!r})"
-                for path, (name, saved, expected) in mismatches.items()
-            )
-        )
-
-
 def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
-    from specforge.algorithms.common.defaults import (
-        empty_options,
-        empty_resume_contract,
-        no_missing_checkpoint_keys,
-        online_needs_input_tools,
-    )
     from specforge.algorithms.common.providers import (
         AlgorithmProviders,
         DraftConfigProvider,
@@ -314,10 +116,6 @@ def resolve_run(cfg, *, target_config=None):
 
     from . import canonical_data
 
-    if cfg.model.draft_model_config or cfg.model.draft_checkpoint_path:
-        raise ValueError(
-            "canonical checkpoint cannot mix with legacy model.draft_* sources"
-        )
     draft = resolve_config(cfg, target_config=target_config)
     if cfg.initialization and cfg.initialization.from_target:
         from specforge.checkpoint.native import validate_target_initialization
@@ -331,34 +129,7 @@ def resolve_run(cfg, *, target_config=None):
             )
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
-    # New objectives have their own options. Never silently consume legacy
-    # algorithm switches with a different meaning on the canonical path.
-    from specforge.config.schema import TrainingConfig
-
-    defaults = TrainingConfig()
-    legacy_options = {
-        "ttt_length",
-        "num_anchors",
-        "dflash2_selector_warmup_ratio",
-        "dflash2_selector_ramp_ratio",
-        "dflash2_selector_stop_gradient",
-        "lambda_base_start",
-        "lambda_base_decay_ratio",
-        "num_depths",
-        "down_sample_ratio",
-        "down_sample_ratio_min",
-    }
-    present = {
-        name
-        for name in legacy_options
-        if getattr(cfg.training, name) != getattr(defaults, name)
-    }
-    if present:
-        raise ValueError(
-            f"canonical training uses training.objective_options, not {sorted(present)}"
-        )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
-    _validate_imported_objective(cfg, resolved)
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
@@ -380,9 +151,7 @@ def resolve_run(cfg, *, target_config=None):
             raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
     requirements = entry.training
-    family = entry.legacy_strategy or objective
-    if cfg.training.strategy not in (defaults.strategy, family, objective):
-        raise ValueError("training.strategy conflicts with the objective")
+    family = entry.runtime_name or objective
     if cfg.training.tp_size != 1:
         raise ValueError("canonical objectives require trainer TP size one")
     sequence_parallel = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size > 1
@@ -400,8 +169,15 @@ def resolve_run(cfg, *, target_config=None):
                 "chain weights are normalized within each sequence shard"
             )
     # Retain the established strategy name for data/rendezvous identifiers.
+    options = asdict(resolved.objective)
+    if cfg.training.weighting is not None:
+        # An explicit weighting replaces these. build_bundle resolves this
+        # config again and must not read the objective's defaults as user input.
+        for name in getattr(resolved.objective, "default_weighting_options", ()):
+            if name not in cfg.training.objective_options:
+                del options[name]
     training = cfg.training.model_copy(
-        update={"strategy": family, "objective": objective}
+        update={"objective": objective, "objective_options": options}
     )
     cfg = cfg.model_copy(update={"draft": encode_config(draft), "training": training})
     keys = tuple(entry.inputs)
@@ -482,8 +258,6 @@ def resolve_run(cfg, *, target_config=None):
         supports_trim_loss_positions=True,
         supports_compact_teacher=vocab,
         supports_liger_kernel=True,
-        # a checkpoint import's legacy config becomes the draft; the reader checks it
-        allows_aux_layer_override=bool(init and init.checkpoint),
     )
     spec = AlgorithmSpec(
         name=family,
@@ -495,10 +269,7 @@ def resolve_run(cfg, *, target_config=None):
         capabilities=capabilities,
     )
     provider = ModelProvider(
-        build_draft=None,
-        build_training_model=None,
         build_bundle=build_bundle,
-        needs_input_tools=online_needs_input_tools,
         default_dataloader_num_workers=requirements.dataloader_workers,
         loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
@@ -509,9 +280,6 @@ def resolve_run(cfg, *, target_config=None):
     )
     step = StepProvider(
         build=build_step,
-        options=empty_options,
-        resume_contract=empty_resume_contract,
-        allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
         uses_external_target_head=False,
     )
     providers = AlgorithmProviders(
@@ -525,27 +293,74 @@ def resolve_run(cfg, *, target_config=None):
     return cfg, make_registration(spec, providers)
 
 
+@dataclass(frozen=True)
+class LigerChoice:
+    """Resolved ``model.use_liger_kernel`` for one trainer platform."""
+
+    enabled: bool
+    reason: str
+
+    def describe(self):
+        return f"Liger kernels: {'on' if self.enabled else 'off'} ({self.reason})"
+
+
+#: Liger kernels are Triton programs. SpecForge validates them on CUDA and ROCm;
+#: Liger also ships Ascend and XPU backends that SpecForge has not validated.
+_LIGER_VALIDATED_PLATFORMS = ("cuda", "rocm")
+_LIGER_UNVALIDATED_PLATFORMS = ("npu", "xpu")
+
+
+def trainer_platform():
+    """This process's accelerator; PyTorch reports ROCm as ``cuda``."""
+    import torch
+
+    from specforge.utils import get_device_type
+
+    device_type = get_device_type()
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        return "rocm"
+    return device_type
+
+
 def liger_choice(requested, *, by_default, hidden_act, platform=None):
     """Resolve model.use_liger_kernel for a trainer platform (default: this one).
 
     An unset flag enables Liger only for objectives that declare it as their
-    default, on a CUDA/ROCm trainer with a silu/swish draft; ``true`` fails
-    where Liger cannot run.
+    default, on a CUDA/ROCm trainer with a silu/swish draft. ``true`` never
+    degrades silently: it raises where Liger cannot run.
     """
-    from specforge.modeling.draft.dflash_kernels import (
-        LigerKernelChoice,
-        current_liger_platform,
-        resolve_liger_kernel_choice,
-    )
-
-    platform = platform or current_liger_platform()
-    if requested is None and not by_default:
-        return LigerKernelChoice(
-            False, "auto: not a default for this objective", platform
+    platform = platform or trainer_platform()
+    if requested is False:
+        return LigerChoice(False, "model.use_liger_kernel=false")
+    supported_activation = hidden_act in ("silu", "swish")
+    if requested is None:
+        if not by_default:
+            return LigerChoice(False, "auto: not a default for this objective")
+        if platform not in _LIGER_VALIDATED_PLATFORMS:
+            return LigerChoice(
+                False, f"auto: trainer device {platform!r} is not CUDA/ROCm"
+            )
+        if not supported_activation:
+            return LigerChoice(
+                False, f"auto: draft hidden_act {hidden_act!r} is not silu/swish"
+            )
+        return LigerChoice(True, f"auto: {platform} trainer")
+    if platform not in _LIGER_VALIDATED_PLATFORMS + _LIGER_UNVALIDATED_PLATFORMS:
+        raise ValueError(
+            "model.use_liger_kernel=true requires a Triton GPU backend: CUDA or "
+            "ROCm, or Ascend NPU/XPU where it is unvalidated in SpecForge; this "
+            f"trainer's device is {platform!r}. Remove the key or set it to "
+            "false to use the PyTorch RMSNorm/SwiGLU."
         )
-    return resolve_liger_kernel_choice(
-        requested, platform=platform, hidden_act=hidden_act
-    )
+    if not supported_activation:
+        raise ValueError(
+            "model.use_liger_kernel=true requires the draft hidden_act to be "
+            f"'silu' or 'swish' (Liger SwiGLU); got {hidden_act!r}. Remove the "
+            "key or set it to false to use the PyTorch MLP."
+        )
+    if platform in _LIGER_UNVALIDATED_PLATFORMS:
+        return LigerChoice(True, f"explicit, unvalidated in SpecForge on {platform}")
+    return LigerChoice(True, "explicit")
 
 
 def preflight_kernels(cfg):
@@ -560,9 +375,8 @@ def preflight_kernels(cfg):
     if requested is None:
         from specforge.algorithms.objectives import resolve_objective
         from specforge.config.draft.mlp.dense import DenseFFNSpec
-        from specforge.modeling.draft.dflash_kernels import current_liger_platform
 
-        if current_liger_platform() not in ("cuda", "rocm"):
+        if trainer_platform() not in _LIGER_VALIDATED_PLATFORMS:
             return  # auto never enables Liger here, so there is nothing to read
         draft = resolve_config(cfg)
         acts = {
@@ -671,8 +485,6 @@ def build_bundle(cfg, algorithm):
             source,
             **common,
             adapter=init.adapter if init else None,
-            legacy_config=init.legacy_config if init else None,
-            legacy_settings=_source_legacy_settings(cfg, source),
         ).train()
     else:
         weights = init.weights_from if init else None
@@ -701,10 +513,6 @@ def build_bundle(cfg, algorithm):
             require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
-            legacy_config=init.legacy_config if init else None,
-            legacy_settings=(
-                _source_legacy_settings(cfg, weights.checkpoint) if weights else None
-            ),
         )
     teacher = None
     if resolved.requires_teacher:

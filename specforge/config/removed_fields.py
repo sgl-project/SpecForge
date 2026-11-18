@@ -24,6 +24,57 @@ REMOVED_LOSS_FIELDS = {
 }
 
 
+#: Removed with the legacy training entry. Each maps to where the setting lives
+#: now; "draft" means the draft configuration (a preset path or inline mapping).
+REMOVED_FIELDS = {
+    "model": {
+        "draft_model_config": "draft (a preset under specforge/config/draft/presets, or an inline canonical configuration)",
+        "draft_checkpoint_path": "initialization.checkpoint to import weights, or resume for a training checkpoint",
+        "draft_num_hidden_layers": "the layer list of the draft configuration",
+        "draft_block_size": "spec_config.block.block_size of the draft configuration",
+        "mask_token_id": "spec_config of the draft configuration (the presets carry it)",
+        "aux_hidden_state_layer_ids": "target_features.target_layer_ids of the draft configuration",
+    },
+    "training": {
+        "strategy": "draft (its architecture selects the objective; training.objective chooses another)",
+        "num_anchors": "training.objective_options.num_anchors",
+        "ttt_length": "training.objective_options.ttt_length",
+        "num_depths": "training.objective_options.num_depths",
+        "down_sample_ratio": "training.objective_options.down_sample_ratio",
+        "down_sample_ratio_min": "training.objective_options.down_sample_ratio_min",
+        "lambda_base_start": "training.objective_options.lambda_base_start",
+        "lambda_base_decay_ratio": "training.objective_options.lambda_base_decay_ratio",
+        "dflash2_selector_warmup_ratio": "training.objective_options.selector_warmup_ratio",
+        "dflash2_selector_ramp_ratio": "training.objective_options.selector_ramp_ratio",
+        "dflash2_selector_stop_gradient": "training.objective_options.selector_stop_gradient",
+        "dflash_teacher_metrics": "training.objective_options.teacher_metrics",
+        "norm_before_residual": "spec_config.norm_before_residual of the draft configuration",
+        "deployment_mode": "deployment.mode",
+        "server_urls": "deployment.disaggregated.server_urls",
+        "metadata_db_path": "deployment.disaggregated.consumer_state_dir (the directory that held consumer.sqlite)",
+    },
+    "initialization": {
+        "legacy_config": "nothing: only canonical checkpoints, which carry their config.json, can be imported",
+    },
+}
+
+
+def reject_removed_fields(section, fields):
+    """Reject keys removed from one config section, naming each replacement.
+
+    Args:
+        section: "model", "training" or "initialization".
+        fields: Names present in that section.
+    """
+    removed = [
+        f"{section}.{key} -> {replacement}"
+        for key, replacement in REMOVED_FIELDS.get(section, {}).items()
+        if key in fields
+    ]
+    if removed:
+        raise ValueError("Removed configuration fields: " + "; ".join(removed))
+
+
 def reject_removed_loss_fields(fields, *, override=False):
     """Reject retired keys with their replacement paths.
 

@@ -23,7 +23,10 @@ def convert_config(config, *, hf_metadata=None):
     try:
         converter = _CONVERTERS[config.architecture]
     except KeyError:
-        raise ValueError(f"no SGLang converter for {config.architecture}") from None
+        raise ValueError(
+            f"no SGLang converter for {config.architecture}; an architecture that "
+            "merges back into its target exports with --export-mode native"
+        ) from None
     result = converter(config)
     metadata = hf_metadata or {}
     result.update(

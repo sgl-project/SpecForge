@@ -4,16 +4,14 @@ import glob
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from specforge.config.draft import DraftConfig
-from specforge.config.draft.codec.legacy import LEGACY_ARCHITECTURES
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling.draft.hf_config import _METADATA, SpecForgeDraftConfig
 
 from .draft_dir import read_artifact_metadata
-from .formats.legacy import read_legacy
 from .tensors import TensorStore
 
 _ADAPTERS = {}
@@ -163,7 +161,6 @@ class DraftCheckpoint:
     weights: dict
     hf_metadata: dict
     source: str
-    bound_copies: dict = field(default_factory=dict)
 
 
 def _canonical(payload, store, target):
@@ -177,22 +174,12 @@ def _canonical(payload, store, target):
 register_adapter(
     "canonical", lambda p: p.get("model_type") == "specforge_draft", _canonical
 )
-register_adapter(
-    "legacy",
-    lambda p: p.get("model_type") != "specforge_draft"
-    and isinstance(p.get("architectures"), list)
-    and len(p["architectures"]) == 1
-    and p["architectures"][0] in LEGACY_ARCHITECTURES,
-    read_legacy,
-)
 
 
 def read_checkpoint(
     source,
     *,
     target_config=None,
-    legacy_config=None,
-    legacy_settings=None,
     adapter=None,
     cache_dir=None,
     check_target=True,
@@ -200,19 +187,11 @@ def read_checkpoint(
     path = resolve_checkpoint_path(source, cache_dir=cache_dir)
     directory = path.parent if path.is_file() else path
     config_path = directory / "config.json"
-    if config_path.exists():
-        if legacy_config is not None:
-            raise ValueError(
-                "legacy_config is only for checkpoints without config.json"
-            )
-        payload = read_json(config_path)
-    elif legacy_config is not None:
-        payload = read_json(legacy_config)
-    else:
+    if not config_path.is_file():
         raise ValueError(
-            f"{directory} has no config.json: point at a checkpoint directory "
-            "rather than a run output directory, or supply legacy_config"
+            f"{directory} has no config.json; select a canonical checkpoint directory"
         )
+    payload = read_json(config_path)
     if not isinstance(payload, dict):
         raise ValueError("checkpoint config must be an object")
     artifact = read_artifact_metadata(payload)
@@ -225,26 +204,10 @@ def read_checkpoint(
         matches = [adapter]
     if len(matches) != 1:
         raise ValueError(
-            f"expected one checkpoint adapter, found {matches}; select adapter explicitly if ambiguous"
+            f"Expected one checkpoint adapter, found {matches}; provide a canonical SpecForge checkpoint or a registered adapter"
         )
     store = TensorStore(path)
-    bound_copies = {}
-    if matches[0] == "legacy":
-        config, weights, metadata = read_legacy(
-            payload,
-            store,
-            target_config,
-            check_target=check_target,
-            settings=legacy_settings,
-        )
-        for name in config.target_bindings:
-            key = name + ".weight"
-            if key in weights:
-                bound_copies[name] = weights.pop(key)
-    else:
-        if legacy_settings:
-            raise ValueError("legacy_settings apply only to legacy checkpoints")
-        config, weights, metadata = _ADAPTERS[matches[0]][1](
-            payload, store, target_config if check_target else None
-        )
-    return DraftCheckpoint(config, weights, metadata, str(path), bound_copies)
+    config, weights, metadata = _ADAPTERS[matches[0]][1](
+        payload, store, target_config if check_target else None
+    )
+    return DraftCheckpoint(config, weights, metadata, str(path))
