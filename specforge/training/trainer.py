@@ -9,8 +9,8 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + an injected step factory -> FSDPTrainingBackend -> TrainerCore ->
-TrainerController (the trainer seam) behind one object with a ``.fit()``.
+model + an injected step factory -> FSDPTrainingBackend -> DataParallelRunner ->
+TrainerController (the run loop) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
 """
@@ -33,7 +33,8 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.controller import TrainerController
+from specforge.training.runner import DataParallelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +465,7 @@ class Trainer:
             target_head=target_head,
             **resolved_strategy_kwargs,
         )
-        core = TrainerCore(strategy, backend, accumulation_steps=accumulation_steps)
+        runner = DataParallelRunner(strategy, backend)
         ack_fn = None
         if durable_ack:
 
@@ -481,7 +482,13 @@ class Trainer:
                     ack_ids(ids)
 
         controller_obj = TrainerController(
-            core,
+            runner,
+            strategy=strategy,
+            backend=backend,
+            accumulation_steps=accumulation_steps,
+            data_parallel_size=max(
+                1, parallel.world_size // (parallel.tp_size * parallel.sp_size)
+            ),
             run_id=run_id,
             output_dir=output_dir,
             num_epochs=num_epochs,
@@ -519,12 +526,13 @@ class Trainer:
         self.run_id = run_id
         self.output_dir = output_dir
         self.batch_size = batch_size
+        self.accumulation_steps = accumulation_steps
         self.max_steps = max_steps
         self.max_checkpoints = max_checkpoints
         self.dataflow_controller = controller
         self.trainer_id = trainer_id
         self.backend = backend
-        self.core = core
+        self.runner = runner
         self._controller = controller_obj
         self._loader = loader
         self._fit_context = fit_context

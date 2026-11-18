@@ -3,7 +3,6 @@
 from dataclasses import replace
 
 import torch
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from .base import DraftTrainStrategy, StepContext, StepOutput
@@ -30,6 +29,9 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self._duplicate_parameters = set()
         inner = model.module if isinstance(model, DistributedDataParallel) else model
         self.window_statistic = inner.registration.training.window_statistic
+        self.replay_statistics = (
+            (self.window_statistic.argument_name,) if self.window_statistic else ()
+        )
         self.host_inputs = inner.registration.training.host_inputs
         self.evaluation_diagnostics = inner.registration.training.evaluation_diagnostics
         self.draft_config = inner.draft_model.config.draft
@@ -37,8 +39,6 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
             seen.add(id(value))
-        self._statistic_window = None
-        self._window_value = None
 
     def trainable_module(self):
         return self.model
@@ -113,41 +113,25 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             loss_terms=(result.numerator, result.denominator),
         )
 
-    def forward_loss(self, batch, ctx=None):
-        ctx = ctx or StepContext()
-        if (
-            self.window_statistic is None
-            or not self.trainable_module().training
-            or not torch.is_grad_enabled()
-        ):
-            return self._forward(batch, ctx)
+    def prepass(self, batch, ctx):
         device = next(self.model.parameters()).device
-        devices = [] if device.type == "cpu" else [device.index]
-        device_module = torch.get_device_module(device.type)
-        cpu_rng = torch.get_rng_state()
-        device_rng = [device_module.get_rng_state(index) for index in devices]
-        with torch.no_grad():
-            output = self._forward(
-                batch, ctx, window_value=torch.zeros((), device=device)
-            )
-        replay_batch = replace(
-            batch,
-            tensors={key: value.detach().cpu() for key, value in batch.tensors.items()},
+        output = self._forward(batch, ctx, window_value=torch.zeros((), device=device))
+        statistic = self.window_statistic
+        return replace(
+            output,
+            statistics={
+                statistic.argument_name: torch.stack(
+                    output.ratio_metrics[statistic.ratio_name]
+                )
+            },
         )
 
-        def replay(window_ratios):
-            if self._statistic_window is not window_ratios:
-                numerator, denominator = window_ratios[self.window_statistic.ratio_name]
-                totals = torch.stack((numerator, denominator))
-                if dist.is_initialized():
-                    dist.all_reduce(totals)
-                denominator = totals[1].where(totals[1] > 0, 1)
-                self._window_value = (totals[0] / denominator).detach()
-                self._statistic_window = window_ratios
-            with torch.random.fork_rng(devices=devices, device_type=device.type):
-                torch.set_rng_state(cpu_rng)
-                for index, state in zip(devices, device_rng):
-                    device_module.set_rng_state(state, index)
-                return self._forward(replay_batch, ctx, self._window_value)
-
-        return replace(output, replay_loss=replay)
+    def forward_loss(self, batch, ctx=None):
+        ctx = ctx or StepContext()
+        if self.window_statistic is None or not ctx.replay_values:
+            return self._forward(batch, ctx)
+        # The pooled sums arrive unchanged; the ratio and its guard are formed
+        # here, from the values and not from which tensor carries them.
+        numerator, denominator = ctx.replay_values[self.window_statistic.argument_name]
+        denominator = denominator.where(denominator > 0, 1)
+        return self._forward(batch, ctx, (numerator / denominator).detach())

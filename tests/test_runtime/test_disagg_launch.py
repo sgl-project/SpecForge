@@ -212,7 +212,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             max_steps=MAX_OPT_STEPS,
         )
 
-        module = trainer.core.strategy.trainable_module()
+        module = trainer.runner.strategy.trainable_module()
         self.assertIsInstance(
             module, FSDP, "strategy must hold the FSDP-wrapped module"
         )

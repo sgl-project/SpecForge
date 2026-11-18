@@ -1,11 +1,13 @@
 # coding=utf-8
-"""TrainerCore grad-accum + TrainerController fit/eval/checkpoint (CPU)."""
+"""Step runner grad-accum + TrainerController fit/eval/checkpoint (CPU)."""
 
+import gc
 import inspect
 import json
 import os
 import tempfile
 import unittest
+import weakref
 from dataclasses import replace
 from unittest import mock
 
@@ -19,14 +21,20 @@ from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.controller import (
-    Checkpoint,
-    TrainerController,
-    TrainerCore,
-    _materialize_metrics,
-    _reduce_ratio_metrics,
+from specforge.training.contracts import (
+    IncompleteWindow,
+    StepMetrics,
+    materialize_metrics,
 )
-from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
+from specforge.training.controller import Checkpoint, TrainerController
+from specforge.training.frame import run_window
+from specforge.training.runner import DataParallelRunner, _reduce_ratio_metrics
+from specforge.training.strategies.base import (
+    DraftTrainStrategy,
+    StepContext,
+    StepOutput,
+)
+from tests.test_runtime._fixtures import train_window
 
 
 class TinyModel(nn.Module):
@@ -84,25 +92,28 @@ class WeightedStrategy(FakeStrategy):
 
 
 class ReplayStrategy(WeightedStrategy):
+    """Pools the accuracy counts over a window before its gradient pass."""
+
+    replay_statistics = ("acc",)
+
     def __init__(self):
         super().__init__()
-        self.replay_enabled = True
-        self.replayed_ratios = []
+        self.replayed_values = []
+
+    def prepass(self, batch, ctx):
+        output = super().forward_loss(batch, ctx)
+        return replace(
+            output, statistics={"acc": torch.stack(output.ratio_metrics["acc"])}
+        )
 
     def forward_loss(self, batch, ctx=None):
-        if not self.replay_enabled:
-            return super().forward_loss(batch, ctx)
-        with torch.no_grad():
-            prepared = super().forward_loss(batch, ctx)
-
-        def replay_loss(window_ratios):
-            self.replayed_ratios.append(window_ratios)
-            return super(ReplayStrategy, self).forward_loss(batch, ctx)
-
-        return replace(prepared, replay_loss=replay_loss)
+        if ctx is not None and ctx.replay_values:
+            self.replayed_values.append(ctx.replay_values["acc"])
+        return super().forward_loss(batch, ctx)
 
 
 class FakeBackend(TrainingBackend):
+    process_group = None
     name = "fake"
 
     def __init__(self, model):
@@ -162,90 +173,74 @@ def _weighted_batch(coefficient, denominator, correct):
     )
 
 
-class TestTrainerCore(unittest.TestCase):
-    def test_rejects_mode_changes_within_accumulation_window_in_both_directions(self):
-        for replay_first in (False, True):
-            for pending in (1, 3):
-                with self.subTest(replay_first=replay_first, pending=pending):
-                    strategy = ReplayStrategy()
-                    strategy.replay_enabled = replay_first
-                    backend = FakeBackend(strategy.model)
-                    core = TrainerCore(strategy, backend, accumulation_steps=4)
-                    for _ in range(pending):
-                        core.train_step(_weighted_batch(2, 1, 1))
-                    backwards = backend.backwards
-                    gradient = strategy.model.w.grad
-                    if gradient is not None:
-                        gradient = gradient.clone()
+def _controller(strategy, backend, **options):
+    """A run loop that drives ``strategy`` and ``backend`` through the step runner."""
+    return TrainerController(
+        DataParallelRunner(strategy, backend),
+        strategy=strategy,
+        backend=backend,
+        **options,
+    )
 
-                    strategy.replay_enabled = not replay_first
-                    with self.assertRaisesRegex(
-                        ValueError, "Cannot mix immediate and replayed losses"
-                    ):
-                        core.train_step(_weighted_batch(100, 10, 0))
-                    self.assertEqual(core.accumulation_remainder, pending)
-                    self.assertEqual(backend.backwards, backwards)
-                    self.assertEqual(backend.steps, 0)
-                    self.assertFalse(strategy.replayed_ratios)
-                    torch.testing.assert_close(strategy.model.w.grad, gradient)
 
-                    # Rejection must not contaminate the existing window.
-                    strategy.replay_enabled = replay_first
-                    for _ in range(4 - pending):
-                        result = core.train_step(_weighted_batch(2, 1, 1))
-                    self.assertTrue(result.optimizer_stepped)
-                    self.assertEqual(core.accumulation_remainder, 0)
-                    self.assertEqual(backend.backwards, 4)
-                    self.assertEqual(backend.boundaries, [False, False, False, True])
-                    self.assertEqual(backend.steps, 1)
-                    self.assertEqual(result.metrics["acc"], 1.0)
-                    self.assertEqual(result.metrics["sample_count"], 4.0)
-                    torch.testing.assert_close(
-                        strategy.model.w.grad, torch.tensor([2.0])
-                    )
-
-    def test_modes_can_change_between_complete_accumulation_windows(self):
-        for first_mode in (False, True):
-            with self.subTest(first_mode=first_mode):
-                strategy = ReplayStrategy()
+class TestDataParallelRunner(unittest.TestCase):
+    def test_window_order_follows_the_declared_replay_statistics(self):
+        for replayed in (False, True):
+            with self.subTest(replayed=replayed):
+                strategy = ReplayStrategy() if replayed else WeightedStrategy()
                 backend = FakeBackend(strategy.model)
-                core = TrainerCore(strategy, backend, accumulation_steps=2)
-                for window, mode in enumerate((first_mode, not first_mode, first_mode)):
-                    strategy.replay_enabled = mode
+                runner = DataParallelRunner(strategy, backend)
+                ctx = StepContext(accumulation_steps=2)
+                for window in range(3):
                     strategy.model.zero_grad(set_to_none=True)
-                    first = core.train_step(_weighted_batch(2, 1, 1))
-                    self.assertFalse(first.optimizer_stepped)
-                    self.assertEqual(core.accumulation_remainder, 1)
-                    self.assertEqual(backend.backwards, 2 * window + int(not mode))
-                    self.assertEqual(backend.steps, window)
-                    result = core.train_step(_weighted_batch(30, 3, 1))
-                    self.assertTrue(result.optimizer_stepped)
-                    self.assertEqual(core.accumulation_remainder, 0)
+                    progress_at_pull = []
+
+                    def batches():
+                        for batch in (
+                            _weighted_batch(2, 1, 1),
+                            _weighted_batch(30, 3, 1),
+                        ):
+                            progress_at_pull.append((backend.backwards, backend.steps))
+                            yield batch
+
+                    metrics = run_window(runner, batches(), ctx)
+                    # A replayed window reads every micro-batch before its first
+                    # backward; neither kind steps before its last micro-batch.
+                    self.assertEqual(
+                        progress_at_pull,
+                        [
+                            (2 * window, window),
+                            (2 * window + int(not replayed), window),
+                        ],
+                    )
                     self.assertEqual(backend.backwards, 2 * (window + 1))
                     self.assertEqual(backend.steps, window + 1)
-                    self.assertEqual(result.loss, 8.0)
-                    self.assertEqual(result.metrics["acc"], 0.5)
-                    self.assertEqual(result.metrics["sample_count"], 4.0)
+                    self.assertEqual(metrics.loss, 8.0)
+                    self.assertEqual(metrics.materialize()["acc"], 0.5)
+                    self.assertEqual(metrics.materialize()["sample_count"], 4.0)
                     torch.testing.assert_close(
                         strategy.model.w.grad, torch.tensor([8.0])
                     )
                 self.assertEqual(backend.boundaries, [False, True] * 3)
-                for ratios in strategy.replayed_ratios:
-                    torch.testing.assert_close(
-                        ratios["acc"], (torch.tensor(2.0), torch.tensor(4.0))
-                    )
+                if replayed:
+                    # Every replayed forward sees the counts of its whole window.
+                    self.assertEqual(len(strategy.replayed_values), 6)
+                    for values in strategy.replayed_values:
+                        torch.testing.assert_close(values, torch.tensor([2.0, 4.0]))
 
     def test_accumulation_boundary(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=2)
-        m0 = core.train_step(_batch())
-        self.assertFalse(m0.optimizer_stepped)  # no optimizer step yet
-        self.assertIsNone(m0.grad_norm)
+        runner = DataParallelRunner(strat, backend)
+        ctx = StepContext(accumulation_steps=2)
+        # no optimizer step yet
+        self.assertIsNone(runner.forward_backward(_batch(), ctx, is_boundary=False))
         self.assertEqual(backend.steps, 0)
-        m1 = core.train_step(_batch())
-        self.assertTrue(m1.optimizer_stepped)  # step on the 2nd micro-batch
-        self.assertIsNotNone(m1.grad_norm)
+        # step on the 2nd micro-batch
+        pending = runner.forward_backward(_batch(), ctx, is_boundary=True)
+        self.assertIsNotNone(pending)
+        metrics = runner.apply_step(pending)
+        self.assertIsNotNone(metrics.grad_norm)
         self.assertEqual(backend.steps, 1)
         self.assertEqual(backend.backwards, 2)
         # boundary known BEFORE backward so the backend can no_sync micro-steps
@@ -253,7 +248,8 @@ class TestTrainerCore(unittest.TestCase):
 
     def test_metrics_reduce_once_at_accumulation_boundary(self):
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        ctx = StepContext(accumulation_steps=2)
 
         def reduce_sum(tensor):
             tensor.mul_(2)
@@ -266,35 +262,33 @@ class TestTrainerCore(unittest.TestCase):
                 "torch.distributed.all_reduce", side_effect=reduce_sum
             ) as reduce,
         ):
-            core.train_step(_batch())
+            runner.forward_backward(_batch(), ctx, is_boundary=False)
             self.assertEqual(reduce.call_count, 0)
-            core.train_step(_batch())
+            runner.apply_step(runner.forward_backward(_batch(), ctx, is_boundary=True))
 
         self.assertEqual(reduce.call_count, 1)
         self.assertEqual(reduce.call_args.args[0].numel(), 2)
 
     def test_metrics_carry_no_mode(self):
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
-        rep = core.train_step(_batch())
-        self.assertNotIn("mode", rep.metrics)
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        metrics = train_window(runner, [_batch()])
+        self.assertNotIn("mode", metrics.materialize())
 
     def test_global_loss_normalization_matches_combined_batch(self):
         split_strategy = WeightedStrategy()
-        split_core = TrainerCore(
-            split_strategy,
-            FakeBackend(split_strategy.model),
-            accumulation_steps=2,
+        split_runner = DataParallelRunner(
+            split_strategy, FakeBackend(split_strategy.model)
         )
-        split_core.train_step(_weighted_batch(2, 1, 1))
-        split_result = split_core.train_step(_weighted_batch(30, 3, 1))
+        split_result = train_window(
+            split_runner, [_weighted_batch(2, 1, 1), _weighted_batch(30, 3, 1)]
+        )
 
         combined_strategy = WeightedStrategy()
-        combined_core = TrainerCore(
-            combined_strategy,
-            FakeBackend(combined_strategy.model),
+        combined_runner = DataParallelRunner(
+            combined_strategy, FakeBackend(combined_strategy.model)
         )
-        combined_result = combined_core.train_step(_weighted_batch(32, 4, 2))
+        combined_result = train_window(combined_runner, [_weighted_batch(32, 4, 2)])
 
         torch.testing.assert_close(
             split_strategy.model.w.grad,
@@ -302,20 +296,22 @@ class TestTrainerCore(unittest.TestCase):
         )
         self.assertEqual(split_strategy.model.w.grad.item(), 8.0)
         self.assertEqual(split_result.loss, combined_result.loss)
-        self.assertEqual(split_result.metrics["acc"], 0.5)
-        self.assertEqual(combined_result.metrics["acc"], 0.5)
+        self.assertEqual(split_result.materialize()["acc"], 0.5)
+        self.assertEqual(combined_result.materialize()["acc"], 0.5)
 
     def test_global_loss_normalization_compensates_rank_averaging(self):
-        strategy = FakeStrategy()
+        strategy = WeightedStrategy()
         backend = FakeBackend(strategy.model)
-        backend.parallel_config = mock.Mock(fsdp_process_group="dp")
-        core = TrainerCore(strategy, backend)
-        strategy.model.w.grad = torch.tensor([9.0])
+        backend.process_group = "dp"
+        runner = DataParallelRunner(strategy, backend)
 
-        def add_remote_denominator(denominator, *, op, group):
-            self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+        def add_remote_denominator(tensor, *, group, op=None):
             self.assertEqual(group, "dp")
-            denominator.add_(7.0)
+            # The loss denominator is the scalar collective; the packed metrics
+            # follow it.
+            if tensor.dim() == 0:
+                self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+                tensor.add_(7.0)
 
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
@@ -326,7 +322,8 @@ class TestTrainerCore(unittest.TestCase):
                 side_effect=add_remote_denominator,
             ),
         ):
-            core._normalize_gradients(torch.tensor(3.0))
+            # This rank's gradient is 9 over a local denominator of 3.
+            train_window(runner, [_weighted_batch(9, 3, 0)])
 
         torch.testing.assert_close(
             strategy.model.w.grad,
@@ -334,81 +331,84 @@ class TestTrainerCore(unittest.TestCase):
         )
 
     def test_global_loss_normalization_rejects_invalid_denominator(self):
-        strategy = FakeStrategy()
-        core = TrainerCore(strategy, FakeBackend(strategy.model))
-
         for denominator in (0.0, -1.0, float("nan"), float("inf")):
             with self.subTest(denominator=denominator):
+                strategy = WeightedStrategy()
+                backend = FakeBackend(strategy.model)
+                runner = DataParallelRunner(strategy, backend)
                 with self.assertRaisesRegex(ValueError, "finite and positive"):
-                    core._normalize_gradients(torch.tensor(denominator))
+                    train_window(runner, [_weighted_batch(2, denominator, 0)])
+                self.assertEqual(backend.steps, 0)
+                torch.testing.assert_close(strategy.model.w.grad, torch.tensor([2.0]))
 
     def test_strategy_scalar_metrics_are_preserved(self):
-        strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
-        result = core._result(
-            StepOutput(
-                loss=torch.tensor(2.0, requires_grad=True),
-                metrics={
-                    "loss": torch.tensor(99.0),
-                    "accuracy": torch.tensor(0.5),
-                    "accuracy_denom": torch.tensor(4.0),
-                    "ce_loss": torch.tensor(1.25),
-                    "lambda_base": 0.75,
-                    "non_scalar_debug": torch.tensor([1.0, 2.0]),
-                },
-            ),
-            grad_norm=None,
-            stepped=False,
-        )
+        class ScalarStrategy(FakeStrategy):
+            def forward_loss(self, batch, ctx=None):
+                return StepOutput(
+                    loss=(self.model.w * 2.0).sum(),
+                    metrics={
+                        "loss": torch.tensor(99.0),
+                        "accuracy": torch.tensor(0.5),
+                        "accuracy_denom": torch.tensor(4.0),
+                        "ce_loss": torch.tensor(1.25),
+                        "lambda_base": 0.75,
+                        "non_scalar_debug": torch.tensor([1.0, 2.0]),
+                    },
+                )
 
-        self.assertEqual(result.metrics["loss"], 2.0)
-        self.assertEqual(result.metrics["acc"], 0.5)
-        self.assertEqual(result.metrics["ce_loss"], 1.25)
-        self.assertEqual(result.metrics["lambda_base"], 0.75)
-        self.assertIsInstance(result._metric_values["lambda_base"], float)
-        self.assertFalse(result._metric_values["loss"].requires_grad)
-        self.assertNotIn("accuracy_denom", result.metrics)
-        self.assertNotIn("non_scalar_debug", result.metrics)
+        strat = ScalarStrategy()
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        result = train_window(runner, [_batch()])
+        metrics = result.materialize()
+
+        self.assertEqual(metrics["loss"], 2.0)
+        self.assertEqual(metrics["acc"], 0.5)
+        self.assertEqual(metrics["ce_loss"], 1.25)
+        self.assertEqual(metrics["lambda_base"], 0.75)
+        self.assertIsInstance(result._values["lambda_base"], float)
+        self.assertFalse(result._values["loss"].requires_grad)
+        self.assertNotIn("accuracy_denom", metrics)
+        self.assertNotIn("non_scalar_debug", metrics)
 
     def test_metrics_are_materialized_lazily_and_cached(self):
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
 
         with mock.patch(
-            "specforge.training.controller._materialize_metrics",
-            wraps=_materialize_metrics,
+            "specforge.training.contracts.materialize_metrics",
+            wraps=materialize_metrics,
         ) as materialize:
-            result = core.train_step(_batch())
+            metrics = train_window(runner, [_batch()])
             materialize.assert_not_called()
 
-            self.assertEqual(result.loss, 2.0)
+            self.assertEqual(metrics.loss, 2.0)
             materialize.assert_called_once()
-            self.assertEqual(result.metrics["acc"], 0.5)
-            self.assertEqual(result.grad_norm, 1.0)
+            self.assertEqual(metrics.materialize()["acc"], 0.5)
+            self.assertEqual(metrics.grad_norm, 1.0)
             materialize.assert_called_once()
 
     def test_ratio_metrics_override_mean_of_means_accuracy(self):
-        strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
-        result = core._result(
-            StepOutput(
-                loss=torch.tensor(2.0),
-                metrics={"accuracy": torch.tensor(0.99)},
-                ratio_metrics={
-                    "acc": (torch.tensor(2.0), torch.tensor(4.0)),
-                    "ce_position": (
-                        torch.tensor([1.0, 3.0]),
-                        torch.tensor([2.0, 6.0]),
-                    ),
-                },
-            ),
-            grad_norm=None,
-            stepped=False,
-        )
+        class RatioStrategy(FakeStrategy):
+            def forward_loss(self, batch, ctx=None):
+                return replace(
+                    super().forward_loss(batch, ctx),
+                    metrics={"accuracy": torch.tensor(0.99)},
+                    ratio_metrics={
+                        "acc": (torch.tensor(2.0), torch.tensor(4.0)),
+                        "ce_position": (
+                            torch.tensor([1.0, 3.0]),
+                            torch.tensor([2.0, 6.0]),
+                        ),
+                    },
+                )
 
-        self.assertEqual(result.metrics["acc"], 0.5)
-        self.assertEqual(result.metrics["ce_position_0"], 0.5)
-        self.assertEqual(result.metrics["ce_position_1"], 0.5)
+        strat = RatioStrategy()
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        metrics = train_window(runner, [_batch()]).materialize()
+
+        self.assertEqual(metrics["acc"], 0.5)
+        self.assertEqual(metrics["ce_position_0"], 0.5)
+        self.assertEqual(metrics["ce_position_1"], 0.5)
 
     _RATIO_INPUTS = {
         "acc": (torch.tensor(2.0), torch.tensor(4.0)),
@@ -465,18 +465,19 @@ class TestTrainerCore(unittest.TestCase):
 
     def test_additive_telemetry_accumulates_and_resets_each_optimizer_window(self):
         strat = WeightedStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=2)
-        first = core.train_step(_weighted_batch(2, 1, 1))
-        second = core.train_step(_weighted_batch(30, 3, 1))
-        self.assertEqual(first.metrics["sample_count"], 1)
-        self.assertEqual(second.metrics["sample_count"], 4)
-        self.assertEqual(second.metrics["correct_count"], 2)
-        self.assertEqual(second.metrics["acc"], 0.5)
-        core.train_step(_weighted_batch(1, 2, 0))
-        fourth = core.train_step(_weighted_batch(1, 3, 1))
-        self.assertEqual(fourth.metrics["sample_count"], 5)
-        self.assertEqual(fourth.metrics["correct_count"], 1)
-        self.assertAlmostEqual(fourth.metrics["acc"], 0.2)
+        runner = DataParallelRunner(strat, FakeBackend(strat.model))
+        second = train_window(
+            runner, [_weighted_batch(2, 1, 1), _weighted_batch(30, 3, 1)]
+        ).materialize()
+        self.assertEqual(second["sample_count"], 4)
+        self.assertEqual(second["correct_count"], 2)
+        self.assertEqual(second["acc"], 0.5)
+        fourth = train_window(
+            runner, [_weighted_batch(1, 2, 0), _weighted_batch(1, 3, 1)]
+        ).materialize()
+        self.assertEqual(fourth["sample_count"], 5)
+        self.assertEqual(fourth["correct_count"], 1)
+        self.assertAlmostEqual(fourth["acc"], 0.2)
 
     def test_prefix_counts_and_ratios_share_one_dp_sum_with_unequal_populations(self):
         accepted = torch.tensor([2.0, 0.0], requires_grad=True)
@@ -536,11 +537,11 @@ class TestTrainerController(unittest.TestCase):
         backend.step = mock.Mock(
             side_effect=FloatingPointError("non-finite global grad norm")
         )
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         acknowledged = []
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -558,22 +559,23 @@ class TestTrainerController(unittest.TestCase):
     def test_training_log_reports_pipeline_throughput_breakdown(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         logged = []
         with (
             tempfile.TemporaryDirectory() as d,
             mock.patch(
-                "specforge.training.controller._materialize_metrics",
-                wraps=_materialize_metrics,
+                "specforge.training.contracts.materialize_metrics",
+                wraps=materialize_metrics,
             ) as materialize,
         ):
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
                 num_epochs=1,
                 log_interval=2,
+                data_parallel_size=4,
                 logger=lambda metrics, step: logged.append((dict(metrics), step)),
             )
             self.assertEqual(ctrl.fit([_batch(), _batch()]), 2)
@@ -595,6 +597,14 @@ class TestTrainerController(unittest.TestCase):
             self.assertGreaterEqual(metrics[name], 0.0)
         self.assertGreater(metrics["perf/optimizer_steps_per_hour"], 0.0)
         self.assertGreater(metrics["perf/global_samples_per_second"], 0.0)
+        # Both rates share one elapsed time: each step trains one local sample,
+        # and every data-parallel rank trains as many.
+        self.assertAlmostEqual(
+            metrics["perf/global_samples_per_second"]
+            * 3600.0
+            / metrics["perf/optimizer_steps_per_hour"],
+            4.0,
+        )
         self.assertEqual(
             [ctx.collect_detailed_metrics for ctx in strat.contexts],
             [False, True],
@@ -615,12 +625,12 @@ class TestTrainerController(unittest.TestCase):
 
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         data = PerfData([_batch()])
         logged = []
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -636,7 +646,6 @@ class TestTrainerController(unittest.TestCase):
     def test_progress_bar_tracks_optimizer_steps_on_rank_zero(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         progress = mock.Mock()
         with (
             tempfile.TemporaryDirectory() as d,
@@ -647,8 +656,9 @@ class TestTrainerController(unittest.TestCase):
             mock.patch("torch.distributed.is_initialized", return_value=False),
             mock.patch("tqdm.tqdm", return_value=progress) as build_progress,
         ):
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=3,
@@ -665,7 +675,6 @@ class TestTrainerController(unittest.TestCase):
     def test_progress_bar_is_disabled_off_rank_zero(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with (
             tempfile.TemporaryDirectory() as d,
             mock.patch(
@@ -676,8 +685,9 @@ class TestTrainerController(unittest.TestCase):
             mock.patch("torch.distributed.get_rank", return_value=1),
             mock.patch("tqdm.tqdm") as build_progress,
         ):
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -690,10 +700,10 @@ class TestTrainerController(unittest.TestCase):
     def test_fit_and_checkpoint(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=3,
@@ -711,7 +721,6 @@ class TestTrainerController(unittest.TestCase):
     def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
             for index in range(4):
                 torch.save(
@@ -741,8 +750,9 @@ class TestTrainerController(unittest.TestCase):
             def ack(ids, _step):
                 queue.ack([refs_by_id[sample_id] for sample_id in ids])
 
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -764,32 +774,131 @@ class TestTrainerController(unittest.TestCase):
     def test_natural_eos_rejects_incomplete_accumulation(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=2)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(core, run_id="r", output_dir=d)
+            ctrl = _controller(
+                strat, backend, accumulation_steps=2, run_id="r", output_dir=d
+            )
             progress = mock.Mock()
             with (
                 mock.patch.object(ctrl, "_make_progress_bar", return_value=progress),
                 self.assertRaisesRegex(
-                    RuntimeError, "incomplete gradient accumulation"
+                    IncompleteWindow,
+                    "incomplete gradient accumulation: received 1 of 2",
                 ),
             ):
                 ctrl.fit([_batch() for _ in range(3)])
 
         self.assertEqual(ctrl.global_step, 1)
         self.assertEqual(backend.steps, 1)
-        self.assertEqual(core.accumulation_remainder, 1)
         self.assertEqual(backend.boundaries, [False, True, False])
         progress.close.assert_called_once_with()
+        # The third batch was consumed and never committed: a retry finds the
+        # stream exhausted and must not report the run as complete.
+        with self.assertRaisesRegex(RuntimeError, "received 1 of 2"):
+            ctrl.fit([])
+        self.assertEqual(ctrl.global_step, 1)
+
+    def test_window_that_raised_ends_the_run(self):
+        class FailingStrategy(FakeStrategy):
+            def forward_loss(self, batch, ctx=None):
+                if batch.sample_ids == ["bad"]:
+                    raise ValueError("bad batch")
+                return super().forward_loss(batch, ctx)
+
+        strat = FailingStrategy()
+        backend = FakeBackend(strat.model)
+        bad = replace(_batch(), sample_ids=["bad"])
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, backend, accumulation_steps=2, run_id="r", output_dir=d
+            )
+            with self.assertRaisesRegex(ValueError, "bad batch"):
+                ctrl.fit([_batch(), _batch(), _batch(), bad])
+            # The third batch's backward ran; skipping to the end of the data
+            # on a retry would save a checkpoint that never trained on it.
+            with self.assertRaisesRegex(RuntimeError, "never committed.*bad batch"):
+                ctrl.fit([])
+            # Saving would record a position past both uncommitted batches.
+            with self.assertRaisesRegex(RuntimeError, "cannot be saved"):
+                ctrl.save_checkpoint(ctrl.global_step)
+            self.assertEqual(os.listdir(d), [])
+        self.assertEqual(ctrl.global_step, 1)
+
+    def test_failed_acknowledgement_ends_the_run(self):
+        def ack(sample_ids, step):
+            raise OSError("ledger unavailable")
+
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                ack_fn=ack,
+            )
+            with self.assertRaisesRegex(OSError, "ledger unavailable"):
+                ctrl.fit([_batch()])
+            # The update is applied and its samples are not durable: a retry
+            # that stopped at max_steps would report the run complete.
+            self.assertEqual(ctrl.global_step, 1)
+            with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
+                ctrl.fit([])
+
+    def test_window_holds_one_micro_batch_at_a_time(self):
+        """A batch may live on the training device; none outlives its turn."""
+        for replay_statistics in ((), ("count",)):
+            with self.subTest(replay_statistics=replay_statistics):
+                alive = []
+                streamed = []
+
+                class Runner:
+                    def forward_backward(self, batch, ctx, *, is_boundary):
+                        gc.collect()
+                        alive.append(sum(ref() is not None for ref in streamed))
+                        return "pending" if is_boundary else None
+
+                    def apply_step(self, pending):
+                        return StepMetrics({"loss": 0.0})
+
+                    def prepass(self, batch, ctx):
+                        return {"count": torch.ones(1)}
+
+                    def reduce_sum(self, values):
+                        return values
+
+                def stream():
+                    for _ in range(6):
+                        # Hold nothing while suspended, as a loader would not.
+                        handed = [_batch()]
+                        streamed.append(weakref.ref(handed[0]))
+                        yield handed.pop()
+
+                Runner.replay_statistics = replay_statistics
+                strat = FakeStrategy()
+                with tempfile.TemporaryDirectory() as d:
+                    ctrl = TrainerController(
+                        Runner(),
+                        strategy=strat,
+                        backend=FakeBackend(strat.model),
+                        accumulation_steps=3,
+                        run_id="r",
+                        output_dir=d,
+                    )
+                    ctrl.fit(stream())
+                # Entering a forward, only the batch it is handed is alive; a
+                # replayed forward is handed a host copy and none is.
+                self.assertEqual(alive, [0 if replay_statistics else 1] * 6)
 
 
 class TestBestTracking(unittest.TestCase):
     def test_best_checkpoint_does_not_require_periodic_saves(self):
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
@@ -807,10 +916,10 @@ class TestBestTracking(unittest.TestCase):
         # on demand as the best even though it is not a periodic-save step.
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=3,
@@ -831,11 +940,11 @@ class TestEvalMetricsFlow(unittest.TestCase):
     def test_eval_metrics_reach_logger_and_last_metrics(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         logged = []
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
@@ -856,9 +965,10 @@ class TestEvalMetricsFlow(unittest.TestCase):
 
     def test_eval_does_not_request_the_detailed_metrics_it_discards(self):
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(core, run_id="r", output_dir=d, num_epochs=1)
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d, num_epochs=1
+            )
             metrics = ctrl.evaluate([_batch()])
         self.assertIn("eval/avg_loss", metrics)
         self.assertFalse(strat.last_ctx.collect_detailed_metrics)
@@ -885,10 +995,10 @@ class TestEvalMetricsFlow(unittest.TestCase):
             return ManagedEval(pass_id)
 
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
                 run_id="r",
                 output_dir=d,
                 max_steps=2,
@@ -916,10 +1026,10 @@ class TestResumeDataPosition(unittest.TestCase):
         # Resume mid-epoch: start_batch=k drops the first k batches of the FIRST
         # epoch only; later epochs iterate in full.
         strat = RecordingStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
                 run_id="r",
                 output_dir=d,
                 num_epochs=2,
@@ -934,10 +1044,9 @@ class TestResumeDataPosition(unittest.TestCase):
     def test_natural_exhaustion_checkpoint_records_completed_epochs(self):
         strat = RecordingStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         data = [_named_batch(i) for i in range(2)]
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(core, run_id="r", output_dir=d, num_epochs=2)
+            ctrl = _controller(strat, backend, run_id="r", output_dir=d, num_epochs=2)
             step = ctrl.fit(data)
             self.assertEqual(ctrl.epoch, 2)
             checkpoint = ctrl.save_checkpoint(step)
@@ -948,11 +1057,9 @@ class TestResumeDataPosition(unittest.TestCase):
             self.assertEqual(state["epoch_samples"], 0)
 
             resumed = RecordingStrategy()
-            resumed_core = TrainerCore(
-                resumed, FakeBackend(resumed.model), accumulation_steps=1
-            )
-            resumed_ctrl = TrainerController(
-                resumed_core,
+            resumed_ctrl = _controller(
+                resumed,
+                FakeBackend(resumed.model),
                 run_id="r2",
                 output_dir=d,
                 num_epochs=2,
@@ -968,18 +1075,18 @@ class TestResumeDataPosition(unittest.TestCase):
         # start_batch/start_samples describe ONE position; one without the other
         # is a corrupt resume.
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model))
+        backend = FakeBackend(strat.model)
         for kw in ({"start_batch": 3}, {"start_samples": 3}):
             with self.assertRaisesRegex(ValueError, "zero or nonzero together"):
-                TrainerController(core, run_id="r", output_dir="/tmp-unused", **kw)
+                _controller(strat, backend, run_id="r", output_dir="/tmp-unused", **kw)
 
     def test_islice_skip_past_end_raises(self):
         # plain-iterable fallback: a silent empty epoch is banned.
         strat = FakeStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
                 run_id="r",
                 output_dir=d,
                 num_epochs=1,
@@ -993,10 +1100,10 @@ class TestResumeDataPosition(unittest.TestCase):
         # skip == available means the epoch was fully consumed pre-restart.
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core,
+            ctrl = _controller(
+                strat,
+                backend,
                 run_id="r",
                 output_dir=d,
                 num_epochs=1,
@@ -1011,11 +1118,15 @@ class TestResumeDataPosition(unittest.TestCase):
         # a mid-epoch max_steps return keeps the live position; re-entering
         # fit() continues from it instead of re-training the prefix.
         strat = RecordingStrategy()
-        core = TrainerCore(strat, FakeBackend(strat.model), accumulation_steps=1)
         data = [_named_batch(i) for i in range(5)]
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core, run_id="r", output_dir=d, num_epochs=1, max_steps=2
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
+                run_id="r",
+                output_dir=d,
+                num_epochs=1,
+                max_steps=2,
             )
             self.assertEqual(ctrl.fit(data), 2)
             ctrl.max_steps = 4
@@ -1031,10 +1142,9 @@ class TestStepContextThreading(unittest.TestCase):
     def _last_ctx(self, **controller_kw):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
-        core = TrainerCore(strat, backend, accumulation_steps=1)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(
-                core, run_id="r", output_dir=d, num_epochs=1, **controller_kw
+            ctrl = _controller(
+                strat, backend, run_id="r", output_dir=d, num_epochs=1, **controller_kw
             )
             ctrl.fit([_batch() for _ in range(3)])
         return strat.last_ctx
