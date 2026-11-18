@@ -323,6 +323,17 @@ def build_objective_model(
         weighting=weighting,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    if (
+        attention_backend is not None
+        and attention_backend not in entry.training.attention_backends
+    ):
+        raise ValueError(
+            f"objective {name!r} does not train with attention backend "
+            f"{attention_backend!r}; it supports "
+            f"{sorted(entry.training.attention_backends)}"
+        )
+    if sequence_parallel is not None and not entry.training.supports_sequence_parallel:
+        raise ValueError(f"objective {name!r} does not support sequence parallelism")
     if resolved.execution.teacher_chunk_size:
         from torch import nn
 
