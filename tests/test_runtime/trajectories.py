@@ -151,8 +151,11 @@ def _free_port():
     The port is released before the run binds it. A port the system assigned
     could be assigned again in between, to any process that asks for one.
     """
+    # Not the seeded generator: every run reseeds it, so two recorders at once
+    # would draw the same ports.
+    ports = random.SystemRandom()
     while True:
-        port = random.randrange(10000, 30000)
+        port = ports.randrange(10000, 30000)
         with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:
             try:
                 listener.bind(("127.0.0.1", port))
