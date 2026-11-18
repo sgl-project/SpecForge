@@ -41,8 +41,20 @@ def sequence_parallel_groups() -> SequenceParallel:
         get_sp_ulysses_group,
     )
 
+    groups = {
+        "ring": get_sp_ring_group(),
+        "Ulysses": get_sp_ulysses_group(),
+        "draft sequence": get_draft_sp_group(),
+    }
+    missing = [name for name, group in groups.items() if group is None]
+    if missing:
+        # A reduction over no group is one over the world: every sample.
+        raise RuntimeError(
+            f"this process has no {', '.join(missing)} process group: "
+            "init_distributed builds the sequence-parallel groups"
+        )
     return SequenceParallel(
-        ring_group=get_sp_ring_group(),
-        ulysses_group=get_sp_ulysses_group(),
-        reduce_statistics=partial(reduce_statistics, group=get_draft_sp_group()),
+        ring_group=groups["ring"],
+        ulysses_group=groups["Ulysses"],
+        reduce_statistics=partial(reduce_statistics, group=groups["draft sequence"]),
     )

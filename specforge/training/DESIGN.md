@@ -46,23 +46,36 @@ state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
 
 ### Boundaries
 
-The parts meet through `contracts.py`, and
-`tests/test_runtime/test_training_boundaries.py` reads the rules from the
-source:
+The parts meet through `contracts.py`. `tests/test_runtime/test_training_boundaries.py`
+reads five import rules from the source:
 
-| Rule | Covers |
-|---|---|
-| A collective across samples appears only in a runner | objectives, drafts, losses, layers, the frame, the run loop and the evaluator reach neither `torch.distributed` nor `specforge.distributed` |
-| The frame meets the other parts through the contracts only | `contracts.py`, `frame.py`, `program.py` |
-| The run loop holds no runner, backend, objective or model | `controller.py`, `specforge/eval/` |
-| A runner decides from declarations, never from a registry | `runner.py`, `backend.py` |
-| A program does not know how it is trained | objectives, drafts, losses and layers import nothing from `training`, `runtime`, `launch` or `eval` |
+| Rule | Modules | May not reach |
+|---|---|---|
+| A collective across samples appears only in a runner | objectives, drafts, losses, layers; the frame; the run loop and the evaluator; the checkpoint manager, the profiler and `trainer.py` | `torch.distributed`, `specforge.distributed` |
+| The frame imports the shared contracts only | `contracts.py`, `frame.py`, `program.py` | anything else in `specforge` |
+| The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling` |
+| A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
+| A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.nn.parallel` |
 
-Each rule lists its exceptions with the reason: the model-parallel axes
-(sequence and tensor parallelism), whose groups share a sequence or a tensor
-and never samples, and the run loop's remaining reads of the process's
-topology. The list may only shrink: an exception that matches nothing fails
-the test.
+The shared contracts are `training.contracts`, `runtime.contracts` and the
+value types of `config.draft`.
+
+A module reaches a name by importing it, at module level or inside a function,
+by using it through an alias (`import torch as t; t.distributed.barrier()`),
+by a literal `importlib.import_module`, or one step through the package: a
+name another module re-exports is followed to its origin, and a helper
+function brings what its own body reaches. The scan does not see which
+process group a collective runs on, or what a method called on a value does:
+the run loop holds a runner and the scan does not stop it from reaching
+through it.
+
+Every module that breaks a rule today is listed in the test with the reason
+and with exactly the names it reaches; one more or one fewer fails. Six are a
+model-parallel axis (sequence parallelism: the cached rollout, ring attention;
+tensor parallelism: three layers), whose groups share a sequence or a tensor
+and never samples. Four are the run loop's own uses of the process group
+(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`), which the
+design moves behind `runner.agree` and a topology value.
 
 ### Conformance
 
@@ -131,10 +144,13 @@ training entry. For a save the run loop asks the runner for its
 rank 0), this rank's own optimizer and RNG state, the optimizer state that is
 the same on every rank (DDP), and the loss kernels this rank has realised. The
 ranks compare those kernels through `runner.agree` before anything is written,
-so what rank 0 records for resume holds for every rank. All saves then delegate
-to `CheckpointManager`; the shared draft state is written by rank 0 while every
-rank writes its own optimizer/RNG state. On resume the trainer hands each
-rank's saved state back through `runner.load_resume`.
+so what rank 0 records for resume holds for every rank; a rank that failed to
+collect its state reports that through the same agreement. All saves then
+delegate to `CheckpointManager`. Rank 0 writes the shared file: the draft
+state and, under DDP, the one optimizer state every rank holds. Every rank
+writes its own file: its RNG state and, under FSDP, its shard of the optimizer
+state. On resume the trainer hands each rank's saved state back through
+`runner.load_resume` and the ranks agree that it restored.
 
 DSpine declares a replay statistic: its alignment CE is normalized over the
 whole optimizer window and every rank. For such a window the frame first calls

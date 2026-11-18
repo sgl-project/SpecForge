@@ -699,6 +699,37 @@ class TestTrainerController(unittest.TestCase):
             )
             self.assertEqual(os.listdir(d), [])
 
+    def test_rank_that_cannot_collect_its_state_says_so_in_the_agreement(self):
+        program = TinyProgram()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(program, FakeBackend(program), run_id="r", output_dir=d)
+            lost = MemoryError("optimizer masters")
+            with (
+                mock.patch.object(ctrl.runner, "checkpoint_state", side_effect=lost),
+                mock.patch.object(
+                    ctrl.runner, "agree", wraps=ctrl.runner.agree
+                ) as agree,
+                self.assertRaises(MemoryError) as raised,
+            ):
+                ctrl.save_checkpoint(1)
+            # The other ranks are told, and raise, before this one raises what
+            # it failed with.
+            agree.assert_called_once_with("MemoryError: optimizer masters", value=None)
+            self.assertIs(raised.exception, lost)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_rank_told_of_another_ranks_failure_writes_nothing(self):
+        program = TinyProgram()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(program, FakeBackend(program), run_id="r", output_dir=d)
+            told = RuntimeError("rank 1: MemoryError: optimizer masters")
+            with (
+                mock.patch.object(ctrl.runner, "agree", side_effect=told),
+                self.assertRaisesRegex(RuntimeError, "rank 1: MemoryError"),
+            ):
+                ctrl.save_checkpoint(1)
+            self.assertEqual(os.listdir(d), [])
+
     def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
         program = TinyProgram()
         backend = FakeBackend(program)
