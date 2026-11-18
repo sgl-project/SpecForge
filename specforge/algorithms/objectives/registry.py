@@ -254,6 +254,7 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
+    frozen_modules=(),
     attention_backend=None,
     sequence_parallel=None,
 ):
@@ -267,6 +268,9 @@ def build_objective_model(
         target_head: Optional teacher head; it is frozen and kept in eval mode.
         loss: Common mathematical loss configuration.
         weighting: Common position-weighting configuration.
+        frozen_modules: Frozen modules of the composed model that a runner
+            keeps out of sharding and out of the optimizer (bound target
+            tables, the teacher head).
         attention_backend: The attention backend the run trains with, for a
             protocol whose rollout depends on it.
         sequence_parallel: The process groups of the sequence-parallel axis
@@ -352,6 +356,7 @@ def build_objective_model(
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,
+        frozen_modules=frozen_modules,
         attention_backend=attention_backend,
         sequence_parallel=sequence_parallel,
     )

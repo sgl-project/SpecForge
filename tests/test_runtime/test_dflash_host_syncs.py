@@ -322,7 +322,7 @@ class TestOptimizerBoundarySyncs(unittest.TestCase):
         self.assertTrue(runner.backend.checks_loss_denominator)
         self.assertEqual(self._boundary_syncs(runner), (0, 1))
 
-    def test_dp_boundary_reduces_host_scalars_without_extra_syncs(self):
+    def test_dp_boundary_reduces_device_metrics_without_extra_syncs(self):
         runner = _boundary_runner()
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
