@@ -1,0 +1,37 @@
+# coding=utf-8
+# Copyright 2024 The SpecForge team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+"""What a canonical objective model declares to the frame and a runner."""
+
+from __future__ import annotations
+
+from specforge.training.contracts import ProgramSpec
+
+
+def program_spec(model) -> ProgramSpec:
+    """Read the declarations of an objective model from its registration.
+
+    Args:
+        model: The unwrapped ``ObjectiveModel``.
+    """
+    registration = model.registration
+    if registration is None:
+        raise ValueError(
+            f"objective model {model.objective_name!r} was built without a "
+            "registration and declares nothing a runner could honour"
+        )
+    statistic = registration.training.window_statistic
+    return ProgramSpec(
+        name=model.objective_name,
+        inputs=tuple(registration.inputs),
+        replay_statistics=() if statistic is None else (statistic.argument_name,),
+        evaluation_diagnostics=registration.training.evaluation_diagnostics,
+    )
+
+
+__all__ = ["program_spec"]

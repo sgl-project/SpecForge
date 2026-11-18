@@ -7,7 +7,6 @@ import torch
 from specforge.modeling.draft.layers.conv.grouped_causal import GroupedCausalConv
 from specforge.modeling.draft.layers.kernels import configure_kernels, liger_hidden_act
 from specforge.training.canonical import liger_choice
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_config.test_recipe_execution_defaults import protocol_chunk
 
@@ -91,16 +90,10 @@ class KernelDefaultsTest(unittest.TestCase):
             with self.subTest(architecture=architecture):
                 self.assertEqual(protocol_chunk(architecture), expected)
 
-    def test_strategy_reports_the_implementations_it_resolved(self):
+    def test_objective_model_reports_the_implementations_it_resolved(self):
         _, runtime = build_runtime("DFlashDraftModel")
-        strategy = CanonicalTrainStrategy(
-            runtime,
-            name="dflash",
-            objective="dflash",
-            required_features=runtime.registration.inputs,
-        )
         runtime.loss_implementations.names["0:0"] = "reference"
-        kernels = strategy.kernels()
+        kernels = runtime.kernel_record()
         self.assertEqual(kernels, {"0:0": "reference"})
         # A copy: what a checkpoint compares must not change under it.
         self.assertIsNot(kernels, runtime.loss_implementations.names)

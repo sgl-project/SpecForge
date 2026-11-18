@@ -44,7 +44,6 @@ def _assemble_trainer(
     store: FeatureStore,
     ref_source: dict,  # {"refs": [...]} re-iterable (offline) | {"queue": q} stream (online)
     model,
-    target_head,
     optimizer_factory,
     run_id: str,
     output_dir: str,
@@ -79,7 +78,7 @@ def _assemble_trainer(
     on_fit_finally: Optional[Callable[[], None]] = None,
 ):
     """Delegate to the domain ``Trainer`` (``specforge.training``) — the one
-    assembly (FSDP wrap, optimizer-after-wrap, per-step strategy, loader, acks)
+    assembly (FSDP wrap, optimizer-after-wrap, step runner, loader, acks)
     shared by every trainer-bearing builder.
     """
     from specforge.algorithms.common.providers import (
@@ -87,6 +86,7 @@ def _assemble_trainer(
         StepRuntimeConfig,
     )
     from specforge.training import Trainer
+    from specforge.training.program import program_spec
 
     if not isinstance(strategy_kwargs, StepRuntimeConfig):
         if resume_from is not None:
@@ -114,12 +114,11 @@ def _assemble_trainer(
 
     trainer = Trainer(
         algorithm_name=algorithm.name,
-        make_step_strategy=algorithm.providers.step.build,
         controller=controller,
         store=store,
         ref_source=ref_source,
         model=model,
-        target_head=target_head,
+        program_spec=program_spec(model),
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
@@ -628,9 +627,6 @@ def build_offline_runtime(
         store=store,
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
-        target_head=(
-            target_head if algorithm.providers.step.uses_external_target_head else None
-        ),
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
@@ -750,9 +746,6 @@ def build_disagg_offline_runtime(
         store=feature_store,
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
-        target_head=(
-            target_head if algorithm.providers.step.uses_external_target_head else None
-        ),
         optimizer_factory=optimizer_factory,
         run_id=run_id,
         output_dir=output_dir,
@@ -1889,11 +1882,6 @@ def build_disagg_online_consumer(
                 "defer_ack_until_durable": True,
             },
             model=draft_model,
-            target_head=(
-                target_head
-                if algorithm.providers.step.uses_external_target_head
-                else None
-            ),
             optimizer_factory=optimizer_factory,
             run_id=run_id,
             output_dir=output_dir,

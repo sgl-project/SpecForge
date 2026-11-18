@@ -13,6 +13,9 @@ class ObjectiveResult:
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
     sums: dict[str, Tensor] = field(default_factory=dict)
+    #: This rank's sums of each statistic the objective needs pooled over a
+    #: window, by name; filled by a prepass only.
+    statistics: dict[str, Tensor] = field(default_factory=dict)
 
     @property
     def loss(self):
@@ -215,9 +218,64 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def forward(self, batch, *, step, total_steps, **context):
+    def host_inputs(self, tensors):
+        """Extra batch tensors the objective derives on the host, before placement."""
+        prepare = self.registration.training.host_inputs if self.registration else None
+        if prepare is None:
+            return {}
+        return prepare(tensors, self.draft_model.config.draft)
+
+    def kernel_record(self):
+        """The loss kernels resolved so far, by the group they compute."""
+        return dict(self.loss_implementations.names)
+
+    def draft_state(self, state):
+        """The draft's entries of this module's state dict, under the draft's keys.
+
+        A parameter the draft holds under several names is kept under its
+        first name only.
+        """
+        seen, repeated = set(), set()
+        for key, value in self.draft_model.named_parameters(remove_duplicate=False):
+            if id(value) in seen:
+                repeated.add(key)
+            seen.add(id(value))
+        prefix = "draft_model."
+        return {
+            key[len(prefix) :]: value
+            for key, value in state.items()
+            if key.startswith(prefix) and key[len(prefix) :] not in repeated
+        }
+
+    def forward(
+        self, batch, *, step, total_steps, replay_values=None, prepass=False, **context
+    ):
+        """Run the objective on one batch.
+
+        Args:
+            batch: Captured batch tensors.
+            step: Optimizer updates applied so far.
+            total_steps: The schedule's horizon, or None.
+            replay_values: For an objective that declares a window statistic,
+                its sums over the whole optimizer window and every rank. The
+                ratio the objective uses, and its guard, are formed here.
+            prepass: Collect the window statistic only: the objective runs
+                with the statistic's value at zero and the result carries this
+                rank's sums of it.
+            **context: Passed to the objective.
+        """
         from .inputs import valid_tokens
 
+        statistic = (
+            self.registration.training.window_statistic if self.registration else None
+        )
+        if statistic is not None and prepass:
+            device = next(self.parameters()).device
+            context[statistic.argument_name] = torch.zeros((), device=device)
+        elif statistic is not None and replay_values:
+            numerator, denominator = replay_values[statistic.argument_name]
+            denominator = denominator.where(denominator > 0, 1)
+            context[statistic.argument_name] = (numerator / denominator).detach()
         valid_tokens(batch)
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
@@ -251,6 +309,10 @@ class ObjectiveModel(nn.Module):
                 ratios, sums = prepared.diagnostics()
             result.ratios.update(ratios)
             result.sums.update(sums)
+        if statistic is not None and prepass:
+            result.statistics[statistic.argument_name] = torch.stack(
+                result.ratios[statistic.ratio_name]
+            )
         return result
 
 

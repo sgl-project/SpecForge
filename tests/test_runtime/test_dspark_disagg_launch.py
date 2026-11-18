@@ -4,7 +4,7 @@
 The real DSpark producer requires SGLang server capture. This test starts at the
 same Mooncake ``SampleRef`` boundary with shape-real synthetic server features,
 then exercises the production ref distributor, durable acknowledgements,
-DSpark strategy, FSDP forward/backward, and BF16 optimizer step. No network or
+DSpark objective, FSDP forward/backward, and BF16 optimizer step. No network or
 external model is required.
 """
 
@@ -36,7 +36,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
         )
-        from specforge.training.strategies.canonical import CanonicalTrainStrategy
+        from specforge.training.program import program_spec
 
         torch.manual_seed(17)
         torch.cuda.manual_seed_all(17)
@@ -85,9 +85,10 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
             log_interval=1,
         )
 
-        strategy = trainer.runner.strategy
-        self.assertIsInstance(strategy, CanonicalTrainStrategy)
-        self.assertIsInstance(strategy.model, FSDP)
+        program = trainer.runner.program
+        self.assertIsInstance(program, FSDP)
+        self.assertIs(program.module, model)
+        self.assertEqual(trainer.runner.spec, program_spec(model))
         self.assertEqual(
             {cls.__name__ for cls in trainer.backend.auto_wrap_block_classes},
             {"DecoderLayer"},

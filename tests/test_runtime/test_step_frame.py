@@ -7,17 +7,19 @@ from unittest import mock
 import torch
 from torch import nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import (
     IncompleteWindow,
     PendingStep,
     RankFailure,
+    StepContext,
     StepMetrics,
 )
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext, StepOutput
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 
 def batch(value):
@@ -164,52 +166,50 @@ class RunWindowTest(unittest.TestCase):
                 self.assertNotIn("apply_step", [call[0] for call in runner.calls])
 
 
-class _Strategy:
-    replay_statistics = ()
-
+class _Program(FakeProgram):
     def __init__(self):
-        self.model = nn.Linear(1, 1, bias=False)
+        super().__init__()
+        self.linear = nn.Linear(1, 1, bias=False)
 
-    def trainable_module(self):
-        return self.model
-
-    def forward_loss(self, batch, ctx=None):
-        numerator = self.model(batch.tensors["x"]).sum()
-        return StepOutput(
-            loss=numerator, metrics={}, loss_terms=(numerator, torch.ones(()))
-        )
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ):
+        return ObjectiveResult(self.linear(tensors["x"]).sum(), torch.ones(()))
 
 
-class _ReplayStrategy(_Strategy):
-    replay_statistics = ("count",)
+class _ReplayProgram(_Program):
+    """Declares the ``count`` statistic; a prepass reports one per micro-batch."""
 
-    def prepass(self, batch, ctx):
-        return replace(
-            self.forward_loss(batch, ctx), statistics={"count": torch.ones(1)}
-        )
+    def forward(self, tensors, *, prepass=False, replay_values=None, **context):
+        result = super().forward(tensors, **context)
+        if prepass:
+            result.statistics["count"] = torch.ones(1)
+        return result
 
 
-def runner_over(strategy):
+def runner_over(program, **declarations):
     backend = FSDPTrainingBackend(
         ParallelConfig(),
         optimizer_factory=lambda module: torch.optim.SGD(module.parameters(), lr=0.1),
     )
-    backend.prepare_model(strategy.model, wrap=False)
-    return DataParallelRunner(strategy, backend)
+    backend.prepare_model(program, wrap=False)
+    if isinstance(program, _ReplayProgram):
+        declarations.setdefault("replay_statistics", ("count",))
+    return DataParallelRunner(program, backend, fake_spec("x", **declarations))
 
 
-class _EvaluatedStrategy(_Strategy):
-    evaluation_diagnostics = False
-
+class _EvaluatedProgram(_Program):
     def __init__(self):
         super().__init__()
         self.seen = []
 
-    def forward_loss(self, batch, ctx=None):
+    def forward(self, tensors, *, collect_detailed_metrics, **context):
         self.seen.append(
-            (self.model.training, torch.is_grad_enabled(), ctx.collect_detailed_metrics)
+            (self.training, torch.is_grad_enabled(), collect_detailed_metrics)
         )
-        return super().forward_loss(batch, ctx)
+        return super().forward(
+            tensors, collect_detailed_metrics=collect_detailed_metrics, **context
+        )
 
 
 class RunnerModeTest(unittest.TestCase):
@@ -217,42 +217,41 @@ class RunnerModeTest(unittest.TestCase):
         for was_training in (True, False):
             for diagnostics in (False, True):
                 with self.subTest(was_training=was_training, diagnostics=diagnostics):
-                    strategy = _EvaluatedStrategy()
-                    strategy.evaluation_diagnostics = diagnostics
-                    strategy.model.train(was_training)
-                    runner = runner_over(strategy)
+                    program = _EvaluatedProgram()
+                    program.train(was_training)
+                    runner = runner_over(program, evaluation_diagnostics=diagnostics)
                     # What the program declares decides, not the caller's context.
                     ctx = StepContext(collect_detailed_metrics=not diagnostics)
                     with runner.evaluation():
                         output = runner.evaluate(batch(1), ctx)
                         # Evaluation mode holds between the batches of a pass.
-                        self.assertFalse(strategy.model.training)
+                        self.assertFalse(program.training)
                         runner.evaluate(batch(2), ctx)
-                    self.assertEqual(strategy.seen, [(False, False, diagnostics)] * 2)
+                    self.assertEqual(program.seen, [(False, False, diagnostics)] * 2)
                     self.assertFalse(output.loss.requires_grad)
-                    self.assertEqual(strategy.model.training, was_training)
+                    self.assertEqual(program.training, was_training)
 
     def test_pass_without_batches_leaves_the_mode_as_it_was(self):
-        strategy = _EvaluatedStrategy()
-        runner = runner_over(strategy)
+        program = _EvaluatedProgram()
+        runner = runner_over(program)
         with runner.evaluation():
-            self.assertFalse(strategy.model.training)
-        self.assertTrue(strategy.model.training)
+            self.assertFalse(program.training)
+        self.assertTrue(program.training)
 
     def test_failed_evaluation_restores_the_mode(self):
-        class Strategy(_EvaluatedStrategy):
-            def forward_loss(self, batch, ctx=None):
+        class Program(_EvaluatedProgram):
+            def forward(self, tensors, **context):
                 raise ValueError("bad batch")
 
-        strategy = Strategy()
-        runner = runner_over(strategy)
+        program = Program()
+        runner = runner_over(program)
         with self.assertRaisesRegex(ValueError, "bad batch"):
             with runner.evaluation():
                 runner.evaluate(batch(1), StepContext())
-        self.assertTrue(strategy.model.training)
+        self.assertTrue(program.training)
 
     def test_evaluate_belongs_to_a_pass(self):
-        runner = runner_over(_EvaluatedStrategy())
+        runner = runner_over(_EvaluatedProgram())
         with self.assertRaisesRegex(RuntimeError, "inside an evaluation"):
             runner.evaluate(batch(1), StepContext())
         with runner.evaluation():
@@ -262,30 +261,30 @@ class RunnerModeTest(unittest.TestCase):
         run_window(runner, [batch(2)], StepContext())
 
     def test_training_calls_put_the_whole_model_in_training_mode(self):
-        class Strategy(_EvaluatedStrategy):
+        class Program(_EvaluatedProgram):
             """A training-mode module around a draft that was left in evaluation mode."""
 
             def __init__(self):
                 super().__init__()
-                self.model.draft = nn.Linear(1, 1)
-                self.model.draft.eval()
+                self.draft = nn.Linear(1, 1)
+                self.draft.eval()
 
-        strategy = Strategy()
-        self.assertTrue(strategy.model.training)
-        runner = runner_over(strategy)
+        program = Program()
+        self.assertTrue(program.training)
+        runner = runner_over(program)
         run_window(runner, [batch(1)], StepContext())
-        self.assertTrue(strategy.model.draft.training)
+        self.assertTrue(program.draft.training)
         # After an evaluation pass as well, on a rank that had no batch to restore it.
         with runner.evaluation():
             pass
-        strategy.model.draft.eval()
+        program.draft.eval()
         run_window(runner, [batch(2)], StepContext())
-        self.assertTrue(strategy.model.draft.training)
+        self.assertTrue(program.draft.training)
 
 
 class RunnerReductionTest(unittest.TestCase):
     def test_sum_and_maximum_are_taken_over_the_ranks(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         calls = []
 
         def all_reduce(values, *, op, group):
@@ -311,7 +310,7 @@ class RunnerReductionTest(unittest.TestCase):
         )
 
     def test_one_rank_reduces_nothing(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         values = torch.tensor([3])
         with mock.patch("torch.distributed.all_reduce") as reduce:
             self.assertIs(runner.reduce_max(values), values)
@@ -334,7 +333,7 @@ class RunnerAgreementTest(unittest.TestCase):
         )
 
     def agree(self, others, error=None, value=None):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         patches = self.gathered(others)
         with patches[0], patches[1], patches[2], patches[3]:
             runner.agree(error, value=value)
@@ -355,7 +354,7 @@ class RunnerAgreementTest(unittest.TestCase):
             self.agree((None, {"0:0": "token_ce"}), value={"0:0": "reference"})
 
     def test_one_process_gathers_nothing(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         with (
             mock.patch("torch.distributed.is_initialized", return_value=False),
             mock.patch("torch.distributed.all_gather_object") as gather,
@@ -366,7 +365,7 @@ class RunnerAgreementTest(unittest.TestCase):
         gather.assert_not_called()
 
     def test_group_of_one_agrees_with_itself(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
             mock.patch("torch.distributed.is_initialized", return_value=True),
@@ -389,15 +388,17 @@ class RunnerAgreementTest(unittest.TestCase):
 
 class RunnerCheckpointTest(unittest.TestCase):
     def test_state_is_the_backends_split_by_who_saves_it(self):
-        strategy = _Strategy()
-        strategy.checkpoint_state_filter = lambda state: {
-            name.upper(): tensor for name, tensor in state.items()
-        }
-        strategy.kernels = lambda: {"0:0": "reference"}
-        runner = runner_over(strategy)
+        class Program(_Program):
+            def draft_state(self, state):
+                return {name.upper(): tensor for name, tensor in state.items()}
+
+            def kernel_record(self):
+                return {"0:0": "reference"}
+
+        runner = runner_over(Program())
         run_window(runner, [batch(1)], StepContext())
         state = runner.checkpoint_state()
-        self.assertEqual(list(state.draft), ["WEIGHT"])
+        self.assertEqual(list(state.draft), ["LINEAR.WEIGHT"])
         # One process shards nothing: the optimizer state is this rank's own.
         self.assertIsNone(state.replicated)
         self.assertEqual(sorted(state.rank), ["optimizer", "rng"])
@@ -405,15 +406,12 @@ class RunnerCheckpointTest(unittest.TestCase):
         self.assertEqual(state.kernels, {"0:0": "reference"})
 
     def test_resume_restores_the_optimizer_and_the_generator(self):
-        strategy = _Strategy()
-        strategy.checkpoint_state_filter = lambda state: state
-        strategy.kernels = dict
-        runner = runner_over(strategy)
+        runner = runner_over(_Program())
         # State a fresh optimizer does not have.
         runner.backend.optimizer.param_groups[0]["lr"] = 0.025
         saved = runner.checkpoint_state().rank
         expected = torch.rand(3)
-        resumed = runner_over(_Strategy())
+        resumed = runner_over(_Program())
         self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.1)
         resumed.load_resume(saved)
         self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.025)
@@ -421,10 +419,12 @@ class RunnerCheckpointTest(unittest.TestCase):
 
     def test_only_the_first_rank_selects_the_draft_weights(self):
         """The others hold nothing of the model, or under sharding a part of it."""
-        strategy = _Strategy()
-        strategy.checkpoint_state_filter = lambda state: {"w": state["weight"]}
-        strategy.kernels = dict
-        runner = runner_over(strategy)
+
+        class Program(_Program):
+            def draft_state(self, state):
+                return {"w": state["linear.weight"]}
+
+        runner = runner_over(Program())
         self.assertEqual(list(runner.checkpoint_state().draft), ["w"])
         partial = {**runner.backend.state_dict(), "model": {"frozen_table": 0}}
         for rank, selected in ((0, True), (1, False)):
@@ -444,7 +444,7 @@ class RunnerCheckpointTest(unittest.TestCase):
                     self.assertEqual(runner.checkpoint_state().draft, {})
 
     def test_failure_after_the_gather_is_this_ranks_alone(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         optimizer = runner.backend.optimizer
         with mock.patch.object(
             optimizer, "state_dict", side_effect=MemoryError("masters")
@@ -467,7 +467,7 @@ class RunnerCheckpointTest(unittest.TestCase):
 
 class RunnerRefusalTest(unittest.TestCase):
     def test_step_is_applied_once(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         pending = runner.forward_backward(batch(1), StepContext(), is_boundary=True)
         runner.apply_step(pending)
         with self.assertRaisesRegex(RuntimeError, "another window"):
@@ -476,14 +476,14 @@ class RunnerRefusalTest(unittest.TestCase):
             pending.take()
 
     def test_next_window_waits_for_the_pending_step(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         runner.forward_backward(batch(1), StepContext(), is_boundary=True)
         with self.assertRaisesRegex(RuntimeError, "has not been applied"):
             runner.forward_backward(batch(2), StepContext(), is_boundary=True)
 
     def test_boundary_has_to_close_the_window(self):
         ctx = StepContext(accumulation_steps=2)
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         with self.assertRaisesRegex(RuntimeError, "does not close it"):
             runner.forward_backward(batch(1), ctx, is_boundary=True)
         runner.forward_backward(batch(1), ctx, is_boundary=False)
@@ -491,7 +491,7 @@ class RunnerRefusalTest(unittest.TestCase):
             runner.forward_backward(batch(2), ctx, is_boundary=False)
 
     def test_window_keeps_the_length_it_started_with(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         runner.forward_backward(
             batch(1), StepContext(accumulation_steps=3), is_boundary=False
         )
@@ -501,79 +501,75 @@ class RunnerRefusalTest(unittest.TestCase):
             )
 
     def test_replayed_window_keeps_the_length_of_its_first_prepass(self):
-        runner = runner_over(_ReplayStrategy())
+        runner = runner_over(_ReplayProgram())
         runner.prepass(batch(1), StepContext(accumulation_steps=3))
         with self.assertRaisesRegex(RuntimeError, "accumulates 3 micro-batches"):
             runner.prepass(batch(2), StepContext(accumulation_steps=2))
 
     def test_malformed_metric_raises_before_the_update(self):
-        class Strategy(_Strategy):
-            def forward_loss(self, batch, ctx=None):
-                output = super().forward_loss(batch, ctx)
+        class Program(_Program):
+            def forward(self, tensors, **context):
+                result = super().forward(tensors, **context)
                 count = torch.ones(())
                 return replace(
-                    output,
-                    ratio_metrics={"seen": (count, count)},
-                    sum_metrics={"seen": count},
+                    result, ratios={"seen": (count, count)}, sums={"seen": count}
                 )
 
-        strategy = Strategy()
-        runner = runner_over(strategy)
-        before = strategy.model.weight.detach().clone()
+        program = Program()
+        runner = runner_over(program)
+        before = program.linear.weight.detach().clone()
         with self.assertRaisesRegex(ValueError, "must be distinct"):
             run_window(runner, [batch(1), batch(2)], StepContext(accumulation_steps=2))
         # Found at the first micro-batch: no backward, no optimizer step.
-        self.assertIsNone(strategy.model.weight.grad)
-        torch.testing.assert_close(strategy.model.weight, before, rtol=0, atol=0)
+        self.assertIsNone(program.linear.weight.grad)
+        torch.testing.assert_close(program.linear.weight, before, rtol=0, atol=0)
 
     def test_metric_name_reused_across_micro_batches_raises_before_the_update(self):
-        class Strategy(_Strategy):
+        class Program(_Program):
             calls = 0
 
-            def forward_loss(self, batch, ctx=None):
-                output = super().forward_loss(batch, ctx)
+            def forward(self, tensors, **context):
+                result = super().forward(tensors, **context)
                 count = torch.ones(())
                 self.calls += 1
                 if self.calls == 1:
-                    return replace(output, ratio_metrics={"seen": (count, count)})
-                return replace(output, sum_metrics={"seen": count})
+                    return replace(result, ratios={"seen": (count, count)})
+                return replace(result, sums={"seen": count})
 
-        strategy = Strategy()
-        runner = runner_over(strategy)
-        before = strategy.model.weight.detach().clone()
+        program = Program()
+        runner = runner_over(program)
+        before = program.linear.weight.detach().clone()
         with self.assertRaisesRegex(ValueError, "must be distinct"):
             run_window(runner, [batch(1), batch(2)], StepContext(accumulation_steps=2))
-        torch.testing.assert_close(strategy.model.weight, before, rtol=0, atol=0)
+        torch.testing.assert_close(program.linear.weight, before, rtol=0, atol=0)
 
     def test_failed_backward_ends_the_runner(self):
-        class Strategy(_Strategy):
+        class Program(_Program):
             detach = True
 
-            def forward_loss(self, batch, ctx=None):
-                output = super().forward_loss(batch, ctx)
+            def forward(self, tensors, **context):
+                result = super().forward(tensors, **context)
                 if not self.detach:
-                    return output
-                numerator, denominator = output.loss_terms
-                return replace(output, loss_terms=(numerator.detach(), denominator))
+                    return result
+                return replace(result, numerator=result.numerator.detach())
 
-        strategy = Strategy()
-        runner = runner_over(strategy)
+        program = Program()
+        runner = runner_over(program)
         with self.assertRaisesRegex(RuntimeError, "does not require grad"):
             run_window(runner, [batch(1)], StepContext())
         # Its denominator is already in the window's totals.
-        strategy.detach = False
+        program.detach = False
         with self.assertRaisesRegex(RuntimeError, "runner cannot continue"):
             run_window(runner, [batch(2)], StepContext())
 
     def test_failed_step_blocks_the_next_window(self):
-        class Strategy(_Strategy):
-            def forward_loss(self, batch, ctx=None):
-                output = super().forward_loss(batch, ctx)
+        class Program(_Program):
+            def forward(self, tensors, **context):
                 return replace(
-                    output, loss_terms=(output.loss_terms[0], torch.zeros(()))
+                    super().forward(tensors, **context), denominator=torch.zeros(())
                 )
 
-        runner = runner_over(Strategy())
+        runner = runner_over(Program())
         pending = runner.forward_backward(batch(1), StepContext(), is_boundary=True)
         with self.assertRaisesRegex(ValueError, "finite and positive"):
             runner.apply_step(pending)
@@ -582,37 +578,37 @@ class RunnerRefusalTest(unittest.TestCase):
             runner.forward_backward(batch(2), StepContext(), is_boundary=True)
 
     def test_failed_prepass_leaves_nothing_to_pair(self):
-        class Strategy(_ReplayStrategy):
+        class Program(_ReplayProgram):
             fail = True
 
-            def prepass(self, batch, ctx):
-                if self.fail:
+            def forward(self, tensors, *, prepass=False, **context):
+                if prepass and self.fail:
                     raise ValueError("missing feature")
-                return super().prepass(batch, ctx)
+                return super().forward(tensors, prepass=prepass, **context)
 
-        strategy = Strategy()
-        runner = runner_over(strategy)
+        program = Program()
+        runner = runner_over(program)
         with self.assertRaisesRegex(ValueError, "missing feature"):
             run_window(runner, [batch(1)], StepContext())
-        strategy.fail = False
+        program.fail = False
         self.assertIsNotNone(run_window(runner, [batch(1)], StepContext()).loss)
 
     def test_runner_left_inside_a_window_cannot_start_another(self):
         ctx = StepContext(accumulation_steps=2)
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         with self.assertRaises(IncompleteWindow):
             run_window(runner, [batch(1)], ctx)
         with self.assertRaisesRegex(RuntimeError, "does not close it"):
             run_window(runner, [batch(2), batch(3)], ctx)
 
     def test_declared_replay_statistic_cannot_be_skipped(self):
-        runner = runner_over(_ReplayStrategy())
+        runner = runner_over(_ReplayProgram())
         with self.assertRaisesRegex(RuntimeError, "were not pooled"):
             runner.forward_backward(batch(1), StepContext(), is_boundary=True)
 
     def test_replay_pairs_every_prepass_of_the_window(self):
         ctx = StepContext(accumulation_steps=2)
-        runner = runner_over(_ReplayStrategy())
+        runner = runner_over(_ReplayProgram())
         with self.assertRaises(IncompleteWindow):
             run_window(runner, [batch(1)], ctx)
         # The abandoned window's prepass would shift every later pairing.
@@ -620,7 +616,7 @@ class RunnerRefusalTest(unittest.TestCase):
             run_window(runner, [batch(2), batch(3)], ctx)
 
     def test_replay_values_need_a_declaration(self):
-        runner = runner_over(_Strategy())
+        runner = runner_over(_Program())
         ctx = StepContext(replay_values={"count": torch.ones(1)})
         with self.assertRaisesRegex(RuntimeError, "declares no replay statistic"):
             runner.forward_backward(batch(1), ctx, is_boundary=True)

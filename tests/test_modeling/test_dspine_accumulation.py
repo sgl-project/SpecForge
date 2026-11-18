@@ -10,17 +10,15 @@ import torch
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-from specforge.training.contracts import IncompleteWindow
+from specforge.training.contracts import IncompleteWindow, StepContext
 from specforge.training.controller import TrainerController
-from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
 from tests.test_modeling.test_dspine_distributed import (
     fixed_anchors,
     per_microbatch_objective,
     uneven_batch,
 )
-from tests.test_runtime._fixtures import build_strategy, train_window
+from tests.test_runtime._fixtures import build_runner, train_window
 
 
 class RecordingOptimizer:
@@ -43,7 +41,7 @@ def training_runner(model):
     backend.prepare_model(model, wrap=False)
     optimizer = RecordingOptimizer(model)
     backend.set_optimizer(optimizer)
-    return DataParallelRunner(build_strategy(model), backend), optimizer
+    return build_runner(model, backend), optimizer
 
 
 class DSpineAccumulationTest(unittest.TestCase):
@@ -145,14 +143,18 @@ class DSpineAccumulationTest(unittest.TestCase):
         forwards = []
         model.register_forward_pre_hook(
             lambda _module, _args, kwargs: forwards.append(
-                (torch.is_grad_enabled(), kwargs["alignment_ce"])
+                (
+                    torch.is_grad_enabled(),
+                    kwargs.get("prepass", False),
+                    kwargs.get("replay_values"),
+                )
             ),
             with_kwargs=True,
         )
         with TemporaryDirectory() as directory:
             controller = TrainerController(
                 runner,
-                strategy_name=runner.strategy.name,
+                strategy_name=runner.spec.name,
                 accumulation_steps=2,
                 run_id="dspine-evaluation",
                 output_dir=directory,
@@ -162,8 +164,9 @@ class DSpineAccumulationTest(unittest.TestCase):
             metrics = controller.evaluate(
                 [TrainBatch(["0", "1"], "dspine", training_inputs())]
             )
-        # One forward without gradients, on the batch's own statistic.
-        self.assertEqual(forwards, [(False, None)])
+        # One forward without gradients, on the batch's own statistic: neither
+        # a prepass nor the replay of one.
+        self.assertEqual(forwards, [(False, False, None)])
         self.assertTrue(torch.isfinite(torch.tensor(metrics["eval/avg_loss"])))
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
@@ -229,7 +232,7 @@ class DSpineAccumulationTest(unittest.TestCase):
             (runner, optimizer) = training_runner(model)
             controller = TrainerController(
                 runner,
-                strategy_name=runner.strategy.name,
+                strategy_name=runner.spec.name,
                 accumulation_steps=2,
                 run_id="dspine-incomplete",
                 output_dir=tmp_path,
