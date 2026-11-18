@@ -550,6 +550,11 @@ def build_bundle(cfg, algorithm):
                 "vocab_mapping_path disagrees with the loaded draft vocabulary"
             )
         model.vocabulary.load_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
+    sequence_parallel = None
+    if cfg.training.attention_backend == "usp":
+        from .sequence_parallel import sequence_parallel_groups
+
+        sequence_parallel = sequence_parallel_groups()
     runtime = build_objective_model(
         model,
         **_objective_settings(cfg),
@@ -557,12 +562,9 @@ def build_bundle(cfg, algorithm):
         target_head=teacher,
         frozen_modules=[model.get_submodule(name) for name in draft.target_bindings]
         + ([teacher] if teacher is not None else []),
+        attention_backend=cfg.training.attention_backend,
+        sequence_parallel=sequence_parallel,
     )
-    runtime.attention_backend = cfg.training.attention_backend
-    if cfg.training.attention_backend == "usp":
-        from .sequence_parallel import configure_sequence_parallel
-
-        configure_sequence_parallel(runtime)
     runtime.fsdp_param_dtype = dtype
     contract = {
         "canonical_draft_config": encode_config(draft),

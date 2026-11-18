@@ -283,6 +283,8 @@ def build_objective_model(
     loss=None,
     weighting=None,
     frozen_modules=(),
+    attention_backend=None,
+    sequence_parallel=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -298,6 +300,11 @@ def build_objective_model(
         frozen_modules: Frozen modules of the composed model that a runner
             keeps out of sharding and out of the optimizer (bound target
             tables, the teacher head).
+        attention_backend: The attention backend the run trains with, for a
+            protocol whose rollout depends on it.
+        sequence_parallel: The process groups of the sequence-parallel axis
+            (ring group, Ulysses group and the reduction of loss statistics
+            over one sequence), when the run has one.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -380,6 +387,8 @@ def build_objective_model(
         frozen_parameters=frozen,
         execution=resolved.execution,
         frozen_modules=frozen_modules,
+        attention_backend=attention_backend,
+        sequence_parallel=sequence_parallel,
     )
 
 
