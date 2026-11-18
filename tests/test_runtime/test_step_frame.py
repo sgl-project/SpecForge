@@ -352,11 +352,35 @@ class RunnerAgreementTest(unittest.TestCase):
 
     def test_one_process_gathers_nothing(self):
         runner = runner_over(_Program())
-        with mock.patch("torch.distributed.all_gather_object") as gather:
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+            mock.patch("torch.distributed.all_gather_object") as gather,
+        ):
             runner.agree(None, value={"0:0": "reference"})
             with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
                 runner.agree("disk full")
         gather.assert_not_called()
+
+    def test_group_of_one_agrees_with_itself(self):
+        runner = runner_over(_Program())
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=1),
+            mock.patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda out, mine, group: out.__setitem__(0, mine),
+            ) as gather,
+        ):
+            # One outcome has nothing to differ from, whatever ``==`` says of it.
+            runner.agree(None, value=float("nan"))
+            with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
+                runner.agree("disk full")
+        self.assertEqual(gather.call_count, 2)
+
+    def test_empty_error_is_an_error(self):
+        with self.assertRaisesRegex(RuntimeError, "rank 1: $"):
+            self.agree(("", None))
 
 
 class RunnerCheckpointTest(unittest.TestCase):
@@ -380,11 +404,30 @@ class RunnerCheckpointTest(unittest.TestCase):
 
     def test_resume_restores_the_optimizer_and_the_generator(self):
         runner = runner_over(_Program())
+        # State a fresh optimizer does not have.
+        runner.backend.optimizer.param_groups[0]["lr"] = 0.025
         saved = runner.checkpoint_state().rank
         expected = torch.rand(3)
         resumed = runner_over(_Program())
+        self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.1)
         resumed.load_resume(saved)
+        self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.025)
         torch.testing.assert_close(torch.rand(3), expected, rtol=0, atol=0)
+
+    def test_rank_without_model_state_selects_nothing(self):
+        """Only the first rank of a wrapped model holds the gathered weights."""
+
+        class Program(_Program):
+            def draft_state(self, state):
+                return {"w": state["linear.weight"]}
+
+        runner = runner_over(Program())
+        self.assertEqual(list(runner.checkpoint_state().draft), ["w"])
+        full = runner.backend.state_dict
+        with mock.patch.object(
+            runner.backend, "state_dict", lambda: {**full(), "model": {}}
+        ):
+            self.assertEqual(runner.checkpoint_state().draft, {})
 
 
 class RunnerRefusalTest(unittest.TestCase):
