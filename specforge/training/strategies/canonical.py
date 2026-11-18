@@ -1,6 +1,7 @@
 """Adapt additive objective results to the existing distributed trainer."""
 
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -50,6 +51,14 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             return {}
         return self.statistics.step(process_group=process_group)
 
+    def prepare_statistics(self, output, *, keep, pooled, process_group=None):
+        """The statistics-preparation stage: pooling over ranks is the training layer's, as the step is."""
+        if self.statistics is None:
+            return None
+        return self.statistics.balance(
+            output, keep=keep, pooled=pooled, process_group=process_group
+        )
+
     def before_checkpoint(self):
         # What rank 0 records for resume has to hold for every rank.
         model = self.model
@@ -87,19 +96,17 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             step=ctx.global_step,
             total_steps=ctx.total_steps,
             collect_detailed_metrics=ctx.collect_detailed_metrics,
+            prepare_statistics=partial(
+                self.prepare_statistics,
+                pooled=self.model.training and torch.is_grad_enabled(),
+                process_group=ctx.process_group,
+            ),
             **(
                 {self.window_statistic.argument_name: window_value}
                 if self.window_statistic
                 else {}
             ),
         )
-        if result.deferred is not None:
-            # The objective's term is unfinished: pooling over ranks is the strategy's, as above.
-            result = result.deferred.finish(
-                result,
-                pooled=self.model.training and torch.is_grad_enabled(),
-                process_group=ctx.process_group,
-            )
         counts = depth_ratios(result.ratios, "acc")
         metrics = (
             {

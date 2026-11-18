@@ -6,7 +6,6 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import Tensor
 
-from .base import DeferredTerm
 from .losses import TokenLoss
 from .plan import LossPlan
 from .projection import Projection
@@ -227,5 +226,3 @@ class PredictionBatch:
     #: Under "sum_means": callable(per-set PlanResults) returning detached ratio
     #: pairs that name what each set's loss already computed.
     set_metrics: Callable | None = None
-    # A term the training layer finishes before the loss is read; None without one.
-    deferred: DeferredTerm | None = None

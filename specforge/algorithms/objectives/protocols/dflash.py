@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 from ..base import check_options
+from ..configuration import LossDefinition
 from ..diagnostics import block_diagnostics, diagnostic_requirements, report_token_loss
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import TokenLoss, decay_weighting
+from ..plan import LossPlan, LossTerm
 from ..predictions import PredictionBatch, block_chunk_size
 from ..projection import LinearProjection
 from ..registry import TrainingRequirements, register_protocol
@@ -51,6 +53,14 @@ class DFlashObjective:
     default_weighting_options = ("loss_decay_gamma",)
 
     @property
+    def loss_terms(self):
+        return {
+            "token": LossDefinition(self.default_loss),
+            # the MoE balance term; the training layer prepares its load
+            "moe_balance": LossDefinition(TokenLoss("value")),
+        }
+
+    @property
     def default_weighting(self):
         return decay_weighting(self.loss_decay_gamma)
 
@@ -78,12 +88,15 @@ class DFlashObjective:
             calc.run()
             report_token_loss(calc)
 
+        balance, value = runtime.balance_term(output, blocks, context)
         predictions = runtime.block_predictions(
             output,
             blocks,
             batch,
             compute=compute,
             projection=LinearProjection(model.project, model.lm_head),
+            plan=LossPlan((LossTerm(), balance)),
+            term_values={1: value},
         )
         chunk_size = block_chunk_size(batch)
         return PredictionBatch(
@@ -98,5 +111,4 @@ class DFlashObjective:
                 top_k=self.metric_top_k,
             ),
             chunk_size=chunk_size,
-            deferred=runtime.deferred_term(output, blocks),
         )

@@ -51,7 +51,6 @@ class CanonicalReviewTest(unittest.TestCase):
             "acc_0": (torch.tensor(3.0), torch.tensor(4.0)),
         }
         result = SimpleNamespace(
-            deferred=None,  # nothing left for the strategy to finish
             loss=torch.tensor(1.0),
             ratios=ratios,
             sums={},

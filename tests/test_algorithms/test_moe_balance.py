@@ -8,13 +8,13 @@ import torch
 from torch import nn
 
 from specforge.algorithms.objectives import build_objective_model
-from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.algorithms.objectives.moe_balance import (
     AUX_LOSS_TYPES,
     MoEBalancer,
-    balance_from_terms,
+    PreparedLoad,
     count_tokens_per_expert,
     dispatch_balance,
+    moe_balance_loss,
 )
 from specforge.algorithms.objectives.registry import resolve_objective
 from specforge.modeling import build_draft_model
@@ -166,19 +166,13 @@ class MoEBalanceTest(unittest.TestCase):
                 base = plain(batch, step=1, total_steps=10)
                 torch.manual_seed(1)
                 result = runtime(batch, step=1, total_steps=10)
-                with self.assertRaisesRegex(ValueError, "unfinished"):
-                    result.loss
-                self.assertEqual(
-                    [tuple(c.shape) for c in result.deferred.counts],
-                    [(4,)] * len(config.layer_types),
-                )
-                finished = balancer.finish(result, pooled=True)
-                aux, one = finished.ratios["moe/aux_loss"]
+                # The term's value rides on the result; the executor weighted it.
+                aux, one = result.ratios["moe_balance"]
                 self.assertEqual(one.item(), 1.0)
                 self.assertGreater(aux.item(), 0.0)
-                self.assertNotIn("moe/aux_loss", base.ratios)
-                torch.testing.assert_close(finished.loss, base.loss + 0.5 * aux)
-                finished.loss.backward()
+                self.assertNotIn("moe_balance", base.ratios)
+                torch.testing.assert_close(result.loss, base.loss + 0.5 * aux)
+                result.loss.backward()
                 for counts in balancer.counts:
                     self.assertGreater(counts.sum().item(), 0)
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})
@@ -204,31 +198,44 @@ class MoEBalanceTest(unittest.TestCase):
             options={"num_anchors": 2, "bias_update_rate": 0.01, "aux_loss_coef": 0.5},
             target_head=nn.Linear(32, config.vocab_size, bias=False),
         )
+        balancer, seen = runtime.statistics, []
+        balance = balancer.balance
+
+        def record(output, *, keep, **options):  # what the forward hands the statistics
+            seen.append((output, keep))
+            return balance(output, keep=keep, **options)
+
+        balancer.balance = record
         torch.manual_seed(0)
         result = runtime(training_batch(config), step=0, total_steps=2)
-        term = result.deferred
-        self.assertEqual([tuple(c.shape) for c in term.counts], [(8,), (4,)])
-        self.assertEqual([tuple(p.shape) for p in term.mean_probs], [(8,), (4,)])
-        finished = runtime.statistics.finish(result, pooled=True)
+        (output, keep) = seen[0]
+        counts = [
+            count_tokens_per_expert(routing.expert_ids, keep, size)
+            for routing, size in zip(output.expert_routing, (8, 4))
+        ]
+        self.assertEqual([tuple(c.shape) for c in counts], [(8,), (4,)])
         # Each layer is normalized by its own expert count; the loss is their mean.
         per_layer = [
-            balance_from_terms((p,), (c,)) for p, c in zip(term.mean_probs, term.counts)
+            moe_balance_loss(
+                SimpleNamespace(expert_routing=(routing,)), keep, PreparedLoad((c,))
+            )
+            for routing, c in zip(output.expert_routing, counts)
         ]
         torch.testing.assert_close(
-            finished.ratios["moe/aux_loss"][0], torch.stack(per_layer).mean().detach()
+            result.ratios["moe_balance"][0], torch.stack(per_layer).mean().detach()
         )
-        finished.loss.backward()
+        result.loss.backward()
         before = [layer.gate.expert_bias.clone() for layer in layers]
         metrics = runtime.statistics.step()
-        for layer, old, counts in zip(layers, before, term.counts):
-            load = counts.float()
+        for layer, old, c in zip(layers, before, counts):
+            load = c.float()
             delta = 0.01 * torch.sign(load.mean() - load)
             torch.testing.assert_close(
                 layer.gate.expert_bias - old, delta - delta.mean()
             )
         torch.testing.assert_close(
             metrics["moe/step_balance"],
-            torch.stack([dispatch_balance(c) for c in term.counts]).mean(),
+            torch.stack([dispatch_balance(c) for c in counts]).mean(),
         )
 
     def test_the_loss_matches_transformers(self):
@@ -236,8 +243,6 @@ class MoEBalanceTest(unittest.TestCase):
             load_balancing_loss_func,
         )
 
-        model = build_draft_model(moe_model_config(expert_bias=False))
-        balancer = MoEBalancer(model, rate=0.0, aux_loss_coef=1.0)
         torch.manual_seed(0)
         B, S, E, K = 2, 6, 4, 2
         logits = torch.randn(B * S, E, requires_grad=True)
@@ -253,28 +258,30 @@ class MoEBalanceTest(unittest.TestCase):
                     if attention_mask is None
                     else attention_mask.reshape(-1).bool()
                 )
-                term = balancer.observe(output, keep=keep)
-                self.assertTrue(
-                    torch.equal(
-                        term.counts[0], count_tokens_per_expert(expert_ids, keep, E)
-                    )
-                )
+                load = PreparedLoad((count_tokens_per_expert(expert_ids, keep, E),))
                 # Transformers sums the K slots of each token: K times the per-token form.
                 torch.testing.assert_close(
-                    K * balance_from_terms(term.mean_probs, term.counts), want
+                    K * moe_balance_loss(output, keep, load), want
                 )
-        uniform = (torch.full((E,), 1.0 / E),)
+        uniform = SimpleNamespace(
+            expert_routing=(ExpertRouting(expert_ids, torch.full((B * S, E), 1.0 / E)),)
+        )
         torch.testing.assert_close(
-            balance_from_terms(uniform, (torch.full((E,), 2),)), torch.tensor(1.0)
+            moe_balance_loss(
+                uniform,
+                torch.ones(B * S, dtype=torch.bool),
+                PreparedLoad((torch.full((E,), 2),)),
+            ),
+            torch.tensor(1.0),
         )
         none = torch.zeros(B * S, dtype=torch.bool)
-        term = balancer.observe(output, keep=none)
-        loss = balance_from_terms(term.mean_probs, term.counts)
+        load = PreparedLoad((count_tokens_per_expert(expert_ids, none, E),))
+        loss = moe_balance_loss(output, none, load)
         self.assertEqual(loss.item(), 0.0)
         loss.backward()
         self.assertTrue(torch.all(logits.grad == 0))
 
-    def test_the_term_is_finished_with_its_own_or_this_steps_pooled_load(self):
+    def test_the_value_balances_against_its_own_or_this_steps_pooled_load(self):
         model = build_draft_model(moe_model_config(expert_bias=False))
         (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
         E = layer.config.num_experts
@@ -291,41 +298,27 @@ class MoEBalanceTest(unittest.TestCase):
             count_tokens_per_expert(o.expert_routing[0].expert_ids, keep, E)
             for o in outputs
         ]
+        own = [
+            moe_balance_loss(o, keep, PreparedLoad((c,)))
+            for o, c in zip(outputs, counts)
+        ]
         for aux_loss_type in AUX_LOSS_TYPES:
             with self.subTest(aux_loss_type=aux_loss_type):
                 balancer = MoEBalancer(
                     model, rate=0.0, aux_loss_coef=0.5, aux_loss_type=aux_loss_type
                 )
-                terms, finished = [], []
-                for output, own in zip(outputs, counts):
-                    term = balancer.observe(output, keep=keep)
-                    self.assertEqual([tuple(p.shape) for p in term.mean_probs], [(E,)])
-                    self.assertTrue(term.mean_probs[0].requires_grad)
-                    self.assertTrue(torch.equal(term.counts[0], own))
-                    result = ObjectiveResult(
-                        torch.tensor(6.0), torch.tensor(2.0), deferred=term
-                    )
-                    with self.assertRaisesRegex(ValueError, "unfinished"):
-                        result.loss
-                    terms.append(term)
-                    finished.append(balancer.finish(result, pooled=True))
-                first, second = finished
-                self.assertIsNone(second.deferred)
+                first = balancer.balance(outputs[0], keep=keep, pooled=True)
+                self.assertTrue(first.requires_grad)
                 # A step's first forward balances against its own load either way.
-                aux = first.ratios["moe/aux_loss"][0]
-                torch.testing.assert_close(
-                    aux,
-                    balance_from_terms(terms[0].mean_probs, (counts[0],)).detach(),
-                )
-                torch.testing.assert_close(first.loss, 3.0 + 0.5 * aux)
+                torch.testing.assert_close(first, own[0])
+                second = balancer.balance(outputs[1], keep=keep, pooled=True)
                 load = (
                     counts[0] + counts[1]
                     if aux_loss_type == "batch_wise"
                     else counts[1]
                 )
                 torch.testing.assert_close(
-                    second.ratios["moe/aux_loss"][0],
-                    balance_from_terms(terms[1].mean_probs, (load,)).detach(),
+                    second, moe_balance_loss(outputs[1], keep, PreparedLoad((load,)))
                 )
                 if aux_loss_type == "batch_wise":
                     self.assertTrue(
@@ -334,27 +327,17 @@ class MoEBalanceTest(unittest.TestCase):
                 else:
                     self.assertIsNone(balancer.pooled)
                 # Without pooling (evaluation) every forward balances against its own load.
-                again = balancer.finish(
-                    ObjectiveResult(
-                        torch.tensor(6.0),
-                        torch.tensor(2.0),
-                        deferred=balancer.observe(outputs[1], keep=keep),
-                    ),
-                    pooled=False,
-                )
                 torch.testing.assert_close(
-                    again.ratios["moe/aux_loss"][0],
-                    balance_from_terms(terms[1].mean_probs, (counts[1],)).detach(),
+                    balancer.balance(outputs[1], keep=keep, pooled=False), own[1]
                 )
                 # The optimizer step resets the pooled load; rate 0 moves no bias.
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})
                 self.assertIsNone(balancer.pooled)
         off = MoEBalancer(model, rate=0.0, aux_loss_coef=0.0)
-        self.assertIsNone(off.observe(outputs[0], keep=keep))
-        plain = ObjectiveResult(torch.tensor(6.0), torch.tensor(2.0))
-        self.assertIs(off.finish(plain, pooled=True), plain)
+        self.assertIsNone(off.balance(outputs[0], keep=keep, pooled=True))
+        self.assertIsNotNone(off.counts[0])  # the bias statistics still count
 
-    def test_the_strategy_finishes_the_term_and_pools_only_while_training(self):
+    def test_the_strategy_prepares_the_load_and_pools_only_while_training(self):
         config = moe_model_config(expert_bias=False)
         model = build_draft_model(config)
         runtime = build_objective_model(
@@ -369,7 +352,7 @@ class MoEBalanceTest(unittest.TestCase):
             sample_ids=["a"], strategy="dspark", tensors=training_batch(config)
         )
         out = strategy.forward_loss(batch)
-        aux = out.ratio_metrics["moe/aux_loss"][0]
+        aux = out.ratio_metrics["moe_balance"][0]
         self.assertGreater(aux.item(), 0.0)
         self.assertIsNotNone(runtime.statistics.pooled)  # training: this step's load
         numerator, denominator = out.loss_terms
@@ -378,7 +361,7 @@ class MoEBalanceTest(unittest.TestCase):
         runtime.eval()
         with torch.no_grad():
             out = strategy.forward_loss(batch)
-        self.assertIn("moe/aux_loss", out.ratio_metrics)
+        self.assertIn("moe_balance", out.ratio_metrics)
         self.assertIsNone(runtime.statistics.pooled)  # evaluation: its own load
 
 

@@ -8,23 +8,19 @@ import torch
 from torch import Tensor, nn
 
 
-class DeferredTerm(Protocol):
-    """A loss term the training layer finishes, since finishing may pool statistics over ranks."""
-
-    def finish(
-        self, result: "ObjectiveResult", *, pooled: bool, process_group=None
-    ) -> "ObjectiveResult": ...
-
-
 class StepStatistics(Protocol):
-    """Per-forward statistics an objective observes; the training layer applies them each optimizer step."""
+    """Per-forward statistics an objective observes; the training layer prepares their pooling and applies them each optimizer step."""
 
     @property
     def settings(
         self,
     ) -> dict[str, object]: ...  # what built them; the resume contract records it
 
-    def observe(self, output, *, keep: Tensor) -> DeferredTerm | None: ...
+    def balance(
+        self, output, *, keep: Tensor, pooled: bool, process_group=None
+    ) -> (
+        Tensor | None
+    ): ...  # this forward's regularizer, already normalized; None while off
 
     def step(self, *, process_group=None) -> dict[str, Tensor]: ...
 
@@ -35,15 +31,9 @@ class ObjectiveResult:
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
     sums: dict[str, Tensor] = field(default_factory=dict)
-    # A term the training layer finishes before the loss is read; None once finished.
-    deferred: DeferredTerm | None = None
 
     @property
     def loss(self):
-        if self.deferred is not None:
-            raise ValueError(
-                "a deferred term is unfinished; the training layer finishes it"
-            )
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
@@ -221,14 +211,37 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def deferred_term(self, output, blocks):
-        """Hand this forward and its kept slots to the statistics; the deferred term, or None."""
-        if self.statistics is None:
-            return None
-        slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
-        # Every token of a kept block went through the model; padded blocks did not.
-        keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
-        return self.statistics.observe(output, keep=keep)
+    def balance_term(self, output, blocks, context):
+        """A block protocol's balance term and its value for this forward.
+
+        The statistics' regularizer runs through the training layer's
+        ``prepare_statistics`` hook when the forward has one, which pools the
+        load over ranks; a direct call balances against this forward's own
+        load. Without statistics the term is off and its value zero.
+        """
+        from .losses import TokenLoss
+        from .plan import LossTerm
+
+        value = None
+        if self.statistics is not None:
+            slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
+            # Every token of a kept block went through the model; padded blocks did not.
+            keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+            prepare = context.get("prepare_statistics")
+            value = (
+                self.statistics.balance(output, keep=keep, pooled=False)
+                if prepare is None
+                else prepare(output, keep=keep)
+            )
+        coefficient = (
+            0.0 if value is None else self.statistics.settings["aux_loss_coef"]
+        )
+        if value is None:
+            value = output.hidden_states.new_zeros(())
+        term = LossTerm(
+            "moe_balance", coefficient, TokenLoss("value"), reduction="scalar"
+        )
+        return term, value
 
     def block_predictions(self, output, blocks, batch, **options):
         """Build deferred predictions for complete algorithm proposal blocks.

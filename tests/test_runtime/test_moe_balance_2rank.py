@@ -21,7 +21,6 @@ def _worker(rank, world_size):
     from torch import nn
 
     from specforge.algorithms.objectives import build_objective_model
-    from specforge.algorithms.objectives.base import ObjectiveResult
     from specforge.algorithms.objectives.moe_balance import (
         AUX_LOSS_TYPES,
         dispatch_balance,
@@ -64,7 +63,6 @@ def _worker(rank, world_size):
     # modes; loss and router gradients against DeepSeek-V3's E / (K T) * sum_e count_e P_e.
     E, K = layer.config.num_experts, layer.config.num_experts_per_tok
     head = nn.Linear(32, config.vocab_size, bias=False).cuda()
-    zero, one = torch.zeros((), device="cuda"), torch.ones((), device="cuda")
     for aux_loss_type in AUX_LOSS_TYPES:
         balanced = build_objective_model(
             model,
@@ -76,13 +74,14 @@ def _worker(rank, world_size):
             target_head=head,
         )
         balancer, seen = balanced.statistics, []
-        observe = balancer.observe
 
-        def record(output, *, keep):  # the routing and keep mask each forward hands in
-            seen.append((output.expert_routing[0], keep))
-            return observe(output, keep=keep)
+        def prepare(output, *, keep):  # the training layer's hook: pooled over ranks
+            value = balancer.balance(
+                output, keep=keep, pooled=True, process_group=dist.group.WORLD
+            )
+            seen.append((output.expert_routing[0], keep, value))
+            return value
 
-        balancer.observe = record
         step_counts = torch.zeros(E, device="cuda")
         step_kept = torch.zeros((), device="cuda")
         names = ("balancer", "reference")
@@ -95,13 +94,10 @@ def _worker(rank, world_size):
                 batch["loss_mask"] = torch.tensor(
                     [[0, 0, 1, 1, 0, 0, 0, 0, 0]], device="cuda"
                 )
-            result = balanced(batch, step=0, total_steps=2)
-            finished = balancer.finish(
-                ObjectiveResult(zero, one, deferred=result.deferred),
-                pooled=True,
-                process_group=dist.group.WORLD,
-            )
-            routing, keep = seen[-1]
+            result = balanced(batch, step=0, total_steps=2, prepare_statistics=prepare)
+            routing, keep, value = seen[-1]
+            torch.testing.assert_close(result.ratios["moe_balance"][0], value.detach())
+            contribution = COEF * value  # what the executor adds to the loss
             kept = keep.sum().float()
             kept_per_batch.append(kept.clone())
             counts = torch.bincount(
@@ -117,9 +113,9 @@ def _worker(rank, world_size):
                     balancer.pooled[0].float(), counts
                 ), "pooled load differs"
             reference = COEF * E / (K * kept) * (counts * probs).sum()
-            torch.testing.assert_close(finished.loss, reference)
+            torch.testing.assert_close(contribution, reference)
             (from_balancer,) = torch.autograd.grad(
-                finished.loss, layer.gate.weight, retain_graph=True
+                contribution, layer.gate.weight, retain_graph=True
             )
             (from_reference,) = torch.autograd.grad(reference, layer.gate.weight)
             torch.testing.assert_close(from_balancer, from_reference)

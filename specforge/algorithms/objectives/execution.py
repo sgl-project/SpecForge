@@ -265,9 +265,9 @@ def add_term_values(result, predictions):
     for index, value in predictions.term_values.items():
         result.terms[index].numerator = value
         result.terms[index].denominator = value.new_ones(())
-        name = predictions.plan.terms[index].name
-        if name:
-            result.ratios[name] = (value.detach(), value.new_ones(()))
+        term = predictions.plan.terms[index]
+        if term.name and term.coefficient:  # an off term is not reported
+            result.ratios[term.name] = (value.detach(), value.new_ones(()))
     return result
 
 
@@ -712,5 +712,4 @@ def execute_batch(
             )
         else:
             result = combined.objective_result()
-    result.deferred = batch.deferred
     return result
