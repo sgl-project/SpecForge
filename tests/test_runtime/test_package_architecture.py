@@ -203,6 +203,10 @@ LEGACY_ENTRY_GLOBS = (
     "examples/disagg/run_disagg_*.py",
 )
 
+# scripts/convert_legacy_checkpoint.py converts historical draft checkpoints; its
+# package is the one place outside specforge/ that keeps their decoders.
+LEGACY_CONVERTER_PACKAGE = REPO_ROOT / "scripts" / "legacy_checkpoint"
+
 LEGACY_API_NAMES = {
     "AutoEagle3DraftModel",
     "AutoDistributedTargetModel",
@@ -434,12 +438,25 @@ class TestPackageArchitecture(unittest.TestCase):
                         name = node.arg
                     elif isinstance(node, ast.keyword):
                         name = node.arg
-                    if name in LEGACY_API_NAMES:
+                    if name in LEGACY_API_NAMES and not (
+                        name == "decode_legacy_config"
+                        and LEGACY_CONVERTER_PACKAGE in path.parents
+                    ):
                         relative_path = path.relative_to(REPO_ROOT)
                         violations.append(f"{relative_path}:{node.lineno}: {name}")
         self.assertEqual(
             [], violations, "legacy API references:\n" + "\n".join(violations)
         )
+
+    def test_package_does_not_import_the_legacy_converter(self):
+        # HF export bundles code by following the package's imports.
+        violations = [
+            f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
+            for path in sorted((REPO_ROOT / "specforge").rglob("*.py"))
+            for line_number, module in _imported_modules(path)
+            if module.split(".")[0] in {"scripts", "legacy_checkpoint"}
+        ]
+        self.assertEqual([], violations, "converter imports:\n" + "\n".join(violations))
 
     def test_launch_exports_only_canonical_topology_builders(self):
         self.assertEqual(

@@ -1,0 +1,141 @@
+{
+ "config": {
+  "architectures": ["LlamaForCausalLMEagle3"],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": null,
+  "eos_token_id": null,
+  "head_dim": 8,
+  "hidden_act": "silu",
+  "hidden_size": 32,
+  "initializer_range": 0.02,
+  "intermediate_size": 64,
+  "max_position_embeddings": 40960,
+  "max_window_layers": 36,
+  "model_type": "llama",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 1,
+  "num_key_value_heads": 2,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 1000000,
+  "sliding_window": null,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.51.0",
+  "use_cache": true,
+  "use_sliding_window": false,
+  "vocab_size": 64,
+  "draft_vocab_size": 32,
+  "pad_token_id": null,
+  "target_hidden_size": 32,
+  "fc_norm": true
+ },
+ "settings": {},
+ "target_config": {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 128},
+ "tensors": {
+  "t2d": {
+   "shape": [64],
+   "dtype": "bool",
+   "values": [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+  },
+  "d2t": {
+   "shape": [32],
+   "dtype": "int64",
+   "values": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  },
+  "embed_tokens.weight": {"shape": [64, 32], "dtype": "float32"},
+  "midlayer.self_attn.q_proj.weight": {"shape": [32, 64], "dtype": "float32"},
+  "midlayer.self_attn.k_proj.weight": {"shape": [16, 64], "dtype": "float32"},
+  "midlayer.self_attn.v_proj.weight": {"shape": [16, 64], "dtype": "float32"},
+  "midlayer.self_attn.o_proj.weight": {"shape": [32, 32], "dtype": "float32"},
+  "midlayer.mlp.gate_proj.weight": {"shape": [64, 32], "dtype": "float32"},
+  "midlayer.mlp.up_proj.weight": {"shape": [64, 32], "dtype": "float32"},
+  "midlayer.mlp.down_proj.weight": {"shape": [32, 64], "dtype": "float32"},
+  "midlayer.hidden_norm.weight": {"shape": [32], "dtype": "float32"},
+  "midlayer.input_layernorm.weight": {"shape": [32], "dtype": "float32"},
+  "midlayer.post_attention_layernorm.weight": {"shape": [32], "dtype": "float32"},
+  "fc.weight": {"shape": [32, 96], "dtype": "float32"},
+  "fc_norm.0.weight": {"shape": [32], "dtype": "float32"},
+  "fc_norm.1.weight": {"shape": [32], "dtype": "float32"},
+  "fc_norm.2.weight": {"shape": [32], "dtype": "float32"},
+  "norm.weight": {"shape": [32], "dtype": "float32"},
+  "lm_head.weight": {"shape": [32, 32], "dtype": "float32"}
+ },
+ "expected": {
+  "config": {
+   "schema_version": 1,
+   "model_type": "specforge_draft",
+   "architectures": ["Eagle3DraftModel"],
+   "extensions": [],
+   "hidden_size": 32,
+   "vocab_size": 64,
+   "draft_vocab_size": 32,
+   "max_position_embeddings": 40960,
+   "initializer_range": 0.02,
+   "tie_word_embeddings": false,
+   "attention_configs": {
+    "default": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": false,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": true,
+     "sliding_window": null,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    }
+   },
+   "mlp_configs": {
+    "default": {"type": "dense", "intermediate_size": 64, "hidden_act": "silu"}
+   },
+   "conv_configs": {},
+   "layer_configs": {
+    "default": {"attention": "default", "mlp": "default", "sublayer_conv": null}
+   },
+   "layer_types": ["default"],
+   "num_hidden_layers": 1,
+   "norm_config": {"type": "rms", "eps": 1e-06, "weight_offset": 0, "has_weight": true},
+   "residual_config": {"type": "standard"},
+   "rope_parameters": {
+    "rope_type": "default",
+    "rope_theta": 1000000,
+    "partial_rotary_factor": 1.0,
+    "interleaved": false
+   },
+   "spec_config": {
+    "target_features": {"target_layer_ids": [1, 63, 124], "hidden_size": 32},
+    "normalize_features": true,
+    "norm_output": false
+   },
+   "target_bindings": ["embed_tokens"]
+  },
+  "names": {
+   "norm.weight": "backbone.final_norm.weight",
+   "midlayer.hidden_norm.weight": "backbone.layers.0.hidden_norm.weight",
+   "midlayer.input_layernorm.weight": "backbone.layers.0.input_layernorm.weight",
+   "midlayer.mlp.down_proj.weight": "backbone.layers.0.mlp.down_proj.weight",
+   "midlayer.mlp.gate_proj.weight": "backbone.layers.0.mlp.gate_proj.weight",
+   "midlayer.mlp.up_proj.weight": "backbone.layers.0.mlp.up_proj.weight",
+   "midlayer.post_attention_layernorm.weight": "backbone.layers.0.post_attention_layernorm.weight",
+   "midlayer.self_attn.k_proj.weight": "backbone.layers.0.self_attn.k_proj.weight",
+   "midlayer.self_attn.o_proj.weight": "backbone.layers.0.self_attn.o_proj.weight",
+   "midlayer.self_attn.q_proj.weight": "backbone.layers.0.self_attn.q_proj.weight",
+   "midlayer.self_attn.v_proj.weight": "backbone.layers.0.self_attn.v_proj.weight",
+   "fc.weight": "fusion.fc.weight",
+   "fc_norm.0.weight": "fusion.fc_norm.0.weight",
+   "fc_norm.1.weight": "fusion.fc_norm.1.weight",
+   "fc_norm.2.weight": "fusion.fc_norm.2.weight",
+   "lm_head.weight": "lm_head.weight",
+   "d2t": "vocabulary.d2t",
+   "t2d": "vocabulary.t2d"
+  },
+  "bound_copies": {"embed_tokens": "embed_tokens.weight"}
+ }
+}

@@ -1,0 +1,313 @@
+{
+ "dflash_sliding_window": {
+  "base": "dflash",
+  "config": {
+   "use_sliding_window": true,
+   "sliding_window": 4,
+   "layer_types": ["sliding_attention", "full_attention"]
+  },
+  "target_config": {},
+  "expected": {
+   "attention_configs": {
+    "full_attention": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": true,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": false,
+     "sliding_window": null,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    },
+    "sliding_attention": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": true,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": true,
+     "sliding_window": 4,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    }
+   },
+   "layer_configs": {
+    "full_attention": {"attention": "full_attention", "mlp": "default", "sublayer_conv": null},
+    "sliding_attention": {
+     "attention": "sliding_attention",
+     "mlp": "default",
+     "sublayer_conv": null
+    }
+   },
+   "layer_types": ["sliding_attention", "full_attention"]
+  }
+ },
+ "dflash2_bidirectional_window": {
+  "base": "dflash2",
+  "config": {
+   "use_sliding_window": true,
+   "sliding_window": 4,
+   "layer_types": ["sliding_attention", "sliding_attention"],
+   "is_causal": false,
+   "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"}
+  },
+  "target_config": {},
+  "expected": {
+   "attention_configs": {
+    "sliding_attention": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": true,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": false,
+     "sliding_window": 4,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    }
+   },
+   "layer_configs": {
+    "sliding_attention": {
+     "attention": "sliding_attention",
+     "mlp": "default",
+     "sublayer_conv": "default"
+    }
+   },
+   "layer_types": ["sliding_attention", "sliding_attention"]
+  }
+ },
+ "dflash_default_layers": {
+  "base": "dflash",
+  "config": {
+   "use_sliding_window": true,
+   "sliding_window": 4,
+   "max_window_layers": 1,
+   "layer_types": null,
+   "dflash_config": {"mask_token_id": 63}
+  },
+  "target_config": {},
+  "expected": {
+   "attention_configs": {
+    "full_attention": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": true,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": false,
+     "sliding_window": null,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    },
+    "sliding_attention": {
+     "type": "gqa",
+     "rope_parameters": null,
+     "num_attention_heads": 4,
+     "num_key_value_heads": 2,
+     "head_dim": 8,
+     "qk_norm": true,
+     "attention_bias": false,
+     "output_gate": false,
+     "is_causal": true,
+     "sliding_window": 4,
+     "attention_dropout": 0.0,
+     "qk_norm_position": "before_rope",
+     "qk_norm_scope": "head",
+     "qk_norm_config": null
+    }
+   },
+   "layer_configs": {
+    "full_attention": {"attention": "full_attention", "mlp": "default", "sublayer_conv": null},
+    "sliding_attention": {
+     "attention": "sliding_attention",
+     "mlp": "default",
+     "sublayer_conv": null
+    }
+   },
+   "layer_types": ["full_attention", "sliding_attention"],
+   "spec_config": {
+    "block": {"block_size": 16},
+    "target_features": {"hidden_size": 32, "mask_token_id": 63, "target_layer_ids": [1, 125]}
+   }
+  }
+ },
+ "dspark_yarn_rope": {
+  "base": "dspark",
+  "config": {
+   "rope_parameters": {
+    "factor": 16.0,
+    "original_max_position_embeddings": 2560,
+    "rope_theta": 1000000,
+    "rope_type": "yarn"
+   }
+  },
+  "target_config": {},
+  "expected": {
+   "rope_parameters": {
+    "rope_type": "yarn",
+    "rope_theta": 1000000,
+    "partial_rotary_factor": 1.0,
+    "interleaved": false,
+    "factor": 16.0,
+    "original_max_position_embeddings": 2560,
+    "attention_factor": 1.2772588722239782,
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "truncate": true,
+    "mscale_all_dim": 0.0
+   }
+  }
+ },
+ "eagle3_llama3_rope": {
+  "base": "eagle3",
+  "config": {
+   "rope_scaling": {
+    "factor": 8.0,
+    "high_freq_factor": 4.0,
+    "low_freq_factor": 1.0,
+    "original_max_position_embeddings": 4096,
+    "rope_type": "llama3"
+   }
+  },
+  "target_config": {},
+  "expected": {
+   "rope_parameters": {
+    "rope_type": "llama3",
+    "rope_theta": 1000000,
+    "partial_rotary_factor": 1.0,
+    "interleaved": false,
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 4096
+   }
+  }
+ },
+ "eagle3_yarn_rope": {
+  "base": "eagle3",
+  "config": {
+   "rope_scaling": {
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "factor": 40.0,
+    "mscale": 0.707,
+    "mscale_all_dim": 0.707,
+    "original_max_position_embeddings": 1024,
+    "rope_type": "yarn"
+   }
+  },
+  "target_config": {},
+  "expected": {
+   "rope_parameters": {
+    "rope_type": "yarn",
+    "rope_theta": 1000000,
+    "partial_rotary_factor": 1.0,
+    "interleaved": false,
+    "factor": 40.0,
+    "original_max_position_embeddings": 1024,
+    "attention_factor": 1.0,
+    "beta_fast": 32.0,
+    "beta_slow": 1.0,
+    "truncate": true,
+    "mscale_all_dim": 0.0
+   }
+  }
+ },
+ "eagle3_mrope": {
+  "base": "eagle3",
+  "config": {
+   "rope_scaling": {"type": "mrope", "mrope_section": [1, 1, 2]}
+  },
+  "target_config": {},
+  "expected": {
+   "rope_parameters": {
+    "rope_type": "mrope",
+    "rope_theta": 1000000,
+    "partial_rotary_factor": 1.0,
+    "interleaved": false,
+    "mrope_section": [1, 1, 2],
+    "mrope_interleaved": false
+   }
+  }
+ },
+ "eagle3_capture_layers": {
+  "base": "eagle3",
+  "config": {
+   "eagle_config": {
+    "eagle_aux_hidden_state_layer_ids": [57, 1, 29],
+    "use_aux_hidden_state": true
+   },
+   "norm_output": true
+  },
+  "target_config": {},
+  "expected": {
+   "spec_config": {
+    "target_features": {"target_layer_ids": [1, 29, 57], "hidden_size": 32},
+    "normalize_features": true,
+    "norm_output": true
+   }
+  }
+ },
+ "mtp_multi_axis_rope": {
+  "base": "mtp",
+  "config": {
+   "rope_parameters": {"rope_theta": 10000000.0}
+  },
+  "target_config": {
+   "rope_parameters": {
+    "rope_theta": 10000000.0,
+    "partial_rotary_factor": 0.5,
+    "mrope_section": [1, 1, 0],
+    "mrope_interleaved": true
+   }
+  },
+  "expected": {
+   "rope_parameters": {
+    "rope_type": "mrope",
+    "rope_theta": 10000000.0,
+    "partial_rotary_factor": 0.5,
+    "interleaved": false,
+    "mrope_section": [1, 1, 0],
+    "mrope_interleaved": true
+   }
+  }
+ },
+ "peagle_unused_rope_scaling": {
+  "base": "peagle",
+  "config": {
+   "rope_scaling": {"rope_type": "linear", "factor": 4},
+   "norm_before_residual": true,
+   "eagle_config": {"eagle_aux_hidden_state_layer_ids": [3, 1, 2]}
+  },
+  "target_config": {},
+  "expected": {
+   "spec_config": {
+    "target_features": {"target_layer_ids": [1, 2, 3], "hidden_size": 32},
+    "norm_before_residual": true,
+    "pad_token_id": 0,
+    "mask_token_id": 63
+   }
+  }
+ }
+}
