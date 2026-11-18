@@ -161,6 +161,10 @@ class TrainingBackend(abc.ABC):
         over. It has no default: a wrong group trains on wrong gradients.
         """
 
+    #: Whether every rank owns the same complete optimizer state, which a
+    #: checkpoint then saves once.
+    optimizer_state_is_replicated: bool = False
+
     def learning_rate(self) -> Any:
         """The optimizer's current rate, or None when it does not report one."""
         return None

@@ -311,6 +311,80 @@ class RunnerReductionTest(unittest.TestCase):
         reduce.assert_not_called()
 
 
+class RunnerAgreementTest(unittest.TestCase):
+    def gathered(self, others):
+        """Two ranks: this one's outcome and the given one for the other."""
+        return (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda out, mine, group: out.__setitem__(
+                    slice(None), [mine, others]
+                ),
+            ),
+        )
+
+    def agree(self, others, error=None, value=None):
+        runner = runner_over(_Strategy())
+        patches = self.gathered(others)
+        with patches[0], patches[1], patches[2], patches[3]:
+            runner.agree(error, value=value)
+
+    def test_equal_outcomes_pass(self):
+        self.agree((None, {"0:0": "reference"}), value={"0:0": "reference"})
+
+    def test_another_ranks_error_raises_here_too(self):
+        with self.assertRaisesRegex(RuntimeError, "rank 1: disk full"):
+            self.agree(("disk full", None))
+
+    def test_own_error_is_reported_with_its_rank(self):
+        with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
+            self.agree((None, None), error="disk full")
+
+    def test_differing_values_raise(self):
+        with self.assertRaisesRegex(RuntimeError, "ranks disagree.*token_ce"):
+            self.agree((None, {"0:0": "token_ce"}), value={"0:0": "reference"})
+
+    def test_one_process_gathers_nothing(self):
+        runner = runner_over(_Strategy())
+        with mock.patch("torch.distributed.all_gather_object") as gather:
+            runner.agree(None, value={"0:0": "reference"})
+            with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
+                runner.agree("disk full")
+        gather.assert_not_called()
+
+
+class RunnerCheckpointTest(unittest.TestCase):
+    def test_state_is_the_backends_split_by_who_saves_it(self):
+        strategy = _Strategy()
+        strategy.checkpoint_state_filter = lambda state: {
+            name.upper(): tensor for name, tensor in state.items()
+        }
+        strategy.kernels = lambda: {"0:0": "reference"}
+        runner = runner_over(strategy)
+        run_window(runner, [batch(1)], StepContext())
+        state = runner.checkpoint_state()
+        self.assertEqual(list(state.draft), ["WEIGHT"])
+        # One process shards nothing: the optimizer state is this rank's own.
+        self.assertIsNone(state.replicated)
+        self.assertEqual(sorted(state.rank), ["optimizer", "rng"])
+        self.assertIsNotNone(state.rank["optimizer"])
+        self.assertEqual(state.kernels, {"0:0": "reference"})
+
+    def test_resume_restores_the_optimizer_and_the_generator(self):
+        strategy = _Strategy()
+        strategy.checkpoint_state_filter = lambda state: state
+        strategy.kernels = dict
+        runner = runner_over(strategy)
+        saved = runner.checkpoint_state().rank
+        expected = torch.rand(3)
+        resumed = runner_over(_Strategy())
+        resumed.load_resume(saved)
+        torch.testing.assert_close(torch.rand(3), expected, rtol=0, atol=0)
+
+
 class RunnerRefusalTest(unittest.TestCase):
     def test_step_is_applied_once(self):
         runner = runner_over(_Strategy())

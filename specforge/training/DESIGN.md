@@ -57,8 +57,7 @@ flowchart TD
   FIT -->|global_step plus 1| BND[boundary actions]
   BND -->|ack_fn ids step| ACK[ack_train_refs durable]
   BND -->|save_interval| CKPT
-  CKPT -->|checkpoint_state_filter| ST
-  CKPT -->|state_dict FULL| BK
+  CKPT -->|checkpoint_state and agree| RN
 
   class PUB,FIT,FR,RN,ST,BK,BND,PA,CKPT compute;
   class ACK control;
@@ -80,8 +79,15 @@ retains its backward-only deferral.
 been applied, commits the pending sample acknowledgements, emits metrics, and
 performs configured interval saves. The outer `Trainer` owns topology cleanup and the guarded final
 save, so CLI, builders, and Python callers cannot select a second loader-based
-training entry. All saves delegate to `CheckpointManager`; the shared draft
-state is written by rank 0 while every rank writes its own optimizer/RNG state.
+training entry. For a save the run loop asks the runner for its
+`checkpoint_state()`: the draft's weights under canonical keys (complete on
+rank 0), this rank's own optimizer and RNG state, the optimizer state that is
+the same on every rank (DDP), and the loss kernels this rank has realised. The
+ranks compare those kernels through `runner.agree` before anything is written,
+so what rank 0 records for resume holds for every rank. All saves then delegate
+to `CheckpointManager`; the shared draft state is written by rank 0 while every
+rank writes its own optimizer/RNG state. On resume the trainer hands each
+rank's saved state back through `runner.load_resume`.
 
 DSpine declares a replay statistic: its alignment CE is normalized over the
 whole optimizer window and every rank. For such a window the frame first calls
