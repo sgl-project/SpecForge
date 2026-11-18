@@ -97,7 +97,7 @@ class TrainingProgram(Protocol):
     """
 
     #: Frozen modules a runner neither shards nor optimizes (target tables,
-    #: the teacher head).
+    #: the teacher head), as declared when the program was built.
     frozen: Tuple[torch.nn.Module, ...]
 
     def __call__(

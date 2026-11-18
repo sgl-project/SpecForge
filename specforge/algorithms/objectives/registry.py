@@ -254,6 +254,7 @@ def build_objective_model(
     target_head=None,
     loss=None,
     weighting=None,
+    frozen_modules=(),
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -265,6 +266,9 @@ def build_objective_model(
         target_head: Optional teacher head; it is frozen and kept in eval mode.
         loss: Common mathematical loss configuration.
         weighting: Common position-weighting configuration.
+        frozen_modules: Frozen modules of the composed model that a runner
+            keeps out of sharding and out of the optimizer (bound target
+            tables, the teacher head).
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -345,6 +349,7 @@ def build_objective_model(
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,
+        frozen_modules=frozen_modules,
     )
 
 
