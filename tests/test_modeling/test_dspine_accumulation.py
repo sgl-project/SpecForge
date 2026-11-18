@@ -178,7 +178,6 @@ class DSpineAccumulationTest(unittest.TestCase):
                     device="cuda",
                     dtype=torch.bfloat16,
                 )
-                model.attention_backend = attention_backend
                 model.draft_model.transfer_codes = (
                     model.draft_model.transfer_codes.float()
                 )

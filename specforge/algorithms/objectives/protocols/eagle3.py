@@ -79,7 +79,7 @@ class Eagle3Objective:
         valid = valid_tokens(batch)
         if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
             raise ValueError("EAGLE requires unpacked sequences")
-        backend = getattr(runtime, "attention_backend", None)
+        backend, groups = runtime.attention_backend, runtime.sequence_parallel
         parallel = backend == "usp"
         length = ids.shape[1] - (self.ttt_length if parallel else 0)
         if length < 1:
@@ -87,8 +87,8 @@ class Eagle3Objective:
         cached = (
             model.new_rollout(
                 backend,
-                ring_group=getattr(runtime, "ring_group", None),
-                ulysses_group=getattr(runtime, "ulysses_group", None),
+                ring_group=groups.ring_group if groups else None,
+                ulysses_group=groups.ulysses_group if groups else None,
             )
             if backend in ("fa", "usp", "flex_attention")
             else None
@@ -158,7 +158,7 @@ class Eagle3Objective:
                 ),
                 # every depth also counts toward the pooled ``acc``
                 accuracy_name=f"acc_{depth}",
-                reduce_statistics=getattr(runtime, "reduce_sequence_statistics", None),
+                reduce_statistics=groups.reduce_statistics if groups else None,
             )
             if deferred is not None:
                 deferred.append(build)

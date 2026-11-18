@@ -14,6 +14,7 @@ from specforge.algorithms.objectives.registry import (
     resolve_objective,
 )
 from specforge.modeling import build_draft_model
+from specforge.training.sequence_parallel import SequenceParallel
 from tests.test_algorithms.test_objectives import eagle_config, training_batch
 from tests.test_modeling.test_canonical_eagle3 import install_mapping
 
@@ -35,8 +36,8 @@ def objective_model(backend, **selection):
     install_mapping(model)
     torch.manual_seed(1)
     head = nn.Linear(config.hidden_size, config.vocab_size, bias=False).to(DEVICE)
+    selection.setdefault("attention_backend", backend)
     runtime = build_objective_model(model, target_head=head, **selection)
-    runtime.attention_backend = backend  # set by build_bundle in a real run
     return config, runtime
 
 
@@ -65,8 +66,7 @@ class EagleBackendTest(unittest.TestCase):
     def test_flex_runs_through_the_cached_rollout(self):
         # The uncached branch builds a tensor visibility without active
         # queries, which Flex preparation rejects; the rollout supplies both.
-        config, runtime = objective_model("sdpa")
-        runtime.attention_backend = "flex_attention"
+        config, runtime = objective_model("sdpa", attention_backend="flex_attention")
         model = runtime.draft_model
         original, requested = model.new_rollout, []
 
@@ -80,6 +80,55 @@ class EagleBackendTest(unittest.TestCase):
         torch.testing.assert_close(
             loss, forward_loss(*objective_model("sdpa")), rtol=1e-5, atol=1e-6
         )
+
+    def test_rollout_takes_the_groups_the_model_was_built_with(self):
+        def requested_groups(**construction):
+            config, runtime = objective_model(
+                "sdpa", attention_backend="flex_attention", **construction
+            )
+            model = runtime.draft_model
+            original, requested = model.new_rollout, []
+
+            def new_rollout(backend, **groups):
+                requested.append(groups)
+                return original("sdpa")
+
+            with patch.object(model, "new_rollout", new_rollout):
+                forward_loss(config, runtime)
+            return requested
+
+        self.assertEqual(
+            requested_groups(), [{"ring_group": None, "ulysses_group": None}]
+        )
+        groups = SequenceParallel(
+            ring_group="ring",
+            ulysses_group="ulysses",
+            reduce_statistics=lambda accepted, count, denominator: (
+                accepted,
+                count,
+                denominator,
+            ),
+        )
+        self.assertEqual(
+            requested_groups(sequence_parallel=groups),
+            [{"ring_group": "ring", "ulysses_group": "ulysses"}],
+        )
+
+    def test_sequence_parallel_groups_are_read_once_from_the_process(self):
+        from specforge.training import sequence_parallel
+
+        with (
+            patch("specforge.distributed.get_sp_ring_group", return_value="ring"),
+            patch("specforge.distributed.get_sp_ulysses_group", return_value="ulysses"),
+            patch("specforge.distributed.get_draft_sp_group", return_value="draft"),
+            patch.object(
+                sequence_parallel, "reduce_statistics", return_value="reduced"
+            ) as reduce,
+        ):
+            groups = sequence_parallel.sequence_parallel_groups()
+            self.assertEqual(groups.reduce_statistics(1, 2, 3), "reduced")
+        self.assertEqual((groups.ring_group, groups.ulysses_group), ("ring", "ulysses"))
+        reduce.assert_called_once_with(1, 2, 3, group="draft")
 
     def test_trimming_is_skipped_when_statistics_cross_ranks(self):
         # Trimming leaves each sequence-parallel rank a different number of
@@ -97,8 +146,14 @@ class EagleBackendTest(unittest.TestCase):
         }
         results = {}
         for name, reducer in (("local", None), ("reduced", reduce)):
-            config, runtime = objective_model("eager", loss=loss)
-            runtime.reduce_sequence_statistics = reducer
+            config, runtime = objective_model(
+                "eager",
+                loss=loss,
+                sequence_parallel=reducer
+                and SequenceParallel(
+                    ring_group=None, ulysses_group=None, reduce_statistics=reducer
+                ),
+            )
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 results[name] = forward_loss(config, runtime)
