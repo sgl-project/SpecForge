@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
+from safetensors.torch import load_file, save_file
 
 from specforge.config.draft.architecture.block import DraftOnlyBlockSpec
 from specforge.config.draft.architecture.dspark import (
@@ -16,6 +17,7 @@ from specforge.config.draft.architecture.dspark import (
 )
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import DenseFFNSpec
+from specforge.loading import load_draft
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.mlp import MoEFFN
@@ -229,6 +231,27 @@ class CanonicalDSparkTest(unittest.TestCase):
             config_path.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, "unexpected_keys"):
                 DSparkDraftModel.from_pretrained(path)
+
+    def test_moe_load_infers_the_dtype_past_the_fixed_fp32_expert_bias(self):
+        """dtype omitted: the checkpoint's one dtype, the fp32 expert_bias aside; mixed weights need it explicit."""
+        model = build_draft_model(moe_model_config(), dtype=torch.bfloat16)
+        with TemporaryDirectory() as path:
+            model.save_pretrained(path)
+            restored = load_draft(path)
+            (layer,) = moe_layers(restored)
+            self.assertEqual(layer.gate.weight.dtype, torch.bfloat16)
+            self.assertEqual(layer.gate.expert_bias.dtype, torch.float32)
+            self.assertEqual({p.dtype for p in restored.parameters()}, {torch.bfloat16})
+            # One bf16 weight rewritten as fp16 leaves no single dtype to follow.
+            (file,) = Path(path).glob("*.safetensors")
+            tensors = load_file(file)
+            name = next(k for k, t in tensors.items() if t.dtype == torch.bfloat16)
+            tensors[name] = tensors[name].half()
+            save_file(tensors, file, metadata={"format": "pt"})
+            with self.assertRaisesRegex(ValueError, "pass dtype explicitly"):
+                load_draft(path)
+            explicit = load_draft(path, dtype=torch.bfloat16)
+            self.assertEqual(explicit.state_dict()[name].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

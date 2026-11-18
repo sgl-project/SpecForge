@@ -1,7 +1,5 @@
 """Public draft loading: files and weight plans, never training state."""
 
-import math
-
 import torch
 
 from specforge.checkpoint import apply_weight_plan, make_weight_plan
@@ -66,15 +64,19 @@ def _dtype(requested, checkpoint):
         if not isinstance(requested, torch.dtype) or not requested.is_floating_point:
             raise ValueError("dtype must be a floating-point torch.dtype")
         return requested
-    # The dtype holding most elements: an fp32 expert_bias rides along with bf16 weights.
-    elements = {}
-    for ref in checkpoint.weights.values():
-        dtype = ref.info.dtype
-        if isinstance(dtype, torch.dtype) and dtype.is_floating_point:
-            elements[dtype] = elements.get(dtype, 0) + math.prod(ref.info.shape)
-    if not elements:
-        raise ValueError("checkpoint has no floating dtypes; pass dtype explicitly")
-    return max(elements, key=elements.get)
+    # The checkpoint's one floating dtype; a MoE router's expert_bias is fp32 whatever it is.
+    types = {
+        ref.info.dtype
+        for name, ref in checkpoint.weights.items()
+        if not name.endswith(".expert_bias")
+        and isinstance(ref.info.dtype, torch.dtype)
+        and ref.info.dtype.is_floating_point
+    }
+    if len(types) != 1:
+        raise ValueError(
+            "checkpoint has mixed/no floating dtypes; pass dtype explicitly"
+        )
+    return types.pop()
 
 
 def _validate_vocabulary(model, plan):
