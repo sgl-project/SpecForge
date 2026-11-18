@@ -4,31 +4,15 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.modeling.draft.layers.norm import RMSNorm
-from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm
 from tests.test_modeling.mtp_reference import OffsetRMSNorm
 
 
 class RMSNormTest(unittest.TestCase):
-    def test_liger_skips_weightless_norms(self):
-        """Liger RMSNorm needs a weight; a weightless norm keeps the PyTorch path."""
-        from specforge.modeling.draft.layers.kernels import configure_kernels
-
-        weightless = RMSNorm(
-            RMSNormSpec(eps=1e-6, weight_offset=0, has_weight=False), hidden_size=8
-        )
-        model = torch.nn.Sequential(weightless)
-        kernels = (object(), object())
-        with patch(
-            "specforge.modeling.draft.layers.kernels.load_liger_kernels",
-            return_value=kernels,
-        ):
-            configure_kernels(model, use_liger=True)
-        self.assertIsNone(weightless.liger_norm)
-
     def _assert_parity(self, device, dtypes):
         for reference_type, offset in (
             (Qwen3RMSNorm, 0),
@@ -59,11 +43,7 @@ class RMSNormTest(unittest.TestCase):
                             2, 3, 16, device=device, dtype=input_dtype
                         ).requires_grad_()
                         right = left.detach().clone().requires_grad_()
-                        # Compare eager primitives; compilation is a separate backend choice.
-                        with patch.object(
-                            LlamaRMSNorm, "forward", LlamaRMSNorm.forward.__wrapped__
-                        ):
-                            expected_output = expected(left)
+                        expected_output = expected(left)
                         actual_output = actual(right)
                         torch.testing.assert_close(
                             actual_output, expected_output, rtol=0, atol=0
@@ -117,6 +97,22 @@ class RMSNormTest(unittest.TestCase):
             with self.assertRaises(TypeError):
                 RMSNorm({"eps": 1e-6}, hidden_size=8)
             allocate.assert_not_called()
+
+    def test_liger_skips_weightless_norms(self):
+        """Liger RMSNorm needs a weight; a weightless norm keeps the PyTorch path."""
+        from specforge.modeling.draft.layers.kernels import configure_kernels
+
+        weightless = RMSNorm(
+            RMSNormSpec(eps=1e-6, weight_offset=0, has_weight=False), hidden_size=8
+        )
+        model = torch.nn.Sequential(weightless)
+        kernels = (object(), object())
+        with patch(
+            "specforge.modeling.draft.layers.kernels.load_liger_kernels",
+            return_value=kernels,
+        ):
+            configure_kernels(model, use_liger=True)
+        self.assertIsNone(weightless.liger_norm)
 
 
 if __name__ == "__main__":

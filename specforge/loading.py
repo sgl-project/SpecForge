@@ -16,7 +16,6 @@ from specforge.checkpoint.resolve import (
 )
 from specforge.checkpoint.target import TargetWeights
 from specforge.checkpoint.tensors import TensorStore
-from specforge.checkpoint.weight_plan import _validate_unquantized
 from specforge.config.draft import DraftConfig
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling import build_draft_model
@@ -41,54 +40,22 @@ def _target_store(source, config, from_target, cache_dir):
     )
 
 
-def _check_bound_copies(checkpoint, preview, plan):
-    """Do not silently replace a legacy table with a different target table."""
-    bindings = dict(plan.bindings)
-    for name, ref in checkpoint.bound_copies.items():
-        _validate_unquantized(name, ref)
-        saved = ref.read()
-        target = bindings[name].read().to(saved.dtype).clone()
-        preview.get_submodule(name)._transform_weight(target)
-        if saved.shape != target.shape or not torch.equal(saved, target):
-            raise ValueError(
-                f"legacy {ref.key} differs from bound target {bindings[name].key}"
-            )
-
-
-def check_bound_copies(checkpoint, *, target, cache_dir=None):
-    """Reject legacy copies of bound tables that differ from the target."""
-    if not checkpoint.bound_copies:
-        return
-    preview = build_draft_model(checkpoint.config, device="meta")
-    bindings = resolve_bindings(
-        checkpoint.config,
-        _target_store(target, checkpoint.config, None, cache_dir),
-        _target_config(target, cache_dir),
-    )
-    plan = make_weight_plan(preview, checkpoint.weights, bindings=bindings)
-    _check_bound_copies(checkpoint, preview, plan)
-
-
 def read_draft(
     source,
     *,
     target=None,
-    legacy_config=None,
-    legacy_settings=None,
     adapter=None,
     cache_dir=None,
 ):
     """Read structure and tensor references without constructing/loading a model.
 
     target is a checkpoint path/repository, not a target model instance. A source
-    without config.json needs an explicit supplementary legacy configuration.
+    must contain a canonical config.json.
     """
     target_config = _target_config(target, cache_dir)
     return read_checkpoint(
         source,
         target_config=target_config,
-        legacy_config=legacy_config,
-        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -127,15 +94,13 @@ def load_draft(
     *,
     target=None,
     draft=None,
-    legacy_config=None,
-    legacy_settings=None,
     adapter=None,
     device="cpu",
     dtype=None,
     backend="eager",
     cache_dir=None,
 ):
-    """Restore canonical/legacy draft weights; optional draft is an equality check.
+    """Restore canonical draft weights; optional draft is an equality check.
 
     Constructs on meta for preflight, then constructs the real model once and
     copies into its initialized tensors. Missing weights are never randomized.
@@ -144,8 +109,6 @@ def load_draft(
     checkpoint = read_checkpoint(
         source,
         target_config=target_config,
-        legacy_config=legacy_config,
-        legacy_settings=legacy_settings,
         adapter=adapter,
         cache_dir=cache_dir,
     )
@@ -165,7 +128,6 @@ def load_draft(
         checkpoint.weights,
         bindings=resolve_bindings(checkpoint.config, target_store, target_config),
     )
-    _check_bound_copies(checkpoint, preview, plan)
     model = build_draft_model(
         checkpoint.config, device=device, dtype=dtype, backend=backend
     )
@@ -193,8 +155,6 @@ def initialize_draft(
     dtype=torch.float32,
     backend="eager",
     cache_dir=None,
-    legacy_config=None,
-    legacy_settings=None,
 ):
     """Construct scratch/new-structure weights, optionally copying explicit sources.
 
@@ -219,8 +179,6 @@ def initialize_draft(
             weights_from,
             check_target=False,
             target_config=target_config,
-            legacy_config=legacy_config,
-            legacy_settings=legacy_settings,
             cache_dir=cache_dir,
         )
     )

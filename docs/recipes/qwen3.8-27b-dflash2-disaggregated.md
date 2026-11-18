@@ -8,7 +8,7 @@ topology: Disaggregated
 
 # Qwen3.8-27B DFlash2 disaggregated training
 
-Trains the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Trains the DFlash2 drafter in `specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml` for
 `Qwen/Qwen3.8-27B` on the disaggregated online data plane: SGLang with the capture plugin
 capture servers publish the target's hidden states into Mooncake, and
 data-parallel trainer ranks consume them. The first two recipes share every
@@ -37,7 +37,7 @@ payload size and which from the GPU generation.
   retries transient read failures. The in-flight watermarks in the recipes are
   sized for that loader.
 - A compatible SGLang build with the
-  [capture plugin](../../plugins/sglang-spec-capture/README.md) on every capture
+  [capture plugin](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md) on every capture
   host. Servers run `--enable-return-aux-hidden-states --speculative-algorithm DFLASH`
   with the draft's auxiliary layers
   `5 19 33 47 61`; the DFlash2 selector exists only on the trainer.
@@ -145,7 +145,7 @@ warm-up, stock SGLang 0.5.18 with DeepGEMM:
 | same, re-split | 5+3 | 12.33 | three trainer ranks |
 | same, `model.use_liger_kernel: true` | 4+4 / 5+3 | 14.00 / 13.10 | trainer ranks and producer drains |
 | this revision, FA3 + FlashInfer GDN servers, TCP | 4+4 | 18.06 | trainer compute + fetch wait |
-| + `training.dflash_teacher_metrics: false` | 4+4 | 18.70 | trainer TCP receive path |
+| + `training.objective_options.teacher_metrics: false` | 4+4 | 18.70 | trainer TCP receive path |
 | + RDMA loopback | 4+4 | 18.60 | capture servers (trainers wait 0.42 s/step) |
 | + Liger, re-split | 5+3 | 22.34 | balanced, no data wait |
 | + accumulation 6 (this recipe, 36 samples/step) | 5+3 | 22.65 | balanced |
@@ -162,7 +162,7 @@ What moved each side:
   fp32 traffic per micro-batch; now 3.4x faster), the fused grouped
   convolution, one host sync per optimizer step instead of one per micro-step,
   and Liger RMSNorm/SwiGLU. These numbers keep the objective logits for
-  backward, so the recipes set `training.objective_checkpointing: false`; the
+  backward, so the recipes set `training.loss.execution.checkpoint: false`; the
   default recomputes the projection to save memory.
 - RDMA loopback takes the per-byte CPU copies out of the SGLang and trainer
   processes: at 4+4 the trainer step fell from 1.42 s to 1.22 s. The capture
@@ -364,7 +364,7 @@ Recipes and launcher were exercised as follows:
 - `DRY_RUN=1` of the two-node wrapper for both node ranks, including the
   eight-server URL list handed to the producer.
 - No full-convergence run was made in disaggregated mode. The optimizer
-  settings (constant 5e-4, `loss_decay_gamma` 7, hard-target CE with the
+  settings (constant 5e-4, `weighting.gamma` 7, hard-target CE with the
   strict top-k selector objective) are those of one-epoch colocated runs of
   the same draft and corpus, in which the strict top-k selector gave the best
   serving acceptance length among the objective variants tried.

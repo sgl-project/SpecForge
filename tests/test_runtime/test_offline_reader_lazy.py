@@ -77,6 +77,43 @@ def _no_file_reads():
 
 
 class TestOfflineReaderIsLazy(unittest.TestCase):
+    def test_canonical_reader_accepts_historical_eagle_fields(self):
+        from specforge.training.canonical_data import build_reader
+
+        with tempfile.TemporaryDirectory() as directory:
+            features = {
+                "input_ids": torch.arange(4),
+                "loss_mask": torch.ones(4),
+                "aux_hidden_state": torch.randn(4, 12),
+                "hidden_state": torch.randn(4, 4),
+            }
+            torch.save(features, os.path.join(directory, "sample.ckpt"))
+            keys = (
+                "input_ids",
+                "loss_mask",
+                "hidden_states",
+                "target_last_hidden_states",
+            )
+            for validate in (False, True):
+                reader = build_reader(
+                    directory,
+                    strategy="eagle3",
+                    keys=keys,
+                    run_id="migration",
+                    validate_files=validate,
+                )
+                store = LocalFeatureStore()
+                tensors, handle = store.get(reader.read()[0])
+                try:
+                    torch.testing.assert_close(
+                        tensors["hidden_states"], features["aux_hidden_state"]
+                    )
+                    torch.testing.assert_close(
+                        tensors["target_last_hidden_states"], features["hidden_state"]
+                    )
+                finally:
+                    store.release(handle)
+
     def test_assembly_reads_no_uncompressed_file(self):
         directory = _features(compress=False)
         with _no_file_reads():

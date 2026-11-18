@@ -25,7 +25,6 @@ data:
   dataloader_num_workers: 8
 
 training:
-  strategy: dspark
   num_epochs: 12
   batch_size: 2
   accumulation_steps: 11
@@ -38,12 +37,16 @@ training:
   attention_backend: eager
   objective_options:
     num_anchors: 512
-    confidence_loss_alpha: 0.0
     # Expert-bias load balancing: zero-mean sign step per optimizer step.
     bias_update_rate: 0.001
     # Load-balance loss on the router scores against this step's pooled load.
     aux_loss_coef: 0.005
     aux_loss_type: batch_wise
+  loss:
+    terms:
+      # A zero confidence coefficient also freezes confidence_head.
+      confidence:
+        coefficient: 0.0
   weighting:
     kind: exponential
     gamma: 7.0

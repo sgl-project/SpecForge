@@ -1,6 +1,6 @@
 """Encode and decode registered component schemas and layer references.
 
-Legacy aliases and defaults belong in the legacy codec, not in these readers.
+These readers are strict: unknown fields are rejected and no aliases are read.
 """
 
 from collections.abc import Mapping

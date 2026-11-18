@@ -303,7 +303,7 @@ class MoEBalanceTest(unittest.TestCase):
                     self.assertTrue(term.mean_probs[0].requires_grad)
                     self.assertTrue(torch.equal(term.counts[0], own))
                     result = ObjectiveResult(
-                        torch.tensor(6.0), torch.tensor(2.0), {}, term
+                        torch.tensor(6.0), torch.tensor(2.0), deferred=term
                     )
                     with self.assertRaisesRegex(ValueError, "unfinished"):
                         result.loss
@@ -338,8 +338,7 @@ class MoEBalanceTest(unittest.TestCase):
                     ObjectiveResult(
                         torch.tensor(6.0),
                         torch.tensor(2.0),
-                        {},
-                        balancer.observe(outputs[1], keep=keep),
+                        deferred=balancer.observe(outputs[1], keep=keep),
                     ),
                     pooled=False,
                 )

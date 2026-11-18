@@ -1,18 +1,21 @@
 """Dense FFN retains projection names, computation order, and gradient updates."""
 
-import json
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import yaml
+from transformers.models.llama.modeling_llama import LlamaMLP
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
 
+from specforge.config.draft.codec import parse_draft
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.config.draft.mlp.dense import SUPPORTED_ACTIVATIONS
 from specforge.modeling.draft.layers.mlp import DenseFFN
-from specforge.modeling.draft.llama3_eagle import LlamaMLP
-from tests.test_config.test_draft_legacy_dflash import CONFIGS
+
+CONFIGS = Path(__file__).resolve().parents[2] / "specforge/config/draft/presets"
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
 
@@ -34,6 +37,7 @@ class DenseFFNTest(unittest.TestCase):
                                 intermediate_size=node.intermediate_size,
                                 hidden_act=activation,
                                 pretraining_tp=1,
+                                mlp_bias=False,
                             )
                         ).to(device=device, dtype=dtype)
                         actual = DenseFFN(
@@ -79,10 +83,12 @@ class DenseFFNTest(unittest.TestCase):
         self._assert_parity("cuda", (torch.float32, torch.float16, torch.bfloat16))
 
     def test_all_bundled_activation_choices_are_supported(self):
-        for path in CONFIGS.glob("*.json"):
-            payload = json.loads(path.read_text())
+        for path in CONFIGS.rglob("*.yaml"):
+            config = parse_draft(yaml.safe_load(path.read_text()), target_config=None)
             with self.subTest(path=path.name):
-                self.assertIn(payload["hidden_act"], SUPPORTED_ACTIVATIONS)
+                for mlp in config.mlp_configs.values():
+                    if isinstance(mlp, DenseFFNSpec):
+                        self.assertIn(mlp.hidden_act, SUPPORTED_ACTIVATIONS)
 
     def test_generic_base_initializes_child_projections_from_golden_config(self):
         owner = DFlashDraftModel(model_config(initializer_range=0))

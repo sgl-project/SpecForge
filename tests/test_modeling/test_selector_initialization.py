@@ -5,7 +5,6 @@ import unittest
 import torch
 from torch import nn
 
-from specforge.modeling.draft.dflash2 import CandidateSelector as LegacySelector
 from specforge.modeling.draft.heads.candidate_selector import CandidateSelector
 from tests.test_modeling.test_draft_pretrained import DFlashDraftModel, model_config
 
@@ -22,8 +21,7 @@ def selector(**options):
 
 
 class SelectorInitializationTest(unittest.TestCase):
-    def test_standalone_initialization_and_legacy_alias_are_unchanged(self):
-        self.assertIs(LegacySelector, CandidateSelector)
+    def test_standalone_initialization(self):
         torch.manual_seed(71)
         module = selector()
         # Preserve the old constructor's random draw order: child Linear first,

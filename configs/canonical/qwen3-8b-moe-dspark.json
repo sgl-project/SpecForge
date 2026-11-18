@@ -64,7 +64,7 @@
   "num_hidden_layers": 2,
   "norm_config": {
     "type": "rms",
-    "eps": 1e-06,
+    "eps": 1.0e-06,
     "weight_offset": 0,
     "has_weight": true
   },

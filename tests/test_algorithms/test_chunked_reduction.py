@@ -7,6 +7,7 @@ import torch
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
+from specforge.algorithms.objectives.projection import Projection
 
 
 class ChunkedReductionTest(unittest.TestCase):
@@ -25,7 +26,7 @@ class ChunkedReductionTest(unittest.TestCase):
                         sets.append(
                             Predictions(
                                 hidden=hidden,
-                                projector=lambda x: {"logits": head(x)},
+                                projection=Projection(lambda x: {"logits": head(x)}),
                                 mask=torch.tensor(mask, dtype=torch.float64)[:, None],
                                 positions=torch.zeros(len(mask), 1, dtype=torch.long),
                                 labels=torch.randint(7, (len(mask), 1)),

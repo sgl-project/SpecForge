@@ -1,131 +1,30 @@
 """Compose canonical models/objectives with existing data and trainer ports."""
 
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from functools import partial
 from pathlib import Path
 
-
-def enabled(cfg):
-    if (
-        cfg.draft is not None
-        or cfg.initialization is not None
-        or cfg.resume is not None
-    ):
-        return True
-    if cfg.resume_path:
-        from specforge.checkpoint.resolve import read_json
-        from specforge.training.checkpoint import CheckpointManager
-
-        try:
-            directory = CheckpointManager.resolve_resume_dir(cfg.resume_path)
-        except FileNotFoundError:
-            return False  # Legacy launch planning need not have a local checkpoint.
-        path = Path(directory) / "config.json"
-        return path.is_file() and read_json(path).get("model_type") == "specforge_draft"
-    return False
-
-
-_LEGACY_SETTING_FIELDS = {
-    "mask_token_id": "model.mask_token_id",
-    "norm_before_residual": "training.norm_before_residual",
-    "capture_layers": "model.aux_hidden_state_layer_ids",
-}
-
-
-def _legacy_settings(cfg):
-    return {
-        name: value
-        for name, value in {
-            "mask_token_id": cfg.model.mask_token_id,
-            "norm_before_residual": cfg.training.norm_before_residual,
-            "capture_layers": cfg.model.aux_hidden_state_layer_ids,
-        }.items()
-        if value is not None
-    }
-
-
-def _is_canonical_checkpoint(cfg, source):
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-
-    path = resolve_checkpoint_path(
-        source, cache_dir=cfg.model.cache_dir, config_only=True
-    )
-    config = (path.parent if path.is_file() else path) / "config.json"
-    return config.is_file() and read_json(config).get("model_type") == "specforge_draft"
-
-
-def _source_legacy_settings(cfg, source):
-    """Legacy imports apply the YAML settings; canonical sources already record them."""
-    return None if _is_canonical_checkpoint(cfg, source) else _legacy_settings(cfg)
-
-
-def _reject_changed_legacy_settings(config, settings):
-    spec = config.spec_config
-    features = spec.target_features
-    # each setting lives on the spec node of the architectures that have it
-    recorded = {
-        "mask_token_id": getattr(
-            spec, "mask_token_id", getattr(features, "mask_token_id", None)
-        ),
-        "norm_before_residual": getattr(spec, "norm_before_residual", None),
-        "capture_layers": getattr(features, "target_layer_ids", None),
-    }
-    for name, value in settings.items():
-        saved = recorded[name]
-        if name == "capture_layers" and saved is not None:
-            saved, value = list(saved), list(value)
-        if saved != value:
-            raise ValueError(
-                f"{_LEGACY_SETTING_FIELDS[name]}={value!r} differs from the "
-                f"draft's recorded {saved!r}; remove it or make it match"
-            )
-
-
-def _read_draft_payload(draft):
-    if not isinstance(draft, str):
-        return draft
-    import json
-
-    import yaml
-
-    text = Path(draft).read_text()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return yaml.safe_load(text)
-
-
-def _is_legacy_payload(payload):
-    return isinstance(payload, dict) and payload.get("model_type") not in (
-        None,
-        "specforge_draft",
-    )
+logger = logging.getLogger(__name__)
 
 
 def resolve_config(cfg, *, target_config=None):
     from specforge.config.draft.codec import parse_draft
 
-    draft = _read_draft_payload(cfg.draft)
-    legacy_draft = _is_legacy_payload(draft)
-    if legacy_draft:
-        from specforge.config.draft.codec import decode_legacy_config
+    draft = cfg.draft
+    if isinstance(draft, str):
+        import json
 
-        if target_config is None:
-            from specforge.checkpoint.resolve import read_target_config
+        import yaml
 
-            target_config = read_target_config(
-                cfg.model.target_model_path, cache_dir=cfg.model.cache_dir
-            )
-        supplied = decode_legacy_config(
-            draft, target_config=target_config, **_legacy_settings(cfg)
-        )
-    else:
-        supplied = (
-            parse_draft(draft, target_config=target_config)
-            if draft is not None
-            else None
-        )
+        text = Path(draft).read_text()
+        try:
+            draft = json.loads(text)
+        except json.JSONDecodeError:
+            draft = yaml.safe_load(text)
+    supplied = (
+        parse_draft(draft, target_config=target_config) if draft is not None else None
+    )
     initialization = cfg.initialization
     source = initialization.checkpoint if initialization else None
     if cfg.resume_path:
@@ -135,38 +34,17 @@ def resolve_config(cfg, *, target_config=None):
     if source:
         from specforge.loading import read_draft
 
-        canonical = _is_canonical_checkpoint(cfg, source)
-        if cfg.resume_path and not canonical:
-            raise ValueError(
-                "legacy full resume uses the legacy training path, which MTP no longer has; use initialization.checkpoint for canonical weight import"
-            )
         loaded = read_draft(
             source,
             target=cfg.model.target_model_path,
             cache_dir=cfg.model.cache_dir,
             adapter=initialization.adapter if initialization else None,
-            legacy_config=initialization.legacy_config if initialization else None,
-            legacy_settings=None if canonical else _legacy_settings(cfg),
         ).config
-        if canonical:
-            _reject_changed_legacy_settings(loaded, _legacy_settings(cfg))
         if supplied is not None and supplied != loaded:
             raise ValueError(
                 "draft must exactly match checkpoint structure; use weights_from to change it"
             )
         return loaded
-    settings = _legacy_settings(cfg)
-    if (
-        settings
-        and not legacy_draft
-        and not (initialization and initialization.weights_from)
-    ):
-        if supplied is None:
-            raise ValueError(
-                "canonical draft settings belong in draft; legacy overrides require a legacy checkpoint"
-            )
-        # a decoded legacy draft records them; resolve_run re-resolves that draft
-        _reject_changed_legacy_settings(supplied, settings)
     if supplied is None:
         raise ValueError("canonical training requires draft or a checkpoint")
     return supplied
@@ -212,43 +90,8 @@ def _objective_settings(cfg):
     )
 
 
-def _validate_imported_objective(cfg, resolved):
-    from specforge.checkpoint.resolve import read_json, resolve_checkpoint_path
-    from specforge.config.draft.codec.legacy.dspine import (
-        extract_dspine_training_settings,
-    )
-
-    payloads = []
-    draft = _read_draft_payload(cfg.draft)
-    if _is_legacy_payload(draft):
-        payloads.append(draft)
-    init = cfg.initialization
-    if init is not None and init.checkpoint is not None:
-        source = resolve_checkpoint_path(
-            init.checkpoint, cache_dir=cfg.model.cache_dir, config_only=True
-        )
-        directory = source.parent if source.is_file() else source
-        payloads.append(read_json(init.legacy_config or directory / "config.json"))
-    for payload in payloads:
-        if payload.get("model_type") == "specforge_draft" or payload.get(
-            "architectures"
-        ) != ["DSpineDraftModel"]:
-            continue
-        for name, saved in extract_dspine_training_settings(payload).items():
-            if getattr(resolved.objective, name) != saved:
-                raise ValueError(
-                    f"legacy DSpine {name}={saved!r}; set training.objective_options.{name} to preserve it"
-                )
-
-
 def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
-    from specforge.algorithms.common.defaults import (
-        empty_options,
-        empty_resume_contract,
-        no_missing_checkpoint_keys,
-        online_needs_input_tools,
-    )
     from specforge.algorithms.common.providers import (
         AlgorithmProviders,
         DraftConfigProvider,
@@ -273,10 +116,6 @@ def resolve_run(cfg, *, target_config=None):
 
     from . import canonical_data
 
-    if cfg.model.draft_model_config or cfg.model.draft_checkpoint_path:
-        raise ValueError(
-            "canonical checkpoint cannot mix with legacy model.draft_* sources"
-        )
     draft = resolve_config(cfg, target_config=target_config)
     if cfg.initialization and cfg.initialization.from_target:
         from specforge.checkpoint.native import validate_target_initialization
@@ -290,81 +129,9 @@ def resolve_run(cfg, *, target_config=None):
             )
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
-    # New objectives have their own options. Never silently consume legacy
-    # algorithm switches with a different meaning on the canonical path.
-    optimization_options = {
-        "objective_chunk_blocks",
-        "objective_checkpointing",
-        "fused_logits_loss",
-        "mtp_objective_chunk_size",
-        "trim_loss_positions",
-    }
-    legacy_options = optimization_options | {
-        "loss_type",
-        "lk_loss_type",
-        "dpace_alpha",
-        "kl_scale",
-        "kl_decay",
-        "ttt_length",
-        "num_anchors",
-        "loss_decay_gamma",
-        "dflash2_selector_loss_alpha",
-        "dflash2_selector_warmup_ratio",
-        "dflash2_selector_ramp_ratio",
-        "dflash2_selector_stop_gradient",
-        "lambda_base_start",
-        "lambda_base_decay_ratio",
-        "dspark_ce_loss_alpha",
-        "dspark_l1_loss_alpha",
-        "dspark_confidence_head_alpha",
-        "num_depths",
-        "down_sample_ratio",
-        "down_sample_ratio_min",
-    }
-    from specforge.config.schema import TrainingConfig
-
-    defaults = TrainingConfig()
-    if draft.architecture == "MTPDraftModel":
-        legacy_options.remove("mtp_objective_chunk_size")
-        optimization_options.discard("mtp_objective_chunk_size")
-        chunk = cfg.training.mtp_objective_chunk_size
-        if chunk != defaults.mtp_objective_chunk_size:
-            options = dict(cfg.training.objective_options)
-            if (
-                "objective_chunk_size" in options
-                and options["objective_chunk_size"] != chunk
-            ):
-                raise ValueError("conflicting MTP objective_chunk_size settings")
-            options["objective_chunk_size"] = chunk
-            cfg = cfg.model_copy(
-                update={
-                    "training": cfg.training.model_copy(
-                        update={
-                            "objective_options": options,
-                            "mtp_objective_chunk_size": defaults.mtp_objective_chunk_size,
-                        }
-                    )
-                }
-            )
-    present = {
-        name
-        for name in legacy_options
-        if getattr(cfg.training, name) != getattr(defaults, name)
-    }
-    if present:
-        raise ValueError(
-            f"canonical training uses training.loss, training.weighting and "
-            f"training.objective_options, not {sorted(present)}"
-        )
-    ignored = cfg.training.model_fields_set & optimization_options
-    if ignored:
-        logging.getLogger(__name__).warning(
-            "Canonical objectives do not use legacy optimization options %s; "
-            "their default values do not enable chunking, checkpointing or fused loss",
-            sorted(ignored),
-        )
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
-    _validate_imported_objective(cfg, resolved)
+    if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
+        raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
 
     init = cfg.initialization
@@ -384,20 +151,35 @@ def resolve_run(cfg, *, target_config=None):
             raise ValueError(f"model.{field} is not used by this draft initialization")
     objective, entry = resolved.name, resolved.registration
     requirements = entry.training
-    family = entry.legacy_strategy or objective
-    if cfg.training.strategy not in (defaults.strategy, family, objective):
-        raise ValueError("training.strategy conflicts with the objective")
-    if (
-        cfg.training.tp_size,
-        cfg.training.sp_ulysses_size,
-        cfg.training.sp_ring_size,
-    ) != (1, 1, 1):
-        raise ValueError(
-            "canonical objectives currently require trainer TP/SP sizes of one"
-        )
+    family = entry.runtime_name or objective
+    if cfg.training.tp_size != 1:
+        raise ValueError("canonical objectives require trainer TP size one")
+    sequence_parallel = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size > 1
+    if sequence_parallel and (
+        not requirements.supports_sequence_parallel
+        or cfg.training.attention_backend != "usp"
+    ):
+        raise ValueError("sequence parallelism requires an objective supporting USP")
+    if sequence_parallel:
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+            raise ValueError(
+                "D-PACE weighting is not supported with sequence parallelism: "
+                "chain weights are normalized within each sequence shard"
+            )
     # Retain the established strategy name for data/rendezvous identifiers.
+    options = asdict(resolved.objective)
+    # The balancing options sit beside the objective's; build_bundle reads them back.
+    options.update(resolved.statistics_settings)
+    if cfg.training.weighting is not None:
+        # An explicit weighting replaces these. build_bundle resolves this
+        # config again and must not read the objective's defaults as user input.
+        for name in getattr(resolved.objective, "default_weighting_options", ()):
+            if name not in cfg.training.objective_options:
+                del options[name]
     training = cfg.training.model_copy(
-        update={"strategy": family, "objective": objective}
+        update={"objective": objective, "objective_options": options}
     )
     cfg = cfg.model_copy(update={"draft": encode_config(draft), "training": training})
     keys = tuple(entry.inputs)
@@ -440,6 +222,7 @@ def resolve_run(cfg, *, target_config=None):
             canonical_data.build_normalizer,
             keys=keys,
             loss_mask_filter=requirements.loss_mask_filter,
+            overlap=getattr(resolved.objective, "ttt_length", 1),
         ),
         build_collator=partial(canonical_data.build_collator, keys=keys),
         capture_layout=layout,
@@ -474,9 +257,9 @@ def resolve_run(cfg, *, target_config=None):
         attention_backends=requirements.attention_backends,
         required_batch_size=requirements.required_batch_size,
         supports_vocab_mapping=vocab,
+        supports_trim_loss_positions=True,
+        supports_compact_teacher=vocab,
         supports_liger_kernel=True,
-        # a checkpoint import's legacy config becomes the draft; the reader checks it
-        allows_aux_layer_override=bool(init and init.checkpoint),
     )
     spec = AlgorithmSpec(
         name=family,
@@ -488,11 +271,8 @@ def resolve_run(cfg, *, target_config=None):
         capabilities=capabilities,
     )
     provider = ModelProvider(
-        build_draft=None,
-        build_training_model=None,
         build_bundle=build_bundle,
-        needs_input_tools=online_needs_input_tools,
-        default_dataloader_num_workers=None,
+        default_dataloader_num_workers=requirements.dataloader_workers,
         loss_mask_filter=requirements.loss_mask_filter,
         draft_config=DraftConfigProvider(architecture=draft.architecture),
         resolve_capture_layers=capture_layers,
@@ -502,9 +282,6 @@ def resolve_run(cfg, *, target_config=None):
     )
     step = StepProvider(
         build=build_step,
-        options=empty_options,
-        resume_contract=empty_resume_contract,
-        allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
         uses_external_target_head=False,
     )
     providers = AlgorithmProviders(
@@ -518,6 +295,125 @@ def resolve_run(cfg, *, target_config=None):
     return cfg, make_registration(spec, providers)
 
 
+@dataclass(frozen=True)
+class LigerChoice:
+    """Resolved ``model.use_liger_kernel`` for one trainer platform."""
+
+    enabled: bool
+    reason: str
+
+    def describe(self):
+        return f"Liger kernels: {'on' if self.enabled else 'off'} ({self.reason})"
+
+
+#: Liger kernels are Triton programs. SpecForge validates them on CUDA and ROCm;
+#: Liger also ships Ascend and XPU backends that SpecForge has not validated.
+_LIGER_VALIDATED_PLATFORMS = ("cuda", "rocm")
+_LIGER_UNVALIDATED_PLATFORMS = ("npu", "xpu")
+
+
+def trainer_platform():
+    """This process's accelerator; PyTorch reports ROCm as ``cuda``."""
+    import torch
+
+    from specforge.utils import get_device_type
+
+    device_type = get_device_type()
+    if device_type == "cuda" and getattr(torch.version, "hip", None) is not None:
+        return "rocm"
+    return device_type
+
+
+def liger_choice(requested, *, by_default, hidden_act, platform=None):
+    """Resolve model.use_liger_kernel for a trainer platform (default: this one).
+
+    An unset flag enables Liger only for objectives that declare it as their
+    default, on a CUDA/ROCm trainer with a silu/swish draft. ``true`` never
+    degrades silently: it raises where Liger cannot run.
+    """
+    platform = platform or trainer_platform()
+    if requested is False:
+        return LigerChoice(False, "model.use_liger_kernel=false")
+    supported_activation = hidden_act in ("silu", "swish")
+    if requested is None:
+        if not by_default:
+            return LigerChoice(False, "auto: not a default for this objective")
+        if platform not in _LIGER_VALIDATED_PLATFORMS:
+            return LigerChoice(
+                False, f"auto: trainer device {platform!r} is not CUDA/ROCm"
+            )
+        if not supported_activation:
+            return LigerChoice(
+                False, f"auto: draft hidden_act {hidden_act!r} is not silu/swish"
+            )
+        return LigerChoice(True, f"auto: {platform} trainer")
+    if platform not in _LIGER_VALIDATED_PLATFORMS + _LIGER_UNVALIDATED_PLATFORMS:
+        raise ValueError(
+            "model.use_liger_kernel=true requires a Triton GPU backend: CUDA or "
+            "ROCm, or Ascend NPU/XPU where it is unvalidated in SpecForge; this "
+            f"trainer's device is {platform!r}. Remove the key or set it to "
+            "false to use the PyTorch RMSNorm/SwiGLU."
+        )
+    if not supported_activation:
+        raise ValueError(
+            "model.use_liger_kernel=true requires the draft hidden_act to be "
+            f"'silu' or 'swish' (Liger SwiGLU); got {hidden_act!r}. Remove the "
+            "key or set it to false to use the PyTorch MLP."
+        )
+    if platform in _LIGER_UNVALIDATED_PLATFORMS:
+        return LigerChoice(True, f"explicit, unvalidated in SpecForge on {platform}")
+    return LigerChoice(True, "explicit")
+
+
+def preflight_kernels(cfg):
+    """Import the Liger kernels this run's draft build will resolve.
+
+    Called before services start or a consumer waits on its producer, so a
+    missing install fails at startup. build_bundle still owns the resolution.
+    """
+    requested = cfg.model.use_liger_kernel
+    if requested is False:
+        return
+    if requested is None:
+        from specforge.algorithms.objectives import resolve_objective
+        from specforge.config.draft.mlp.dense import DenseFFNSpec
+        from specforge.config.draft.mlp.moe import MoEFFNSpec
+
+        if trainer_platform() not in _LIGER_VALIDATED_PLATFORMS:
+            return  # auto never enables Liger here, so there is nothing to read
+        draft = resolve_config(cfg)
+        acts = set()  # what Liger's SwiGLU would replace: dense FFNs and shared experts
+        for node in draft.mlp_configs.values():
+            if isinstance(node, DenseFFNSpec):
+                acts.add(node.hidden_act)
+            elif isinstance(node, MoEFFNSpec) and node.shared_expert is not None:
+                acts.add(node.shared_expert.hidden_act)
+        resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+        choice = liger_choice(
+            None,
+            by_default=resolved.registration.training.liger_by_default,
+            # routed experts keep their own kernel; without other FFNs Liger has its RMSNorm
+            hidden_act="silu" if acts <= {"silu", "swish"} else "other",
+        )
+        if not choice.enabled:
+            return
+    from specforge.modeling.draft.layers.kernels import load_liger_kernels
+
+    load_liger_kernels()
+
+
+def _raise_flex_recompile_limit():
+    """Let compiled FlexAttention follow changing block-mask shapes.
+
+    Past the limit torch stops compiling the frame and runs it eagerly without
+    an error. The limit is process-wide; 64 is the value the block objectives
+    were tuned with.
+    """
+    import torch._dynamo as dynamo
+
+    dynamo.config.recompile_limit = max(dynamo.config.recompile_limit, 64)
+
+
 def build_bundle(cfg, algorithm):
     import torch
 
@@ -525,7 +421,11 @@ def build_bundle(cfg, algorithm):
         MODEL_PROVENANCE_CONTRACT_KEY,
         StepRuntimeConfig,
     )
-    from specforge.algorithms.objectives import build_objective_model, resolve_objective
+    from specforge.algorithms.objectives import (
+        build_objective_model,
+        objective_record,
+        resolve_objective,
+    )
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import (
@@ -535,7 +435,10 @@ def build_bundle(cfg, algorithm):
     from specforge.config.schema import ModelConfig
     from specforge.loading import initialize_draft, load_draft
     from specforge.modeling.draft.bindings import BoundLMHead
-    from specforge.modeling.draft.layers.kernels import configure_kernels
+    from specforge.modeling.draft.layers.kernels import (
+        configure_kernels,
+        liger_hidden_act,
+    )
     from specforge.modeling.draft.layers.mlp import MoEFFN
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
@@ -576,7 +479,11 @@ def build_bundle(cfg, algorithm):
         draft=draft,
         device=device,
         dtype=dtype,
-        backend=cfg.training.attention_backend,
+        backend=(
+            "eager"
+            if cfg.training.attention_backend == "usp"
+            else cfg.training.attention_backend
+        ),
         cache_dir=cfg.model.cache_dir,
     )
     if source:
@@ -584,8 +491,6 @@ def build_bundle(cfg, algorithm):
             source,
             **common,
             adapter=init.adapter if init else None,
-            legacy_config=init.legacy_config if init else None,
-            legacy_settings=_source_legacy_settings(cfg, source),
         ).train()
     else:
         weights = init.weights_from if init else None
@@ -611,14 +516,9 @@ def build_bundle(cfg, algorithm):
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
             allow_new=weights.allow_new if weights else (),
-            require_loaded=tuple(cfg.training.frozen)
-            + getattr(resolved.objective, "frozen_parameters", ()),
+            require_loaded=tuple(cfg.training.frozen) + resolved.frozen_parameters,
             from_target=from_target or None,
             cast_target_copies=cast_copies,
-            legacy_config=init.legacy_config if init else None,
-            legacy_settings=(
-                _source_legacy_settings(cfg, weights.checkpoint) if weights else None
-            ),
         )
     teacher = None
     if resolved.requires_teacher:
@@ -642,10 +542,21 @@ def build_bundle(cfg, algorithm):
                 f"draft vocab_size {model.vocabulary.vocab_size} must equal the "
                 f"target logit width {width} (padded_vocab_size when the target pads)"
             )
-    use_liger = cfg.model.use_liger_kernel is True
-    configure_kernels(
-        model, use_liger=use_liger, moe_experts_kernel=cfg.model.moe_experts_kernel
+    liger = liger_choice(
+        cfg.model.use_liger_kernel,
+        by_default=resolved.registration.training.liger_by_default,
+        hidden_act=liger_hidden_act(model),
     )
+    logger.info(liger.describe())
+    use_liger = liger.enabled
+    use_fused_conv = configure_kernels(
+        model,
+        use_liger=use_liger,
+        use_fused_conv=cfg.model.use_fused_conv,
+        moe_experts_kernel=cfg.model.moe_experts_kernel,
+    )
+    if cfg.training.attention_backend == "flex_attention":
+        _raise_flex_recompile_limit()
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
@@ -665,6 +576,11 @@ def build_bundle(cfg, algorithm):
         frozen=cfg.training.frozen,
         target_head=teacher,
     )
+    runtime.attention_backend = cfg.training.attention_backend
+    if cfg.training.attention_backend == "usp":
+        from .sequence_parallel import configure_sequence_parallel
+
+        configure_sequence_parallel(runtime)
     runtime.frozen_target_modules = tuple(
         dict.fromkeys(
             [model.get_submodule(name) for name in draft.target_bindings]
@@ -672,7 +588,7 @@ def build_bundle(cfg, algorithm):
         )
     )
     runtime.fsdp_param_dtype = dtype
-    options = asdict(runtime.objective)
+    options = objective_record(runtime.objective_name, asdict(runtime.objective))
     if runtime.statistics is not None:
         # Statistics settings join the contract only while on; earlier runs wrote none.
         options.update(runtime.statistics.settings)
@@ -681,9 +597,12 @@ def build_bundle(cfg, algorithm):
         "canonical_objective": runtime.objective_name,
         "canonical_objective_options": options,
         "canonical_use_liger_kernel": use_liger,
+        "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
-        "canonical_loss": asdict(runtime.token_loss),
+        "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),
+        "canonical_loss_execution": asdict(runtime.execution),
+        "canonical_loss_implementations": runtime.loss_implementations.names,
     }
     if any(isinstance(module, MoEFFN) for module in model.modules()):
         # Dense drafts never record the kernel, so their earlier checkpoints still resume.

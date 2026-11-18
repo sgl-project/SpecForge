@@ -33,6 +33,7 @@ COLLECTION_URL = "https://huggingface.co/collections/lmsys/specbundle"
 OUTPUT = Path(__file__).resolve().parents[2] / "data" / "specbundle_models.json"
 
 METHOD_PATTERNS = [
+    ("DMTP", re.compile(r"dmtp|d-mtp", re.I)),
     ("DSpark", re.compile(r"dspark", re.I)),
     ("Domino", re.compile(r"domino", re.I)),
     ("DFlash", re.compile(r"dflash", re.I)),

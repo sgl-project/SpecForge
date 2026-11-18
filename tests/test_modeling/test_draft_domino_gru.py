@@ -9,7 +9,6 @@ import torch
 from specforge.config.draft.architecture.domino import GRUHeadSpec
 from specforge.modeling.draft.heads import DominoGRUHead
 from specforge.modeling.draft.pretrained import DraftPreTrainedModel
-from tests.test_modeling.test_domino_model import _bare_domino
 from tests.test_modeling.test_draft_pretrained import model_config
 
 
@@ -23,7 +22,7 @@ class DFlashDraftModel(DraftPreTrainedModel):
 
 
 class DominoGRUTest(unittest.TestCase):
-    def test_aligned_head_matches_legacy_interface_for_both_label_conventions(self):
+    def test_aligned_head_matches_explicit_gru_for_both_label_conventions(self):
         cases = [("cpu", torch.float32), ("cpu", torch.bfloat16)]
         if torch.cuda.is_available():
             cases.extend(
@@ -36,11 +35,25 @@ class DominoGRUTest(unittest.TestCase):
                     with self.subTest(
                         device=device, dtype=dtype, shifted=shifted, prefix=prefix
                     ):
-                        legacy = _bare_domino().to(device=device, dtype=dtype)
-                        legacy.shift_label, legacy.pure_draft_prefix_len = (
-                            shifted,
-                            prefix,
+                        legacy = torch.nn.Module()
+                        legacy.prefix_gru = torch.nn.GRU(
+                            4,
+                            3,
+                            batch_first=True,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
                         )
+                        legacy.embed_proj = torch.nn.Sequential(
+                            torch.nn.Linear(
+                                7, 2, bias=False, device=device, dtype=dtype
+                            ),
+                            torch.nn.SiLU(),
+                            torch.nn.Linear(
+                                2, 7, bias=False, device=device, dtype=dtype
+                            ),
+                        )
+                        legacy.suffix_start = prefix + (0 if shifted else 1)
                         head = DominoGRUHead(
                             GRUHeadSpec(hidden_size=3, projection_size=2),
                             hidden_size=4,
@@ -72,14 +85,6 @@ class DominoGRUTest(unittest.TestCase):
                                 ),
                                 -1,
                             )
-                        )
-                        torch.testing.assert_close(
-                            legacy.compute_correction_logits(
-                                prev_token_embeddings=embeddings, hidden_states=hidden
-                            ),
-                            expected,
-                            rtol=0,
-                            atol=0,
                         )
                         actual = head(
                             other_hidden[:, :, legacy.suffix_start :],

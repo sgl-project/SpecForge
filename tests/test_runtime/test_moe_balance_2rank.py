@@ -97,7 +97,7 @@ def _worker(rank, world_size):
                 )
             result = balanced(batch, step=0, total_steps=2)
             finished = balancer.finish(
-                ObjectiveResult(zero, one, {}, result.deferred),
+                ObjectiveResult(zero, one, deferred=result.deferred),
                 pooled=True,
                 process_group=dist.group.WORLD,
             )

@@ -64,14 +64,14 @@ python scripts/regenerate_train_data.py \
 export TRAIN_DATA_PATH=./cache/dataset/sharegpt_train_regen_10.jsonl
 export MODEL_NAME=Qwen3.6-27B
 export SPEC_METHOD=Dspark
-export DRAFT_MODEL_CONFIG=configs/qwen3.6-27b-dspark.json
+export DRAFT_MODEL_CONFIG=specforge/config/draft/presets/qwen3.6-27b-dspark.yaml
 export MODEL=Qwen/Qwen3.6-27B
 export TRAINING_CONFIG=examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dspark.yaml
 
 specforge train \
   --config ${TRAINING_CONFIG} \
   model.target_model_path=${MODEL} \
-  model.draft_model_config=${DRAFT_MODEL_CONFIG} \
+  draft=${DRAFT_MODEL_CONFIG} \
   model.sglang_context_length=4200 \
   data.train_data_path=${TRAIN_DATA_PATH} \
   data.max_length=4096 \
@@ -98,8 +98,7 @@ specforge train \
   runtime.producer_lease=1 \
   run_id=${MODEL_NAME}-${SPEC_METHOD}-overfit \
   output_dir=outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer \
-  model.embedding_key="model.language_model.embed_tokens.weight" \
-  model.mask_token_id=248070
+  model.embedding_key="model.language_model.embed_tokens.weight"
 ```
 <span style="color: red;"><strong>Note:</strong></span> The training data must be inferenced by the target model use temperature=0 and corresponding thinking mode.</span>
 
@@ -122,17 +121,16 @@ experiment, use a new suffix consistently in `run_id`, `output_dir`,
 First export the trained draft:
 
 ```bash
-# Export a serving artifact (legacy checkpoints need the config and target)
+# Export a canonical checkpoint to a serving artifact
 specforge export \
   --converter sglang \
   --checkpoint outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/consumer/${MODEL_NAME}-${SPEC_METHOD}-overfit-latest \
-  --draft-config ${DRAFT_MODEL_CONFIG} \
   --output-dir outputs/${MODEL_NAME}-${SPEC_METHOD}-overfit/draft_sglang \
   --target-model ${MODEL}
 ```
 
 The converter writes serving fields directly; no post-export normalization is
-needed. Canonical checkpoints do not need `--draft-config` or `--target-model`.
+needed. Historical checkpoint imports and `--draft-config` are not supported.
 The block size comes from the trained configuration.
 
 Start SGLang in the first terminal:
