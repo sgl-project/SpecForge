@@ -252,14 +252,17 @@ token.
 
 The auxiliary loss is DeepSeek-V3's load-balance loss on the router scores,
 E × Σ_e share_e × P_e per MoE layer with its own expert count, averaged (1 when
-balanced), weighted by `aux_loss_coef` (`0` skips
-it; the recipe uses `0.005`) and reported as `moe/aux_loss`. `aux_loss_type`
-picks the load behind share_e: `microbatch_wise` is this forward's own,
-`batch_wise` (the default) this optimizer step's so far, pooled over
-micro-batches and ranks, as in torchtitan and Megatron. The objective hands the
-loss out as a typed term holding its P_e and counts; the strategy pools the
-counts and finishes it, so objective evaluation still performs no collectives,
-and evaluation forwards balance against their own load.
+balanced). It is the named loss term `moe_balance`, weighted by
+`training.loss.terms.moe_balance.coefficient` (`0`, the default, skips it; the
+recipe uses `0.005`) and reported under that name. `aux_loss_type` in
+`training.objective_options` picks the load behind share_e: `microbatch_wise`
+is this forward's own, `batch_wise` (the default) this optimizer step's so far,
+pooled over micro-batches and ranks, as in torchtitan and Megatron. The
+strategy prepares that load (the only collective) and hands it to the forward,
+whose objective returns the term's value with its normalization; the shared
+loss flow applies the coefficient and combines it with the other terms, so
+objective evaluation still performs no collectives, and evaluation forwards
+balance against their own load.
 
 ### Loss execution
 

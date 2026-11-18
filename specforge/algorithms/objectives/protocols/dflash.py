@@ -56,8 +56,8 @@ class DFlashObjective:
     def loss_terms(self):
         return {
             "token": LossDefinition(self.default_loss),
-            # the MoE balance term; the training layer prepares its load
-            "moe_balance": LossDefinition(TokenLoss("value")),
+            # the MoE balance term, off by default; the training layer prepares its load
+            "moe_balance": LossDefinition(TokenLoss("value"), coefficient=0.0),
         }
 
     @property

@@ -123,9 +123,9 @@ def moe_run_config(target, draft, kernel, bias_update_rate=0.0, aux_loss_coef=0.
             "objective_options": {
                 "num_anchors": 2,
                 "bias_update_rate": bias_update_rate,
-                "aux_loss_coef": aux_loss_coef,
                 "aux_loss_type": "batch_wise",
             },
+            "loss": {"terms": {"moe_balance": {"coefficient": aux_loss_coef}}},
         },
     )
 
@@ -650,10 +650,21 @@ class CanonicalTrainingTest(unittest.TestCase):
             build_application_run(Config.model_validate(raw)).run()
         # Balancing joins the contract only while on; switching it either way is a change.
         raw["model"]["moe_experts_kernel"] = kernel
-        raw["training"]["objective_options"].update(
-            bias_update_rate=0.0 if bias_update_rate else 0.001, aux_loss_coef=0.0
+        raw["training"]["objective_options"]["bias_update_rate"] = (
+            0.0 if bias_update_rate else 0.001
         )
         with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+            build_application_run(Config.model_validate(raw)).run()
+        # The balance term's coefficient is part of the named loss record; turning
+        # the term on also brings the statistics' settings into the record.
+        raw["training"]["objective_options"]["bias_update_rate"] = bias_update_rate
+        raw["training"]["loss"]["terms"]["moe_balance"]["coefficient"] = (
+            0.0 if aux_loss_coef else 0.01
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical_loss" if aux_loss_coef else "canonical_objective_options",
+        ):
             build_application_run(Config.model_validate(raw)).run()
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
@@ -687,13 +698,22 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertTrue(
                 set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
             )
+            # A record from before the balance term existed resumes with it off.
+            terms = state["canonical_loss"]["terms"]
+            self.assertEqual(terms["moe_balance"]["coefficient"], 0.0)
+            old = {
+                **state,
+                "canonical_loss": {
+                    **state["canonical_loss"],
+                    "terms": {k: v for k, v in terms.items() if k != "moe_balance"},
+                },
+            }
+            torch.save(old, checkpoint / "training_state.pt")
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(checkpoint))
             raw["model"]["moe_experts_kernel"] = "loop"
             raw["training"]["max_steps"] = 2
-            raw["training"]["objective_options"].update(
-                aux_loss_coef=0.0, aux_loss_type="microbatch_wise"
-            )
+            raw["training"]["objective_options"].update(aux_loss_type="microbatch_wise")
             build_application_run(Config.model_validate(raw)).run()
             final = torch.load(
                 root / "output" / "specforge-run-step2" / "training_state.pt",

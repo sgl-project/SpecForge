@@ -50,11 +50,7 @@ class MoEBalanceTest(unittest.TestCase):
         self.assertFalse(hasattr(resolved.objective, "bias_update_rate"))
         self.assertEqual(
             resolved.statistics_settings,
-            {
-                "bias_update_rate": 0.001,
-                "aux_loss_coef": 0.0,
-                "aux_loss_type": "batch_wise",
-            },
+            {"bias_update_rate": 0.001, "aux_loss_type": "batch_wise"},
         )
         resolve_objective("DFlashDraftModel", options={"bias_update_rate": 0.5})
         for architecture in ("DFlash2DraftModel", "DominoDraftModel"):
@@ -67,8 +63,13 @@ class MoEBalanceTest(unittest.TestCase):
             resolve_objective(
                 "DSparkDraftModel", options={"aux_loss_type": "sequence_wise"}
             )
-        with self.assertRaises(ValueError):
-            resolve_objective("DFlashDraftModel", options={"aux_loss_coef": -0.1})
+        with self.assertRaises(ValueError):  # the term's coefficient is a loss setting
+            resolve_objective(
+                "DFlashDraftModel",
+                loss={"terms": {"moe_balance": {"coefficient": -0.1}}},
+            )
+        with self.assertRaises(TypeError):
+            resolve_objective("DFlashDraftModel", options={"aux_loss_coef": 0.1})
         with self.assertRaisesRegex(ValueError, "MoE layers"):
             build_objective_model(build_draft_model(dense_config()), options=options)
         with self.assertRaisesRegex(ValueError, "expert_bias"):
@@ -82,7 +83,8 @@ class MoEBalanceTest(unittest.TestCase):
         # The auxiliary loss alone needs no expert bias.
         runtime = build_objective_model(
             build_draft_model(moe_model_config(expert_bias=False)),
-            options={"num_anchors": 2, "aux_loss_coef": 0.01},
+            options={"num_anchors": 2},
+            loss={"terms": {"moe_balance": {"coefficient": 0.01}}},
         )
         self.assertEqual(runtime.statistics.rate, 0.0)
         self.assertEqual(runtime.statistics.settings["aux_loss_type"], "batch_wise")
@@ -151,11 +153,8 @@ class MoEBalanceTest(unittest.TestCase):
                 )
                 runtime = build_objective_model(
                     model,
-                    options={
-                        "num_anchors": 2,
-                        "bias_update_rate": 0.01,
-                        "aux_loss_coef": 0.5,
-                    },
+                    options={"num_anchors": 2, "bias_update_rate": 0.01},
+                    loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
                     target_head=head,
                 )
                 self.assertIsNone(plain.statistics)
@@ -195,7 +194,8 @@ class MoEBalanceTest(unittest.TestCase):
         self.assertEqual([layer.config.num_experts for layer in layers], [8, 4])
         runtime = build_objective_model(
             model,
-            options={"num_anchors": 2, "bias_update_rate": 0.01, "aux_loss_coef": 0.5},
+            options={"num_anchors": 2, "bias_update_rate": 0.01},
+            loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
             target_head=nn.Linear(32, config.vocab_size, bias=False),
         )
         balancer, seen = runtime.statistics, []
@@ -304,9 +304,7 @@ class MoEBalanceTest(unittest.TestCase):
         ]
         for aux_loss_type in AUX_LOSS_TYPES:
             with self.subTest(aux_loss_type=aux_loss_type):
-                balancer = MoEBalancer(
-                    model, rate=0.0, aux_loss_coef=0.5, aux_loss_type=aux_loss_type
-                )
+                balancer = MoEBalancer(model, rate=0.0, aux_loss_type=aux_loss_type)
                 first = balancer.balance(outputs[0], keep=keep, pooled=True)
                 self.assertTrue(first.requires_grad)
                 # A step's first forward balances against its own load either way.
@@ -333,16 +331,20 @@ class MoEBalanceTest(unittest.TestCase):
                 # The optimizer step resets the pooled load; rate 0 moves no bias.
                 self.assertEqual(set(balancer.step()), {"moe/step_balance"})
                 self.assertIsNone(balancer.pooled)
-        off = MoEBalancer(model, rate=0.0, aux_loss_coef=0.0)
-        self.assertIsNone(off.balance(outputs[0], keep=keep, pooled=True))
-        self.assertIsNotNone(off.counts[0])  # the bias statistics still count
+        # No balancer while the bias stays and no balance term is on; the term alone needs one.
+        settings = {"bias_update_rate": 0.0, "aux_loss_type": "batch_wise"}
+        self.assertIsNone(MoEBalancer.from_settings(model, settings))
+        self.assertIsNotNone(
+            MoEBalancer.from_settings(model, settings, balance_term=True)
+        )
 
     def test_the_strategy_prepares_the_load_and_pools_only_while_training(self):
         config = moe_model_config(expert_bias=False)
         model = build_draft_model(config)
         runtime = build_objective_model(
             model,
-            options={"num_anchors": 2, "aux_loss_coef": 0.5},
+            options={"num_anchors": 2},
+            loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
             target_head=nn.Linear(32, config.vocab_size, bias=False),
         )
         strategy = CanonicalTrainStrategy(

@@ -13,8 +13,9 @@ from .base import check_options
 
 # The load the auxiliary loss balances: this forward's, or the step's so far over ranks.
 AUX_LOSS_TYPES = ("microbatch_wise", "batch_wise")
-# The options that join a resume contract only while balancing is on.
-BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_coef", "aux_loss_type")
+# The options that join a resume contract only while balancing is on; the balance
+# loss's coefficient is the named loss term's (training.loss.terms.moe_balance).
+BALANCING_OPTIONS = ("bias_update_rate", "aux_loss_type")
 
 
 def check_aux_loss_type(value: str) -> None:
@@ -25,16 +26,9 @@ def check_aux_loss_type(value: str) -> None:
 
 
 def balancing_settings(options: dict) -> dict:
-    """The balancing options with defaults filled in and checked; off when rate and coef are 0."""
-    settings = {
-        "bias_update_rate": 0.0,
-        "aux_loss_coef": 0.0,
-        "aux_loss_type": "batch_wise",
-        **options,
-    }
-    check_options(
-        nonnegative={k: settings[k] for k in ("bias_update_rate", "aux_loss_coef")}
-    )
+    """The balancing options with defaults filled in and checked."""
+    settings = {"bias_update_rate": 0.0, "aux_loss_type": "batch_wise", **options}
+    check_options(nonnegative={"bias_update_rate": settings["bias_update_rate"]})
     check_aux_loss_type(settings["aux_loss_type"])
     return settings
 
@@ -79,16 +73,8 @@ def moe_balance_loss(output, keep: Tensor, load: PreparedLoad) -> Tensor:
 class MoEBalancer:
     """The objectives' StepStatistics for MoE drafts: counts, the bias step, the aux loss."""
 
-    def __init__(
-        self,
-        model: nn.Module,
-        *,
-        rate: float,
-        aux_loss_coef: float = 0.0,
-        aux_loss_type: str = "batch_wise",
-    ):
+    def __init__(self, model: nn.Module, *, rate: float, aux_loss_type="batch_wise"):
         self.rate = rate
-        self.aux_loss_coef = aux_loss_coef
         self.aux_loss_type = aux_loss_type
         self.layers = [m for m in model.modules() if isinstance(m, MoEFFN)]
         if not self.layers:
@@ -104,25 +90,22 @@ class MoEBalancer:
         self.pooled: tuple[Tensor, ...] | None = None
 
     @classmethod
-    def from_settings(cls, model: nn.Module, settings: dict) -> "MoEBalancer | None":
-        """A balancer from balancing_settings; None while balancing is off."""
-        if not settings.get("bias_update_rate") and not settings.get("aux_loss_coef"):
+    def from_settings(
+        cls, model: nn.Module, settings: dict, *, balance_term: bool = False
+    ) -> "MoEBalancer | None":
+        """A balancer from balancing_settings; None while the bias stays and no balance term is on."""
+        if not settings.get("bias_update_rate") and not balance_term:
             return None
         return cls(
             model,
             rate=settings["bias_update_rate"],
-            aux_loss_coef=settings["aux_loss_coef"],
             aux_loss_type=settings["aux_loss_type"],
         )
 
     @property
     def settings(self) -> dict:
         """The StepStatistics contract: the options that built this balancer."""
-        return {
-            "bias_update_rate": self.rate,
-            "aux_loss_coef": self.aux_loss_coef,
-            "aux_loss_type": self.aux_loss_type,
-        }
+        return {"bias_update_rate": self.rate, "aux_loss_type": self.aux_loss_type}
 
     def _routings(self, output):
         routings = output.expert_routing or ()
@@ -156,10 +139,8 @@ class MoEBalancer:
         return tuple(counts)
 
     def balance(self, output, *, keep: Tensor, pooled: bool, process_group=None):
-        """Count this forward; then its balance value against its own load, or (batch_wise while `pooled`) the step's so far over micro-batches and ranks; None while the loss is off."""
+        """Count this forward; then its balance value against its own load, or (batch_wise while `pooled`) the step's so far over micro-batches and ranks."""
         counts = self.observe(output, keep=keep)
-        if not self.aux_loss_coef:
-            return None
         if pooled and self.aux_loss_type == "batch_wise":
             counts = self._sum_over_ranks(counts, process_group)
             if self.pooled is not None:

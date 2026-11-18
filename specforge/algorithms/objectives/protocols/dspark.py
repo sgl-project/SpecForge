@@ -52,8 +52,8 @@ class DSparkObjective:
             "confidence": LossDefinition(
                 TokenLoss("bce"), modules=("confidence_head",)
             ),
-            # the MoE balance term; the training layer prepares its load
-            "moe_balance": LossDefinition(TokenLoss("value")),
+            # the MoE balance term, off by default; the training layer prepares its load
+            "moe_balance": LossDefinition(TokenLoss("value"), coefficient=0.0),
         }
 
     default_weighting_options = ("loss_decay_gamma",)

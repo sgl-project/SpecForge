@@ -335,6 +335,7 @@ def build_objective_model(
     for module in to_freeze:
         module.requires_grad_(False)
 
+    balance = resolved.losses.terms.get("moe_balance")
     return ObjectiveModel(
         draft_model,
         objective,
@@ -345,7 +346,11 @@ def build_objective_model(
         weighting=resolved.weighting,
         frozen_parameters=frozen,
         execution=resolved.execution,
-        statistics=MoEBalancer.from_settings(draft_model, resolved.statistics_settings),
+        statistics=MoEBalancer.from_settings(
+            draft_model,
+            resolved.statistics_settings,
+            balance_term=balance is not None and balance.coefficient != 0,
+        ),
     )
 
 

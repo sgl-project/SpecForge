@@ -16,11 +16,11 @@ class StepStatistics(Protocol):
         self,
     ) -> dict[str, object]: ...  # what built them; the resume contract records it
 
+    def observe(self, output, *, keep: Tensor) -> tuple[Tensor, ...]: ...  # counts
+
     def balance(
         self, output, *, keep: Tensor, pooled: bool, process_group=None
-    ) -> (
-        Tensor | None
-    ): ...  # this forward's regularizer, already normalized; None while off
+    ) -> Tensor: ...  # counts, then this forward's regularizer, already normalized
 
     def step(self, *, process_group=None) -> dict[str, Tensor]: ...
 
@@ -214,33 +214,32 @@ class ObjectiveModel(nn.Module):
     def balance_term(self, output, blocks, context):
         """A block protocol's balance term and its value for this forward.
 
-        The statistics' regularizer runs through the training layer's
-        ``prepare_statistics`` hook when the forward has one, which pools the
-        load over ranks; a direct call balances against this forward's own
-        load. Without statistics the term is off and its value zero.
+        The term's coefficient is the configured ``moe_balance`` loss term's.
+        While it is on, the statistics' regularizer runs through the training
+        layer's ``prepare_statistics`` hook when the forward has one, which
+        pools the load over ranks; a direct call balances against this
+        forward's own load. Off, the statistics still count for the bias step
+        and the value is zero.
         """
         from .losses import TokenLoss
         from .plan import LossTerm
 
+        configured = self.loss_configuration.terms.get("moe_balance")
         value = None
         if self.statistics is not None:
             slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
             # Every token of a kept block went through the model; padded blocks did not.
             keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
             prepare = context.get("prepare_statistics")
-            value = (
-                self.statistics.balance(output, keep=keep, pooled=False)
-                if prepare is None
-                else prepare(output, keep=keep)
-            )
-        coefficient = (
-            0.0 if value is None else self.statistics.settings["aux_loss_coef"]
-        )
+            if configured is None or configured.coefficient == 0:
+                self.statistics.observe(output, keep=keep)
+            elif prepare is None:
+                value = self.statistics.balance(output, keep=keep, pooled=False)
+            else:
+                value = prepare(output, keep=keep)
         if value is None:
             value = output.hidden_states.new_zeros(())
-        term = LossTerm(
-            "moe_balance", coefficient, TokenLoss("value"), reduction="scalar"
-        )
+        term = LossTerm("moe_balance", 1.0, TokenLoss("value"), reduction="scalar")
         return term, value
 
     def block_predictions(self, output, blocks, batch, **options):

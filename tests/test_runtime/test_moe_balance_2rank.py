@@ -66,11 +66,8 @@ def _worker(rank, world_size):
     for aux_loss_type in AUX_LOSS_TYPES:
         balanced = build_objective_model(
             model,
-            options={
-                "num_anchors": 2,
-                "aux_loss_coef": COEF,
-                "aux_loss_type": aux_loss_type,
-            },
+            options={"num_anchors": 2, "aux_loss_type": aux_loss_type},
+            loss={"terms": {"moe_balance": {"coefficient": COEF}}},
             target_head=head,
         )
         balancer, seen = balanced.statistics, []
