@@ -205,6 +205,25 @@ class CheckpointLoadingTest(unittest.TestCase):
                     str(package), keys=["model.embed_tokens.weight"]
                 )
 
+    def test_shard_parent_is_resolved_after_directory_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "checkpoint"
+            version = root / "versions" / "v1"
+            version.mkdir(parents=True)
+            self._symlink(str(version), root / "current")
+            # Only the shard beside v1 is used. The lexical shortcut is a dangling link.
+            self._symlink(str(Path(tmp) / "absent"), root / "part.safetensors")
+            weights = {"embed.weight": torch.ones(2, 2)}
+            save_file(weights, str(version.parent / "part.safetensors"))
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    {"weight_map": {"embed.weight": "current/../part.safetensors"}}
+                )
+            )
+            torch.testing.assert_close(
+                load_checkpoint_tensors(str(root), keys=["embed.weight"]), weights
+            )
+
     def test_weight_map_accepts_huggingface_snapshot_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -267,7 +286,7 @@ class CheckpointLoadingTest(unittest.TestCase):
 
     def _symlink(self, target: str, link: Path) -> None:
         try:
-            os.symlink(target, link)
+            os.symlink(target, link, target_is_directory=os.path.isdir(target))
         except (OSError, NotImplementedError) as error:
             # Windows needs Developer Mode or admin rights for symlinks.
             self.skipTest(f"symlinks are unavailable here: {error}")

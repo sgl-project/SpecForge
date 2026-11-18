@@ -132,11 +132,12 @@ def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
             f"{checkpoint_dir}"
         )
 
-    directory = os.path.abspath(checkpoint_dir)
-    joined = os.path.normpath(os.path.join(directory, shard))
-    if _inside(joined, directory):
+    directory = os.path.realpath(checkpoint_dir)
+    joined = os.path.join(directory, shard)
+    if _inside(os.path.normpath(joined), directory):
+        # Match file lookup: follow directory symlinks before interpreting '..'.
         resolved = os.path.realpath(joined)
-        if _inside(resolved, os.path.realpath(directory)):
+        if _inside(resolved, directory):
             return
         repo_root = _hub_cache_repo_root(directory)
         if repo_root is not None and _inside(resolved, repo_root):
@@ -144,7 +145,7 @@ def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
 
     raise ValueError(
         f"Checkpoint index {index_path} maps a tensor to the shard {shard!r}, "
-        f"which resolves outside {checkpoint_dir}; weight_map values must be "
+        f"which leaves the checkpoint directory {checkpoint_dir}; weight_map values must be "
         "shard file names inside the checkpoint directory"
     )
 
@@ -160,7 +161,7 @@ def _read_weight_map_file(index_path: str) -> Dict[str, str]:
         for key, filename in weight_map.items()
     ):
         raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
-    checkpoint_dir = os.path.dirname(os.path.abspath(index_path))
+    checkpoint_dir = os.path.dirname(index_path) or os.curdir
     for filename in weight_map.values():
         _check_shard_name(checkpoint_dir, filename, index_path)
     return weight_map
