@@ -44,6 +44,26 @@ Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
 
+### Boundaries
+
+The parts meet through `contracts.py`, and
+`tests/test_runtime/test_training_boundaries.py` reads the rules from the
+source:
+
+| Rule | Covers |
+|---|---|
+| A collective across samples appears only in a runner | objectives, drafts, losses, layers, the frame, the run loop and the evaluator reach neither `torch.distributed` nor `specforge.distributed` |
+| The frame meets the other parts through the contracts only | `contracts.py`, `frame.py`, `program.py` |
+| The run loop holds no runner, backend, objective or model | `controller.py`, `specforge/eval/` |
+| A runner decides from declarations, never from a registry | `runner.py`, `backend.py` |
+| A program does not know how it is trained | objectives, drafts, losses and layers import nothing from `training`, `runtime`, `launch` or `eval` |
+
+Each rule lists its exceptions with the reason: the model-parallel axes
+(sequence and tensor parallelism), whose groups share a sequence or a tensor
+and never samples, and the run loop's remaining reads of the process's
+topology. The list may only shrink: an exception that matches nothing fails
+the test.
+
 ## Internal mechanics
 
 ```mermaid
