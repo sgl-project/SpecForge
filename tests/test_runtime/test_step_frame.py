@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import replace
+from unittest import mock
 
 import torch
 from torch import nn
@@ -190,6 +191,124 @@ def runner_over(strategy):
     )
     backend.prepare_model(strategy.model, wrap=False)
     return DataParallelRunner(strategy, backend)
+
+
+class _EvaluatedStrategy(_Strategy):
+    evaluation_diagnostics = False
+
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward_loss(self, batch, ctx=None):
+        self.seen.append(
+            (self.model.training, torch.is_grad_enabled(), ctx.collect_detailed_metrics)
+        )
+        return super().forward_loss(batch, ctx)
+
+
+class RunnerModeTest(unittest.TestCase):
+    def test_evaluation_runs_in_its_own_mode_and_restores_the_callers(self):
+        for was_training in (True, False):
+            for diagnostics in (False, True):
+                with self.subTest(was_training=was_training, diagnostics=diagnostics):
+                    strategy = _EvaluatedStrategy()
+                    strategy.evaluation_diagnostics = diagnostics
+                    strategy.model.train(was_training)
+                    runner = runner_over(strategy)
+                    # What the program declares decides, not the caller's context.
+                    ctx = StepContext(collect_detailed_metrics=not diagnostics)
+                    with runner.evaluation():
+                        output = runner.evaluate(batch(1), ctx)
+                        # Evaluation mode holds between the batches of a pass.
+                        self.assertFalse(strategy.model.training)
+                        runner.evaluate(batch(2), ctx)
+                    self.assertEqual(strategy.seen, [(False, False, diagnostics)] * 2)
+                    self.assertFalse(output.loss.requires_grad)
+                    self.assertEqual(strategy.model.training, was_training)
+
+    def test_pass_without_batches_leaves_the_mode_as_it_was(self):
+        strategy = _EvaluatedStrategy()
+        runner = runner_over(strategy)
+        with runner.evaluation():
+            self.assertFalse(strategy.model.training)
+        self.assertTrue(strategy.model.training)
+
+    def test_failed_evaluation_restores_the_mode(self):
+        class Strategy(_EvaluatedStrategy):
+            def forward_loss(self, batch, ctx=None):
+                raise ValueError("bad batch")
+
+        strategy = Strategy()
+        runner = runner_over(strategy)
+        with self.assertRaisesRegex(ValueError, "bad batch"):
+            with runner.evaluation():
+                runner.evaluate(batch(1), StepContext())
+        self.assertTrue(strategy.model.training)
+
+    def test_evaluate_belongs_to_a_pass(self):
+        runner = runner_over(_EvaluatedStrategy())
+        with self.assertRaisesRegex(RuntimeError, "inside an evaluation"):
+            runner.evaluate(batch(1), StepContext())
+        with runner.evaluation():
+            with self.assertRaisesRegex(RuntimeError, "inside an evaluation pass"):
+                runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+
+    def test_training_calls_put_the_whole_model_in_training_mode(self):
+        class Strategy(_EvaluatedStrategy):
+            """A training-mode module around a draft that was left in evaluation mode."""
+
+            def __init__(self):
+                super().__init__()
+                self.model.draft = nn.Linear(1, 1)
+                self.model.draft.eval()
+
+        strategy = Strategy()
+        self.assertTrue(strategy.model.training)
+        runner = runner_over(strategy)
+        run_window(runner, [batch(1)], StepContext())
+        self.assertTrue(strategy.model.draft.training)
+        # After an evaluation pass as well, on a rank that had no batch to restore it.
+        with runner.evaluation():
+            pass
+        strategy.model.draft.eval()
+        run_window(runner, [batch(2)], StepContext())
+        self.assertTrue(strategy.model.draft.training)
+
+
+class RunnerReductionTest(unittest.TestCase):
+    def test_sum_and_maximum_are_taken_over_the_ranks(self):
+        runner = runner_over(_Strategy())
+        calls = []
+
+        def all_reduce(values, *, op, group):
+            calls.append((op, group))
+            values.mul_(2)
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            total = runner.reduce_sum(torch.tensor([1.0]))
+            widest = runner.reduce_max(torch.tensor([3]))
+        self.assertEqual(total.tolist(), [2.0])
+        self.assertEqual(widest.tolist(), [6])
+        self.assertEqual(
+            calls,
+            [
+                (torch.distributed.ReduceOp.SUM, None),
+                (torch.distributed.ReduceOp.MAX, None),
+            ],
+        )
+
+    def test_one_rank_reduces_nothing(self):
+        runner = runner_over(_Strategy())
+        values = torch.tensor([3])
+        with mock.patch("torch.distributed.all_reduce") as reduce:
+            self.assertIs(runner.reduce_max(values), values)
+        reduce.assert_not_called()
 
 
 class RunnerRefusalTest(unittest.TestCase):

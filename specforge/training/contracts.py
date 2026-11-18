@@ -15,13 +15,22 @@ is declared here, so a second runner needs nothing from the first.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ContextManager,
+    Dict,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import torch
 
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
-    from specforge.training.strategies.base import StepContext
+    from specforge.training.strategies.base import StepContext, StepOutput
 
 
 class IncompleteWindow(RuntimeError):
@@ -124,10 +133,12 @@ def materialize_metrics(values: Mapping[str, Any]) -> Dict[str, float]:
 class StepRunner(Protocol):
     """Executes the micro-batches of an optimizer window and applies its update.
 
-    A runner owns the wrapped model, the step's collectives across samples,
-    normalization, clipping, the optimizer and the RNG. It does not decide
-    which micro-batch comes next: the frame does. Every method runs on every
-    rank, in the same order.
+    A runner owns the wrapped model and its mode, the step's collectives
+    across samples, normalization, clipping, the optimizer and the RNG. It
+    does not decide which micro-batch comes next: the frame does. Every method
+    runs on every rank, in the same order, with one exception: inside an
+    evaluation pass a rank calls :meth:`evaluate` once for each batch of its
+    own shard, which may be none.
     """
 
     #: Names of the statistics its program needs pooled over the whole window
@@ -168,5 +179,39 @@ class StepRunner(Protocol):
             This rank's sums of each declared replay statistic, by name.
         """
 
+    def evaluation(self) -> ContextManager[None]:
+        """Delimit one evaluation pass.
+
+        The model is in evaluation mode from entry to exit, between batches
+        as well, and back in the mode it was found in afterwards, also when
+        the pass raises. Every rank enters it, with or without batches.
+        """
+
+    def evaluate(self, batch: "TrainBatch", ctx: "StepContext") -> "StepOutput":
+        """Run one batch of an evaluation pass, without gradients.
+
+        The result is the program's own, normalized on this rank. The call
+        reduces nothing across samples: whoever pools a pass does it once at
+        the end through :meth:`reduce_sum` and :meth:`reduce_max`. A rank may
+        therefore hold fewer evaluation batches than another, or none, unless
+        the forward itself communicates: a sharded wrapper does, and so does
+        a component that exchanges data on a model-parallel axis, whose ranks
+        then have to evaluate the same batches. Detailed metrics are collected
+        when the program declares that its evaluation reports them, whatever
+        ``ctx.collect_detailed_metrics`` says.
+        """
+
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
-        """Sum ``values`` over the data-parallel ranks."""
+        """Sum ``values`` over the data-parallel ranks.
+
+        ``values`` may be on the host, as a rank with nothing to report builds
+        them; the result is on the device the ranks communicate on.
+        """
+
+    def reduce_max(self, values: torch.Tensor) -> torch.Tensor:
+        """Take the maximum of ``values`` over the data-parallel ranks.
+
+        It lets every rank size a buffer for the widest rank's data when its
+        own shard was empty. ``values`` may be on the host, as for
+        :meth:`reduce_sum`.
+        """

@@ -39,6 +39,9 @@ class CanonicalReviewTest(unittest.TestCase):
     def test_depth_metrics_and_runtime_eval_mode(self):
         from specforge.algorithms.objectives import objective_registrations
         from specforge.eval import Evaluator
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.runner import DataParallelRunner
+        from specforge.training.strategies.base import StepContext
         from tests.test_runtime.test_evaluator_aggregation import _batch
 
         runtime = torch.nn.Module()
@@ -59,14 +62,20 @@ class CanonicalReviewTest(unittest.TestCase):
         strategy = CanonicalTrainStrategy(
             runtime, name="eagle3", objective="eagle3", required_features=()
         )
-        strategy.trainable_module().eval()
-        self.assertFalse(runtime.training)
-        self.assertFalse(runtime.draft_model.training)
-        with patch.object(runtime, "forward", return_value=result):
-            metrics = Evaluator().run(strategy.forward_loss, [_batch()])
+        runner = DataParallelRunner(strategy, FSDPTrainingBackend(ParallelConfig()))
+        modes = []
+
+        def forward(*args, **kwargs):
+            modes.append((runtime.training, runtime.draft_model.training))
+            return result
+
+        self.assertTrue(runtime.training)
+        with patch.object(runtime, "forward", side_effect=forward):
+            metrics = Evaluator().run(runner, [_batch()], StepContext())
         self.assertAlmostEqual(metrics["eval/avg_acc"], 0.75)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 1.125)
-        strategy.trainable_module().train()
+        # Evaluated in evaluation mode, and left as it was found.
+        self.assertEqual(modes, [(False, False)])
         self.assertTrue(runtime.training)
 
     def test_config_is_published_before_complete_state(self):
