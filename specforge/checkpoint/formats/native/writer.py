@@ -20,7 +20,7 @@ def require(condition, message):
         raise ValueError(f"Native export: {message}")
 
 
-def export_native(config, state, target, output, *, copy_target=False, metadata=None):
+def export_native(config, state, target, output, *, copy_target=False):
     require(target is not None, "native export requires --target-model")
     source = resolve_directory(target)
     payload = json.loads((source / "config.json").read_text())
@@ -31,9 +31,7 @@ def export_native(config, state, target, output, *, copy_target=False, metadata=
         "native merge requires an unquantized target",
     )
     native.validate(config, text)
-    payload = payload | {
-        "specforge_artifact": metadata or {"format": "native", "version": 1}
-    }
+    payload = payload | {"specforge_artifact": {"format": "native", "version": 1}}
     native.export(config, state, source, payload, output, copy_target=copy_target)
 
 

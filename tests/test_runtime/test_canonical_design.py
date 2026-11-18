@@ -13,7 +13,7 @@ from specforge.algorithms.objectives import (
     register_protocol,
     registry,
 )
-from specforge.algorithms.objectives.dflash import DFlashObjective
+from specforge.algorithms.objectives.protocols.dflash import DFlashObjective
 from specforge.application.composition import resolve_run
 from specforge.checkpoint.resolve import read_target_config
 from specforge.loading import initialize_draft
@@ -51,11 +51,7 @@ class CanonicalDesignTest(unittest.TestCase):
                 draft_config(),
                 training={"attention_backend": "sdpa", "objective": "custom"},
             )
-            with patch(
-                "specforge.algorithms.builtin.builtin_algorithm_registry",
-                side_effect=AssertionError("legacy registry used"),
-            ):
-                resolved = resolve_run(cfg)
+            resolved = resolve_run(cfg)
             self.assertEqual(resolved.algorithm.name, "custom")
             self.assertEqual(
                 resolved.algorithm.spec.capabilities.attention_backends,
@@ -85,7 +81,22 @@ class CanonicalDesignTest(unittest.TestCase):
                 cfg = run_config(Path("target"), draft)
                 cfg.data.dataloader_num_workers = None
                 run = resolve_run(cfg)
-                self.assertEqual(_dataloader_num_workers(run.config, run.algorithm), 4)
+                # the block objectives keep the loader default they were tuned with
+                expected = (
+                    8
+                    if draft.architecture
+                    in (
+                        "DFlashDraftModel",
+                        "DFlash2DraftModel",
+                        "DSparkDraftModel",
+                        "DominoDraftModel",
+                        "DSpineDraftModel",
+                    )
+                    else 4
+                )
+                self.assertEqual(
+                    _dataloader_num_workers(run.config, run.algorithm), expected
+                )
                 for workers in (0, 8):
                     run.config.data.dataloader_num_workers = workers
                     self.assertEqual(
@@ -93,7 +104,12 @@ class CanonicalDesignTest(unittest.TestCase):
                     )
                 if draft.architecture in ("DFlash2DraftModel", "DMTPDraftModel"):
                     self.assertEqual(run.algorithm.name, "dflash")
-                    self.assertEqual(run.config.training.strategy, "dflash")
+                    self.assertEqual(
+                        run.config.training.objective,
+                        {"DFlash2DraftModel": "dflash2", "DMTPDraftModel": "dmtp"}[
+                            draft.architecture
+                        ],
+                    )
 
     def test_target_metadata_is_raw_and_shared_with_capture(self):
         with TemporaryDirectory() as temp:
@@ -103,6 +119,12 @@ class CanonicalDesignTest(unittest.TestCase):
             (target / "config.json").write_text(json.dumps({"text_config": metadata}))
             cfg = run_config(target, draft_config())
             self.assertEqual(training_target_config(cfg), read_target_config(target))
+            # a target that names its depth num_layers still has one for tap checks
+            depth = metadata.pop("num_hidden_layers")
+            (target / "config.json").write_text(
+                json.dumps({**metadata, "num_layers": depth})
+            )
+            self.assertEqual(read_target_config(target)["num_hidden_layers"], depth)
             with patch(
                 "transformers.AutoConfig.from_pretrained",
                 side_effect=AssertionError("HF defaults used"),
@@ -169,7 +191,7 @@ class CanonicalDesignTest(unittest.TestCase):
                 dflash2_config(),
                 training={
                     "attention_backend": "eager",
-                    "objective_options": {"selector_loss_alpha": 0},
+                    "loss": {"terms": {"selector": {"coefficient": 0}}},
                 },
             )
             run = resolve_run(cfg)

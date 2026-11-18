@@ -19,7 +19,10 @@ data:
   hidden_states_path: ./cache/hidden_states/qwen3.5-4b-native-mtp
   max_length: 512
 training:
-  strategy: mtp
+  # Reference FP32 cross entropy, the kernel these recipes were validated
+  # with; remove to let a CUDA trainer use the fused one.
+  loss:
+    fused: false
   attention_backend: sdpa
   objective_options:
     objective_chunk_size: 4096

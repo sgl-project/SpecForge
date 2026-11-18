@@ -47,12 +47,11 @@ class ExportModesTest(unittest.TestCase):
                     export=native,
                 )
                 # The default remains canonical even after native registration.
-                export_draft(root / "draft", None, root / "standalone")
+                export_draft(root / "draft", root / "standalone")
                 self.assertEqual(read_draft(root / "standalone").config, config)
                 native.assert_not_called()
                 export_draft(
                     root / "draft",
-                    None,
                     root / "merged",
                     export_mode="native",
                     target_model=target,
@@ -76,7 +75,7 @@ class ExportModesTest(unittest.TestCase):
             ({"export_mode": "native", "converter": "sglang"}, "omit --converter"),
         ):
             with self.assertRaisesRegex(ValueError, error):
-                export_draft("missing", None, "out", **options)
+                export_draft("missing", "out", **options)
             flags = []
             for key, value in options.items():
                 flags.append("--" + key.replace("_", "-"))
@@ -102,7 +101,6 @@ class ExportModesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no native target implementation"):
                 export_draft(
                     root / "draft",
-                    None,
                     root / "native",
                     export_mode="native",
                     target_model=root / "target",
@@ -110,7 +108,6 @@ class ExportModesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no SGLang converter"):
                 export_draft(
                     root / "draft",
-                    None,
                     root / "serving",
                     export_mode="standalone",
                     converter="sglang",

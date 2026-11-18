@@ -7,7 +7,7 @@ Start the capture service separately (see examples/offline/README.md), then:
         --target-model-path Qwen/Qwen3-8B \
         --data-path ./cache/dataset/sharegpt_train.jsonl \
         --output-path ./cache/hidden_states/sharegpt_qwen3-8b \
-        --chat-template qwen --strategy eagle3
+        --chat-template qwen --draft specforge/config/draft/presets/qwen3-8b-eagle3.yaml
 
 Optional torchrun workers shard samples on CPU; model TP belongs to the server.
 """
@@ -30,7 +30,6 @@ import torch.distributed as dist
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoConfig
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.application import resolve_offline_capture
@@ -70,13 +69,7 @@ def parse_args():
         default=None,
         help="Target model; defaults to model.target_model_path of --config",
     )
-    model_group.add_argument(
-        "--strategy",
-        type=str,
-        default="eagle3",
-        help="Offline draft strategy (default: eagle3)",
-    )
-    draft_group = model_group.add_mutually_exclusive_group()
+    draft_group = model_group.add_mutually_exclusive_group(required=True)
     draft_group.add_argument(
         "-c",
         "--config",
@@ -88,15 +81,6 @@ def parse_args():
     draft_group.add_argument(
         "--draft",
         help="Canonical draft YAML file (including presets); default objective and loss",
-    )
-    draft_group.add_argument(
-        "--draft-model-config",
-        type=str,
-        default=None,
-        help=(
-            "Draft config used to resolve capture layers; required by strategies "
-            "without target-derived defaults"
-        ),
     )
     model_group.add_argument(
         "--trust-remote-code",
@@ -277,7 +261,6 @@ def resolve_offline_capture_plan(
     """Resolve capture layers and output keys through training composition."""
 
     if getattr(args, "config", None):
-        from specforge.config.draft import DraftConfig
         from specforge.config.schema import load_config
 
         cfg = load_config(args.config)
@@ -288,11 +271,6 @@ def resolve_offline_capture_plan(
         resolved = resolve_offline_capture(
             cfg.model_copy(update={"data": data}), target_config=target_config
         )
-        if type(resolved.draft_config) is not DraftConfig:
-            raise ValueError(
-                f"{args.config} is not a canonical run (draft, initialization or "
-                "resume); use --strategy and --draft-model-config for legacy runs"
-            )
         return OfflineCapturePlan(
             strategy=resolved.run.algorithm.name,
             draft_config=resolved.draft_config,
@@ -301,10 +279,8 @@ def resolve_offline_capture_plan(
             layout=resolved.layout,
             loss_mask_filter=resolved.loss_mask_filter,
         )
-    strategy = getattr(args, "strategy", "eagle3")
     model = {
         "target_model_path": args.target_model_path,
-        "draft_model_config": getattr(args, "draft_model_config", None),
         "trust_remote_code": args.trust_remote_code,
         "cache_dir": getattr(args, "cache_dir", None),
     }
@@ -315,11 +291,7 @@ def resolve_offline_capture_plan(
             "max_length": args.max_length,
         },
         draft=getattr(args, "draft", None),
-        training=(
-            {"attention_backend": "eager"}
-            if getattr(args, "draft", None)
-            else {"strategy": strategy}
-        ),
+        training={"attention_backend": "eager"},
     )
     resolved = resolve_offline_capture(cfg, target_config=target_config)
     return OfflineCapturePlan(
@@ -560,19 +532,11 @@ def main():
             Path(__file__).parent.parent, "cache", "hidden_states"
         )
 
-    canonical = bool(args.draft or args.config)
-    if canonical:
-        from specforge.checkpoint.resolve import read_target_config
+    from specforge.checkpoint.resolve import read_target_config
 
-        target_model_config = read_target_config(
-            args.target_model_path, cache_dir=args.cache_dir
-        )
-    else:
-        target_model_config = AutoConfig.from_pretrained(
-            args.target_model_path,
-            cache_dir=args.cache_dir,
-            trust_remote_code=args.trust_remote_code,
-        )
+    target_model_config = read_target_config(
+        args.target_model_path, cache_dir=args.cache_dir
+    )
     capture_plan = resolve_offline_capture_plan(args, target_model_config)
     draft_vocab_size = _resolve_draft_vocab_size(capture_plan.draft_config)
 
@@ -583,28 +547,18 @@ def main():
         print_args_with_dots(args)
         if _rank() == 0:
             print("Resolved draft model config:")
-            if canonical:
-                import json
+            import json
 
-                from specforge.config.draft.codec import encode_config
+            from specforge.config.draft.codec import encode_config
 
-                print(json.dumps(encode_config(capture_plan.draft_config), indent=2))
-            else:
-                print(capture_plan.draft_config.to_json_string(use_diff=False))
+            print(json.dumps(encode_config(capture_plan.draft_config), indent=2))
         print_with_rank(
             f"Resolved {capture_plan.strategy} offline "
             f"capture method {capture_plan.capture_method!r}, layers: "
             f"{list(capture_plan.capture_layers)}"
         )
 
-        if canonical:
-            # the draft vocabulary spans the target logits, padded_vocab_size included
-            target_vocab_size = capture_plan.draft_config.vocab_size
-        else:
-            target_text_config = getattr(
-                target_model_config, "text_config", target_model_config
-            )
-            target_vocab_size = int(target_text_config.vocab_size)
+        target_vocab_size = capture_plan.draft_config.vocab_size
         if draft_vocab_size > target_vocab_size:
             raise ValueError(
                 f"draft_vocab_size={draft_vocab_size} exceeds target "

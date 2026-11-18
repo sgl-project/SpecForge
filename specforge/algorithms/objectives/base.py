@@ -12,6 +12,7 @@ class ObjectiveResult:
     numerator: Tensor
     denominator: Tensor
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
+    sums: dict[str, Tensor] = field(default_factory=dict)
 
     @property
     def loss(self):
@@ -28,7 +29,7 @@ def microbatch_mean(result, *, global_denominator=False):
         world_size = dist.get_world_size()
         dist.all_reduce(denominator)
     loss = world_size * result.numerator / denominator.where(denominator > 0, 1)
-    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios)
+    return ObjectiveResult(loss, denominator.new_ones(()), result.ratios, result.sums)
 
 
 class ObjectiveModel(nn.Module):
@@ -46,22 +47,52 @@ class ObjectiveModel(nn.Module):
         *,
         registration=None,
         name=None,
-        token_loss=None,
+        loss_configuration,
         weighting=None,
         frozen_parameters=(),
+        execution=None,
     ):
         super().__init__()
+        from .execution_options import LossExecution
+        from .implementations.registry import ExecutionSelection
+
+        self.execution = execution or LossExecution()
+        self.loss_implementations = ExecutionSelection()
         self.draft_model = draft_model
         self.objective = objective
         self.registration = registration
         self.objective_name = name
         self.target_head = target_head
-        self.token_loss = token_loss
+        self.loss_configuration = loss_configuration
         self.weighting = weighting
         self.frozen_parameters = tuple(frozen_parameters)
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
+
+    def adopt_recorded_execution(self, recorded):
+        """Continue a resumed run with the fused setting its checkpoint recorded.
+
+        An unset ``fused`` has no request of its own, so on resume it takes the
+        recorded one: a run written with the reference formulas is not moved to
+        optimized kernels by resuming it, and the other way round. An explicit
+        setting is left alone and compared as it is.
+
+        Args:
+            recorded: The checkpoint's execution record, or None when it has none.
+
+        Returns:
+            The execution record this run now has.
+        """
+        from dataclasses import asdict, replace
+
+        if (
+            self.execution.fused is None
+            and isinstance(recorded, dict)
+            and recorded.get("fused") is not None
+        ):
+            self.execution = replace(self.execution, fused=recorded["fused"])
+        return asdict(self.execution)
 
     def train(self, mode=True):
         super().train(mode)
@@ -82,11 +113,34 @@ class ObjectiveModel(nn.Module):
         chain_ids=None,
         sequence_ids=None,
         projection_inputs=None,
-        auxiliary_inputs=None,
+        context_inputs=None,
+        projection=None,
         **options,
     ):
+        """Align algorithm output and supervision into deferred prediction units.
+
+        Args:
+            hidden: Backbone hidden states, with hidden size in the last dimension.
+            batch: Captured batch tensors; teacher logits or hidden states are optional.
+            teacher_positions: Indices used to gather teacher supervision.
+            mask: Supervision weights/eligibility aligned with the prediction positions.
+            labels: Optional hard token targets aligned with mask.
+            positions: Optional position/depth values used by weighting.
+            unit_size: Number of positions in each indivisible projection unit.
+            chain_ids: Optional acceptance-chain IDs broadcastable to the unit layout.
+            sequence_ids: Optional source-sequence IDs broadcastable to mask.
+            projection_inputs: Extra aligned tensors passed to the projection.
+            context_inputs: Extra aligned tensors consumed by the chunk computation.
+            projection: Optional adapter; defaults to the draft's ordinary project.
+            **options: Remaining Predictions fields, such as plan and denominator.
+
+        Returns:
+            Predictions with tensors aligned to [units, positions, ...]. Draft
+            projection is deferred; teacher data is gathered but not projected.
+        """
         from .inputs import gather
         from .predictions import Predictions, Teacher
+        from .projection import Projection
 
         def align(value):
             return value.reshape(-1, unit_size, *value.shape[mask.ndim :])
@@ -112,9 +166,12 @@ class ObjectiveModel(nn.Module):
             sequence_ids = torch.arange(mask.shape[0], device=hidden.device).reshape(
                 -1, *([1] * (mask.ndim - 1))
             )
+        from .plan import LossPlan
+
+        options["plan"] = self.loss_configuration.bind(options.get("plan", LossPlan()))
         return Predictions(
             hidden=hidden,
-            projector=self.draft_model.project,
+            projection=projection or Projection(self.draft_model.project),
             mask=mask.reshape(-1, unit_size),
             chain_ids=torch.broadcast_to(chain_ids, hidden.shape[:2]),
             sequence_ids=torch.broadcast_to(sequence_ids, mask.shape).reshape(
@@ -126,13 +183,24 @@ class ObjectiveModel(nn.Module):
             projection_inputs={
                 key: align(value) for key, value in (projection_inputs or {}).items()
             },
-            auxiliary_inputs={
-                key: align(value) for key, value in (auxiliary_inputs or {}).items()
+            context_inputs={
+                key: align(value) for key, value in (context_inputs or {}).items()
             },
             **options,
         )
 
     def block_predictions(self, output, blocks, batch, **options):
+        """Build deferred predictions for complete algorithm proposal blocks.
+
+        Args:
+            output: Draft forward output containing hidden_states.
+            blocks: Prepared tokens, labels, masks and teacher positions.
+            batch: Captured batch inputs used to gather teacher data.
+            **options: Projection, loss plan and other prediction overrides.
+
+        Returns:
+            Predictions preserving the configured number of model slots per block.
+        """
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
         return self.predictions(
@@ -170,12 +238,20 @@ class ObjectiveModel(nn.Module):
         prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, **context
         )
-        return execute_batch(
+        result = execute_batch(
             prepared,
-            self.token_loss,
+            None,
             self.weighting,
             training=self.draft_model.training,
+            execution=self.execution,
+            selection=self.loss_implementations,
         )
+        if prepared.diagnostics is not None:
+            with torch.no_grad():
+                ratios, sums = prepared.diagnostics()
+            result.ratios.update(ratios)
+            result.sums.update(sums)
+        return result
 
 
 def check_options(**groups):

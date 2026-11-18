@@ -61,6 +61,57 @@ def run_config(target, draft, **updates):
 
 
 class CanonicalTrainingTest(unittest.TestCase):
+    def test_loss_execution_reaches_runtime_and_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = run_config(
+                target,
+                draft_config(),
+                training={
+                    "attention_backend": "eager",
+                    "loss": {
+                        "execution": {
+                            "chunk_size": 2,
+                            "checkpoint": False,
+                            "trim": True,
+                        }
+                    },
+                },
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertEqual(bundle.model.execution.chunk_size, 2)
+            self.assertFalse(bundle.model.execution.checkpoint)
+            contract = bundle.strategy_kwargs.resume_contract[
+                "canonical_loss_execution"
+            ]
+            self.assertTrue(contract["trim"])
+            self.assertEqual(contract["chunk_size"], 2)
+
+    def test_named_loss_settings_reach_capture_and_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = run_config(
+                target,
+                draft_config(),
+                training={
+                    "attention_backend": "eager",
+                    "loss": {
+                        "terms": {"token": {"kind": "kl"}},
+                        "execution": {"chunk_size": 2},
+                    },
+                },
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            self.assertIsNotNone(bundle.model.target_head)
+            term = bundle.model.loss_configuration.terms["token"]
+            self.assertEqual(term.loss.kind, "kl")
+            self.assertFalse(bundle.model.execution.fused)
+            saved = bundle.strategy_kwargs.resume_contract
+            self.assertEqual(saved["canonical_loss"]["terms"]["token"]["kind"], "kl")
+            self.assertEqual(saved["canonical_loss_execution"]["chunk_size"], 2)
+
     def test_mtp_training_requires_explicit_initialization(self):
         from tests.test_modeling.test_mtp_sdpa_chunking import owned_mtp_config
 
@@ -94,7 +145,10 @@ class CanonicalTrainingTest(unittest.TestCase):
                 run_config(
                     target,
                     draft_config(),
-                    training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                    training={
+                        "attention_backend": "eager",
+                        "loss": {"terms": {"token": {"kind": "kl"}}},
+                    },
                 )
             )
             with patch.object(TensorStore, "read", read):
@@ -130,36 +184,6 @@ class CanonicalTrainingTest(unittest.TestCase):
                 bundle.draft_model.embed_tokens.weight,
                 bundle.draft_model.lm_head.weight,
             )
-
-    def test_legacy_import_settings_and_full_resume_boundary(self):
-        import shutil
-
-        from specforge.training.canonical import enabled
-
-        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
-        with TemporaryDirectory() as temp:
-            target = target_directory(Path(temp))
-            fixture = Path(shutil.copytree(fixture, Path(temp) / "legacy"))
-            torch.save({}, fixture / "training_state.pt")
-            raw = dict(
-                model={"target_model_path": str(target), "mask_token_id": 63},
-                initialization={"checkpoint": str(fixture)},
-                data={"hidden_states_path": str(target.parent / "features")},
-                training={"attention_backend": "eager"},
-            )
-            resolved = resolve_run(Config.model_validate(raw))
-            self.assertEqual(resolved.config.draft["spec_config"]["mask_token_id"], 63)
-            raw.pop("initialization")
-            raw["resume"] = str(fixture)
-            with self.assertRaisesRegex(ValueError, "legacy full resume"):
-                resolve_run(Config.model_validate(raw))
-            raw.pop("resume")
-            raw["training"] = {
-                "resume_from": str(fixture),
-                "attention_backend": "eager",
-            }
-            raw["model"]["draft_model_config"] = str(fixture)
-            self.assertFalse(enabled(Config.model_validate(raw)))
 
     @unittest.skipUnless(torch.cuda.is_available(), "Liger requires CUDA")
     def test_liger_training_kernels_preserve_forward_and_gradients(self):
@@ -220,7 +244,10 @@ class CanonicalTrainingTest(unittest.TestCase):
             cfg = run_config(
                 target,
                 draft_config(),
-                training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                training={
+                    "attention_backend": "eager",
+                    "loss": {"terms": {"token": {"kind": "kl"}}},
+                },
             )
             del cfg.draft["target_logit_transform"]
             resolved = resolve_run(cfg, target_config=training_target_config(cfg))
@@ -286,7 +313,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                         draft_config(),
                         training={
                             "attention_backend": "eager",
-                            "loss": loss,
+                            "loss": {"terms": {"token": loss}},
                             "weighting": {"kind": "dpace", "alpha": 0.3},
                         },
                     )
@@ -307,7 +334,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                         needs_teacher,
                     )
                     contract = bundle.strategy_kwargs.resume_contract
-                    self.assertEqual(contract["canonical_loss"]["kind"], kind)
+                    self.assertEqual(
+                        contract["canonical_loss"]["terms"]["token"]["kind"], kind
+                    )
                     self.assertEqual(contract["canonical_weighting"]["alpha"], 0.3)
                     if bundle.target_head is not None:
                         self.assertFalse(
@@ -320,11 +349,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertFalse(resolve_objective("MTPDraftModel").requires_teacher)
             self.assertTrue(
                 resolve_objective(
-                    "Eagle3DraftModel", loss={"kind": "ce"}
+                    "Eagle3DraftModel", loss={"terms": {"token": {"kind": "ce"}}}
                 ).requires_teacher
             )
             for changes in (
-                {"loss": {"kind": "unknown"}},
+                {"loss": {"terms": {"token": {"kind": "unknown"}}}},
                 {"weighting": {"kind": "dpace", "alpha": 2}},
             ):
                 cfg = run_config(
@@ -339,7 +368,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             raw = run_config(target, draft_config()).model_dump()
             raw["draft"] = None
             raw["training"]["loss"] = {"kind": "kl"}
-            with self.assertRaisesRegex(ValueError, "canonical"):
+            with self.assertRaisesRegex(ValueError, "training.loss"):
                 Config.model_validate(raw)
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
@@ -419,7 +448,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     "objective_options": (
                         {"objective_chunk_size": 2} if mtp else {"num_anchors": 2}
                     ),
-                    "loss": {"kind": "ce" if mtp else "kl"},
+                    "loss": {"terms": {"token": {"kind": "ce" if mtp else "kl"}}},
                     "weighting": (
                         {"kind": "uniform"} if mtp else {"kind": "dpace", "alpha": 0.3}
                     ),
@@ -443,9 +472,31 @@ class CanonicalTrainingTest(unittest.TestCase):
             before = {
                 name: tensor.clone() for name, tensor in model.state_dict().items()
             }
+            saved = torch.load(checkpoint / "training_state.pt", weights_only=True)
+            self.assertIn("canonical_loss_execution", saved)
+            self.assertFalse(saved["canonical_use_fused_conv"])
             raw = cfg.model_dump()
             raw.update(draft=None, initialization=None, resume=str(checkpoint))
             raw["training"]["max_steps"] = 2
+            token = saved["canonical_loss"]["terms"]["token"]
+            old = {
+                **saved,
+                "canonical_loss": {key: token[key] for key in ("kind", "options")},
+            }
+            torch.save(old, checkpoint / "training_state.pt")
+            with self.assertRaisesRegex(ValueError, "canonical_loss"):
+                build_application_run(Config.model_validate(raw))
+            # A checkpoint from before fused had an unset (auto) setting records
+            # False. A run that leaves fused unset continues it as it was written.
+            self.assertIsNone(saved["canonical_loss_execution"]["fused"])
+            saved = {
+                **saved,
+                "canonical_loss_execution": {
+                    **saved["canonical_loss_execution"],
+                    "fused": False,
+                },
+            }
+            torch.save(saved, checkpoint / "training_state.pt")
             second = build_application_run(Config.model_validate(raw))
             second.run()
             final = root / "output" / "specforge-run-step2"
@@ -453,7 +504,10 @@ class CanonicalTrainingTest(unittest.TestCase):
                 final / "training_state.pt", map_location="cpu", weights_only=True
             )
             self.assertEqual(state["global_step"], 2)
-            self.assertEqual(state["canonical_loss"]["kind"], "ce" if mtp else "kl")
+            self.assertIs(state["canonical_loss_execution"]["fused"], False)
+            self.assertEqual(
+                state["canonical_loss"]["terms"]["token"]["kind"], "ce" if mtp else "kl"
+            )
             if mtp:
                 self.assertEqual(state["canonical_weighting"]["kind"], "uniform")
             else:
@@ -467,7 +521,12 @@ class CanonicalTrainingTest(unittest.TestCase):
                     for name, tensor in state["draft_state_dict"].items()
                 )
             )
-            changes = [("loss", {"kind": "tv"})]
+            changes = [
+                ("loss", {"terms": {"token": {"kind": "tv"}}}),
+                ("loss", {**saved["canonical_loss"], "execution": {"chunk_size": 1}}),
+                # An explicit fused is this run's own request and must match.
+                ("loss", {**saved["canonical_loss"], "fused": True}),
+            ]
             if not mtp:
                 changes.append(("weighting", {"kind": "uniform"}))
             for key, changed in changes:
@@ -584,8 +643,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             run_config(
                 Path("target"), draft, initialization={"checkpoint": "a"}, resume="b"
             )
-        cfg = run_config(
-            Path("target"), draft, training={"attention_backend": "flex_attention"}
-        )
+        cfg = run_config(Path("target"), draft, training={"attention_backend": "fa"})
         with self.assertRaisesRegex(ValueError, "attention_backend"):
             resolve_run(cfg)

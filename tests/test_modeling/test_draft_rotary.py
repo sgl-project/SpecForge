@@ -12,14 +12,13 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone, LayerInputs
-from specforge.modeling.draft.dflash import apply_mla_rope
 from specforge.modeling.draft.layers.residual import StandardResidual
 from specforge.modeling.draft.layers.rope import DefaultRotaryEmbedding, apply_rotary
-from specforge.modeling.draft.llama3_eagle import LlamaRotaryEmbedding
 from tests.test_modeling.mtp_reference import (
     PartialRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from tests.test_modeling.rotary_reference import LlamaRotaryEmbedding, apply_mla_rope
 
 
 class RotaryLayer(nn.Module):

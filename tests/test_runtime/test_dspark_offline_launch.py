@@ -7,7 +7,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 CUDA = torch.cuda.is_available()
 ALGORITHM = builtin_algorithm_registry().resolve("dspark")
@@ -24,7 +24,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
 
         from specforge.launch import build_offline_runtime
         from specforge.optimizer import BF16Optimizer
-        from specforge.training.strategies.base import DSparkTrainStrategy
+        from specforge.training.strategies.canonical import CanonicalTrainStrategy
 
         hidden, sequence_length = 64, 12
         workdir = tempfile.mkdtemp(prefix="dspark_offline_")
@@ -65,9 +65,9 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
         )
 
         strategy = trainer.core.strategy
-        self.assertIsInstance(strategy, DSparkTrainStrategy)
+        self.assertIsInstance(strategy, CanonicalTrainStrategy)
         module = strategy.trainable_module()
-        self.assertIsInstance(module, FSDP)
+        self.assertIsInstance(strategy.model, FSDP)
         self.assertEqual(trainer.fit(), 2)
         self.assertTrue(all(torch.isfinite(p).all() for p in module.parameters()))
 

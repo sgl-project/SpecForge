@@ -6,18 +6,13 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import torch
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture.domino import DominoBlockSpec
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.domino import DominoDraftModel as LegacyDominoDraftModel
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DominoDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_domino_spec import domino_spec
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import legacy_name
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -43,130 +38,7 @@ def model_inputs(config, device="cpu", dtype=torch.float32):
     return (ids, features, entries), torch.randint(64, (2, 8), device=device)
 
 
-def reference_name(name):
-    return legacy_name(name) or name.removeprefix("gru_head.")
-
-
 class CanonicalDominoTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        # Canonical RoPE computes in FP32 before casting back to the model dtype.
-        tolerance = (
-            2e-2
-            if dtype == torch.bfloat16
-            else 1e-2 if dtype == torch.float16 else 1e-5
-        )
-        torch.manual_seed(0)
-        for shifted, prefix in ((False, 0), (False, 2), (True, 0), (True, 3)):
-            with self.subTest(
-                device=device, dtype=dtype, shifted=shifted, prefix=prefix
-            ):
-                config = model_config(shifted=shifted, prefix=prefix)
-                actual = build_draft_model(config, device=device, dtype=dtype)
-                legacy = legacy_dflash_config(
-                    block_size=4,
-                    dflash_config={
-                        "target_layer_ids": [1, 3],
-                        "mask_token_id": 63,
-                        "emb_dim": 8,
-                        "gru_hidden_dim": 16,
-                        "pure_draft_prefix_len": prefix,
-                        "shift_label": shifted,
-                    },
-                )
-                reference = LegacyDominoDraftModel(legacy).to(
-                    device=device, dtype=dtype
-                )
-                # Canonical RoPE derives frequencies in FP32 even for low-precision weights.
-                reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
-                reference.load_state_dict(
-                    {
-                        reference_name(n): v
-                        for n, v in actual.state_dict().items()
-                        if n not in ("embed_tokens.weight", "lm_head.weight")
-                    },
-                    strict=True,
-                )
-                embedding, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-                    actual.lm_head
-                )
-                (ids, features, entries), previous = model_inputs(config, device, dtype)
-                other = features.detach().clone().requires_grad_()
-                output = actual(
-                    ids,
-                    features,
-                    entries,
-                    predecessor_ids=previous,
-                    output_correction_logits=True,
-                )
-                hidden = reference(
-                    entries[0].position_ids,
-                    noise_embedding=embedding(ids),
-                    target_hidden=other,
-                )
-                states = hidden.reshape(2, 2, 4, 32)
-                legacy_previous = previous.reshape(2, 2, 4)
-                if not shifted:
-                    legacy_previous = torch.cat(
-                        (legacy_previous[..., 1:], legacy_previous[..., :1]), dim=-1
-                    )
-                previous_embeddings = embedding(legacy_previous).reshape_as(states)
-                correction = reference.compute_correction_logits(
-                    hidden_states=states, prev_token_embeddings=previous_embeddings
-                )
-                base = head(hidden).reshape(2, 2, 4, 64)
-                start = reference.suffix_start
-                logits = torch.cat(
-                    (base[..., :start, :], base[..., start:, :] + correction), dim=-2
-                ).reshape(2, 8, 64)
-                torch.testing.assert_close(
-                    (
-                        output.hidden_states,
-                        output.logits,
-                        output.base_logits,
-                        output.correction_logits,
-                    ),
-                    (hidden, logits, base.reshape_as(logits), correction),
-                    rtol=tolerance,
-                    atol=tolerance,
-                )
-                torch.testing.assert_close(
-                    output.logits.reshape_as(base)[..., :start, :],
-                    base[..., :start, :],
-                    rtol=tolerance,
-                    atol=tolerance,
-                )
-                grad = torch.randn_like(logits)
-                output.logits.mul(grad).sum().backward()
-                logits.mul(grad).sum().backward()
-                torch.testing.assert_close(
-                    features.grad, other.grad, rtol=tolerance, atol=tolerance
-                )
-                for name, parameter in actual.named_parameters():
-                    ref = (
-                        embedding.weight
-                        if name == "embed_tokens.weight"
-                        else (
-                            head.weight
-                            if name == "lm_head.weight"
-                            else dict(reference.named_parameters())[
-                                reference_name(name)
-                            ]
-                        )
-                    )
-                    self.assertIsNotNone(parameter.grad, name)
-                    torch.testing.assert_close(
-                        parameter.grad, ref.grad, rtol=tolerance, atol=tolerance
-                    )
-
-    def test_cpu_legacy_composition(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_composition(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_gru_resets_at_block_boundaries(self):
         for shifted in (False, True):

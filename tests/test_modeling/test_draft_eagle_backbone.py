@@ -6,25 +6,20 @@ from dataclasses import replace
 from unittest.mock import patch
 
 import torch
-from torch import nn
-from transformers import LlamaConfig
 
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.rope import NoRoPESpec
 from specforge.modeling.draft.layers import DecoderLayer, MLAAttention
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.registry import _BUILDERS
-from specforge.modeling.draft.llama3_eagle import LlamaRMSNorm, LlamaRotaryEmbedding
 from specforge.modeling.draft.models.eagle_backbone import build_eagle_backbone
 from specforge.modeling.draft.models.eagle_fusion import (
     AuxiliaryFeatureProjection,
     EagleDecoderStage,
 )
-from specforge.modeling.draft.peagle import PEagleFirstLayer, PEagleStandardLayer
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_eagle3_spec import eagle_config
 from tests.test_config.test_draft_peagle_spec import peagle_config
-from tests.test_modeling.test_draft_eagle_fusion import eager_reference
 from tests.test_modeling.test_draft_gqa import layout_for
 from tests.test_modeling.test_draft_mla import mla_node
 
@@ -52,105 +47,6 @@ def config_for(kind, option):
 
 
 class EagleBackboneTest(unittest.TestCase):
-    def setUp(self):
-        # Compare eager FP32 assembly math, independently of legacy compile caches.
-        torch._dynamo.reset()
-        self.enterContext(patch("torch._dynamo.config.disable", True))
-
-    def _parity(self, device):
-        for kind in ("eagle3", "peagle"):
-            for option in (False, True):
-                with self.subTest(device=device, kind=kind, option=option):
-                    config = config_for(kind, option)
-                    actual = build_eagle_backbone(
-                        config, backend="eager", device=device
-                    )
-                    reference_config = LlamaConfig(
-                        hidden_size=32,
-                        intermediate_size=64,
-                        num_attention_heads=4,
-                        num_key_value_heads=2,
-                        head_dim=8,
-                        rms_norm_eps=1e-6,
-                        hidden_act="silu",
-                        pretraining_tp=1,
-                    )
-                    references = nn.ModuleList(
-                        [
-                            PEagleFirstLayer(
-                                reference_config,
-                                norm_before_residual=(
-                                    option if kind == "peagle" else False
-                                ),
-                            ),
-                            *[
-                                PEagleStandardLayer(reference_config)
-                                for _ in config.layer_types[1:]
-                            ],
-                        ]
-                    ).to(device)
-                    references.load_state_dict(actual.layers.state_dict(), strict=True)
-                    final_norm = LlamaRMSNorm(32).to(device)
-                    final_norm.load_state_dict(
-                        actual.final_norm.state_dict(), strict=True
-                    )
-                    hidden = torch.randn(2, 4, 64, device=device, requires_grad=True)
-                    other = hidden.detach().clone().requires_grad_()
-                    layout = layout_for(hidden)
-                    inputs = [
-                        LayerInputs(
-                            attention_layout=layout, position_ids=layout.key_positions
-                        )
-                        for _ in config.layer_types
-                    ]
-                    rotary = LlamaRotaryEmbedding(
-                        reference_config.head_dim,
-                        base=config.rope_parameters.rope_theta,
-                        device=device,
-                    )
-                    embeddings = tuple(
-                        table[0, 0][layout.key_positions]
-                        for table in rotary(hidden, seq_len=hidden.shape[1])
-                    )
-                    causal = (
-                        layout.key_positions[:, None, None, :]
-                        <= layout.query_positions[:, None, :, None]
-                    )
-                    output = actual(hidden, inputs)
-                    expected = other
-                    with patch(
-                        "specforge.modeling.draft.peagle.compile_friendly_flex_attention",
-                        eager_reference,
-                    ):
-                        for layer in references:
-                            expected = layer(expected, causal, embeddings)
-                    expected = final_norm(expected)
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-                    upstream = torch.randn_like(output)
-                    output.backward(upstream)
-                    expected.backward(upstream)
-                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
-                    for name, parameter in actual.layers.named_parameters():
-                        torch.testing.assert_close(
-                            parameter.grad,
-                            dict(references.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
-                        )
-                    for name, parameter in actual.final_norm.named_parameters():
-                        torch.testing.assert_close(
-                            parameter.grad,
-                            dict(final_norm.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
-                        )
-
-    def test_cpu_legacy_eager_wiring(self):
-        self._parity("cpu")
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_legacy_eager_wiring(self):
-        self._parity("cuda")
 
     def test_projection_and_mixed_layers_checkpoint_together(self):
         base = config_for("peagle", True)
