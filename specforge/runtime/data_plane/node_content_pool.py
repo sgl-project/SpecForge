@@ -7,6 +7,8 @@ writing to a slot that a new generation will reuse.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
+
 import fcntl
 import mmap
 import os
@@ -274,7 +276,7 @@ class NodeContentPool:
             self._diag.count('victim_queries')
             self._diag.count(f'victim_queries_{reason}')
         try:
-            victim = db.execute("SELECT key FROM entries e WHERE state='READY' AND NOT EXISTS (SELECT 1 FROM pins p WHERE p.key=e.key AND p.generation=e.generation) ORDER BY touched LIMIT 1").fetchone()
+            victim = db.execute("SELECT key,offset FROM entries e WHERE state='READY' AND NOT EXISTS (SELECT 1 FROM pins p WHERE p.key=e.key AND p.generation=e.generation) ORDER BY touched LIMIT 1").fetchone()
             if victim is None and self._diag.enabled:
                 self._diag.count(f'no_eligible_victim_{reason}')
             return victim
@@ -283,7 +285,7 @@ class NodeContentPool:
                 self._diag.add_ns('victim_query', time.perf_counter_ns() - start)
 
     def _evict(self, db, victim, reason):
-        db.execute('DELETE FROM entries WHERE key=?', victim)
+        db.execute('DELETE FROM entries WHERE key=?', (victim[0],))
         self._count(db, 'evictions')
         if self._diag.enabled:
             self._diag.count('evictions')
@@ -356,6 +358,31 @@ class NodeContentPool:
                 reason = 'fragmentation' if self.capacity - occupied >= extent else 'capacity'
                 self._diag.count(f'reserve_pressure_{reason}')
                 self._diag.add_ns('reason_classification', time.perf_counter_ns() - classification_start)
+            if self.batch_enabled:
+                # The write lock still covers this ordered snapshot. No gap fits.
+                # Only the gap containing the next eviction can now become a fit.
+                while True:
+                    victim = self._victim(db, reason)
+                    if victim is None:
+                        return None
+                    index = bisect_left(rows, (victim[1],))
+                    start, amount = rows.pop(index)
+                    if start != victim[1]:
+                        raise RuntimeError('eviction victim missing from extent snapshot')
+                    self._evict(db, victim, reason)
+                    left = sum(rows[index - 1]) if index else 0
+                    right = rows[index][0] if index < len(rows) else self.capacity
+                    if self.max_entries is not None:
+                        entries -= 1
+                    if right - left >= extent:
+                        if self._diag.enabled and self.max_entries is not None:
+                            self._entry_count_before_insert = entries
+                        return left
+                    if self._diag.enabled:
+                        occupied -= amount
+                        reason = 'fragmentation' if self.capacity - occupied >= extent else 'capacity'
+                        self._diag.count('reserve_iterations')
+                        self._diag.count(f'reserve_pressure_{reason}')
             victim = self._victim(db, reason)
             if victim is None:
                 return None

@@ -798,12 +798,14 @@ class MooncakeFeatureStore(FeatureStore):
                         self._mark_freed_locked(sid, handle.generation)
                         self._release_pending.setdefault(sid, 0)
 
-    def _recover_capture_reads(self, *, require_drained=False):
+    def _recover_capture_reads(self, *, require_drained=False, sample_ids=None):
         from specforge.inference.capture_protocol import CaptureControlRejected
         with self._lock:
             intents = list(self._capture_read_intents.values())
         failures = []
         for intent in intents:
+            if sample_ids is not None and intent["fence"].wire["sample_id"] not in sample_ids:
+                continue
             if intent.get("active"):
                 continue
             if intent["unsafe_fetch"]:
@@ -1198,10 +1200,16 @@ class MooncakeFeatureStore(FeatureStore):
                 raise RuntimeError("cannot close capture transport with live readers")
         # CUDA H2D completion is independent of native transport shutdown.
         self._drain_h2d_quarantine()
+        if not self._owns_store:
+            self._recover_capture_reads(require_drained=True)
         if self._terminal_cleanup_authority is not None:
             self._terminal_cleanup_authority.close()
         if self._terminal_proofs is not None and not self._terminal_proofs.closed:
             if self._terminal_proofs.owned_claims(self._terminal_proof_owner):
+                # An ended window has its own exact release tokens. Its cleanup
+                # needs neither the remote receipt nor terminal ownership.
+                if self._node_pool is not None:
+                    self._node_pool.retry_batch_cleanup()
                 raise RuntimeError('cannot close with unresolved terminal ACK claims')
             self._terminal_proof_health = self._terminal_proofs.health()
             self._terminal_proofs.close()
@@ -1567,6 +1575,7 @@ class MooncakeFeatureStore(FeatureStore):
                 record['fetch'] = fetch
                 records.append(record)
             window = self._node_pool.acquire_many((r['segment']['logical_key'], r['segment']['nbytes'], r['fetch']) for r in records)
+            copies_drained = False
             try:
                 with window:
                     for index, record in enumerate(records):
@@ -1611,6 +1620,15 @@ class MooncakeFeatureStore(FeatureStore):
                                 finally:
                                     self._hold_batch_receive(window)
                             source = None
+                    copies_drained = not (window.deferred or window.external or window.source_releases)
+            except BaseException:
+                # Only __exit__ remains after synchronous copy and source release.
+                # The window still owns every uncommitted pin.
+                if copies_drained:
+                    intent = getattr(self._capture_read_local, 'intent', None)
+                    if intent is not None:
+                        intent['segment_copy_drained'] = True
+                raise
             finally:
                 # Each finish reflects the real release transaction, after
                 # __exit__; no early finish for a still-owned batch token.
@@ -2042,12 +2060,15 @@ class MooncakeFeatureStore(FeatureStore):
         self._capture_read_local.intent = intent
         try:
             result = self._get_impl(sample_ref, device=device, names=names)
-        except BaseException:
+        except BaseException as primary:
             if intent is not None:
                 intent["active"] = False
                 if not intent["unsafe_fetch"]:
                     intent["release_requested"] = True
-                    self._release_capture_read(intent)
+                    try:
+                        self._release_capture_read(intent)
+                    except Exception as cleanup:
+                        primary.add_note(f"capture read release also failed: {cleanup!r}")
             raise
         finally:
             self._capture_read_local.intent = previous
@@ -2153,7 +2174,7 @@ class MooncakeFeatureStore(FeatureStore):
                 except BaseException:
                     intent = getattr(self._capture_read_local, 'intent', None)
                     if intent is not None:
-                        intent['unsafe_fetch'] = True
+                        intent['unsafe_fetch'] = not intent.pop('segment_copy_drained', False)
                     raise
                 continue
             if not self._store_exists(key):
@@ -2485,7 +2506,23 @@ class MooncakeFeatureStore(FeatureStore):
         return result
 
     def _drain_removals(self, *, sample_ids, **kwargs):
-        self._recover_capture_reads(require_drained=True)
+        try:
+            self._recover_capture_reads(require_drained=True, sample_ids=sample_ids)
+        except RuntimeError as primary:
+            # A global drain remains blocked, but an already-published ACK on a
+            # different, reader-free fence may have its receipt ready now.
+            with self._lock:
+                readers = {id(intent["fence"]) for intent in self._capture_read_intents.values()}
+                pending = {sid: fence for sid, fence in self._capture_fences.items()
+                           if sid in self._segment_ack_sent and sid in self._release_pending
+                           and id(fence) not in readers and (sample_ids is None or sid in sample_ids)}
+            for sid, fence in pending.items():
+                try:
+                    with self._capture_cleanup_scope([sid], expected_records={sid: fence}):
+                        self._retry_sample_removals_impl([sid])
+                except Exception as cleanup:
+                    primary.add_note(f"independent receipt recovery for {sid} failed: {cleanup!r}")
+            raise
         with self._lock:
             targets = [sid for sid in set(self._release_pending) | set(self._capture_ack_pending) if sample_ids is None or sid in sample_ids]
         with self._capture_cleanup_scope(targets):

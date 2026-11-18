@@ -152,6 +152,22 @@ class TestNodePoolBatch(unittest.TestCase):
             self.assertEqual(pool.health()['node_pool_fallbacks'], 1)
             pool.close()
 
+    def test_multi_eviction_first_fit_between_two_pinned_generations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pool = NodeContentPool(directory, 5 * 4096)
+            requests = [self.request(str(i), i) for i in range(5)]
+            with pool.acquire_many(requests):
+                pass
+            sql = []
+            pool._db.set_trace_callback(sql.append)
+            large = ('large', 3 * 4096, lambda: torch.full((3 * 4096,), 31, dtype=torch.uint8))
+            with pool.acquire_many([requests[0], large, requests[4]]) as window:
+                self.assertEqual(pool._db.execute("SELECT offset FROM entries WHERE key='large'").fetchone(), (4096,))
+                self.assertEqual([p.tensor[0].item() for p in window.pins], [0, 31, 4])
+            self.assertEqual(sum(stmt.startswith("SELECT offset,extent") for stmt in sql), 1)
+            self.assertEqual(pool.health()['node_pool_evictions'], 3)
+            pool.close()
+
     def test_partial_fill_failure_settles_completed_and_unstarted_writers(self):
         with tempfile.TemporaryDirectory() as directory:
             pool = NodeContentPool(directory, 65536)
