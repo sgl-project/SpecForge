@@ -304,7 +304,8 @@ class CIDependencyTest(unittest.TestCase):
         )
         installs = [args for args in self.calls() if requirement in args]
         self.assertEqual(len(installs), 2)
-        self.assertIn(".", installs[0])
+        # the package with its KDA kernels, so CUDA KDA tests run instead of skipping
+        self.assertIn(".[kda]", installs[0])
         self.assertIn("sf-capture/bin/python", installs[1])
 
 

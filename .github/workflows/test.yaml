@@ -106,7 +106,8 @@ jobs:
           source sf/bin/activate
           uv pip install wheel setuptools setuptools-rust setuptools-scm psutil packaging ninja
           uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
-          uv pip install -v . --no-build-isolation --prerelease=allow \
+          # The kda extra lets the CUDA KDA tests run instead of skipping.
+          uv pip install -v ".[kda]" --no-build-isolation --prerelease=allow \
             "sglang @ git+https://github.com/sgl-project/sglang.git@${SGLANG_COMMIT}#subdirectory=python"
           uv pip install --no-deps plugins/sglang-spec-capture
           # The live server-capture gate needs the Mooncake client AND the

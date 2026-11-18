@@ -23,7 +23,7 @@ from .architecture.dspine import validate_dspine
 from .architecture.eagle3 import validate_eagle3
 from .architecture.mtp import validate_mtp
 from .architecture.peagle import validate_peagle
-from .attention import AttentionSpec, GQASpec, MHASpec, MLASpec
+from .attention import AttentionSpec, GQASpec, KDASpec, MHASpec, MLASpec
 from .conv import ConvSpec, GroupedCausalConvSpec
 from .conv.constraints import validate_grouped_causal
 from .layer import KIND_BY_REFERENCE_FIELD
@@ -226,6 +226,7 @@ for _kind, _schema in (
     ("attention", GQASpec),
     ("attention", MHASpec),
     ("attention", MLASpec),
+    ("attention", KDASpec),
     ("mlp", DenseFFNSpec),
     ("norm", RMSNormSpec),
     ("residual", StandardResidualSpec),

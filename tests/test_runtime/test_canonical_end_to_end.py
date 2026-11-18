@@ -38,6 +38,7 @@ from tests.test_modeling.test_canonical_dspark import model_config as dspark_con
 from tests.test_modeling.test_canonical_dspine import model_config as dspine_config
 from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
 from tests.test_modeling.test_canonical_peagle import model_config as peagle_config
+from tests.test_modeling.test_draft_kda import kda_hybrid
 from tests.test_runtime.test_canonical_training import target_directory
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,6 +70,7 @@ def drafts():
     return [
         draft_config(),
         dflash2_config(bound=True),
+        kda_hybrid(dflash2_config(bound=True)),
         dspark_config(bound=True),
         domino_config(bound=True),
         dspine_config(),
@@ -77,6 +79,13 @@ def drafts():
         eagle_config(bound=True, target_width=32),
         peagle_config(target_width=32),
     ]
+
+
+def served_by_sglang(draft):
+    # KDA layers need an SGLang that serves them; the converter refuses them.
+    return draft.architecture in SGLANG_SERVED and all(
+        node.type != "kda" for node in draft.attention_configs.values()
+    )
 
 
 def write_run(root, draft):
@@ -343,7 +352,7 @@ class CanonicalLifecycleTest(unittest.TestCase):
                 model = load_draft(root / "hf", target=root / "target")
                 assert_same_state(self, model.state_dict(), saved)
                 convert = ("serving", "--converter", "sglang")
-                if draft.architecture in SGLANG_SERVED:
+                if served_by_sglang(draft):
                     self.assertEqual(export(root, *convert), 0)
                     weights = load_file(root / "serving" / "model.safetensors")
                     assert_same_tensors(self, weights, saved)

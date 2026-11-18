@@ -1,4 +1,4 @@
-"""Optional Liger RMSNorm/SwiGLU and Triton convolution kernels.
+"""Optional Liger RMSNorm/SwiGLU and Triton convolution kernels; KDA's FLA check.
 
 None of them changes checkpoint parameters.
 """
@@ -9,6 +9,8 @@ LIGER_REQUIREMENT = "liger-kernel>=0.8.3,<0.9"
 
 import torch
 
+from .attention.kda import KDAAttention
+from .attention.kda.kernels import load_fla_chunk_kda
 from .conv.grouped_causal import GroupedCausalConv
 from .mlp.dense import DenseFFN
 from .norm.rms import RMSNorm
@@ -59,9 +61,19 @@ def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
             where it cannot run; None uses it when the draft has grouped
             convolutions that all support it; False keeps the eager one.
 
+    KDA layers have no kernel choice: CUDA runs FLA, so a missing FLA fails
+    here rather than at the first forward.
+
     Returns:
         Whether the grouped convolutions use the Triton kernel.
     """
+    if any(
+        parameter.is_cuda
+        for module in model.modules()
+        if isinstance(module, KDAAttention)
+        for parameter in module.parameters()
+    ):
+        load_fla_chunk_kda()
     convolutions = [m for m in model.modules() if isinstance(m, GroupedCausalConv)]
     if use_fused_conv is True and not convolutions:
         raise ValueError("use_fused_conv requires a grouped convolution")

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from torch import Tensor
 
-from .attention.backends import PreparedAttention
+from .attention.backends import PreparedLayout
 from .attention.masks import AttentionLayout
 
 
@@ -19,7 +19,7 @@ class LayerInputs:
     autograd graph is live; mutable serving KV caches are not part of this API.
     """
 
-    attention: PreparedAttention | None = None
+    attention: PreparedLayout | None = None
     target_context: Tensor | None = None
     position_ids: Tensor | None = None
     position_embeddings: tuple[Tensor, Tensor] | None = None
@@ -27,8 +27,8 @@ class LayerInputs:
 
     def __post_init__(self):
         if self.attention is not None:
-            if not isinstance(self.attention, PreparedAttention):
-                raise TypeError("attention must be PreparedAttention")
+            if not isinstance(self.attention, PreparedLayout):
+                raise TypeError("attention must be a PreparedLayout")
             if self.attention_layout is not None:
                 raise ValueError("provide prepared attention or a layout, not both")
         if self.attention_layout is not None:
