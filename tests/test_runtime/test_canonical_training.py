@@ -622,9 +622,13 @@ class CanonicalTrainingTest(unittest.TestCase):
                 )
         strategy.trainable_module().eval()
         self.assertFalse(runtime.training)
-        evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
         self.assertEqual(evaluated.statistics, {})
-        self.assertEqual(len(runner.pooled), 1)
+        reduce.assert_not_called()
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""

@@ -276,10 +276,10 @@ class TrainerController:
         self._last_result: Optional[StepMetrics] = None
         self._pending_ack: List[str] = []
         self._perf = _PerfWindow()
-        # Set once a window has failed, whether the stream ended inside it or
-        # a micro-batch raised: its micro-batches were consumed and never
-        # committed, so the run cannot continue.
-        self._failed_window: Optional[str] = None
+        # Set once fit() has raised. Whatever failed (a window, a batch pull,
+        # an acknowledgement), the data position is then ahead of the work
+        # that was committed, so the run can neither continue nor be saved.
+        self._failed: Optional[str] = None
         self._last_eval_metrics: Dict[str, Any] = {}
         self.last_checkpoint_step: Optional[int] = None
         from specforge.training.profiling import ProfilingOptions, StepProfiler
@@ -323,6 +323,7 @@ class TrainerController:
         )
 
     def fit(self, data: Iterable[TrainBatch]) -> int:
+        self._refuse_after_failure("continue")
         progress = self._make_progress_bar()
         if self.async_ack and self.ack_fn is not None:
             self._ack_runner = _AsyncAckRunner(self.ack_fn)
@@ -332,11 +333,20 @@ class TrainerController:
             self._close_ack_runner(None)
             return step
         except BaseException as exc:
+            self._failed = f"{type(exc).__name__}: {exc}"
             self._close_ack_runner(exc)
             raise
         finally:
             if progress is not None:
                 progress.close()
+
+    def _refuse_after_failure(self, action: str) -> None:
+        if self._failed is not None:
+            raise RuntimeError(
+                f"training cannot {action}: an earlier fit() of this run failed "
+                "after consuming work that was never committed "
+                f"({self._failed}); resume from its last checkpoint"
+            )
 
     def _close_ack_runner(self, primary: Optional[BaseException]) -> None:
         runner, self._ack_runner = self._ack_runner, None
@@ -367,12 +377,6 @@ class TrainerController:
             self._ack_flush_wait_s += time.perf_counter() - started
 
     def _fit(self, data: Iterable[TrainBatch], progress: Optional[Any]) -> int:
-        if self._failed_window is not None:
-            raise RuntimeError(
-                "training cannot continue: an optimizer window of this run "
-                "failed after consuming micro-batches that were never "
-                f"committed ({self._failed_window})"
-            )
         if self.max_steps is not None and self.global_step >= self.max_steps:
             logger.info(
                 "fit: global_step=%d already at max_steps=%d; nothing to train",
@@ -403,11 +407,7 @@ class TrainerController:
             # is the data path's, not the step's.
             window_started = time.perf_counter()
             stream_before = perf.stream_s
-            try:
-                result = run_window(self.runner, window, ctx)
-            except BaseException as error:
-                self._failed_window = f"{type(error).__name__}: {error}"
-                raise
+            result = run_window(self.runner, window, ctx)
             perf.train_compute_s += (time.perf_counter() - window_started) - (
                 perf.stream_s - stream_before
             )
@@ -431,8 +431,9 @@ class TrainerController:
                 self._pending_ack = []
             if self.logger and self.global_step % max(1, self.log_interval) == 0:
                 log_metrics = dict(result.materialize())
-                if result.learning_rate is not None:
-                    log_metrics["lr"] = result.learning_rate
+                learning_rate = result.learning_rate
+                if learning_rate is not None:
+                    log_metrics["lr"] = learning_rate
                 perf_elapsed_s = max(time.perf_counter() - perf.started, 1e-12)
                 # Time the training thread was BLOCKED on durable acks; in
                 # async mode the ack itself runs behind the next step.
@@ -523,8 +524,8 @@ class TrainerController:
         A window spans epoch boundaries, so accumulation does not restart at
         an epoch. Each window has its first micro-batch in hand, which is how
         the end of the stream at a boundary differs from its end inside a
-        window; the rest is pulled as the frame consumes it. No reference to
-        a micro-batch outlives its turn, so the device holds one at a time.
+        window; the rest is pulled as the frame consumes it. The run loop
+        keeps no reference to a micro-batch it has handed over.
         """
         stream = self._batches(data)
         first: List[TrainBatch] = []
@@ -670,6 +671,9 @@ class TrainerController:
         return self._checkpoint_mgr
 
     def save_checkpoint(self, step: int) -> Checkpoint:
+        # After a failed fit() the data position is ahead of the applied
+        # updates; saving it would replace a good checkpoint of this step.
+        self._refuse_after_failure("be saved")
         # A checkpoint must never be ahead of its durable ack: resume requires
         # the ledger marker to equal the checkpoint step.
         self._flush_durable_ack()
