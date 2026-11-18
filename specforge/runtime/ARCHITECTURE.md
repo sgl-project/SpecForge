@@ -36,8 +36,9 @@ stream as a second trainer epoch.
   tensor-carrying `TrainBatch`.
 - The inference plane sends model inputs to an external spec-capture server,
   adopts its Mooncake-backed refs, and commits only metadata.
-- The training plane resolves an algorithm step provider; the core training loop
-  does not branch on online, offline, colocated, or disaggregated deployment.
+- The training plane reads what an objective declares (`ProgramSpec`, from its
+  registration); the core training loop does not branch on online, offline,
+  colocated, or disaggregated deployment.
 
 ## Canonical online-disaggregated flow
 

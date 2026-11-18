@@ -277,8 +277,11 @@ class DataParallelRunner:
         # optimizer state is each rank's own, and so is every rank's RNG.
         replicated = self.backend.optimizer_state_is_replicated
         return CheckpointState(
-            # The backend gathers the model on the first rank only.
-            draft=self._unwrapped.draft_state(state["model"]),
+            # The backend gathers the model on the first rank only; the others
+            # hold nothing to select from.
+            draft=(
+                self._unwrapped.draft_state(state["model"]) if state["model"] else {}
+            ),
             rank={
                 "optimizer": None if replicated else state["optimizer"],
                 "rng": state["rng"],
@@ -301,13 +304,13 @@ class DataParallelRunner:
         failures = [
             f"rank {rank}: {failure}"
             for rank, (failure, _) in enumerate(outcomes)
-            if failure
+            if failure is not None
         ]
         if failures:
             raise RuntimeError("; ".join(failures))
-        values = [reported for _, reported in outcomes]
-        if any(reported != values[0] for reported in values):
-            raise RuntimeError(f"ranks disagree: {values}")
+        first, *others = [reported for _, reported in outcomes]
+        if any(reported != first for reported in others):
+            raise RuntimeError(f"ranks disagree: {[first, *others]}")
 
     def _train_mode(self) -> None:
         """Put the whole model in training mode before a training call.
@@ -344,6 +347,10 @@ class DataParallelRunner:
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()
+        if not self.replay_statistics:
+            # Its RNG state would be kept for a replay that never comes and
+            # handed to the next gradient pass instead.
+            raise RuntimeError("this program declares no replay statistic")
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
         self._hold_window_length(ctx, opening=not self._prepass_rng)
@@ -419,8 +426,14 @@ class DataParallelRunner:
     ) -> None:
         """One micro-batch's forward, its share of the window's totals, its backward."""
         self._train_mode()
-        # A program that declares a replay statistic takes the pooled sums.
-        replay = {"replay_values": ctx.replay_values} if self.replay_statistics else {}
+        # A program that declares a replay statistic turns the pooled sums
+        # into its forward's arguments; that arithmetic stays out of the
+        # wrapper, which may cast what passes through its forward.
+        replay = (
+            self._unwrapped.replay_arguments(ctx.replay_values)
+            if self.replay_statistics
+            else {}
+        )
         # DDP defers its gradient synchronization only when the scope encloses
         # the forward as well as the backward.
         with self.backend.accumulation_context(is_boundary=is_boundary):
@@ -461,19 +474,26 @@ class DataParallelRunner:
             )
         if not pooled:
             return result.numerator, result.denominator
-        # Every rank holds the same terms in the same order.
-        denominators = self.reduce_sum(
-            torch.stack([denominator for _, _, denominator in result.terms])
-        )
+        # Every rank holds the same terms in the same order. Denominators of
+        # one dtype share a reduction: a sum is rounded in the dtype it is
+        # taken in, so packing two dtypes together would change one of them.
+        device = self._device()
+        local = [denominator.to(device) for _, _, denominator in result.terms]
+        pooled_by_term = list(local)
+        for dtype in dict.fromkeys(denominator.dtype for denominator in local):
+            members = [i for i, d in enumerate(local) if d.dtype == dtype]
+            sums = self.reduce_sum(torch.stack([local[i] for i in members]))
+            for index, total in zip(members, sums):
+                pooled_by_term[index] = total
         world_size = self._world_size()
         loss = sum(
             coefficient
             * (world_size * numerator / denominator.where(denominator > 0, 1))
             for (coefficient, numerator, _), denominator in zip(
-                result.terms, denominators
+                result.terms, pooled_by_term
             )
         )
-        return loss, denominators.new_ones(())
+        return loss, pooled_by_term[0].new_ones(())
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:
@@ -489,8 +509,9 @@ class DataParallelRunner:
             if not math.isfinite(denominator_value) or denominator_value <= 0:
                 raise ValueError("global loss denominator must be finite and positive")
         # new_full fills on the device; new_tensor would be a synchronizing H2D.
+        world_size = self._world_size()
         scale = (
-            denominator.new_full((), self._world_size() * window.accumulation_steps)
+            denominator.new_full((), world_size * window.accumulation_steps)
             / denominator
         )
         self.backend.scale_gradients(scale)
@@ -504,9 +525,11 @@ class DataParallelRunner:
         # Ratios and sums are reduced as counts, in one collective.
         metrics: Dict[str, Any] = _reduce_ratio_metrics(
             window.ratio_totals,
-            device=denominator.device,
+            # Where the program computes: a metric side it built on the host
+            # would otherwise pull every other one there.
+            device=self._device(),
             process_group=self.backend.process_group,
-            reduce=self._world_size() > 1,
+            reduce=world_size > 1,
             sums=window.sum_totals,
         )
         if grad_norm is not None:

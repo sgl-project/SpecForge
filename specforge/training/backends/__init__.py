@@ -6,8 +6,9 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Step runners beyond the reference, one module each.
+"""Step runners beyond the reference.
 
+Today one module, ``plain``, built on the reference runner's own classes.
 Nothing in the training plane imports this package: a runner is chosen by
-whoever assembles the trainer. Today no configuration key selects one.
+whoever assembles the trainer, and no configuration key selects one yet.
 """

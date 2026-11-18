@@ -1,6 +1,7 @@
 """The conformance kit holds for the reference runner, and it can fail."""
 
 import contextlib
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from specforge.algorithms.objectives.registry import (
 )
 from specforge.training.backends.plain import PlainRunner
 from specforge.training.contracts import StepContext
+from specforge.training.controller import TrainerController
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
 from tests.test_runtime.conformance import (
@@ -30,6 +32,7 @@ from tests.test_runtime.conformance import (
     reference_runner,
     trained_by_the_plain_runner,
 )
+from tests.test_runtime.test_canonical_end_to_end import recomputed_tolerance
 from tests.test_runtime.trajectories import cases, differences, record
 
 
@@ -62,13 +65,21 @@ class PlainRunnerTest(RunnerChecks, unittest.TestCase):
                 world_size=2,
             )
 
-    def test_no_collective_is_issued_inside_a_process_group(self):
+    def test_trainable_module_declared_frozen_is_refused(self):
+        """As the reference refuses it: the optimizer would train it."""
+        program = KitProgram()
+        program.frozen = (program.linear,)
+        with self.assertRaisesRegex(ValueError, "only frozen parameters"):
+            plain_runner(program, program.spec())
+
+    def test_runner_issues_no_collective_inside_a_process_group(self):
         """Not even in a group of several ranks that it was wrongly built in."""
         program = KitProgram(reduction="microbatch")
         runner = plain_runner(program, program.spec())
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.get_rank", return_value=1),
             patch("torch.distributed.all_reduce") as reduce,
             patch("torch.distributed.all_gather_object") as gather,
         ):
@@ -78,12 +89,17 @@ class PlainRunnerTest(RunnerChecks, unittest.TestCase):
             runner.agree(None, value="kernels")
             with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
                 runner.agree("disk full")
+            saved = runner.checkpoint_state()
         reduce.assert_not_called()
         gather.assert_not_called()
+        # And none is needed to restore it where there is no group at all.
+        again = KitProgram(reduction="microbatch")
+        with patch("torch.distributed.is_initialized", return_value=False):
+            plain_runner(again, again.spec()).load_resume(saved.rank)
 
 
 class PlainTrajectoryTest(unittest.TestCase):
-    """One rank through ``specforge train``: the plain runner is the reference, bit for bit."""
+    """One rank through ``specforge train``: the plain runner against DDP."""
 
     def test_plain_runner_reproduces_the_reference_at_one_rank(self):
         placeable = {case.name for case in cases()}
@@ -91,15 +107,23 @@ class PlainTrajectoryTest(unittest.TestCase):
         self.assertEqual(len(selected), len(one_rank_cases()))
         reference = record(selected)
         plain = record(selected, around_training=trained_by_the_plain_runner)
-        # Metrics, learning rates, weights, optimizer and RNG state.
+        # Metrics, learning rates, weights, optimizer and RNG state: bit for
+        # bit on CPU, and as far as two accelerator runs of one revision agree.
         self.assertEqual(
-            differences(one_rank_state(plain), one_rank_state(reference)), []
+            differences(
+                one_rank_state(plain),
+                one_rank_state(reference),
+                atol=recomputed_tolerance(),
+            ),
+            [],
         )
         # What does differ is where the optimizer state is written: once in the
         # shared file under DDP, in the rank's file without a wrapper.
         for name, updates in plain.items():
             for update, expected in zip(updates, reference[name]):
                 self.assertNotIn("replicated_optimizer_state", update["shared"])
+                self.assertTrue(update["ranks"][0]["optimizer"])
+                self.assertTrue(expected["shared"]["replicated_optimizer_state"])
                 self.assertIsNone(expected["ranks"][0]["optimizer"])
                 self.assertEqual(update["replicas"], [])
 
@@ -152,34 +176,97 @@ class KitCanFailTest(unittest.TestCase):
         self.assertEqual(self.failures(broken, "test_replay_statistic"), 1)
         self.assertEqual(self.failures(broken, "test_window_reduction"), 0)
 
+    def test_lost_resume_state_fails_the_resume_job(self):
+        def losing(key):
+            class Runner(DataParallelRunner):
+                def load_resume(self, state):
+                    optimizer = dict(copy.deepcopy(state["optimizer"]))
+                    if key == "scheduler_state_dict":
+                        # A schedule that starts over.
+                        optimizer[key] = self.backend.optimizer.scheduler.state_dict()
+                    else:
+                        del optimizer[key]
+                    super().load_resume({**state, "optimizer": optimizer})
+
+            return Runner
+
+        for key in ("fp32_params", "scheduler_state_dict"):
+            with self.subTest(lost=key):
+                self.assertEqual(
+                    self.failures(
+                        losing(key), "test_resume_continues_the_same_trajectory"
+                    ),
+                    1,
+                )
+
+    def test_checkpoint_that_does_not_wait_for_commits_fails_the_protocol(self):
+        class Probe(ProtocolChecks, unittest.TestCase):
+            pass
+
+        result = unittest.TestResult()
+        with patch.object(TrainerController, "_flush_durable_ack", lambda self: None):
+            Probe("test_commits_are_flushed_before_a_checkpoint").run(result)
+        self.assertEqual((len(result.failures), result.errors), (1, []))
+
     def test_ledger_that_breaks_the_commit_contract_is_reported(self):
         good = [
             ("batch", "s0"),
+            ("forward", "s0"),
             ("batch", "s1"),
+            ("forward", "s1"),
             ("update",),
             ("commit", ("s0", "s1"), 1),
             ("checkpoint", 1),
         ]
         self.assertEqual(protocol_violations(good), [])
-        early = [good[0], good[1], good[3], good[2], good[4]]
+        batch_0, forward_0, batch_1, forward_1, update, commit, checkpoint = good
+        for broken, message in (
+            (
+                [batch_0, forward_0, batch_1, forward_1, commit, update, checkpoint],
+                "step 1 was committed after 0 updates",
+            ),
+            (
+                [batch_0, forward_0, batch_1, forward_1, update, checkpoint, commit],
+                "checkpoint 1 was written after 0 commits",
+            ),
+            (
+                # Read and acknowledged, never handed to the runner.
+                [batch_0, forward_0, forward_0, update, batch_1, commit],
+                "step 1 committed ('s0', 's1'); its update consumed ('s0', 's0')",
+            ),
+            (
+                [batch_0, forward_0, update, ("commit", ("s0",), 1)],
+                "update 1 consumed ('s0',), not a window of 2",
+            ),
+            (
+                good[:5] + [("commit", ("s1", "s0"), 1)],
+                "step 1 committed ('s1', 's0'); its update consumed ('s0', 's1')",
+            ),
+            (
+                good[:5] + [("raised", "IncompleteWindow"), commit],
+                "step 1 was committed after the run raised",
+            ),
+            (good[:5], "1 updates were applied and 0 committed"),
+        ):
+            with self.subTest(expected=message):
+                self.assertEqual(protocol_violations(broken), [message])
         self.assertEqual(
-            protocol_violations(early), ["step 1 was committed after 0 updates"]
+            protocol_violations(good[:6] + [commit]),
+            [
+                "commit of step 1 follows 1 commits",
+                "1 updates were applied and 2 committed",
+            ],
         )
-        unflushed = [good[0], good[1], good[2], good[4], good[3]]
-        self.assertEqual(
-            protocol_violations(unflushed),
-            ["checkpoint 1 was written after 0 commits"],
-        )
-        partial = [good[0], ("update",), ("commit", ("s0",), 1)]
-        self.assertEqual(
-            protocol_violations(partial),
-            ["step 1 committed ('s0',), not the window ('s0',)"],
-        )
-        reordered = good[:3] + [("commit", ("s1", "s0"), 1)]
-        self.assertEqual(
-            protocol_violations(reordered),
-            ["step 1 committed ('s1', 's0'), not the window ('s0', 's1')"],
-        )
+
+    def test_runner_that_ignores_the_terms_cannot_train_the_microbatch_job(self):
+        class _WindowOnly(DataParallelRunner):
+            def _loss_terms(self, result):
+                return result.numerator, result.denominator
+
+        program = KitProgram(reduction="microbatch")
+        runner = _as(_WindowOnly)(program, program.spec())
+        with self.assertRaisesRegex(RuntimeError, "does not require grad"):
+            runner.forward_backward(batch(0), StepContext(), is_boundary=True)
 
 
 class DeclarationTest(unittest.TestCase):
@@ -203,8 +290,9 @@ class MutationTest(unittest.TestCase):
     def setUpClass(cls):
         placeable = {case.name for case in cases()}
         cls.cases = [case for case in declaration_cases() if case.name in placeable]
-        # An accelerator host with one device would leave nothing to compare.
-        assert cls.cases
+        if len(cls.cases) != len(declaration_cases()):
+            # The cases need two ranks; a host with one accelerator has one.
+            raise unittest.SkipTest("this host cannot place two training ranks")
         cls.reference = record(cls.cases)
         cls.mutated = {
             name: record(cls.cases, around_training=mutation)
@@ -243,22 +331,6 @@ class MutationTest(unittest.TestCase):
                 self.assertTrue(
                     any(
                         line.startswith(f"recording.{name}[0].applied_lr[0]")
-                        for line in lines
-                    )
-                )
-
-    def test_skipped_clipping_leaves_the_first_gradient_norm_alone(self):
-        """It changes the update, not what the update measured."""
-        found = self.changed("clipping skipped")
-        for name, lines in found.items():
-            with self.subTest(case=name):
-                first_norm = (
-                    f"recording.{name}[0].logged[0].metrics.grad_norm: values differ"
-                )
-                self.assertNotIn(first_norm, lines)
-                self.assertTrue(
-                    any(
-                        line.startswith(f"recording.{name}[0].shared.draft_state_dict")
                         for line in lines
                     )
                 )

@@ -25,8 +25,10 @@ class PlainRunner(DataParallelRunner):
 
     The window's bookkeeping, the normalization, the replay's RNG and the
     optimizer are the reference runner's. What differs is what one process
-    does not need: the program is not wrapped, no process group is read and
-    no collective is issued, inside an initialized process group or not.
+    does not need: the program is not wrapped, and the runner reads no
+    process group and issues no collective of its own, inside an initialized
+    process group or not. What the program's forward does is the program's:
+    a model-parallel axis, or a compiler that coordinates ranks.
 
     Args:
         program: The program, placed on its device.
@@ -57,7 +59,13 @@ class PlainRunner(DataParallelRunner):
         backend = FSDPTrainingBackend(
             ParallelConfig(), optimizer_factory=optimizer_factory
         )
-        backend.prepare_model(program, wrap=False, optimizer_target=optimizer_target)
+        backend.prepare_model(
+            program,
+            wrap=False,
+            optimizer_target=optimizer_target,
+            # Checked as the reference checks them: none may be trainable.
+            frozen=program.frozen,
+        )
         super().__init__(program, backend, spec)
 
     def _world_size(self) -> int:

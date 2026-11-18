@@ -361,6 +361,46 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
             program.linear.weight.grad, torch.tensor([[2 * (1 / 6 + 3.0)]])
         )
 
+    def test_denominators_are_pooled_in_their_own_dtype(self):
+        """A sum is rounded in the dtype it is taken in: 256 + 1 is 256 in bfloat16."""
+
+        class Program(_Program):
+            def forward(self, tensors, **context):
+                value = self.linear(tensors["x"]).sum()
+                result = ObjectiveResult(value.detach(), torch.ones(()))
+                result.terms = (
+                    (1.0, value, torch.tensor(256.0, dtype=torch.bfloat16)),
+                    (1.0, value, torch.tensor(256.0)),
+                )
+                return result
+
+        program = Program()
+        with torch.no_grad():
+            program.linear.weight.fill_(1.0)
+        runner = runner_over(program, reduction="microbatch")
+        pooled = []
+
+        def all_reduce(values, *, op, group):
+            if len(pooled) < 2:
+                # The other rank holds one of each.
+                values.add_(torch.ones_like(values))
+            pooled.append(values.clone())
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+        self.assertEqual(
+            [(values.dtype, values.tolist()) for values in pooled[:2]],
+            [(torch.bfloat16, [256.0]), (torch.float32, [257.0])],
+        )
+        torch.testing.assert_close(
+            program.linear.weight.grad, torch.tensor([[2 / 256 + 2 / 257]])
+        )
+
     def test_one_rank_normalizes_by_its_own_denominators(self):
         program = _TermsProgram()
         with torch.no_grad():
@@ -442,11 +482,35 @@ class RunnerAgreementTest(unittest.TestCase):
 
     def test_one_process_gathers_nothing(self):
         runner = runner_over(_Program())
-        with mock.patch("torch.distributed.all_gather_object") as gather:
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=False),
+            mock.patch("torch.distributed.all_gather_object") as gather,
+        ):
             runner.agree(None, value={"0:0": "reference"})
             with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
                 runner.agree("disk full")
         gather.assert_not_called()
+
+    def test_group_of_one_agrees_with_itself(self):
+        runner = runner_over(_Program())
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=1),
+            mock.patch(
+                "torch.distributed.all_gather_object",
+                side_effect=lambda out, mine, group: out.__setitem__(0, mine),
+            ) as gather,
+        ):
+            # One outcome has nothing to differ from, whatever ``==`` says of it.
+            runner.agree(None, value=float("nan"))
+            with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
+                runner.agree("disk full")
+        self.assertEqual(gather.call_count, 2)
+
+    def test_empty_error_is_an_error(self):
+        with self.assertRaisesRegex(RuntimeError, "rank 1: $"):
+            self.agree(("", None))
 
 
 class RunnerCheckpointTest(unittest.TestCase):
@@ -470,11 +534,30 @@ class RunnerCheckpointTest(unittest.TestCase):
 
     def test_resume_restores_the_optimizer_and_the_generator(self):
         runner = runner_over(_Program())
+        # State a fresh optimizer does not have.
+        runner.backend.optimizer.param_groups[0]["lr"] = 0.025
         saved = runner.checkpoint_state().rank
         expected = torch.rand(3)
         resumed = runner_over(_Program())
+        self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.1)
         resumed.load_resume(saved)
+        self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.025)
         torch.testing.assert_close(torch.rand(3), expected, rtol=0, atol=0)
+
+    def test_rank_without_model_state_selects_nothing(self):
+        """Only the first rank of a wrapped model holds the gathered weights."""
+
+        class Program(_Program):
+            def draft_state(self, state):
+                return {"w": state["linear.weight"]}
+
+        runner = runner_over(Program())
+        self.assertEqual(list(runner.checkpoint_state().draft), ["w"])
+        full = runner.backend.state_dict
+        with mock.patch.object(
+            runner.backend, "state_dict", lambda: {**full(), "model": {}}
+        ):
+            self.assertEqual(runner.checkpoint_state().draft, {})
 
 
 class RunnerRefusalTest(unittest.TestCase):
@@ -626,6 +709,13 @@ class RunnerRefusalTest(unittest.TestCase):
         # The abandoned window's prepass would shift every later pairing.
         with self.assertRaisesRegex(RuntimeError, "prepasses to pair"):
             run_window(runner, [batch(2), batch(3)], ctx)
+
+    def test_prepass_needs_a_declaration(self):
+        runner = runner_over(_Program())
+        with self.assertRaisesRegex(RuntimeError, "declares no replay statistic"):
+            runner.prepass(batch(1), StepContext())
+        # Nothing was kept for a replay: the next forward draws as it would.
+        self.assertFalse(runner._prepass_rng)
 
     def test_replay_values_need_a_declaration(self):
         runner = runner_over(_Program())
