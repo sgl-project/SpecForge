@@ -32,7 +32,11 @@ FRAME = (
     "specforge/training/program.py",
 )
 RUN_LOOP = ("specforge/training/controller.py", "specforge/eval/**/*.py")
-RUNNER = ("specforge/training/runner.py", "specforge/training/backend.py")
+RUNNER = (
+    "specforge/training/runner.py",
+    "specforge/training/backend.py",
+    "specforge/training/backends/**/*.py",
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,8 @@ class Rule:
     scope: tuple[str, ...]
     forbidden: tuple[str, ...]
     allowed: dict[str, str]
+    #: Patterns of modules inside ``scope`` the rule does not cover.
+    outside: tuple[str, ...] = ()
 
 
 RULES = (
@@ -95,6 +101,19 @@ RULES = (
         "a runner decides from declarations, never from a registry",
         RUNNER,
         ("specforge.algorithms", "specforge.modeling", "specforge.config"),
+        {},
+    ),
+    Rule(
+        "nothing imports a runner package; whoever assembles the trainer chooses one",
+        ("specforge/**/*.py",),
+        ("specforge.training.backends",),
+        {},
+        outside=("specforge/training/backends/**/*.py",),
+    ),
+    Rule(
+        "a runner of one process reads no process group",
+        ("specforge/training/backends/plain.py",),
+        DISTRIBUTED,
         {},
     ),
     Rule(
@@ -183,8 +202,9 @@ def _under(name: str, prefix: str) -> bool:
 def violations(rule: Rule) -> dict[str, list[str]]:
     """For each module in the rule's scope, the forbidden names it reaches."""
     found: dict[str, list[str]] = {}
+    outside = {path for pattern in rule.outside for path in REPO_ROOT.glob(pattern)}
     for pattern in rule.scope:
-        for path in sorted(REPO_ROOT.glob(pattern)):
+        for path in sorted(set(REPO_ROOT.glob(pattern)) - outside):
             hits = sorted(
                 name
                 for name in reached(path.read_text(), _package(path))

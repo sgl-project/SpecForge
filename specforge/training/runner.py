@@ -506,7 +506,7 @@ class DataParallelRunner:
             window.ratio_totals,
             device=denominator.device,
             process_group=self.backend.process_group,
-            reduce=True,
+            reduce=self._world_size() > 1,
             sums=window.sum_totals,
         )
         if grad_norm is not None:

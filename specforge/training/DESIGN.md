@@ -57,6 +57,8 @@ source:
 | The run loop holds no runner, backend, objective or model | `controller.py`, `specforge/eval/` |
 | A runner decides from declarations, never from a registry | `runner.py`, `backend.py` |
 | A program does not know how it is trained | objectives, drafts, losses and layers import nothing from `training`, `runtime`, `launch` or `eval` |
+| Nothing imports a runner package | every module outside `training/backends/` |
+| A runner of one process reads no process group | `backends/plain.py` |
 
 Each rule lists its exceptions with the reason: the model-parallel axes
 (sequence and tensor parallelism), whose groups share a sequence or a tensor
@@ -84,6 +86,14 @@ the test.
   single-use handle, evaluation and resume.
 
 A new runner adds two test classes that set `make_runner`.
+
+`backends/plain.py` is the first: `PlainRunner`, for a job of one rank. It
+shares the reference runner's window bookkeeping, normalization, replay RNG
+and optimizer, wraps nothing, reads no process group and issues no collective.
+It passes the kit, and a recording of it through `specforge train` equals the
+reference's at one rank in every value; it writes its optimizer state in the
+rank's file where DDP writes it once in the shared file. No configuration key
+selects it yet.
 
 ## Internal mechanics
 

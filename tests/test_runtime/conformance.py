@@ -20,6 +20,9 @@ commits are flushed before a checkpoint.
 
 ``RunnerChecks`` holds a runner to the reference runner's updates in one
 process, bit for bit, for each declaration.
+
+``one_rank_cases`` are the recorded cases a one-process runner can place, and
+``trained_by_the_plain_runner`` records them under the plain runner.
 """
 
 from __future__ import annotations
@@ -77,6 +80,15 @@ def declaration_cases():
             evaluated=declaration == "evaluation diagnostics",
         )
         for declaration, architecture in DECLARATIONS.items()
+    ]
+
+
+def one_rank_cases():
+    """Each declaration on one rank: alone, in a window of two, and evaluated."""
+    return [
+        Case(architecture, **topology)
+        for architecture in DECLARATIONS.values()
+        for topology in (dict(), dict(accumulation_steps=2), dict(evaluated=True))
     ]
 
 
@@ -145,6 +157,87 @@ def reference_runner(program, spec):
         ),
     )
     return DataParallelRunner(backend.prepare_model(program, wrap=False), backend, spec)
+
+
+def plain_runner(program, spec):
+    """The plain runner over ``program``, with the reference job's optimizer."""
+    from specforge.optimizer import BF16Optimizer
+    from specforge.training.backends.plain import PlainRunner
+
+    return PlainRunner(
+        program,
+        spec,
+        optimizer_factory=lambda module: BF16Optimizer(
+            module, lr=0.05, max_grad_norm=1.0, warmup_ratio=0.5, total_steps=4
+        ),
+        world_size=1,
+    )
+
+
+@contextmanager
+def trained_by_the_plain_runner():
+    """Have ``Trainer`` assemble the plain runner where it assembles the reference.
+
+    No configuration key selects a runner yet, so a recording of the plain
+    runner through ``specforge train`` replaces the two names ``Trainer``
+    builds its runner from.
+    """
+    from specforge.training import trainer
+    from specforge.training.backends.plain import PlainRunner
+
+    class Assembly:
+        """Stands in for the backend ``Trainer`` constructs and wraps with."""
+
+        def __init__(self, parallel, *, optimizer_factory):
+            self.world_size = parallel.world_size
+            self.optimizer_factory = optimizer_factory
+
+        def prepare_model(self, model, *, optimizer_target, frozen, blocks):
+            self.optimizer_target = optimizer_target
+            return model
+
+    def runner(program, assembly, spec):
+        return PlainRunner(
+            program,
+            spec,
+            optimizer_factory=assembly.optimizer_factory,
+            optimizer_target=assembly.optimizer_target,
+            world_size=assembly.world_size,
+        )
+
+    with (
+        patch.object(trainer, "FSDPTrainingBackend", Assembly),
+        patch.object(trainer, "DataParallelRunner", runner),
+    ):
+        yield
+
+
+def one_rank_state(recording):
+    """A one-rank recording without where the optimizer state was written.
+
+    DDP writes the optimizer once, in the checkpoint's shared file, and the
+    recorder reads each replica's own state besides; a runner without a
+    wrapper writes it in its rank's file. The values are kept, under one name.
+    """
+    view = {}
+    for name, updates in recording.items():
+        view[name] = []
+        for update in updates:
+            (rank,) = update["ranks"]
+            shared = dict(update["shared"])
+            optimizer = shared.pop("replicated_optimizer_state", None)
+            view[name].append(
+                {
+                    **{
+                        key: update[key]
+                        for key in ("checkpoint", "logged", "evaluated", "applied_lr")
+                    },
+                    "shared": shared,
+                    "optimizer": rank["optimizer"] if optimizer is None else optimizer,
+                    "rank": {key: rank[key] for key in rank if key != "optimizer"},
+                }
+            )
+    return view
 
 
 def batch(index, value=None):
