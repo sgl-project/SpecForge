@@ -613,6 +613,19 @@ class ObjectiveContractTest(unittest.TestCase):
         torch.testing.assert_close(
             sum(c * n / d for c, n, d in result.terms), result.loss, rtol=0, atol=0
         )
+        # A protocol whose batches contradict its declaration is refused where
+        # both are in hand, in evaluation as well.
+        registration = runtime.registration
+        runtime.registration = replace(
+            registration, training=replace(registration.training, reduction="window")
+        )
+        for mode in (runtime.train, runtime.eval):
+            mode()
+            with self.assertRaisesRegex(
+                ValueError, "declares the 'window' reduction and returned a 'global_"
+            ):
+                runtime(batch, step=0, total_steps=1)
+        runtime.registration = registration
         # Outside training every term is normalized on its own rank.
         runtime.eval()
         torch.manual_seed(3)

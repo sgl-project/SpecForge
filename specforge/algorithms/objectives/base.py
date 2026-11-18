@@ -308,6 +308,16 @@ class ObjectiveModel(nn.Module):
         prepared = self.objective(
             self, batch, step=step, total_steps=total_steps, **context
         )
+        if self.registration is not None:
+            declared = self.registration.training.reduction
+            if (prepared.reduction == "global_microbatch") != (
+                declared == "microbatch"
+            ):
+                # In evaluation no runner is there to notice.
+                raise ValueError(
+                    f"{self.objective_name} declares the {declared!r} reduction and "
+                    f"returned a {prepared.reduction!r} prediction batch"
+                )
         result = execute_batch(
             prepared,
             None,
