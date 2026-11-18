@@ -73,7 +73,7 @@ class DFlashObjective:
             blocks.layer_inputs,
             output_logits=False,
         )
-        runtime.observe_statistics(output, blocks)
+        runtime.observe_statistics(output, blocks.kept_tokens)
 
         def compute(calc):
             calc.run()

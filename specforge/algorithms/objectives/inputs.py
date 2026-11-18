@@ -75,6 +75,7 @@ class Blocks:
     weights: Tensor
     anchors: Tensor
     keep: Tensor
+    kept_tokens: Tensor  # [batch, blocks * slots]: every model token of a kept block
     label_positions: Tensor
     layer_inputs: tuple[LayerInputs, ...]
 
@@ -164,6 +165,8 @@ def prepare_blocks(
             active_blocks=keep,
         ),
     )
+    # The model's tokens: every slot of a kept block; a padded block's are inert.
+    kept_tokens = keep.repeat_interleave(size, dim=1)
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)
         for _ in config.layer_types
@@ -175,6 +178,7 @@ def prepare_blocks(
         weights,
         anchors,
         keep,
+        kept_tokens,
         label_positions,
         entries,
     )

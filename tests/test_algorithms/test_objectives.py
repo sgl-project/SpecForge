@@ -145,6 +145,17 @@ class ObjectiveTest(unittest.TestCase):
                 blocks.input_ids.reshape_as(blocks.labels)[..., 0], blocks.anchors + 1
             )
         )
+        # The model's tokens of kept blocks, as the attention layout activates them.
+        slots = config.spec_config.protocol.num_model_slots
+        self.assertTrue(
+            torch.equal(blocks.kept_tokens, blocks.keep.repeat_interleave(slots, dim=1))
+        )
+        layout = blocks.layer_inputs[0].attention_layout
+        self.assertTrue(
+            torch.equal(
+                blocks.kept_tokens, layout.context_blocks.compute_active_queries()
+            )
+        )
         self.assertTrue(
             torch.equal(
                 blocks.label_positions, blocks.anchors[..., None] + 1 + torch.arange(4)
