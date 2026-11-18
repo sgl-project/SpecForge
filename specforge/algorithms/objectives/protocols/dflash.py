@@ -88,7 +88,7 @@ class DFlashObjective:
             calc.run()
             report_token_loss(calc)
 
-        balance, value = runtime.balance_term(output, blocks, context)
+        balance, value = runtime.balance_term(output, blocks.kept_tokens, context)
         predictions = runtime.block_predictions(
             output,
             blocks,

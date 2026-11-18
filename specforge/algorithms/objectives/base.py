@@ -211,15 +211,18 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def balance_term(self, output, blocks, context):
-        """A block protocol's balance term and its value for this forward.
+    def balance_term(self, output, keep, context):
+        """A protocol's balance term and its value for this forward.
 
-        The term's coefficient is the configured ``moe_balance`` loss term's.
-        While it is on, the statistics' regularizer runs through the training
-        layer's ``prepare_statistics`` hook when the forward has one, which
-        pools the load over ranks; a direct call balances against this
-        forward's own load. Off, the statistics still count for the bias step
-        and the value is zero.
+        ``keep`` marks the forward's tokens that count, in the routing's token
+        order (any shape that flattens to it): a block protocol's kept-block
+        tokens, a sequence protocol's supervised positions. The term's
+        coefficient is the configured ``moe_balance`` loss term's. While it is
+        on, the statistics' regularizer runs through the training layer's
+        ``prepare_statistics`` hook when the forward has one, which pools the
+        load over ranks; a direct call balances against this forward's own
+        load. Off, the statistics still count for the bias step and the value
+        is zero.
         """
         from .losses import TokenLoss
         from .plan import LossTerm
@@ -227,9 +230,7 @@ class ObjectiveModel(nn.Module):
         configured = self.loss_configuration.terms.get("moe_balance")
         value = None
         if self.statistics is not None:
-            slots = self.draft_model.config.draft.spec_config.protocol.num_model_slots
-            # Every token of a kept block went through the model; padded blocks did not.
-            keep = blocks.keep.repeat_interleave(slots, dim=1).reshape(-1)
+            keep = keep.reshape(-1)
             prepare = context.get("prepare_statistics")
             if configured is None or configured.coefficient == 0:
                 self.statistics.observe(output, keep=keep)
