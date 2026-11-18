@@ -477,7 +477,22 @@ class Trainer:
         )
         runner = DataParallelRunner(strategy, backend)
         if resume is not None:
-            runner.load_resume(resume["backend"])
+            # A rank whose own state does not restore tells the others, which
+            # would otherwise wait for it in the first step's collectives.
+            failure = None
+            try:
+                runner.load_resume(resume["backend"])
+            except Exception as error:
+                failure = error
+            try:
+                runner.agree(
+                    None if failure is None else f"{type(failure).__name__}: {failure}"
+                )
+            except RuntimeError:
+                if failure is not None:
+                    # The rank that failed raises what it failed with.
+                    raise failure
+                raise
         ack_fn = None
         if durable_ack:
 

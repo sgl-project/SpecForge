@@ -658,11 +658,26 @@ class TrainerController:
         # the ledger marker to equal the checkpoint step.
         self._flush_durable_ack()
         # Every rank participates: gathering a sharded model is collective and
-        # every rank saves its own state.
-        state = self.runner.checkpoint_state()
+        # every rank saves its own state. A rank that fails once the gather is
+        # over, copying its optimizer state for one, reports it through the
+        # agreement; raising here would leave the others waiting in it.
+        state = failure = None
+        try:
+            state = self.runner.checkpoint_state()
+        except Exception as error:
+            failure = error
         # What rank 0 records for resume has to hold for every rank; a
         # difference raises here, before anything is written.
-        self.runner.agree(None, value=("loss kernels", dict(state.kernels)))
+        try:
+            self.runner.agree(
+                None if failure is None else f"{type(failure).__name__}: {failure}",
+                value=None if state is None else ("loss kernels", dict(state.kernels)),
+            )
+        except RuntimeError:
+            if failure is not None:
+                # The rank that failed raises what it failed with.
+                raise failure
+            raise
         mgr = self._checkpoint_manager()
         shared = None
         if mgr.is_rank0():
