@@ -40,7 +40,28 @@ class PlanResult:
             storing the already-normalized loss with denominator one. Metrics are
             preserved and remain the caller's responsibility to aggregate.
         """
-        if self.shared_reduction and not normalize:
+        if with_terms and not normalize:
+            raise ValueError("terms are returned with per-term normalization only")
+        one = self.terms[0].denominator.new_ones(())
+        if normalize:
+            # A denominator normalizes and is never differentiated, here or
+            # where a runner pools it.
+            denominators = [term.denominator.detach() for term in self.terms]
+            result = ObjectiveResult(
+                sum(
+                    c * (term.numerator / d.where(d > 0, 1))
+                    for c, term, d in zip(self.coefficients, self.terms, denominators)
+                ),
+                one,
+                self.ratios,
+            )
+            if with_terms:
+                result.terms = tuple(
+                    (c, term.numerator, d)
+                    for c, term, d in zip(self.coefficients, self.terms, denominators)
+                )
+            return result
+        if self.shared_reduction:
             return ObjectiveResult(
                 sum(
                     c * term.numerator for c, term in zip(self.coefficients, self.terms)
@@ -48,15 +69,7 @@ class PlanResult:
                 self.terms[0].denominator,
                 self.ratios,
             )
-        result = ObjectiveResult(
-            self.loss, self.terms[0].denominator.new_ones(()), self.ratios
-        )
-        if with_terms:
-            result.terms = tuple(
-                (c, term.numerator, term.denominator.detach())
-                for c, term in zip(self.coefficients, self.terms)
-            )
-        return result
+        return ObjectiveResult(self.loss, one, self.ratios)
 
 
 def combine_results(results):

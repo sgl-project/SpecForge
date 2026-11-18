@@ -1,14 +1,24 @@
 """What an objective model declares to a runner, read from its registration."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 
+from specforge.algorithms.objectives.base import ObjectiveModel
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import PartitionHints, ProgramSpec
 from specforge.training.program import program_spec
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import configurations
+from tests.test_runtime.test_canonical_end_to_end import (
+    build,
+    drafts,
+    process_group,
+    write_run,
+)
 
 
 class ProgramSpecTest(unittest.TestCase):
@@ -29,7 +39,7 @@ class ProgramSpecTest(unittest.TestCase):
                         evaluation_diagnostics=training.evaluation_diagnostics,
                         reduction=training.reduction,
                         partition=PartitionHints(
-                            blocks=tuple(runtime.draft_model._no_split_modules)
+                            blocks=tuple(sorted(runtime.draft_model._no_split_modules))
                         ),
                     ),
                 )
@@ -60,6 +70,11 @@ class ProgramSpecTest(unittest.TestCase):
         # A block draft is sharded per decoder layer; EAGLE is one unit.
         self.assertEqual(specs["DFlashDraftModel"].partition.blocks, ("DecoderLayer",))
         self.assertEqual(specs["Eagle3DraftModel"].partition.blocks, ())
+        # In one order on every rank, whatever order the draft class holds them in.
+        self.assertEqual(
+            program_spec(build_runtime("PEagleDraftModel")[1]).partition.blocks,
+            ("DecoderLayer", "EagleDecoderStage"),
+        )
 
     def test_model_without_a_registration_declares_nothing(self):
         _, runtime = build_runtime("DFlashDraftModel")
@@ -69,33 +84,56 @@ class ProgramSpecTest(unittest.TestCase):
 
 
 class FrozenModulesTest(unittest.TestCase):
-    def test_bound_tables_and_the_teacher_head_are_frozen(self):
-        for config in configurations():
-            with self.subTest(architecture=config.architecture):
-                _, runtime = build_runtime(config.architecture)
-                draft = runtime.draft_model
-                bound = [draft.get_submodule(name) for name in config.target_bindings]
-                self.assertEqual(
-                    [id(module) for module in runtime.frozen],
-                    [id(module) for module in bound + [runtime.target_head]],
+    def test_modules_are_frozen_where_the_builder_declares_them(self):
+        """A model built without the declaration shards as it always did."""
+        _, runtime = build_runtime("DSpineDraftModel")
+        self.assertEqual(runtime.frozen, ())
+        table = nn.Embedding(4, 2)
+        declared = ObjectiveModel(
+            runtime.draft_model,
+            runtime.objective,
+            loss_configuration=runtime.loss_configuration,
+            frozen_modules=[table, runtime.draft_model.lm_head, table],
+        )
+        # Each once, in the order given.
+        self.assertEqual(
+            [id(module) for module in declared.frozen],
+            [id(table), id(runtime.draft_model.lm_head)],
+        )
+
+    def test_assembled_run_keeps_bound_tables_and_the_teacher_replicated(self):
+        for draft in drafts():
+            with (
+                self.subTest(architecture=draft.architecture),
+                TemporaryDirectory() as temp,
+                process_group(Path(temp)),
+            ):
+                trainer = build(write_run(Path(temp), draft)).trainer
+                program = trainer.runner.program
+                model = (
+                    program.module
+                    if isinstance(program, DistributedDataParallel)
+                    else program
                 )
+                bound = [
+                    model.draft_model.get_submodule(name)
+                    for name in draft.target_bindings
+                ]
+                teacher = [] if model.target_head is None else [model.target_head]
+                expected = list(dict.fromkeys(bound + teacher))
+                self.assertEqual(
+                    [id(module) for module in model.frozen],
+                    [id(module) for module in expected],
+                )
+                # What the program declares is what the backend left alone.
+                self.assertEqual(trainer.backend.ignored_frozen_modules, model.frozen)
                 self.assertFalse(
                     any(
                         parameter.requires_grad
-                        for module in runtime.frozen
+                        for module in model.frozen
                         for parameter in module.parameters()
                     )
                 )
-
-    def test_head_shared_with_the_draft_is_listed_once(self):
-        # DSpine binds its embedding and its LM head to the target's tables.
-        config, runtime = build_runtime("DSpineDraftModel")
-        self.assertEqual(config.target_bindings, ("embed_tokens", "lm_head"))
-        runtime.target_head = runtime.draft_model.lm_head
-        self.assertEqual(
-            [id(module) for module in runtime.frozen],
-            [id(runtime.draft_model.embed_tokens), id(runtime.draft_model.lm_head)],
-        )
 
     def test_backend_refuses_a_trainable_module_as_frozen(self):
         model = nn.Linear(2, 2)
