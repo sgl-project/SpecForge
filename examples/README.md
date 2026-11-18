@@ -16,7 +16,7 @@ choose the model and strategy inside it:
 | --- | --- | --- |
 | Offline colocated | Feature checkpoints already exist and the trainer can read them directly | [`offline/colocated/qwen3-8b-eagle3.yaml`](./configs/offline/colocated/qwen3-8b-eagle3.yaml) |
 | Offline disaggregated | A producer must ingest existing features for a separate trainer pool | [`offline/disaggregated/qwen3-8b-eagle3.yaml`](./configs/offline/disaggregated/qwen3-8b-eagle3.yaml) |
-| Online disaggregated, external | Mooncake and patched SGLang are started by the user or scheduler | [`online/disaggregated/external/qwen3-8b-eagle3.yaml`](./configs/online/disaggregated/external/qwen3-8b-eagle3.yaml) |
+| Online disaggregated, external | Mooncake and SGLang with the capture plugin are started by the user or scheduler | [`online/disaggregated/external/qwen3-8b-eagle3.yaml`](./configs/online/disaggregated/external/qwen3-8b-eagle3.yaml) |
 | Online disaggregated, managed-local | One command should own a single-node Mooncake/SGLang/trainer stack | [`online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml`](./configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
 
 The complete model, strategy, CUDA/ROCm/Ascend, and resource-layout catalog is

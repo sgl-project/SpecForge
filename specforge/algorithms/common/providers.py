@@ -122,50 +122,10 @@ def checkpoint_key_fingerprint(model: Any, keys: Iterable[str]) -> str:
 
 
 @dataclass(frozen=True)
-class TargetDerivedDraftDefaults:
-    """Defaults used when a target config generates a draft config.
-
-    ``populate`` is the algorithm-owned seam for derived values such as
-    DFlash target-layer IDs.  Reading a config and resolving its model/config
-    class remain responsibilities of ``DraftModelRegistry``.
-    """
-
-    model_type: str
-    num_hidden_layers: int
-    draft_vocab_size: int | None = None
-    populate: Factory | None = None
-
-    def __post_init__(self) -> None:
-        _non_empty(self.model_type, field_name="model_type")
-        if (
-            isinstance(self.num_hidden_layers, bool)
-            or not isinstance(self.num_hidden_layers, int)
-            or self.num_hidden_layers <= 0
-        ):
-            raise ValueError("num_hidden_layers must be a positive integer")
-        if self.draft_vocab_size is not None and (
-            isinstance(self.draft_vocab_size, bool)
-            or not isinstance(self.draft_vocab_size, int)
-            or self.draft_vocab_size <= 0
-        ):
-            raise ValueError("draft_vocab_size must be a positive integer or None")
-        if self.populate is not None and not callable(self.populate):
-            raise TypeError("populate must be callable or None")
-
-
-@dataclass(frozen=True)
 class DraftConfigProvider:
-    """Algorithm policy around a registered draft architecture.
-
-    This object does not contain a model/config class and does not load a
-    config.  It supplies algorithm-specific generation and override behavior
-    to the composition root after ``DraftModelRegistry`` resolves the class.
-    """
+    """Architecture accepted by the resolved canonical runtime."""
 
     architecture: str
-    target_defaults: TargetDerivedDraftDefaults | None = None
-    expected_auto_map_model: str | None = None
-    apply_overrides: Factory | None = None
     compatible_architectures: FrozenSet[str] | None = None
 
     def __post_init__(self) -> None:
@@ -184,13 +144,6 @@ class DraftConfigProvider:
                     "architecture must be included in compatible_architectures"
                 )
         object.__setattr__(self, "compatible_architectures", compatible)
-        if self.expected_auto_map_model is not None:
-            _non_empty(
-                self.expected_auto_map_model,
-                field_name="expected_auto_map_model",
-            )
-        if self.apply_overrides is not None and not callable(self.apply_overrides):
-            raise TypeError("apply_overrides must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -283,81 +236,12 @@ class StepProvider:
     """Factories and persistence hooks for one algorithm's training step."""
 
     build: Factory
-    options: Factory
-    resume_contract: Factory
-    allowed_missing_checkpoint_keys: Factory
     uses_external_target_head: bool
 
     def __post_init__(self) -> None:
-        _factories_are_callable(
-            (
-                ("build", self.build),
-                ("options", self.options),
-                ("resume_contract", self.resume_contract),
-                (
-                    "allowed_missing_checkpoint_keys",
-                    self.allowed_missing_checkpoint_keys,
-                ),
-            )
-        )
+        _factories_are_callable((("build", self.build),))
         if not isinstance(self.uses_external_target_head, bool):
             raise TypeError("uses_external_target_head must be a bool")
-
-    def bind_runtime(
-        self,
-        config: Any,
-        draft_model: Any,
-        training_model: Any,
-        *,
-        model_provenance: Mapping[str, Any] | None = None,
-    ) -> StepRuntimeConfig:
-        """Resolve algorithm checkpoint semantics against the live model."""
-
-        options = self.options(config)
-        if not isinstance(options, Mapping):
-            raise TypeError(
-                "step options must return a mapping, got " f"{type(options).__name__}"
-            )
-        provider_contract = self.resume_contract(config, draft_model, training_model)
-        if not isinstance(provider_contract, Mapping):
-            raise TypeError(
-                "step resume_contract must return a mapping, got "
-                f"{type(provider_contract).__name__}"
-            )
-        resume_contract = dict(provider_contract)
-        reserved = {
-            STEP_OPTIONS_CONTRACT_KEY,
-            MODEL_PROVENANCE_CONTRACT_KEY,
-            OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
-        } & resume_contract.keys()
-        if reserved:
-            raise ValueError(
-                "provider resume_contract uses runtime-owned fields: "
-                f"{sorted(reserved)}"
-            )
-        resume_contract[STEP_OPTIONS_CONTRACT_KEY] = tuple(
-            (key, options[key]) for key in sorted(options)
-        )
-        if model_provenance is not None:
-            resume_contract[MODEL_PROVENANCE_CONTRACT_KEY] = tuple(
-                (key, model_provenance[key]) for key in sorted(model_provenance)
-            )
-        allowed_missing = frozenset(
-            self.allowed_missing_checkpoint_keys(
-                config,
-                draft_model,
-                training_model,
-            )
-        )
-        if allowed_missing:
-            resume_contract[OMITTED_STATE_FINGERPRINT_CONTRACT_KEY] = (
-                checkpoint_key_fingerprint(draft_model, allowed_missing)
-            )
-        return StepRuntimeConfig(
-            options=options,
-            resume_contract=resume_contract,
-            allowed_missing_checkpoint_keys=allowed_missing,
-        )
 
 
 @dataclass(frozen=True)
@@ -369,44 +253,37 @@ class ModelProvider:
     """
 
     draft_config: DraftConfigProvider
-    build_draft: Factory
-    build_training_model: Factory
     resolve_capture_layers: Factory
     minimum_loss_tokens: Factory
-    needs_input_tools: Factory
-    default_dataloader_num_workers: int
-    allow_missing_warm_start_embedding: bool = False
+    default_dataloader_num_workers: int | None
+    build_bundle: Factory
     loss_mask_filter: Factory | None = None
 
     def __post_init__(self) -> None:
+        _factories_are_callable((("build_bundle", self.build_bundle),))
         if not isinstance(self.draft_config, DraftConfigProvider):
             raise TypeError("draft_config must be a DraftConfigProvider")
         _factories_are_callable(
             (
-                ("build_draft", self.build_draft),
-                ("build_training_model", self.build_training_model),
                 ("resolve_capture_layers", self.resolve_capture_layers),
                 ("minimum_loss_tokens", self.minimum_loss_tokens),
-                ("needs_input_tools", self.needs_input_tools),
             )
         )
-        if (
+        if self.default_dataloader_num_workers is not None and (
             isinstance(self.default_dataloader_num_workers, bool)
             or not isinstance(self.default_dataloader_num_workers, int)
             or self.default_dataloader_num_workers < 0
         ):
             raise ValueError(
-                "default_dataloader_num_workers must be a non-negative integer"
+                "default_dataloader_num_workers must be a non-negative integer or None"
             )
-        if not isinstance(self.allow_missing_warm_start_embedding, bool):
-            raise TypeError("allow_missing_warm_start_embedding must be a bool")
         if self.loss_mask_filter is not None and not callable(self.loss_mask_filter):
             raise TypeError("loss_mask_filter must be callable or None")
 
 
 @dataclass(frozen=True)
 class OfflineCaptureLayout:
-    """Map one generic local capture onto the persisted offline schema.
+    """Map generic captured tensors onto the persisted offline schema.
 
     Local capture always exposes the same four per-sample sources:
     ``input_ids``, ``loss_mask``, ``aux_hidden_states``, and
@@ -857,7 +734,6 @@ __all__ = [
     "ServerStreamingProvider",
     "StepProvider",
     "StepRuntimeConfig",
-    "TargetDerivedDraftDefaults",
     "checkpoint_key_fingerprint",
     "make_registration",
     "resolve_server_capture_layout",

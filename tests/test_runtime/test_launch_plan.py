@@ -20,9 +20,9 @@ from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
+from specforge.config.draft.codec import encode_config
 from specforge.launch_plan import (
     _SERVER_CAPTURE_REQUIREMENTS,
     CommandSpec,
@@ -38,6 +38,8 @@ from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
@@ -75,11 +77,11 @@ def _unexpected_capture_probe(command, modules):
 def build_launch_plan(cfg, **kwargs):
     """Build every test plan with one already-resolved registration.
 
-    Capture interpreters default to patched SGLang, so server_capture=auto
-    resolves to the patch as it does for existing deployments.
+    Capture interpreters default to SGLang with the plugin, so server_capture=auto
+    resolves to the plugin as it does for existing deployments.
     """
     kwargs.setdefault("rdma_device_resolver", _fake_rdma_devices)
-    kwargs.setdefault("capture_module_probe", _installed_capture("patch"))
+    kwargs.setdefault("capture_module_probe", _installed_capture("plugin"))
     return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
 
 
@@ -106,13 +108,14 @@ def _mooncake_clients(plan):
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     raw = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft"},
+        "model": {"target_model_path": "target"},
+        "draft": encode_config(draft_config()),
         "data": (
             {"prompts_path": "prompts.jsonl"}
             if mode == "disaggregated"
             else {"hidden_states_path": "features"}
         ),
-        "training": {"strategy": "dflash", "max_steps": 1},
+        "training": {"max_steps": 1},
         "deployment": {
             "mode": mode,
             "trainer": {
@@ -265,6 +268,14 @@ class _FakeProcess:
 
 
 class LaunchPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            mock.patch(
+                "specforge.training.model_loading.training_target_config",
+                return_value=None,
+            )
+        )
+
     def test_cuda_receive_buffers_validate_effective_external_protocol(self):
         for configured, override, valid in (
             ("tcp", "rdma", True),
@@ -437,7 +448,7 @@ class LaunchPlanTest(unittest.TestCase):
                     algorithm=ALGORITHM,
                     config_path="run.yaml",
                     env={},
-                    capture_module_probe=_installed_capture("patch"),
+                    capture_module_probe=_installed_capture("plugin"),
                 )
 
     def test_managed_rdma_without_usable_devices_names_the_opt_out(self):
@@ -1106,10 +1117,6 @@ class LaunchPlanTest(unittest.TestCase):
                 self.assertIn("--enable-return-aux-hidden-states", capture.argv)
                 self.assertNotIn("--enable-spec-capture", capture.argv)
                 self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
-            elif server_capture == "patch":
-                self.assertIn("--enable-spec-capture", capture.argv)
-                self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
-                self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "0")
             else:
                 for flag in (
                     "--enable-spec-capture",
@@ -1129,12 +1136,7 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(cfg.deployment.disaggregated.server_capture, "auto")
 
     def test_managed_auto_capture_resolves_to_the_installed_backend(self):
-        for installed, expected in (
-            (("plugin",), "plugin"),
-            (("patch",), "patch"),
-            # A build with both prefers the plugin.
-            (("patch", "plugin"), "plugin"),
-        ):
+        for installed, expected in ((("plugin",), "plugin"),):
             with self.subTest(installed=installed):
                 plan = self._managed_plan_for(
                     capture_module_probe=_installed_capture(*installed)
@@ -1197,10 +1199,10 @@ class LaunchPlanTest(unittest.TestCase):
             {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
         ]
         plugin_only = _installed_capture("plugin")
-        patch_only = _installed_capture("patch")
+        no_plugin = _installed_capture()
 
         def mixed(command, modules):
-            probe = plugin_only if command.label == "capture-server-0" else patch_only
+            probe = plugin_only if command.label == "capture-server-0" else no_plugin
             return probe(command, modules)
 
         def without_mooncake(command, modules):
@@ -1213,14 +1215,13 @@ class LaunchPlanTest(unittest.TestCase):
             "mixed servers": (
                 two_servers,
                 mixed,
-                r"different backends \{'capture-server-0': 'plugin', "
-                r"'capture-server-1': 'patch'\}",
+                r"found no capture backend for capture-server-1",
             ),
             "neither installed": (
                 None,
                 _installed_capture(),
                 "found no capture backend for capture-server-0.*"
-                "specforge-sglang-capture plugin.*apply_sglang_spec_capture_patch",
+                "specforge-sglang-capture plugin",
             ),
             "mooncake missing": (
                 None,
@@ -1248,7 +1249,7 @@ class LaunchPlanTest(unittest.TestCase):
                     self._capture_preflight(plan)
 
     def test_explicit_server_capture_skips_the_probe(self):
-        for backend in ("patch", "plugin"):
+        for backend in ("plugin",):
             for source in ("config", "env"):
                 with self.subTest(backend=backend, source=source):
                     plan = self._managed_plan_for(
@@ -1277,11 +1278,11 @@ class LaunchPlanTest(unittest.TestCase):
 
     def test_explicit_config_server_capture_wins_over_the_env(self):
         plan = self._managed_plan_for(
-            "patch",
-            env={"DISAGG_SERVER_CAPTURE": "plugin"},
+            "plugin",
+            env={"DISAGG_SERVER_CAPTURE": "patch"},
             capture_module_probe=_unexpected_capture_probe,
         )
-        self._assert_capture_flags(plan, "patch")
+        self._assert_capture_flags(plan, "plugin")
 
         plan = self._managed_plan_for(
             env={"DISAGG_SERVER_CAPTURE": "auto"},
@@ -1291,13 +1292,17 @@ class LaunchPlanTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "DISAGG_SERVER_CAPTURE must be"):
             self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "sidecar"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "patch"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for("patch")
 
     def test_producer_reads_the_exported_server_capture(self):
         from specforge.training.disaggregated import _server_capture
 
         auto = _managed_config("/fresh/attempt")
         raw = auto.model_dump()
-        raw["deployment"]["disaggregated"]["server_capture"] = "patch"
+        raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
         explicit = Config.model_validate(raw)
         # Legacy configs without deployment.disaggregated use the env contract.
         legacy = _config()
@@ -1308,8 +1313,8 @@ class LaunchPlanTest(unittest.TestCase):
             (legacy, {}, "auto"),
             # A managed supervisor exports its resolution to the producer.
             (auto, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
-            (legacy, {"DISAGG_SERVER_CAPTURE": "patch"}, "patch"),
-            (explicit, {"DISAGG_SERVER_CAPTURE": "plugin"}, "patch"),
+            (legacy, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+            (explicit, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
         ):
             with (
                 self.subTest(env=env, expected=expected),
@@ -1338,20 +1343,8 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--chunked-prefill-size") + 1], "-1")
         self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
 
-    def test_managed_local_patch_capture_renders_patch_flags(self):
-        plan = self._managed_plan_for("patch")
-
-        self.assertEqual(plan.server_capture, "patch")
-        capture = plan.services[1].command
-        self.assertIn("--enable-spec-capture", capture.argv)
-        self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
-        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "0")
-
     def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
-        for backend, inherited, expected in (
-            ("patch", "1", "0"),
-            ("plugin", "0", "1"),
-        ):
+        for backend, inherited, expected in (("plugin", "0", "1"),):
             with (
                 self.subTest(backend=backend),
                 mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
@@ -1439,12 +1432,12 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(mooncake.readiness.kind, "mooncake")
         for index, service in enumerate(plan.services[1:]):
             argv = service.command.argv
-            self.assertIn("--enable-spec-capture", argv)
+            self.assertIn("--enable-return-aux-hidden-states", argv)
             self.assertIn("--disable-radix-cache", argv)
             self.assertEqual(argv[argv.index("--dtype") + 1], "float32")
             self.assertEqual(argv[argv.index("--download-dir") + 1], "/models/cache")
-            self.assertEqual(argv[argv.index("--spec-capture-method") + 1], "dflash")
-            layer_index = argv.index("--spec-capture-aux-layer-ids")
+            self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+            layer_index = argv.index("--return-aux-hidden-state-layer-ids")
             self.assertEqual(
                 argv[layer_index + 1 : layer_index + 6],
                 ("1", "9", "17", "25", "33"),
@@ -1858,7 +1851,7 @@ class LaunchPlanTest(unittest.TestCase):
                             server["extra_args"] = [second]
                         Config.model_validate(raw)
 
-    def test_flag_tables_match_the_pinned_sglang_parser(self):
+    def test_flag_tables_match_the_installed_sglang_parser(self):
         import argparse
 
         from sglang.srt.server_args import ServerArgs
@@ -2236,7 +2229,7 @@ class LaunchPlanTest(unittest.TestCase):
             raw = Config.model_validate(
                 _managed_raw(os.path.join(root, "attempt"))
             ).model_dump(mode="json")
-            raw["deployment"]["disaggregated"]["server_capture"] = "patch"
+            raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(raw, stream)
             with (
@@ -2578,7 +2571,10 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertIn((capture.pid, signal.SIGTERM), signals)
         self.assertIn((mooncake.pid, signal.SIGTERM), signals)
 
-    def test_managed_preflight_rejects_an_occupied_port_before_spawning(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_an_occupied_port_before_spawning(
+        self, _capture_modules
+    ):
         with tempfile.TemporaryDirectory() as parent:
             root = os.path.join(parent, "attempt")
             port = 30000
@@ -2612,7 +2608,6 @@ class LaunchPlanTest(unittest.TestCase):
         cases = (
             ("plugin", "specforge_sglang_capture", "specforge-sglang-capture plugin"),
             ("plugin", "sglang.srt.managers.deferred_output", "deferred_output"),
-            ("patch", "sglang.srt.spec_capture_sink", "patched SGLang spec capture"),
         )
         for server_capture, missing, message in cases:
             with (
@@ -2748,7 +2743,8 @@ class LaunchPlanTest(unittest.TestCase):
             finally:
                 popen.assert_not_called()
 
-    def test_managed_preflight_rejects_mooncake_tcp_overrides(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_mooncake_tcp_overrides(self, _capture_modules):
         with (
             tempfile.TemporaryDirectory() as parent,
             mock.patch(
@@ -2854,7 +2850,10 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "port 2 is not ACTIVE"):
                     _managed_rdma_preflight(self._rdma_plan(root))
 
-    def test_managed_preflight_requires_memlock_for_rdma_registration(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_requires_memlock_for_rdma_registration(
+        self, _capture_modules
+    ):
         with (
             tempfile.TemporaryDirectory() as parent,
             mock.patch(
@@ -2915,76 +2914,19 @@ class LaunchPlanTest(unittest.TestCase):
             getrlimit.assert_not_called()
 
     def test_managed_plan_defers_the_trainer_liger_import_check(self):
-        with tempfile.TemporaryDirectory() as root:
-            cfg = _managed_config(os.path.join(root, "attempt"))
-            raw = cfg.model_dump()
-            raw["model"]["use_liger_kernel"] = False
-            disabled = Config.model_validate(raw)
-            with (
-                mock.patch(
-                    "specforge.training.capture_contract.resolve_server_capture_contract",
-                    return_value=CAPTURE_CONTRACT,
-                ),
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config"
-                ) as resolve_draft_config,
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
-                disabled_plan = build_launch_plan(
-                    disabled, config_path="run.yaml", env={}
-                )
-                # Planning only records the check; the preflight runs it.
-                resolve_draft_config.assert_not_called()
-                self.assertEqual(1, len(plan.preflight_checks))
-                self.assertEqual(1, len(disabled_plan.preflight_checks))
-                # An explicit false never resolves the draft or imports Liger.
-                disabled_plan.preflight_checks[0]()
-            resolve_draft_config.assert_not_called()
-            load_liger.assert_not_called()
+        with mock.patch(
+            "specforge.training.model_loading.preflight_draft_kernels"
+        ) as resolve:
+            plan = _build_managed(_managed_raw("/unused"))
+            resolve.assert_not_called()
+            self.assertEqual(len(plan.preflight_checks), 1)
+            plan.preflight_checks[0]()
+            resolve.assert_called_once()
 
-            draft_config = mock.Mock(hidden_act="silu")
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="rocm",
-                ),
-                mock.patch.dict(
-                    sys.modules,
-                    {"liger_kernel": None, "liger_kernel.transformers": None},
-                ),
-                self.assertRaisesRegex(
-                    ImportError,
-                    r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
-                    r'not be imported.*pip install --no-deps "liger-kernel>=',
-                ),
-            ):
-                plan.preflight_checks[0]()
-
-            draft_config.hidden_act = "gelu"
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="cuda",
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan.preflight_checks[0]()
-            load_liger.assert_not_called()
-
-    def test_managed_preflight_runs_trainer_checks_before_spawning(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_runs_trainer_checks_before_spawning(
+        self, _capture_modules
+    ):
         with tempfile.TemporaryDirectory() as parent:
             root = os.path.join(parent, "attempt")
             check = mock.Mock(side_effect=ImportError("liger missing"))
@@ -3013,43 +2955,17 @@ class LaunchPlanTest(unittest.TestCase):
             self.assertFalse(os.path.exists(root))
 
     def test_supervisor_runs_trainer_checks_before_spawning_either_role(self):
-        plan = build_launch_plan(
-            _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
-        )
-        self.assertEqual("supervisor", plan.kind)
-        self.assertEqual(1, len(plan.preflight_checks))
-
-        draft_config = mock.Mock(hidden_act="silu")
         popen = mock.Mock()
-        with (
-            mock.patch(
-                "specforge.training.model_loading.resolve_draft_config",
-                return_value=draft_config,
-            ),
-            mock.patch(
-                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                return_value="cuda",
-            ),
-            mock.patch.dict(
-                sys.modules,
-                {"liger_kernel": None, "liger_kernel.transformers": None},
-            ),
-            self.assertRaisesRegex(
-                ImportError,
-                r"resolved to true \(auto: DFlash on CUDA\) but Liger could not "
-                r'be imported.*Install it \(pip install "liger-kernel>=',
-            ),
+        with mock.patch(
+            "specforge.training.model_loading.preflight_draft_kernels",
+            side_effect=RuntimeError("liger missing"),
         ):
-            run_commands(plan, popen=popen)
-        popen.assert_not_called()
-
-        # A plan built without a registration has nothing to check.
-        self.assertEqual(
-            (),
-            _build_launch_plan(
+            plan = build_launch_plan(
                 _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
-            ).preflight_checks,
-        )
+            )
+            with self.assertRaisesRegex(RuntimeError, "liger missing"):
+                run_commands(plan, popen=popen)
+        popen.assert_not_called()
 
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(

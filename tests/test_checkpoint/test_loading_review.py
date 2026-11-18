@@ -1,0 +1,280 @@
+"""Public loading boundaries for warm starts, target I/O and legacy provenance."""
+
+import json
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import torch
+from safetensors.torch import save_file
+
+from specforge.checkpoint import save_draft
+from specforge.checkpoint.initialization import resolve_bindings
+from specforge.checkpoint.resolve import target_configuration
+from specforge.checkpoint.target import _TARGET_KEYS
+from specforge.checkpoint.tensors import TensorStore
+from specforge.loading import initialize_draft, load_draft, read_draft
+from specforge.modeling import build_draft_model
+from tests.test_checkpoint.test_loading import write_target
+from tests.test_config.draft_fixtures import draft_config
+
+
+class LoadingReviewTest(unittest.TestCase):
+    def test_dspine_initializes_fresh_transfer_space_and_preserves_loaded_state(self):
+        from tests.test_modeling.test_canonical_dspine import model_config
+
+        with TemporaryDirectory() as tmp:
+            target, source = Path(tmp) / "target", Path(tmp) / "draft"
+            write_target(target)
+            model = initialize_draft(model_config(), target=target)
+            self.assertTrue(model.transfer_ready.item())
+            with torch.no_grad():
+                model.injection.readouts[0].weight.add_(1)
+            save_draft(model, source)
+            for restored in (
+                load_draft(source, target=target),
+                initialize_draft(model_config(), target=target, weights_from=source),
+            ):
+                torch.testing.assert_close(
+                    restored.state_dict(), model.state_dict(), rtol=0, atol=0
+                )
+            for missing in ("transfer_ready", "transfer_codes", "injection.readouts"):
+                with (
+                    self.subTest(missing=missing),
+                    self.assertRaisesRegex(
+                        ValueError, "incomplete DSpine transfer space"
+                    ),
+                ):
+                    initialize_draft(
+                        model_config(),
+                        target=target,
+                        weights_from=source,
+                        allow_new=[missing],
+                    )
+
+    def test_warm_start_selects_only_needed_weights(self):
+        config = draft_config(target_bindings=(), target_logit_transform=None)
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            original = build_draft_model(config)
+            save_draft(original, source)
+            smaller = replace(config, layer_types=config.layer_types[:1])
+            with self.assertLogs("specforge.checkpoint.initialization", "WARNING"):
+                model = initialize_draft(
+                    smaller, weights_from=source, allow_new=["fusion"]
+                )
+            torch.testing.assert_close(
+                model.backbone.layers[0].state_dict(),
+                original.backbone.layers[0].state_dict(),
+            )
+            self.assertFalse(
+                torch.equal(model.fusion.fc.weight, original.fusion.fc.weight)
+            )
+            target = Path(tmp) / "target"
+            write_target(target)
+            with self.assertLogs("specforge.checkpoint.initialization", "WARNING"):
+                model = initialize_draft(
+                    draft_config(), weights_from=source, target=target
+                )
+            self.assertEqual(model.embed_tokens.bound_weight().shape, (64, 32))
+
+    def test_warm_start_does_not_recheck_source_against_new_target(self):
+        config = draft_config(target_bindings=(), target_logit_transform=None)
+        old = replace(
+            config,
+            spec_config=replace(
+                config.spec_config,
+                target_features=replace(
+                    config.spec_config.target_features, target_layer_ids=(90, 100)
+                ),
+            ),
+        )
+        with TemporaryDirectory() as tmp:
+            source, target = Path(tmp) / "source", Path(tmp) / "target"
+            save_draft(build_draft_model(old), source)
+            write_target(target)
+            (target / "config.json").write_text(
+                json.dumps(dict(hidden_size=32, vocab_size=64, num_hidden_layers=8))
+            )
+            initialize_draft(config, target=target, weights_from=source)
+            with self.assertRaisesRegex(ValueError, "target_layer_ids"):
+                load_draft(source, target=target)
+
+    def test_target_weights_are_opened_only_after_config_checks(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "config.json").write_text(
+                json.dumps(dict(hidden_size=32, vocab_size=64, num_hidden_layers=128))
+            )
+            with (
+                patch(
+                    "huggingface_hub.snapshot_download", return_value=tmp
+                ) as download,
+                patch("specforge.loading.TensorStore") as store,
+            ):
+                initialize_draft(
+                    draft_config(target_bindings=(), target_logit_transform=None),
+                    target="test/target",
+                )
+                self.assertEqual(
+                    download.call_args.kwargs["allow_patterns"], ["config.json"]
+                )
+                store.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "hidden_size"):
+                    initialize_draft(
+                        replace(draft_config(), hidden_size=16), target="test/target"
+                    )
+                store.assert_not_called()
+                with TemporaryDirectory() as other:
+                    source = Path(other) / "draft"
+                    save_draft(build_draft_model(draft_config()), source)
+                    with self.assertRaisesRegex(ValueError, "does not match"):
+                        load_draft(
+                            source,
+                            target="test/target",
+                            draft=replace(draft_config(), initializer_range=0.5),
+                        )
+                store.assert_not_called()
+
+    def test_target_copy_into_one_name_of_a_tied_pair(self):
+        """Copying the embedding of a tied, owned table also fills its lm_head alias."""
+        config = draft_config(
+            target_bindings=(), target_logit_transform=None, tie_word_embeddings=True
+        )
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            tensors = write_target(target)
+            model = initialize_draft(
+                config,
+                target=target,
+                from_target={"embed_tokens": "model.embed_tokens"},
+            )
+            embed = tensors["model.embed_tokens.weight"]
+            torch.testing.assert_close(model.lm_head.weight, embed, rtol=0, atol=0)
+            # a copied name the draft lacks is still a plan error, not a KeyError
+            with self.assertRaisesRegex(ValueError, "unexpected draft tensors"):
+                initialize_draft(
+                    config,
+                    target=target,
+                    from_target={
+                        "embed_tokens": "model.embed_tokens",
+                        "extra": "lm_head",
+                    },
+                )
+
+    def test_fp8_unselected_weights_bind_but_selected_weights_fail(self):
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            weights = write_target(
+                target, {"mlp.weight": torch.ones(32, 32).to(torch.float8_e4m3fn)}
+            )
+            save_file(
+                {
+                    k: v if k == "mlp.weight" else v.bfloat16()
+                    for k, v in weights.items()
+                },
+                target / "model.safetensors",
+            )
+            initialize_draft(draft_config(), target=target)
+            with self.assertRaisesRegex(ValueError, "mlp.weight.*quantized"):
+                initialize_draft(
+                    draft_config(), target=target, from_target={"fusion.fc": "mlp"}
+                )
+
+    def test_binding_layouts_and_top_level_tie_flag(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(
+                json.dumps(
+                    {"tie_word_embeddings": True, "text_config": {"hidden_size": 32}}
+                )
+            )
+            config = target_configuration(root)
+            for module, keys in _TARGET_KEYS.items():
+                for key in keys:
+                    with self.subTest(key=key):
+                        save_file({key: torch.ones(64, 32)}, root / "model.safetensors")
+                        refs = resolve_bindings(
+                            replace(
+                                draft_config(),
+                                target_bindings=(module,),
+                                target_logit_transform=(
+                                    draft_config().target_logit_transform
+                                    if module == "lm_head"
+                                    else None
+                                ),
+                            ),
+                            TensorStore(root),
+                            config,
+                        )
+                        self.assertEqual(refs[module].key, key)
+            save_file({"embed.weight": torch.ones(64, 32)}, root / "model.safetensors")
+            self.assertEqual(
+                resolve_bindings(draft_config(), TensorStore(root), config)[
+                    "lm_head"
+                ].key,
+                "embed.weight",
+            )
+
+    def test_source_directory_metadata_does_not_follow_the_model(self):
+        """Re-saving a loaded export must not carry its auto_map without its code."""
+        with TemporaryDirectory() as tmp:
+            source, target, out = (Path(tmp) / n for n in ("export", "target", "out"))
+            write_target(target)
+            save_draft(build_draft_model(draft_config()), source)
+            payload = json.loads((source / "config.json").read_text())
+            artifact = payload["specforge_artifact"]
+            payload["auto_map"] = {"AutoModel": "modeling_draft.DFlashDraftModel"}
+            payload["specforge_artifact"] = artifact | {"stale": True}
+            (source / "config.json").write_text(json.dumps(payload))
+            save_draft(load_draft(source, target=target), out)
+            saved = json.loads((out / "config.json").read_text())
+            self.assertNotIn("auto_map", saved)
+            self.assertEqual(saved["specforge_artifact"], artifact)
+
+    def test_tied_target_whose_config_omits_the_tie_flag(self):
+        """Diff-mode configs drop tie_word_embeddings when it equals the default."""
+        from specforge.checkpoint.target import TargetWeights
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            save_file(
+                {"model.embed_tokens.weight": torch.randn(64, 32)},
+                root / "model.safetensors",
+            )
+            for model_type, tied in (("gemma3_text", True), ("llama", False)):
+                with self.subTest(model_type=model_type):
+                    payload = {"model_type": model_type, "hidden_size": 32}
+                    (root / "config.json").write_text(json.dumps(payload))
+                    store = TargetWeights(root)
+                    if tied:
+                        key = store.resolve("lm_head").key
+                        self.assertEqual(key, "model.embed_tokens.weight")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "lm_head"):
+                            store.resolve("lm_head")
+
+    def test_run_root_without_complete_checkpoint_is_rejected(self):
+        """An empty step directory is not a loadable training checkpoint."""
+        with TemporaryDirectory() as temp:
+            run = Path(temp) / "run"
+            (run / "run-step2").mkdir(parents=True)
+            with self.assertRaisesRegex(
+                FileNotFoundError, "no complete checkpoint found"
+            ):
+                read_draft(run)
+
+    def test_config_less_model_directories_are_not_run_roots(self):
+        """Config-only hub snapshots and subfolder shards resolve to themselves."""
+        from specforge.checkpoint.resolve import resolve_checkpoint_path
+
+        with TemporaryDirectory() as temp:
+            snapshot = Path(temp) / "snapshot"
+            snapshot.mkdir()
+            sharded = Path(temp) / "sharded"
+            (sharded / "shards").mkdir(parents=True)
+            (sharded / "model.safetensors.index.json").write_text("{}")
+            for path in (snapshot, sharded):
+                self.assertEqual(resolve_checkpoint_path(path), path)

@@ -67,6 +67,8 @@ def _capture_internal_state(result, scheduler, *args, **kwargs):
     runtime = getattr(scheduler, "_specforge_capture_runtime", None)
     if runtime is not None:
         result.internal_state["spec_capture_backend"] = "plugin"
+        result.internal_state["spec_capture_method"] = runtime.capture_method
+        result.internal_state["spec_capture_aux_layer_ids"] = runtime.sink.aux_layer_ids
         if runtime.is_writer:
             control = runtime.sink.control_endpoint()
             if control is not None:

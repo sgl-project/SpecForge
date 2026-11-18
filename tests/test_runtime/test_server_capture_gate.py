@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Server-capture gate: a LIVE patched SGLang server writes features into a
+"""Server-capture gate: a LIVE SGLang plugin server writes features into a
 LIVE Mooncake store; the data plane consumes them zero-copy and trains.
 
 What is pinned here:
@@ -14,7 +14,7 @@ What is pinned here:
   agnostic), within the documented bf16 tolerance;
 - strategy-agnosticism: the same server serves eagle3 (aux + last_hidden) and
   dflash (aux + last_hidden, or aux only with
-  ``training.dflash_teacher_metrics=false``) requests, named per strategy by
+  a loss that does not require teacher logits) requests, named per strategy by
   the client schema; an unrequested artifact is never written.
 - cache isolation: radix cache stays enabled and sequential identical prompts
   still capture every token because each request attempt has a fresh
@@ -22,19 +22,9 @@ What is pinned here:
 
 The PR workflow runs this gate explicitly on its GPU runner. Local runs need a
 GPU, the ``mooncake`` package, a reachable/spawnable ``mooncake_master``, and a
-capture-capable SGLang: either patched with
-``patches/sglang/v0.5.18/spec-capture.patch`` (see
-``scripts/apply_sglang_spec_capture_patch.sh``) or a build with the forward
-observer extension points plus the installed ``specforge-sglang-capture``
-plugin. ``SPECFORGE_SERVER_CAPTURE=patch|plugin`` selects one; otherwise the
-installed one is used. Opt in locally with ``SPECFORGE_RUN_SERVER_CAPTURE_TESTS=1``.
-``SPECFORGE_CAPTURE_GATE_PORT``, ``SPECFORGE_CAPTURE_GATE_TRAIN_PORT`` and
-``SPECFORGE_CAPTURE_GATE_TP_SIZE`` isolate concurrent runs. Set
-``SPECFORGE_CAPTURE_GATE_WORKDIR`` to retain the generated model and logs in
-that directory; an existing ``target`` subdirectory is rejected. Set
-``SPECFORGE_CAPTURE_GATE_SERVER_PYTHON`` to launch the server from a separate
-SGLang environment; the tests themselves run in the SpecForge environment.
-This requires an explicit ``SPECFORGE_SERVER_CAPTURE=patch|plugin``.
+capture-capable SGLang with the SpecForge plugin and its required extension APIs.
+A separate server interpreter can be set with
+``SPECFORGE_CAPTURE_GATE_SERVER_PYTHON`` and ``SPECFORGE_SERVER_CAPTURE=plugin``.
 """
 
 import importlib.util
@@ -58,27 +48,20 @@ H, TOL = 64, 2e-2  # fixture hidden size; documented bf16 tolerance
 
 
 def _capture_schema(algorithm: str, *, teacher_metrics: bool = True):
-    from types import SimpleNamespace
-
-    from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import ServerCaptureSchema
+    from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
-    registration = builtin_algorithm_registry().resolve(algorithm)
-    config = SimpleNamespace(
-        training=SimpleNamespace(dflash_teacher_metrics=teacher_metrics)
+    registration = builtin_algorithm_registry(teacher_metrics=teacher_metrics).resolve(
+        algorithm
     )
-    layout = resolve_server_capture_layout(registration, config, modality="text")
+    layout = resolve_server_capture_layout(registration, None, modality="text")
     return ServerCaptureSchema(
         aux_feature=layout.aux_feature,
         last_hidden_feature=layout.last_hidden_feature,
         passthrough=layout.passthrough,
         attention_mask_feature=layout.attention_mask_feature,
     )
-
-
-def _patched_sglang() -> bool:
-    return importlib.util.find_spec("sglang.srt.spec_capture_sink") is not None
 
 
 def _capture_plugin() -> bool:
@@ -94,14 +77,14 @@ def _capture_plugin() -> bool:
 def _server_capture_backend():
     requested = os.environ.get("SPECFORGE_SERVER_CAPTURE")
     if requested:
+        if requested != "plugin":
+            raise ValueError("SPECFORGE_SERVER_CAPTURE must be plugin")
         return requested
     if os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"):
         raise ValueError(
-            "Set SPECFORGE_SERVER_CAPTURE=patch|plugin when using "
+            "Set SPECFORGE_SERVER_CAPTURE=plugin when using "
             "SPECFORGE_CAPTURE_GATE_SERVER_PYTHON"
         )
-    if _patched_sglang():
-        return "patch"
     if _capture_plugin():
         return "plugin"
     return None
@@ -112,17 +95,15 @@ SERVER_CAPTURE = _server_capture_backend()
 
 def _capture_server_flags():
     layer_ids = [str(i) for i in AUX_LAYER_IDS]
-    if SERVER_CAPTURE == "plugin":
-        return [
-            "--speculative-algorithm",
-            "EAGLE3",
-            "--enable-return-aux-hidden-states",
-            "--return-aux-hidden-state-layer-ids",
-            *layer_ids,
-            "--return-hidden-states-mode",
-            "full",
-        ]
-    return ["--enable-spec-capture", "--spec-capture-aux-layer-ids", *layer_ids]
+    return [
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--enable-return-aux-hidden-states",
+        "--return-aux-hidden-state-layer-ids",
+        *layer_ids,
+        "--return-hidden-states-mode",
+        "full",
+    ]
 
 
 def _mooncake_available() -> bool:
@@ -152,9 +133,7 @@ class TestServerCaptureGate(unittest.TestCase):
     def setUpClass(cls):
         if SERVER_CAPTURE is None:
             raise unittest.SkipTest(
-                "installed sglang has no spec capture — apply "
-                "patches/sglang/v0.5.18/spec-capture.patch "
-                "(scripts/apply_sglang_spec_capture_patch.sh) or install the "
+                "installed sglang has no spec capture — install the "
                 "specforge-sglang-capture plugin on an SGLang build with "
                 "forward observers"
             )
@@ -359,6 +338,57 @@ class TestServerCaptureGate(unittest.TestCase):
         return aux, logits
 
     # -- tests -------------------------------------------------------------------
+    def test_offline_plugin_to_files_matches_reference_and_resumes(self):
+        from pathlib import Path
+
+        from scripts.prepare_hidden_states import HiddenStatesGenerator
+        from specforge.offline_capture import OfflineCaptureClient
+        from tests.test_algorithms.fixtures import builtin_algorithm_registry
+
+        layout = (
+            builtin_algorithm_registry()
+            .resolve("eagle3")
+            .providers.offline_for("text")
+            .capture_layout
+        )
+        tokens = [[5, 6, 7, 8, 9, 10], [11, 12, 13]]
+        rows = [
+            {
+                "input_ids": row,
+                "attention_mask": [1] * len(row),
+                "loss_mask": [1] * len(row),
+            }
+            for row in tokens
+        ]
+        with tempfile.TemporaryDirectory(dir=self.workdir) as directory:
+            with (
+                OfflineCaptureClient(
+                    [f"http://localhost:{PORT}"],
+                    target_model_path=self.target_dir,
+                    capture_layers=AUX_LAYER_IDS,
+                    layout=layout,
+                    target_hidden_size=H,
+                ) as client,
+                HiddenStatesGenerator(client, layout) as generator,
+            ):
+                generator.generate([rows], directory)
+                files = sorted(Path(directory).rglob("*.ckpt"))
+                self.assertEqual(len(files), len(rows))
+                mtimes = [path.stat().st_mtime_ns for path in files]
+                generator.generate([rows], directory)
+                self.assertEqual(mtimes, [path.stat().st_mtime_ns for path in files])
+            for row, path in zip(tokens, files):
+                aux, _ = self._hf_reference([row])
+                record = torch.load(path, weights_only=True)
+                self.assertEqual(set(record), set(layout.output_names))
+                self.assertEqual(record["input_ids"].tolist(), row)
+                torch.testing.assert_close(
+                    record[layout.aux_feature].float(),
+                    aux[0].float(),
+                    rtol=TOL,
+                    atol=TOL,
+                )
+
     def test_eagle3_zero_copy_end_to_end(self):
         from specforge.inference.adapters.server_capture import (
             SGLangServerCaptureAdapter,
@@ -379,10 +409,9 @@ class TestServerCaptureGate(unittest.TestCase):
         contract = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",
-                "attention_mask",
                 "loss_mask",
-                "hidden_state",
-                "target",
+                "hidden_states",
+                "target_last_hidden_states",
             },
             aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
             target_repr="hidden_state",
@@ -407,20 +436,20 @@ class TestServerCaptureGate(unittest.TestCase):
             fetched.append(out)
             length = len(rows[i])
             self.assertEqual(
-                out["hidden_state"].shape, (1, length, len(AUX_LAYER_IDS) * H)
+                out["hidden_states"].shape, (1, length, len(AUX_LAYER_IDS) * H)
             )
-            self.assertEqual(out["target"].shape, (1, length, H))
+            self.assertEqual(out["target_last_hidden_states"].shape, (1, length, H))
             self.assertEqual(out["input_ids"].tolist(), [rows[i]])
             self.assertEqual(out["loss_mask"].shape, (1, length))
             # extraction correctness vs the independent HF forward
             torch.testing.assert_close(
-                out["hidden_state"].float(),
+                out["hidden_states"].float(),
                 aux_ref[i].float(),
                 rtol=TOL,
                 atol=TOL,
             )
             with torch.no_grad():
-                recomputed = head(out["target"].cuda()).cpu().float()
+                recomputed = head(out["target_last_hidden_states"].cuda()).cpu().float()
             torch.testing.assert_close(
                 recomputed, logits_ref[i].float(), rtol=TOL, atol=TOL
             )
@@ -430,30 +459,21 @@ class TestServerCaptureGate(unittest.TestCase):
         self._train_step(fetched, head)
 
     def _train_step(self, fetched, head):
-        from specforge.algorithms.eagle3.model import OnlineEagle3Model
-        from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerCore
-        from specforge.training.strategies.base import Eagle3TrainStrategy
         from tests.test_runtime import _fixtures as fx
+        from tests.test_runtime._fixtures import build_strategy
 
         fx.build_single_rank_distributed(
             port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
         )
         torch.manual_seed(0)
-        draft_cfg = AutoDraftModelConfig.from_file(
-            fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
-        )
-        dm = AutoDraftModel.from_config(
-            draft_cfg, attention_backend="sdpa", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(
-            fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
-        )
-        dm.freeze_embedding()
-        model = OnlineEagle3Model(dm, length=3, attention_backend="sdpa").cuda()
+        config_path = fx.write_draft_config(os.path.join(self.workdir, "draft.json"))
+        vocab_path = fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
+        model = fx.load_eagle3(config_path, self.target_dir, vocab_path, ttt=3)
+        dm = model.draft_model
         backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(
@@ -461,7 +481,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        core = TrainerCore(Eagle3TrainStrategy(model, target_head=head), backend)
+        core = TrainerCore(build_strategy(model, target_head=head), backend)
         # batch_size=1 batches (ragged lengths), one step each
         for i, out in enumerate(fetched):
             batch = TrainBatch(
@@ -469,10 +489,11 @@ class TestServerCaptureGate(unittest.TestCase):
                 strategy="eagle3",
                 tensors={
                     "input_ids": out["input_ids"].cuda(),
-                    "attention_mask": out["attention_mask"].cuda(),
                     "loss_mask": out["loss_mask"].cuda(),
-                    "target": out["target"].cuda(),
-                    "hidden_state": out["hidden_state"].cuda(),
+                    "target_last_hidden_states": out[
+                        "target_last_hidden_states"
+                    ].cuda(),
+                    "hidden_states": out["hidden_states"].cuda(),
                 },
                 metadata={"target_repr": "hidden_state", "ttt_length": 3},
             )

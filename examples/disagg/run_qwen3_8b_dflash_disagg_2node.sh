@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Two physical nodes, one canonical SpecForge training entry:
-#   rank 0: Mooncake + one or more patched SGLang capture servers + CPU producer
+#   rank 0: Mooncake + one or more plugin-enabled SGLang capture servers + CPU producer
 #   rank 1: GPU consumer/trainer
 #
 # Launch the same command on both nodes (for example with `rcli exec --per-node`).
@@ -36,7 +36,6 @@ TARGET_MODEL_PATH="${TARGET_MODEL_PATH:-Qwen/Qwen3-8B}"
 # Each flag and value must be one shell token; embedded whitespace is
 # unsupported.
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS:-}"
-APPLY_SGLANG_CAPTURE_PATCH="${APPLY_SGLANG_CAPTURE_PATCH:-1}"
 SERVER_EXTRA_ARGV=()
 if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
     read -r -a SERVER_EXTRA_ARGV <<< "$SERVER_EXTRA_ARGS"
@@ -176,9 +175,6 @@ validate_identity() {
     [[ -z "$MOONCAKE_DEFAULT_KV_LEASE_TTL" || \
         "$MOONCAKE_DEFAULT_KV_LEASE_TTL" =~ ^[1-9][0-9]*$ ]] || \
         fail "MOONCAKE_DEFAULT_KV_LEASE_TTL must be a positive number of milliseconds"
-    [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "0" || \
-        "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]] || \
-        fail "APPLY_SGLANG_CAPTURE_PATCH must be 0 or 1"
     [[ "$(count_devices "$SERVER_GPUS")" == "$((SERVER_COUNT * SERVER_TP))" ]] || \
         fail "SERVER_GPUS must contain exactly SERVER_COUNT*SERVER_TP=$((SERVER_COUNT * SERVER_TP)) devices"
     [[ "$(count_devices "$TRAINER_GPUS")" == "$TRAINER_NPROC" ]] || \
@@ -225,7 +221,7 @@ export_common_environment() {
 }
 
 export_rdma_devices() {
-    # A patched capture server refuses MOONCAKE_PROTOCOL=rdma without an
+    # The managed capture launcher refuses MOONCAKE_PROTOCOL=rdma without an
     # explicit MOONCAKE_RDMA_DEVICES (Mooncake would fall back to TCP when it
     # finds no usable HCA), and only after loading the target. Resolve this
     # node's usable HCAs up front, including validation of an explicit list,
@@ -269,7 +265,7 @@ build_server_command() {
     local -a capture_layers
     read -r -a capture_layers <<< "$CAPTURE_LAYER_IDS"
     SERVER_COMMAND=(
-        python -m sglang.launch_server
+        env SPECFORGE_SPEC_CAPTURE=1 python -m sglang.launch_server
         --host 0.0.0.0
         --model-path "$TARGET_MODEL_PATH"
         --trust-remote-code
@@ -277,9 +273,10 @@ build_server_command() {
         --tp-size "$SERVER_TP"
         --mem-fraction-static "$SERVER_MEM_FRACTION"
         --chunked-prefill-size -1
-        --enable-spec-capture
-        --spec-capture-method dflash
-        --spec-capture-aux-layer-ids "${capture_layers[@]}"
+        --speculative-algorithm DFLASH
+        --enable-return-aux-hidden-states
+        --return-hidden-states-mode full
+        --return-aux-hidden-state-layer-ids "${capture_layers[@]}"
         --port "$(server_port "$index")"
     )
     if [[ -n "$SERVER_EXTRA_ARGS" ]]; then
@@ -346,9 +343,8 @@ run_inference_node() {
     command -v mooncake_master >/dev/null || fail "mooncake_master is not on PATH"
     command -v curl >/dev/null || fail "curl is not on PATH"
     export_rdma_devices
-    if [[ "$APPLY_SGLANG_CAPTURE_PATCH" == "1" ]]; then
-        "$ROOT_DIR/scripts/apply_sglang_spec_capture_patch.sh"
-    fi
+    python -c 'import specforge_sglang_capture; import sglang.srt.model_executor.forward_observer; from sglang.srt.managers.deferred_output import ResponseCompletion' || fail "install the capture plugin and a compatible SGLang build (see plugins/sglang-spec-capture/README.md)"
+    export SPECFORGE_SPEC_CAPTURE=1
     export MOONCAKE_LOCAL_HOSTNAME="${INFERENCE_NODE_IP:-$HEAD_IP}"
     export_mooncake_bind_address
     # Store capacity is contributed by every capture server; size the segment

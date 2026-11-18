@@ -16,7 +16,6 @@ overrides both re-validate through the same schema.
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -26,6 +25,8 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
+
+from .removed_fields import reject_removed_fields, reject_removed_loss_fields
 
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
@@ -42,9 +43,6 @@ SGLANG_LAUNCHER_OWNED_FLAGS: Mapping[str, str] = {
     "--skip-tokenizer-init": "the capture launcher",
     "--tp-size": "capture_servers[].tp_size",
     "--chunked-prefill-size": "the capture launcher (complete prefills)",
-    "--enable-spec-capture": "the capture launcher",
-    "--spec-capture-method": "the algorithm's capture contract",
-    "--spec-capture-aux-layer-ids": "the algorithm's capture contract",
     "--speculative-algorithm": "the algorithm's capture contract (plugin backend)",
     "--enable-return-aux-hidden-states": "the algorithm's capture contract",
     "--return-aux-hidden-state-layer-ids": "the algorithm's capture contract",
@@ -67,7 +65,7 @@ _SGLANG_UNSUPPORTED_FLAGS: Mapping[str, str] = {
     ),
     "--config": "SGLang merges that file unchecked; list its flags instead",
 }
-#: SGLang v0.5.18 spellings that write the same option, checked against its
+#: Pinned SGLang CLI spellings that write the same option, checked against its
 #: parser in tests. Positive/negative boolean flags belong to one group too:
 #: they conflict under the no-overrides rule, but their argv is never rewritten.
 _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
@@ -88,33 +86,26 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
     "--lora-strict-loading": ("--no-lora-strict-loading",),
     "--dllm-fdfo": ("--no-dllm-fdfo",),
-    "--mamba-radix-cache-strategy": ("--mamba-scheduler-strategy",),
-    "--stream-output": ("--incremental-streaming-output",),
-    "--cuda-graph-bs-decode": ("--cuda-graph-bs",),
-    "--cuda-graph-max-bs-decode": ("--cuda-graph-max-bs",),
-    "--cuda-graph-bs-prefill": ("--piecewise-cuda-graph-tokens",),
-    "--cuda-graph-max-bs-prefill": ("--piecewise-cuda-graph-max-tokens",),
-    "--cuda-graph-backend-prefill": (
-        "--enable-breakable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
-        "--enforce-piecewise-cuda-graph",
+    "--enable-tf32-matmul": ("--no-enable-tf32-matmul",),
+    "--attn-dp-size": ("--attention-data-parallel-size",),
+    "--cuda-graph-prefill-max-context": ("--context-bucket",),
+    "--enable-fused-qk-norm-rope": ("--no-enable-fused-qk-norm-rope",),
+    "--speculative-enable-w4a4-mxfp4-megamoe": (
+        "--no-speculative-enable-w4a4-mxfp4-megamoe",
     ),
-    "--cuda-graph-tc-compiler": ("--piecewise-cuda-graph-compiler",),
-    "--dsa-prefill-cp-mode": ("--nsa-prefill-cp-mode",),
-    "--dsa-prefill-backend": ("--nsa-prefill-backend",),
-    "--dsa-decode-backend": ("--nsa-decode-backend",),
-    "--enable-dsa-prefill-context-parallel": ("--enable-nsa-prefill-context-parallel",),
-    "--enable-linear-replayssm-spec": ("--enable-gdn-replayssm-spec",),
-    "--speculative-draft-window-size": ("--speculative-dflash-draft-window-size",),
+    "--enable-hierarchical-cache": ("--enable-hicache",),
+    "--mm-enable-dp-encoder": ("--no-mm-enable-dp-encoder",),
+    "--ple-offload-embedding": ("--no-ple-offload-embedding",),
+    "--enable-decoder-swa-bounded-replay": ("--no-enable-decoder-swa-bounded-replay",),
+    "--enable-megamoe-for-layernorm-sp": ("--no-enable-megamoe-for-layernorm-sp",),
+    "--enable-dsa-fused-indexer": ("--no-enable-dsa-fused-indexer",),
 }
-#: Complete SGLang v0.5.18 options that are also prefixes of other options.
+#: Complete pinned SGLang CLI options that are also prefixes of other options.
 #: argparse matches these exactly instead of expanding them. Keep this small
-#: table in sync with the pinned parser (covered by the launch-plan tests),
+#: table in sync with the installed parser (covered by the launch-plan tests),
 #: without importing SGLang/PyTorch during configuration validation.
 _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
     {
-        "--cuda-graph-bs",
-        "--cuda-graph-max-bs",
         "--disable-cuda-graph",
         "--dllm-algorithm",
         "--enable-dp-attention",
@@ -129,7 +120,9 @@ _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
         "--log-level",
         "--log-requests",
         "--model",
+        "--prefill-decode-interval",
         "--quantization",
+        "--radix-eviction-policy",
         "--sidecar",
         "--speculative-adaptive",
         "--speculative-draft-model",
@@ -270,19 +263,14 @@ class StrictConfigModel(BaseModel):
 
 
 class ModelConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("model", value)
+        return value
+
     target_model_path: str
-    #: Draft config as a local JSON file, a directory containing config.json,
-    #: or a Hugging Face repository. EAGLE3, P-EAGLE, and DFlash can derive it
-    #: from the target when omitted.
-    draft_model_config: Optional[str] = None
-    #: Load draft weights only. Unlike training.resume_from, this never restores
-    #: optimizer/scheduler state, counters, data position, or RNG state.
-    draft_checkpoint_path: Optional[str] = None
-    #: Optional architecture override. Auto-generated defaults preserve the
-    #: former trainers: EAGLE3=1, P-EAGLE=4, DFlash=1.
-    draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
-    #: Optional DFlash block-size override (auto-generated default: 16).
-    draft_block_size: Optional[int] = Field(default=None, gt=0)
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.
@@ -295,25 +283,27 @@ class ModelConfig(StrictConfigModel):
     #: text only; unsupported modalities fail during application resolution.
     input_modality: str = "text"
     trust_remote_code: bool = False
-    #: Liger RMSNorm/SwiGLU kernels for DFlash/DFlash2 drafts. ``None`` (auto)
-    #: enables them for training.strategy=dflash on a CUDA/ROCm trainer with a
-    #: silu/swish draft and keeps the native Qwen3 modules otherwise; ``true``
-    #: fails when they cannot be used; ``false`` disables them. Resolved kernels
-    #: that cannot be imported are an error in both the auto and explicit cases.
+    #: Liger kernels for RMSNorm and SwiGLU. ``None`` (auto) uses them on a
+    #: CUDA/ROCm trainer when the objective declares ``liger_by_default`` and
+    #: the draft's dense FFNs use silu/swish; ``true`` uses them for any
+    #: objective and fails when the trainer device or the activation cannot
+    #: run them; ``false`` keeps the PyTorch modules.
     use_liger_kernel: Optional[bool] = None
+    #: Triton kernel for grouped causal convolutions (DFlash2). ``None`` (auto)
+    #: uses it when the draft has such a convolution and the trainer supports
+    #: it (CUDA/ROCm, FP16/BF16/FP32, power-of-two group size up to 1024);
+    #: ``true`` fails when it cannot be used; ``false`` keeps the eager one.
+    use_fused_conv: Optional[bool] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).
     vocab_mapping_path: str = ""
     #: copy the frozen target embedding into the draft before training.
     load_target_embedding: bool = True
-    #: aux hidden-state layer ids to capture (None = backend defaults).
-    aux_hidden_state_layer_ids: Optional[List[int]] = None
     torch_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     cache_dir: Optional[str] = None
     #: DFlash-family and P-EAGLE mask token. ``None`` resolves it from the
     #: draft config, then the target tokenizer.
-    mask_token_id: Optional[int] = None
     #: Explicit tokenizer padding ID for released targets whose tokenizer
     #: metadata omits it or whose padding row is outside the unpadded vocab.
     tokenizer_pad_token_id: Optional[int] = Field(default=None, ge=0)
@@ -431,8 +421,8 @@ class DataConfig(StrictConfigModel):
     is_preformatted: bool = False
     train_only_last_turn: bool = False
     build_dataset_num_proc: int = Field(default=8, gt=0)
-    #: Ordered background feature-loader workers. ``None`` preserves the
-    #: former strategy defaults (EAGLE/P-EAGLE=4, DFlash-family=8).
+    #: Ordered background feature-loader workers. ``None`` uses the shared
+    #: default (4) when unspecified.
     dataloader_num_workers: Optional[int] = Field(default=None, ge=0)
     cache_dir: str = "./cache"
     cache_key: Optional[str] = None
@@ -659,7 +649,7 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
 
 
 class ManagedLocalCaptureServerConfig(StrictConfigModel):
-    """One patched SGLang capture server owned by the local supervisor.
+    """One SGLang capture server owned by the local supervisor.
 
     ``cuda_visible_devices`` holds plain device ordinals; the launcher maps
     them to the accelerator's visibility env var.
@@ -685,7 +675,7 @@ class ManagedLocalCaptureServerConfig(StrictConfigModel):
     #: ``model.sglang_extra_args``.
     extra_args: List[str] = Field(default_factory=list)
     #: Extra environment for this server process, such as the capture
-    #: patch's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
+    #: plugin's ``SGLANG_SPEC_CAPTURE_*`` knobs. Keys the launcher sets
     #: (Mooncake, transport and device visibility) are rejected.
     env: Dict[str, str] = Field(default_factory=dict)
 
@@ -842,14 +832,13 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     store_root: Optional[str] = None
     store_id: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
-    #: How the SGLang capture servers implement spec capture: ``patch`` is the
-    #: versioned source patch under ``patches/sglang``; ``plugin`` is the
+    #: SGLang capture uses the
     #: ``specforge-sglang-capture`` plugin on an SGLang build with forward
     #: observers, deferred outputs and ``--enable-return-aux-hidden-states``.
     #: ``auto`` takes ``DISAGG_SERVER_CAPTURE`` when set, else detects the
     #: backend: managed_local probes each capture server's interpreter while
     #: planning; the producer reads an external server's ``/server_info``.
-    server_capture: Literal["auto", "patch", "plugin"] = "auto"
+    server_capture: Literal["auto", "plugin"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -979,8 +968,74 @@ class DeploymentConfig(StrictConfigModel):
         return self
 
 
+class WeightsFromConfig(StrictConfigModel):
+    checkpoint: str
+    mapping: Optional[dict] = None
+    allow_new: List[str] = Field(default_factory=list)
+
+
+class InitializationConfig(StrictConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_fields("initialization", value)
+        return value
+
+    checkpoint: Optional[str] = None
+    weights_from: Optional[WeightsFromConfig] = None
+    from_target: Optional[dict] = None
+    adapter: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exclusive_sources(self):
+        if self.checkpoint and (self.weights_from or self.from_target):
+            raise ValueError(
+                "initialization.checkpoint excludes weights_from/from_target"
+            )
+        if self.adapter and not self.checkpoint:
+            raise ValueError("adapter requires initialization.checkpoint")
+        return self
+
+
+class LossTermConfig(StrictConfigModel):
+    """User-selected formula and coefficient; defaults belong to the protocol."""
+
+    kind: str = Field(default="default", strict=True)
+    options: dict[str, object] = Field(default_factory=dict)
+    coefficient: float = Field(default=1.0, strict=True, ge=0, allow_inf_nan=False)
+
+
+class LossExecutionConfig(StrictConfigModel):
+    """Projection chunking and recomputation, independent of the formula."""
+
+    chunk_size: int | None = Field(default=None, strict=True, ge=0)
+    checkpoint: bool = Field(default=True, strict=True)
+    trim: bool = Field(default=False, strict=True)
+    teacher_chunk_size: int | None = Field(default=None, strict=True, gt=0)
+
+
+class LossConfig(StrictConfigModel):
+    """Shared syntax for run files and programmatic objective construction."""
+
+    terms: dict[str, LossTermConfig] = Field(default_factory=dict)
+    #: ``None`` (auto) uses a default-enabled optimized implementation where
+    #: one applies and the reference formula otherwise; ``true`` requires
+    #: optimized execution and fails where it cannot run; ``false`` always
+    #: evaluates the reference.
+    fused: bool | None = Field(default=None, strict=True)
+    execution: LossExecutionConfig = Field(default_factory=LossExecutionConfig)
+
+
 class TrainingConfig(StrictConfigModel):
-    strategy: str = "eagle3"
+    objective: Optional[str] = None
+    objective_options: dict = Field(default_factory=dict)
+    loss: dict = Field(
+        default_factory=dict
+    )  # Named terms, shared fusion switch and scheduling.
+    weighting: Optional[dict] = None
+    frozen: List[str] = Field(default_factory=list)
+
     num_epochs: int = Field(default=1, gt=0)
     max_steps: Optional[int] = Field(default=None, gt=0)
     total_steps: Optional[int] = Field(default=None, gt=0)
@@ -988,8 +1043,6 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
-    #: Joint logits loss; independent of objective checkpointing.
-    fused_logits_loss: bool = True
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
@@ -997,7 +1050,6 @@ class TrainingConfig(StrictConfigModel):
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False
-    ttt_length: int = Field(default=7, gt=0)
     attention_backend: Literal["eager", "sdpa", "flex_attention", "fa", "usp"] = (
         "flex_attention"
     )
@@ -1007,69 +1059,12 @@ class TrainingConfig(StrictConfigModel):
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
-    #: Acceptance-aware token objective. DFlash-family hard targets make
-    #: ``alpha`` equivalent to CE; ``lambda`` mixes CE and TV.
-    lk_loss_type: Optional[Literal["lambda", "alpha", "tv"]] = None
-    kl_scale: float = 1.0
-    kl_decay: float = 1.0
-    #: Compute the teacher target_p, draft logits and loss only at supervised
-    #: (loss-masked) positions instead of over the full sequence. Mathematically
-    #: equivalent (the mean denominator is rescaled) and saves memory/compute on
-    #: prompt-heavy data. Falls back to the full-length path for batch > 1 or when
-    #: an lk_loss objective is used.
-    trim_loss_positions: bool = False
-    #: MTP token positions per lm_head + CE chunk (0 disables chunking).
-    mtp_objective_chunk_size: int = Field(default=4096, ge=0)
-    #: DFlash-family objective/model knobs.
-    num_anchors: int = Field(default=512, gt=0)
-    loss_decay_gamma: Optional[float] = None
-    #: Anchor blocks per objective slice; 0 treats the whole objective as one chunk.
-    objective_chunk_blocks: int = Field(default=128, ge=0)
-    #: Recompute each objective chunk during backward, independently of its backend.
-    objective_checkpointing: bool = True
-    loss_type: Literal[
-        "dflash",
-        "dpace",
-        "dpace-cumulative-confidence-only",
-        "dpace-continuation-value-only",
-    ] = "dflash"
-    dpace_alpha: float = 0.5
-    #: Weight of the top-k path-selector objective for DFlash2 drafts.
-    dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
-    #: Fraction of optimizer steps that train only the DFlash2 base objective.
-    dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Fraction of optimizer steps used to ramp the selector weight to its target.
-    dflash2_selector_ramp_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
-    #: Stop selector gradients at the unary/backbone boundary while preserving
-    #: the primary DFlash/D-PACE/LK gradient path.
-    dflash2_selector_stop_gradient: bool = False
-    #: Online DFlash/DFlash2 only: capture the target's final hidden state for
-    #: the teacher-agreement diagnostics (``dflash/teacher/*`` and
-    #: ``dflash2/selector/self_conditioned_teacher_argmax_agreement``). The
-    #: objective never reads it; ``false`` stops the capture server from
-    #: writing it and the trainer from fetching it (one ``hidden_size`` row per
-    #: token next to the ``len(target_layer_ids) * hidden_size`` aux row).
-    dflash_teacher_metrics: bool = True
-    lambda_base_start: float = 1.0
-    lambda_base_decay_ratio: float = 0.5
-    dspark_ce_loss_alpha: float = 0.1
-    dspark_l1_loss_alpha: float = 0.9
-    dspark_confidence_head_alpha: float = 1.0
-    #: P-EAGLE COD sampling/model knobs.
-    num_depths: int = Field(default=8, gt=0)
-    down_sample_ratio: float = 0.8
-    down_sample_ratio_min: float = 0.2
-    norm_before_residual: Optional[bool] = None
     save_interval: int = Field(default=0, ge=0)
     #: Run a full evaluation pass every N optimizer steps (0 = disabled).
     eval_interval: int = Field(default=0, ge=0)
     log_interval: int = Field(default=50, gt=0)
     #: CheckpointManager rotation: keep the newest N checkpoints (0 = keep all).
     max_checkpoints: int = Field(default=0, ge=0)
-    #: Offline EAGLE3 teacher projection without materializing full-vocab fp32
-    #: logits. Exact, but trades additional head passes for lower peak memory.
-    compact_teacher: bool = False
-    compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
     #: ``all`` is an offline colocated run. Online runs launch producer and
@@ -1081,17 +1076,21 @@ class TrainingConfig(StrictConfigModel):
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, value):
+        if isinstance(value, dict):
+            reject_removed_loss_fields(value)
+            reject_removed_fields("training", value)
+        return value
+
+    @field_validator("loss")
+    @classmethod
+    def _validate_loss(cls, value):
+        return LossConfig.model_validate(value).model_dump(exclude_unset=True)
+
     @model_validator(mode="after")
     def _validate_training_shape(self):
-        if not 0.0 <= self.dpace_alpha <= 1.0:
-            raise ValueError("training.dpace_alpha must be in [0, 1]")
-        if not 0.0 < self.down_sample_ratio <= 1.0:
-            raise ValueError("training.down_sample_ratio must be in (0, 1]")
-        if not 0.0 < self.down_sample_ratio_min <= self.down_sample_ratio:
-            raise ValueError(
-                "training.down_sample_ratio_min must be in "
-                "(0, training.down_sample_ratio]"
-            )
         sp_size = self.sp_ulysses_size * self.sp_ring_size
         if self.attention_backend == "usp":
             if self.batch_size != 1:
@@ -1110,73 +1109,10 @@ class TrainingConfig(StrictConfigModel):
         return self
 
 
-def migrate_legacy_config(values: dict) -> dict:
-    """Translate legacy deployment keys before constructing the domain config.
-
-    Compatibility exists only at this raw loader boundary. The returned domain
-    model never projects canonical deployment state back into ``training``.
-    """
-
-    if not isinstance(values, dict):
-        return values
-    raw = copy.deepcopy(values)
-    training = raw.get("training")
-    if not isinstance(training, dict):
-        return raw
-
-    has_legacy_mode = "deployment_mode" in training
-    has_legacy_urls = "server_urls" in training
-    has_legacy_database = "metadata_db_path" in training
-    if not (has_legacy_mode or has_legacy_urls or has_legacy_database):
-        return raw
-
-    legacy_mode = training.pop("deployment_mode", None)
-    legacy_urls = training.pop("server_urls", None)
-    legacy_database = training.pop("metadata_db_path", None)
-    deployment = raw.setdefault("deployment", {})
-    if not isinstance(deployment, dict):
-        return raw
-
-    canonical_mode = deployment.get("mode")
-    if legacy_mode is not None:
-        if canonical_mode is not None and canonical_mode != legacy_mode:
-            raise ValueError(
-                "deployment.mode conflicts with legacy training.deployment_mode"
-            )
-        deployment["mode"] = legacy_mode
-    elif canonical_mode is None and (legacy_urls or legacy_database):
-        deployment["mode"] = "disaggregated"
-
-    if legacy_urls is not None or legacy_database is not None:
-        disaggregated = deployment.setdefault("disaggregated", {})
-        if not isinstance(disaggregated, dict):
-            return raw
-        if legacy_urls is not None:
-            canonical_urls = disaggregated.get("server_urls")
-            if canonical_urls is not None and canonical_urls != legacy_urls:
-                raise ValueError(
-                    "deployment.disaggregated.server_urls conflicts with legacy "
-                    "training.server_urls"
-                )
-            disaggregated["server_urls"] = legacy_urls
-        if legacy_database:
-            if os.path.basename(legacy_database) != "consumer.sqlite":
-                raise ValueError(
-                    "legacy training.metadata_db_path must end in consumer.sqlite; "
-                    "use deployment.disaggregated.consumer_state_dir instead"
-                )
-            state_dir = os.path.dirname(legacy_database) or "."
-            canonical_state_dir = disaggregated.get("consumer_state_dir")
-            if canonical_state_dir is not None and canonical_state_dir != state_dir:
-                raise ValueError(
-                    "deployment.disaggregated.consumer_state_dir conflicts with "
-                    "legacy training.metadata_db_path"
-                )
-            disaggregated["consumer_state_dir"] = state_dir
-    return raw
-
-
 class Config(StrictConfigModel):
+    draft: Optional[dict | str] = None
+    initialization: Optional[InitializationConfig] = None
+    resume: Optional[str] = None
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
@@ -1201,9 +1137,24 @@ class Config(StrictConfigModel):
         raw["training"] = training
         return raw
 
+    @property
+    def resume_path(self) -> Optional[str]:
+        return self.resume or self.training.resume_from
+
     @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
+        if self.resume:
+            if self.training.resume_from and self.training.resume_from != self.resume:
+                raise ValueError("resume and training.resume_from disagree")
+        if self.initialization is not None and self.resume_path:
+            raise ValueError("initialization and resume are mutually exclusive")
+        if self.draft is None and not (
+            self.resume_path or (self.initialization and self.initialization.checkpoint)
+        ):
+            raise ValueError(
+                "Training requires draft, initialization.checkpoint or resume"
+            )
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
@@ -1252,14 +1203,6 @@ class Config(StrictConfigModel):
                 "training.role=auto, producer, or consumer"
             )
 
-        if (
-            self.model.draft_checkpoint_path is not None
-            and self.training.resume_from is not None
-        ):
-            raise ValueError(
-                "model.draft_checkpoint_path (weights-only warm start) and "
-                "training.resume_from (full resume) are mutually exclusive"
-            )
         if self.training.role == "producer" and self.profiling.enabled:
             raise ValueError(
                 "profiling.enabled applies to trainer roles, not a capture-only "
@@ -1280,14 +1223,6 @@ class Config(StrictConfigModel):
         if self.data.eval_hidden_states_path and mode != "offline":
             raise ValueError(
                 "data.eval_hidden_states_path requires an offline training data source"
-            )
-        if (
-            not self.training.compact_teacher
-            and self.training.compact_teacher_chunk_size is not None
-        ):
-            raise ValueError(
-                "training.compact_teacher_chunk_size requires "
-                "training.compact_teacher=true"
             )
         if (
             mode == "online"
@@ -1351,7 +1286,7 @@ class Config(StrictConfigModel):
                 raise ValueError(
                     "managed_local requires the persisted training role to be auto"
                 )
-            if self.training.resume_from is not None:
+            if self.resume_path is not None:
                 raise ValueError("managed_local does not support resume")
             mooncake = managed_local.mooncake
             if mooncake.protocol == "nvlink":
@@ -1428,7 +1363,7 @@ class Config(StrictConfigModel):
                     field_name=f"managed_local.capture_servers[{index}].extra_args",
                     reserved=reserved,
                 )
-        if self.training.role == "producer" and self.training.resume_from is not None:
+        if self.training.role == "producer" and self.resume_path is not None:
             raise ValueError("training.resume_from is valid only for a trainer role")
         if self.training.attention_backend == "usp":
             if mode != "offline":
@@ -1485,28 +1420,50 @@ class Config(StrictConfigModel):
                 raw = yaml.safe_load(f)
             else:
                 raw = json.load(f)
-        return cls.model_validate(migrate_legacy_config(raw))
+        return cls.model_validate(raw)
 
 
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
-    """Apply dotted ``section.field=value`` overrides, re-validating the result."""
-    raw = config.model_dump()
+    """Apply dotted ``section.field=value`` overrides, re-validating the result.
+
+    Only the file's own fields and the overridden ones count as set afterwards.
+    Keys under an untyped mapping (``training.objective_options`` and the like)
+    may be new, and their values are parsed as YAML. ``null`` clears a section.
+    """
+    import yaml
+
+    raw = config.model_dump(exclude_unset=True)
     for item in overrides:
         if "=" not in item:
             raise ValueError(f"override {item!r} is not of the form path=value")
         path, value = item.split("=", 1)
-        node = raw
         keys = path.split(".")
+        if len(keys) > 1:
+            if keys[0] == "training":
+                reject_removed_loss_fields({keys[1]}, override=True)
+            reject_removed_fields(keys[0], {keys[1]})
+        owner, node = config, raw
         for key in keys[:-1]:
-            if not isinstance(node.get(key), dict):
+            owner = _override_field(owner, key, path)
+            if not isinstance(owner, (BaseModel, dict)):
                 raise ValueError(f"override path {path!r} does not exist")
+            if not isinstance(node.get(key), dict):
+                node[key] = (
+                    owner.model_dump(exclude_unset=True)
+                    if isinstance(owner, BaseModel)
+                    else dict(owner)
+                )
             node = node[key]
-        if keys[-1] not in node:
-            raise ValueError(f"override path {path!r} does not exist")
-        current = node[keys[-1]]
-        if isinstance(current, (dict, list)) and value.lstrip().startswith(("[", "{")):
-            import yaml
-
+        current = _override_field(owner, keys[-1], path)
+        untyped = isinstance(owner, dict)
+        structured = isinstance(current, (BaseModel, dict, list)) or current is None
+        # null clears a section, e.g. a recipe's initialization when resuming
+        if untyped or (
+            structured
+            and (
+                value.lstrip().startswith(("[", "{")) or value.strip() in ("null", "~")
+            )
+        ):
             try:
                 value = yaml.safe_load(value)
             except yaml.YAMLError as exc:
@@ -1515,6 +1472,14 @@ def apply_overrides(config: Config, overrides: List[str]) -> Config:
                 ) from exc
         node[keys[-1]] = value  # pydantic coerces scalars on re-validation
     return Config.model_validate(raw)
+
+
+def _override_field(owner, key, path):
+    if isinstance(owner, BaseModel):
+        if key not in type(owner).model_fields:
+            raise ValueError(f"override path {path!r} does not exist")
+        return getattr(owner, key)
+    return owner.get(key)
 
 
 def load_config(path: str, overrides: Optional[List[str]] = None) -> Config:
@@ -1538,7 +1503,6 @@ __all__ = [
     "DeploymentConfig",
     "TrainingConfig",
     "Config",
-    "migrate_legacy_config",
     "load_config",
     "apply_overrides",
 ]

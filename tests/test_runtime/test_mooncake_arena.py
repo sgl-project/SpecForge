@@ -84,7 +84,8 @@ class _ArenaCaptureServer(_StubCaptureServer):
     def __call__(self, url, json_body, timeout):
         rows = super().__call__(url, json_body, timeout)
         for row in rows:
-            result = row["meta_info"]["spec_capture"]
+            # The stub wraps each result like the real server; unwrap it.
+            (result,) = row["meta_info"]["spec_capture"]
             prefix = f"{result['store_id']}/{result['sample_id']}/g{result['gen']}"
             result["arena"] = {"session": SESSION, "control": self.backend.control}
             for name, meta in result["features"].items():
@@ -307,6 +308,7 @@ class ArenaStoreFactoryTest(unittest.TestCase):
     def _cfg(self, receive_buffers):
         return Config.model_validate(
             {
+                "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                 "model": {"target_model_path": "target"},
                 "data": {"prompts_path": "prompts.jsonl"},
                 "deployment": {

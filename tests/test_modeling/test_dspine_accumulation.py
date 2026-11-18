@@ -1,28 +1,29 @@
-"""DSpine accumulation preserves the per-micro-batch window objective and sampling."""
+"""DSpine accumulation preserves the combined-batch objective and sampling."""
 
 import copy
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 
-from specforge.algorithms.dspine.strategy import DSpineTrainStrategy
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.base import StepContext
-from tests.test_modeling.test_dspine import training_inputs, training_model
+from tests.test_modeling.dspine_fixtures import training_inputs, training_model
 from tests.test_modeling.test_dspine_distributed import (
     fixed_anchors,
     per_microbatch_objective,
     uneven_batch,
 )
+from tests.test_runtime._fixtures import build_strategy
 
 
 class RecordingOptimizer:
     def __init__(self, model):
-        self.parameters = list(model.draft_model.parameters())
+        self.parameters = [p for p in model.draft_model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.SGD(self.parameters, lr=0.01)
         self.gradients = []
 
@@ -42,7 +43,7 @@ def training_core(model, accumulation_steps):
     backend.set_optimizer(optimizer)
     return (
         TrainerCore(
-            DSpineTrainStrategy(model), backend, accumulation_steps=accumulation_steps
+            build_strategy(model), backend, accumulation_steps=accumulation_steps
         ),
         optimizer,
     )
@@ -54,7 +55,12 @@ class DSpineAccumulationTest(unittest.TestCase):
         for accumulation_steps in [2, 4]:
             with self.subTest(accumulation_steps=accumulation_steps):
                 full = training_model(chunk_size=1)
-                full._sample_anchor_positions = fixed_anchors
+                self.enterContext(
+                    patch(
+                        "specforge.algorithms.objectives.inputs.sample_anchors",
+                        fixed_anchors,
+                    )
+                )
                 split = copy.deepcopy(full)
                 (_, full_optimizer) = training_core(full, 1)
                 (split_core, split_optimizer) = training_core(split, accumulation_steps)
@@ -66,9 +72,7 @@ class DSpineAccumulationTest(unittest.TestCase):
                     }
                     ctx = StepContext(global_step=300 + window, total_steps=600)
                     width = 4 // accumulation_steps
-                    expected = per_microbatch_objective(
-                        full, inputs, width, ctx.global_step, ctx.total_steps
-                    )
+                    expected = per_microbatch_objective(full, inputs, width, ctx)
                     expected.backward()
                     full_optimizer.step()
                     for microstep in range(accumulation_steps):
@@ -120,7 +124,7 @@ class DSpineAccumulationTest(unittest.TestCase):
         torch.manual_seed(321)
         with torch.no_grad():
             for batch in batches:
-                reference(**batch.tensors, global_step=100, total_steps=600)
+                reference(batch.tensors, step=100, total_steps=600)
         expected_rng = torch.get_rng_state()
         forwards = []
 
@@ -128,8 +132,8 @@ class DSpineAccumulationTest(unittest.TestCase):
             forwards.append(
                 (
                     torch.is_grad_enabled(),
-                    kwargs["position_ids"].clone(),
-                    kwargs["replace_mask"].clone(),
+                    _args[2][0].position_ids.clone(),
+                    kwargs["replace_masks"][0].clone(),
                 )
             )
 
@@ -147,7 +151,7 @@ class DSpineAccumulationTest(unittest.TestCase):
     def test_evaluation_does_not_request_window_replay(self):
         model = training_model(chunk_size=1)
         with torch.no_grad():
-            output = DSpineTrainStrategy(model).forward_loss(
+            output = build_strategy(model).forward_loss(
                 TrainBatch(["0", "1"], "dspine", training_inputs()),
                 StepContext(global_step=300, total_steps=600, accumulation_steps=2),
             )
@@ -158,11 +162,14 @@ class DSpineAccumulationTest(unittest.TestCase):
     def test_cuda_bf16_window_replay_has_finite_updates(self):
         for attention_backend in ["sdpa", "flex_attention"]:
             with self.subTest(attention_backend=attention_backend):
-                model = training_model(chunk_size=1, head_dim=16).to(
-                    device="cuda", dtype=torch.bfloat16
+                model = training_model(
+                    chunk_size=1,
+                    head_dim=16,
+                    backend=attention_backend,
+                    device="cuda",
+                    dtype=torch.bfloat16,
                 )
                 model.attention_backend = attention_backend
-                model.draft_model.config._attn_implementation = attention_backend
                 model.draft_model.transfer_codes = (
                     model.draft_model.transfer_codes.float()
                 )
@@ -203,16 +210,15 @@ class DSpineAccumulationTest(unittest.TestCase):
                     )
                 self.assertEqual(len(optimizer.gradients), 2)
                 self.assertEqual(model.draft_model.transfer_codes.dtype, torch.float32)
-                self.assertIs(model.lm_head.weight.grad, None)
-                self.assertIs(model.embed_tokens.weight.grad, None)
+                self.assertIs(model.target_head.weight.grad, None)
 
     def test_incomplete_replay_window_is_rejected_without_an_optimizer_step(self):
         with TemporaryDirectory() as directory:
             tmp_path = Path(directory)
-            model = training_model(chunk_size=1)
+            model = training_model(chunk_size=1, replacement_probability=0)
             (core, optimizer) = training_core(model, 2)
             controller = TrainerController(
-                core, run_id="dspine-incomplete", output_dir=tmp_path, total_steps=600
+                core, run_id="dspine-incomplete", output_dir=tmp_path
             )
             with self.assertRaisesRegex(
                 RuntimeError, "incomplete gradient accumulation"

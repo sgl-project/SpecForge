@@ -478,7 +478,7 @@ def _build_offline(
                         cfg.model.input_modality
                     ).build_reader,
                     run_id=cfg.run_id,
-                    ttt_length=cfg.training.ttt_length,
+                    ttt_length=cfg.training.objective_options.get("ttt_length", 7),
                     max_len=cfg.data.max_length,
                     on_ref=tracked_refs.append,
                 )
@@ -553,7 +553,7 @@ def _build_offline(
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
-        ttt_length=cfg.training.ttt_length,
+        ttt_length=cfg.training.objective_options.get("ttt_length", 7),
         max_len=cfg.data.max_length,
         batch_size=cfg.training.batch_size,
         accumulation_steps=accumulation_steps,
@@ -566,7 +566,7 @@ def _build_offline(
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         max_checkpoints=cfg.training.max_checkpoints,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -657,10 +657,7 @@ def _build_online(
             algorithm,
             input_adapter=input_adapter,
         )
-        draft_config = resolve_draft_config(
-            cfg,
-            provider=algorithm.providers.model.draft_config,
-        )
+        draft_config = resolve_draft_config(cfg)
         if input_adapter is None:
             prompts = prepare_prompts(
                 cfg,
@@ -853,12 +850,12 @@ def _build_online(
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
         consumer_dispatch=cfg.runtime.consumer_dispatch,
-        dispatch_num_anchors=cfg.training.num_anchors,
+        dispatch_num_anchors=cfg.training.objective_options.get("num_anchors", 512),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

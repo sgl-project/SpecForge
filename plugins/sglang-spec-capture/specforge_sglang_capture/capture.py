@@ -304,7 +304,13 @@ class CaptureHostOutput:
             self.runtime.defer_response(
                 req,
                 CaptureCompletion(
-                    future, index, len(samples), req.rid, spec, self.runtime.results
+                    future,
+                    index,
+                    len(samples),
+                    req.rid,
+                    spec,
+                    self.runtime.results,
+                    self.runtime.sink.discard_sample,
                 ),
             )
 
@@ -315,6 +321,8 @@ class CaptureCompletion:
 
     SGLang calls these methods on the scheduler thread. Cancelling one request
     leaves the shared write running for its siblings and suppresses its metadata.
+    Cleanup is queued on the sink's writer, after publication, even if the
+    client has already tried to remove keys that did not exist yet.
     """
 
     future: Future
@@ -323,6 +331,7 @@ class CaptureCompletion:
     rid: str
     spec: Dict[str, Any]
     results: Dict[str, Dict[str, Any]]
+    discard_sample: Callable[[Dict[str, Any]], Future]
     _cancelled: bool = False
     _resolved: bool = False
 
@@ -349,6 +358,9 @@ class CaptureCompletion:
     def cancel(self) -> bool:
         if self._resolved:
             return False
+        if self._cancelled:
+            return True
+        self.discard_sample(self.spec)
         self._cancelled = True
         return True
 
@@ -471,6 +483,8 @@ def install(scheduler) -> CaptureRuntime:
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
     )
+    method = features.aux_hidden_state_capture
+    runtime.capture_method = str(getattr(method, "name", method)).lower()
     model_runner.forward_observer = runtime.observer
     scheduler.output_streamer.spec_capture_results = runtime.results
     scheduler._specforge_capture_runtime = runtime

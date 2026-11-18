@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.algorithms.common.providers import OfflineCaptureLayout
-from specforge.offline_capture import OfflineSGLangCapture
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 
 class OfflineCaptureLayoutTest(unittest.TestCase):
@@ -20,8 +18,8 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
             "eagle3": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
-                "aux_hidden_state": "aux_hidden_states",
-                "hidden_state": "last_hidden_states",
+                "hidden_states": "aux_hidden_states",
+                "target_last_hidden_states": "last_hidden_states",
             },
             "dflash": {
                 "input_ids": "input_ids",
@@ -118,7 +116,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                     .providers.offline_for("text")
                     .build_normalizer(3)
                 )
-                with self.assertRaisesRegex(ValueError, "two consecutive"):
+                with self.assertRaisesRegex(ValueError, "loss-mask requirement"):
                     normalizer(raw)
 
     def test_duplicate_output_names_are_rejected(self):
@@ -152,24 +150,6 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("last_hidden_states", message)
         self.assertIn("target_last_hidden_states", message)
-
-    def test_local_capture_forwards_the_algorithm_capture_method(self):
-        backend = mock.Mock()
-        capture = OfflineSGLangCapture(backend)
-
-        for capture_method in ("dflash", "dspark"):
-            with self.subTest(capture_method=capture_method):
-                backend.reset_mock()
-                capture.set_capture_layers(
-                    [1, 9, 17, 25, 33],
-                    capture_method=capture_method,
-                )
-
-                self.assertEqual(capture_method, capture.capture_method)
-                backend.set_capture_layers.assert_called_once_with(
-                    [1, 9, 17, 25, 33],
-                    capture_method=capture_method,
-                )
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ does not load or execute a target model in a trainer or producer process.
 ## Responsibility
 
 `SGLangServerCaptureAdapter` sends model inputs and capture metadata to a
-patched SGLang server. The server performs prefill and writes captured tensors
-directly to Mooncake. Its response contains only sample ids and feature
+SGLang server running the capture plugin. The server performs prefill and
+writes captured tensors directly to Mooncake. Its response contains only sample ids and feature
 key/shape/dtype metadata. The adapter validates those feature specifications,
 adopts the server-written objects into the producer store, and returns
 `SampleRef`s for `RolloutWorker` to commit.
@@ -21,7 +21,7 @@ algorithm policy, and deployment wiring separate.
 flowchart LR
   P["PromptTask lease"] --> I["ServerInputAdapter inputs"]
   I --> A["SGLangServerCaptureAdapter"]
-  A --> S["patched SGLang /generate"]
+  A --> S["SGLang with the capture plugin /generate"]
   S --> M["Mooncake tensor writes"]
   S --> V["feature metadata response"]
   V --> C["verify_capture_specs"]
@@ -37,8 +37,8 @@ pass through the controller or the producer process.
 ## Offline capture
 
 The separate `specforge.offline_capture` package is used only by
-`scripts/prepare_hidden_states.py`. It contains the version-pinned local SGLang
-internals needed to generate precomputed EAGLE3 features. It is not imported by
+`scripts/prepare_hidden_states.py`. Its CPU client uses the same capture plugin and Mooncake transport as online
+capture, then persists algorithm-owned offline feature layouts. It is not imported by
 online application or training assembly.
 
 ## Endpoints
@@ -47,8 +47,8 @@ online application or training assembly.
 |---|---|---|
 | `RolloutWorker` | `DataFlowController.lease_prompt_tasks` | control |
 | `RolloutWorker` | `SGLangServerCaptureAdapter.produce_refs` | inference |
-| `SGLangServerCaptureAdapter` | patched SGLang `/generate` | external compute |
-| patched SGLang | Mooncake feature keys | data |
+| `SGLangServerCaptureAdapter` | SGLang with the capture plugin `/generate` | external compute |
+| SGLang with the capture plugin | Mooncake feature keys | data |
 | `SGLangServerCaptureAdapter` | `MooncakeFeatureStore.adopt` | data |
 | `RolloutWorker` | `DataFlowController.commit_samples` | control |
 | producer | `StreamingRefChannel.publish` | data |

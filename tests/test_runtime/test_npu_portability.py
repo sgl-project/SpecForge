@@ -206,7 +206,7 @@ class NPURNGTest(unittest.TestCase):
         set_cpu_rng.assert_called_once_with(cpu_state)
         accelerator.set_rng_state.assert_called_once_with(accelerator_state, 2)
 
-    def test_legacy_cuda_rng_checkpoint_remains_readable(self):
+    def test_rng_checkpoint_requires_device_type(self):
         accelerator = mock.Mock()
         accelerator.is_available.return_value = True
         accelerator.current_device.return_value = 1
@@ -217,8 +217,9 @@ class NPURNGTest(unittest.TestCase):
             mock.patch.object(torch, "cuda", accelerator),
             mock.patch.object(torch, "set_rng_state"),
         ):
-            FSDPTrainingBackend._set_rng_state(legacy)
-        accelerator.set_rng_state.assert_called_once_with(cuda_state, 1)
+            with self.assertRaisesRegex(ValueError, "does not record device_type"):
+                FSDPTrainingBackend._set_rng_state(legacy)
+        accelerator.set_rng_state.assert_not_called()
 
 
 class NPUEvaluatorTest(unittest.TestCase):
