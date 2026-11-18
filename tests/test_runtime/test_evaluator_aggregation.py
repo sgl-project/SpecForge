@@ -28,6 +28,38 @@ def _batch():
     )
 
 
+class _ScriptedStrategy:
+    """Hands out prepared outputs, one for each batch it is asked to evaluate."""
+
+    evaluation_diagnostics = False
+    replay_statistics = ()
+
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+        self.model = torch.nn.Linear(1, 1)
+
+    def trainable_module(self):
+        return self.model
+
+    def forward_loss(self, batch, ctx=None):
+        return next(self.outputs)
+
+
+def _evaluate(outputs, batches=()):
+    """Pool the outputs as one evaluation pass of this rank, through the step runner."""
+    from specforge.eval import Evaluator
+    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.runner import DataParallelRunner
+    from specforge.training.strategies.base import StepContext
+
+    runner = DataParallelRunner(
+        _ScriptedStrategy(outputs), FSDPTrainingBackend(ParallelConfig())
+    )
+    if batches == ():
+        batches = [_batch() for _ in outputs]
+    return Evaluator().run(runner, batches, StepContext())
+
+
 def _step_output(loss, corrects, denoms, acceptance_rates=None, plosses=None):
     t = lambda xs: [torch.tensor(float(x)) for x in xs]  # noqa: E731
     metrics = {
@@ -69,10 +101,7 @@ def _additive_scalar_out(loss_num, loss_den, accuracy_num, accuracy_den):
 
 class TestEvaluatorAggregation(unittest.TestCase):
     def _run(self, outputs):
-        from specforge.eval import Evaluator
-
-        it = iter(outputs)
-        return Evaluator().run(lambda b: next(it), [_batch() for _ in outputs])
+        return _evaluate(outputs)
 
     def test_aggregates_counts_before_geometric_sum(self):
         # pos0: (3+1)/(4+1)=0.8 ; pos1: (2+0)/(4+1)=0.4  -- NOT the mean of ratios.
@@ -119,10 +148,8 @@ class TestEvaluatorAggregation(unittest.TestCase):
 
     def test_zero_batches_returns_empty(self):
         # Fabricated zero metrics would poison best-checkpoint tracking.
-        from specforge.eval import Evaluator
-
-        self.assertEqual(Evaluator().run(lambda b: None, []), {})
-        self.assertEqual(Evaluator().run(lambda b: None, None), {})
+        self.assertEqual(_evaluate([]), {})
+        self.assertEqual(_evaluate([], batches=None), {})
 
     def test_counts_accumulate_in_float64(self):
         # float32 accumulation stalls at 2**24 (x+1 == x), which would report a
@@ -136,21 +163,16 @@ class TestEvaluatorAggregation(unittest.TestCase):
         self.assertAlmostEqual(m["eval/avg_acc"], big / (big + 3), places=12)
 
     def test_scalar_strategy_degenerates_gracefully(self):
-        from specforge.eval import Evaluator
-
         # equal token counts -> the token-weighted fallback equals the plain mean.
         outs = [
             StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.5)}),
             StepOutput(loss=torch.tensor(1.0), metrics={"accuracy": torch.tensor(0.7)}),
         ]
-        it = iter(outs)
-        m = Evaluator().run(lambda b: next(it), [_batch(), _batch()])
+        m = _evaluate(outs)
         self.assertAlmostEqual(m["eval/avg_acc"], 0.6, places=6)
         self.assertAlmostEqual(m["eval/simulated_acc_len"], 0.6, places=6)
 
     def test_scalar_fallback_weights_by_loss_tokens(self):
-        from specforge.eval import Evaluator
-
         # No accuracy_denom -> fall back to loss-token weights: (3-of-4) +
         # (1-of-2) regrouped as one 4-of-6 batch must agree; a plain mean of
         # per-batch means would not ((0.75+0.5)/2 = 0.625).
@@ -159,15 +181,12 @@ class TestEvaluatorAggregation(unittest.TestCase):
             _scalar_out(1.0, 1 / 2, tokens=2),
         ]
         combined = [_scalar_out(1.0, 4 / 6, tokens=6)]
-        for outs, n in ((split, 2), (combined, 1)):
-            it = iter(outs)
-            m = Evaluator().run(lambda b: next(it), [_batch() for _ in range(n)])
+        for outs in (split, combined):
+            m = _evaluate(outs)
             self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
             self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
 
     def test_scalar_accuracy_weighted_by_accuracy_denom(self):
-        from specforge.eval import Evaluator
-
         # Realistic DFlash shapes: the accuracy denominator (anchor-block eval
         # positions) differs from the loss-token count. Invariance must come
         # from accuracy_denom: 3-of-4 + 1-of-2 == 4-of-6 regardless of grouping.
@@ -176,9 +195,8 @@ class TestEvaluatorAggregation(unittest.TestCase):
             _scalar_out(1.0, 1 / 2, tokens=50, denom=2),
         ]
         combined = [_scalar_out(1.0, 4 / 6, tokens=60, denom=6)]
-        for outs, n in ((split, 2), (combined, 1)):
-            it = iter(outs)
-            m = Evaluator().run(lambda b: next(it), [_batch() for _ in range(n)])
+        for outs in (split, combined):
+            m = _evaluate(outs)
             self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
             self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
             # loss-token weighting would skew to (0.75*10 + 0.5*50)/60 ~ 0.542
@@ -254,8 +272,6 @@ def _dp_worker(rank, world_size, port, results_dir):
         world_size=world_size,
         timeout=timedelta(seconds=60),
     )
-    from specforge.eval import Evaluator
-
     # Scenario 1 — scalar accuracy, uneven shards, accuracy_denom != tokens:
     # both weight sets must be reduced across ranks independently.
     if rank == 0:
@@ -265,18 +281,16 @@ def _dp_worker(rank, world_size, port, results_dir):
             _scalar_out(8.0, 0.7, tokens=2, denom=1),
             _scalar_out(4.0, 0.9, tokens=10, denom=5),
         ]
-    it = iter(outs)
-    scalar = Evaluator().run(lambda b: next(it), [_batch() for _ in outs])
+    scalar = _evaluate(outs)
 
     # Scenario 2 — ragged per-position shards: rank 1's shard is EMPTY. This
-    # gates the Evaluator's OWN collectives only; a collective forward_fn
-    # (FSDP) would additionally need equal per-rank batch counts — out of scope.
+    # gates the pooling's collectives only; a collective forward (FSDP) would
+    # additionally need equal per-rank batch counts — out of scope.
     outs2 = [_step_output(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
-    it2 = iter(outs2)
-    ragged = Evaluator().run(lambda b: next(it2), [_batch() for _ in outs2])
+    ragged = _evaluate(outs2)
 
     # Scenario 3 — zero batches on EVERY rank: the {} verdict is global too.
-    empty = Evaluator().run(lambda b: None, [])
+    empty = _evaluate([])
 
     with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:
         json.dump({"scalar": scalar, "ragged": ragged, "empty": empty}, fh)

@@ -21,7 +21,7 @@ import torch
 
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
-    from specforge.training.strategies.base import StepContext
+    from specforge.training.strategies.base import StepContext, StepOutput
 
 
 class IncompleteWindow(RuntimeError):
@@ -168,5 +168,28 @@ class StepRunner(Protocol):
             This rank's sums of each declared replay statistic, by name.
         """
 
+    def evaluate(self, batch: "TrainBatch", ctx: "StepContext") -> "StepOutput":
+        """Run one batch in evaluation mode, without gradients.
+
+        The result is the program's own, normalized on this rank: nothing is
+        reduced in the call, and whoever pools a pass does it once at the end
+        through :meth:`reduce_sum` and :meth:`reduce_max`. A rank may
+        therefore hold fewer evaluation batches than another, or none, unless
+        the wrapped forward is itself a collective. Detailed metrics are
+        collected when the program declares that its evaluation reports them,
+        whatever ``ctx.collect_detailed_metrics`` says.
+        """
+
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
-        """Sum ``values`` over the data-parallel ranks."""
+        """Sum ``values`` over the data-parallel ranks.
+
+        ``values`` may be on the host, as a rank with nothing to report builds
+        them; the result is on the device the ranks communicate on.
+        """
+
+    def reduce_max(self, values: torch.Tensor) -> torch.Tensor:
+        """Take the maximum of ``values`` over the data-parallel ranks.
+
+        It lets every rank size a buffer for the widest rank's data when its
+        own shard was empty.
+        """

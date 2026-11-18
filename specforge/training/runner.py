@@ -20,7 +20,7 @@ from __future__ import annotations
 import contextlib
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Deque, Dict, Optional, Tuple
 
 import torch
@@ -250,18 +250,48 @@ class DataParallelRunner:
         return 1
 
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
+        return self._reduce(values, dist.ReduceOp.SUM)
+
+    def reduce_max(self, values: torch.Tensor) -> torch.Tensor:
+        return self._reduce(values, dist.ReduceOp.MAX)
+
+    def _reduce(self, values: torch.Tensor, op: Any) -> torch.Tensor:
         if self._world_size() > 1:
-            dist.all_reduce(
-                values, op=dist.ReduceOp.SUM, group=self.backend.process_group
-            )
+            # The ranks exchange tensors of the training device; a rank with
+            # nothing to report built its own on the host.
+            values = values.to(self._device())
+            dist.all_reduce(values, op=op, group=self.backend.process_group)
         return values
+
+    def _device(self) -> torch.device:
+        return next(self.strategy.trainable_module().parameters()).device
+
+    def _train_mode(self) -> None:
+        """A training verb runs in training mode, whatever the caller left."""
+        module = self.strategy.trainable_module()
+        if not module.training:
+            module.train()
+
+    def evaluate(self, batch: TrainBatch, ctx: StepContext) -> StepOutput:
+        ctx = replace(
+            ctx, collect_detailed_metrics=self.strategy.evaluation_diagnostics
+        )
+        module = self.strategy.trainable_module()
+        was_training = module.training
+        module.eval()
+        try:
+            with torch.no_grad():
+                return self.strategy.forward_loss(batch, ctx)
+        finally:
+            module.train(was_training)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
         self._hold_window_length(ctx, opening=not self._prepass_rng)
-        device = next(self.strategy.trainable_module().parameters()).device
+        self._train_mode()
+        device = self._device()
         accelerator = None
         if device.type != "cpu":
             accelerator = torch.get_device_module(device.type).get_rng_state(
@@ -337,6 +367,7 @@ class DataParallelRunner:
         self, batch: TrainBatch, ctx: StepContext, *, is_boundary: bool
     ) -> StepOutput:
         """One micro-batch's forward, its share of the window's totals, its backward."""
+        self._train_mode()
         # DDP defers its gradient synchronization only when the scope encloses
         # the forward as well as the backward.
         with self.backend.accumulation_context(is_boundary=is_boundary):
