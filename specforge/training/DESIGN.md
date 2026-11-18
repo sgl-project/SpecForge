@@ -94,13 +94,14 @@ forward pass without retaining the window's activations. Each replayed
 forward/backward pair uses the backend accumulation context; only the last
 synchronizes DDP gradients. Evaluation does not replay.
 
-Evaluation goes through the same runner. `Evaluator.run` calls
-`runner.evaluate` for each batch (evaluation mode, no gradients, the mode it
-found restored afterwards) and pools the pass once at the end through
+Evaluation goes through the same runner. `Evaluator.run` opens one
+`runner.evaluation()` pass on every rank (evaluation mode from entry to exit,
+the mode it found restored afterwards), calls `runner.evaluate` for each batch
+without gradients, and pools the pass once at the end through
 `runner.reduce_sum` and `runner.reduce_max`, on a schedule that is the same on
-every rank. Nothing is reduced inside `evaluate`, so a rank may hold fewer
-evaluation batches than another, or none, unless the wrapped forward is itself
-a collective (FSDP). An objective that normalizes each rank's micro-batch over
+every rank. `evaluate` reduces nothing across samples, so a rank may hold fewer
+evaluation batches than another, or none, unless the forward itself
+communicates (a sharded wrapper, or sequence-parallel attention). An objective that normalizes each rank's micro-batch over
 all ranks in training (DSpark) is normalized on its own rank in evaluation; the
 evaluator pools numerators and denominators of the whole pass instead.
 

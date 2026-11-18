@@ -239,6 +239,10 @@ class DataParallelRunner:
         # Set once a micro-batch has raised inside its forward or backward:
         # gradients and totals may then hold a part of it.
         self._broken: Optional[str] = None
+        # Whether the next training call has to set the model's mode, and
+        # whether an evaluation pass is open.
+        self._mode_unset = True
+        self._evaluating = False
 
     @property
     def replay_statistics(self) -> Tuple[str, ...]:
@@ -267,23 +271,41 @@ class DataParallelRunner:
         return next(self.strategy.trainable_module().parameters()).device
 
     def _train_mode(self) -> None:
-        """A training verb runs in training mode, whatever the caller left."""
-        module = self.strategy.trainable_module()
-        if not module.training:
-            module.train()
+        """Put the whole model in training mode before a training call.
 
-    def evaluate(self, batch: TrainBatch, ctx: StepContext) -> StepOutput:
-        ctx = replace(
-            ctx, collect_detailed_metrics=self.strategy.evaluation_diagnostics
-        )
+        Once at the start and once after every evaluation pass, as the run
+        loop used to. The call is recursive on purpose: a draft can sit in
+        another mode than the module that wraps it, and an objective reads the
+        draft's own flag to choose its normalization.
+        """
+        if self._evaluating:
+            raise RuntimeError("a training call inside an evaluation pass")
+        module = self.strategy.trainable_module()
+        if self._mode_unset or not module.training:
+            module.train()
+            self._mode_unset = False
+
+    @contextlib.contextmanager
+    def evaluation(self):
         module = self.strategy.trainable_module()
         was_training = module.training
         module.eval()
+        self._evaluating = True
         try:
-            with torch.no_grad():
-                return self.strategy.forward_loss(batch, ctx)
+            yield
         finally:
+            self._evaluating = False
             module.train(was_training)
+            self._mode_unset = True
+
+    def evaluate(self, batch: TrainBatch, ctx: StepContext) -> StepOutput:
+        if not self._evaluating:
+            raise RuntimeError("evaluate belongs inside an evaluation() pass")
+        ctx = replace(
+            ctx, collect_detailed_metrics=self.strategy.evaluation_diagnostics
+        )
+        with torch.no_grad():
+            return self.strategy.forward_loss(batch, ctx)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()

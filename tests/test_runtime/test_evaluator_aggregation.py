@@ -292,8 +292,16 @@ def _dp_worker(rank, world_size, port, results_dir):
     # Scenario 3 — zero batches on EVERY rank: the {} verdict is global too.
     empty = _evaluate([])
 
+    # Scenario 4 — ranks with different numbers of positions: the buffer every
+    # rank pads to is as wide as the widest rank, not as wide as their sum.
+    widths = _evaluate(
+        [_step_output(1.0, corrects=[1] * (2 + rank), denoms=[2] * (2 + rank))]
+    )
+
     with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:
-        json.dump({"scalar": scalar, "ragged": ragged, "empty": empty}, fh)
+        json.dump(
+            {"scalar": scalar, "ragged": ragged, "empty": empty, "widths": widths}, fh
+        )
     dist.destroy_process_group()
 
 
@@ -320,6 +328,8 @@ class TestEvaluatorDataParallel(unittest.TestCase):
         self.assertAlmostEqual(ragged["eval/avg_acc"], 0.75, places=6)
         self.assertAlmostEqual(ragged["eval/simulated_acc_len"], 1.125, places=6)
         self.assertEqual(results[0]["empty"], {})
+        # two positions from both ranks, a third from rank 1 alone
+        self.assertEqual(results[0]["widths"]["eval/per_position_acc"], [0.5, 0.5, 0.5])
 
 
 class TestCheckpointManager(unittest.TestCase):
