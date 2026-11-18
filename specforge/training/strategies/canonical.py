@@ -21,11 +21,10 @@ def depth_ratios(ratios, prefix):
 
 
 class CanonicalTrainStrategy(DraftTrainStrategy):
-    def __init__(self, model, *, name, objective, required_features, warmup_ratio=0.0):
+    def __init__(self, model, *, name, objective, required_features):
         self.model = model
         self.name = name
         self.objective = objective
-        self.warmup_ratio = warmup_ratio
         self.required_features = set(required_features)
         seen = set()
         self._duplicate_parameters = set()
@@ -80,7 +79,6 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             tensors,
             step=ctx.global_step,
             total_steps=ctx.total_steps,
-            lr_warmup_steps=int(self.warmup_ratio * (ctx.total_steps or 0)),
             collect_detailed_metrics=ctx.collect_detailed_metrics,
             **(
                 {self.window_statistic.argument_name: window_value}

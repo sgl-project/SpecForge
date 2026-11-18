@@ -85,6 +85,7 @@ def _objective_settings(cfg):
     return dict(
         name=cfg.training.objective,
         options=cfg.training.objective_options,
+        training=cfg.training,
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
     )
@@ -612,7 +613,6 @@ def build_bundle(cfg, algorithm):
             options={
                 "name": algorithm.name,
                 "objective": runtime.objective_name,
-                "warmup_ratio": cfg.training.warmup_ratio,
                 "required_features": tuple(runtime.registration.inputs),
             },
             resume_contract=contract,

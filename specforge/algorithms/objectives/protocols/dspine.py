@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
+from specforge.lr_scheduler import warmup_steps_from_ratio
 
 from ..base import ObjectiveResult, check_options
 from ..configuration import LossDefinition
@@ -46,6 +47,7 @@ class DSpineObjective:
     loss_decay_gamma: float = 7.0
     top_k: int = 16
     alignment_warmup_steps: int | None = None
+    alignment_warmup_ratio: float = 0.0
     replacement_layers: int = 3
     replacement_probability: float = 0.5
     replacement_hold_ratio: float = 1 / 6
@@ -70,6 +72,26 @@ class DSpineObjective:
 
     default_loss = TokenLoss("ce_l1", {"ce_weight": 0.1, "l1_weight": 0.9})
 
+    @staticmethod
+    def resolve_training_options(options, training):
+        """Inherit the LR warmup only when the alignment schedule is unspecified."""
+        ratio = (
+            training.get("warmup_ratio", 0.0)
+            if options.get("alignment_warmup_steps") is None
+            else 0.0
+        )
+        return {"alignment_warmup_ratio": ratio, **options}
+
+    def alignment_scale(self, step, total_steps):
+        warmup = self.alignment_warmup_steps
+        if warmup is None:
+            if self.alignment_warmup_ratio and not total_steps:
+                raise ValueError("DSpine alignment warmup ratio requires total_steps")
+            warmup = warmup_steps_from_ratio(
+                self.alignment_warmup_ratio, total_steps or 0
+            )
+        return min(max(step, 0) / warmup, 1) if warmup else 1
+
     def __post_init__(self):
         check_options(
             counts={"num_anchors": self.num_anchors, "top_k": self.top_k},
@@ -82,11 +104,16 @@ class DSpineObjective:
                 "replacement_layers": self.replacement_layers,
             },
             probabilities={
+                "alignment_warmup_ratio": self.alignment_warmup_ratio,
                 "replacement_probability": self.replacement_probability,
                 "replacement_hold_ratio": self.replacement_hold_ratio,
                 "replacement_end_ratio": self.replacement_end_ratio,
             },
         )
+        if self.alignment_warmup_ratio is None:
+            raise ValueError("alignment_warmup_ratio must be a probability")
+        if self.alignment_warmup_steps is not None and self.alignment_warmup_ratio:
+            raise ValueError("alignment warmup must use steps or ratio, not both")
         if self.candidate_mass_threshold >= 1:
             raise ValueError("candidate_mass_threshold must be below one")
         if not self.replacement_hold_ratio < self.replacement_end_ratio:
@@ -102,7 +129,6 @@ class DSpineObjective:
         step,
         total_steps,
         alignment_ce=None,
-        lr_warmup_steps=0,
         **context,
     ):
         model = runtime.draft_model
@@ -142,10 +168,7 @@ class DSpineObjective:
             replace_masks=masks,
             output_logits=False,
         )
-        warmup = self.alignment_warmup_steps
-        if warmup is None:
-            warmup = lr_warmup_steps
-        beta = min(max(step, 0) / warmup, 1) if warmup else 1
+        beta = self.alignment_scale(step, total_steps)
 
         def compute(calc):
             calc.run((0,))

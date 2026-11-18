@@ -44,10 +44,10 @@ class DSpineExecutionTest(unittest.TestCase):
         batch = training_inputs()
         for override, ramp in [(None, 0.5), (2, 1.0), (0, 1.0)]:
             model.objective.alignment_warmup_steps = override
+            model.objective.alignment_warmup_ratio = 0.04 if override is None else 0.0
             kwargs = dict(
                 step=2,
                 total_steps=100,
-                lr_warmup_steps=4,
                 alignment_ce=torch.tensor(1.0),
             )
             torch.manual_seed(11)
