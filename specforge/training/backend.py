@@ -229,46 +229,42 @@ class FSDPTrainingBackend(TrainingBackend):
         """Whether every rank owns the same complete optimizer state."""
         return self._wrapper_kind == "ddp"
 
-    @staticmethod
-    def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
-        """Return frozen target tables that should remain replicated.
-
-        DFlash-family wrappers carry the target embedding and LM head only for
-        inference inside the loss.  Sharding those frozen tables makes FSDP
-        all-gather them before every optimizer window without saving optimizer
-        memory, which is the wrong trade-off for the current trainer recipes.
-        """
-        modules = list(getattr(model, "frozen_target_modules", ()))
-        if any(
-            parameter.requires_grad
-            for module in modules
-            for parameter in module.parameters()
-        ):
-            raise ValueError(
-                "frozen_target_modules must contain only frozen parameters"
-            )
-        for name in ("lm_head", "embed_tokens"):
-            module = getattr(model, name, None)
-            if not isinstance(module, nn.Module):
-                continue
-            parameters = tuple(module.parameters())
-            if parameters and not any(
-                parameter.requires_grad for parameter in parameters
-            ):
-                modules.append(module)
-        return tuple(modules)
-
     def prepare_model(
         self,
         model: nn.Module,
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        frozen: Tuple[nn.Module, ...] = (),
+        blocks: Tuple[str, ...] = (),
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
+
+        Args:
+            model: The program.
+            wrap: Whether to wrap it for data-parallel training.
+            optimizer_target: The module whose parameters the optimizer takes;
+                the wrapped module when omitted.
+            frozen: Frozen modules of ``model`` that stay replicated. They are
+                target tables used only inside the loss: sharding them would
+                all-gather them before every optimizer window without saving
+                optimizer memory.
+            blocks: Class names of the modules FSDP wraps as one unit each,
+                which overlaps their all-gather and reduce-scatter with the
+                decoder's compute. Empty: one root unit.
+
+        Raises:
+            ValueError: A module in ``frozen`` holds a trainable parameter.
         """
+        frozen = tuple(frozen)
+        if any(
+            parameter.requires_grad
+            for module in frozen
+            for parameter in module.parameters()
+        ):
+            raise ValueError("frozen modules must contain only frozen parameters")
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -277,20 +273,11 @@ class FSDPTrainingBackend(TrainingBackend):
             import functools
 
             pc = self.parallel_config
-            ignored_frozen_modules = self._frozen_target_modules(model)
-            # DFlash-family models expose their transformer block class through
-            # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
-            # it overlaps all-gather/reduce-scatter with decoder compute and is
-            # required for the memory envelope of the larger recipes.  EAGLE
-            # models do not advertise block classes and retain a single root
-            # FSDP unit.
-            block_names = set(
-                getattr(optimizer_target, "_no_split_modules", None) or ()
-            )
+            ignored_frozen_modules = frozen
             block_classes = {
                 type(module)
                 for module in model.modules()
-                if type(module).__name__ in block_names
+                if type(module).__name__ in blocks
             }
             if pc.sharding_strategy == "NO_SHARD":
                 # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
