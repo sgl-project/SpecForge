@@ -615,6 +615,13 @@ class RunnerRefusalTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "prepasses to pair"):
             run_window(runner, [batch(2), batch(3)], ctx)
 
+    def test_prepass_needs_a_declaration(self):
+        runner = runner_over(_Program())
+        with self.assertRaisesRegex(RuntimeError, "declares no replay statistic"):
+            runner.prepass(batch(1), StepContext())
+        # Nothing was kept for a replay: the next forward draws as it would.
+        self.assertFalse(runner._prepass_rng)
+
     def test_replay_values_need_a_declaration(self):
         runner = runner_over(_Program())
         ctx = StepContext(replay_values={"count": torch.ones(1)})

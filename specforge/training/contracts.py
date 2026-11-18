@@ -72,8 +72,10 @@ class TrainingProgram(Protocol):
     """A draft and the objective that drives it: what a runner executes.
 
     It supervises, runs the draft and forms the loss terms. It knows nothing
-    of the data-parallel ranks, the optimizer or how it is wrapped. A runner
-    calls the forward through its wrapper and the other methods directly.
+    of the data-parallel ranks, the optimizer or how it is wrapped. It is an
+    ``nn.Module``: a runner wraps it, reads its parameters and their device
+    and sets its mode. A runner calls the forward through its wrapper and the
+    other methods on the program itself.
     """
 
     def __call__(
@@ -88,9 +90,20 @@ class TrainingProgram(Protocol):
 
         The result's numerator and denominator are this rank's; the update's
         objective is their sums' ratio over the window and the ranks. A
-        program that declares a replay statistic also takes
-        ``replay_values``, the pooled sums by name, and ``prepass``, which
-        asks for this rank's sums of each statistic in ``result.statistics``.
+        program that declares a replay statistic also takes ``prepass=True``,
+        which asks for this rank's sums of each statistic in
+        ``result.statistics``, and in a replay the keyword arguments that
+        ``replay_arguments`` returned.
+        """
+
+    def replay_arguments(
+        self, replay_values: Mapping[str, torch.Tensor]
+    ) -> Mapping[str, torch.Tensor]:
+        """The forward's keyword arguments for a replayed micro-batch.
+
+        Any arithmetic on the pooled sums, a ratio and its zero guard for
+        one, is done here, outside the wrapper: a wrapper may cast what
+        passes through its forward. Empty for a program without a statistic.
         """
 
     def host_inputs(

@@ -927,10 +927,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
 
-        def runtime(model, *, objective_scale=1.0):
+        def runtime(model, *, name="eagle3"):
             allowed_missing = {"embed_tokens.weight"}
             return StepRuntimeConfig(
-                options={"objective_scale": objective_scale},
+                options={"name": name},
                 resume_contract={
                     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
                         checkpoint_key_fingerprint(
@@ -1046,9 +1046,44 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=checkpoint,
                 strategy_runtime=runtime(
                     unchanged_model,
-                    objective_scale=2.0,
+                    name="eagle3-other",
                 ),
             )
+        # An option is recorded for resume, so one that describes nothing of
+        # the program is refused before anything trains.
+        for options, message in (
+            ({"objective_scale": 2.0}, r"\['objective_scale'\] configure nothing"),
+            ({"objective": "dflash"}, "does not name the program's objective 'eagle3'"),
+            (
+                {"required_features": ("x", "teacher")},
+                r"differs from the inputs the program declares, \['x'\]",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                assemble(
+                    Composite(),
+                    output_dir=os.path.join(workdir, "refused"),
+                    max_steps=1,
+                    strategy_runtime=StepRuntimeConfig(
+                        options=options,
+                        resume_contract={},
+                        allowed_missing_checkpoint_keys=frozenset(),
+                    ),
+                )
+        described = StepRuntimeConfig(
+            options={"objective": "eagle3", "required_features": ("x",)},
+            resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        assemble(
+            Composite(),
+            output_dir=os.path.join(workdir, "described"),
+            max_steps=1,
+            strategy_runtime=described,
+        )
 
         changed_model = Composite()
         with torch.no_grad():

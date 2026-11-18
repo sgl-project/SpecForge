@@ -146,7 +146,7 @@ class DSpineAccumulationTest(unittest.TestCase):
                 (
                     torch.is_grad_enabled(),
                     kwargs.get("prepass", False),
-                    kwargs.get("replay_values"),
+                    kwargs.get("alignment_ce"),
                 )
             ),
             with_kwargs=True,

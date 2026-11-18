@@ -570,7 +570,7 @@ class CanonicalTrainingTest(unittest.TestCase):
 
             def _forward(self, batch, ctx, **replay):
                 result = super()._forward(batch, ctx, **replay)
-                if replay.get("replay_values"):
+                if replay.get("alignment_ce") is not None:
                     self.replayed.append(result)
                 return result
 
@@ -619,6 +619,69 @@ class CanonicalTrainingTest(unittest.TestCase):
             evaluated = runner.evaluate(batch, StepContext(global_step=1))
         self.assertEqual(evaluated.statistics, {})
         reduce.assert_not_called()
+
+    def test_dspine_replay_ratio_is_formed_before_a_wrapper_casts(self):
+        """Under FSDP's mixed precision the forward's inputs are cast on the way in."""
+        from unittest.mock import Mock
+
+        from specforge.algorithms.objectives import build_objective_model
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.frame import run_window
+        from specforge.training.program import program_spec
+        from specforge.training.runner import DataParallelRunner
+        from tests.test_modeling.test_canonical_dspine import initialized_model
+
+        model = initialized_model()
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "alignment_warmup_steps": 0},
+            target_head=torch.nn.Linear(32, 64, bias=False),
+        )
+
+        class Casting(torch.nn.Module):
+            """Casts floating keyword tensors to bfloat16, nested ones included."""
+
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
+            def cast(self, value):
+                if isinstance(value, dict):
+                    return {name: self.cast(item) for name, item in value.items()}
+                if torch.is_tensor(value) and value.is_floating_point():
+                    return value.to(torch.bfloat16)
+                return value
+
+            def forward(self, tensors, **keywords):
+                return self.module(tensors, **self.cast(keywords))
+
+        class Runner(DataParallelRunner):
+            def reduce_sum(self, values):
+                # Sums whose ratio is not the ratio of their bfloat16 values:
+                # 257 rounds to 256 there.
+                return torch.tensor([768.0, 257.0]) if values.numel() == 2 else values
+
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(runtime, wrap=False)
+        backend.set_optimizer(torch.optim.SGD(model.parameters(), lr=0.0))
+        runner = Runner(Casting(runtime), backend, program_spec(runtime))
+        objective = runtime.objective
+        runtime.objective = Mock(wraps=objective)
+        batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
+        run_window(runner, [batch], StepContext(global_step=1, total_steps=10))
+        prepass, replay = (
+            call.kwargs["alignment_ce"] for call in runtime.objective.call_args_list
+        )
+        self.assertEqual(prepass.item(), 0.0)
+        self.assertEqual(replay.dtype, torch.bfloat16)
+        # 768 / 257 in fp32, then cast; the cast sums would give exactly 3.
+        self.assertEqual(replay.item(), 2.984375)
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""
