@@ -470,14 +470,14 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
-        if resume is not None:
-            backend.load_state_dict(resume["backend"])
         strategy = make_step_strategy(
             wrapped,
             target_head=target_head,
             **resolved_strategy_kwargs,
         )
         runner = DataParallelRunner(strategy, backend)
+        if resume is not None:
+            runner.load_resume(resume["backend"])
         ack_fn = None
         if durable_ack:
 
@@ -495,8 +495,7 @@ class Trainer:
 
         controller_obj = TrainerController(
             runner,
-            strategy=strategy,
-            backend=backend,
+            strategy_name=algorithm_name,
             accumulation_steps=accumulation_steps,
             data_parallel_size=max(
                 1, parallel.world_size // (parallel.tp_size * parallel.sp_size)

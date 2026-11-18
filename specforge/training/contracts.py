@@ -15,6 +15,7 @@ is declared here, so a second runner needs nothing from the first.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,6 +32,23 @@ import torch
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
     from specforge.training.strategies.base import StepContext, StepOutput
+
+
+@dataclass(frozen=True)
+class CheckpointState:
+    """What a runner hands over when a checkpoint is taken."""
+
+    #: The draft's weights under canonical keys: complete on the first rank,
+    #: empty on the others.
+    draft: Dict[str, torch.Tensor]
+    #: This rank's own state for continuing the run; every rank's is saved.
+    rank: Dict[str, Any]
+    #: State for continuing that is the same on every rank and is saved once,
+    #: or None.
+    replicated: Optional[Dict[str, Any]]
+    #: The kernels this rank has realised so far, by the choice they answer.
+    #: Ranks have to agree on them before a checkpoint records them.
+    kernels: Mapping[str, str]
 
 
 class IncompleteWindow(RuntimeError):
@@ -199,6 +217,29 @@ class StepRunner(Protocol):
         then have to evaluate the same batches. Detailed metrics are collected
         when the program declares that its evaluation reports them, whatever
         ``ctx.collect_detailed_metrics`` says.
+        """
+
+    def checkpoint_state(self) -> CheckpointState:
+        """The draft's weights and this rank's state for continuing the run.
+
+        Gathering the weights is a collective when the wrapper shards. Legal
+        between an applied step and the next window.
+        """
+
+    def load_resume(self, state: Mapping[str, Any]) -> None:
+        """Restore the state a checkpoint saved for this rank.
+
+        ``state`` is :attr:`CheckpointState.rank` as it was saved, with the
+        replicated part filled in.
+        """
+
+    def agree(self, error: Optional[str], *, value: Any = None) -> None:
+        """Have every rank learn every rank's outcome.
+
+        One gather of an error and a value per rank. Raises on every rank when
+        any rank reports an error or the values differ, so a rank-local
+        failure never leaves the others waiting in a later collective. It is
+        not for use inside a step.
         """
 
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:

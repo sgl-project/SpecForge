@@ -220,10 +220,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(strategy.built_from, ("STRAT", "WRAPPED", "HEAD"))
         self.assertIs(backend, trainer.backend)
 
-        # the run loop drives that runner over the same strategy and backend
+        # the run loop drives that runner and holds neither the strategy nor the backend
         self.assertIs(cap["ctrl_runner"], trainer.runner)
-        self.assertIs(cap["ctrl_kw"]["strategy"], strategy)
-        self.assertIs(cap["ctrl_kw"]["backend"], backend)
+        self.assertEqual(cap["ctrl_kw"]["strategy_name"], "eagle3")
         self.assertEqual(cap["ctrl_kw"]["accumulation_steps"], 3)
         self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 8)
 

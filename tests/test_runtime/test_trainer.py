@@ -177,8 +177,7 @@ def _controller(strategy, backend, **options):
     """A run loop that drives ``strategy`` and ``backend`` through the step runner."""
     return TrainerController(
         DataParallelRunner(strategy, backend),
-        strategy=strategy,
-        backend=backend,
+        strategy_name=strategy.name,
         **options,
     )
 
@@ -718,6 +717,23 @@ class TestTrainerController(unittest.TestCase):
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
 
+    def test_checkpoint_is_written_only_once_the_ranks_agree(self):
+        strat = FakeStrategy()
+        strat.kernels = lambda: {"0:0": "reference"}
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            with mock.patch.object(
+                ctrl.runner, "agree", side_effect=RuntimeError("ranks disagree")
+            ) as agree:
+                with self.assertRaisesRegex(RuntimeError, "ranks disagree"):
+                    ctrl.save_checkpoint(1)
+            agree.assert_called_once_with(
+                None, value=("loss kernels", {"0:0": "reference"})
+            )
+            self.assertEqual(os.listdir(d), [])
+
     def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -880,8 +896,7 @@ class TestTrainerController(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as d:
                     ctrl = TrainerController(
                         Runner(),
-                        strategy=strat,
-                        backend=FakeBackend(strat.model),
+                        strategy_name=strat.name,
                         accumulation_steps=3,
                         run_id="r",
                         output_dir=d,

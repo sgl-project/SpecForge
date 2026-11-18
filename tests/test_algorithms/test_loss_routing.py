@@ -576,29 +576,20 @@ class LossRoutingTest(unittest.TestCase):
                 select_implementation(request, fused=False).name, "reference"
             )
 
-    def test_rank_agreement_is_separate_from_selection(self):
+    def test_selection_issues_no_collective(self):
+        """Ranks agree on their selections at a checkpoint, through the step runner."""
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
         )
 
         selection = ExecutionSelection()
-        with patch("torch.distributed.all_gather_object") as gather:
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.all_gather_object") as gather,
+        ):
             selection.resolve(self.request(), (0,), 0, fused=None)
             gather.assert_not_called()
         self.assertEqual(selection.names, {"0:0": "reference"})
-        selection.agree()  # no process group: nothing to compare
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.get_world_size", return_value=2),
-            patch(
-                "torch.distributed.all_gather_object",
-                side_effect=lambda out, mine: out.__setitem__(
-                    slice(None), [mine, {"0:0": "token_ce"}]
-                ),
-            ),
-            self.assertRaisesRegex(ValueError, "differ across ranks"),
-        ):
-            selection.agree()
 
     def test_saved_implementation_names_are_checked_without_aliases(self):
         from specforge.algorithms.objectives.implementations.registry import (

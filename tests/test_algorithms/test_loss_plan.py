@@ -124,13 +124,18 @@ def distributed_reduction(rank, rendezvous):
             # Release DDP reducers and their autograd graphs while Gloo is alive.
             del wrapped, model, expected
             gc.collect()
-        # Ranks resolve independently; the trainer's agreement point sees a mismatch.
+        # Ranks resolve independently; the runner's agreement sees a mismatch.
 
         from specforge.algorithms.objectives.implementations.registry import (
             ExecutionSelection,
             Implementation,
         )
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.runner import DataParallelRunner
 
+        runner = DataParallelRunner(
+            SimpleNamespace(), FSDPTrainingBackend(ParallelConfig())
+        )
         request = SimpleNamespace(input_tensor=hidden)
         for mismatch in (False, True):
             entry = Implementation(f"kernel_{rank if mismatch else 0}", 0, None, None)
@@ -142,11 +147,11 @@ def distributed_reduction(rank, rendezvous):
                 selection.resolve(request, (0,), 0)
                 if mismatch:
                     with unittest.TestCase().assertRaisesRegex(
-                        ValueError, "differ across ranks"
+                        RuntimeError, "ranks disagree"
                     ):
-                        selection.agree()
+                        runner.agree(None, value=dict(selection.names))
                 else:
-                    selection.agree()
+                    runner.agree(None, value=dict(selection.names))
                     assert selection.names == {"0:0": "kernel_0"}
         # A dependency error is raised by the rank that hits it, with no collective.
         if rank:

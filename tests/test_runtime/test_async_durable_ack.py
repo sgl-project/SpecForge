@@ -153,8 +153,7 @@ def _controller(output_dir, *, on_forward=None, on_step=None, **kwargs):
     backend = _Backend(strategy.model, on_step)
     return TrainerController(
         DataParallelRunner(strategy, backend),
-        strategy=strategy,
-        backend=backend,
+        strategy_name=strategy.name,
         run_id="run0",
         output_dir=output_dir,
         **kwargs,

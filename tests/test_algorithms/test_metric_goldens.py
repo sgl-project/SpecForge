@@ -144,8 +144,7 @@ def evaluated_metrics(strategy, batches):
     with TemporaryDirectory() as output_dir:
         controller = TrainerController(
             DataParallelRunner(strategy, backend),
-            strategy=strategy,
-            backend=backend,
+            strategy_name=strategy.name,
             run_id="metrics",
             output_dir=output_dir,
             total_steps=TOTAL_STEPS,

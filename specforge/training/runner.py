@@ -21,14 +21,14 @@ import contextlib
 import math
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
-from specforge.training.contracts import PendingStep, StepMetrics
+from specforge.training.contracts import CheckpointState, PendingStep, StepMetrics
 from specforge.training.strategies.base import (
     DraftTrainStrategy,
     StepContext,
@@ -269,6 +269,46 @@ class DataParallelRunner:
 
     def _device(self) -> torch.device:
         return next(self.strategy.trainable_module().parameters()).device
+
+    def checkpoint_state(self) -> CheckpointState:
+        # Every rank takes part: gathering a sharded model is a collective.
+        state = self.backend.state_dict()
+        # DDP ranks hold identical parameters, gradients, optimizer moments
+        # and scheduler state, so that large state is saved once. Sharded
+        # optimizer state is each rank's own, and so is every rank's RNG.
+        replicated = self.backend.optimizer_state_is_replicated
+        return CheckpointState(
+            # The backend gathers the model on the first rank only.
+            draft=self.strategy.checkpoint_state_filter(state["model"]),
+            rank={
+                "optimizer": None if replicated else state["optimizer"],
+                "rng": state["rng"],
+            },
+            replicated=state["optimizer"] if replicated else None,
+            kernels=self.strategy.kernels(),
+        )
+
+    def load_resume(self, state: Mapping[str, Any]) -> None:
+        self.backend.load_state_dict(state)
+
+    def agree(self, error: Optional[str], *, value: Any = None) -> None:
+        if dist.is_available() and dist.is_initialized():
+            outcomes = [None] * dist.get_world_size(group=self.backend.process_group)
+            dist.all_gather_object(
+                outcomes, (error, value), group=self.backend.process_group
+            )
+        else:
+            outcomes = [(error, value)]
+        failures = [
+            f"rank {rank}: {failure}"
+            for rank, (failure, _) in enumerate(outcomes)
+            if failure
+        ]
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        values = [reported for _, reported in outcomes]
+        if any(reported != values[0] for reported in values):
+            raise RuntimeError(f"ranks disagree: {values}")
 
     def _train_mode(self) -> None:
         """Put the whole model in training mode before a training call.
