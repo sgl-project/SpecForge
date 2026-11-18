@@ -85,7 +85,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
             log_interval=1,
         )
 
-        strategy = trainer.core.strategy
+        strategy = trainer.runner.strategy
         self.assertIsInstance(strategy, CanonicalTrainStrategy)
         self.assertIsInstance(strategy.model, FSDP)
         self.assertEqual(

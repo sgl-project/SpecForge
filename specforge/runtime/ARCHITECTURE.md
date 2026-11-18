@@ -10,7 +10,8 @@ trainer. The launch layer exposes exactly four topology builders:
 - `build_disagg_online_consumer`
 
 All trainer-bearing builders converge on the same
-`Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` path. Only
+`Trainer -> FeatureDataLoader -> TrainerController -> step frame -> step runner`
+path. Only
 the reference source and feature-store backend change.
 
 ## Supported paths

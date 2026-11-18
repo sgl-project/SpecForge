@@ -2,7 +2,7 @@
 """Gate: grad-accumulation no_sync() is math-equivalent to reducing every micro-step.
 
 2-rank FSDP DP group with DISTINCT per-rank micro-batches, so a skipped or wrong
-cross-rank reduction shows up as a weight diff between path A (TrainerCore,
+cross-rank reduction shows up as a weight diff between path A (the step runner,
 no_sync off the boundary) and path B (reduce on every micro-step). Reusing one
 batch per rank keeps the check exact: power-of-two loss scaling commutes with
 rounding. GPU-only (>=2 GPUs, flex_attention); run on the H200 box via rcli."""
@@ -29,7 +29,7 @@ def _worker(rank, world_size, workdir, results_dir):
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-    from specforge.training.controller import TrainerCore
+    from specforge.training.runner import DataParallelRunner
     from tests.test_runtime._fixtures import build_strategy
 
     torch.manual_seed(0)
@@ -70,7 +70,8 @@ def _worker(rank, world_size, workdir, results_dir):
 
     pc = ParallelConfig.from_distributed()
 
-    # Path A: no_sync via TrainerCore accumulation (reduce once, on the boundary).
+    # Path A: no_sync via the runner's accumulation window (reduce once, on the
+    # boundary).
     backend_a = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
     backend_a.prepare_model(model_a, wrap=True, optimizer_target=model_a.draft_model)
     # Count deferrals: every NON-boundary micro-step must enter no_sync(), so
@@ -84,9 +85,8 @@ def _worker(rank, world_size, workdir, results_dir):
 
     backend_a.module.no_sync = _counting_no_sync
     strat_a = build_strategy(backend_a.module, target_head=head)
-    core_a = TrainerCore(strat_a, backend_a, accumulation_steps=ACC)
-    for _ in range(ACC):
-        rep_a = core_a.train_step(batch)
+    runner_a = DataParallelRunner(strat_a, backend_a)
+    rep_a = fx.train_window(runner_a, [batch] * ACC)
 
     # Path B: force the reduction on every micro-step (is_boundary=True), same math.
     backend_b = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)

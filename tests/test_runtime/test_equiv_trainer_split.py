@@ -3,8 +3,8 @@
 
 One model takes a step through the offline builder and public ``Trainer.fit()``.
 An identically initialized model takes the same step through the canonical
-``TrainerCore``/``FSDPTrainingBackend`` seam.  Loss, gradient norm and updated
-draft weights must agree.
+``DataParallelRunner``/``FSDPTrainingBackend`` seam.  Loss, gradient norm and
+updated draft weights must agree.
 """
 
 import os
@@ -32,11 +32,11 @@ def _optimizer_factory(module):
 
 @unittest.skipUnless(CUDA, "trainer-boundary parity requires CUDA")
 class TestEquivTrainerSplit(unittest.TestCase):
-    def test_trainer_fit_matches_current_core_step(self):
+    def test_trainer_fit_matches_direct_runner_step(self):
         fx.build_single_rank_distributed(port="29562")
         from specforge.launch import build_offline_runtime
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.controller import TrainerCore
+        from specforge.training.runner import DataParallelRunner
         from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
         algorithm = builtin_algorithm_registry().resolve("eagle3")
@@ -50,15 +50,15 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     os.path.join(work, "features"), n=1, seq=16, seed=19
                 )
                 fit_dir = os.path.join(work, "fit-model")
-                core_dir = os.path.join(work, "core-model")
+                runner_dir = os.path.join(work, "runner-model")
                 os.makedirs(fit_dir)
-                os.makedirs(core_dir)
+                os.makedirs(runner_dir)
 
                 torch.manual_seed(0)
                 fit_model, fit_head = fx.build_eagle3(fit_dir, ttt=3)
-                core_model, core_head = fx.build_eagle3(core_dir, ttt=3)
-                core_model.load_state_dict(fit_model.state_dict())
-                core_head.load_state_dict(fit_head.state_dict())
+                runner_model, runner_head = fx.build_eagle3(runner_dir, ttt=3)
+                runner_model.load_state_dict(fit_model.state_dict())
+                runner_head.load_state_dict(fit_head.state_dict())
 
                 logged = []
                 trainer = build_offline_runtime(
@@ -82,24 +82,23 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     optimizer_factory=_optimizer_factory,
                 )
                 wrapped = backend.prepare_model(
-                    core_model,
+                    runner_model,
                     wrap=True,
-                    optimizer_target=core_model.draft_model,
+                    optimizer_target=runner_model.draft_model,
                 )
-                core = TrainerCore(
+                runner = DataParallelRunner(
                     algorithm.providers.step.build(
                         wrapped,
-                        target_head=core_head,
+                        target_head=runner_head,
                     ),
                     backend,
-                    accumulation_steps=1,
                 )
                 batch = next(
                     iter(
                         fx.build_offline_eagle3_loader(
                             feature_dir,
                             batch_size=1,
-                            run_id="core-data",
+                            run_id="runner-data",
                             ttt_length=3,
                             max_len=512,
                         )
@@ -107,24 +106,23 @@ class TestEquivTrainerSplit(unittest.TestCase):
                 )
 
                 self.assertEqual(trainer.fit(), 1)
-                core_result = core.train_step(batch)
-                self.assertTrue(core_result.optimizer_stepped)
+                runner_metrics = fx.train_window(runner, [batch])
                 self.assertEqual([step for step, _ in logged], [1])
-                self.assertEqual(logged[0][1]["loss"], core_result.loss)
+                self.assertEqual(logged[0][1]["loss"], runner_metrics.loss)
                 self.assertAlmostEqual(
-                    logged[0][1]["grad_norm"], core_result.grad_norm, places=3
+                    logged[0][1]["grad_norm"], runner_metrics.grad_norm, places=3
                 )
 
-                fit_state = trainer.core.strategy.checkpoint_state_filter(
+                fit_state = trainer.runner.strategy.checkpoint_state_filter(
                     trainer.backend.state_dict()["model"]
                 )
-                core_state = core.strategy.checkpoint_state_filter(
+                runner_state = runner.strategy.checkpoint_state_filter(
                     backend.state_dict()["model"]
                 )
-                self.assertEqual(set(fit_state), set(core_state))
+                self.assertEqual(set(fit_state), set(runner_state))
                 for name in sorted(fit_state):
                     self.assertTrue(
-                        torch.equal(fit_state[name], core_state[name]),
+                        torch.equal(fit_state[name], runner_state[name]),
                         f"draft weight {name!r} changed at the Trainer boundary",
                     )
         finally:

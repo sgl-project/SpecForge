@@ -462,7 +462,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.controller import TrainerCore
+        from specforge.training.runner import DataParallelRunner
         from tests.test_runtime import _fixtures as fx
         from tests.test_runtime._fixtures import build_strategy
 
@@ -481,7 +481,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        core = TrainerCore(build_strategy(model, target_head=head), backend)
+        runner = DataParallelRunner(build_strategy(model, target_head=head), backend)
         # batch_size=1 batches (ragged lengths), one step each
         for i, out in enumerate(fetched):
             batch = TrainBatch(
@@ -497,8 +497,8 @@ class TestServerCaptureGate(unittest.TestCase):
                 },
                 metadata={"target_repr": "hidden_state", "ttt_length": 3},
             )
-            result = core.train_step(batch)
-            self.assertTrue(torch.isfinite(torch.tensor(result.loss)))
+            metrics = fx.train_window(runner, [batch])
+            self.assertTrue(torch.isfinite(torch.tensor(metrics.loss)))
 
     def test_dflash_capture_same_server(self):
         from specforge.inference.adapters.server_capture import (

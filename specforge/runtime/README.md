@@ -15,7 +15,8 @@ The runtime has three responsibilities:
   channels, rank inboxes, and `FeatureDataLoader`.
 
 All trainer-bearing launchers converge on the same
-`Trainer -> FeatureDataLoader -> TrainerController -> TrainerCore` lifecycle.
+`Trainer -> FeatureDataLoader -> TrainerController -> step frame -> step runner`
+lifecycle.
 Offline refs remain a fixed list and never enter an online queue or ledger.
 Online capture always runs in an external SGLang server running the capture plugin and uses
 `RefDistributor -> per-rank InboxChannel -> StreamingRefQueue`, including for a

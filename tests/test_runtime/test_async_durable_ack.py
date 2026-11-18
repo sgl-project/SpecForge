@@ -42,11 +42,8 @@ from specforge.runtime.control_plane.metadata_store import (
 )
 from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import STATE_FILE, CheckpointManager
-from specforge.training.controller import (
-    TrainerController,
-    TrainerCore,
-    _AsyncAckRunner,
-)
+from specforge.training.controller import TrainerController, _AsyncAckRunner
+from specforge.training.runner import DataParallelRunner
 from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
 
 WORLD_SIZE = 2
@@ -152,8 +149,15 @@ def _ref(sample_id: str) -> SampleRef:
 
 def _controller(output_dir, *, on_forward=None, on_step=None, **kwargs):
     strategy = _Strategy(on_forward)
-    core = TrainerCore(strategy, _Backend(strategy.model, on_step))
-    return TrainerController(core, run_id="run0", output_dir=output_dir, **kwargs)
+    backend = _Backend(strategy.model, on_step)
+    return TrainerController(
+        DataParallelRunner(strategy, backend),
+        strategy=strategy,
+        backend=backend,
+        run_id="run0",
+        output_dir=output_dir,
+        **kwargs,
+    )
 
 
 class TestAsyncDurableAck(unittest.TestCase):

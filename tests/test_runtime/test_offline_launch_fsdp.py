@@ -65,11 +65,11 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         )
 
         # Issue 1: the strategy runs forward through the FSDP-wrapped module
-        module = trainer.core.strategy.trainable_module()
+        module = trainer.runner.strategy.trainable_module()
         self.assertIsInstance(
             module, FSDP, "strategy must hold the FSDP-wrapped module"
         )
-        self.assertIsNotNone(trainer.core.backend.optimizer)
+        self.assertIsNotNone(trainer.runner.backend.optimizer)
 
         step = trainer.fit()
 
