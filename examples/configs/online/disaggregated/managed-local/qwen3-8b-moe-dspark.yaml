@@ -39,11 +39,16 @@ training:
     num_anchors: 512
     # Expert-bias load balancing: zero-mean sign step per optimizer step.
     bias_update_rate: 0.001
+    # The load the balance loss below measures against: this step's, pooled over ranks.
+    aux_loss_type: batch_wise
   loss:
     terms:
       # A zero confidence coefficient also freezes confidence_head.
       confidence:
         coefficient: 0.0
+      # Load-balance loss on the router scores (0 = off).
+      moe_balance:
+        coefficient: 0.005
   weighting:
     kind: exponential
     gamma: 7.0
