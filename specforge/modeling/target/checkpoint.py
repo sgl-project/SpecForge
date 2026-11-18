@@ -162,7 +162,7 @@ def _read_weight_map_file(index_path: str) -> Dict[str, str]:
     ):
         raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
     checkpoint_dir = os.path.dirname(index_path) or os.curdir
-    for filename in weight_map.values():
+    for filename in dict.fromkeys(weight_map.values()):
         _check_shard_name(checkpoint_dir, filename, index_path)
     return weight_map
 
