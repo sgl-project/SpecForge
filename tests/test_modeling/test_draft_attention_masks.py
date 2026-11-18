@@ -7,6 +7,7 @@ import torch
 
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
+    ContextBlocks,
     PaddingMask,
     dense_attention_mask,
 )
@@ -217,3 +218,97 @@ class AttentionMaskTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def prepare_blocks_visibility(anchors, keep, padding, size, offset):
+    """The mask `prepare_blocks` built inline before ContextBlocks existed."""
+    batch, count = anchors.shape
+    rows = padding.shape[1]
+    context = torch.arange(rows).expand(batch, -1)
+    context_visible = context[:, None, None, :] < (anchors + offset)[..., None, None]
+    context_visible = context_visible & padding[:, None, None, :].bool()
+    context_visible = context_visible.expand(-1, -1, size, -1).reshape(batch, -1, rows)
+    block_ids = torch.arange(count).repeat_interleave(size)
+    draft_visible = (block_ids[:, None] == block_ids[None, :]).expand(batch, -1, -1)
+    visible = torch.cat((context_visible, draft_visible), dim=-1)
+    visible &= keep.repeat_interleave(size, dim=1)[..., None]
+    return visible[:, None], keep.repeat_interleave(size, dim=1)
+
+
+class ContextBlocksTest(unittest.TestCase):
+    def test_block_layout_equals_the_inline_prepare_blocks_mask(self):
+        generator = torch.Generator().manual_seed(0)
+        for trial in range(40):
+            batch = 1 + trial % 3
+            rows = 1 + int(torch.randint(1, 40, (1,), generator=generator))
+            count = 1 + trial % 5
+            size = 1 + trial % 4
+            # DMTP shifts the visible prefix by input and context offsets.
+            offset = (-3, 0, 1, 2, 5)[trial % 5]
+            anchors = torch.randint(0, rows, (batch, count), generator=generator)
+            keep = torch.rand(batch, count, generator=generator) < 0.7
+            valid = torch.randint(1, rows + 1, (batch, 1), generator=generator)
+            padding = torch.arange(rows) < valid
+            if trial % 4 == 0:
+                padding = torch.rand(batch, rows, generator=generator) < 0.8
+            with self.subTest(trial=trial):
+                queries = (anchors[..., None] + torch.arange(size)).flatten(1)
+                layout = AttentionLayout(
+                    query_positions=queries,
+                    key_positions=torch.cat(
+                        (torch.arange(rows).expand(batch, -1), queries), dim=1
+                    ),
+                    context_blocks=ContextBlocks(
+                        block_size=size,
+                        context_lengths=(anchors + offset).clamp(0, rows),
+                        context_valid=padding,
+                        active_blocks=keep,
+                    ),
+                )
+                visible, active = prepare_blocks_visibility(
+                    anchors, keep, padding, size, offset
+                )
+                self.assertTrue(torch.equal(layout.visibility, visible))
+                self.assertTrue(torch.equal(layout.active_queries, active))
+
+    def test_block_layouts_derive_visibility_from_one_description(self):
+        blocks = ContextBlocks(
+            block_size=2,
+            context_lengths=torch.tensor([[1, 3]]),
+            context_valid=torch.ones(1, 4, dtype=torch.bool),
+            active_blocks=torch.tensor([[True, False]]),
+        )
+        queries = torch.tensor([[1, 2, 3, 4]])
+        keys = torch.cat((torch.arange(4)[None], queries), dim=1)
+        layout = AttentionLayout(
+            query_positions=queries, key_positions=keys, context_blocks=blocks
+        )
+        self.assertIs(layout.context_blocks, blocks)
+        for override in (
+            {"visibility": layout.visibility},
+            {"active_queries": layout.active_queries},
+        ):
+            with (
+                self.subTest(override=sorted(override)),
+                self.assertRaisesRegex(ValueError, "context_blocks determine"),
+            ):
+                AttentionLayout(
+                    query_positions=queries,
+                    key_positions=keys,
+                    context_blocks=blocks,
+                    **override,
+                )
+        with self.assertRaisesRegex(ValueError, "context-then-query"):
+            AttentionLayout(
+                query_positions=queries,
+                key_positions=keys[:, 1:],
+                context_blocks=blocks,
+            )
+        with self.assertRaisesRegex(ValueError, "visibility or context_blocks"):
+            AttentionLayout(query_positions=queries, key_positions=keys)
+        with self.assertRaisesRegex(ValueError, "active_blocks"):
+            dataclasses.replace(
+                blocks, active_blocks=torch.ones(1, 3, dtype=torch.bool)
+            )
+        with self.assertRaisesRegex(ValueError, "context_lengths"):
+            dataclasses.replace(blocks, context_lengths=torch.ones(1, 2))
