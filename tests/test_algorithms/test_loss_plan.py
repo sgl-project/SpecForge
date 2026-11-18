@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
 from specforge.algorithms.objectives.implementations import domino_ce  # noqa: F401
@@ -29,6 +30,7 @@ from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.plan import LossPlan, LossTerm
 from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
 from specforge.algorithms.objectives.projection import LinearProjection, Projection
+from specforge.algorithms.objectives.reductions import PlanResult
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_runtime._fixtures import FakeProgram, fake_spec
@@ -200,6 +202,27 @@ def distributed_reduction(rank, rendezvous):
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+class PlanResultTest(unittest.TestCase):
+    def test_per_term_normalization_never_differentiates_a_denominator(self):
+        weight = torch.tensor(2.0, requires_grad=True)
+        plan = PlanResult((ObjectiveResult(weight, weight),), (1.0,), False, {})
+        result = plan.objective_result(normalize=True, with_terms=True)
+        result.loss.backward()
+        # d/dw of w / 2 with the denominator held, not of w / w.
+        self.assertEqual(weight.grad.item(), 0.5)
+        ((coefficient, numerator, denominator),) = result.terms
+        self.assertEqual(coefficient, 1.0)
+        self.assertIs(numerator, weight)
+        self.assertFalse(denominator.requires_grad)
+
+    def test_terms_come_with_per_term_normalization_only(self):
+        one = torch.ones(())
+        plan = PlanResult((ObjectiveResult(one, one),), (1.0,), True, {})
+        with self.assertRaisesRegex(ValueError, "per-term normalization only"):
+            plan.objective_result(with_terms=True)
+        self.assertEqual(plan.objective_result().terms, ())
 
 
 class LossPlanTest(unittest.TestCase):

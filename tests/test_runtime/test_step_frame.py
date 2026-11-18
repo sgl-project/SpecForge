@@ -361,6 +361,46 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
             program.linear.weight.grad, torch.tensor([[2 * (1 / 6 + 3.0)]])
         )
 
+    def test_denominators_are_pooled_in_their_own_dtype(self):
+        """A sum is rounded in the dtype it is taken in: 256 + 1 is 256 in bfloat16."""
+
+        class Program(_Program):
+            def forward(self, tensors, **context):
+                value = self.linear(tensors["x"]).sum()
+                result = ObjectiveResult(value.detach(), torch.ones(()))
+                result.terms = (
+                    (1.0, value, torch.tensor(256.0, dtype=torch.bfloat16)),
+                    (1.0, value, torch.tensor(256.0)),
+                )
+                return result
+
+        program = Program()
+        with torch.no_grad():
+            program.linear.weight.fill_(1.0)
+        runner = runner_over(program, reduction="microbatch")
+        pooled = []
+
+        def all_reduce(values, *, op, group):
+            if len(pooled) < 2:
+                # The other rank holds one of each.
+                values.add_(torch.ones_like(values))
+            pooled.append(values.clone())
+
+        with (
+            mock.patch("torch.distributed.is_available", return_value=True),
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
+        ):
+            runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+        self.assertEqual(
+            [(values.dtype, values.tolist()) for values in pooled[:2]],
+            [(torch.bfloat16, [256.0]), (torch.float32, [257.0])],
+        )
+        torch.testing.assert_close(
+            program.linear.weight.grad, torch.tensor([[2 / 256 + 2 / 257]])
+        )
+
     def test_one_rank_normalizes_by_its_own_denominators(self):
         program = _TermsProgram()
         with torch.no_grad():

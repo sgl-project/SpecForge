@@ -474,19 +474,26 @@ class DataParallelRunner:
             )
         if not pooled:
             return result.numerator, result.denominator
-        # Every rank holds the same terms in the same order.
-        denominators = self.reduce_sum(
-            torch.stack([denominator for _, _, denominator in result.terms])
-        )
+        # Every rank holds the same terms in the same order. Denominators of
+        # one dtype share a reduction: a sum is rounded in the dtype it is
+        # taken in, so packing two dtypes together would change one of them.
+        device = self._device()
+        local = [denominator.to(device) for _, _, denominator in result.terms]
+        pooled_by_term = list(local)
+        for dtype in dict.fromkeys(denominator.dtype for denominator in local):
+            members = [i for i, d in enumerate(local) if d.dtype == dtype]
+            sums = self.reduce_sum(torch.stack([local[i] for i in members]))
+            for index, total in zip(members, sums):
+                pooled_by_term[index] = total
         world_size = self._world_size()
         loss = sum(
             coefficient
             * (world_size * numerator / denominator.where(denominator > 0, 1))
             for (coefficient, numerator, _), denominator in zip(
-                result.terms, denominators
+                result.terms, pooled_by_term
             )
         )
-        return loss, denominators.new_ones(())
+        return loss, pooled_by_term[0].new_ones(())
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:
