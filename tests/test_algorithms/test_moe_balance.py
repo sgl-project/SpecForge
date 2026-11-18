@@ -235,6 +235,34 @@ class MoEBalanceTest(unittest.TestCase):
             torch.stack([dispatch_balance(c) for c in counts]).mean(),
         )
 
+    def test_balance_term_counts_the_tokens_of_the_given_mask(self):
+        """The term takes the forward's token mask in routing order, whatever layout made it."""
+        config = moe_model_config()
+        model = build_draft_model(config)
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "bias_update_rate": 0.01},
+            target_head=nn.Linear(32, config.vocab_size, bias=False),
+        )
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        E, K = layer.config.num_experts, layer.config.num_experts_per_tok
+        torch.manual_seed(0)
+        scores = torch.randn(2 * 6, E).softmax(-1)
+        ids = scores.topk(K, dim=-1).indices
+        output = SimpleNamespace(
+            expert_routing=(ExpertRouting(ids, scores),), hidden_states=scores
+        )
+        keep = torch.tensor([[True] * 4 + [False] * 2, [False] + [True] * 5])
+        term, value = runtime.balance_term(output, keep, {})
+        self.assertEqual(
+            (term.output, term.reduction, value.item()), ("moe_balance", "scalar", 0.0)
+        )
+        (counts,) = runtime.statistics.counts
+        self.assertTrue(
+            torch.equal(counts, count_tokens_per_expert(ids, keep.reshape(-1), E))
+        )
+        self.assertEqual(counts.sum().item(), 9 * K)
+
     def test_the_loss_matches_transformers(self):
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
             load_balancing_loss_func,
