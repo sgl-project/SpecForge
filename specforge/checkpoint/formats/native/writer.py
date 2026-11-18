@@ -1,5 +1,6 @@
 """Dispatch native exports and publish validated replacement weights."""
 
+import errno
 import json
 import os
 import shutil
@@ -112,7 +113,15 @@ def write_native(
             elif copy_target:
                 shutil.copy2(file, staging / filename)
             else:
-                (staging / filename).symlink_to(file.resolve())
+                try:
+                    os.link(file.resolve(), staging / filename)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    raise ValueError(
+                        "Target shard and export directory are on different filesystems; "
+                        "use --copy-target for native export."
+                    ) from error
             weight_map.update({name: filename for name in retained})
         save_file(
             {key: tensor.contiguous().clone() for key, tensor in weights.items()},
