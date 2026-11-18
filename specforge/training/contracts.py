@@ -240,6 +240,12 @@ class StepRunner(Protocol):
         any rank reports an error or the values differ, so a rank-local
         failure never leaves the others waiting in a later collective. It is
         not for use inside a step.
+
+        Args:
+            error: This rank's failure, or None; any string is a failure, an
+                empty one included.
+            value: Plain data that ``==`` compares to a bool, the same on
+                every rank when the ranks agree.
         """
 
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:

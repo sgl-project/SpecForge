@@ -278,8 +278,13 @@ class DataParallelRunner:
         # optimizer state is each rank's own, and so is every rank's RNG.
         replicated = self.backend.optimizer_state_is_replicated
         return CheckpointState(
-            # The backend gathers the model on the first rank only.
-            draft=self.strategy.checkpoint_state_filter(state["model"]),
+            # The backend gathers the model on the first rank only; the others
+            # hold nothing to select from.
+            draft=(
+                self.strategy.checkpoint_state_filter(state["model"])
+                if state["model"]
+                else {}
+            ),
             rank={
                 "optimizer": None if replicated else state["optimizer"],
                 "rng": state["rng"],
@@ -302,13 +307,13 @@ class DataParallelRunner:
         failures = [
             f"rank {rank}: {failure}"
             for rank, (failure, _) in enumerate(outcomes)
-            if failure
+            if failure is not None
         ]
         if failures:
             raise RuntimeError("; ".join(failures))
-        values = [reported for _, reported in outcomes]
-        if any(reported != values[0] for reported in values):
-            raise RuntimeError(f"ranks disagree: {values}")
+        first, *others = [reported for _, reported in outcomes]
+        if any(reported != first for reported in others):
+            raise RuntimeError(f"ranks disagree: {[first, *others]}")
 
     def _train_mode(self) -> None:
         """Put the whole model in training mode before a training call.
