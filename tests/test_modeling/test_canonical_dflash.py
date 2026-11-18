@@ -7,16 +7,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dflash import DFlashDraftModel as LegacyDFlashDraftModel
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DFlashDraftModel
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -52,79 +48,7 @@ def count_layer_calls(model):
     return calls
 
 
-def legacy_name(name):
-    for prefix, replacement in (
-        ("backbone.layers.", "layers."),
-        ("backbone.final_norm.", "norm."),
-        ("fusion.", ""),
-    ):
-        if name.startswith(prefix):
-            return replacement + name[len(prefix) :]
-    return None
-
-
 class CanonicalDFlashTest(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _legacy_parity(self, device, dtype):
-        torch.manual_seed(0)
-        config = draft_config(target_bindings=(), target_logit_transform=None)
-        actual = build_draft_model(config, device=device, dtype=dtype)
-        legacy_config = legacy_dflash_config(
-            block_size=8,
-            dflash_config={"target_layer_ids": [1, 3], "mask_token_id": 63},
-        )
-        reference = LegacyDFlashDraftModel(legacy_config).to(device=device, dtype=dtype)
-        # Canonical RoPE derives FP32 frequencies after module casts. Rebuild the
-        # legacy non-persistent buffer so both models use that same frequency
-        # rule; casting the legacy buffer to BF16/FP16 would quantize it first.
-        reference.rotary_emb = Qwen3RotaryEmbedding(legacy_config).to(device)
-        reference.load_state_dict(
-            {
-                legacy_name(name): value
-                for name, value in actual.state_dict().items()
-                if legacy_name(name) is not None
-            },
-            strict=True,
-        )
-        embeddings, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-            actual.lm_head
-        )
-        ids, features, entries = inputs_for(config, device, dtype)
-        other_features = features.detach().clone().requires_grad_()
-        output = actual(ids, features, entries)
-        # Bidirectional full attention matches the fixture's explicit node.
-        expected_hidden = reference(
-            entries[0].position_ids,
-            noise_embedding=embeddings(ids),
-            target_hidden=other_features,
-        )
-        expected = head(expected_hidden)
-        torch.testing.assert_close(
-            output.hidden_states, expected_hidden, rtol=0, atol=0
-        )
-        torch.testing.assert_close(output.logits, expected, rtol=0, atol=0)
-        upstream = torch.randn_like(expected)
-        output.logits.backward(upstream)
-        expected.backward(upstream)
-        torch.testing.assert_close(features.grad, other_features.grad, rtol=0, atol=0)
-        for name, parameter in actual.named_parameters():
-            if legacy_name(name) is not None:
-                ref = dict(reference.named_parameters())[legacy_name(name)]
-            else:
-                ref = (
-                    embeddings.weight if name == "embed_tokens.weight" else head.weight
-                )
-            self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
-
-    def test_cpu_complete_legacy_forward_and_backward(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._legacy_parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_complete_legacy_forward_and_backward(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._legacy_parity("cuda", dtype)
 
     def test_bindings_round_trip_and_only_trainable_parameters_receive_gradients(self):
         for bindings in (

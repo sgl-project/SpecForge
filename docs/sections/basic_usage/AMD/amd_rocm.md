@@ -91,7 +91,7 @@ python -m pip install --no-deps tensorboard tensorboard-data-server absl-py mark
 
 The images' stock SGLang 0.5.18 lacks the generic capture extension APIs.
 Use a separate ROCm-compatible SGLang environment with the APIs documented in
-[the plugin guide](../../../../plugins/sglang-spec-capture/README.md), then install:
+[the plugin guide](https://github.com/sgl-project/SpecForge/blob/main/plugins/sglang-spec-capture/README.md), then install:
 
 ```bash
 python -m pip install --no-deps plugins/sglang-spec-capture
@@ -139,7 +139,7 @@ see the [Data Preparation](../data_preparation.md) guide.
 Offline training reads target features from disk, so the trainer only has to fit
 the draft model. It uses more storage but keeps target inference out of the
 training loop, and needs no capture service or Mooncake. This section trains a
-**Qwen3.5-4B DFlash** draft (`configs/qwen3.5-4b-dflash.json`).
+**Qwen3.5-4B DFlash** draft (`specforge/config/draft/presets/qwen3.5-4b-dflash.yaml`).
 
 ### Step 1: Capture hidden states
 
@@ -150,7 +150,7 @@ radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
 Start the compatible plugin server and Mooncake following the
-[offline guide](../../../../examples/offline/README.md), with
+[offline guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), with
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`
 and server flags `--attention-backend aiter --disable-radix-cache
 --mem-fraction-static 0.8 --context-length 2560`. Then run the CPU client:
@@ -159,8 +159,7 @@ and server flags `--attention-backend aiter --disable-radix-cache
 python scripts/prepare_hidden_states.py \
   --server-urls http://127.0.0.1:30000 \
   --target-model-path Qwen/Qwen3.5-4B \
-  --strategy dflash \
-  --draft-model-config configs/qwen3.5-4b-dflash.json \
+  --draft specforge/config/draft/presets/qwen3.5-4b-dflash.yaml \
   --trust-remote-code \
   --data-path ./cache/dataset/sharegpt_train.jsonl \
   --output-path ./cache/hidden_states/qwen3.5-4b-dflash-sharegpt \
@@ -263,7 +262,7 @@ mooncake_master --enable_http_metadata_server=true \
 
 Start the plugin-enabled capture server on GPU 0. **The `--return-aux-hidden-state-layer-ids`
 must match the draft's `target_layer_ids`** — for DFlash these are read straight
-from `configs/qwen3.5-4b-dflash.json`: `1 8 15 22 29` (this is not the EAGLE3
+from `specforge/config/draft/presets/qwen3.5-4b-dflash.yaml`: `1 8 15 22 29` (this is not the EAGLE3
 `[1, num_layers//2 - 1, num_layers - 4]` formula). A mismatch produces zero
 features with no error. Because Qwen3.5-4B is a hybrid Mamba target, the server
 must run under **AITER** with `--attention-backend aiter` and
@@ -397,7 +396,7 @@ linear-attention/Mamba target (`Qwen3_5ForConditionalGeneration`); its draft is 
 5-layer DFlash head (`hidden_size=2560`, `block_size=16`,
 `target_layer_ids=[1, 8, 15, 22, 29]`). Both runs used `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, a `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, a `flex_attention`
 trainer, and ~10 epochs (~680 optimizer steps).
 
 The SGLang side (offline capture and online capture server) runs the hybrid
@@ -470,7 +469,7 @@ The same **Qwen3.5-4B DFlash** recipe was reproduced end-to-end on a single AMD
 Instinct **MI300X** (gfx942) inside the `lmsysorg/sglang:v0.5.14-rocm720-mi30x`
 container, using identical hyperparameters (offline and online, `max_length=2048`,
 `chat_template=qwen3.5`, `batch_size=2`, `accumulation_steps=4`,
-`learning_rate=6e-4`, `num_anchors=512`, `loss_decay_gamma=7`, `flex_attention`
+`learning_rate=6e-4`, `num_anchors=512`, `weighting: {kind: exponential, gamma: 7}`, `flex_attention`
 trainer, ~10 epochs). The ROCm requirements are the same as on MI355X: run the
 hybrid Mamba target under **AITER**
 (`SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`,

@@ -46,12 +46,13 @@ class CanonicalReviewTest(unittest.TestCase):
         runtime.draft_model = torch.nn.Linear(1, 1)
         runtime.draft_model.config = SimpleNamespace(draft=None)
         ratios = {
-            "position_1_accuracy": (torch.tensor(1.0), torch.tensor(2.0)),
-            "position_0_accuracy": (torch.tensor(3.0), torch.tensor(4.0)),
+            "acc_1": (torch.tensor(1.0), torch.tensor(2.0)),
+            "acc_0": (torch.tensor(3.0), torch.tensor(4.0)),
         }
         result = SimpleNamespace(
             loss=torch.tensor(1.0),
             ratios=ratios,
+            sums={},
             numerator=torch.tensor(1.0),
             denominator=torch.tensor(1.0),
         )
@@ -118,7 +119,10 @@ class CanonicalReviewTest(unittest.TestCase):
             cfg = run_config(
                 target,
                 draft_config(),
-                training={"attention_backend": "eager", "loss": {"kind": "kl"}},
+                training={
+                    "attention_backend": "eager",
+                    "loss": {"terms": {"token": {"kind": "kl"}}},
+                },
             )
             resolved = resolve_run(cfg)
             bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
@@ -137,16 +141,10 @@ class CanonicalReviewTest(unittest.TestCase):
                 ("fused_logits_loss", False),
                 ("mtp_objective_chunk_size", 1),
             ):
-                changed = cfg.model_copy(deep=True)
-                setattr(changed.training, name, value)
+                changed = cfg.model_dump()
+                changed["training"][name] = value
                 with self.assertRaisesRegex(ValueError, name):
-                    resolve_run(changed)
-            cfg.training.objective_chunk_blocks = 128
-            with self.assertLogs(
-                "specforge.training.canonical", level="WARNING"
-            ) as logs:
-                resolve_run(cfg)
-            self.assertIn("do not enable", logs.output[0])
+                    Config.model_validate(changed)
             for name in ("embedding_key", "lm_head_key"):
                 owned = run_config(
                     target,
@@ -165,7 +163,10 @@ class CanonicalReviewTest(unittest.TestCase):
             self.assertEqual(cfg.resume_path, "second")
             self.assertIsNone(cfg.training.resume_from)
             self.assertIsNone(
-                Config.model_validate(cfg.model_dump() | {"resume": None}).resume_path
+                Config.model_validate(
+                    cfg.model_dump()
+                    | {"resume": None, "draft": encode_config(draft_config())}
+                ).resume_path
             )
             path = Path(temp) / "checkpoint"
             path.mkdir()
@@ -178,35 +179,131 @@ class CanonicalReviewTest(unittest.TestCase):
                 encode_config(draft_config()),
             )
 
-    def test_legacy_dspine_requires_explicit_matching_training_settings(self):
+    def test_explicit_weighting_survives_the_second_resolution(self):
+        """resolve_run writes the options back; build_bundle resolves them again."""
         from specforge.algorithms.objectives import resolve_objective
-        from specforge.training.canonical import _validate_imported_objective
-        from tests.test_config.test_draft_legacy_dspine import dspine_payload
+        from specforge.training.canonical import _objective_settings
+        from tests.test_modeling.test_canonical_dspine import (
+            model_config as dspine_config,
+        )
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
 
         with TemporaryDirectory() as temp:
-            source = Path(temp)
-            payload = dspine_payload()
-            payload["dspine_config"]["ce_weight"] = 0.3
-            (source / "config.json").write_text(json.dumps(payload))
-            cfg = run_config(
-                source, draft_config(), initialization={"checkpoint": temp}
+            target = target_directory(Path(temp))
+            for config in (eagle_config(), dspine_config()):
+                with self.subTest(architecture=config.architecture):
+                    cfg = run_config(
+                        target, config, training={"weighting": {"kind": "uniform"}}
+                    )
+                    run = resolve_run(cfg)
+                    again = resolve_objective(
+                        config.architecture, **_objective_settings(run.config)
+                    )
+                    self.assertEqual(again.weighting.kind, "uniform")
+
+    def test_logging_options_are_not_part_of_the_resume_record(self):
+        from specforge.algorithms.objectives import objective_record
+
+        saved = {"num_anchors": 8, "loss_decay_gamma": None}
+        for name, logged in (
+            ("dflash", {"teacher_metrics": True, "metric_top_k": 4}),
+            ("dflash2", {"teacher_metrics": True}),
+        ):
+            with self.subTest(objective=name):
+                self.assertEqual(objective_record(name, {**saved, **logged}), saved)
+        self.assertEqual(objective_record("dspark", saved), saved)
+
+    def test_built_resume_contract_is_the_record_written_before_logging_options(self):
+        from specforge.training.assembly import build_model_bundle
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for options in ({}, {"teacher_metrics": True, "metric_top_k": 4}):
+                with self.subTest(options=options):
+                    cfg = run_config(
+                        target,
+                        draft_config(),
+                        training={
+                            "attention_backend": "eager",
+                            "objective_options": options,
+                        },
+                    )
+                    resolved = resolve_run(cfg)
+                    bundle = build_model_bundle(
+                        resolved.config, algorithm=resolved.algorithm
+                    )
+                    self.assertEqual(
+                        bundle.strategy_kwargs.resume_contract[
+                            "canonical_objective_options"
+                        ],
+                        {"num_anchors": 512, "loss_decay_gamma": None},
+                    )
+
+    def test_resume_accepts_a_record_saved_with_logging_options(self):
+        from tests.test_runtime import test_checkpoint_resume as resume_tests
+
+        harness = resume_tests.TestTrainerResumeEntrypoint()
+        if not torch.distributed.is_initialized():
+            harness.setUpClass()
+            self.addCleanup(harness.tearDownClass)
+        trained = {"num_anchors": 8, "loss_decay_gamma": None}
+
+        def contract(options):
+            return {
+                "canonical_objective": "dflash",
+                "canonical_objective_options": options,
+            }
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            features = resume_tests._write_feature_files(str(root / "features"), n=4)
+            trainer, _, _ = harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=1,
+                checkpoint_extra=contract(
+                    {**trained, "teacher_metrics": True, "metric_top_k": 4}
+                ),
             )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
-                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
-            _validate_imported_objective(
-                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
+            trainer.fit()
+            source = str((root / "run" / "rz-latest").resolve())
+            harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=2,
+                checkpoint_extra=contract(trained),
+                resume_from=source,
             )
-            # the same JSON given as `draft:` must not drop its settings either
-            legacy = source / "old_dspine.json"
-            legacy.write_text(json.dumps(payload))
-            cfg = run_config(source, draft_config(), initialization={}).model_copy(
-                update={"draft": str(legacy)}
-            )
-            with self.assertRaisesRegex(ValueError, "objective_options.ce_weight"):
-                _validate_imported_objective(cfg, resolve_objective("DSpineDraftModel"))
-            _validate_imported_objective(
-                cfg, resolve_objective("DSpineDraftModel", options={"ce_weight": 0.3})
-            )
+            # the options that fix the trajectory are still compared
+            with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+                harness._make_trainer(
+                    str(root / "run"),
+                    feat_dir=features,
+                    max_steps=2,
+                    checkpoint_extra=contract({**trained, "num_anchors": 16}),
+                    resume_from=source,
+                )
+
+    def test_legacy_compact_teacher_is_not_silently_accepted(self):
+        from tests.test_modeling.test_canonical_eagle3 import (
+            model_config as eagle_config,
+        )
+        from tests.test_modeling.test_canonical_peagle import (
+            model_config as peagle_config,
+        )
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for config in (eagle_config(), peagle_config()):
+                with self.subTest(architecture=config.architecture):
+                    cfg = run_config(target, config)
+                    cfg.training.batch_size = 1
+                    raw = cfg.model_dump()
+                    raw["training"]["compact_teacher"] = True
+                    with self.assertRaisesRegex(ValueError, "compact_teacher"):
+                        Config.model_validate(raw)
 
     def test_scratch_embedding_key_survives_resume(self):
         """A scratch run that needed model.embedding_key must resume with it."""
@@ -358,54 +455,6 @@ class CanonicalReviewTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "vocab_mapping_path disagrees"):
                 build_model_bundle(resolved.config, algorithm=resolved.algorithm)
 
-    def test_legacy_import_accepts_matching_aux_layer_override(self):
-        """The documented legacy override must reach the legacy reader."""
-        import shutil
-
-        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
-        with TemporaryDirectory() as temp:
-            target = target_directory(Path(temp))
-            legacy = shutil.copytree(fixture, Path(temp) / "legacy")
-
-            def resolve(layers):
-                raw = dict(
-                    model={
-                        "target_model_path": str(target),
-                        "torch_dtype": "float32",
-                        "mask_token_id": 63,
-                        "aux_hidden_state_layer_ids": layers,
-                    },
-                    initialization={"checkpoint": str(legacy)},
-                    data={"hidden_states_path": str(Path(temp) / "features")},
-                    training={"attention_backend": "eager", "batch_size": 1},
-                )
-                return resolve_run(Config.model_validate(raw))
-
-            features = resolve([1, 2, 3]).config.draft["spec_config"]["target_features"]
-            self.assertEqual(list(features["target_layer_ids"]), [1, 2, 3])
-            with self.assertRaisesRegex(ValueError, "capture_layers conflict"):
-                resolve([1, 2, 4])
-            # weights_from keeps the supplied draft's layers, so an override is refused
-            from specforge.loading import read_draft
-
-            imported = read_draft(
-                legacy, target=target, legacy_settings={"mask_token_id": 63}
-            ).config
-            raw = dict(
-                model={
-                    "target_model_path": str(target),
-                    "torch_dtype": "float32",
-                    "mask_token_id": 63,
-                    "aux_hidden_state_layer_ids": [1, 2, 3],
-                },
-                draft=encode_config(imported),
-                initialization={"weights_from": {"checkpoint": str(legacy)}},
-                data={"hidden_states_path": str(Path(temp) / "features")},
-                training={"attention_backend": "eager", "batch_size": 1},
-            )
-            with self.assertRaisesRegex(ValueError, "would be ignored"):
-                resolve_run(Config.model_validate(raw))
-
     def test_objective_frozen_head_that_the_draft_disables_needs_no_weights(self):
         """DSpark freezes its confidence head at alpha 0, which a draft may omit."""
         from specforge.training.assembly import build_model_bundle
@@ -419,7 +468,7 @@ class CanonicalReviewTest(unittest.TestCase):
                     dspark(confidence=confidence),
                     training={
                         "attention_backend": "eager",
-                        "objective_options": {"confidence_loss_alpha": 0.0},
+                        "loss": {"terms": {"confidence": {"coefficient": 0.0}}},
                     },
                 )
                 resolved = resolve_run(cfg)
@@ -471,70 +520,6 @@ class CanonicalReviewTest(unittest.TestCase):
                     target_config=store.config,
                     from_target={"embed_tokens.weight": "model.embed_tokens.weight"},
                 )
-
-    def test_legacy_import_settings_may_repeat_on_canonical_resume(self):
-        """The import YAML with initialization swapped for resume must still run."""
-        import shutil
-
-        from specforge.checkpoint import save_draft
-        from specforge.loading import load_draft
-
-        fixture = Path(__file__).resolve().parents[1] / "fixtures/legacy_peagle"
-        with TemporaryDirectory() as temp:
-            target = target_directory(Path(temp))
-            legacy = shutil.copytree(fixture, Path(temp) / "legacy")
-            model = load_draft(
-                legacy, target=target, legacy_settings={"mask_token_id": 63}
-            )
-            resumed = Path(temp) / "resumed"
-            save_draft(model, resumed)
-            torch.save({}, resumed / "training_state.pt")
-
-            def resolve(**settings):
-                raw = dict(
-                    model={
-                        "target_model_path": str(target),
-                        "torch_dtype": "float32",
-                        **settings,
-                    },
-                    resume=str(resumed),
-                    data={"hidden_states_path": str(Path(temp) / "features")},
-                    training={"attention_backend": "eager", "batch_size": 1},
-                )
-                return resolve_run(Config.model_validate(raw))
-
-            spec = resolve(mask_token_id=63).config.draft["spec_config"]
-            self.assertEqual(spec["mask_token_id"], 63)
-            with self.assertRaisesRegex(ValueError, "model.mask_token_id=62"):
-                resolve(mask_token_id=62)
-            raw = dict(
-                model={"target_model_path": str(target), "mask_token_id": 63},
-                resume=str(legacy),
-                data={"hidden_states_path": str(Path(temp) / "features")},
-                training={"attention_backend": "eager", "batch_size": 1},
-            )
-            torch.save({}, Path(legacy) / "training_state.pt")
-            with patch("specforge.loading.read_draft") as read:
-                with self.assertRaisesRegex(ValueError, "legacy full resume"):
-                    resolve_run(Config.model_validate(raw))
-                read.assert_not_called()
-
-    def test_resume_override_can_clear_a_recipe_initialization(self):
-        """The native MTP recipe sets initialization; resuming it needs no YAML copy."""
-        from specforge.config import load_config
-
-        recipe = Path(__file__).resolve().parents[2] / (
-            "examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml"
-        )
-        cfg = load_config(str(recipe))
-        self.assertIsNotNone(cfg.initialization)
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-            apply_overrides(cfg, ["training.resume_from=out/run-latest"])
-        resumed = apply_overrides(
-            cfg, ["training.resume_from=out/run-latest", "initialization=null"]
-        )
-        self.assertIsNone(resumed.initialization)
-        self.assertEqual(resumed.resume_path, "out/run-latest")
 
     def test_cli_overrides_do_not_warn_about_unset_legacy_options(self):
         """apply_overrides marks every field set; only YAML values may warn."""

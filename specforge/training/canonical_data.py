@@ -27,13 +27,69 @@ def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
             "offline record fails the objective's loss-mask requirement "
             f"({loss_mask_filter.__name__})"
         )
+    if "lengths" in raw:
+        lengths = raw["lengths"].flatten().long()
+        if lengths.numel() == 0 or (lengths <= 0).any():
+            raise ValueError("lengths must contain positive document lengths")
+        starts = lengths.cumsum(0) - lengths
+        result["lengths"] = lengths.minimum(length - starts)[starts < length]
     result["attention_mask"] = torch.ones_like(result["input_ids"], dtype=torch.bool)
     return result
 
 
-def build_normalizer(max_len, *, keys, loss_mask_filter=None, **topology):
-    return partial(
+def shard_sequence(sample, *, rank, size, overlap):
+    """Keep owned rows plus teacher lookahead, with global RoPE coordinates."""
+    import torch
+
+    if "lengths" in sample:
+        raise ValueError("packed documents are not supported with USP")
+    length = sample["input_ids"].shape[1]
+    chunk = (length + size - 1) // size
+    start, width = rank * chunk, chunk + overlap
+    result = {}
+    for name, tensor in sample.items():
+        part = tensor[:, start : start + width]
+        zeros = tensor.new_zeros(
+            tensor.shape[0], width - part.shape[1], *tensor.shape[2:]
+        )
+        result[name] = torch.cat((part, zeros), dim=1).contiguous()
+    result["position_ids"] = (
+        torch.arange(start, start + width, device=sample["input_ids"].device)
+        .unsqueeze(0)
+        .expand(sample["input_ids"].shape[0], -1)
+    )
+    return result
+
+
+def normalize_parallel_sample(raw, *, normalizer, rank, size, overlap):
+    return shard_sequence(normalizer(raw), rank=rank, size=size, overlap=overlap)
+
+
+def build_normalizer(
+    max_len,
+    *,
+    keys,
+    loss_mask_filter=None,
+    overlap=1,
+    use_usp_preprocess=False,
+    **topology,
+):
+    normalizer = partial(
         normalize_sample, keys=keys, max_len=max_len, loss_mask_filter=loss_mask_filter
+    )
+    if not use_usp_preprocess:
+        return normalizer
+    import torch.distributed as dist
+
+    from specforge.distributed import get_draft_sp_group
+
+    group = get_draft_sp_group()
+    return partial(
+        normalize_parallel_sample,
+        normalizer=normalizer,
+        rank=dist.get_rank(group),
+        size=dist.get_world_size(group),
+        overlap=overlap,
     )
 
 
@@ -54,10 +110,19 @@ def collate(features, *, keys):
         }
         for feature in features
     ]
-    all_keys = (*keys, "attention_mask")
-    return pad_and_concatenate_features(
+    all_keys = (
+        *keys,
+        "attention_mask",
+        *(("position_ids",) if "position_ids" in features[0] else ()),
+    )
+    result = pad_and_concatenate_features(
         features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
     )
+    if any("lengths" in feature for feature in features):
+        if len(features) != 1:
+            raise ValueError("packed documents require batch size one")
+        result["lengths"] = features[0]["lengths"]
+    return result
 
 
 def build_collator(*, keys):
@@ -71,6 +136,11 @@ def build_reader(hidden_states_path, *, strategy, keys, **kwargs):
         hidden_states_path,
         strategy=strategy,
         feature_keys=keys,
+        feature_aliases={
+            "hidden_states": ("aux_hidden_state",),
+            "target_last_hidden_states": ("hidden_state",),
+        },
+        optional_features=("lengths",),
         target_repr="hidden_state" if "target_last_hidden_states" in keys else None,
         **kwargs,
     )

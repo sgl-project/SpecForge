@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,7 +28,10 @@ class CIDependencyTest(unittest.TestCase):
         self.modules.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        (self.bin / "python").symlink_to(sys.executable)
+        # A relocated Python symlink can lose the interpreter's virtualenv.
+        python = self.bin / "python"
+        python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+        python.chmod(0o755)
         self.env = {
             **os.environ,
             "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
@@ -53,6 +57,17 @@ class CIDependencyTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def setup_fa(self):
+        # Fake uv manages only fixture metadata, not the host's real FA install.
+        (self.modules / "sitecustomize.py").write_text(
+            "import os\n"
+            "from importlib import metadata\n"
+            "original = metadata.distributions\n"
+            "def distributions(**kwargs):\n"
+            "    if kwargs.get('name') == 'flash-attn':\n"
+            "        kwargs['path'] = [os.path.dirname(__file__)]\n"
+            "    return original(**kwargs)\n"
+            "metadata.distributions = distributions\n"
+        )
         (self.modules / "torch.py").write_text(
             "import os\n"
             "__version__ = os.environ.get('TEST_TORCH', '2.13.0+cu130')\n"

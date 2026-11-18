@@ -20,9 +20,6 @@ from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
 from specforge.config.draft.rope import DefaultRoPESpec, NoRoPESpec
 from specforge.modeling.draft.backbone import DraftBackbone
-from specforge.modeling.draft.dflash import Qwen3DFlashDecoderLayer
-from specforge.modeling.draft.dflash2 import DFlashGroupedConv, Qwen3DFlash2DecoderLayer
-from specforge.modeling.draft.dflash_kernels import DEFAULT_DFLASH_KERNELS
 from specforge.modeling.draft.layers import DecoderLayer, build_component
 from specforge.modeling.draft.layers.attention.backends import AttentionPreparationScope
 from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
@@ -33,6 +30,7 @@ from specforge.modeling.draft.layers.residual import (
     StandardResidualConnection,
 )
 from specforge.modeling.draft.layers.rope import build_rotary
+from tests.test_modeling.attention_reference import context_layer
 from tests.test_modeling.test_draft_gqa import build, layout_for, make_node
 
 
@@ -136,27 +134,6 @@ class DecoderTest(unittest.TestCase):
                         else Qwen3Config(**args)
                     )
                     config._attn_implementation = "eager"
-                    if kind == "convolution":
-                        reference = Qwen3DFlash2DecoderLayer(
-                            config,
-                            0,
-                            DEFAULT_DFLASH_KERNELS,
-                            attention_conv=DFlashGroupedConv(16, 4, 3, 4),
-                            mlp_conv=DFlashGroupedConv(16, 4, 3, 4),
-                        )
-                        with torch.no_grad():
-                            for conv in (reference.attention_conv, reference.mlp_conv):
-                                for parameter in conv.parameters():
-                                    parameter.normal_(std=0.1)
-                    elif kind == "context":
-                        reference = Qwen3DFlashDecoderLayer(
-                            config, 0, DEFAULT_DFLASH_KERNELS
-                        )
-                    else:
-                        reference = (
-                            Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer
-                        )(config, 0)
-                    reference.to(device=device, dtype=dtype)
                     actual = make_layer(
                         node,
                         rotary_dim=rotary_dim,
@@ -165,7 +142,21 @@ class DecoderTest(unittest.TestCase):
                         dtype=dtype,
                         convolution=kind == "convolution",
                     )
-                    actual.load_state_dict(reference.state_dict(), strict=True)
+                    if kind in ("context", "convolution"):
+                        # No library layer has these; the reference is the
+                        # direct formula over a second copy of the weights.
+                        if kind == "convolution":
+                            with torch.no_grad():
+                                for conv in (actual.attention_conv, actual.mlp_conv):
+                                    for parameter in conv.parameters():
+                                        parameter.normal_(std=0.1)
+                        reference = copy.deepcopy(actual)
+                    else:
+                        reference = (
+                            Qwen3_5DecoderLayer if gated else Qwen3DecoderLayer
+                        )(config, 0)
+                        reference.to(device=device, dtype=dtype)
+                        actual.load_state_dict(reference.state_dict(), strict=True)
                     hidden = torch.randn(
                         2,
                         8 if kind == "convolution" else 3,
@@ -237,28 +228,37 @@ class DecoderTest(unittest.TestCase):
                                 attention_mask=bias,
                             )
                         else:
-                            expected = reference(
-                                hidden_states=other,
-                                target_hidden=other_context,
-                                position_embeddings=embeddings,
-                                attention_mask=bias,
+                            expected = context_layer(
+                                reference,
+                                other,
+                                other_context,
+                                embeddings,
+                                mask,
+                                head_dim=node.head_dim,
+                                dropout=node.attention_dropout,
                             )
-                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    # The library layers run the same operations in the same
+                    # order; the formulas differ in operation order.
+                    close = (
+                        dict(rtol=0, atol=0)
+                        if context is None
+                        else dict(rtol=1e-5, atol=1e-6)
+                    )
+                    torch.testing.assert_close(output, expected, **close)
                     upstream = torch.randn_like(output)
                     output.backward(upstream)
                     expected.backward(upstream)
-                    torch.testing.assert_close(hidden.grad, other.grad, rtol=0, atol=0)
+                    torch.testing.assert_close(hidden.grad, other.grad, **close)
                     if context is not None:
                         torch.testing.assert_close(
-                            context.grad, other_context.grad, rtol=0, atol=0
+                            context.grad, other_context.grad, **close
                         )
                     for name, parameter in actual.named_parameters():
                         self.assertIsNotNone(parameter.grad, name)
                         torch.testing.assert_close(
                             parameter.grad,
                             dict(reference.named_parameters())[name].grad,
-                            rtol=0,
-                            atol=0,
+                            **close,
                         )
 
     def test_cpu_whole_layer_outputs_and_gradients(self):

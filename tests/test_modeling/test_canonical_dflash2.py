@@ -4,24 +4,17 @@ import copy
 import unittest
 from dataclasses import replace
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 import torch
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 from specforge.config.draft.architecture import DFlash2Spec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
 from specforge.modeling import build_draft_model
-from specforge.modeling.draft.dflash2 import (
-    DFlash2DraftModel as LegacyDFlash2DraftModel,
-)
 from specforge.modeling.draft.layers.inputs import LayerInputs
-from specforge.modeling.draft.models import DFlash2DraftModel, DFlashDraftModel
+from specforge.modeling.draft.models import DFlash2DraftModel
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_modeling.legacy_fixtures import legacy_dflash_config
-from tests.test_modeling.legacy_rope_reference import legacy_fp32_rope
-from tests.test_modeling.test_canonical_dflash import count_layer_calls, legacy_name
+from tests.test_modeling.test_canonical_dflash import count_layer_calls
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -75,91 +68,6 @@ def score(model, output, options):
 
 
 class CanonicalDFlash2Test(unittest.TestCase):
-    @legacy_fp32_rope()
-    def _parity(self, device, dtype):
-        torch.manual_seed(0)
-        config = dflash2_config()
-        actual = build_draft_model(config, device=device, dtype=dtype)
-        self.assertNotIsInstance(actual, DFlashDraftModel)
-        with torch.no_grad():
-            actual.candidate_selector.successor_codebook.normal_(std=0.1)
-            for layer in actual.backbone.layers:
-                for conv in (layer.attention_conv, layer.mlp_conv):
-                    conv.kernel_projection.weight.normal_(std=0.03)
-        legacy = legacy_dflash_config(
-            block_size=8,
-            dflash_config={
-                "target_layer_ids": [1, 3],
-                "mask_token_id": 63,
-                "conv_kernel_size": 3,
-                "conv_group_size": 4,
-                "selector_rank": 4,
-                "selector_top_k": 3,
-                "output_multiplier": 1.7,
-                "final_logit_softcapping": 2.5,
-            },
-        )
-        reference = LegacyDFlash2DraftModel(legacy).to(device=device, dtype=dtype)
-        reference.rotary_emb = Qwen3RotaryEmbedding(legacy).to(device)
-        reference.load_state_dict(
-            {
-                legacy_name(name) or name: value
-                for name, value in actual.state_dict().items()
-                if name not in ("embed_tokens.weight", "lm_head.weight")
-            },
-            strict=True,
-        )
-        embedding, head = copy.deepcopy(actual.embed_tokens), copy.deepcopy(
-            actual.lm_head
-        )
-        (ids, features, entries), options = model_inputs(config, device, dtype)
-        other = features.detach().clone().requires_grad_()
-        output = actual(ids, features, entries)
-        actual_scores = score(actual, output, options)
-        with patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}):
-            hidden = reference(
-                entries[0].position_ids,
-                noise_embedding=embedding(ids),
-                target_hidden=other,
-            )
-        logits = reference.transform_unary_logits(head(hidden))
-        scores = reference.candidate_selector.score_candidates(
-            **options,
-            unary_logits=logits.gather(-1, options["candidate_ids"]),
-            hidden_states=hidden,
-        )
-        torch.testing.assert_close(
-            (output.hidden_states, output.logits, actual_scores),
-            (hidden, logits, scores),
-            rtol=0,
-            atol=0,
-        )
-        self.assertEqual(output.logits.dtype, torch.float32)
-        upstream = torch.randn_like(scores)
-        actual_scores.backward(upstream)
-        scores.backward(upstream)
-        torch.testing.assert_close(features.grad, other.grad, rtol=0, atol=0)
-        for name, parameter in actual.named_parameters():
-            ref = (
-                embedding.weight
-                if name == "embed_tokens.weight"
-                else (
-                    head.weight
-                    if name == "lm_head.weight"
-                    else dict(reference.named_parameters())[legacy_name(name) or name]
-                )
-            )
-            self.assertIsNotNone(parameter.grad, name)
-            torch.testing.assert_close(parameter.grad, ref.grad, rtol=0, atol=0)
-
-    def test_cpu_complete_legacy_computation(self):
-        for dtype in (torch.float32, torch.bfloat16):
-            self._parity("cpu", dtype)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_cuda_complete_legacy_computation(self):
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            self._parity("cuda", dtype)
 
     def test_bound_weights_checkpointing_and_hf_restore(self):
         config = dflash2_config(bound=True)
