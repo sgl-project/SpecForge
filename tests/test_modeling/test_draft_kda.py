@@ -5,10 +5,12 @@ import unittest
 from dataclasses import replace
 
 import torch
+import yaml
 from torch import nn
 
 from specforge.algorithms.objectives import build_objective_model
 from specforge.config.draft.attention import KDASpec
+from specforge.config.draft.codec import parse_draft
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.rope import DefaultRoPESpec
 from specforge.modeling import build_draft_model
@@ -28,6 +30,7 @@ from specforge.modeling.draft.layers.attention.masks import (
 )
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_kda_spec import PRESET
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
 from tests.test_modeling.test_canonical_dmtp import model_config as dmtp_config
 from tests.test_modeling.test_canonical_domino import model_config as domino_config
@@ -369,6 +372,15 @@ class KDAAttentionTest(unittest.TestCase):
 
 
 class KDAHybridTrainingTest(unittest.TestCase):
+    def test_preset_builds_kimi_shaped_kda_layers(self):
+        config = parse_draft(yaml.safe_load(PRESET.read_text()), target_config=None)
+        model = build_draft_model(config, device="meta")
+        kinds = [type(layer.self_attn) for layer in model.backbone.layers]
+        self.assertEqual(kinds.count(KDAAttention), 4)
+        attention = model.backbone.layers[0].self_attn
+        self.assertEqual(attention.q_proj.weight.shape, (2048, 5120))
+        self.assertEqual(attention.A_log.shape, (16,))
+
     def test_hybrid_stacks_train_every_parameter_on_block_architectures(self):
         for config in (
             draft_config(target_bindings=(), target_logit_transform=None),

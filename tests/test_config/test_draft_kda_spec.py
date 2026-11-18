@@ -10,13 +10,11 @@ import yaml
 from specforge.config.draft.attention import KDASpec
 from specforge.config.draft.codec import encode_config, parse_draft
 from specforge.config.draft.codec.components import decode_component, encode_component
-from specforge.modeling import build_draft_model
-from specforge.modeling.draft.layers.attention.kda import KDAAttention
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.test_draft_dspine_spec import dspine_config
+from tests.test_config.test_draft_eagle3_spec import eagle_config
 from tests.test_config.test_draft_mtp_spec import mtp_config
-from tests.test_modeling.test_canonical_dspine import model_config as dspine_config
-from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
-from tests.test_modeling.test_canonical_peagle import model_config as peagle_config
+from tests.test_config.test_draft_peagle_spec import peagle_config
 
 PRESET = (
     Path(__file__).resolve().parents[2]
@@ -119,16 +117,10 @@ class KDAArchitectureTest(unittest.TestCase):
                 ):
                     with_kda(config, layers=range(len(config.layer_types)))
 
-    def test_preset_round_trips_and_builds_the_hybrid_stack(self):
+    def test_preset_round_trips_the_hybrid_stack(self):
         config = parse_draft(yaml.safe_load(PRESET.read_text()), target_config=None)
         self.assertEqual(
             [config.layer_configs[name].attention for name in config.layer_types],
             ["kda", "kda", "sliding_attention", "kda", "kda"],
         )
         self.assertEqual(parse_draft(encode_config(config), target_config=None), config)
-        model = build_draft_model(config, device="meta")
-        kinds = [type(layer.self_attn) for layer in model.backbone.layers]
-        self.assertEqual(kinds.count(KDAAttention), 4)
-        attention = model.backbone.layers[0].self_attn
-        self.assertEqual(attention.q_proj.weight.shape, (2048, 5120))
-        self.assertEqual(attention.A_log.shape, (16,))
