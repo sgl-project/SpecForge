@@ -20,6 +20,7 @@ import argparse
 import os
 import random
 import re
+import shutil
 import socket
 import struct
 import sys
@@ -45,18 +46,24 @@ from tests.test_runtime.test_canonical_end_to_end import drafts, write_run
 
 EPOCHS = 2
 BATCHES_PER_EPOCH = 3
-# World size, accumulation window, wrapper, parameter dtype, log interval.
+# What each case changes from one DDP rank that logs every update.
 # Under bfloat16 the optimizer's fp32 masters hold bits the parameters do not.
 # A log interval of two leaves updates whose forward collects no detailed
-# metrics, which is what most updates of a real run are.
+# metrics, which is what most updates of a real run are. An evaluated case
+# runs an evaluation pass after every update.
+_TWO_RANKS = dict(world_size=2, accumulation_steps=2)
+_SHARDED = dict(sharding="SHARD_GRAD_OP")
 TOPOLOGIES = (
-    (1, 1, "NO_SHARD", "float32", 1),
-    (1, 2, "NO_SHARD", "float32", 1),
-    (2, 2, "NO_SHARD", "float32", 1),
-    (2, 2, "NO_SHARD", "float32", 2),
-    (2, 2, "NO_SHARD", "bfloat16", 1),
-    (2, 2, "SHARD_GRAD_OP", "float32", 1),
-    (4, 2, "SHARD_GRAD_OP", "bfloat16", 1),
+    dict(),
+    dict(accumulation_steps=2),
+    dict(evaluated=True),
+    _TWO_RANKS,
+    _TWO_RANKS | dict(log_interval=2),
+    _TWO_RANKS | dict(dtype="bfloat16"),
+    _TWO_RANKS | dict(evaluated=True),
+    _TWO_RANKS | _SHARDED,
+    _TWO_RANKS | _SHARDED | dict(evaluated=True),
+    dict(world_size=4, accumulation_steps=2, dtype="bfloat16") | _SHARDED,
 )
 # What a checkpoint's shared file says about the run's progress and weights.
 SHARED_STATE = (
@@ -83,13 +90,14 @@ class Case:
     sharding: str = "NO_SHARD"
     dtype: str = "float32"
     log_interval: int = 1
+    evaluated: bool = False
 
     @property
     def name(self):
         return (
             f"{self.architecture}/ranks{self.world_size}"
             f"/accumulation{self.accumulation_steps}/{self.sharding}/{self.dtype}"
-            f"/log{self.log_interval}"
+            f"/log{self.log_interval}" + ("/evaluated" if self.evaluated else "")
         )
 
     @property
@@ -100,19 +108,17 @@ class Case:
 
 def every_case(ranks=()):
     """Every architecture under every topology, and under each extra world size."""
-    topologies = TOPOLOGIES + tuple(
-        topology
-        for world_size in ranks
-        for topology in (
-            (world_size, 2, "NO_SHARD", "float32", 1),
-            (world_size, 2, "SHARD_GRAD_OP", "bfloat16", 1),
+    topologies = list(TOPOLOGIES)
+    for world_size in ranks:
+        wider = dict(world_size=world_size, accumulation_steps=2)
+        topologies += [wider, wider | _SHARDED | dict(dtype="bfloat16")]
+    return list(
+        dict.fromkeys(
+            Case(draft.architecture, **topology)
+            for draft in drafts()
+            for topology in topologies
         )
     )
-    return [
-        Case(draft.architecture, *topology)
-        for draft in drafts()
-        for topology in dict.fromkeys(topologies)
-    ]
 
 
 def cases(ranks=()):
@@ -143,6 +149,15 @@ def _vary_records(features):
         supervised = record["loss_mask"].nonzero().flatten()
         record["loss_mask"][supervised[len(supervised) - index % 3 :]] = 0
         torch.save(record, path)
+
+
+def _evaluation(root, world_size):
+    """Set two of the run's records per rank aside as its evaluation data."""
+    held_out = root / "evaluation"
+    held_out.mkdir()
+    for path in sorted((root / "features").iterdir())[: 2 * world_size]:
+        shutil.copy(path, held_out)
+    return [f"data.eval_hidden_states_path={held_out}", "training.eval_interval=1"]
 
 
 def _free_port():
@@ -295,27 +310,42 @@ def _train_rank(rank, world_size, runs):
         torch.save(ended, Path(output) / f"ended-rank{rank}.pt")
 
 
-def _logged(events, case):
-    """What the rank logged, by update: one event at each logging update."""
-    steps = [step for step, _ in events]
-    expected = [
-        step for step in range(1, case.updates + 1) if step % case.log_interval == 0
-    ]
-    if steps != expected:
-        raise RuntimeError(f"{case.name}: a rank logged updates {steps}")
+def _on_device(values):
+    """Metrics as float64 tensors: computed on the training device, like the weights."""
     return {
-        step: {
-            # Computed on the host; the same on every device.
-            "lr": metrics["lr"],
-            # Computed on the training device, like the weights.
-            "metrics": {
-                name: torch.tensor(value, dtype=torch.float64)
-                for name, value in metrics.items()
-                if name != "lr" and not name.startswith("perf/")
-            },
-        }
-        for step, metrics in events
+        name: torch.tensor(value, dtype=torch.float64)
+        for name, value in values.items()
+        if not name.startswith("perf/")
     }
+
+
+def _logged(events, case):
+    """What the rank logged, by update: its training and its evaluation metrics."""
+    trained, evaluated = {}, {}
+    for step, metrics in events:
+        if any(name.startswith("eval/") for name in metrics):
+            kind, entry = evaluated, _on_device(metrics)
+        else:
+            kind = trained
+            entry = {
+                # Computed on the host; the same on every device.
+                "lr": metrics.pop("lr"),
+                "metrics": _on_device(metrics),
+            }
+        if step in kind:
+            raise RuntimeError(f"{case.name}: a rank logged update {step} twice")
+        kind[step] = entry
+    updates = range(1, case.updates + 1)
+    expected = (
+        [step for step in updates if step % case.log_interval == 0],
+        list(updates) if case.evaluated else [],
+    )
+    if (sorted(trained), sorted(evaluated)) != expected:
+        raise RuntimeError(
+            f"{case.name}: a rank logged updates {sorted(trained)} and "
+            f"evaluations {sorted(evaluated)}"
+        )
+    return trained, evaluated
 
 
 def _read_checkpoint(directory, world_size):
@@ -342,7 +372,7 @@ def _read_case(output, case):
         )
         for rank in range(case.world_size)
     ]
-    logged = [_logged(rank["logged"], case) for rank in ended]
+    trained, evaluated = zip(*(_logged(rank["logged"], case) for rank in ended))
     steps = sorted(
         int(match.group(1))
         for match in map(CHECKPOINT.fullmatch, os.listdir(output))
@@ -358,8 +388,9 @@ def _read_case(output, case):
     return [
         {
             "checkpoint": step,
-            # None at an update that is not logged.
-            "logged": [rank.get(step) for rank in logged],
+            # None at an update that is not logged, or not evaluated.
+            "logged": [rank.get(step) for rank in trained],
+            "evaluated": [rank.get(step) for rank in evaluated],
             "applied_lr": [rank["replica"]["applied_lr"][index] for rank in ended],
             # Empty unless DDP wrapped the model.
             "replicas": [
@@ -398,7 +429,8 @@ def record(selected):
                 _vary_records(root / "features")
                 output = root / "run"
                 output.mkdir()
-                overrides = [
+                overrides = _evaluation(root, world_size) if case.evaluated else []
+                overrides += [
                     f"output_dir={output}",
                     f"model.torch_dtype={case.dtype}",
                     f"deployment.trainer.nproc_per_node={world_size}",

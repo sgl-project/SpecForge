@@ -63,7 +63,7 @@ class TrajectoryTest(unittest.TestCase):
                 logged = []
                 for update in self.first[case.name]:
                     self.assertEqual(update["shared"]["world_size"], case.world_size)
-                    for name in ("logged", "applied_lr"):
+                    for name in ("logged", "evaluated", "applied_lr"):
                         self.assertEqual(len(update[name]), case.world_size)
                         for other in update[name][1:]:
                             self.assertEqual(differences(other, update[name][0]), [])
@@ -75,6 +75,15 @@ class TrajectoryTest(unittest.TestCase):
                         for step in range(1, case.updates + 1)
                     ],
                 )
+
+    def test_evaluated_cases_report_a_pooled_loss_after_every_update(self):
+        evaluated = [case for case in self.cases if case.evaluated]
+        self.assertTrue(evaluated)
+        for case in evaluated:
+            with self.subTest(case=case.name):
+                for update in self.first[case.name]:
+                    loss = update["evaluated"][0]["eval/avg_loss"]
+                    self.assertTrue(torch.isfinite(loss))
 
     def test_runs_warm_up(self):
         """A schedule without its warmup would otherwise record the same rates."""
