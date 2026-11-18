@@ -561,12 +561,6 @@ def build_bundle(cfg, algorithm):
         from .sequence_parallel import configure_sequence_parallel
 
         configure_sequence_parallel(runtime)
-    runtime.frozen_target_modules = tuple(
-        dict.fromkeys(
-            [model.get_submodule(name) for name in draft.target_bindings]
-            + ([teacher] if teacher is not None else [])
-        )
-    )
     runtime.fsdp_param_dtype = dtype
     contract = {
         "canonical_draft_config": encode_config(draft),

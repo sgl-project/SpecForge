@@ -56,6 +56,15 @@ class StepContext:
 
 
 @dataclass(frozen=True)
+class PartitionHints:
+    """What a runner that shards parameters has to keep together."""
+
+    #: Class names of the modules that are each one indivisible unit. Empty:
+    #: the program is one unit.
+    blocks: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ProgramSpec:
     """What a program declares to the frame and a runner, as values."""
 
@@ -75,6 +84,7 @@ class ProgramSpec:
     #: over the ranks; the program returns the terms and the runner pools
     #: their denominators between each forward and its backward.
     reduction: Literal["window", "microbatch"] = "window"
+    partition: PartitionHints = PartitionHints()
 
 
 class TrainingProgram(Protocol):
@@ -86,6 +96,10 @@ class TrainingProgram(Protocol):
     and sets its mode. A runner calls the forward through its wrapper and the
     other methods on the program itself.
     """
+
+    #: Frozen modules a runner neither shards nor optimizes (target tables,
+    #: the teacher head).
+    frozen: Tuple[torch.nn.Module, ...]
 
     #: The module's mode; a runner sets it with ``train()`` and ``eval()``.
     training: bool

@@ -218,6 +218,20 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
+    @property
+    def frozen(self):
+        """Modules a runner neither shards nor optimizes.
+
+        The draft's bound target tables and the teacher head: frozen tables
+        that are deliberately absent from the draft's state dict.
+        """
+        bound = [
+            self.draft_model.get_submodule(name)
+            for name in self.draft_model.config.draft.target_bindings
+        ]
+        teacher = [] if self.target_head is None else [self.target_head]
+        return tuple(dict.fromkeys(bound + teacher))
+
     def host_inputs(self, tensors):
         """Extra batch tensors the objective derives on the host, before placement."""
         prepare = self.registration.training.host_inputs if self.registration else None

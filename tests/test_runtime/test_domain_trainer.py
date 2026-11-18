@@ -37,9 +37,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
         store="STORE",
     ):
         import specforge.training.trainer as tr
-        from specforge.training.contracts import ProgramSpec
+        from specforge.training.contracts import PartitionHints, ProgramSpec
 
-        spec = ProgramSpec(name="eagle3", inputs=())
+        spec = ProgramSpec(
+            name="eagle3",
+            inputs=(),
+            partition=PartitionHints(blocks=("Block",)),
+        )
         cap = {"program_spec": spec}
         events = [] if events is None else events
 
@@ -69,8 +73,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
 
-            def prepare_model(self, model, *, optimizer_target):
-                cap["prepare_model"] = (model, optimizer_target)
+            def prepare_model(self, model, *, optimizer_target, frozen, blocks):
+                cap["prepare_model"] = (model, optimizer_target, frozen, blocks)
                 return "WRAPPED"
 
         class FakeRunner:
@@ -114,7 +118,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def ack_train_refs(self, tid, ids, *, global_step, optimizer_durable):
                 dfc_calls.append(("ack", tid, ids, global_step, optimizer_durable))
 
-        model = SimpleNamespace(draft_model="DRAFT")
+        model = SimpleNamespace(draft_model="DRAFT", frozen=("TABLE",))
         dfc = FakeDataflowController()
 
         with mock.patch.multiple(
@@ -205,8 +209,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertIs(cap["loader_kw"]["drop_last"], True)
         self.assertEqual(cap["loader_kw"]["refs"], refs)
 
-        # optimizer built over the inner draft AFTER FSDP wrap
-        self.assertEqual(cap["prepare_model"], (model, "DRAFT"))
+        # optimizer built over the inner draft AFTER FSDP wrap; the backend is
+        # told what stays replicated and what stays whole
+        self.assertEqual(cap["prepare_model"], (model, "DRAFT", ("TABLE",), ("Block",)))
         # the runner executes the wrapped model under the declarations it was given
         program, backend, spec = cap["runner"]
         self.assertEqual(program, "WRAPPED")
