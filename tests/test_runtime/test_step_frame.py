@@ -115,16 +115,23 @@ class RunWindowTest(unittest.TestCase):
                     run_window(runner, [batch(1)], StepContext(accumulation_steps=2))
                 self.assertNotIn("apply_step", [call[0] for call in runner.calls])
 
-    def test_short_window_is_not_applied_whatever_the_runner_returned(self):
+    def test_step_before_the_boundary_is_refused(self):
         class EagerRunner(RecordingRunner):
             def forward_backward(self, batch, ctx, *, is_boundary):
                 super().forward_backward(batch, ctx, is_boundary=is_boundary)
                 return PendingStep("early")
 
-        runner = EagerRunner()
-        with self.assertRaisesRegex(IncompleteWindow, "received 1 of 2"):
-            run_window(runner, [batch(1)], StepContext(accumulation_steps=2))
-        self.assertNotIn("apply_step", [call[0] for call in runner.calls])
+        # A runner that closed after one micro-batch must not have its step
+        # applied, whether or not the rest of the window arrives.
+        for statistics in ((), ("count",)):
+            for batches in ([batch(1)], [batch(1), batch(2)]):
+                with self.subTest(replay_statistics=statistics, window=len(batches)):
+                    runner = EagerRunner(replay_statistics=statistics)
+                    with self.assertRaisesRegex(
+                        RuntimeError, "received 1 of 2|a step for micro-batch 1 of 2"
+                    ):
+                        run_window(runner, batches, StepContext(accumulation_steps=2))
+                    self.assertNotIn("apply_step", [call[0] for call in runner.calls])
 
     def test_boundary_without_a_step_is_refused(self):
         class ForgetfulRunner(RecordingRunner):
@@ -134,7 +141,7 @@ class RunWindowTest(unittest.TestCase):
         for statistics in ((), ("count",)):
             with self.subTest(replay_statistics=statistics):
                 runner = ForgetfulRunner(replay_statistics=statistics)
-                with self.assertRaisesRegex(RuntimeError, "no step for the window"):
+                with self.assertRaisesRegex(RuntimeError, "no step for micro-batch 1"):
                     run_window(runner, [batch(1)], StepContext())
                 self.assertNotIn("apply_step", [call[0] for call in runner.calls])
 
@@ -245,6 +252,45 @@ class RunnerRefusalTest(unittest.TestCase):
         # Found at the first micro-batch: no backward, no optimizer step.
         self.assertIsNone(strategy.model.weight.grad)
         torch.testing.assert_close(strategy.model.weight, before, rtol=0, atol=0)
+
+    def test_metric_name_reused_across_micro_batches_raises_before_the_update(self):
+        class Strategy(_Strategy):
+            calls = 0
+
+            def forward_loss(self, batch, ctx=None):
+                output = super().forward_loss(batch, ctx)
+                count = torch.ones(())
+                self.calls += 1
+                if self.calls == 1:
+                    return replace(output, ratio_metrics={"seen": (count, count)})
+                return replace(output, sum_metrics={"seen": count})
+
+        strategy = Strategy()
+        runner = runner_over(strategy)
+        before = strategy.model.weight.detach().clone()
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            run_window(runner, [batch(1), batch(2)], StepContext(accumulation_steps=2))
+        torch.testing.assert_close(strategy.model.weight, before, rtol=0, atol=0)
+
+    def test_failed_backward_ends_the_runner(self):
+        class Strategy(_Strategy):
+            detach = True
+
+            def forward_loss(self, batch, ctx=None):
+                output = super().forward_loss(batch, ctx)
+                if not self.detach:
+                    return output
+                numerator, denominator = output.loss_terms
+                return replace(output, loss_terms=(numerator.detach(), denominator))
+
+        strategy = Strategy()
+        runner = runner_over(strategy)
+        with self.assertRaisesRegex(RuntimeError, "does not require grad"):
+            run_window(runner, [batch(1)], StepContext())
+        # Its denominator is already in the window's totals.
+        strategy.detach = False
+        with self.assertRaisesRegex(RuntimeError, "runner cannot continue"):
+            run_window(runner, [batch(2)], StepContext())
 
     def test_failed_step_blocks_the_next_window(self):
         class Strategy(_Strategy):

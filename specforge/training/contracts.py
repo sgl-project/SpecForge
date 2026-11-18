@@ -155,7 +155,9 @@ class StepRunner(Protocol):
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         """Normalize, clip and apply the window's update; report its metrics."""
 
-    def prepass(self, batch: "TrainBatch", ctx: "StepContext") -> Dict[str, Any]:
+    def prepass(
+        self, batch: "TrainBatch", ctx: "StepContext"
+    ) -> Dict[str, torch.Tensor]:
         """Run one micro-batch in training mode without gradients.
 
         Every replay statistic is delivered as zero. The runner remembers the

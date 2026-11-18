@@ -29,7 +29,33 @@ import torch.distributed as dist
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
 from specforge.training.contracts import PendingStep, StepMetrics
-from specforge.training.strategies.base import DraftTrainStrategy, StepContext
+from specforge.training.strategies.base import (
+    DraftTrainStrategy,
+    StepContext,
+    StepOutput,
+)
+
+
+def _check_metrics(values: Dict[str, Any], sums: Dict[str, Any]) -> None:
+    """Raise for metrics the reduction cannot pack.
+
+    A name used for both a ratio and a sum, a ratio that is not a pair, or a
+    pair whose sides differ in size.
+    """
+    if values.keys() & sums.keys():
+        raise ValueError("ratio and sum metric names must be distinct")
+    for name in sorted(values):
+        pair = values[name]
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise TypeError(
+                f"ratio metric {name!r} must be a (numerator, denominator) pair"
+            )
+        numerator, denominator = (torch.as_tensor(side).numel() for side in pair)
+        if numerator != denominator:
+            raise ValueError(
+                f"ratio metric {name!r} shape mismatch: "
+                f"({numerator},) vs ({denominator},)"
+            )
 
 
 def _reduce_ratio_metrics(
@@ -49,23 +75,15 @@ def _reduce_ratio_metrics(
     sums = sums or {}
     if not values and not sums:
         return {}
-    if values.keys() & sums.keys():
-        raise ValueError("ratio and sum metric names must be distinct")
-    normalized = []
-    for name in sorted(values):
-        pair = values[name]
-        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-            raise TypeError(
-                f"ratio metric {name!r} must be a (numerator, denominator) pair"
-            )
-        numerator = torch.as_tensor(pair[0]).detach().float().flatten().to(device)
-        denominator = torch.as_tensor(pair[1]).detach().float().flatten().to(device)
-        if numerator.shape != denominator.shape:
-            raise ValueError(
-                f"ratio metric {name!r} shape mismatch: "
-                f"{tuple(numerator.shape)} vs {tuple(denominator.shape)}"
-            )
-        normalized.append((name, numerator, denominator))
+    _check_metrics(values, sums)
+    normalized = [
+        (
+            name,
+            torch.as_tensor(values[name][0]).detach().float().flatten().to(device),
+            torch.as_tensor(values[name][1]).detach().float().flatten().to(device),
+        )
+        for name in sorted(values)
+    ]
 
     normalized_sums = [
         (name, torch.as_tensor(sums[name]).detach().float().flatten().to(device))
@@ -218,6 +236,9 @@ class DataParallelRunner:
         self._micro = 0
         self._window_steps = 0
         self._pending: Optional[PendingStep] = None
+        # Set once a micro-batch has raised inside its forward or backward:
+        # gradients and totals may then hold a part of it.
+        self._broken: Optional[str] = None
 
     @property
     def replay_statistics(self) -> Tuple[str, ...]:
@@ -236,6 +257,7 @@ class DataParallelRunner:
         return values
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
+        self._refuse_after_failure()
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
         self._hold_window_length(ctx, opening=not self._prepass_rng)
@@ -255,6 +277,7 @@ class DataParallelRunner:
     def forward_backward(
         self, batch: TrainBatch, ctx: StepContext, *, is_boundary: bool
     ) -> Optional[PendingStep]:
+        self._refuse_after_failure()
         if self._pending is not None:
             raise RuntimeError(
                 "the previous window's optimizer step has not been applied"
@@ -284,39 +307,11 @@ class DataParallelRunner:
                 f"the window of {ctx.accumulation_steps} micro-batches has "
                 f"{remaining} left; is_boundary={is_boundary} does not close it"
             )
-        # DDP defers its gradient synchronization only when the scope encloses
-        # the forward as well as the backward.
-        with self.backend.accumulation_context(is_boundary=is_boundary):
-            with self._replayed_rng():
-                out = self.strategy.forward_loss(batch, ctx)
-            loss = out.loss
-            ratio_metrics = dict(out.ratio_metrics)
-            if out.loss_terms is not None:
-                numerator, denominator = out.loss_terms
-                if numerator.numel() != 1 or denominator.numel() != 1:
-                    raise ValueError("loss_terms must contain scalar tensors")
-                loss = numerator.reshape(())
-                ratio_metrics["loss"] = (
-                    numerator.detach().reshape(()),
-                    denominator.detach().reshape(()),
-                )
-            # Reduced locally only for its checks of names and shapes: found
-            # at the boundary, a malformed metric would raise after the update
-            # was applied and before it was counted or acknowledged.
-            _reduce_ratio_metrics(
-                ratio_metrics,
-                device=out.loss.device,
-                process_group=None,
-                reduce=False,
-                sums=out.sum_metrics,
-            )
-            self._accumulate_ratio_metrics(ratio_metrics)
-            for name, value in out.sum_metrics.items():
-                self._sum_totals[name] = (
-                    self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
-                )
-            loss = loss / ctx.accumulation_steps
-            self.backend.backward(loss, is_boundary=is_boundary)
+        try:
+            out = self._forward_backward(batch, ctx, is_boundary=is_boundary)
+        except BaseException as error:
+            self._broken = f"{type(error).__name__}: {error}"
+            raise
         self._micro += 1
         if not is_boundary:
             return None
@@ -337,6 +332,42 @@ class DataParallelRunner:
         self._sum_totals = {}
         self._pending = PendingStep(window)
         return self._pending
+
+    def _forward_backward(
+        self, batch: TrainBatch, ctx: StepContext, *, is_boundary: bool
+    ) -> StepOutput:
+        """One micro-batch's forward, its share of the window's totals, its backward."""
+        # DDP defers its gradient synchronization only when the scope encloses
+        # the forward as well as the backward.
+        with self.backend.accumulation_context(is_boundary=is_boundary):
+            with self._replayed_rng():
+                out = self.strategy.forward_loss(batch, ctx)
+            loss = out.loss
+            ratio_metrics = dict(out.ratio_metrics)
+            if out.loss_terms is not None:
+                numerator, denominator = out.loss_terms
+                if numerator.numel() != 1 or denominator.numel() != 1:
+                    raise ValueError("loss_terms must contain scalar tensors")
+                loss = numerator.reshape(())
+                ratio_metrics["loss"] = (
+                    numerator.detach().reshape(()),
+                    denominator.detach().reshape(()),
+                )
+            # Checked against the window so far, before this backward: found
+            # at the boundary, a malformed metric would raise after the update
+            # was applied and before it was counted or acknowledged.
+            _check_metrics(
+                {**self._ratio_totals, **ratio_metrics},
+                {**self._sum_totals, **out.sum_metrics},
+            )
+            self._accumulate_ratio_metrics(ratio_metrics)
+            for name, value in out.sum_metrics.items():
+                self._sum_totals[name] = (
+                    self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
+                )
+            loss = loss / ctx.accumulation_steps
+            self.backend.backward(loss, is_boundary=is_boundary)
+        return out
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:
@@ -425,6 +456,13 @@ class DataParallelRunner:
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
                 scalars[key] = float(value)
         return scalars
+
+    def _refuse_after_failure(self) -> None:
+        if self._broken is not None:
+            raise RuntimeError(
+                "this runner cannot continue: a micro-batch raised inside its "
+                f"forward or backward ({self._broken})"
+            )
 
     def _hold_window_length(self, ctx: StepContext, *, opening: bool) -> None:
         """Keep the length the window's first call gave it, prepass or backward."""

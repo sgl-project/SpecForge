@@ -57,13 +57,17 @@ def run_window(
     pending = None
     received = 0
     for received, batch in _bounded(window, ctx):
-        pending = runner.forward_backward(
-            batch, ctx, is_boundary=received == ctx.accumulation_steps
+        pending = _at_boundary(
+            runner.forward_backward(
+                batch, ctx, is_boundary=received == ctx.accumulation_steps
+            ),
+            received,
+            ctx,
         )
-    # The frame's own count decides, whatever a runner returned on the way.
+    # The frame's own count decides whether the window is complete.
     if received != ctx.accumulation_steps:
         raise _incomplete(received, ctx)
-    return runner.apply_step(_boundary_step(pending))
+    return runner.apply_step(pending)
 
 
 def _bounded(
@@ -95,7 +99,8 @@ def _run_replayed_window(
             # The pooled sums are reduced in place; they must not be the
             # program's own tensor.
             sums[name] = sums[name] + value if name in sums else value.clone()
-        # The replay reads the inputs again; the device keeps one micro-batch.
+        # The replay reads the inputs again, from the host: a device tensor is
+        # copied there, a host tensor is kept as it is.
         kept.append(
             replace(
                 batch,
@@ -111,15 +116,25 @@ def _run_replayed_window(
     )
     pending = None
     for index, batch in enumerate(kept, start=1):
-        pending = runner.forward_backward(
-            batch, replay, is_boundary=index == ctx.accumulation_steps
+        pending = _at_boundary(
+            runner.forward_backward(
+                batch, replay, is_boundary=index == ctx.accumulation_steps
+            ),
+            index,
+            ctx,
         )
-    return runner.apply_step(_boundary_step(pending))
+    return runner.apply_step(pending)
 
 
-def _boundary_step(pending: Optional[PendingStep]) -> PendingStep:
-    if pending is None:
-        raise RuntimeError("the runner returned no step for the window's boundary")
+def _at_boundary(
+    pending: Optional[PendingStep], received: int, ctx: "StepContext"
+) -> Optional[PendingStep]:
+    """A runner returns a step at the window's boundary and nowhere else."""
+    if (pending is not None) != (received == ctx.accumulation_steps):
+        raise RuntimeError(
+            f"the runner returned {'a' if pending is not None else 'no'} step "
+            f"for micro-batch {received} of {ctx.accumulation_steps}"
+        )
     return pending
 
 

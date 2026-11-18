@@ -818,7 +818,33 @@ class TestTrainerController(unittest.TestCase):
             # on a retry would save a checkpoint that never trained on it.
             with self.assertRaisesRegex(RuntimeError, "never committed.*bad batch"):
                 ctrl.fit([])
+            # Saving would record a position past both uncommitted batches.
+            with self.assertRaisesRegex(RuntimeError, "cannot be saved"):
+                ctrl.save_checkpoint(ctrl.global_step)
+            self.assertEqual(os.listdir(d), [])
         self.assertEqual(ctrl.global_step, 1)
+
+    def test_failed_acknowledgement_ends_the_run(self):
+        def ack(sample_ids, step):
+            raise OSError("ledger unavailable")
+
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat,
+                FakeBackend(strat.model),
+                run_id="r",
+                output_dir=d,
+                max_steps=1,
+                ack_fn=ack,
+            )
+            with self.assertRaisesRegex(OSError, "ledger unavailable"):
+                ctrl.fit([_batch()])
+            # The update is applied and its samples are not durable: a retry
+            # that stopped at max_steps would report the run complete.
+            self.assertEqual(ctrl.global_step, 1)
+            with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
+                ctrl.fit([])
 
     def test_window_holds_one_micro_batch_at_a_time(self):
         """A batch may live on the training device; none outlives its turn."""
