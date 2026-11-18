@@ -218,10 +218,21 @@ class RunnerModeTest(unittest.TestCase):
                     runner = runner_over(strategy)
                     # What the program declares decides, not the caller's context.
                     ctx = StepContext(collect_detailed_metrics=not diagnostics)
-                    output = runner.evaluate(batch(1), ctx)
-                    self.assertEqual(strategy.seen, [(False, False, diagnostics)])
+                    with runner.evaluation():
+                        output = runner.evaluate(batch(1), ctx)
+                        # Evaluation mode holds between the batches of a pass.
+                        self.assertFalse(strategy.model.training)
+                        runner.evaluate(batch(2), ctx)
+                    self.assertEqual(strategy.seen, [(False, False, diagnostics)] * 2)
                     self.assertFalse(output.loss.requires_grad)
                     self.assertEqual(strategy.model.training, was_training)
+
+    def test_pass_without_batches_leaves_the_mode_as_it_was(self):
+        strategy = _EvaluatedStrategy()
+        runner = runner_over(strategy)
+        with runner.evaluation():
+            self.assertFalse(strategy.model.training)
+        self.assertTrue(strategy.model.training)
 
     def test_failed_evaluation_restores_the_mode(self):
         class Strategy(_EvaluatedStrategy):
@@ -231,15 +242,38 @@ class RunnerModeTest(unittest.TestCase):
         strategy = Strategy()
         runner = runner_over(strategy)
         with self.assertRaisesRegex(ValueError, "bad batch"):
-            runner.evaluate(batch(1), StepContext())
+            with runner.evaluation():
+                runner.evaluate(batch(1), StepContext())
         self.assertTrue(strategy.model.training)
 
-    def test_training_verbs_run_in_training_mode(self):
-        strategy = _EvaluatedStrategy()
-        strategy.model.eval()
-        run_window(runner_over(strategy), [batch(1)], StepContext())
-        self.assertEqual(strategy.seen, [(True, True, True)])
+    def test_evaluate_belongs_to_a_pass(self):
+        runner = runner_over(_EvaluatedStrategy())
+        with self.assertRaisesRegex(RuntimeError, "inside an evaluation"):
+            runner.evaluate(batch(1), StepContext())
+        with runner.evaluation():
+            with self.assertRaisesRegex(RuntimeError, "inside an evaluation pass"):
+                runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+
+    def test_training_calls_put_the_whole_model_in_training_mode(self):
+        class Strategy(_EvaluatedStrategy):
+            """A training-mode module around a draft that was left in evaluation mode."""
+
+            def __init__(self):
+                super().__init__()
+                self.model.draft = nn.Linear(1, 1)
+                self.model.draft.eval()
+
+        strategy = Strategy()
         self.assertTrue(strategy.model.training)
+        runner = runner_over(strategy)
+        run_window(runner, [batch(1)], StepContext())
+        self.assertTrue(strategy.model.draft.training)
+        # After an evaluation pass as well, on a rank that had no batch to restore it.
+        with runner.evaluation():
+            pass
+        strategy.model.draft.eval()
+        run_window(runner, [batch(2)], StepContext())
+        self.assertTrue(strategy.model.draft.training)
 
 
 class RunnerReductionTest(unittest.TestCase):

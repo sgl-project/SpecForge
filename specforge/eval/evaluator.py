@@ -42,8 +42,9 @@ class Evaluator:
     ) -> Dict[str, Any]:
         """Run the pass; returns ``{}`` if zero batches were processed globally.
 
-        Each batch is evaluated by ``runner.evaluate`` and the pass is pooled
-        across ranks by ``runner.reduce_sum`` and ``runner.reduce_max``.
+        Each batch is evaluated by ``runner.evaluate`` inside one
+        ``runner.evaluation()`` pass, which is then pooled across ranks by
+        ``runner.reduce_sum`` and ``runner.reduce_max``.
 
         Additive loss and accuracy terms are used directly when the strategy
         provides them. Scalar fallbacks use ``metrics['accuracy_denom']`` when
@@ -56,7 +57,8 @@ class Evaluator:
         # [loss*w, w, scalar_acc*denom, scalar_denom, n_batches, ar_w, pl_w]
         sums = None
 
-        with torch.no_grad():
+        # Entered on every rank, with or without batches of its own.
+        with runner.evaluation(), torch.no_grad():
             for batch in batches if batches is not None else ():
                 out = runner.evaluate(batch, ctx)
                 m = out.metrics
