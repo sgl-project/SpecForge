@@ -44,15 +44,18 @@ from tests.test_runtime.test_canonical_end_to_end import drafts, write_run
 
 EPOCHS = 2
 BATCHES_PER_EPOCH = 3
-# World size, accumulation window, wrapper, parameter dtype. Under bfloat16
-# the optimizer's fp32 masters hold bits the parameters do not.
+# World size, accumulation window, wrapper, parameter dtype, log interval.
+# Under bfloat16 the optimizer's fp32 masters hold bits the parameters do not.
+# A log interval of two leaves updates whose forward collects no detailed
+# metrics, which is what most updates of a real run are.
 TOPOLOGIES = (
-    (1, 1, "NO_SHARD", "float32"),
-    (1, 2, "NO_SHARD", "float32"),
-    (2, 2, "NO_SHARD", "float32"),
-    (2, 2, "NO_SHARD", "bfloat16"),
-    (2, 2, "SHARD_GRAD_OP", "float32"),
-    (4, 2, "SHARD_GRAD_OP", "bfloat16"),
+    (1, 1, "NO_SHARD", "float32", 1),
+    (1, 2, "NO_SHARD", "float32", 1),
+    (2, 2, "NO_SHARD", "float32", 1),
+    (2, 2, "NO_SHARD", "float32", 2),
+    (2, 2, "NO_SHARD", "bfloat16", 1),
+    (2, 2, "SHARD_GRAD_OP", "float32", 1),
+    (4, 2, "SHARD_GRAD_OP", "bfloat16", 1),
 )
 # What a checkpoint's shared file says about the run's progress and weights.
 SHARED_STATE = (
@@ -62,7 +65,10 @@ SHARED_STATE = (
     "epoch",
     "epoch_batch",
     "epoch_samples",
+    "world_size",
 )
+# Half of a run's updates warm up: the shortest run has one warmup update.
+WARMUP_RATIO = 0.5
 CHECKPOINT = re.compile(r"specforge-run-step(\d+)")
 
 
@@ -75,12 +81,14 @@ class Case:
     accumulation_steps: int = 1
     sharding: str = "NO_SHARD"
     dtype: str = "float32"
+    log_interval: int = 1
 
     @property
     def name(self):
         return (
             f"{self.architecture}/ranks{self.world_size}"
             f"/accumulation{self.accumulation_steps}/{self.sharding}/{self.dtype}"
+            f"/log{self.log_interval}"
         )
 
     @property
@@ -95,8 +103,8 @@ def every_case(ranks=()):
         topology
         for world_size in ranks
         for topology in (
-            (world_size, 2, "NO_SHARD", "float32"),
-            (world_size, 2, "SHARD_GRAD_OP", "bfloat16"),
+            (world_size, 2, "NO_SHARD", "float32", 1),
+            (world_size, 2, "SHARD_GRAD_OP", "bfloat16", 1),
         )
     )
     return [
@@ -106,7 +114,7 @@ def every_case(ranks=()):
     ]
 
 
-def cases():
+def cases(ranks=()):
     """The cases this host can place.
 
     An accelerator run needs one device per rank. FSDP refuses a CPU model
@@ -115,19 +123,22 @@ def cases():
     """
     device_type = get_device_type()
     if device_type == "cpu":
-        return [case for case in every_case() if case.sharding == "NO_SHARD"]
+        return [case for case in every_case(ranks) if case.sharding == "NO_SHARD"]
     devices = torch.get_device_module(device_type).device_count()
-    return [case for case in every_case() if case.world_size <= devices]
+    return [case for case in every_case(ranks) if case.world_size <= devices]
 
 
-def _vary_supervision(features):
-    """Give the records different supervised lengths.
+def _vary_records(features):
+    """Give the records different lengths and different supervised lengths.
 
-    Ranks and micro-batches then hold different loss denominators, so a
-    denominator pooled the wrong way changes the update.
+    Ranks and micro-batches then hold different loss denominators, whether an
+    objective counts supervised tokens or whole sequences, so a denominator
+    pooled the wrong way changes the update.
     """
     for index, path in enumerate(sorted(features.iterdir())):
         record = torch.load(path)
+        length = len(record["loss_mask"]) - index % 3
+        record = {name: tensor[:length] for name, tensor in record.items()}
         supervised = record["loss_mask"].nonzero().flatten()
         record["loss_mask"][supervised[len(supervised) - index % 3 :]] = 0
         torch.save(record, path)
@@ -181,6 +192,7 @@ class _Replica:
         self.applied_lr = []
         self.updates = []
         self._model = None
+        self._optimizer = None
         self._weights_due = False
 
     def __enter__(self):
@@ -200,9 +212,6 @@ class _Replica:
             self._model = module.module
             self._keep_weights()
 
-    def _before_step(self, optimizer, arguments, keywords):
-        self.applied_lr.append([group["lr"] for group in optimizer.param_groups])
-
     def _after_step(self, optimizer, arguments, keywords):
         if self._model is None:
             return
@@ -220,9 +229,16 @@ class _Replica:
         # step; the weights are read once that is done.
         self._weights_due = True
 
+    def _before_step(self, optimizer, arguments, keywords):
+        self._optimizer = optimizer
+        self.applied_lr.append([group["lr"] for group in optimizer.param_groups])
+
     def _keep_weights(self):
         if self._weights_due:
-            self.updates[-1]["weights"] = _on_host(self._model.state_dict())
+            update = self.updates[-1]
+            update["weights"] = _on_host(self._model.state_dict())
+            # The trainer's scheduler has advanced as well by now.
+            update["next_lr"] = [group["lr"] for group in self._optimizer.param_groups]
             self._weights_due = False
 
     def ended(self):
@@ -266,12 +282,15 @@ def _train_rank(rank, world_size, runs):
 
 
 def _logged(events, case):
-    """Per update, what the rank logged: exactly one event for each update."""
+    """What the rank logged, by update: one event at each logging update."""
     steps = [step for step, _ in events]
-    if steps != list(range(1, len(steps) + 1)):
+    expected = [
+        step for step in range(1, case.updates + 1) if step % case.log_interval == 0
+    ]
+    if steps != expected:
         raise RuntimeError(f"{case.name}: a rank logged updates {steps}")
-    return [
-        {
+    return {
+        step: {
             # Computed on the host; the same on every device.
             "lr": metrics["lr"],
             # Computed on the training device, like the weights.
@@ -281,8 +300,8 @@ def _logged(events, case):
                 if name != "lr" and not name.startswith("perf/")
             },
         }
-        for _, metrics in events
-    ]
+        for step, metrics in events
+    }
 
 
 def _read_checkpoint(directory, world_size):
@@ -316,19 +335,17 @@ def _read_case(output, case):
         if match
     )
     for rank in ended:
-        replica = rank["replica"]
-        if len(rank["logged"]) != len(steps) or len(replica["applied_lr"]) != len(
-            steps
-        ):
+        applied = len(rank["replica"]["applied_lr"])
+        if applied != len(steps):
             raise RuntimeError(
-                f"{case.name}: checkpoints {steps} do not match the "
-                f"{len(rank['logged'])} logged and {len(replica['applied_lr'])} "
-                "applied updates of a rank"
+                f"{case.name}: checkpoints {steps} do not match the {applied} "
+                "updates a rank applied"
             )
     return [
         {
             "checkpoint": step,
-            "logged": [rank[index] for rank in logged],
+            # None at an update that is not logged.
+            "logged": [rank.get(step) for rank in logged],
             "applied_lr": [rank["replica"]["applied_lr"][index] for rank in ended],
             # Empty unless DDP wrapped the model.
             "replicas": [
@@ -348,6 +365,8 @@ def record(selected):
     Cases of one world size share their worker processes, so a recording pays
     for the Python imports once per rank.
     """
+    if not selected:
+        raise ValueError("no case to record: this host can place none of them")
     by_name = {draft.architecture: draft for draft in drafts()}
     recording = {}
     with TemporaryDirectory() as temp:
@@ -362,7 +381,7 @@ def record(selected):
                     by_name[case.architecture],
                     records=BATCHES_PER_EPOCH * world_size,
                 )
-                _vary_supervision(root / "features")
+                _vary_records(root / "features")
                 output = root / "run"
                 output.mkdir()
                 overrides = [
@@ -375,8 +394,9 @@ def record(selected):
                     # One more than the data holds: an extra update would show.
                     f"training.max_steps={case.updates + 1}",
                     f"training.total_steps={case.updates}",
+                    f"training.warmup_ratio={WARMUP_RATIO}",
                     "training.save_interval=1",
-                    "training.log_interval=1",
+                    f"training.log_interval={case.log_interval}",
                 ]
                 runs.append((str(config), overrides, str(output)))
             multiprocessing.spawn(
@@ -431,7 +451,10 @@ def differences(actual, expected, *, atol=0.0, where="recording"):
         if actual.dtype != expected.dtype or actual.shape != expected.shape:
             return [f"{where}: dtype or shape differs"]
         if atol and expected.is_floating_point():
-            same = torch.allclose(actual, expected, rtol=0, atol=atol, equal_nan=True)
+            # In the tensors' own dtype a bfloat16 threshold would round up.
+            same = torch.allclose(
+                actual.double(), expected.double(), rtol=0, atol=atol, equal_nan=True
+            )
         else:
             same = _same_bits(actual, expected)
         return [] if same else [f"{where}: values differ"]
@@ -457,7 +480,7 @@ def main(arguments=None):
         type=int,
         nargs="+",
         default=(),
-        help="further world sizes to record under DDP and FSDP (implies --every-case)",
+        help="further world sizes to record under DDP and FSDP",
     )
     comparer = commands.add_parser("compare", help="compare two saved recordings")
     comparer.add_argument("actual")
@@ -465,12 +488,8 @@ def main(arguments=None):
     comparer.add_argument("--atol", type=float, default=0.0)
     options = parser.parse_args(arguments)
     if options.command == "record":
-        selected = (
-            every_case(options.ranks)
-            if options.every_case or options.ranks
-            else cases()
-        )
-        recording = record(selected)
+        select = every_case if options.every_case else cases
+        recording = record(select(options.ranks))
         torch.save(recording, options.output)
         print(f"recorded {len(recording)} cases to {options.output}")
         return 0
