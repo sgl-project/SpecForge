@@ -8,7 +8,7 @@ topology: Disaggregated
 
 # Qwen3.8-27B DFlash2 disaggregated training
 
-Trains the DFlash2 drafter in `configs/qwen3.8-27b-dflash2.json` for
+Trains the DFlash2 drafter in `specforge/config/draft/presets/qwen3.8-27b-dflash2.yaml` for
 `Qwen/Qwen3.8-27B` on the disaggregated online data plane: SGLang with the capture plugin
 capture servers publish the target's hidden states into Mooncake, and
 data-parallel trainer ranks consume them. The first two recipes share every
@@ -145,7 +145,7 @@ warm-up, stock SGLang 0.5.18 with DeepGEMM:
 | same, re-split | 5+3 | 12.33 | three trainer ranks |
 | same, `model.use_liger_kernel: true` | 4+4 / 5+3 | 14.00 / 13.10 | trainer ranks and producer drains |
 | this revision, FA3 + FlashInfer GDN servers, TCP | 4+4 | 18.06 | trainer compute + fetch wait |
-| + `training.dflash_teacher_metrics: false` | 4+4 | 18.70 | trainer TCP receive path |
+| + `training.objective_options.teacher_metrics: false` | 4+4 | 18.70 | trainer TCP receive path |
 | + RDMA loopback | 4+4 | 18.60 | capture servers (trainers wait 0.42 s/step) |
 | + Liger, re-split | 5+3 | 22.34 | balanced, no data wait |
 | + accumulation 6 (this recipe, 36 samples/step) | 5+3 | 22.65 | balanced |
