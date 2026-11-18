@@ -1,11 +1,12 @@
 """Record what ``specforge train`` does, update by update, on tiny synthetic runs.
 
 A recording holds, for every optimizer update of every case, what each rank
-logged and the checkpoint written after it: draft weights, every rank's
-optimizer and RNG state, and the data position. Where the checkpoint stores
-one replica for all ranks (DDP), it also holds what each rank's own process
-ended with. Comparing two recordings names the values that differ, which is
-how a change to the training step is shown to leave training unchanged:
+logged, the learning rate its optimizer applied, and the checkpoint written
+after it: draft weights, every rank's optimizer and RNG state, and the data
+position. Where the checkpoint stores one replica for all ranks (DDP), it also
+holds each rank's own weights and optimizer state after the update. Comparing
+two recordings names the values that differ, which is how a change to the
+training step is shown to leave training unchanged:
 
     python -m tests.test_runtime.trajectories record before.pt   # on the base
     python -m tests.test_runtime.trajectories record after.pt    # on the change
@@ -32,7 +33,10 @@ import torch
 import torch.multiprocessing as multiprocessing
 from torch.nn.modules.module import register_module_forward_pre_hook
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim.optimizer import register_optimizer_step_post_hook
+from torch.optim.optimizer import (
+    register_optimizer_step_post_hook,
+    register_optimizer_step_pre_hook,
+)
 
 from specforge.training.checkpoint import STATE_FILE
 from specforge.utils import get_device_type
@@ -85,32 +89,48 @@ class Case:
         return EPOCHS * BATCHES_PER_EPOCH // self.accumulation_steps
 
 
-def every_case():
+def every_case(ranks=()):
+    """Every architecture under every topology, and under each extra world size."""
+    topologies = TOPOLOGIES + tuple(
+        topology
+        for world_size in ranks
+        for topology in (
+            (world_size, 2, "NO_SHARD", "float32"),
+            (world_size, 2, "SHARD_GRAD_OP", "bfloat16"),
+        )
+    )
     return [
         Case(draft.architecture, *topology)
         for draft in drafts()
-        for topology in TOPOLOGIES
+        for topology in dict.fromkeys(topologies)
     ]
 
 
 def cases():
     """The cases this host can place.
 
-    An accelerator run needs one device per rank. FSDP computes on the host's
-    accelerator even for a CPU trainer, so it needs the two to be the same.
+    An accelerator run needs one device per rank. FSDP refuses a CPU model
+    unless the host has an accelerator to compute on, so a CPU trainer records
+    the DDP cases only.
     """
     device_type = get_device_type()
     if device_type == "cpu":
-        devices = max(case.world_size for case in every_case())
-        fsdp = not torch.backends.mps.is_available()
-    else:
-        devices = torch.get_device_module(device_type).device_count()
-        fsdp = True
-    return [
-        case
-        for case in every_case()
-        if case.world_size <= devices and (fsdp or case.sharding == "NO_SHARD")
-    ]
+        return [case for case in every_case() if case.sharding == "NO_SHARD"]
+    devices = torch.get_device_module(device_type).device_count()
+    return [case for case in every_case() if case.world_size <= devices]
+
+
+def _vary_supervision(features):
+    """Give the records different supervised lengths.
+
+    Ranks and micro-batches then hold different loss denominators, so a
+    denominator pooled the wrong way changes the update.
+    """
+    for index, path in enumerate(sorted(features.iterdir())):
+        record = torch.load(path)
+        supervised = record["loss_mask"].nonzero().flatten()
+        record["loss_mask"][supervised[len(supervised) - index % 3 :]] = 0
+        torch.save(record, path)
 
 
 def _free_port():
@@ -136,22 +156,38 @@ def _rendezvous_port(output, rank):
     return int(path.read_text())
 
 
-class _Replica:
-    """What this rank's own process holds, seen through torch's global hooks.
+def _on_host(value):
+    """A detached host copy of nested optimizer state."""
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _on_host(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_on_host(item) for item in value)
+    return value
 
-    DDP writes one rank's weights and optimizer for all of them, so a replica
-    that drifted would otherwise show only in a later update's pooled loss,
-    and not at all after the last one.
+
+class _Replica:
+    """What this rank's own process does, seen through torch's global hooks.
+
+    Every update: the learning rate its optimizer step applied. Under DDP,
+    which writes one rank's weights and optimizer for all of them, also this
+    rank's optimizer state and weights after the update: a replica that
+    drifted would otherwise show only in a later update's pooled loss, and
+    not at all where the drift never reaches a later forward.
     """
 
     def __init__(self):
-        self.model = None
-        self.optimizer = None
+        self.applied_lr = []
+        self.updates = []
+        self._model = None
+        self._weights_due = False
 
     def __enter__(self):
         self._hooks = [
-            register_module_forward_pre_hook(self._see_forward),
-            register_optimizer_step_post_hook(self._see_step),
+            register_module_forward_pre_hook(self._before_forward),
+            register_optimizer_step_pre_hook(self._before_step),
+            register_optimizer_step_post_hook(self._after_step),
         ]
         return self
 
@@ -159,29 +195,40 @@ class _Replica:
         for hook in self._hooks:
             hook.remove()
 
-    def _see_forward(self, module, arguments):
+    def _before_forward(self, module, arguments):
         if isinstance(module, DistributedDataParallel):
-            self.model = module.module
+            self._model = module.module
+            self._keep_weights()
 
-    def _see_step(self, optimizer, arguments, keywords):
-        self.optimizer = optimizer
+    def _before_step(self, optimizer, arguments, keywords):
+        self.applied_lr.append([group["lr"] for group in optimizer.param_groups])
 
-    def state(self):
-        """The replica's weights and optimizer; None when no DDP model ran."""
-        if self.model is None:
-            return None
-        return {
-            "weights": {
-                name: tensor.detach().cpu().clone()
-                for name, tensor in self.model.state_dict().items()
-            },
-            "optimizer": self.optimizer.state_dict(),
-            "optimized": [
-                parameter.detach().cpu().clone()
-                for group in self.optimizer.param_groups
-                for parameter in group["params"]
-            ],
-        }
+    def _after_step(self, optimizer, arguments, keywords):
+        if self._model is None:
+            return
+        self.updates.append(
+            {
+                "optimizer": _on_host(optimizer.state_dict()),
+                "optimized": [
+                    _on_host(parameter)
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                ],
+            }
+        )
+        # The trainer copies the optimized tensors into the model after the
+        # step; the weights are read once that is done.
+        self._weights_due = True
+
+    def _keep_weights(self):
+        if self._weights_due:
+            self.updates[-1]["weights"] = _on_host(self._model.state_dict())
+            self._weights_due = False
+
+    def ended(self):
+        """Everything seen, once training has returned."""
+        self._keep_weights()
+        return {"applied_lr": self.applied_lr, "updates": self.updates}
 
 
 def _train_rank(rank, world_size, runs):
@@ -198,6 +245,9 @@ def _train_rank(rank, world_size, runs):
             "WORLD_SIZE": str(world_size),
             "MASTER_ADDR": "127.0.0.1",
             "MASTER_PORT": str(_rendezvous_port(output, rank)),
+            # Set by a torchrun this recorder may itself run under; it would
+            # make rank 0 look for a store instead of hosting one.
+            "TORCHELASTIC_USE_AGENT_STORE": "False",
         }
         with (
             patch.dict(os.environ, rendezvous),
@@ -211,7 +261,7 @@ def _train_rank(rank, world_size, runs):
             status = main(["train", "-c", config, *overrides])
             if status != 0:
                 raise RuntimeError(f"specforge train exited with {status}: {config}")
-            ended = {"logged": logged, "replica": replica.state()}
+            ended = {"logged": logged, "replica": replica.ended()}
         torch.save(ended, Path(output) / f"ended-rank{rank}.pt")
 
 
@@ -252,9 +302,11 @@ def _read_checkpoint(directory, world_size):
 
 
 def _read_case(output, case):
-    """Everything one run left: every checkpoint on disk, every rank's log."""
+    """Everything one run left: every checkpoint on disk, every rank's record."""
     ended = [
-        torch.load(output / f"ended-rank{rank}.pt", weights_only=False)
+        torch.load(
+            output / f"ended-rank{rank}.pt", map_location="cpu", weights_only=False
+        )
         for rank in range(case.world_size)
     ]
     logged = [_logged(rank["logged"], case) for rank in ended]
@@ -263,22 +315,31 @@ def _read_case(output, case):
         for match in map(CHECKPOINT.fullmatch, os.listdir(output))
         if match
     )
-    if any(len(rank) != len(steps) for rank in logged):
-        raise RuntimeError(
-            f"{case.name}: checkpoints {steps} do not match the logged updates"
-        )
-    return {
-        "updates": [
-            {
-                "logged": [rank[index] for rank in logged],
-                **_read_checkpoint(
-                    output / f"specforge-run-step{step}", case.world_size
-                ),
-            }
-            for index, step in enumerate(steps)
-        ],
-        "replicas": [rank["replica"] for rank in ended],
-    }
+    for rank in ended:
+        replica = rank["replica"]
+        if len(rank["logged"]) != len(steps) or len(replica["applied_lr"]) != len(
+            steps
+        ):
+            raise RuntimeError(
+                f"{case.name}: checkpoints {steps} do not match the "
+                f"{len(rank['logged'])} logged and {len(replica['applied_lr'])} "
+                "applied updates of a rank"
+            )
+    return [
+        {
+            "checkpoint": step,
+            "logged": [rank[index] for rank in logged],
+            "applied_lr": [rank["replica"]["applied_lr"][index] for rank in ended],
+            # Empty unless DDP wrapped the model.
+            "replicas": [
+                rank["replica"]["updates"][index]
+                for rank in ended
+                if rank["replica"]["updates"]
+            ],
+            **_read_checkpoint(output / f"specforge-run-step{step}", case.world_size),
+        }
+        for index, step in enumerate(steps)
+    ]
 
 
 def record(selected):
@@ -301,6 +362,7 @@ def record(selected):
                     by_name[case.architecture],
                     records=BATCHES_PER_EPOCH * world_size,
                 )
+                _vary_supervision(root / "features")
                 output = root / "run"
                 output.mkdir()
                 overrides = [
@@ -343,8 +405,10 @@ def differences(actual, expected, *, atol=0.0, where="recording"):
     if type(actual) is not type(expected):
         return [f"{where}: {type(actual).__name__} != {type(expected).__name__}"]
     if isinstance(expected, dict):
-        if actual.keys() != expected.keys():
-            changed = sorted(map(str, actual.keys() ^ expected.keys()))
+        # 1, 1.0 and True are one key to a dict and three to a recording.
+        typed = [{(type(key), key) for key in keys} for keys in (actual, expected)]
+        if typed[0] != typed[1]:
+            changed = sorted(str(key) for _, key in typed[0] ^ typed[1])
             return [f"{where}: keys differ in {changed}"]
         return [
             difference
@@ -388,13 +452,25 @@ def main(arguments=None):
         action="store_true",
         help="also record the cases this host is not expected to place",
     )
+    recorder.add_argument(
+        "--ranks",
+        type=int,
+        nargs="+",
+        default=(),
+        help="further world sizes to record under DDP and FSDP (implies --every-case)",
+    )
     comparer = commands.add_parser("compare", help="compare two saved recordings")
     comparer.add_argument("actual")
     comparer.add_argument("expected")
     comparer.add_argument("--atol", type=float, default=0.0)
     options = parser.parse_args(arguments)
     if options.command == "record":
-        recording = record(every_case() if options.every_case else cases())
+        selected = (
+            every_case(options.ranks)
+            if options.every_case or options.ranks
+            else cases()
+        )
+        recording = record(selected)
         torch.save(recording, options.output)
         print(f"recorded {len(recording)} cases to {options.output}")
         return 0
