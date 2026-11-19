@@ -24,6 +24,7 @@ class ProgramSpecTest(unittest.TestCase):
                             () if statistic is None else (statistic.argument_name,)
                         ),
                         evaluation_diagnostics=training.evaluation_diagnostics,
+                        reduction=training.reduction,
                     ),
                 )
 
@@ -32,10 +33,20 @@ class ProgramSpecTest(unittest.TestCase):
             architecture: program_spec(build_runtime(architecture)[1])
             for architecture in (
                 "DFlashDraftModel",
+                "DSparkDraftModel",
                 "DSpineDraftModel",
                 "Eagle3DraftModel",
             )
         }
+        self.assertEqual(
+            {name: spec.reduction for name, spec in specs.items()},
+            {
+                "DFlashDraftModel": "window",
+                "DSparkDraftModel": "microbatch",
+                "DSpineDraftModel": "window",
+                "Eagle3DraftModel": "window",
+            },
+        )
         self.assertEqual(specs["DSpineDraftModel"].replay_statistics, ("alignment_ce",))
         self.assertEqual(specs["DFlashDraftModel"].replay_statistics, ())
         self.assertTrue(specs["Eagle3DraftModel"].evaluation_diagnostics)

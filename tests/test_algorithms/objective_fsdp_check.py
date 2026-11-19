@@ -7,10 +7,14 @@ import torch
 import torch.distributed as dist
 
 from specforge.algorithms.objectives import build_objective_model
-from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.modeling import build_draft_model
+from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.contracts import StepContext
+from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objectives import dflash2_config, training_batch
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 
 def main():
@@ -36,18 +40,40 @@ def main():
         result.loss.backward()
         gradients = [p.grad for p in model.candidate_selector.parameters() if p.numel()]
         assert all(g is not None and torch.isfinite(g).all() for g in gradients)
-        # DSpark uses a global denominator per microbatch, with DDP averaging.
-        numerator = torch.tensor(2.0, device=device, requires_grad=True)
-        result = microbatch_mean(
-            ObjectiveResult(numerator, numerator.new_tensor(dist.get_rank() + 1)),
-            global_denominator=True,
+
+        # The microbatch reduction: the runner pools a term's denominator over
+        # the two ranks, which hold 1 and 2, between forward and backward.
+        class Terms(FakeProgram):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+
+            def forward(self, tensors, **context):
+                denominator = self.weight.new_tensor(dist.get_rank() + 1.0)
+                return ObjectiveResult(
+                    self.weight.detach(),
+                    denominator.new_ones(()),
+                    terms=((1.0, self.weight, denominator),),
+                )
+
+        program = Terms().to(device)
+        replicated = FSDPTrainingBackend(
+            ParallelConfig(world_size=2, sharding_strategy="NO_SHARD")
         )
-        result.loss.backward()
-        torch.testing.assert_close(numerator.grad, numerator.new_tensor(2 / 3))
+        runner = DataParallelRunner(
+            replicated.prepare_model(program),
+            replicated,
+            fake_spec(reduction="microbatch"),
+        )
+        runner.forward_backward(
+            TrainBatch(["0"], "check", {}), StepContext(), is_boundary=True
+        )
+        # d/dw of 2 * w / 3 on each rank, averaged over the ranks.
+        torch.testing.assert_close(
+            program.weight.grad, program.weight.new_tensor(2 / 3)
+        )
         if dist.get_rank() == 0:
-            print(
-                "Two-rank FSDP selector backward and global microbatch normalization passed"
-            )
+            print("Two-rank FSDP selector backward and microbatch reduction passed")
     finally:
         dist.destroy_process_group()
 
