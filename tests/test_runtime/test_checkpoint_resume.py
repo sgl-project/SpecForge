@@ -898,8 +898,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         Program, _ = _fake_seam()
 
         class Draft(nn.Module):
-            _no_split_modules = []
-
             def __init__(self):
                 super().__init__()
                 self.w = nn.Parameter(torch.zeros(1))
