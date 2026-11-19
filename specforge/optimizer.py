@@ -8,6 +8,7 @@ from specforge.lr_scheduler import (
     ConstantWarmupLR,
     CosineAnnealingWarmupLR,
     warmup_steps_from_ratio,
+    TorchSpecCosineWarmupLR,
 )
 from specforge.utils import print_on_rank0
 
@@ -53,6 +54,7 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        min_lr=0.0,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -88,6 +90,7 @@ class BF16Optimizer:
         scheduler_types = {
             "constant": ConstantWarmupLR,
             "cosine": CosineAnnealingWarmupLR,
+            "torchspec_cosine": TorchSpecCosineWarmupLR,
         }
         if lr_scheduler not in scheduler_types:
             raise ValueError(
@@ -95,10 +98,12 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
+        scheduler_kwargs = {} if lr_scheduler == "constant" else {"eta_min": min_lr}
         self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
             warmup_steps=warmup_steps_from_ratio(warmup_ratio, total_steps),
+            **scheduler_kwargs,
         )
 
     def configure_grad_norm_reduction(

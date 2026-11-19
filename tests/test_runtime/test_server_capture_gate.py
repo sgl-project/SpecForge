@@ -175,11 +175,11 @@ class TestServerCaptureGate(unittest.TestCase):
 
         env = dict(
             os.environ,
-            FLASHINFER_DISABLE_VERSION_CHECK="1",
             MOONCAKE_LOCAL_HOSTNAME=os.environ.get(
                 "MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1"
             ),
         )
+        env.pop("FLASHINFER_DISABLE_VERSION_CHECK", None)
         if SERVER_CAPTURE == "plugin":
             env["SPECFORGE_SPEC_CAPTURE"] = "1"
         server_python = os.environ.get("SPECFORGE_CAPTURE_GATE_SERVER_PYTHON")

@@ -32,6 +32,8 @@ def prepare_prompt_tasks(
     min_loss_tokens: int = 1,
     max_prompts: int | None = None,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None = None,
+    overlength_policy: str = "truncate",
+    filter_report: dict[str, Any] | None = None,
 ) -> Sequence[PromptTaskDict]:
     """Prepare runtime prompt dictionaries from a JSONL file.
 
@@ -43,11 +45,17 @@ def prepare_prompt_tasks(
     lazy random-access sequence so large Arrow datasets are not expanded into
     Python token lists before rollout starts.
 
-    ``max_prompts`` caps input records before preprocessing and filtering on
-    both paths. Rejected records count toward the cap and are not replaced,
-    so fewer prompts may be returned. ``None`` and ``0`` mean no cap.
+    Native ``overlength_policy="drop"`` rejects full P+G records longer than
+    ``max_length`` before any slicing. Equal-length records remain unchanged.
+    In this mode, ``max_prompts`` caps accepted prompts for compatibility with
+    existing filtered datasets. Raw conversations and native ``truncate`` cap
+    input records before preprocessing and filtering; rejected rows consume
+    that quota. ``None`` and ``0`` mean no cap in either mode.
+    ``filter_report`` optionally receives the filter counts and dropped IDs.
     """
 
+    if overlength_policy not in {"truncate", "drop"}:
+        raise ValueError("overlength_policy must be truncate or drop")
     _validate_options(
         max_length=max_length,
         min_loss_tokens=min_loss_tokens,
@@ -77,15 +85,22 @@ def prepare_prompt_tasks(
             (record, f"{path_string}:{line_number}")
             for line_number, record in _iter_records(path_string)
         )
-        if limit is not None:
+        if limit is not None and overlength_policy == "truncate":
             rows = islice(rows, limit)
         return _materialize_prompt_tasks(
             rows,
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
             loss_mask_filter=loss_mask_filter,
+            accepted_limit=limit if overlength_policy == "drop" else None,
+            overlength_policy=overlength_policy,
+            filter_report=filter_report,
         )
 
+    if overlength_policy == "drop":
+        raise ValueError(
+            "overlength_policy=drop requires pre-tokenized input_ids/loss_mask"
+        )
     return _prepare_raw_prompts(
         path_string,
         tokenizer,
@@ -195,22 +210,51 @@ def _materialize_prompt_tasks(
     max_length: int,
     min_loss_tokens: int,
     loss_mask_filter: Callable[[Sequence[int]], bool] | None,
+    accepted_limit: int | None = None,
+    overlength_policy: str = "truncate",
+    filter_report: dict[str, Any] | None = None,
 ) -> list[PromptTaskDict]:
+    report = filter_report if filter_report is not None else {}
+    report.update(
+        policy=overlength_policy,
+        max_length=max_length,
+        rows_seen=0,
+        accepted=0,
+        dropped_overlength=0,
+        dropped_other=0,
+        kept_input_tokens=0,
+        kept_loss_tokens=0,
+        dropped_samples=[],
+    )
     prompts: list[PromptTaskDict] = []
     for record, source in rows:
+        report["rows_seen"] += 1
+        before_overlength = report["dropped_overlength"]
         prompt = _prompt_from_record(
             record,
             source=source,
             max_length=max_length,
             min_loss_tokens=min_loss_tokens,
+            overlength_policy=overlength_policy,
+            filter_report=report,
         )
         if prompt is None:
+            if report["dropped_overlength"] == before_overlength:
+                report["dropped_other"] += 1
             continue
         if loss_mask_filter is not None and not loss_mask_filter(
             prompt["payload"]["loss_mask"]
         ):
+            report["dropped_other"] += 1
             continue
         prompts.append(prompt)
+        report["accepted"] += 1
+        report["kept_input_tokens"] += len(prompt["payload"]["input_ids"])
+        report["kept_loss_tokens"] += sum(prompt["payload"]["loss_mask"])
+        if accepted_limit is not None and len(prompts) >= accepted_limit:
+            break
+    if overlength_policy == "drop":
+        print("[prompt-filter] " + json.dumps(report, ensure_ascii=False), flush=True)
     return prompts
 
 
@@ -220,6 +264,8 @@ def _prompt_from_record(
     source: str,
     max_length: int,
     min_loss_tokens: int,
+    overlength_policy: str = "truncate",
+    filter_report: dict[str, Any] | None = None,
 ) -> PromptTaskDict | None:
     if "input_ids" not in record or "loss_mask" not in record:
         raise ValueError(f"{source} must contain both input_ids and loss_mask")
@@ -237,6 +283,19 @@ def _prompt_from_record(
         )
     if not input_ids:
         raise ValueError(f"{source} contains an empty token sequence")
+
+    if overlength_policy == "drop" and len(input_ids) > max_length:
+        if filter_report is not None:
+            filter_report["dropped_overlength"] += 1
+            filter_report["dropped_samples"].append(
+                {
+                    "id": record.get("id"),
+                    "source": source,
+                    "length": len(input_ids),
+                    "loss_tokens": sum(loss_mask),
+                }
+            )
+        return None
 
     input_ids = input_ids[:max_length]
     loss_mask = loss_mask[:max_length]

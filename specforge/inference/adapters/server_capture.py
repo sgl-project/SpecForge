@@ -27,6 +27,8 @@ tensors.  The application composition root injects an algorithm-owned
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import json
 import logging
 import threading
@@ -200,6 +202,9 @@ class SGLangServerCaptureAdapter:
         target_model_version: str = "unknown",
         server_capture: str = "plugin",
         server_info_fn: Optional[Callable[[str, float], Mapping[str, Any]]] = None,
+        hs_capture: bool = False,
+        hs_prefix_cache: bool = False,
+        control_fn: Optional[Callable[..., Any]] = None,
     ) -> None:
         if server_capture not in ("auto", *SERVER_CAPTURE_BACKENDS):
             raise ValueError(
@@ -238,6 +243,16 @@ class SGLangServerCaptureAdapter:
         self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _SessionPost()
+        if hs_prefix_cache and not hs_capture:
+            raise ValueError("hs_prefix_cache requires explicit hs_capture opt-in")
+        self.hs_capture = hs_capture
+        self.hs_prefix_cache = hs_prefix_cache
+        from specforge.inference.capture_protocol import CaptureProtocol
+
+        self._capture_protocol = (
+            CaptureProtocol(base_url, control_fn or self.post_fn, timeout_s)
+            if hs_capture else None
+        )
         self.target_model_version = target_model_version
         #: ``auto`` until the first request reads the server's backend.
         self.server_capture = server_capture
@@ -382,7 +397,7 @@ class SGLangServerCaptureAdapter:
             run_id=self.run_id,
             source_task_id=task.task_id,
             feature_store_uri=f"mooncake://{result['store_id']}/{sample_id}",
-            feature_keys={n: f"{sample_id}/{n}" for n in specs},
+            feature_keys=(dict(result["physical_keys"]) if result.get("publication_ownership") == "attempt-v1" else {n: f"{sample_id}/{n}" for n in specs}),
             feature_specs=specs,
             strategy=self.strategy,
             schema_version=SCHEMA_VERSION,
@@ -408,6 +423,15 @@ class SGLangServerCaptureAdapter:
                 ),
             },
         )
+        if result.get("protocol_version") == 1:
+            ref.metadata["capture_fence"] = {
+                **{name: result[name] for name in ("server_epoch", "store_id", "sample_id", "gen", "attempt_id", "reservation_token")},
+                "protocol_version": 1, "control_url": self.base_url + "/spec_capture/control",
+                "timeout_s": self.timeout_s,
+                **{name: result[name] for name in ('object_key_layout', 'publication_ownership', 'physical_keys', 'writer_drained', 'state') if name in result},
+            }
+            ref.metadata["capture_diagnostics"] = {name: result.get(name) for name in
+                ("H", "L", "N", "span", "execution_epoch", "rank", "reused_tokens", "capture_namespace", "capture_signature", "timings")}
         if "arena" in result:
             # Arena objects stay on the capture server; currently only online
             # NVLink capture uses the arena.
@@ -433,16 +457,184 @@ class SGLangServerCaptureAdapter:
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
+        prepared = self.prepare_refs_batches([tasks], capture=capture)
+        self.register_prepared_batches(prepared)
+        return self.produce_prepared(prepared[0], capture=capture)
+
+    def prepare_refs_batches(self, task_batches, *, capture: CaptureConfig):
+        """Build bounded lease groups without registering a writer yet."""
+        self._resolve_server_capture()
+        capability = self._capture_protocol.capability() if self._capture_protocol is not None else None
+        if self.hs_capture:
+            if capability is None or capability.get("published_ownership") != "attempt-v1":
+                raise RuntimeError("HS capture requires native plugin attempt-v1 capability")
+            if capability.get("cache_enabled") is not self.hs_prefix_cache:
+                raise RuntimeError("HS cache setting disagrees with server capability")
+        if capability is not None:
+            required = ("prepare_capture_retry", "track_capture_fence")
+            if any(not callable(getattr(self.store, name, None)) for name in required):
+                raise TypeError("negotiated capture requires attempt-fenced store")
+            requested_layers = tuple(capture.aux_hidden_state_layer_ids or ())
+            schema = {item["name"]: item for item in capability["schema"]}
+            if requested_layers and schema.get("aux", {}).get("width") != capture.expected_aux_width:
+                raise CaptureMismatchError("server capability aux width mismatch")
+            if self.schema.last_hidden_feature is not None and schema.get("last_hidden", {}).get("width") != capture.target_hidden_size:
+                raise CaptureMismatchError("server capability last hidden width mismatch")
+            if requested_layers and tuple(schema.get("aux", {}).get("layer_ids", ())) != requested_layers:
+                raise CaptureMismatchError("server capability aux layer order mismatch")
+        prepared = []
+        for tasks in task_batches:
+            body = self._request_inputs(tasks)
+            body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
+            payloads = [self._spec_capture_payload(task) for task in tasks]
+            if capability is not None:
+                for payload in payloads:
+                    self.store.prepare_capture_retry(payload["sample_id"])
+                if capability["cache_enabled"]:
+                    body["extra_key"] = [capability["capture_namespace"]] * len(tasks)
+            prepared.append(dict(tasks=tasks, body=body, payloads=payloads,
+                                 capability=capability,
+                                 estimated_bytes=self._output_bytes(tasks, capability)))
+        return prepared
+
+    def _output_bytes(self, tasks, capability):
+        # The negotiated schema fixes the complete engine tensor width/dtype.
+        # Passthrough tensors are int64 and have client-declared trailing dims.
+        if capability is None:
+            return None
+        schema = {item["name"]: item for item in capability["schema"]}
+        per_token = 0
+        for artifact, feature in (("aux", self.schema.aux_feature),
+                                  ("last_hidden", self.schema.last_hidden_feature)):
+            if feature is not None:
+                item = schema[artifact]
+                width = int(item["width"])
+                if width < 1 or item["dtype"] not in _DTYPE_BYTES:
+                    raise ValueError("invalid negotiated capture output schema")
+                per_token += width * _DTYPE_BYTES[item["dtype"]]
+        for _name, _key, trailing in self.schema.passthrough:
+            per_token += _spec_nbytes((1, *trailing), "int64")
+        if self.schema.attention_mask_feature is not None:
+            per_token += 8
+        return sum(len(task.payload["input_ids"]) * per_token for task in tasks)
+
+    def registration_capacity(self):
+        """Return the negotiated endpoint's atomic begin bound before leasing."""
+        if self._capture_protocol is None:
+            return None
+        return self._registration_capacity(self._capture_protocol.capability())
+
+    @staticmethod
+    def _registration_capacity(capability):
+        if capability is None:
+            return None
+        capacity = capability.get("limits", {}).get("attempt_capacity")
+        if capacity is not None and (isinstance(capacity, bool) or
+                                     not isinstance(capacity, int) or capacity < 1):
+            raise RuntimeError("invalid capture attempt capacity")
+        return capacity
+
+    def register_prepared_batches(self, prepared):
+        """Coalesce all currently ready leases into one endpoint begin_batch."""
+        if not prepared:
+            return
+        capability = prepared[0]["capability"]
+        if any(item["capability"] != capability for item in prepared):
+            raise RuntimeError("capture capability changed within registration batch")
+        if capability is None:
+            return
+        payloads = [payload for item in prepared for payload in item["payloads"]]
+        tasks = [task for item in prepared for task in item["tasks"]]
+        capacity = self._registration_capacity(capability)
+        if capacity is not None and len(tasks) > capacity:
+            # No attempt identity or local begin intent exists yet. The producer
+            # splits ready groups before this boundary; direct callers receive a
+            # local error rather than an ambiguous partial remote reservation.
+            raise ValueError("registration batch exceeds capture attempt capacity")
+        requests = []
+        for item in prepared:
+            item["begin_control_url"] = self._capture_protocol.url
+        retryable_payloads = {
+            id(payload) for item in prepared if item.get("registration_refused")
+            for payload in item["payloads"]
+        }
+        for task, payload in zip(tasks, payloads):
+            names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
+            # Freeze the begin identity before crossing HTTP. Even a lost reply
+            # must not let a late cleanup retarget a peer's replacement writer.
+            if "attempt_id" in payload and id(payload) not in retryable_payloads:
+                raise RuntimeError("prepared capture registration cannot be replayed")
+            payload.update(attempt_id=payload.get("attempt_id", uuid.uuid4().hex),
+                           server_epoch=capability["server_epoch"], replace=False)
+            from specforge.inference.capture_protocol import request_digest
+            payload["request_digest"] = request_digest(task.payload["input_ids"], payload)
+            requests.append((payload, task.payload["input_ids"], payload["attempt_id"], names))
+        from specforge.inference.capture_protocol import CaptureCapacityDeclined
+        try:
+            fences = self.store.begin_capture_attempts(self._capture_protocol, capability, requests)
+        except CaptureCapacityDeclined:
+            for item in prepared:
+                item["registration_refused"] = True
+            raise
+        for item in prepared:
+            item["registration_refused"] = False
+        for payload, fence in zip(payloads, fences):
+            payload.update({name: capability[name] for name in ("server_epoch", "capture_namespace", "capture_signature")})
+            payload.update({name: fence[name] for name in ("protocol_version", "attempt_id", "reservation_token")})
+            if fence.get("object_key_layout") == "attempt-v1":
+                payload["object_key_layout"] = "attempt-v1"
+
+    @staticmethod
+    def _verify_hs_feature_metadata(result, payload, capability):
+        """Check the complete negotiated schema, including passthrough dtype."""
+        schema = {item["name"]: item for item in capability["schema"]}
+        n = result.get("N")
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise RuntimeError("negotiated capture returned invalid token count")
+        expected = {
+            name: ((1, n, int(schema[artifact]["width"])), schema[artifact]["dtype"])
+            for artifact, name in payload["features"].items()
+        }
+        expected.update({item["name"]: (tuple(item["shape"]), item["dtype"])
+                         for item in payload.get("passthrough", ())})
+        actual = result.get("features", {})
+        if set(actual) != set(expected):
+            raise RuntimeError("negotiated capture feature names mismatch")
+        for name, (shape, dtype) in expected.items():
+            if tuple(actual[name].get("shape", ())) != shape or actual[name].get("dtype") != dtype:
+                raise RuntimeError("negotiated capture feature shape/dtype mismatch: " + name)
+
+    def unreturned_prepared(self, prepared, refs):
+        """Retain only per-task failures for exact-attempt retirement."""
+        returned = {ref.sample_id for ref in refs}
+        pairs = [(task, payload) for task, payload in zip(prepared["tasks"], prepared["payloads"])
+                 if payload["sample_id"] not in returned]
+        if not pairs:
+            return None
+        tasks, payloads = map(list, zip(*pairs))
+        return {**prepared, "tasks": tasks, "payloads": payloads,
+                "estimated_bytes": self._output_bytes(tasks, prepared["capability"])}
+
+    def discard_prepared_batches(self, prepared):
+        # Resolve uncertain begin replies using the store's immutable original
+        # intent, then retire that exact writer before releasing byte credits.
+        for item in prepared:
+            for payload in item["payloads"]:
+                if "attempt_id" not in payload:
+                    continue  # This lease never registered a server writer.
+                self.store.discard_capture_attempt(
+                    payload["sample_id"], server_epoch=payload["server_epoch"],
+                    attempt_id=payload["attempt_id"], control_url=item["begin_control_url"],
+                    reservation_token=payload.get("reservation_token"),
+                )
+
+    def produce_prepared(self, prepared, *, capture: CaptureConfig):
+        tasks = prepared["tasks"]
+        body = prepared["body"]
+        capture_payloads = prepared["payloads"]
+        capability = prepared["capability"]
         server_capture = self._resolve_server_capture()
-        body = self._request_inputs(tasks)
-        # A fresh cache namespace forces a full prefill on every attempt while
-        # leaving SGLang free to use the radix data structure required by hybrid
-        # targets. Retries need a new key because the prior attempt may have
-        # populated its namespace before the response was lost.
-        body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
         sampling_params = {"temperature": 0.0, "max_new_tokens": 0}
-        capture_payloads = [self._spec_capture_payload(t) for t in tasks]
-        # custom_params values are JSON scalars: one encoded spec per request.
         body["sampling_params"] = [
             {
                 **sampling_params,
@@ -463,9 +655,14 @@ class SGLangServerCaptureAdapter:
                 feature_names=feature_names,
                 server_url=self.base_url,
             )
-        rows = self.post_fn(
-            f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
-        )
+        try:
+            rows = self.post_fn(
+                f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
+            )
+        except Exception as exc:
+            if self._capture_protocol is not None and getattr(getattr(exc, 'response', None), 'status_code', None) == 409:
+                self._capture_protocol.capability(refresh=True)
+            raise
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
@@ -475,7 +672,7 @@ class SGLangServerCaptureAdapter:
         capture_hint = _CAPTURE_HINTS[server_capture]
         out: List[Union[Any, ServerCaptureFailure]] = []
         successful_refs = []
-        for task, row in zip(tasks, rows):
+        for task, row, payload in zip(tasks, rows, capture_payloads):
             if not isinstance(row, dict):
                 raise RuntimeError(
                     "spec-capture server returned a non-object row for task "
@@ -526,7 +723,31 @@ class SGLangServerCaptureAdapter:
                     f"task {task.task_id}: {actual_identity} != "
                     f"{expected_identity}"
                 )
+            if capability is not None:
+                for name in ("protocol_version", "server_epoch", "capture_namespace", "capture_signature", "attempt_id", "reservation_token"):
+                    if result.get(name) != payload.get(name):
+                        if name == 'server_epoch':
+                            self._capture_protocol.invalidate_epoch(result.get(name))
+                        raise RuntimeError("negotiated capture response identity mismatch: " + name)
+                if self.hs_capture:
+                    if result.get("request_digest") != payload.get("request_digest"):
+                        raise RuntimeError("negotiated capture response request digest mismatch")
+                    self._verify_hs_feature_metadata(result, payload, capability)
+                if capability.get('published_ownership') == 'attempt-v1':
+                    if result.get('publication_ownership') != 'attempt-v1' or result.get('state') != 'PUBLISHED' or not result.get('writer_drained'):
+                        raise RuntimeError('capture response omitted drained ownership transfer')
+                    from specforge.inference.capture_protocol import attempt_keys
+                    names = [*payload['features'].values(), *(x['name'] for x in payload.get('passthrough', ()))]
+                    keys = attempt_keys(result, names)
+                    if result.get('physical_keys') != keys or any(result.get('features', {}).get(name, {}).get('key') != key for name, key in keys.items()):
+                        raise RuntimeError('capture response immutable keys mismatch')
+                if self.hs_capture:
+                    N, L = len(task.payload["input_ids"]), result.get("L")
+                    if isinstance(L, bool) or not isinstance(L, int) or not 0 <= L < N or result.get("N") != N or result.get("span") != [L, N]:
+                        raise RuntimeError("negotiated capture returned invalid absolute span")
             ref = self._ref_from_result(task, result, capture)
+            if capability is not None and ref.estimated_bytes > self._output_bytes([task], capability):
+                raise RuntimeError("capture output exceeded negotiated byte reservation")
             # A capture shorter than the prompt is corrupt: it means cache
             # isolation or another full-prefill invariant failed despite the
             # request's fresh namespace.
@@ -538,7 +759,7 @@ class SGLangServerCaptureAdapter:
             }
             if short:
                 self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason="seq-len-mismatch")
+                abort_feature_ref(self.store, ref, reason="seq-len-mismatch")
                 out.append(
                     ServerCaptureFailure(
                         task_id=task.task_id,
@@ -578,7 +799,7 @@ class SGLangServerCaptureAdapter:
                 # Loud boundary failure; free the server-written keys so a
                 # mismatched sample is never consumable.
                 self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason=f"contract:{exc}")
+                abort_feature_ref(self.store, ref, reason=f"contract:{exc}")
                 out.append(
                     ServerCaptureFailure(
                         task_id=task.task_id, reason=str(exc), retryable=False

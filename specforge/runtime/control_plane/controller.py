@@ -22,6 +22,8 @@ online consumers use one SQLite ledger shared by their ranks.
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import dataclasses
 import threading
 import uuid
@@ -250,10 +252,12 @@ class DataFlowController:
                     # never have materialized refs that belonged to another DP
                     # rank, so seed generation/key bookkeeping from the durable
                     # committed ref before asking it to remove remote objects.
+                    if ref is None:
+                        raise RuntimeError("cannot reconcile released sample without its committed ref")
                     adopt = getattr(feature_store, "adopt", None)
-                    if callable(adopt) and ref is not None:
+                    if callable(adopt):
                         adopt(ref)
-                    feature_store.abort(sample_id, reason="reconciled-released")
+                    abort_feature_ref(feature_store, ref, reason="reconciled-released")
                 continue
             if ref is not None:
                 self.sample_queue.put([ref])

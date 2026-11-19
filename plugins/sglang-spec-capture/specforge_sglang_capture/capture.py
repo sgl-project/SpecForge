@@ -117,12 +117,19 @@ def collect_capture_items(
         if spec is not None:
             error = spec.get("_parse_error")
             prompt_len = len(req.origin_input_ids)
-            if error is None and prefix_len:
+            plan = getattr(req, "_specforge_hs_plan", None)
+            if error is None and plan is not None:
+                if (prefix_len != plan.L or length != plan.N - plan.L
+                        or prompt_len != plan.N or plan.execution.request_id != req.rid):
+                    error = "the native capture span differs from its committed HS plan"
+            elif error is None and "protocol_version" in spec:
+                error = "HS capture has no committed native admission plan"
+            elif error is None and prefix_len:
                 error = (
                     f"{prefix_len} prompt tokens were served from the prefix "
                     "cache; spec capture needs a full prefill"
                 )
-            elif error is None and length != prompt_len:
+            elif error is None and plan is None and length != prompt_len:
                 error = (
                     f"the prefill covered {length} of {prompt_len} prompt tokens; "
                     "launch the server with --chunked-prefill-size -1"
@@ -185,9 +192,25 @@ class CaptureObserver:
                         ),
                     )
             checked.append(item)
-        return CaptureDeviceOutput.from_rows(
-            self.runtime, checked, aux, last_hidden, copy=can_run_graph
-        )
+        jobs, native_items = [], []
+        reqs = {req.rid: req for req in batch.reqs}
+        for item in checked:
+            if self.runtime.hs is None or "protocol_version" not in item.spec:
+                native_items.append(item)
+                continue
+            req = reqs[item.rid]
+            if item.error is None:
+                try:
+                    jobs.append(self.runtime.hs.snapshot(req, item, aux, last_hidden))
+                    continue
+                except Exception as exc:
+                    item = dataclasses.replace(item, error=str(exc))
+            self.runtime.hs.capture_error(req, item.error)
+            native_items.append(item)
+        output = CaptureDeviceOutput.from_rows(
+            self.runtime, native_items, aux, last_hidden, copy=can_run_graph)
+        output.hs_jobs = jobs
+        return output
 
 
 def _select_rows(
@@ -235,6 +258,7 @@ class CaptureDeviceOutput:
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
+        self.hs_jobs = []
 
     @classmethod
     def from_rows(cls, runtime, items, aux, last_hidden, *, copy):
@@ -242,30 +266,36 @@ class CaptureDeviceOutput:
         return cls(runtime, items, aux, last_hidden)
 
     def copy_to_host(self, copy_tensor):
+        if not self.items:
+            # HS controller owns the only D2H path and its bounded pinned arena.
+            return CaptureHostOutput(self.runtime, [], None, None, hs_jobs=self.hs_jobs)
         if self.runtime.gpu_put:
             # Device publication: the sink waits for everything enqueued so far.
             ready = torch.cuda.Event()
             ready.record()
             return CaptureHostOutput(
-                self.runtime, self.items, self.aux, self.last_hidden, ready_event=ready
+                self.runtime, self.items, self.aux, self.last_hidden, ready_event=ready,
+                hs_jobs=self.hs_jobs,
             )
         return CaptureHostOutput(
             self.runtime,
             self.items,
             copy_tensor(self.aux) if self.aux is not None else None,
             copy_tensor(self.last_hidden) if self.last_hidden is not None else None,
+            hs_jobs=self.hs_jobs,
         )
 
 
 class CaptureHostOutput:
     """HostAuxiliaryOutput: publish finished capture requests, then hold them."""
 
-    def __init__(self, runtime, items, aux, last_hidden, *, ready_event=None):
+    def __init__(self, runtime, items, aux, last_hidden, *, ready_event=None, hs_jobs=()):
         self.runtime = runtime
         self.items = items
         self.aux = aux
         self.last_hidden = last_hidden
         self.ready_event = ready_event
+        self.hs_jobs = hs_jobs
 
     def _rows(self, tensor, item):
         if tensor is None:
@@ -273,6 +303,9 @@ class CaptureHostOutput:
         return tensor[item.start : item.start + item.length]
 
     def consume(self, batch, commits) -> None:
+        if self.hs_jobs:
+            self.runtime.hs.consume(self.hs_jobs, batch)
+            self.hs_jobs = []
         reqs = {req.rid: req for req in batch.reqs}
         samples: List[Sample] = []
         held = []
@@ -433,6 +466,7 @@ class CaptureRuntime:
         self.results: Dict[str, Dict[str, Any]] = {}
         self.pending = PendingCaptures(self, max_pending_batches)
         self.observer = CaptureObserver(self)
+        self.hs = None
 
 
 def install(scheduler) -> CaptureRuntime:
@@ -485,6 +519,18 @@ def install(scheduler) -> CaptureRuntime:
     )
     method = features.aux_hidden_state_capture
     runtime.capture_method = str(getattr(method, "name", method)).lower()
+    from specforge_sglang_capture.hs.config import HSConfig
+    hs_config = HSConfig.from_env()
+    if hs_config.capture:
+        from sglang.srt.managers.prefix_admission import CAPTURE_ADMISSION_PROTOCOL
+        from specforge_sglang_capture.hs.runtime import HSCaptureRuntime
+
+        if CAPTURE_ADMISSION_PROTOCOL != 1:
+            raise RuntimeError("HS capture requires native admission protocol v1")
+        if getattr(scheduler, "prefix_admission_observer", None) is not None:
+            raise RuntimeError("another native prefix admission observer is already installed")
+        runtime.hs = HSCaptureRuntime(scheduler, runtime, hs_config)
+        scheduler.prefix_admission_observer = runtime.hs
     model_runner.forward_observer = runtime.observer
     scheduler.output_streamer.spec_capture_results = runtime.results
     scheduler._specforge_capture_runtime = runtime

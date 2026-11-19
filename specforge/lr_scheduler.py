@@ -1,3 +1,4 @@
+import math
 from warnings import warn
 
 from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
@@ -122,6 +123,40 @@ class CosineAnnealingWarmupLR(_WarmupScheduler):
             last_epoch=last_epoch,
         )
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+
+class TorchSpecCosineWarmupLR(_LRScheduler):
+    """Opt-in match for the archived TorchSpec cosine schedule.
+
+    With warmup, step zero is zero LR and warmup reaches peak at warmup_steps.
+    Without warmup, step zero is the peak. Cosine reaches eta_min at total_steps.
+    The default SpecForge path is unchanged.
+    """
+
+    def __init__(
+        self, optimizer, total_steps, warmup_steps=0, eta_min=0.0, last_epoch=-1
+    ):
+        if not 0 <= warmup_steps < total_steps:
+            raise ValueError("warmup_steps must be in [0, total_steps)")
+        if eta_min < 0 or any(eta_min > g["lr"] for g in optimizer.param_groups):
+            raise ValueError("eta_min must be between zero and each peak LR")
+        self.total_steps = int(total_steps)
+        self.warmup_steps = int(warmup_steps)
+        self.eta_min = float(eta_min)
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch
+        if self.warmup_steps and step <= self.warmup_steps:
+            return [peak * step / self.warmup_steps for peak in self.base_lrs]
+        progress = min(
+            1.0,
+            max(
+                0.0, (step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+            ),
+        )
+        coeff = 0.5 * (math.cos(math.pi * progress) + 1.0)
+        return [self.eta_min + coeff * (peak - self.eta_min) for peak in self.base_lrs]
 
 
 class _FlatLR(_LRScheduler):
