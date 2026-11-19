@@ -32,6 +32,7 @@ from specforge.training.contracts import (
     CheckpointState,
     PendingStep,
     ProgramSpec,
+    RankFailure,
     StepContext,
     StepMetrics,
     TrainingProgram,
@@ -170,7 +171,7 @@ class DataParallelRunner:
     ``world size * window length / global denominator``.
 
     Under ``microbatch`` every term's denominator is pooled over the ranks
-    between a micro-batch's forward and its backward, in one reduction. The
+    between a micro-batch's forward and its backward, one reduction each. The
     loss that is differentiated is ``world size * sum_t c_t * numerator_t /
     pooled denominator_t``, which the wrapper's average over the ranks turns
     into the micro-batch's global mean; its denominator is one, so the
@@ -257,7 +258,7 @@ class DataParallelRunner:
                     key: value.pin_memory() if value.device.type == "cpu" else value
                     for key, value in prepared.items()
                 }
-            inputs = inputs | prepared
+            inputs = {**inputs, **prepared}
         tensors = {
             key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }
@@ -276,18 +277,32 @@ class DataParallelRunner:
         # and scheduler state, so that large state is saved once. Sharded
         # optimizer state is each rank's own, and so is every rank's RNG.
         replicated = self.backend.optimizer_state_is_replicated
-        return CheckpointState(
-            # The backend gathers the model on the first rank only; the others
-            # hold nothing to select from.
-            draft=(
-                self._unwrapped.draft_state(state["model"]) if state["model"] else {}
-            ),
-            rank={
-                "optimizer": None if replicated else state["optimizer"],
-                "rng": state["rng"],
-            },
-            replicated=state["optimizer"] if replicated else None,
-            kernels=self._unwrapped.kernel_record(),
+        try:
+            # This rank's own work, once the gather is over.
+            return CheckpointState(
+                # Only the rank that writes the shared file selects the
+                # draft's weights; what the others hold of the model is
+                # partial under sharding.
+                draft=(
+                    self._unwrapped.draft_state(state["model"])
+                    if self._first_rank()
+                    else {}
+                ),
+                rank={
+                    "optimizer": None if replicated else state["optimizer"],
+                    "rng": state["rng"],
+                },
+                replicated=state["optimizer"] if replicated else None,
+                kernels=dict(self._unwrapped.kernel_record()),
+            )
+        except Exception as error:
+            raise RankFailure(f"{type(error).__name__}: {error}") from error
+
+    @staticmethod
+    def _first_rank() -> bool:
+        """Whether this is the process that writes a checkpoint's shared file."""
+        return not (dist.is_available() and dist.is_initialized()) or (
+            dist.get_rank() == 0
         )
 
     def load_resume(self, state: Mapping[str, Any]) -> None:
@@ -342,8 +357,13 @@ class DataParallelRunner:
         if not self._evaluating:
             raise RuntimeError("evaluate belongs inside an evaluation() pass")
         ctx = replace(ctx, collect_detailed_metrics=self.spec.evaluation_diagnostics)
+        # A program with a statistic is told there is none pooled: it then
+        # uses the batch's own.
+        arguments = (
+            self._unwrapped.replay_arguments({}) if self.replay_statistics else {}
+        )
         with torch.no_grad():
-            return self._forward(batch, ctx)
+            return self._forward(batch, ctx, **arguments)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()
@@ -363,7 +383,12 @@ class DataParallelRunner:
             )
         state = _RngState(device, torch.get_rng_state(), accelerator)
         with torch.no_grad():
-            statistics = self._forward(batch, ctx, prepass=True).statistics
+            statistics = self._forward(
+                batch,
+                ctx,
+                prepass=True,
+                **self._unwrapped.replay_arguments({}, prepass=True),
+            ).statistics
         # Kept only for a prepass that ran: each one pairs with one replay.
         self._prepass_rng.append(state)
         return statistics
@@ -474,26 +499,23 @@ class DataParallelRunner:
             )
         if not pooled:
             return result.numerator, result.denominator
-        # Every rank holds the same terms in the same order. Denominators of
-        # one dtype share a reduction: a sum is rounded in the dtype it is
-        # taken in, so packing two dtypes together would change one of them.
-        device = self._device()
-        local = [denominator.to(device) for _, _, denominator in result.terms]
-        pooled_by_term = list(local)
-        for dtype in dict.fromkeys(denominator.dtype for denominator in local):
-            members = [i for i, d in enumerate(local) if d.dtype == dtype]
-            sums = self.reduce_sum(torch.stack([local[i] for i in members]))
-            for index, total in zip(members, sums):
-                pooled_by_term[index] = total
+        # Every rank holds the same terms in the same order. Each denominator
+        # is reduced on its own, in its own dtype and shape: a packed
+        # reduction rounds in one dtype and may sum the ranks of each element
+        # in another order. It is never differentiated.
+        pooled = [
+            self.reduce_sum(denominator.detach().clone())
+            for _, _, denominator in result.terms
+        ]
         world_size = self._world_size()
         loss = sum(
             coefficient
             * (world_size * numerator / denominator.where(denominator > 0, 1))
-            for (coefficient, numerator, _), denominator in zip(
-                result.terms, pooled_by_term
-            )
+            for (coefficient, numerator, _), denominator in zip(result.terms, pooled)
         )
-        return loss, pooled_by_term[0].new_ones(())
+        # The window counts its micro-batches with this one, in a dtype that
+        # holds the count whatever the terms' is.
+        return loss, torch.ones((), device=pooled[0].device)
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:

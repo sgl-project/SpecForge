@@ -22,6 +22,7 @@ from typing import (
     Any,
     ContextManager,
     Dict,
+    Iterator,
     Literal,
     Mapping,
     Optional,
@@ -100,6 +101,18 @@ class TrainingProgram(Protocol):
     #: the teacher head), as declared when the program was built.
     frozen: Tuple[torch.nn.Module, ...]
 
+    #: The module's mode; a runner sets it with ``train()`` and ``eval()``.
+    training: bool
+
+    def train(self, mode: bool = True) -> "TrainingProgram":
+        """Set the mode of the whole module, the draft included."""
+
+    def eval(self) -> "TrainingProgram":
+        """``train(False)``."""
+
+    def parameters(self) -> Iterator[torch.nn.Parameter]:
+        """The module's parameters; their device is where batches are placed."""
+
     def __call__(
         self,
         tensors: Mapping[str, torch.Tensor],
@@ -107,6 +120,8 @@ class TrainingProgram(Protocol):
         step: int,
         total_steps: Optional[int],
         collect_detailed_metrics: bool,
+        prepass: bool = False,
+        **statistics: Optional[torch.Tensor],
     ) -> "ObjectiveResult":
         """Run the objective on one placed batch.
 
@@ -116,18 +131,20 @@ class TrainingProgram(Protocol):
         returns ``result.terms``. No collective across samples is issued
         here. A program that declares a replay statistic also takes
         ``prepass=True``, which asks for this rank's sums of each statistic
-        in ``result.statistics``, and in a replay the keyword arguments that
-        ``replay_arguments`` returned.
+        in ``result.statistics``, and in every call the keyword arguments
+        that ``replay_arguments`` returned for it.
         """
 
     def replay_arguments(
-        self, replay_values: Mapping[str, torch.Tensor]
-    ) -> Mapping[str, torch.Tensor]:
-        """The forward's keyword arguments for a replayed micro-batch.
+        self, replay_values: Mapping[str, torch.Tensor], *, prepass: bool = False
+    ) -> Mapping[str, Optional[torch.Tensor]]:
+        """The forward's keyword arguments that carry the declared statistics.
 
-        Any arithmetic on the pooled sums, a ratio and its zero guard for
-        one, is done here, outside the wrapper: a wrapper may cast what
-        passes through its forward. Empty for a program without a statistic.
+        For a prepass, a replay (``replay_values`` holds the pooled sums) and
+        any other call (it is empty). Any arithmetic on the pooled sums, a
+        ratio and its zero guard for one, is done here, outside the wrapper:
+        a wrapper may cast what passes through its forward. Empty for a
+        program without a statistic.
         """
 
     def host_inputs(
@@ -151,12 +168,23 @@ class CheckpointState:
     draft: Dict[str, torch.Tensor]
     #: This rank's own state for continuing the run; every rank's is saved.
     rank: Dict[str, Any]
-    #: State for continuing that is the same on every rank and is saved once,
-    #: or None.
+    #: The optimizer state where every rank holds the same one: saved once
+    #: and handed back to every rank on resume. None where each rank's is its
+    #: own, in ``rank``.
     replicated: Optional[Dict[str, Any]]
     #: The kernels this rank has realised so far, by the choice they answer.
     #: Ranks have to agree on them before a checkpoint records them.
     kernels: Mapping[str, str]
+
+
+class RankFailure(RuntimeError):
+    """This rank failed outside any collective, where its peers will succeed.
+
+    Whoever catches it reports it through ``StepRunner.agree`` and then
+    raises its cause, so the other ranks do not wait for this one in their
+    next collective. A failure inside a collective is not one: the ranks are
+    already apart there, and it propagates so the launcher tears the job down.
+    """
 
 
 class IncompleteWindow(RuntimeError):
