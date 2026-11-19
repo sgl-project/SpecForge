@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
@@ -70,11 +71,29 @@ class ProgramSpecTest(unittest.TestCase):
         # A block draft is sharded per decoder layer; EAGLE is one unit.
         self.assertEqual(specs["DFlashDraftModel"].partition.blocks, ("DecoderLayer",))
         self.assertEqual(specs["Eagle3DraftModel"].partition.blocks, ())
-        # In one order on every rank, whatever order the draft class holds them in.
-        self.assertEqual(
-            program_spec(build_runtime("PEagleDraftModel")[1]).partition.blocks,
-            ("DecoderLayer", "EagleDecoderStage"),
-        )
+        # In one order on every rank, whatever order the draft holds them in.
+        _, peagle = build_runtime("PEagleDraftModel")
+        for held in (
+            ["EagleDecoderStage", "DecoderLayer"],
+            {"DecoderLayer", "EagleDecoderStage"},
+        ):
+            peagle.draft_model._no_split_modules = held
+            self.assertEqual(
+                program_spec(peagle).partition.blocks,
+                ("DecoderLayer", "EagleDecoderStage"),
+            )
+
+    def test_draft_that_names_no_block_is_one_unit(self):
+        _, runtime = build_runtime("DFlashDraftModel")
+        for held in (None, [], ()):
+            with self.subTest(held=held):
+                runtime.draft_model._no_split_modules = held
+                self.assertEqual(program_spec(runtime).partition.blocks, ())
+        # A draft that is not a canonical draft class has no such attribute.
+        plain = nn.Linear(2, 2)
+        runtime.draft_model = plain
+        self.assertFalse(hasattr(plain, "_no_split_modules"))
+        self.assertEqual(program_spec(runtime).partition.blocks, ())
 
     def test_model_without_a_registration_declares_nothing(self):
         _, runtime = build_runtime("DFlashDraftModel")
@@ -134,6 +153,36 @@ class FrozenModulesTest(unittest.TestCase):
                         for parameter in module.parameters()
                     )
                 )
+
+    def test_sharding_wrapper_is_given_the_frozen_modules_and_the_blocks(self):
+        """What the backend is told is what reaches FSDP's constructor."""
+
+        class Block(nn.Linear):
+            pass
+
+        model = nn.Sequential(Block(2, 2), nn.Linear(2, 2), nn.Embedding(4, 2))
+        table = model[2]
+        table.requires_grad_(False)
+        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="SHARD_GRAD_OP"))
+        with patch(
+            "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
+        ) as wrapper:
+            backend.prepare_model(model, frozen=(table,), blocks=("Block",))
+        ((wrapped,), arguments) = wrapper.call_args
+        self.assertIs(wrapped, model)
+        self.assertEqual(arguments["ignored_modules"], (table,))
+        self.assertEqual(
+            arguments["auto_wrap_policy"].keywords["transformer_layer_cls"], {Block}
+        )
+        # Without declarations: nothing ignored, one root unit.
+        with patch(
+            "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
+        ) as wrapper:
+            FSDPTrainingBackend(
+                ParallelConfig(sharding_strategy="SHARD_GRAD_OP")
+            ).prepare_model(model)
+        self.assertNotIn("ignored_modules", wrapper.call_args.kwargs)
+        self.assertNotIn("auto_wrap_policy", wrapper.call_args.kwargs)
 
     def test_backend_refuses_a_trainable_module_as_frozen(self):
         model = nn.Linear(2, 2)
