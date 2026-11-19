@@ -7,15 +7,20 @@ from typing import Callable
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration, AlgorithmRegistry
-from specforge.config import Config
+from specforge.config import Config, flatten_drafter
 
 
 @dataclass(frozen=True)
 class ResolvedRun:
-    """A validated config paired with its one algorithm registration."""
+    """A validated config paired with its one algorithm registration.
+
+    A config with ``drafters`` resolves to the shared config, the first
+    drafter's registration and, in ``drafters``, each drafter's own run.
+    """
 
     config: Config
     algorithm: AlgorithmRegistration
+    drafters: tuple["ResolvedRun", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,11 @@ def resolve_run(
     *,
     target_config=None,
 ) -> ResolvedRun:
-    """Resolve and validate all algorithm-owned behavior exactly once."""
+    """Resolve and validate all algorithm-owned behavior exactly once.
+
+    Each drafter of a config with ``drafters`` is resolved as the plain
+    single-draft run it flattens to.
+    """
 
     from specforge.training.canonical import resolve_run as resolve_canonical_run
 
@@ -53,6 +62,15 @@ def resolve_run(
         raise ValueError(
             "Register canonical objectives instead of a combined algorithm registry"
         )
+    if cfg.drafters:
+        drafters = []
+        for drafter in cfg.drafters:
+            flat = flatten_drafter(cfg, drafter.name)
+            try:
+                drafters.append(resolve_run(flat, target_config=target_config))
+            except Exception as exc:
+                raise ValueError(f"drafter {drafter.name!r}: {exc}") from exc
+        return ResolvedRun(cfg, drafters[0].algorithm, tuple(drafters))
     cfg, algorithm = resolve_canonical_run(cfg, target_config=target_config)
     return bind_run(cfg, algorithm)
 
@@ -143,6 +161,12 @@ def build_application_run(
         resolved = resolve_run(run, registry, target_config=target_config)
     from specforge.training.assembly import build_training_run
 
+    if resolved.drafters:
+        return build_training_run(
+            resolved.config,
+            algorithm=resolved.algorithm,
+            drafters=[(run.config, run.algorithm) for run in resolved.drafters],
+        )
     return build_training_run(
         resolved.config,
         algorithm=resolved.algorithm,

@@ -139,13 +139,18 @@ class CommandSpec:
     #: Child environment overrides; a None value unsets the inherited
     #: variable (Ascend rejects an empty ASCEND_RT_VISIBLE_DEVICES).
     env: Mapping[str, Optional[str]] = field(default_factory=dict)
+    #: File that takes the command's output; None leaves it on the terminal.
+    log_path: Optional[str] = None
 
     def as_dict(self) -> dict:
-        return {
+        rendered = {
             "label": self.label,
             "argv": _redacted_argv(self.argv),
             "env": _redacted_env(self.env),
         }
+        if self.log_path is not None:
+            rendered["log_path"] = self.log_path
+        return rendered
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,10 @@ class LaunchPlan:
     # SIGTERM-trapped workers run Mooncake drains, checkpoint flushes, and
     # failure-sentinel publication inside this window before SIGKILL.
     shutdown_grace_s: float = 30.0
+    #: For a config with ``drafters``: each drafter's resolved names and
+    #: capture layers, and the method and layers the capture servers must run.
+    drafters: tuple[Mapping[str, object], ...] = ()
+    capture: Mapping[str, object] = field(default_factory=dict)
 
     def render(self) -> str:
         payload = {
@@ -227,6 +236,9 @@ class LaunchPlan:
             "commands": [command.as_dict() for command in self.commands],
             "worker_env": _redacted_env(self.worker_env),
         }
+        if self.drafters:
+            payload["drafters"] = [dict(drafter) for drafter in self.drafters]
+            payload["capture"] = dict(self.capture)
         if self.kind == "managed_supervisor":
             payload.update(
                 {
@@ -842,6 +854,7 @@ def _worker_argv(
     config_path: str,
     role: Literal["all", "producer", "consumer"],
     overrides: Sequence[str],
+    drafter: Optional[str] = None,
 ) -> list[str]:
     return [
         *command_prefix,
@@ -850,6 +863,7 @@ def _worker_argv(
         config_path,
         "--role",
         role,
+        *(("--drafter", drafter) if drafter is not None else ()),
         *overrides,
     ]
 
@@ -865,13 +879,18 @@ def _trainer_command(
     distributed_entry: Sequence[str],
     node_rank: Optional[int],
     env: Mapping[str, str],
+    drafter: Optional[str] = None,
+    label: Optional[str] = None,
+    log_path: Optional[str] = None,
 ) -> CommandSpec:
+    """One trainer's command; *drafter* is the drafter of the config it runs."""
     topology = cfg.deployment.trainer
-    worker = _worker_argv(worker_prefix, config_path, role, overrides)
+    worker = _worker_argv(worker_prefix, config_path, role, overrides, drafter)
     world_size = topology.nnodes * topology.nproc_per_node
     cfg.validate_world_size(world_size)
+    label = label or role
     if world_size == 1:
-        return CommandSpec(role, tuple(worker), env)
+        return CommandSpec(label, tuple(worker), env, log_path)
     if topology.nnodes == 1:
         launch = [
             *torchrun_prefix,
@@ -898,7 +917,9 @@ def _trainer_command(
             str(topology.nproc_per_node),
         ]
     worker_args = worker[len(worker_prefix) :]
-    return CommandSpec(role, tuple([*launch, *distributed_entry, *worker_args]), env)
+    return CommandSpec(
+        label, tuple([*launch, *distributed_entry, *worker_args]), env, log_path
+    )
 
 
 def _validate_consumer_database(
@@ -982,8 +1003,15 @@ def build_launch_plan(
     capture_module_probe: Optional[
         Callable[[CommandSpec, Sequence[str]], list[str]]
     ] = None,
+    drafters: Sequence = (),
+    drafter: Optional[str] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan.
+
+    *drafters* holds the resolved run of each drafter of a config with
+    ``drafters``: one producer then feeds one trainer per drafter, and the
+    capture servers run the layers of all of them. *drafter* names the
+    drafter a flattened *cfg* came from, so the workers flatten it again.
 
     A managed-local stack on RDMA reads the host's HCAs from sysfs;
     *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
@@ -1041,8 +1069,18 @@ def build_launch_plan(
                     f"exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
-    topology = cfg.deployment.trainer
-    if role == "both" and topology.nnodes > 1:
+    if drafters and role == "consumer":
+        raise ValueError(
+            "--role consumer on a config with drafters needs --drafter NAME"
+        )
+    # One (config, algorithm, drafter name) per trainer.
+    trainers = [
+        (run.config, run.algorithm, entry.name)
+        for run, entry in zip(drafters, cfg.drafters or ())
+    ] or [(cfg, algorithm, drafter)]
+    if role == "both" and any(
+        trainer_cfg.deployment.trainer.nnodes > 1 for trainer_cfg, _, _ in trainers
+    ):
         raise ValueError(
             "automatic disaggregated --role both supports one trainer node only; "
             "launch producer and each consumer node explicitly"
@@ -1053,11 +1091,11 @@ def build_launch_plan(
         else None
     )
     producer_env: dict[str, str] = {}
-    consumer_env: dict[str, str] = {}
+    consumer_envs: list[dict[str, str]] = [{} for _ in trainers]
+    managed_environment: dict[str, str] = {}
+    managed_rdma_error: Optional[str] = None
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
-        managed_environment: dict[str, str] = {}
-        managed_rdma_error: Optional[str] = None
         if managed_local is not None:
             protocol, rdma_devices, managed_rdma_error = _managed_mooncake_transport(
                 cfg,
@@ -1073,8 +1111,19 @@ def build_launch_plan(
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
+            if drafters:
+                if producer_env.get("MOONCAKE_PROTOCOL") == "nvlink":
+                    raise ValueError(
+                        "drafters do not support the nvlink Mooncake protocol"
+                    )
+                # Each trainer gets its own channel and ledger instead.
+                for name in ("DISAGG_REF_CHANNEL", "DISAGG_DB", "DISAGG_INBOX_DIR"):
+                    producer_env.pop(name, None)
         if role in ("consumer", "both"):
-            consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
+            consumer_envs = [
+                _disaggregated_env(trainer_cfg, role_base_env, role="consumer")
+                for trainer_cfg, _, _ in trainers
+            ]
         if managed_local is not None:
             device_visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
@@ -1082,21 +1131,61 @@ def build_launch_plan(
                 device_visibility_env
             )
             producer_env[_MANAGED_CHILD_ENV] = "1"
-            consumer_env.update(managed_environment)
-            consumer_env[device_visibility_env] = ",".join(
-                managed_local.trainer_cuda_visible_devices
-            )
-            consumer_env[_MANAGED_CHILD_ENV] = "1"
+            for consumer_env, (trainer_cfg, _, _) in zip(consumer_envs, trainers):
+                trainer_stack = trainer_cfg.deployment.disaggregated.managed_local
+                consumer_env.update(managed_environment)
+                consumer_env[device_visibility_env] = ",".join(
+                    trainer_stack.trainer_cuda_visible_devices
+                )
+                consumer_env[_MANAGED_CHILD_ENV] = "1"
 
     _validate_capture_urls(cfg, role=role, base_env=base_env)
-    _validate_consumer_database(
-        cfg,
-        role=role,
-        launch_env=consumer_env,
-        base_env=base_env,
-        distributed=distributed,
-        node_rank=resolved_rank,
-    )
+    for consumer_env, (trainer_cfg, _, _) in zip(consumer_envs, trainers):
+        _validate_consumer_database(
+            trainer_cfg,
+            role=role,
+            launch_env=consumer_env,
+            base_env=base_env,
+            distributed=distributed,
+            node_rank=resolved_rank,
+        )
+    summaries: tuple[Mapping[str, object], ...] = ()
+    capture: Mapping[str, object] = {}
+    contract = None
+    if drafters:
+        from specforge.training.capture_contract import (
+            combine_capture_contracts,
+            resolve_server_capture_contract,
+        )
+        from specforge.training.disaggregated import _online_flow_window
+
+        contracts = [
+            resolve_server_capture_contract(trainer_cfg, algorithm=trainer_algorithm)
+            for trainer_cfg, trainer_algorithm, _ in trainers
+        ]
+        contract = combine_capture_contracts(contracts)
+        for trainer_cfg, _, name in trainers:
+            try:
+                # The producer repeats this, but only after the servers are up.
+                _online_flow_window(trainer_cfg)
+            except ValueError as exc:
+                raise ValueError(f"drafter {name!r}: {exc}") from exc
+        summaries = tuple(
+            {
+                "name": name,
+                "run_id": trainer_cfg.run_id,
+                "output_dir": trainer_cfg.output_dir,
+                "control_dir": trainer_cfg.deployment.disaggregated.control_dir,
+                "algorithm": trainer_algorithm.name,
+                "aux_layer_ids": list(own.aux_layer_ids),
+            }
+            for (trainer_cfg, trainer_algorithm, name), own in zip(trainers, contracts)
+        )
+        capture = {
+            "method": contract.method,
+            "aux_layer_ids": list(contract.aux_layer_ids),
+        }
+    consumer_env = consumer_envs[0]
     if distributed:
         assert role != "both"
         if role == "producer" and int(base_env["WORLD_SIZE"]) > 1:
@@ -1105,6 +1194,7 @@ def build_launch_plan(
                 "torchrun worker"
             )
         if role != "producer":
+            topology = cfg.deployment.trainer
             actual_world_size = int(base_env["WORLD_SIZE"])
             expected_world_size = topology.nnodes * topology.nproc_per_node
             if actual_world_size != expected_world_size:
@@ -1116,7 +1206,9 @@ def build_launch_plan(
                 )
             cfg.validate_world_size(actual_world_size)
         worker_env = producer_env if role == "producer" else consumer_env
-        return LaunchPlan("worker", role, worker_env=worker_env)
+        return LaunchPlan(
+            "worker", role, worker_env=worker_env, drafters=summaries, capture=capture
+        )
 
     worker_prefix = tuple(worker_prefix or (sys.executable, "-m", "specforge.cli"))
     use_module_entry = torchrun_prefix is None
@@ -1127,19 +1219,39 @@ def build_launch_plan(
         ("--module", "specforge.cli") if use_module_entry else worker_prefix
     )
     if role == "producer":
-        return LaunchPlan("worker", role, worker_env=producer_env)
-    if role in ("all", "consumer"):
-        command = _trainer_command(
-            cfg,
+        return LaunchPlan(
+            "worker", role, worker_env=producer_env, drafters=summaries, capture=capture
+        )
+
+    def trainer_command(index: int, trainer_role: str) -> CommandSpec:
+        trainer_cfg, _, name = trainers[index]
+        named = {}
+        if drafters:
+            # Several trainers would otherwise share one terminal.
+            control_dir = trainer_cfg.deployment.disaggregated.control_dir
+            log_path = str(Path(control_dir, "logs", "trainer.log"))
+            if os.path.exists(log_path):
+                raise ValueError(
+                    f"drafter {name!r}: {log_path} is left from an earlier "
+                    "attempt; use a fresh control_dir"
+                )
+            named = {"label": f"consumer-{name}", "log_path": log_path}
+        return _trainer_command(
+            trainer_cfg,
             config_path=config_path,
-            role=role,
+            role=trainer_role,
             overrides=overrides,
             worker_prefix=worker_prefix,
             torchrun_prefix=torchrun_prefix,
             distributed_entry=distributed_entry,
             node_rank=resolved_rank,
-            env=consumer_env,
+            env=consumer_envs[index],
+            drafter=name,
+            **named,
         )
+
+    if role in ("all", "consumer"):
+        command = trainer_command(0, role)
         if command.argv[: len(worker_prefix)] == worker_prefix:
             return LaunchPlan("worker", role, worker_env=consumer_env)
         if deployment is not None:
@@ -1152,9 +1264,12 @@ def build_launch_plan(
         return LaunchPlan("command", role, commands=(command,))
 
     if managed_local is not None:
-        from specforge.training.capture_contract import resolve_server_capture_contract
+        if contract is None:
+            from specforge.training.capture_contract import (
+                resolve_server_capture_contract,
+            )
 
-        contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+            contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
         requested_capture = requested_server_capture(cfg, base_env)
         server_capture: str = requested_capture
         server_capture_error: Optional[str] = None
@@ -1171,27 +1286,26 @@ def build_launch_plan(
         if server_capture != "auto":
             # The managed producer reads the resolution instead of re-probing.
             producer_env["DISAGG_SERVER_CAPTURE"] = server_capture
-    producer = CommandSpec(
-        "producer",
-        tuple(_worker_argv(worker_prefix, config_path, "producer", overrides)),
-        producer_env,
+    commands = (
+        CommandSpec(
+            "producer",
+            tuple(
+                _worker_argv(worker_prefix, config_path, "producer", overrides, drafter)
+            ),
+            producer_env,
+        ),
+        *(trainer_command(index, "consumer") for index in range(len(trainers))),
     )
-    consumer = _trainer_command(
-        cfg,
-        config_path=config_path,
-        role="consumer",
-        overrides=overrides,
-        worker_prefix=worker_prefix,
-        torchrun_prefix=torchrun_prefix,
-        distributed_entry=distributed_entry,
-        node_rank=resolved_rank,
-        env=consumer_env,
+    preflight_checks = tuple(
+        check
+        for trainer_cfg, trainer_algorithm, _ in trainers
+        for check in _trainer_preflight_checks(trainer_cfg, trainer_algorithm)
     )
     if managed_local is not None:
         return LaunchPlan(
             "managed_supervisor",
             "both",
-            commands=(producer, consumer),
+            commands=commands,
             services=_managed_local_services(
                 cfg,
                 contract=contract,
@@ -1214,15 +1328,19 @@ def build_launch_plan(
                 cfg, managed_environment
             ),
             managed_rdma_error=managed_rdma_error,
-            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
+            preflight_checks=preflight_checks,
             shutdown_grace_s=managed_local.shutdown_grace_s,
+            drafters=summaries,
+            capture=capture,
         )
     return LaunchPlan(
         "supervisor",
         "both",
-        commands=(producer, consumer),
-        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
+        commands=commands,
+        preflight_checks=preflight_checks,
         shutdown_grace_s=deployment.shutdown_grace_s,
+        drafters=summaries,
+        capture=capture,
     )
 
 
@@ -1580,6 +1698,12 @@ def _spawn_command(
     stdout=None,
     stderr=None,
 ) -> subprocess.Popen:
+    if stdout is None and command.log_path is not None:
+        os.makedirs(os.path.dirname(command.log_path), exist_ok=True)
+        with open(command.log_path, "x", encoding="utf-8") as log:
+            return _spawn_command(
+                command, popen=popen, stdout=log, stderr=subprocess.STDOUT
+            )
     child_env = os.environ.copy()
     for key, value in command.env.items():
         if value is None:
@@ -1707,6 +1831,8 @@ def run_commands(
                 check()
         for command in plan.commands:
             processes.append(_spawn_command(command, popen=popen))
+            if command.log_path is not None:
+                print(f"{command.label} logs to {command.log_path}", flush=True)
         remaining = set(range(len(processes)))
         first_failure = 0
         while remaining:
@@ -1717,6 +1843,13 @@ def run_commands(
                 remaining.remove(index)
                 if status != 0 and first_failure == 0:
                     first_failure = _normalized_status(status)
+                    failed = plan.commands[index]
+                    if failed.log_path is not None:
+                        print(
+                            f"{failed.label} exited with status {first_failure}; "
+                            f"see {failed.log_path}",
+                            flush=True,
+                        )
                     _terminate_processes(
                         [processes[item] for item in remaining],
                         grace_s=plan.shutdown_grace_s,

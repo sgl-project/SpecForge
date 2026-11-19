@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import shutil
 import signal
@@ -15,13 +16,14 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
 from specforge.cli import _config_for_role, main
-from specforge.config import Config, apply_overrides
+from specforge.config import Config, apply_overrides, flatten_drafter
 from specforge.config.draft.codec import encode_config
 from specforge.launch_plan import (
     _SERVER_CAPTURE_REQUIREMENTS,
@@ -3176,6 +3178,288 @@ raise SystemExit(run_commands(plan))
         self.assertEqual(
             run_commands(plan, popen=lambda *_args, **_kwargs: process),
             143,
+        )
+
+
+#: What each drafter needs captured; the servers run the union under one method.
+DRAFTER_CONTRACTS = {
+    "run-dflash": replace(CAPTURE_CONTRACT, aux_layer_ids=(1, 9, 17)),
+    "run-dspark": replace(CAPTURE_CONTRACT, method="dspark", aux_layer_ids=(1, 9, 16)),
+}
+
+
+def _drafters_raw(control_dir, *, managed=True):
+    """Two drafters, on two and one trainer GPUs when the stack is managed."""
+    base = (
+        _managed_config(control_dir, nproc=1)
+        if managed
+        else _config(mode="disaggregated")
+    )
+    raw = base.model_dump()
+    draft = raw.pop("draft")
+    del raw["deployment"]["trainer"]
+    disaggregated = raw["deployment"]["disaggregated"]
+    disaggregated["control_dir"] = control_dir
+    if managed:
+        del disaggregated["managed_local"]["trainer_cuda_visible_devices"]
+    devices = (["4", "5"], ["6"]) if managed else (None, None)
+    raw["run_id"] = "run"
+    raw["drafters"] = [
+        {"name": name, "draft": draft, "trainer": {"cuda_visible_devices": gpus}}
+        for name, gpus in zip(("dflash", "dspark"), devices)
+    ]
+    return raw
+
+
+def _drafters_plan(raw, **kwargs):
+    cfg = Config.model_validate(raw)
+    runs = [
+        SimpleNamespace(config=flatten_drafter(cfg, item.name), algorithm=ALGORITHM)
+        for item in cfg.drafters
+    ]
+    kwargs.setdefault("env", {})
+    with mock.patch(
+        "specforge.training.capture_contract.resolve_server_capture_contract",
+        side_effect=lambda cfg, algorithm: DRAFTER_CONTRACTS[cfg.run_id],
+    ):
+        return build_launch_plan(
+            cfg,
+            drafters=runs,
+            config_path="run.yaml",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            **kwargs,
+        )
+
+
+class DraftersLaunchPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            mock.patch(
+                "specforge.training.model_loading.training_target_config",
+                return_value=None,
+            )
+        )
+        # Mixed capture methods are logged; keep the test output quiet.
+        contract_logger = logging.getLogger("specforge.training.capture_contract")
+        self.enterContext(mock.patch.object(contract_logger, "disabled", True))
+
+    def test_one_producer_feeds_a_trainer_per_drafter(self):
+        control_dir = "/fresh/drafters"
+        plan = _drafters_plan(_drafters_raw(control_dir))
+
+        self.assertEqual(plan.kind, "managed_supervisor")
+        producer, dflash, dspark = plan.commands
+        worker = ("specforge", "train", "--config", "run.yaml", "--role")
+        self.assertEqual(
+            [command.label for command in plan.commands],
+            ["producer", "consumer-dflash", "consumer-dspark"],
+        )
+        self.assertEqual(producer.argv, (*worker, "producer"))
+        self.assertEqual(
+            dflash.argv,
+            (
+                *("torchrun", "--standalone", "--nproc_per_node", "2"),
+                *worker,
+                *("consumer", "--drafter", "dflash"),
+            ),
+        )
+        self.assertEqual(dspark.argv, (*worker, "consumer", "--drafter", "dspark"))
+        # One store, one channel and one log per drafter, on its own devices.
+        self.assertNotIn("DISAGG_REF_CHANNEL", producer.env)
+        self.assertIsNone(producer.log_path)
+        for command, name, devices in (
+            (dflash, "dflash", "4,5"),
+            (dspark, "dspark", "6"),
+        ):
+            self.assertEqual(command.env["DISAGG_STORE_ID"], "run")
+            self.assertEqual(
+                command.env["DISAGG_REF_CHANNEL"], f"{control_dir}/{name}/refs.jsonl"
+            )
+            self.assertEqual(command.env["CUDA_VISIBLE_DEVICES"], devices)
+            self.assertEqual(command.log_path, f"{control_dir}/{name}/logs/trainer.log")
+        self.assertEqual(producer.env["DISAGG_STORE_ID"], "run")
+
+        # The servers capture every drafter's layers under one method.
+        server = plan.services[1].command.argv
+        self.assertEqual(server[server.index("--speculative-algorithm") + 1], "DSPARK")
+        layers = server.index("--return-aux-hidden-state-layer-ids")
+        self.assertEqual(server[layers + 1 : layers + 5], ("1", "9", "16", "17"))
+        self.assertEqual(len(plan.preflight_checks), 2)
+
+        rendered = json.loads(plan.render())
+        self.assertEqual(
+            rendered["capture"], {"method": "dspark", "aux_layer_ids": [1, 9, 16, 17]}
+        )
+        self.assertEqual(
+            [(item["run_id"], item["aux_layer_ids"]) for item in rendered["drafters"]],
+            [("run-dflash", [1, 9, 17]), ("run-dspark", [1, 9, 16])],
+        )
+        self.assertEqual(rendered["commands"][1]["log_path"], dflash.log_path)
+        self.assertNotIn("log_path", rendered["commands"][0])
+
+    def test_a_drafters_plan_refuses_what_would_fail_after_startup(self):
+        raw = _drafters_raw("/fresh/drafters")
+        with self.assertRaisesRegex(ValueError, "needs --drafter NAME"):
+            _drafters_plan(
+                _drafters_raw("/shared/drafters", managed=False),
+                requested_role="consumer",
+                env=MOONCAKE_ENV,
+            )
+
+        raw["runtime"].update(in_flight_high_watermark=1, in_flight_low_watermark=1)
+        with self.assertRaisesRegex(
+            ValueError, "drafter 'dflash': producer in-flight high watermark 1"
+        ):
+            _drafters_plan(raw)
+
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "dflash", "logs"))
+            Path(root, "dflash", "logs", "trainer.log").touch()
+            with self.assertRaisesRegex(ValueError, "left from an earlier attempt"):
+                _drafters_plan(_drafters_raw(root, managed=False), env=MOONCAKE_ENV)
+
+        external = _drafters_raw("/shared/drafters", managed=False)
+        external["deployment"]["disaggregated"]["receive_buffers"] = "cuda"
+        external["runtime"]["resident_high_watermark_bytes"] = 1 << 30
+        with self.assertRaisesRegex(ValueError, "do not support the nvlink"):
+            _drafters_plan(
+                external, env={**MOONCAKE_ENV, "MOONCAKE_PROTOCOL": "nvlink"}
+            )
+
+    def test_each_worker_flattens_the_config_it_was_started_with(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            raw = _drafters_raw(control_dir)
+            parent = _drafters_plan(raw)
+            # The supervisor makes both folders before it starts the workers.
+            os.makedirs(os.path.join(control_dir, "logs"))
+            os.makedirs(os.path.dirname(parent.commands[1].log_path))
+
+            producer = _drafters_plan(
+                raw,
+                requested_role="producer",
+                env=parent.commands[0].env,
+                rdma_device_resolver=_unexpected_rdma_devices,
+            )
+            self.assertEqual((producer.kind, producer.role), ("worker", "producer"))
+            self.assertNotIn("DISAGG_REF_CHANNEL", producer.worker_env)
+
+            flat = flatten_drafter(Config.model_validate(raw), "dflash")
+            trainer = build_launch_plan(
+                flat,
+                drafter="dflash",
+                config_path="run.yaml",
+                requested_role="consumer",
+                env={
+                    **parent.commands[1].env,
+                    "RANK": "0",
+                    "WORLD_SIZE": "2",
+                    "LOCAL_RANK": "0",
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": "29500",
+                },
+                rdma_device_resolver=_unexpected_rdma_devices,
+            )
+            self.assertEqual((trainer.kind, trainer.role), ("worker", "consumer"))
+            self.assertEqual(
+                trainer.worker_env["DISAGG_REF_CHANNEL"],
+                parent.commands[1].env["DISAGG_REF_CHANNEL"],
+            )
+
+            # Without a role, --drafter runs that drafter alone.
+            solo = flatten_drafter(
+                Config.model_validate(_drafters_raw(os.path.join(root, "solo"))),
+                "dflash",
+            )
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=DRAFTER_CONTRACTS["run-dflash"],
+            ):
+                alone = build_launch_plan(
+                    solo, drafter="dflash", config_path="run.yaml", env={}
+                )
+            self.assertEqual(
+                [command.argv[-2:] for command in alone.commands],
+                [("--drafter", "dflash")] * 2,
+            )
+            self.assertEqual(alone.drafters, ())
+
+    def test_a_trainer_writes_to_its_own_log(self):
+        with tempfile.TemporaryDirectory() as root:
+            log_path = os.path.join(root, "dflash", "logs", "trainer.log")
+            plan = LaunchPlan(
+                "supervisor",
+                "both",
+                commands=(
+                    CommandSpec(
+                        "consumer-dflash",
+                        (sys.executable, "-c", "print('trained'); raise SystemExit(3)"),
+                        log_path=log_path,
+                    ),
+                ),
+            )
+            with mock.patch("builtins.print") as output:
+                self.assertEqual(run_commands(plan), 3)
+            self.assertEqual(Path(log_path).read_text(encoding="utf-8"), "trained\n")
+            self.assertIn(
+                f"consumer-dflash exited with status 3; see {log_path}",
+                [call.args[0] for call in output.call_args_list],
+            )
+
+    def test_cli_plans_and_starts_the_workers_of_a_drafters_config(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            path = os.path.join(root, "run.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(_drafters_raw(control_dir, managed=False), stream)
+            contract = mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                side_effect=lambda cfg, algorithm: DRAFTER_CONTRACTS[cfg.run_id],
+            )
+            with (
+                mock.patch.dict(os.environ, MOONCAKE_ENV, clear=True),
+                contract,
+                mock.patch("specforge.launch_plan.run_commands") as run,
+                mock.patch("specforge.cli._train", return_value=0) as train,
+                mock.patch("builtins.print") as output,
+                mock.patch("click.echo") as warning,
+            ):
+                self.assertEqual(main(["train", "-c", path, "--plan"]), 0)
+                run.assert_not_called()
+                payload = json.loads(output.call_args.args[0])
+                # External servers: nothing gives each trainer its own GPUs.
+                self.assertIn("same GPUs", warning.call_args.args[0])
+                warning.reset_mock()
+
+                main(["train", "-c", path, "--role", "producer"])
+                producer = train.call_args.args[0]
+                main(["train", "-c", path, "--role", "consumer", "--drafter", "dspark"])
+                trainer = train.call_args.args[0]
+                with self.assertRaisesRegex(ValueError, "unknown drafter 'eagle'"):
+                    main(["train", "-c", path, "--drafter", "eagle"])
+                warning.assert_not_called()
+
+        self.assertEqual(payload["kind"], "supervisor")
+        self.assertEqual(
+            [command["label"] for command in payload["commands"]],
+            ["producer", "consumer-dflash", "consumer-dspark"],
+        )
+        self.assertEqual(payload["capture"]["aux_layer_ids"], [1, 9, 16, 17])
+        # The producer keeps the shared config and every drafter's own run.
+        self.assertEqual(producer.config.training.role, "producer")
+        self.assertEqual(
+            [run.config.run_id for run in producer.drafters],
+            ["run-dflash", "run-dspark"],
+        )
+        # A trainer sees a plain single-draft config.
+        self.assertEqual(
+            (trainer.config.run_id, trainer.config.drafters, trainer.drafters),
+            ("run-dspark", None, ()),
+        )
+        self.assertEqual(
+            trainer.config.deployment.disaggregated.control_dir,
+            os.path.join(control_dir, "dspark"),
         )
 
 

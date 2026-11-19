@@ -28,12 +28,13 @@ import os
 import signal
 import socket
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Iterator, Optional, Sequence
 
 import click
 
-from specforge.config import Config, load_config
+from specforge.config import Config, flatten_drafter, load_config
 
 
 class _WorkerTermination(BaseException):
@@ -211,6 +212,15 @@ def cli() -> None:
     help="Node-local rank for an explicit multi-node trainer launch.",
 )
 @click.option(
+    "--drafter",
+    default=None,
+    metavar="NAME",
+    help=(
+        "Run this drafter of a config with drafters as its own single-draft "
+        "run; with --role consumer it is that drafter's trainer."
+    ),
+)
+@click.option(
     "--plan",
     is_flag=True,
     help="Print the resolved process plan without starting workers.",
@@ -220,6 +230,7 @@ def train(
     config_path: str,
     role: str,
     node_rank: Optional[int],
+    drafter: Optional[str],
     plan: bool,
     overrides: Sequence[str],
 ) -> int:
@@ -230,6 +241,8 @@ def train(
     """
     overrides = list(overrides)
     cfg = load_config(config_path, overrides)
+    if drafter is not None:
+        cfg = flatten_drafter(cfg, drafter)
     from specforge.application import bind_run, resolve_run
     from specforge.launch_plan import build_launch_plan, run_commands
     from specforge.training.model_loading import training_target_config
@@ -239,11 +252,20 @@ def train(
     launch = build_launch_plan(
         resolved.config,
         algorithm=resolved.algorithm,
+        drafters=resolved.drafters,
+        drafter=drafter,
         config_path=config_path,
         overrides=overrides,
         requested_role=role,
         node_rank=node_rank,
     )
+    if launch.kind == "supervisor" and len(resolved.drafters) > 1:
+        click.echo(
+            "warning: the trainers started by this command all see the same GPUs. "
+            "To give each its own, start `--role producer` once and "
+            "`--role consumer --drafter <name>` per drafter",
+            err=True,
+        )
     if plan:
         print(launch.render())
         # The plan renders anywhere; launching it on this host would fail.
@@ -264,9 +286,14 @@ def train(
             else:
                 os.environ[key] = value
         role_config = _config_for_role(resolved.config, launch.role)
+        if resolved.drafters:
+            # Every drafter was checked as its own run; this config is shared.
+            run = replace(resolved, config=role_config)
+        else:
+            run = bind_run(role_config, resolved.algorithm)
         try:
             with _worker_signal_unwind():
-                _train(bind_run(role_config, resolved.algorithm))
+                _train(run)
         except _WorkerTermination as received:
             return 128 + received.signum
         return 0
