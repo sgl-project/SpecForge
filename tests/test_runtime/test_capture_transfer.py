@@ -3,6 +3,8 @@ import types
 import unittest
 from unittest import mock
 
+import torch
+
 from specforge.inference.capture_protocol import CaptureProtocol, WriterFence, attempt_keys
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
@@ -73,7 +75,10 @@ class TransferTests(unittest.TestCase):
         with mock.patch('specforge.inference.capture_protocol.http_control', side_effect=AssertionError('consumer control RPC')):
             for ref in refs:
                 values, handle = consumer.get(ref)
-                self.assertEqual(values['hidden_state'].shape[1], 5)
+                expected = self.server.stub.expected[ref.sample_id]
+                self.assertEqual(set(values), set(expected))
+                for name, tensor in expected.items():
+                    torch.testing.assert_close(values[name], tensor, rtol=0, atol=0)
                 consumer.release(handle)
             consumer.drain_pending_removals(retry_interval_s=0)
         self.assertEqual(before, self.server.calls)
@@ -203,6 +208,41 @@ class PublicationBoundaryTests(TransferTests):
             self.assertEqual(set(self.backend._d), set(refs[0].feature_keys.values()))
             self.assertNotIn(refs[0].sample_id, self.producer._capture_fences)
             self.assertNotIn(refs[1].sample_id, self.producer._capture_fences)
+
+    def test_partial_put_rollback_preserves_same_id_capture(self):
+        consumer = MooncakeFeatureStore(store=self.backend, store_id="run0")
+        sample_id = "run0:t0"
+        legacy_key = f"run0/{sample_id}/g1/input_ids"
+        ref = self.produce(0)[0]
+        self.assertEqual(ref.sample_id, sample_id)
+        self.assertEqual(ref.metadata["generation"], 1)
+        capture_keys = set(ref.feature_keys.values())
+        put = self.backend.put_from
+
+        def write_then_fail(*args):
+            put(*args)
+            return -1
+
+        with (
+            mock.patch.object(self.backend, "put_from", side_effect=write_then_fail),
+            mock.patch.object(self.backend, "remove", return_value=-1),
+            self.assertRaises(RuntimeError),
+        ):
+            consumer.put({"input_ids": torch.tensor([[10]])},
+                         sample_id=sample_id, metadata={})
+        self.assertEqual(set(self.backend._d), capture_keys | {legacy_key})
+        self.assertEqual(consumer.health()["release_pending"], 1)
+
+        consumer.adopt(ref)
+        self.assertEqual(consumer.gc()["release_pending"], 0)
+        self.assertEqual(set(self.backend._d), capture_keys)
+        with self.assertRaisesRegex(RuntimeError, "fenced capture sample"):
+            consumer.put({"input_ids": torch.tensor([[20]])},
+                         sample_id=sample_id, metadata={})
+        values, handle = consumer.get(ref)
+        torch.testing.assert_close(values["input_ids"], torch.arange(1, 6).view(1, -1))
+        consumer.release(handle)
+        self.assertFalse(self.backend._d)
 
     def test_same_consumer_accepts_new_attempt_and_rejects_old_ref(self):
         old = self.produce(0)[0]

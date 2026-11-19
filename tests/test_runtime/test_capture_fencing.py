@@ -3,6 +3,8 @@ import uuid
 import unittest
 from unittest import mock
 
+import torch
+
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter as _NativeAdapter
 from specforge.inference.capture_protocol import CaptureProtocol
 
@@ -128,7 +130,10 @@ class FenceTests(unittest.TestCase):
         consumer = MooncakeFeatureStore(store=self.backend, store_id='run0')
         with mock.patch('specforge.inference.capture_protocol.http_control', self.server):
             tensors, handle = consumer.get(ref)
-            self.assertEqual(tensors['hidden_state'].shape[1], 5)
+            expected = self.server.stub.expected[ref.sample_id]
+            self.assertEqual(set(tensors), set(expected))
+            for name, tensor in expected.items():
+                torch.testing.assert_close(tensors[name], tensor, rtol=0, atol=0)
             consumer.release(handle)
         self.assertFalse(self.backend._d)
         self.assertFalse(self.server.active)

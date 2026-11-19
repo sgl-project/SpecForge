@@ -9,13 +9,13 @@ from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.inference.capture_protocol import attempt_keys
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.disaggregated import _build_online, _cleanup_online_published_refs
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime.test_server_capture import _FakeMooncakeStore
 
 
@@ -181,9 +181,10 @@ class TerminalCleanupTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 channel_path = str(Path(directory) / 'refs')
                 cfg = Config.model_validate({
-                    'model': {'target_model_path': 'target', 'draft_model_config': 'draft'},
+                    'model': {'target_model_path': 'target'},
+                    'draft': 'specforge/config/draft/presets/qwen3-8b-dflash.yaml',
                     'data': {'prompts_path': 'unused'},
-                    'training': {'strategy': 'dflash', 'role': 'producer', 'max_steps': 30, 'total_steps': 1197},
+                    'training': {'role': 'producer', 'max_steps': 30, 'total_steps': 1197},
                     'deployment': {'mode': 'disaggregated', 'disaggregated': {
                         'control_dir': directory, 'backend': 'mooncake', 'server_urls': ['http://capture']}}})
                 def drive(*, should_stop):

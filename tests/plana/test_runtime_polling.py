@@ -9,7 +9,6 @@ from unittest import mock
 from pydantic import ValidationError
 import yaml
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config, load_config
 from specforge.config.schema import RuntimeConfig
 from specforge.launch import build_disagg_online_consumer
@@ -17,6 +16,7 @@ from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
 from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.disaggregated import _build_online
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 
 ALGORITHM=builtin_algorithm_registry().resolve('dflash')
@@ -32,9 +32,10 @@ BOUNDS={'producer_lease':1,'producer_concurrency':1,
 def payload(root,role,*,polling=None):
     runtime=dict(BOUNDS)
     if polling is not None:runtime.update(zip(POLL_FIELDS,polling))
-    return {'model':{'target_model_path':'target','draft_model_config':'draft'},
+    return {'model':{'target_model_path':'target'},
+        'draft':'specforge/config/draft/presets/qwen3-8b-dflash.yaml',
         'data':{'prompts_path':'prompts.jsonl','dataloader_num_workers':0},
-        'training':{'strategy':'dflash','role':role,'max_steps':1,'num_anchors':8,
+        'training':{'role':role,'max_steps':1,'objective_options':{'num_anchors':8},
                     'seed':42,'prompt_seed':42},'runtime':runtime,
         'deployment':{'mode':'disaggregated','disaggregated':{
             'control_dir':str(root),'backend':'mooncake','async_ack':False,

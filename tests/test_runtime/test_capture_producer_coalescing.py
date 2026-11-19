@@ -344,8 +344,9 @@ class CoalescedProducerTests(unittest.TestCase):
         self.assertEqual(workers[0].controller.status()['prompts_leased'], 0)
 
     def test_unreturned_outputs_consume_global_hard_cap_credit(self):
-        # Both negotiated bfloat16 engine tensors plus two int64 passthrough tensors.
-        per_token = sum(item['width'] * 2 for item in self.server.capability['schema']) + 16
+        # The canonical DFlash fixture requests aux only, plus two int64 passthrough tensors.
+        aux = next(item for item in self.server.capability['schema'] if item['name'] == 'aux')
+        per_token = aux['width'] * 2 + 16
         cap = per_token * 42  # Fits two longest prompts across both endpoints.
         other = BatchServer(self.backend)
         _, drive = self.build(n=16, concurrency=8, servers=[self.server, other],

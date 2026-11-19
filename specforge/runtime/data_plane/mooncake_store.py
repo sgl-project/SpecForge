@@ -704,7 +704,7 @@ class MooncakeFeatureStore(FeatureStore):
         # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
         # Failed local puts may leave objects from a generation that was never
-        # published. Keep these separate from the sample's live generation.
+        # published. Keep their exact physical keys separate from the live generation.
         self._partial_put_pending: Dict[Tuple[str, int], Tuple[List[str], int]] = {}
         # (sample_id, generation) logically freed in THIS process. Mooncake's
         # remove() is lease-deferred (an object keeps a short read-lease), so the
@@ -1316,6 +1316,8 @@ class MooncakeFeatureStore(FeatureStore):
         specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
         nbytes = sum(_nbytes(t) for t in staged.values())
         with self._lock:
+            if sample_id in self._capture_fences:
+                raise RuntimeError("cannot put over a fenced capture sample")
             if (
                 self.max_resident_bytes is not None
                 and sum(self._sample_bytes.values()) + nbytes > self.max_resident_bytes
@@ -1327,20 +1329,25 @@ class MooncakeFeatureStore(FeatureStore):
             self._gen_counter += 1
             gen = self._gen_counter
             prior_gen = self._generation.get(sample_id)
-            prior_names = self._sample_names.get(sample_id, [])
+            keys = {name: self._tkey(sample_id, gen, name) for name in staged}
+            prior_keys = [
+                self._tkey(sample_id, prior_gen, name)
+                for name in self._sample_names.get(sample_id, [])
+            ] if prior_gen is not None else []
         # One object per tensor, DMA'd straight from its storage. The shared put
         # config requests hard pinning when the Mooncake client supports it.
         # staged keeps the source tensors alive across the synchronous puts.
-        attempted_names: List[str] = []
+        attempted_keys: List[str] = []
         try:
             for name, t in staged.items():
                 # A failed RPC may still have published its key.
-                attempted_names.append(name)
-                self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+                key = keys[name]
+                attempted_keys.append(key)
+                self._store_put_tensor(key, t)
         except BaseException:
             with self._lock:
                 attempt = (sample_id, gen)
-                self._partial_put_pending[attempt] = (attempted_names, 0)
+                self._partial_put_pending[attempt] = (attempted_keys, 0)
                 try:
                     self._try_partial_put_free_locked(attempt)
                 except Exception:
@@ -1352,11 +1359,7 @@ class MooncakeFeatureStore(FeatureStore):
         # Overwrite-safe: drop the prior generation's tensor keys so a stale
         # ref's keys are gone (its get() then raises -> no use-after-free).
         if prior_gen is not None and prior_gen != gen:
-            leaked = [
-                name
-                for name in prior_names
-                if not self._store_remove(self._tkey(sample_id, prior_gen, name))
-            ]
+            leaked = [key for key in prior_keys if not self._store_remove(key)]
             if leaked:
                 logger.warning(
                     "MooncakeFeatureStore re-put of %s gen %s: removing prior "
@@ -1671,15 +1674,8 @@ class MooncakeFeatureStore(FeatureStore):
         self, attempt: Tuple[str, int], *, force: bool = False
     ) -> bool:
         """Remove keys from an unpublished generation, retaining failed keys."""
-        names, attempts = self._partial_put_pending[attempt]
-        sample_id, generation = attempt
-        remaining = [
-            name
-            for name in names
-            if not self._store_remove(
-                self._tkey(sample_id, generation, name), force=force
-            )
-        ]
+        keys, attempts = self._partial_put_pending[attempt]
+        remaining = [key for key in keys if not self._store_remove(key, force=force)]
         if remaining:
             self._partial_put_pending[attempt] = (remaining, attempts)
             return False
@@ -1930,9 +1926,9 @@ class MooncakeFeatureStore(FeatureStore):
                     removed += 1
                     self._stats["force_freed"] += 1
                 else:
-                    names, count = self._partial_put_pending[attempt]
+                    keys, count = self._partial_put_pending[attempt]
                     self._partial_put_pending[attempt] = (
-                        names,
+                        keys,
                         min(self.max_release_attempts, count + 1),
                     )
             remaining = [
@@ -2076,9 +2072,9 @@ class MooncakeFeatureStore(FeatureStore):
                         self._stats["force_freed"] += 1
                         last_errors.pop(label, None)
                     else:
-                        names, count = self._partial_put_pending[key]
+                        keys, count = self._partial_put_pending[key]
                         self._partial_put_pending[key] = (
-                            names,
+                            keys,
                             min(self.max_release_attempts, count + 1),
                         )
                 remaining = [
