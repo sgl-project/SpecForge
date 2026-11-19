@@ -229,9 +229,10 @@ class OnlineProducerCloseTests(unittest.TestCase):
     def _build(self, directory, backend, drive):
         from specforge.runtime.data_plane.mooncake_store import _InjectedReplicateConfig
         cfg = Config.model_validate({
-            'model': {'target_model_path':'target', 'draft_model_config':'draft'},
+            'model': {'target_model_path':'target'},
+            'draft': 'specforge/config/draft/presets/qwen3-8b-dflash.yaml',
             'data': {'prompts_path':'unused'},
-            'training': {'strategy':'dflash', 'role':'producer', 'max_steps':30, 'total_steps':1197},
+            'training': {'role':'producer', 'max_steps':30, 'total_steps':1197},
             'deployment': {'mode':'disaggregated', 'disaggregated': {
                 'control_dir':directory, 'backend':'mooncake', 'server_urls':['http://capture'],
                 'receive_buffers':'pageable'}}})
