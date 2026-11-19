@@ -475,7 +475,12 @@ class Trainer:
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
+        wrapped = backend.prepare_model(
+            model,
+            optimizer_target=model.draft_model,
+            frozen=model.frozen,
+            blocks=program_spec.partition.blocks,
+        )
         runner = DataParallelRunner(wrapped, backend, program_spec)
         if resume is not None:
             # A rank whose own state does not restore tells the others, which

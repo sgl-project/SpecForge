@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from specforge.training.contracts import ProgramSpec
+from specforge.training.contracts import PartitionHints, ProgramSpec
 
 
 def program_spec(model) -> ProgramSpec:
@@ -32,6 +32,16 @@ def program_spec(model) -> ProgramSpec:
         replay_statistics=() if statistic is None else (statistic.argument_name,),
         evaluation_diagnostics=registration.training.evaluation_diagnostics,
         reduction=registration.training.reduction,
+        # A draft class names its transformer block; a draft without one
+        # (EAGLE) is a single unit.
+        # A draft that names no block (EAGLE, or a module that is not a
+        # canonical draft class) is one unit. Sorted: a draft class may hold
+        # the names in a set, whose order differs between the ranks' processes.
+        partition=PartitionHints(
+            blocks=tuple(
+                sorted(getattr(model.draft_model, "_no_split_modules", None) or ())
+            )
+        ),
     )
 
 

@@ -137,8 +137,8 @@ def _no_fsdp_wrap():
 
     orig = FSDPTrainingBackend.prepare_model
 
-    def unwrapped(self, model, *, wrap=True, optimizer_target=None):
-        return orig(self, model, wrap=False, optimizer_target=optimizer_target)
+    def unwrapped(self, model, *, wrap=True, **arguments):
+        return orig(self, model, wrap=False, **arguments)
 
     with mock.patch.object(FSDPTrainingBackend, "prepare_model", unwrapped):
         yield

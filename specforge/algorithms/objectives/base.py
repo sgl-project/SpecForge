@@ -48,6 +48,7 @@ class ObjectiveModel(nn.Module):
         weighting=None,
         frozen_parameters=(),
         execution=None,
+        frozen_modules=(),
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -63,6 +64,9 @@ class ObjectiveModel(nn.Module):
         self.loss_configuration = loss_configuration
         self.weighting = weighting
         self.frozen_parameters = tuple(frozen_parameters)
+        # Frozen modules a runner neither shards nor optimizes: target tables
+        # used only inside the loss, as whoever built this model declared them.
+        self.frozen = tuple(dict.fromkeys(frozen_modules))
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()

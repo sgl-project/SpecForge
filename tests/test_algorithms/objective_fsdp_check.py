@@ -12,6 +12,7 @@ from specforge.modeling import build_draft_model
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import StepContext
+from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objectives import dflash2_config, training_batch
 from tests.test_runtime._fixtures import FakeProgram, fake_spec
@@ -33,7 +34,12 @@ def main():
         backend = FSDPTrainingBackend(
             ParallelConfig(world_size=2, param_dtype=torch.float32)
         )
-        wrapped = backend.prepare_model(runtime, optimizer_target=model)
+        wrapped = backend.prepare_model(
+            runtime,
+            optimizer_target=model,
+            frozen=runtime.frozen,
+            blocks=program_spec(runtime).partition.blocks,
+        )
         torch.manual_seed(19)
         result = wrapped(batch, step=0, total_steps=10)
         torch.testing.assert_close(result.loss, reference)

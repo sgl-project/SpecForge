@@ -93,21 +93,6 @@ class TestParallelConfigHandles(unittest.TestCase):
         self.assertEqual(pc.tp_size, 2)
         self.assertEqual(pc.sp_size, 2)
 
-    def test_frozen_target_tables_are_ignored_by_fsdp(self):
-        class Composite(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.lm_head = nn.Linear(4, 8, bias=False)
-                self.embed_tokens = nn.Embedding(8, 4)
-                self.draft = nn.Linear(4, 4, bias=False)
-                self.lm_head.requires_grad_(False)
-                self.embed_tokens.requires_grad_(False)
-
-        model = Composite()
-        ignored = FSDPTrainingBackend._frozen_target_modules(model)
-
-        self.assertEqual(ignored, (model.lm_head, model.embed_tokens))
-
     def test_backend_scales_gradients_before_optimizer_step(self):
         model = nn.Linear(2, 1, bias=False)
         backend = FSDPTrainingBackend(ParallelConfig())
@@ -162,7 +147,7 @@ class _FakeDFlashModel(ObjectiveModel):
 
         draft = nn.Module()
         draft.register_parameter("w", nn.Parameter(torch.ones(1)))
-        draft.config = SimpleNamespace(draft=None)
+        draft.config = SimpleNamespace(draft=SimpleNamespace(target_bindings=()))
         super().__init__(
             draft,
             objective=None,
