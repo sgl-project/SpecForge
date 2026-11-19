@@ -2,6 +2,8 @@
 
 import contextlib
 import copy
+import dataclasses
+import os
 import unittest
 from unittest.mock import patch
 
@@ -32,7 +34,7 @@ from tests.test_runtime.conformance import (
     reference_runner,
     trained_by_the_plain_runner,
 )
-from tests.test_runtime.test_canonical_end_to_end import recomputed_tolerance
+from tests.test_runtime.test_canonical_end_to_end import drafts, recomputed_tolerance
 from tests.test_runtime.trajectories import cases, differences, record
 
 
@@ -87,35 +89,50 @@ class PlainRunnerTest(RunnerChecks, unittest.TestCase):
             runner.reduce_sum(torch.ones(1))
             runner.reduce_max(torch.ones(1))
             runner.agree(None, value="kernels")
-            with self.assertRaisesRegex(RuntimeError, "rank 0: disk full"):
-                runner.agree("disk full")
+            for failure in ("disk full", ""):
+                # Any string is a failure, an empty one included.
+                with self.assertRaisesRegex(RuntimeError, f"rank 0: {failure}$"):
+                    runner.agree(failure)
             saved = runner.checkpoint_state()
         reduce.assert_not_called()
         gather.assert_not_called()
-        # And none is needed to restore it where there is no group at all.
-        again = KitProgram(reduction="microbatch")
-        with patch("torch.distributed.is_initialized", return_value=False):
-            plain_runner(again, again.spec()).load_resume(saved.rank)
+
+    def test_resume_needs_no_process_group(self):
+        program = KitProgram()
+        runner = plain_runner(program, program.spec())
+        run_window(runner, [batch(0)], StepContext())
+        saved = runner.checkpoint_state()
+        again = KitProgram()
+        no_group = RuntimeError("Default process group has not been initialized")
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            # Whatever an earlier test left initialized.
+            patch("torch.distributed.get_rank", side_effect=no_group),
+        ):
+            resumed = plain_runner(again, again.spec())
+            resumed.load_resume(copy.deepcopy(saved.rank))
+        self.assertEqual(
+            differences(
+                resumed.checkpoint_state().rank["optimizer"], saved.rank["optimizer"]
+            ),
+            [],
+        )
 
 
 class PlainTrajectoryTest(unittest.TestCase):
-    """One rank through ``specforge train``: the plain runner against DDP."""
+    """One rank through ``specforge train`` on the host: the plain runner against DDP."""
 
     def test_plain_runner_reproduces_the_reference_at_one_rank(self):
-        placeable = {case.name for case in cases()}
-        selected = [case for case in one_rank_cases() if case.name in placeable]
-        self.assertEqual(len(selected), len(one_rank_cases()))
-        reference = record(selected)
-        plain = record(selected, around_training=trained_by_the_plain_runner)
-        # Metrics, learning rates, weights, optimizer and RNG state: bit for
-        # bit on CPU, and as far as two accelerator runs of one revision agree.
+        # On the host whatever the machine has: the gate is bitwise there.
+        with patch.dict(os.environ, {"SPECFORGE_DEVICE": "cpu"}):
+            placeable = {case.name for case in cases()}
+            selected = [case for case in one_rank_cases() if case.name in placeable]
+            self.assertEqual(len(selected), len(one_rank_cases()))
+            reference = record(selected)
+            plain = record(selected, around_training=trained_by_the_plain_runner)
+        # Metrics, learning rates, weights, optimizer and RNG state.
         self.assertEqual(
-            differences(
-                one_rank_state(plain),
-                one_rank_state(reference),
-                atol=recomputed_tolerance(),
-            ),
-            [],
+            differences(one_rank_state(plain), one_rank_state(reference)), []
         )
         # What does differ is where the optimizer state is written: once in the
         # shared file under DDP, in the rank's file without a wrapper.
@@ -177,27 +194,75 @@ class KitCanFailTest(unittest.TestCase):
         self.assertEqual(self.failures(broken, "test_window_reduction"), 0)
 
     def test_lost_resume_state_fails_the_resume_job(self):
-        def losing(key):
-            class Runner(DataParallelRunner):
-                def load_resume(self, state):
-                    optimizer = dict(copy.deepcopy(state["optimizer"]))
-                    if key == "scheduler_state_dict":
-                        # A schedule that starts over.
-                        optimizer[key] = self.backend.optimizer.scheduler.state_dict()
-                    else:
-                        del optimizer[key]
-                    super().load_resume({**state, "optimizer": optimizer})
+        class WithoutMasters(DataParallelRunner):
+            def load_resume(self, state):
+                optimizer = dict(copy.deepcopy(state["optimizer"]))
+                del optimizer["fp32_params"]
+                super().load_resume({**state, "optimizer": optimizer})
 
-            return Runner
+        class WithoutSchedule(DataParallelRunner):
+            def load_resume(self, state):
+                # Everything but the schedule's position is restored.
+                scheduler = self.backend.optimizer.scheduler
+                with patch.object(scheduler, "load_state_dict"):
+                    super().load_resume(state)
 
-        for key in ("fp32_params", "scheduler_state_dict"):
-            with self.subTest(lost=key):
+        for broken in (WithoutMasters, WithoutSchedule):
+            with self.subTest(runner=broken.__name__):
                 self.assertEqual(
-                    self.failures(
-                        losing(key), "test_resume_continues_the_same_trajectory"
-                    ),
+                    self.failures(broken, "test_resume_continues_the_same_trajectory"),
                     1,
                 )
+
+    def test_masters_rounded_to_the_weights_fail_the_bfloat16_job(self):
+        class RoundedMasters(DataParallelRunner):
+            """Copies the rounded draft back over its fp32 masters every update."""
+
+            def apply_step(self, pending):
+                metrics = super().apply_step(pending)
+                optimizer = self.backend.optimizer
+                with torch.no_grad():
+                    for master, weight in zip(
+                        optimizer.fp32_params, optimizer.model_params
+                    ):
+                        master.copy_(weight)
+                return metrics
+
+        self.assertEqual(
+            self.failures(RoundedMasters, "test_window_reduction_in_bfloat16"), 1
+        )
+        # In fp32 the weights are the masters: nothing is lost there.
+        self.assertEqual(self.failures(RoundedMasters, "test_window_reduction"), 0)
+
+    def test_prepass_outside_training_mode_fails_the_replay_job(self):
+        class EvaluatedPrepass(DataParallelRunner):
+            def prepass(self, batch, ctx):
+                self.program.eval()
+                try:
+                    return super().prepass(batch, ctx)
+                finally:
+                    self.program.train()
+
+            def _train_mode(self):
+                pass
+
+        self.assertEqual(self.failures(EvaluatedPrepass, "test_replay_statistic"), 1)
+
+    def test_dropped_schedule_or_detail_flag_fails_the_window_job(self):
+        class StepZero(DataParallelRunner):
+            def _forward(self, batch, ctx, **arguments):
+                return super()._forward(
+                    batch, dataclasses.replace(ctx, global_step=0), **arguments
+                )
+
+        class NoDetail(DataParallelRunner):
+            def _forward(self, batch, ctx, **arguments):
+                ctx = dataclasses.replace(ctx, collect_detailed_metrics=False)
+                return super()._forward(batch, ctx, **arguments)
+
+        for broken in (StepZero, NoDetail):
+            with self.subTest(runner=broken.__name__):
+                self.assertEqual(self.failures(broken, "test_window_reduction"), 1)
 
     def test_checkpoint_that_does_not_wait_for_commits_fails_the_protocol(self):
         class Probe(ProtocolChecks, unittest.TestCase):
@@ -209,54 +274,69 @@ class KitCanFailTest(unittest.TestCase):
         self.assertEqual((len(result.failures), result.errors), (1, []))
 
     def test_ledger_that_breaks_the_commit_contract_is_reported(self):
+        first, second = ("s0.0", "s0.1"), ("s1.0", "s1.1")
+        window = first + second
         good = [
-            ("batch", "s0"),
-            ("forward", "s0"),
-            ("batch", "s1"),
-            ("forward", "s1"),
+            ("batch", first),
+            ("forward", first),
+            ("batch", second),
+            ("forward", second),
             ("update",),
-            ("commit", ("s0", "s1"), 1),
+            ("commit", window, 1),
+            ("snapshot", 0),
             ("checkpoint", 1),
         ]
         self.assertEqual(protocol_violations(good), [])
-        batch_0, forward_0, batch_1, forward_1, update, commit, checkpoint = good
-        for broken, message in (
+        read_1, hand_1, read_2, hand_2, update, commit, snapshot, checkpoint = good
+        for broken, messages in (
             (
-                [batch_0, forward_0, batch_1, forward_1, commit, update, checkpoint],
-                "step 1 was committed after 0 updates",
+                [read_1, hand_1, read_2, hand_2, commit, update],
+                ["step 1 was committed after 0 updates"],
             ),
             (
-                [batch_0, forward_0, batch_1, forward_1, update, checkpoint, commit],
-                "checkpoint 1 was written after 0 commits",
+                [*good[:5], snapshot, checkpoint, commit],
+                [
+                    "a checkpoint's state was collected after 0 commits of 1 "
+                    "updates, 0 in flight",
+                    "checkpoint 1 was written after 0 commits",
+                ],
             ),
             (
-                # Read and acknowledged, never handed to the runner.
-                [batch_0, forward_0, forward_0, update, batch_1, commit],
-                "step 1 committed ('s0', 's1'); its update consumed ('s0', 's0')",
+                [*good[:6], ("snapshot", 1), checkpoint],
+                [
+                    "a checkpoint's state was collected after 1 commits of 1 "
+                    "updates, 1 in flight"
+                ],
             ),
             (
-                [batch_0, forward_0, update, ("commit", ("s0",), 1)],
-                "update 1 consumed ('s0',), not a window of 2",
+                # A batch read and acknowledged that the runner never saw.
+                [read_1, hand_1, read_2, hand_1, update, ("commit", first + first, 1)],
+                ["the runner was handed ('s0.0', 's0.1'), not the stream's next batch"],
             ),
             (
-                good[:5] + [("commit", ("s1", "s0"), 1)],
-                "step 1 committed ('s1', 's0'); its update consumed ('s0', 's1')",
+                [read_1, hand_1, update, ("commit", first, 1)],
+                ["update 1 consumed 1 micro-batches, not 2"],
             ),
             (
-                good[:5] + [("raised", "IncompleteWindow"), commit],
-                "step 1 was committed after the run raised",
+                # One sample of each micro-batch is not the window.
+                [*good[:5], ("commit", ("s0.0", "s1.0"), 1)],
+                ["step 1 committed ('s0.0', 's1.0'); its update consumed " f"{window}"],
             ),
-            (good[:5], "1 updates were applied and 0 committed"),
+            (
+                [*good[:5], ("raised", "IncompleteWindow"), commit],
+                ["step 1 was committed after the run raised"],
+            ),
+            ([*good[:5]], ["1 updates were applied and 0 committed"]),
+            (
+                [*good[:6], commit],
+                [
+                    "commit of step 1 follows 1 commits",
+                    "1 updates were applied and 2 committed",
+                ],
+            ),
         ):
-            with self.subTest(expected=message):
-                self.assertEqual(protocol_violations(broken), [message])
-        self.assertEqual(
-            protocol_violations(good[:6] + [commit]),
-            [
-                "commit of step 1 follows 1 commits",
-                "1 updates were applied and 2 committed",
-            ],
-        )
+            with self.subTest(expected=messages[0]):
+                self.assertEqual(protocol_violations(broken), messages)
 
     def test_runner_that_ignores_the_terms_cannot_train_the_microbatch_job(self):
         class _WindowOnly(DataParallelRunner):
@@ -288,6 +368,14 @@ class MutationTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        recorded = {draft.architecture for draft in drafts()}
+        unknown = [
+            case.name
+            for case in declaration_cases()
+            if case.architecture not in recorded
+        ]
+        # A case the recorder has no draft for is a mistake, not a skip.
+        assert not unknown, unknown
         placeable = {case.name for case in cases()}
         cls.cases = [case for case in declaration_cases() if case.name in placeable]
         if len(cls.cases) != len(declaration_cases()):
@@ -305,6 +393,8 @@ class MutationTest(unittest.TestCase):
             case.name: differences(
                 {case.name: self.mutated[mutation][case.name]},
                 {case.name: self.reference[case.name]},
+                # Beyond what two accelerator runs of one revision differ by.
+                atol=recomputed_tolerance(),
             )
             for case in self.cases
         }

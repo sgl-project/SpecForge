@@ -28,7 +28,12 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.contracts import StepContext, StepMetrics, StepRunner
+from specforge.training.contracts import (
+    RankFailure,
+    StepContext,
+    StepMetrics,
+    StepRunner,
+)
 from specforge.training.frame import run_window
 
 logger = logging.getLogger(__name__)
@@ -659,23 +664,24 @@ class TrainerController:
         # Every rank participates: gathering a sharded model is collective and
         # every rank saves its own state. A rank that fails once the gather is
         # over, copying its optimizer state for one, reports it through the
-        # agreement; raising here would leave the others waiting in it.
+        # agreement; raising here would leave the others waiting in it. A
+        # failure inside the gather propagates: the ranks are apart already.
         state = failure = None
         try:
             state = self.runner.checkpoint_state()
-        except Exception as error:
+        except RankFailure as error:
             failure = error
         # What rank 0 records for resume has to hold for every rank; a
         # difference raises here, before anything is written.
         try:
             self.runner.agree(
-                None if failure is None else f"{type(failure).__name__}: {failure}",
-                value=None if state is None else ("loss kernels", dict(state.kernels)),
+                None if failure is None else str(failure),
+                value=None if state is None else ("loss kernels", state.kernels),
             )
-        except RuntimeError:
+        except Exception:
             if failure is not None:
                 # The rank that failed raises what it failed with.
-                raise failure
+                raise failure.__cause__ or failure
             raise
         mgr = self._checkpoint_manager()
         shared = None

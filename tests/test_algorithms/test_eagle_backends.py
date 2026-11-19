@@ -100,15 +100,7 @@ class EagleBackendTest(unittest.TestCase):
         self.assertEqual(
             requested_groups(), [{"ring_group": None, "ulysses_group": None}]
         )
-        groups = SequenceParallel(
-            ring_group="ring",
-            ulysses_group="ulysses",
-            reduce_statistics=lambda accepted, count, denominator: (
-                accepted,
-                count,
-                denominator,
-            ),
-        )
+        groups = SequenceParallel("ring", "ulysses", "sequence")
         self.assertEqual(
             requested_groups(sequence_parallel=groups),
             [{"ring_group": "ring", "ulysses_group": "ulysses"}],
@@ -132,7 +124,11 @@ class EagleBackendTest(unittest.TestCase):
             groups = sequence_parallel.sequence_parallel_groups()
             self.assertEqual(groups.reduce_statistics(1, 2, 3), "reduced")
             self.assertEqual(groups.reduce_statistics(4, 5, 6), "reduced")
-        self.assertEqual((groups.ring_group, groups.ulysses_group), ("ring", "ulysses"))
+        self.assertEqual(
+            (groups.ring_group, groups.ulysses_group, groups.sequence_group),
+            ("ring", "ulysses", "draft"),
+        )
+        # Statistics of one sequence are reduced over the product group.
         reduce.assert_called_with(4, 5, 6, group="draft")
         for getter in (a, b, c):
             getter.assert_called_once_with()
@@ -145,18 +141,31 @@ class EagleBackendTest(unittest.TestCase):
             patch("specforge.distributed.get_sp_ring_group", return_value="ring"),
             patch("specforge.distributed.get_sp_ulysses_group", return_value="ulysses"),
             patch("specforge.distributed.get_draft_sp_group", return_value=None),
-            self.assertRaisesRegex(RuntimeError, "no draft sequence process group"),
+            self.assertRaisesRegex(ValueError, "without its sequence_group"),
         ):
             sequence_parallel.sequence_parallel_groups()
+        # However the value is built.
+        with self.assertRaisesRegex(ValueError, "without its ring_group"):
+            SequenceParallel(None, "ulysses", "sequence")
 
     def test_objective_refuses_a_backend_or_axis_it_does_not_declare(self):
         from tests.test_algorithms.test_objective_contracts import build_runtime
 
         with self.assertRaisesRegex(ValueError, "does not train with attention.*'usp'"):
             build_runtime("PEagleDraftModel", attention_backend="usp")
-        groups = SequenceParallel("ring", "ulysses", lambda *statistics: statistics)
+        groups = SequenceParallel("ring", "ulysses", "sequence")
         with self.assertRaisesRegex(ValueError, "does not support sequence parallel"):
             build_runtime("PEagleDraftModel", sequence_parallel=groups)
+        # What the CLI refuses, the builder refuses.
+        with self.assertRaisesRegex(ValueError, "needs the sequence-parallel groups"):
+            objective_model("sdpa", attention_backend="usp")
+        with self.assertRaisesRegex(ValueError, "D-PACE weighting is not supported"):
+            objective_model(
+                "sdpa",
+                attention_backend="usp",
+                sequence_parallel=groups,
+                weighting={"kind": "dpace"},
+            )
 
     def test_assembled_usp_run_hands_the_process_groups_to_the_objective(self):
         """The handoff in ``build_bundle``, up to the objective model's construction."""
@@ -178,7 +187,7 @@ class EagleBackendTest(unittest.TestCase):
             received.update(arguments)
             raise Reached
 
-        groups = SequenceParallel("ring", "ulysses", lambda *statistics: statistics)
+        groups = SequenceParallel("ring", "ulysses", "sequence")
         draft = next(d for d in drafts() if d.architecture == "Eagle3DraftModel")
         with TemporaryDirectory() as temp:
             cfg = load_config(
@@ -211,8 +220,8 @@ class EagleBackendTest(unittest.TestCase):
         # number of collectives. The reducer here stands in for the group's.
         calls = []
 
-        def reduce(accepted, count, denominator):
-            calls.append(1)
+        def reduce(accepted, count, denominator, *, group):
+            calls.append(group)
             return accepted, count, denominator
 
         loss = {
@@ -225,11 +234,12 @@ class EagleBackendTest(unittest.TestCase):
                 "eager",
                 loss=loss,
                 sequence_parallel=reducer
-                and SequenceParallel(
-                    ring_group=None, ulysses_group=None, reduce_statistics=reducer
-                ),
+                and SequenceParallel("ring", "ulysses", "sequence"),
             )
-            with warnings.catch_warnings(record=True) as caught:
+            with (
+                warnings.catch_warnings(record=True) as caught,
+                patch("specforge.training.sequence_parallel.reduce_statistics", reduce),
+            ):
                 warnings.simplefilter("always")
                 results[name] = forward_loss(config, runtime)
             trimming_disabled = [
@@ -239,7 +249,7 @@ class EagleBackendTest(unittest.TestCase):
         # one reduction per chunk of the untrimmed units, for each rollout depth
         length = training_batch(eagle_config())["input_ids"].shape[1]
         depths = resolve_objective("Eagle3DraftModel").objective.ttt_length
-        self.assertEqual(len(calls), depths * -(-length // 2))
+        self.assertEqual(calls, ["sequence"] * (depths * -(-length // 2)))
         torch.testing.assert_close(results["reduced"], results["local"])
 
 

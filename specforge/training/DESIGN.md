@@ -62,22 +62,31 @@ reads seven import rules from the source:
 The shared contracts are `training.contracts`, `runtime.contracts` and the
 value types of `config.draft`.
 
-A module reaches a name by importing it, at module level or inside a function,
-by using it through an alias (`import torch as t; t.distributed.barrier()`),
-by a literal `importlib.import_module`, or one step through the package: a
-name another module re-exports is followed to its origin, and a helper
-function brings what its own body reaches. The scan does not see which
-process group a collective runs on, or what a method called on a value does:
-the run loop holds a runner and the scan does not stop it from reaching
-through it.
+A module reaches a name by importing it, at module level or inside a function;
+by using the imported name, through its alias and with the attributes that
+follow (`import torch as t; t.distributed.barrier()`); by a literal
+`importlib.import_module`; or through the package: a name another module
+re-exports is followed to its origin with the rest of the chain, and a helper
+function brings what its own body uses. Names are resolved in the scope they
+are used in. The run-loop rule also forbids `layers`, `losses` and
+`torch.optim`, and the program rule `torch.optim`.
+
+The scan follows names. It does not see which process group a collective runs
+on, what a method called on a value does (the run loop holds a runner and the
+scan does not stop it from reaching through it), a decision taken from
+`spec.name` in place of a declaration, or a name computed at run time.
 
 Every module that breaks a rule today is listed in the test with the reason
-and with exactly the names it reaches; one more or one fewer fails. Six are a
-model-parallel axis (sequence parallelism: the cached rollout, ring attention;
-tensor parallelism: three layers), whose groups share a sequence or a tensor
-and never samples. Four are the run loop's own uses of the process group
-(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`), which the
-design moves behind `runner.agree` and a topology value.
+and with each forbidden name it reaches and how many times; one use more or
+one fewer fails. Six are a model-parallel axis (sequence parallelism: the
+cached rollout, ring attention; tensor parallelism: three layers), whose
+groups share a sequence or a tensor and never samples. Four are the run
+loop's own uses of the process group (`controller.py`, `checkpoint.py`,
+`profiling.py`, `trainer.py`). The design moves the reads to a topology value
+and the error gathers to `runner.agree`; rank 0's two broadcast verdicts
+(whether an evaluation runs, whether a checkpoint is the best) need either a
+way to distribute a decision or every rank computing it, which the contract
+does not have yet.
 
 ### Conformance
 
@@ -95,28 +104,35 @@ design moves behind `runner.agree` and a topology value.
   to change the recording, or the replay proves nothing.
 - `ProtocolChecks`: the run loop over the runner with a stream that is read
   once and a ledger of what was read, handed to the runner, applied,
-  committed and checkpointed. An update consumes one whole window; a commit
-  names exactly what the update of its step consumed and follows it; nothing
-  is committed for an incomplete window; commits are flushed before a
-  checkpoint, slow asynchronous ones included.
+  committed, snapshotted and checkpointed. The runner is handed the stream's
+  batches, each once and in order; an update consumes one whole window; a
+  commit names every sample its step's update consumed and follows it;
+  nothing is committed for an incomplete window; a checkpoint's state is
+  collected and written with every update committed and no acknowledgement
+  in flight; a complete run does not raise.
 - `RunnerChecks`: one job per declaration in one process, compared with the
-  reference runner bit for bit: every update's metrics, learning rate and
-  weights, and the optimizer state at the end. Plus the single-use handle, a
-  refused batch, evaluation, and resume in bfloat16 through two further
-  updates.
+  reference runner bit for bit: every update's metrics, gradient norm,
+  learning rate and weights, and the exported draft, the optimizer state and
+  the generator at the end. The program's loss reads the step and the noise
+  it draws, its replay statistic depends on the mode and the generator of the
+  prepass, and one job runs in bfloat16, where the optimizer's fp32 masters
+  hold more than the weights. Plus the single-use handle, a refused batch,
+  evaluation, and resume in bfloat16 through two further updates.
 
 A new runner adds two test classes that set `make_runner`; those hold it in
-one process. Not in the kit: a recorded case with sequence parallelism (it
-needs `flash_attn` and accelerators), the order of commits across ranks, and
-frozen modules and partition blocks, which only a sharding runner acts on.
+one process, on the host. Not in the kit: a recorded case with sequence
+parallelism (it needs `flash_attn` and accelerators); the order of commits
+across ranks; a prepass in the protocol's ledger; evaluation with unequal
+denominators or an empty shard across ranks; frozen modules and partition
+blocks, which only a sharding runner acts on.
 
 `backends/plain.py` is the first such runner: `PlainRunner`, for a job of one
 rank. It shares the reference runner's window bookkeeping, normalization,
-replay RNG and optimizer, wraps nothing, and reads no process group and issues
-no collective of its own; what a program's forward does (a model-parallel
-axis, a compiler that coordinates ranks) is the program's. It passes the kit.
-Recorded through `specforge train` at one rank, against DDP in fp32 on twelve
-cases, it equals the reference in every metric, learning rate, weight,
+replay RNG and optimizer, wraps nothing and issues no collective of its own;
+what a program's forward does (a model-parallel axis, a compiler that
+coordinates ranks) is the program's. It passes the kit.
+Recorded through `specforge train` at one rank on the host, against DDP in fp32
+on twelve cases, it equals the reference in every metric, learning rate, weight,
 optimizer and RNG value, and differs in where it writes its optimizer state:
 the rank's file, where DDP writes it once in the shared file. One-rank FSDP,
 the default sharding of the bundled recipes, is another reference (it casts

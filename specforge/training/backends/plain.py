@@ -25,10 +25,10 @@ class PlainRunner(DataParallelRunner):
 
     The window's bookkeeping, the normalization, the replay's RNG and the
     optimizer are the reference runner's. What differs is what one process
-    does not need: the program is not wrapped, and the runner reads no
-    process group and issues no collective of its own, inside an initialized
-    process group or not. What the program's forward does is the program's:
-    a model-parallel axis, or a compiler that coordinates ranks.
+    does not need: the program is not wrapped and the runner issues no
+    collective of its own, inside an initialized process group or not. What
+    the program's forward does is the program's: a model-parallel axis, or a
+    compiler that coordinates ranks.
 
     Args:
         program: The program, placed on its device.
@@ -40,7 +40,9 @@ class PlainRunner(DataParallelRunner):
 
     Raises:
         ValueError: The job has more than one rank: every rank would train on
-            its own data without ever meeting the others.
+            its own data without ever meeting the others. Or the program sits
+            on another accelerator than the process's current one, whose
+            generator is the one a checkpoint saves and restores.
     """
 
     def __init__(
@@ -56,6 +58,14 @@ class PlainRunner(DataParallelRunner):
             raise ValueError(
                 f"the plain runner trains one process; this job has {world_size} ranks"
             )
+        device = next(program.parameters()).device
+        if device.type != "cpu":
+            current = torch.get_device_module(device.type).current_device()
+            if device.index not in (None, current):
+                raise ValueError(
+                    f"the program is on {device} and the process's current "
+                    f"{device.type} device is {current}"
+                )
         backend = FSDPTrainingBackend(
             ParallelConfig(), optimizer_factory=optimizer_factory
         )
@@ -75,7 +85,7 @@ class PlainRunner(DataParallelRunner):
         return values
 
     def agree(self, error: Optional[str], *, value: Any = None) -> None:
-        if error:
+        if error is not None:
             raise RuntimeError(f"rank 0: {error}")
 
 

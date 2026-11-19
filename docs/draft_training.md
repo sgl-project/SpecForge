@@ -54,12 +54,14 @@ never run the target or frozen MTP themselves. P-EAGLE additionally needs an
 EAGLE/P-EAGLE return each microbatch mean with denominator one. Other objectives
 return token-weighted sums. Pooling these pairs preserves each method's existing
 accumulation semantics. DSpark is the exception in training: its microbatch mean
-uses each loss term's token count over all ranks, so a training call also returns
-`ObjectiveResult.terms` (coefficient, numerator, this rank's denominator) and the
-step runner pools the denominators before the backward; the numerator and
-denominator of that result hold the loss normalized on this rank alone, which is
-the training loss only on one rank. No objective issues a collective, in training
-or evaluation, so ranks may have unequal evaluation batch counts.
+normalizes each loss term over all ranks, so a training call also returns
+`ObjectiveResult.terms` (coefficient, numerator, this rank's denominator: a token
+count, or a sum of weights under D-PACE) and the step runner pools the
+denominators before the backward; the numerator and denominator of that result
+hold the loss normalized on this rank alone, which is the training loss only on
+one rank and is what evaluation reports. No objective issues a collective across
+samples. Ranks may have unequal evaluation batch counts unless the wrapper's
+forward is itself a collective (FSDP) or the objective runs sequence-parallel.
 All objectives expose accuracy under the `acc` ratio key; EAGLE uses rollout depth
 zero and compares mapped draft predictions against the full target vocabulary.
 DSpine's
