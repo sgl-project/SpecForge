@@ -23,6 +23,7 @@ from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.contracts import (
     IncompleteWindow,
+    RankFailure,
     StepMetrics,
     materialize_metrics,
 )
@@ -741,8 +742,15 @@ class TestTrainerController(unittest.TestCase):
                 strat, FakeBackend(strat.model), run_id="r", output_dir=d
             )
             lost = MemoryError("optimizer masters")
+
+            def collect():
+                try:
+                    raise lost
+                except MemoryError as error:
+                    raise RankFailure("MemoryError: optimizer masters") from error
+
             with (
-                mock.patch.object(ctrl.runner, "checkpoint_state", side_effect=lost),
+                mock.patch.object(ctrl.runner, "checkpoint_state", collect),
                 mock.patch.object(
                     ctrl.runner, "agree", wraps=ctrl.runner.agree
                 ) as agree,
@@ -753,6 +761,24 @@ class TestTrainerController(unittest.TestCase):
             # it failed with.
             agree.assert_called_once_with("MemoryError: optimizer masters", value=None)
             self.assertIs(raised.exception, lost)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_failure_inside_the_gather_is_not_agreed(self):
+        """Its peers are inside the collective: the rank raises and the job ends."""
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            with (
+                mock.patch.object(
+                    ctrl.runner, "checkpoint_state", side_effect=MemoryError("gather")
+                ),
+                mock.patch.object(ctrl.runner, "agree") as agree,
+                self.assertRaisesRegex(MemoryError, "gather"),
+            ):
+                ctrl.save_checkpoint(1)
+            agree.assert_not_called()
             self.assertEqual(os.listdir(d), [])
 
     def test_rank_told_of_another_ranks_failure_writes_nothing(self):
