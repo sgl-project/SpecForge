@@ -60,22 +60,31 @@ reads five import rules from the source:
 The shared contracts are `training.contracts`, `runtime.contracts` and the
 value types of `config.draft`.
 
-A module reaches a name by importing it, at module level or inside a function,
-by using it through an alias (`import torch as t; t.distributed.barrier()`),
-by a literal `importlib.import_module`, or one step through the package: a
-name another module re-exports is followed to its origin, and a helper
-function brings what its own body reaches. The scan does not see which
-process group a collective runs on, or what a method called on a value does:
-the run loop holds a runner and the scan does not stop it from reaching
-through it.
+A module reaches a name by importing it, at module level or inside a function;
+by using the imported name, through its alias and with the attributes that
+follow (`import torch as t; t.distributed.barrier()`); by a literal
+`importlib.import_module`; or through the package: a name another module
+re-exports is followed to its origin with the rest of the chain, and a helper
+function brings what its own body uses. Names are resolved in the scope they
+are used in. The run-loop rule also forbids `layers`, `losses` and
+`torch.optim`, and the program rule `torch.optim`.
+
+The scan follows names. It does not see which process group a collective runs
+on, what a method called on a value does (the run loop holds a runner and the
+scan does not stop it from reaching through it), a decision taken from
+`spec.name` in place of a declaration, or a name computed at run time.
 
 Every module that breaks a rule today is listed in the test with the reason
-and with exactly the names it reaches; one more or one fewer fails. Six are a
-model-parallel axis (sequence parallelism: the cached rollout, ring attention;
-tensor parallelism: three layers), whose groups share a sequence or a tensor
-and never samples. Four are the run loop's own uses of the process group
-(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`), which the
-design moves behind `runner.agree` and a topology value.
+and with each forbidden name it reaches and how many times; one use more or
+one fewer fails. Six are a model-parallel axis (sequence parallelism: the
+cached rollout, ring attention; tensor parallelism: three layers), whose
+groups share a sequence or a tensor and never samples. Four are the run
+loop's own uses of the process group (`controller.py`, `checkpoint.py`,
+`profiling.py`, `trainer.py`). The design moves the reads to a topology value
+and the error gathers to `runner.agree`; rank 0's two broadcast verdicts
+(whether an evaluation runs, whether a checkpoint is the best) need either a
+way to distribute a decision or every rank computing it, which the contract
+does not have yet.
 
 ## Internal mechanics
 
