@@ -501,6 +501,11 @@ class SpecCaptureSink:
             return tuple(self._uncertain_publications)
 
     def _retain_uncertain(self, item):
+        if 'tensors' in item:
+            # An offset view can keep a complete registered tail piece live.
+            storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+                        for t in item['tensors']}
+            item['backing_bytes'] = sum(storages.values())
         with self._uncertain_lock:
             self._uncertain_publications.append(item)
 

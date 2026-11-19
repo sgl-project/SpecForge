@@ -397,6 +397,31 @@ class HSPluginTests(unittest.TestCase):
         self.assertFalse(any(cancelled["reservation_token"] in key for key in store.values))
         self.assertEqual(hs.controller.stats()["output_bytes"], 0)
 
+    def test_shared_tail_unknown_put_retains_writer_and_cache(self):
+        from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ,{
+            'SPECFORGE_HS_REMOTE_LEDGER_DIR':root,'SPECFORGE_HS_REMOTE_BUDGET_BYTES':str(1<<24),
+            'SPECFORGE_HS_SHARE_TAIL_BACKING':'1'}):
+            store=_FakeMooncakeStore()
+            hs=self.runtime(store=store,segmented=True)
+            req=self.request(hs,'unknown-shared',tokens=tuple(range(9)),layout='hs-prefix-v2')
+            self.admit(hs,req)
+            with mock.patch.object(store,'put_from',return_value=-800):
+                self.forward(hs,[req],[9])
+                self.spin(hs,lambda: bool(hs.quarantined_publications))
+            retained=hs.capture.sink._uncertain_snapshot()[0]
+            parent=hs.quarantined_publications[0].sample.tails['aux'][0]
+            self.assertIn(parent.untyped_storage().data_ptr(),retained['registered'])
+            self.assertEqual(retained['backing_bytes'],9*hs.schema.row_bytes)
+            self.assertGreater(hs.controller.stats()['output_bytes'],0)
+            self.assertEqual(hs.cache.stats()['tail_backing_cache_bytes'],9*hs.schema.row_bytes)
+            self.assertFalse(req._specforge_hs_attempt.transfer_certificate)
+            with self.assertRaisesRegex(RuntimeError,'quarantined'):hs.shutdown()
+            owner=hs.capture.sink._manifest_owner
+            self.assertGreater(owner.health()['remote_quarantined_bytes'],0)
+            # Isolate the failed fake backend; no production drain proof is supplied.
+            owner.stop.set();owner.thread.join();owner.ledger.db.close()
+
     def test_unknown_native_write_retains_sources_registration_and_output_charge(self):
         store = _Store(status=-800)
         hs = self.runtime(store=store)

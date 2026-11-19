@@ -30,6 +30,7 @@ from .protocol import (
 class _Reservation:
     handle: OutputReservation
     submitted: bool = False
+    registration_extra: int = 0
     transient_released: bool = False
     release_requested: bool = False
     pinned_offset: int = 0
@@ -84,6 +85,7 @@ class CaptureController:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
         self.segmented = bool(segmented)
+        self.share_tail = os.environ.get("SPECFORGE_HS_SHARE_TAIL_BACKING") == "1"
         self._segment_stats = dict.fromkeys(("segmented_samples", "segment_new_blocks", "segment_reused_blocks", "segment_assembly_bytes", "segment_cache_fill_bytes"), 0)
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
@@ -279,7 +281,7 @@ class CaptureController:
         self._current["device"] -= rec.handle.device_bytes
 
     def _release_host_locked(self, rec: _Reservation, state: _Execution) -> None:
-        self._current["output"] -= rec.handle.host_bytes
+        self._current["output"] -= rec.handle.host_bytes + rec.registration_extra
         self._reservations.pop(rec.handle.reservation_id, None)
         state.reservations.discard(rec.handle.reservation_id)
         assert all(v >= 0 for v in self._current.values())
@@ -621,6 +623,39 @@ class CaptureController:
             else:
                 job.future.set_result(completion.sample)
 
+    def _cover_prefix_registration(self, job, blocks):
+        # A future prefix PUT registers each distinct *entire* storage. The
+        # original output reservation covers logical prefix + tail + extras.
+        # Keep any additional charge until the sink has proved completion.
+        unique = {}
+        logical = 0
+        for block in blocks:
+            for t in block.features.values():
+                storage = t.untyped_storage()
+                unique[storage.data_ptr()] = storage.nbytes()
+                logical += t.numel() * t.element_size()
+        extra = max(0, sum(unique.values()) - logical)
+        if not extra:
+            return 0
+        with self._lock:
+            if self._current['output'] + extra <= self._limits['output']:
+                self._reservation(job.plan.reservation).registration_extra = extra
+                self._current['output'] += extra
+                self._peaks['output'] = max(self._current['output'], self._peaks['output'])
+                return 0
+        # Keep the original publication layout even when re-registration has
+        # no headroom. Copy only oversized backing views into charged output.
+        copied = 0
+        for i, block in enumerate(blocks):
+            values = dict(block.features)
+            for name, t in values.items():
+                nbytes = t.numel() * t.element_size()
+                if t.untyped_storage().nbytes() > nbytes:
+                    values[name] = t.clone(memory_format=torch.contiguous_format)
+                    copied += nbytes
+            blocks[i] = MaterializedBlock(block.start, block.end, block.digest, block.complete, values)
+        return copied
+
     def _run_segmented_job(self, job):
         staging, blocks = {}, []
         sample = None
@@ -650,6 +685,7 @@ class CaptureController:
                     tail[name] = tuple(piece.clone(memory_format=torch.contiguous_format)
                                        for piece in rows[H-job.plan.L:].split(piece_rows))
 
+            tail_counts = {}
             fresh = reused = filled = 0
             assembled = sum(t.numel() * t.element_size() for pieces in tail.values() for t in pieces)
             for start in range(0, job.plan.N, self.cache.chunk_tokens):
@@ -660,7 +696,13 @@ class CaptureController:
                         fill = self.cache.reserve_fill(key, job.plan.execution)
                         if fill is not None:
                             try:
-                                if self.cache.publish_ready(fill, {name: t[start-job.plan.L:end-job.plan.L] for name,t in staging.items()}):
+                                mode = (self.cache._publish_tail_views(fill, tail, H, TAIL_BYTES)
+                                        if self.share_tail else 'compact')
+                                tail_counts[mode] = tail_counts.get(mode, 0) + 1
+                                if mode == 'shared':
+                                    filled += self.cache._chunk_bytes
+                                elif mode != 'stale' and self.cache.publish_ready(fill, {
+                                        name: t[start-job.plan.L:end-job.plan.L] for name,t in staging.items()}):
                                     filled += self.cache._chunk_bytes
                             finally:
                                 self.cache.abort_fill(fill)
@@ -694,6 +736,8 @@ class CaptureController:
                     'spec-tail-v1', job.plan.namespace, job.plan.tokens, start, end,
                     job.plan.execution.attempt_id, job.plan.execution.execution_epoch])
                 blocks.append(MaterializedBlock(start, end, digest, key is not None, values))
+            registration_copy = self._cover_prefix_registration(job, blocks) if self.share_tail and H else 0
+            assembled += registration_copy
             staging.clear()
             with self._lock:
                 self._release_transient_locked(self._reservation(job.plan.reservation))
@@ -701,6 +745,11 @@ class CaptureController:
                     raise CaptureCancelledError(job.state.reason or "execution released")
                 job.state.borrowed_release = release_prefix
                 release_prefix = None
+                for mode, count in tail_counts.items():
+                    counter = 'tail_fill_' + mode + '_blocks'
+                    self._segment_stats[counter] = self._segment_stats.get(counter, 0) + count
+                counter = 'prefix_registration_fallback_copy_bytes'
+                self._segment_stats[counter] = self._segment_stats.get(counter, 0) + registration_copy
                 if H is not None:
                     self._segment_stats['private_tail_objects'] = self._segment_stats.get('private_tail_objects', 0) + sum(len(parts) for parts in tail.values())
                 self._segment_stats['segmented_samples'] += 1

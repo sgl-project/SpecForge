@@ -43,6 +43,7 @@ class _Entry:
     features: dict[str, torch.Tensor] = field(default_factory=dict)
     leases: int = 0
     owner: _StorageOwner | None = None
+    tail_storages: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -75,6 +76,10 @@ class PrefixFeatureCache:
         self._chunk_bytes = self.chunk_tokens * self.schema.row_bytes
         self._lock = threading.RLock()
         self._entries: dict[ContentBlockKey, _Entry] = {}
+        # Each READY entry holds its immutable views. Charge a backing once
+        # while any such entry survives, independently of output ownership.
+        self._tail_refs = {}
+        self._tail_bytes = self._tail_peak = 0
         self._lru: OrderedDict[ContentBlockKey, None] = OrderedDict()
         self._leases: dict[str, _Lease] = {}
         self._fills: dict[str, _Fill] = {}
@@ -310,6 +315,50 @@ class PrefixFeatureCache:
             self._lru[fill.key] = None
             return True
 
+    def _publish_tail_views(self, fill, pieces, tail_start, piece_limit):
+        """Only accepts finalized, writer-owned clones from this segmented job."""
+        offset = fill.key.start - tail_start
+        views, storages = {}, {}
+        for spec in self.schema.features:
+            row_bytes = spec.width * pieces[spec.name][0].element_size()
+            rows = piece_limit // row_bytes
+            if offset < 0 or rows == 0:
+                return 'boundary'
+            index, local = divmod(offset, rows)
+            if index >= len(pieces[spec.name]):
+                return 'boundary'
+            parent = pieces[spec.name][index]
+            if local + self.chunk_tokens > parent.shape[0]:
+                return 'boundary'
+            storage = parent.untyped_storage()
+            if (not parent.is_contiguous() or parent.storage_offset() != 0
+                    or storage.nbytes() != parent.numel() * parent.element_size()):
+                return 'layout'
+            views[spec.name] = parent.narrow(0, local, self.chunk_tokens)
+            storages[storage.data_ptr()] = storage.nbytes()
+        self.schema.validate(views, self.chunk_tokens, "cpu")
+        with self._lock:
+            rec = self._fills.get(fill.reservation_id)
+            if rec is None or rec.handle is not fill or rec.abort_requested or rec.writer_active:
+                return 'stale'
+            parents = tuple(storages.items())
+            added = sum(size for key, size in parents if key not in self._tail_refs)
+            new_total = self._bytes - rec.entry.nbytes + added
+            if new_total > self.capacity_bytes:
+                return 'budget'  # Retain the original compact-fill reservation.
+            for key, _ in parents:
+                self._tail_refs[key] = self._tail_refs.get(key, 0) + 1
+            self._tail_bytes += added
+            self._tail_peak = max(self._tail_peak, self._tail_bytes)
+            self._bytes = new_total
+            self._peak_bytes = max(self._peak_bytes, new_total)
+            rec.entry.tail_storages = parents
+            rec.entry.features = views
+            rec.entry.state = "READY"
+            self._fills.pop(fill.reservation_id)
+            self._lru[fill.key] = None
+        return 'shared'
+
     def reserve_fill(self, key: ContentBlockKey,
                      execution: ExecutionIdentity) -> FillReservation | None:
         self._validate_key(key)
@@ -340,7 +389,14 @@ class PrefixFeatureCache:
         self._entries.pop(entry.key, None)
         self._lru.pop(entry.key, None)
         owner = entry.owner
-        if owner is None:
+        if entry.tail_storages:
+            for ptr, size in entry.tail_storages:
+                self._tail_refs[ptr] -= 1
+                if not self._tail_refs[ptr]:
+                    del self._tail_refs[ptr]
+                    self._tail_bytes -= size
+                    self._bytes -= size
+        elif owner is None:
             self._bytes -= entry.nbytes
         else:
             owner.keys.discard(entry.key)
@@ -509,12 +565,15 @@ class PrefixFeatureCache:
     def stats(self) -> dict[str, int]:
         with self._lock:
             ready_bytes = sum(e.nbytes for e in self._entries.values()
-                              if e.state == "READY" and e.owner is None)
-            ready_bytes += self._owned_bytes
+                              if e.state == "READY" and e.owner is None and not e.tail_storages)
+            ready_bytes += self._owned_bytes + self._tail_bytes
             return {
                 "ready_blocks": sum(e.state == "READY" for e in self._entries.values()),
                 "writing_blocks": sum(e.state == "WRITING" for e in self._entries.values()),
                 "ready_bytes": ready_bytes,
+                "tail_backing_cache_bytes": self._tail_bytes,
+                "tail_backing_cache_peak_bytes": self._tail_peak,
+                "tail_backing_cache_parents": len(self._tail_refs),
                 "writing_bytes": sum(e.nbytes for e in self._entries.values() if e.state == "WRITING"),
                 "cache_bytes": self._bytes, "cache_peak_bytes": self._peak_bytes,
                 "cache_logical_bytes": len(self._entries) * self._chunk_bytes,
