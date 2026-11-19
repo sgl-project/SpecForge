@@ -102,20 +102,27 @@ does not have yet.
   to change the recording, or the replay proves nothing.
 - `ProtocolChecks`: the run loop over the runner with a stream that is read
   once and a ledger of what was read, handed to the runner, applied,
-  committed and checkpointed. An update consumes one whole window; a commit
-  names exactly what the update of its step consumed and follows it; nothing
-  is committed for an incomplete window; commits are flushed before a
-  checkpoint, slow asynchronous ones included.
+  committed, snapshotted and checkpointed. The runner is handed the stream's
+  batches, each once and in order; an update consumes one whole window; a
+  commit names every sample its step's update consumed and follows it;
+  nothing is committed for an incomplete window; a checkpoint's state is
+  collected and written with every update committed and no acknowledgement
+  in flight; a complete run does not raise.
 - `RunnerChecks`: one job per declaration in one process, compared with the
-  reference runner bit for bit: every update's metrics, learning rate and
-  weights, and the optimizer state at the end. Plus the single-use handle, a
-  refused batch, evaluation, and resume in bfloat16 through two further
-  updates.
+  reference runner bit for bit: every update's metrics, gradient norm,
+  learning rate and weights, and the exported draft, the optimizer state and
+  the generator at the end. The program's loss reads the step and the noise
+  it draws, its replay statistic depends on the mode and the generator of the
+  prepass, and one job runs in bfloat16, where the optimizer's fp32 masters
+  hold more than the weights. Plus the single-use handle, a refused batch,
+  evaluation, and resume in bfloat16 through two further updates.
 
 A new runner adds two test classes that set `make_runner`; those hold it in
-one process. Not in the kit: a recorded case with sequence parallelism (it
-needs `flash_attn` and accelerators), the order of commits across ranks, and
-frozen modules and partition blocks, which only a sharding runner acts on.
+one process, on the host. Not in the kit: a recorded case with sequence
+parallelism (it needs `flash_attn` and accelerators); the order of commits
+across ranks; a prepass in the protocol's ledger; evaluation with unequal
+denominators or an empty shard across ranks; frozen modules and partition
+blocks, which only a sharding runner acts on.
 
 ## Internal mechanics
 
