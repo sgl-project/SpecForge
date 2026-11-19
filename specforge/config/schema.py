@@ -22,7 +22,14 @@ import re
 from typing import Dict, List, Literal, Mapping, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from specforge.runtime.contracts import consumer_dispatch_quantum
 
@@ -747,10 +754,13 @@ class ManagedLocalStackConfig(StrictConfigModel):
     """Opt-in ownership of a complete single-node online capture stack.
 
     ``trainer_cuda_visible_devices`` holds plain device ordinals; the
-    launcher maps them to the accelerator's visibility env var.
+    launcher maps them to the accelerator's visibility env var. With
+    ``drafters`` each drafter lists its own devices instead.
     """
 
-    trainer_cuda_visible_devices: List[str] = Field(min_length=1)
+    trainer_cuda_visible_devices: Optional[List[str]] = Field(
+        default=None, min_length=1
+    )
     mooncake: ManagedLocalMooncakeConfig = Field(
         default_factory=ManagedLocalMooncakeConfig
     )
@@ -759,8 +769,9 @@ class ManagedLocalStackConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_local_resources(self):
+        trainer_devices = self.trainer_cuda_visible_devices or []
         _validate_cuda_devices(
-            self.trainer_cuda_visible_devices,
+            trainer_devices,
             field_name="managed_local.trainer_cuda_visible_devices",
         )
         mooncake_ports = {
@@ -804,9 +815,7 @@ class ManagedLocalStackConfig(StrictConfigModel):
             raise ValueError(
                 "managed_local capture servers must not share CUDA devices"
             )
-        overlap_devices = set(server_devices).intersection(
-            self.trainer_cuda_visible_devices
-        )
+        overlap_devices = set(server_devices).intersection(trainer_devices)
         if overlap_devices:
             raise ValueError(
                 "managed_local capture and trainer CUDA devices must be disjoint: "
@@ -1109,10 +1118,57 @@ class TrainingConfig(StrictConfigModel):
         return self
 
 
+_DRAFTER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+#: ``training`` keys a drafter cannot set: the first three are shared by every
+#: drafter, and resume is not supported.
+_DRAFTER_FIXED_TRAINING = ("num_epochs", "prompt_seed", "role", "resume_from")
+
+
+class DrafterTrainerConfig(StrictConfigModel):
+    """One drafter's trainer processes; unset fields keep the usual defaults."""
+
+    #: Device ordinals on a managed-local stack, one trainer rank each.
+    cuda_visible_devices: Optional[List[str]] = Field(default=None, min_length=1)
+    nnodes: Optional[int] = Field(default=None, gt=0)
+    nproc_per_node: Optional[int] = Field(default=None, gt=0)
+    master_addr: Optional[str] = None
+    master_port: Optional[int] = Field(default=None, gt=0, le=65535)
+
+
+class DrafterConfig(StrictConfigModel):
+    """One drafter of a run that trains several from one capture stack.
+
+    A drafter is a plain single-draft run; :func:`flatten_drafter` builds it.
+    """
+
+    #: Names the drafter's run id, folders and ``--drafter`` argument.
+    name: str
+    draft: Optional[dict | str] = None
+    initialization: Optional[InitializationConfig] = None
+    #: Keys set here go over the top-level ``training`` and ``tracking``.
+    training: dict = Field(default_factory=dict)
+    tracking: dict = Field(default_factory=dict)
+    trainer: DrafterTrainerConfig = Field(default_factory=DrafterTrainerConfig)
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, value):
+        # Managed services log under control_dir/logs.
+        if not _DRAFTER_NAME.fullmatch(value) or value.lower() == "logs":
+            raise ValueError(
+                "drafters[].name must start with a letter or digit, use only "
+                f"letters, digits, '_' and '-', and not be 'logs'; got {value!r}"
+            )
+        return value
+
+
 class Config(StrictConfigModel):
     draft: Optional[dict | str] = None
     initialization: Optional[InitializationConfig] = None
     resume: Optional[str] = None
+    #: Several drafters trained from one capture stack; each replaces the
+    #: top-level ``draft``, ``initialization`` and trainer settings.
+    drafters: Optional[List[DrafterConfig]] = Field(default=None, min_length=1)
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig = Field(default_factory=TrainingConfig)
@@ -1142,6 +1198,83 @@ class Config(StrictConfigModel):
         return self.resume or self.training.resume_from
 
     @model_validator(mode="after")
+    def _validate_drafters(self):
+        """Check what drafters must share or keep apart.
+
+        :func:`flatten_drafter` checks each drafter as a single-draft run.
+        """
+        if self.drafters is None:
+            return self
+        disaggregated = self.deployment.disaggregated
+        if self.mode != "online" or disaggregated is None:
+            raise ValueError("drafters require online disaggregated training")
+        managed_local = disaggregated.managed_local
+        per_drafter = {
+            "draft": self.draft is not None,
+            "initialization": self.initialization is not None,
+            "deployment.trainer": self.deployment.trainer != TrainerDeploymentConfig(),
+            "managed_local.trainer_cuda_visible_devices": (
+                managed_local is not None
+                and managed_local.trainer_cuda_visible_devices is not None
+            ),
+        }
+        misplaced = [name for name, present in per_drafter.items() if present]
+        if misplaced:
+            raise ValueError(
+                f"with drafters, {misplaced} must be set on each drafter (draft, "
+                "initialization, trainer, trainer.cuda_visible_devices)"
+            )
+        protocols = (
+            disaggregated.mooncake_protocol,
+            managed_local.mooncake.protocol if managed_local else None,
+        )
+        unsupported = {
+            "resume": self.resume_path is not None,
+            "deployment.disaggregated.inbox_server_url": (
+                disaggregated.inbox_server_url is not None
+            ),
+            "the nvlink Mooncake protocol": "nvlink" in protocols,
+        }
+        unsupported = [name for name, present in unsupported.items() if present]
+        if unsupported:
+            raise ValueError(f"drafters do not support {unsupported}")
+
+        names = [drafter.name.lower() for drafter in self.drafters]
+        if len(set(names)) != len(names):
+            raise ValueError("drafters[].name must be unique, ignoring case")
+        for drafter in self.drafters:
+            fixed = [key for key in _DRAFTER_FIXED_TRAINING if key in drafter.training]
+            if fixed:
+                raise ValueError(
+                    f"drafter {drafter.name!r} must not set training {fixed}; "
+                    "every drafter shares the top-level value, and resume is "
+                    "not supported"
+                )
+            if "seed" in drafter.training and self.training.prompt_seed is None:
+                raise ValueError(
+                    f"drafter {drafter.name!r} sets training.seed, which also "
+                    "orders the prompts; set the top-level training.prompt_seed"
+                )
+        devices = [
+            device
+            for drafter in self.drafters
+            for device in drafter.trainer.cuda_visible_devices or ()
+        ]
+        if len(set(devices)) != len(devices):
+            raise ValueError("drafters must not share trainer.cuda_visible_devices")
+        default_port = TrainerDeploymentConfig.model_fields["master_port"].default
+        rendezvous = [
+            (drafter.trainer.master_addr, drafter.trainer.master_port or default_port)
+            for drafter in self.drafters
+            if (drafter.trainer.nnodes or 1) > 1
+        ]
+        if len(set(rendezvous)) != len(rendezvous):
+            raise ValueError(
+                "multi-node drafters need different trainer.master_port values"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_run_structure(self):
         """Validate topology and cross-field shape without resolving algorithms."""
         if self.resume:
@@ -1149,8 +1282,13 @@ class Config(StrictConfigModel):
                 raise ValueError("resume and training.resume_from disagree")
         if self.initialization is not None and self.resume_path:
             raise ValueError("initialization and resume are mutually exclusive")
-        if self.draft is None and not (
-            self.resume_path or (self.initialization and self.initialization.checkpoint)
+        if (
+            self.drafters is None
+            and self.draft is None
+            and not (
+                self.resume_path
+                or (self.initialization and self.initialization.checkpoint)
+            )
         ):
             raise ValueError(
                 "Training requires draft, initialization.checkpoint or resume"
@@ -1159,7 +1297,8 @@ class Config(StrictConfigModel):
         deployment = self.deployment.mode
         role = self.training.role
 
-        if self.runtime.consumer_dispatch in (
+        # With drafters each one checks its own window when it is flattened.
+        if self.drafters is None and self.runtime.consumer_dispatch in (
             "two_window_bucketed",
             "two_window_joint_balanced",
         ):
@@ -1325,9 +1464,14 @@ class Config(StrictConfigModel):
                     "managed_local capture servers do not support SGLang DP "
                     f"options: {unsupported_dp_options}"
                 )
+            trainer_devices = managed_local.trainer_cuda_visible_devices
+            if self.drafters is None and trainer_devices is None:
+                raise ValueError(
+                    "managed_local.trainer_cuda_visible_devices is required"
+                )
             if (
-                len(managed_local.trainer_cuda_visible_devices)
-                != self.deployment.trainer.nproc_per_node
+                trainer_devices is not None
+                and len(trainer_devices) != self.deployment.trainer.nproc_per_node
             ):
                 raise ValueError(
                     "managed_local trainer_cuda_visible_devices count must equal "
@@ -1423,6 +1567,66 @@ class Config(StrictConfigModel):
         return cls.model_validate(raw)
 
 
+def flatten_drafter(config: Config, name: str) -> Config:
+    """The plain single-draft config of drafter *name* in a loaded *config*.
+
+    The drafter's ``training`` and ``tracking`` keys go over the top-level
+    ones; the run id, output and control folders get the drafter's name; the
+    feature store id stays the shared one. For ``run_id: qwen3`` and
+    ``output_dir: ./out``, drafter ``dflash`` runs as ``qwen3-dflash`` in
+    ``./out/dflash``. Nothing the config wrote is changed, and the result
+    passes the normal single-draft validation.
+    """
+    drafters = {drafter.name: drafter for drafter in config.drafters or ()}
+    if name not in drafters:
+        raise ValueError(
+            f"unknown drafter {name!r}; the config defines {sorted(drafters)}"
+        )
+    drafter = drafters[name]
+    if "trainer" in config.deployment.model_fields_set:
+        # Config validation compares values, so it lets written defaults pass.
+        raise ValueError(
+            "with drafters, deployment.trainer must be set on each drafter "
+            "(trainer), not at the top level"
+        )
+    shared = config.deployment.disaggregated
+    raw = config.model_dump(exclude_unset=True, exclude={"drafters"})
+    if drafter.draft is not None:
+        raw["draft"] = drafter.draft
+    if drafter.initialization is not None:
+        raw["initialization"] = drafter.initialization.model_dump(exclude_unset=True)
+    for section in ("training", "tracking"):
+        if getattr(drafter, section):
+            raw[section] = {**raw.get(section, {}), **getattr(drafter, section)}
+    raw["run_id"] = f"{config.run_id}-{name}"
+    raw["output_dir"] = os.path.join(config.output_dir, name)
+
+    trainer = drafter.trainer.model_dump(exclude_none=True)
+    devices = trainer.pop("cuda_visible_devices", None)
+    if devices is not None:
+        trainer.setdefault("nproc_per_node", len(devices))
+    if trainer:
+        raw["deployment"]["trainer"] = trainer
+    disaggregated = raw["deployment"]["disaggregated"]
+    disaggregated["control_dir"] = os.path.join(shared.control_dir, name)
+    # The default is the run id, which now differs per drafter.
+    disaggregated["store_id"] = shared.store_id or config.run_id
+    if shared.consumer_state_dir is not None:
+        disaggregated["consumer_state_dir"] = os.path.join(
+            shared.consumer_state_dir, name
+        )
+    if devices is not None:
+        if shared.managed_local is None:
+            raise ValueError(
+                f"drafter {name!r}: trainer.cuda_visible_devices needs managed_local"
+            )
+        disaggregated["managed_local"]["trainer_cuda_visible_devices"] = devices
+    try:
+        return Config.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"drafter {name!r}: {exc}") from exc
+
+
 def apply_overrides(config: Config, overrides: List[str]) -> Config:
     """Apply dotted ``section.field=value`` overrides, re-validating the result.
 
@@ -1502,7 +1706,10 @@ __all__ = [
     "DisaggregatedDeploymentConfig",
     "DeploymentConfig",
     "TrainingConfig",
+    "DrafterTrainerConfig",
+    "DrafterConfig",
     "Config",
+    "flatten_drafter",
     "load_config",
     "apply_overrides",
 ]

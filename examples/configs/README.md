@@ -48,6 +48,27 @@ the capture server.
 | `draft` | `null` | Canonical draft mapping or YAML/JSON path, including preset files. Its architecture selects the default objective. |
 | `initialization` | `null` | Canonical weights-only loading: `checkpoint`, or `weights_from` (`checkpoint`, `mapping`, `allow_new`) with optional disjoint `from_target` copies. See [canonical training](../../docs/draft_training.md). |
 | `resume` | `null` | Canonical full training resume; restores structure from the checkpoint. A canonical checkpoint given in `training.resume_from` resumes the same way; if both fields are set they must agree. Excludes initialization. |
+| `drafters` | `null` | Several drafters trained from one capture stack, so the target runs once per prompt. Online disaggregated only, no resume. Described below. |
+
+### `drafters`: several drafters, one capture stack
+
+Each entry is a plain single-draft run. With `drafters`, set `draft`,
+`initialization` and the trainer on each drafter, not at the top level; `model`,
+`data`, `runtime` and the capture servers are shared.
+
+| Field | Default | What to write |
+| --- | --- | --- |
+| `drafters[].name` | required | Letters, digits, `_` and `-`; unique ignoring case; not `logs`. The drafter runs as `<run_id>-<name>` in `output_dir/<name>`, with its channel in `control_dir/<name>`. |
+| `drafters[].draft` | `null` | This drafter's `draft`. |
+| `drafters[].initialization` | `null` | This drafter's `initialization`. |
+| `drafters[].training` | `{}` | Keys that go over the top-level `training`, for example `{learning_rate: 5.0e-4}`. `num_epochs`, `prompt_seed`, `role` and `resume_from` cannot be set here; `seed` needs a top-level `training.prompt_seed`. |
+| `drafters[].tracking` | `{}` | Keys that go over the top-level `tracking`. |
+| `drafters[].trainer` | default object | This drafter's trainer processes, described by the fields below. |
+| `drafters[].trainer.cuda_visible_devices` | `null` | Device tokens on a `managed_local` stack, one trainer rank each. Required there; no overlap with other drafters or capture servers. |
+| `drafters[].trainer.nnodes` | `null` | As `deployment.trainer.nnodes`. |
+| `drafters[].trainer.nproc_per_node` | `null` | As `deployment.trainer.nproc_per_node`; defaults to the device count on a `managed_local` stack. |
+| `drafters[].trainer.master_addr` | `null` | As `deployment.trainer.master_addr`. |
+| `drafters[].trainer.master_port` | `null` | As `deployment.trainer.master_port`. Multi-node drafters need different ports. |
 
 ### `model`: target, draft, and capture backend
 
@@ -203,7 +224,7 @@ the capture server.
 | `deployment.disaggregated.store_root` | Shared offline feature payloads for `shared_dir`. |
 | Field | Default | What to write |
 | --- | --- | --- |
-| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. |
+| `deployment.disaggregated.managed_local.trainer_cuda_visible_devices` | required | One device token per `nproc_per_node`; trainer and capture devices must not overlap. With `drafters`, set `drafters[].trainer.cuda_visible_devices` instead. |
 | `deployment.disaggregated.managed_local.mooncake` | default object | Owned loopback Mooncake configuration described by the nested fields below. |
 | `deployment.disaggregated.managed_local.capture_servers` | required | One or more owned SGLang server running the capture plugin definitions. |
 | `deployment.disaggregated.managed_local.shutdown_grace_s` | `30` | Positive graceful process-group shutdown window. |
