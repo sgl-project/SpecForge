@@ -107,4 +107,3 @@ class TailBackingTests(unittest.TestCase):
                 self.assertEqual(ctrl.stats()['output_bytes'],0)
                 self.assertGreater(cache.stats()['tail_backing_cache_bytes'],0)
                 ctrl.shutdown()
-

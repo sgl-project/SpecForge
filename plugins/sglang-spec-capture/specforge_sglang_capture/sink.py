@@ -501,11 +501,6 @@ class SpecCaptureSink:
             return tuple(self._uncertain_publications)
 
     def _retain_uncertain(self, item):
-        if 'tensors' in item:
-            # An offset view can keep a complete registered tail piece live.
-            storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
-                        for t in item['tensors']}
-            item['backing_bytes'] = sum(storages.values())
         with self._uncertain_lock:
             self._uncertain_publications.append(item)
 
@@ -620,6 +615,17 @@ class SpecCaptureSink:
             if close is not None:
                 close()
 
+    def _retain_uncertain_managed_put(self, tensors, keys, registered):
+        item = {'tensors': tensors, 'keys': keys, 'registered': tuple(registered),
+                'bytes': sum(t.numel() * t.element_size() for t in tensors)}
+        # Retain actual reads before collecting any optional physical-byte diagnostics.
+        self._retain_uncertain(item)
+        try:
+            storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in tensors}
+            item['backing_bytes'] = sum(storages.values())
+        except Exception:
+            item['backing_bytes'] = None
+
     def _managed_put(self, objects):
         """Exact-key writer used by blocks, metadata and receipts alike."""
         if not objects:
@@ -657,9 +663,7 @@ class SpecCaptureSink:
         except BaseException as exc:
             if submitted and not isinstance(exc, _DrainedWriteFailure):
                 uncertain = True
-                self._retain_uncertain({'tensors': tensors, 'keys': keys,
-                                        'registered': tuple(registered),
-                                        'bytes': sum(t.numel()*t.element_size() for t in tensors)})
+                self._retain_uncertain_managed_put(tensors, keys, registered)
                 raise CaptureWriterUncertain(str(exc)) from None
             raise
         finally:
@@ -670,7 +674,7 @@ class SpecCaptureSink:
                     except BaseException:
                         rc = -1
                     if rc is not None and int(rc) != 0:
-                        self._retain_uncertain({'tensors': tensors, 'keys': keys, 'registered': tuple(registered), 'bytes': sum(t.numel()*t.element_size() for t in tensors)})
+                        self._retain_uncertain_managed_put(tensors, keys, registered)
                         raise CaptureWriterUncertain('managed object unregister did not complete')
 
     def _get_manifest_owner(self):
