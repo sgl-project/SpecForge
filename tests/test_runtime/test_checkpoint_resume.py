@@ -927,10 +927,10 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
 
-        def runtime(model, *, name="eagle3"):
+        def runtime(model, *, options=None):
             allowed_missing = {"embed_tokens.weight"}
             return StepRuntimeConfig(
-                options={"name": name},
+                options={"name": "eagle3"} if options is None else options,
                 resume_contract={
                     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
                         checkpoint_key_fingerprint(
@@ -1044,19 +1044,22 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 output_dir=output_dir,
                 max_steps=2,
                 resume_from=checkpoint,
+                # Other options than the checkpoint recorded, that describe
+                # the same run.
                 strategy_runtime=runtime(
                     unchanged_model,
-                    name="eagle3-other",
+                    options={"name": "eagle3", "objective": "eagle3"},
                 ),
             )
         # An option is recorded for resume, so one that describes nothing of
         # the program is refused before anything trains.
         for options, message in (
             ({"objective_scale": 2.0}, r"\['objective_scale'\] configure nothing"),
-            ({"objective": "dflash"}, "does not name the program's objective 'eagle3'"),
+            ({"name": "eagle3-other"}, "whose name is 'eagle3'"),
+            ({"objective": "dflash"}, "whose objective is 'eagle3'"),
             (
                 {"required_features": ("x", "teacher")},
-                r"differs from the inputs the program declares, \['x'\]",
+                r"whose required_features is \{'x'\}",
             ),
         ):
             with (

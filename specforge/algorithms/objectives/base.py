@@ -19,7 +19,9 @@ class ObjectiveResult:
     #: Under the ``microbatch`` reduction, in training: every loss term as
     #: ``(coefficient, numerator, denominator)``, the last two this rank's.
     #: The numerator and denominator above then hold the loss with every term
-    #: normalized on this rank alone.
+    #: normalized on this rank alone. A term's denominator has the same dtype
+    #: on every rank, a rank without supervised tokens included: the ranks
+    #: reduce it together.
     terms: tuple[tuple[float, Tensor, Tensor], ...] = ()
 
     @property
@@ -243,27 +245,37 @@ class ObjectiveModel(nn.Module):
             if key.startswith(prefix) and key[len(prefix) :] not in repeated
         }
 
-    def replay_arguments(self, replay_values):
-        """The forward's keyword arguments for a replayed micro-batch.
+    def replay_arguments(self, replay_values, *, prepass=False):
+        """The forward's keyword argument that carries the declared window statistic.
 
-        The value of the declared window statistic: the ratio of its sums over
+        Zero in a prepass. In a replay, the ratio of the statistic's sums over
         the whole optimizer window and every rank, guarded against an empty
-        denominator and detached. A runner calls this outside its wrapper, so
-        the division is done in the precision the sums were pooled in and a
-        wrapper that casts the forward's inputs casts the ratio.
+        denominator and detached. Otherwise None: the objective then uses the
+        batch's own value. Empty for an objective without a statistic.
+
+        A runner calls this outside its wrapper and passes the result through
+        it, so the division is done in the precision the sums were pooled in
+        and a wrapper that casts the forward's inputs casts the value.
 
         Args:
             replay_values: The pooled sums by statistic name; empty outside a
                 replay.
+            prepass: Whether the forward only collects the statistic.
         """
         statistic = (
             self.registration.training.window_statistic if self.registration else None
         )
-        if statistic is None or not replay_values:
+        if statistic is None:
             return {}
-        numerator, denominator = replay_values[statistic.argument_name]
-        denominator = denominator.where(denominator > 0, 1)
-        return {statistic.argument_name: (numerator / denominator).detach()}
+        if prepass:
+            value = torch.zeros((), device=next(self.parameters()).device)
+        elif replay_values:
+            numerator, denominator = replay_values[statistic.argument_name]
+            denominator = denominator.where(denominator > 0, 1)
+            value = (numerator / denominator).detach()
+        else:
+            value = None
+        return {statistic.argument_name: value}
 
     def forward(self, batch, *, step, total_steps, prepass=False, **context):
         """Run the objective on one batch.
@@ -272,20 +284,16 @@ class ObjectiveModel(nn.Module):
             batch: Captured batch tensors.
             step: Optimizer updates applied so far.
             total_steps: The schedule's horizon, or None.
-            prepass: Collect the window statistic only: the objective runs
-                with the statistic's value at zero and the result carries this
-                rank's sums of it.
-            **context: Passed to the objective; in a replay, what
-                ``replay_arguments`` returned.
+            prepass: Collect the window statistic only: the result carries
+                this rank's sums of it.
+            **context: Passed to the objective, with what ``replay_arguments``
+                returned for this call.
         """
         from .inputs import valid_tokens
 
         statistic = (
             self.registration.training.window_statistic if self.registration else None
         )
-        if statistic is not None and prepass:
-            device = next(self.parameters()).device
-            context[statistic.argument_name] = torch.zeros((), device=device)
         valid_tokens(batch)
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
