@@ -341,7 +341,7 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
             pooled.append((values.clone(), program.linear.weight.grad))
             if len(pooled) == 1:
                 # The other rank holds denominators of 4 and 0.
-                values.add_(torch.tensor([4.0, 0.0]))
+                values.add_(4.0)
 
         with (
             mock.patch("torch.distributed.is_available", return_value=True),
@@ -350,12 +350,12 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
             mock.patch("torch.distributed.all_reduce", side_effect=all_reduce),
         ):
             runner.forward_backward(batch(1), StepContext(), is_boundary=True)
-        # One reduction carries every term's denominator, before any gradient;
-        # the window's own denominator follows the backward.
-        self.assertEqual(len(pooled), 2)
-        self.assertEqual(pooled[0][0].tolist(), [2.0, 0.0])
-        self.assertIsNone(pooled[0][1])
-        self.assertIsNotNone(pooled[1][1])
+        # Each term's denominator is reduced before any gradient; the
+        # window's own denominator follows the backward.
+        self.assertEqual(len(pooled), 3)
+        self.assertEqual([values.item() for values, _ in pooled[:2]], [2.0, 0.0])
+        self.assertEqual([gradient for _, gradient in pooled[:2]], [None, None])
+        self.assertIsNotNone(pooled[2][1])
         # d/dw of 2 * (w / 6 + 0.5 * w**2 / 1) at w = 3, x = 1: the world size
         # undoes the wrapper's average, a pooled zero divides by one.
         torch.testing.assert_close(
@@ -395,12 +395,38 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
         ):
             runner.forward_backward(batch(1), StepContext(), is_boundary=True)
         self.assertEqual(
-            [(values.dtype, values.tolist()) for values in pooled[:2]],
-            [(torch.bfloat16, [256.0]), (torch.float32, [257.0])],
+            [(values.dtype, values.item()) for values in pooled[:2]],
+            [(torch.bfloat16, 256.0), (torch.float32, 257.0)],
         )
         torch.testing.assert_close(
             program.linear.weight.grad, torch.tensor([[2 / 256 + 2 / 257]])
         )
+        # The window counts its micro-batches in a dtype that can: a bfloat16
+        # one stops at 256.
+        _, counted = runner._loss_terms(program({"x": torch.ones(1)}))
+        self.assertEqual(counted.dtype, torch.float32)
+
+    def test_denominator_is_taken_as_the_program_gave_it(self):
+        """Its shape is kept and it is never differentiated."""
+
+        class Program(_Program):
+            def forward(self, tensors, **context):
+                weight = self.linear.weight.sum()
+                result = ObjectiveResult(weight.detach(), torch.ones(()))
+                # A one-element denominator, and one that carries a graph.
+                result.terms = (
+                    (1.0, weight, torch.tensor([4.0])),
+                    (1.0, weight, weight * 1.0),
+                )
+                return result
+
+        program = Program()
+        with torch.no_grad():
+            program.linear.weight.fill_(2.0)
+        runner = runner_over(program, reduction="microbatch")
+        runner.forward_backward(batch(1), StepContext(), is_boundary=True)
+        # d/dw of w / 4 + w / 2 with the second denominator held at 2.
+        torch.testing.assert_close(program.linear.weight.grad, torch.tensor([[0.75]]))
 
     def test_one_rank_normalizes_by_its_own_denominators(self):
         program = _TermsProgram()
@@ -436,10 +462,11 @@ class RunnerMicrobatchReductionTest(unittest.TestCase):
         program = _TermsProgram()
         runner = runner_over(program, reduction="microbatch")
         with (
-            mock.patch("torch.distributed.all_reduce") as reduce,
+            mock.patch.object(runner, "reduce_sum") as reduce,
             runner.evaluation(),
         ):
             result = runner.evaluate(batch(1), StepContext())
+        # Not by a group of one either: the evaluator pools the pass.
         reduce.assert_not_called()
         self.assertEqual(result.terms, ())
         self.assertEqual(result.denominator.item(), 1.0)

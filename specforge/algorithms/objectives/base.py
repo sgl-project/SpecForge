@@ -19,7 +19,9 @@ class ObjectiveResult:
     #: Under the ``microbatch`` reduction, in training: every loss term as
     #: ``(coefficient, numerator, denominator)``, the last two this rank's.
     #: The numerator and denominator above then hold the loss with every term
-    #: normalized on this rank alone.
+    #: normalized on this rank alone. A term's denominator has the same dtype
+    #: on every rank, a rank without supervised tokens included: the ranks
+    #: reduce it together.
     terms: tuple[tuple[float, Tensor, Tensor], ...] = ()
 
     @property
