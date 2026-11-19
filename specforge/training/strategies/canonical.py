@@ -21,11 +21,12 @@ def depth_ratios(ratios, prefix):
 
 
 class CanonicalTrainStrategy(DraftTrainStrategy):
-    def __init__(self, model, *, name, objective, required_features):
+    def __init__(self, model, *, name, objective, required_features, diagnostic_features=()):
         self.model = model
         self.name = name
         self.objective = objective
         self.required_features = set(required_features)
+        self.diagnostic_features = frozenset(diagnostic_features)
         seen = set()
         self._duplicate_parameters = set()
         inner = model.module if isinstance(model, DistributedDataParallel) else model
@@ -42,6 +43,13 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
 
     def trainable_module(self):
         return self.model
+
+    def validate_batch(self, batch, *, collect_detailed_metrics=True):
+        missing = self.required_features.difference(batch.tensors)
+        if not collect_detailed_metrics:
+            missing.difference_update(self.diagnostic_features)
+        if missing:
+            super().validate_batch(batch)
 
     def before_checkpoint(self):
         # What rank 0 records for resume has to hold for every rank.
@@ -60,7 +68,7 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         }
 
     def _forward(self, batch, ctx, window_value=None):
-        self.validate_batch(batch)
+        self.validate_batch(batch, collect_detailed_metrics=ctx.collect_detailed_metrics)
         device = next(self.model.parameters()).device
         inputs = batch.tensors
         if self.host_inputs is not None:

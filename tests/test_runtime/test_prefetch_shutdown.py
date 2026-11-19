@@ -10,12 +10,12 @@ from unittest import mock
 
 import torch
 
-from specforge.algorithms.common.hidden_states_data import build_collator
 from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.data_plane import feature_dataloader as module
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
+from specforge.training.canonical_data import build_collator
 from specforge.training.controller import TrainerController, TrainerCore
 from tests.test_runtime.test_trainer import FakeBackend, FakeStrategy
 
@@ -66,8 +66,7 @@ def refs(store, n, *, direct=False):
     for i in range(n):
         data = ({'input_ids': torch.arange(3).view(1, 3),
                  'loss_mask': torch.ones(1, 3, dtype=torch.int64),
-                 'hidden_states': torch.ones(1, 3, 6),
-                 'target_last_hidden_states': torch.ones(1, 3, 2)}
+                 'hidden_states': torch.ones(1, 3, 6)}
                 if direct else {'x': torch.ones(2)})
         values.append(store.put(data, sample_id=f's{i}', metadata={
             'run_id': 'run', 'strategy': 'dflash' if direct else 'fake', 'num_tokens': 3}))
@@ -164,7 +163,8 @@ class TestCooperativeStop(unittest.TestCase):
         with mock.patch.dict(os.environ, {'SPECFORGE_TRAINER_DIRECT_BATCH': str(int(direct))}):
             loader = FeatureDataLoader(store, queue, batch_size=3, ack=False,
                 num_workers=1, strategy='dflash' if direct else 'fake',
-                collate_fn=build_collator() if direct else None)
+                collate_fn=build_collator(keys=("input_ids", "loss_mask", "hidden_states"))
+                if direct else None)
         iterator, consumer_errors = iter(loader), []
         def consume():
             try:

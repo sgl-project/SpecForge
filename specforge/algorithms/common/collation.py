@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Mapping, Sequence
+
+
+@dataclass(frozen=True)
+class SequenceBatchLayout:
+    """Sequence features a collator can assemble directly from store refs."""
+
+    required_keys: tuple[str, ...]
+    optional_keys: tuple[str, ...]
+    sequence_axes: Mapping[str, int]
+    default_attention_mask: bool = False
+    diagnostic_keys: tuple[str, ...] = ()
 
 
 def concatenate_features(features):
@@ -21,19 +33,8 @@ def concatenate_features(features):
     }
 
 
-def pad_and_concatenate_features(
-    features,
-    *,
-    sequence_axes: Mapping[str, int],
-    required_keys: Sequence[str],
-    optional_keys: Sequence[str] = (),
-):
-    """Zero-pad configured tensor axes to the longest input sequence.
-
-    ``optional_keys`` are collated when every sample carries them and omitted
-    when none does; a batch that mixes both raises.
-    """
-
+def select_batch_features(features, required_keys, optional_keys):
+    """Select present features from tensor dictionaries or ref specifications."""
     if not features:
         raise ValueError("cannot collate an empty feature batch")
     required = tuple(required_keys)
@@ -55,6 +56,23 @@ def pad_and_concatenate_features(
                 f"optional feature {key!r} must be present in every sample or "
                 "omitted from every sample"
             )
+    return keys
+
+
+def pad_and_concatenate_features(
+    features,
+    *,
+    sequence_axes: Mapping[str, int],
+    required_keys: Sequence[str],
+    optional_keys: Sequence[str] = (),
+):
+    """Zero-pad configured tensor axes to the longest input sequence.
+
+    ``optional_keys`` are collated when every sample carries them and omitted
+    when none does; a batch that mixes both raises.
+    """
+
+    keys = select_batch_features(features, required_keys, optional_keys)
     max_length = max(int(feature["input_ids"].shape[-1]) for feature in features)
 
     import torch

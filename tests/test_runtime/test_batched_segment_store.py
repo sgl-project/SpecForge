@@ -17,9 +17,8 @@ from specforge.runtime.data_plane.node_content_pool import NodeContentPool
 from specforge.runtime.data_plane.node_pool_batch import process_gate
 from specforge.runtime.data_plane.pool_diagnostics import Diagnostics
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
-from specforge.algorithms.common.hidden_states_data import build_collator
 from tests.test_runtime.test_mooncake_store import _FakeMooncakeStore
-from tests.test_runtime.test_segment_manifest import Fixture
+from tests.test_runtime.test_segment_manifest import Fixture, segment_collator
 
 
 class ReceiveStub:
@@ -85,8 +84,9 @@ class TestBatchedSegmentStore(unittest.TestCase):
                 with mock.patch('specforge.runtime.data_plane.mooncake_store.get_diagnostics',return_value=diag),mock.patch('specforge.runtime.data_plane.node_content_pool.get_diagnostics',return_value=diag):
                     fixture=Fixture(directory);ref=fixture.publish('batch',n=65)
                     reader=fixture.reader(receive_buffers='pinned')
-                    loader=FeatureDataLoader(reader,refs=[ref],batch_size=1,strategy='dflash',collate_fn=build_collator(),ack=False,num_workers=1)
+                    loader=FeatureDataLoader(reader,refs=[ref],batch_size=1,strategy='dflash',collate_fn=segment_collator(),ack=False,num_workers=1)
                     cold=next(iter(loader));warm=next(iter(loader))
+                    self.assertTrue(cold.metadata["direct_batch"])
                     for name,value in cold.tensors.items():torch.testing.assert_close(warm.tensors[name],value)
                     self.assertGreater(reader.health()['node_pool_hits'],0)
                     self.assertEqual(reader.health()['node_pool_active_pins'],0)

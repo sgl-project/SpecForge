@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import torch
 
+from specforge.algorithms.common.collation import SequenceBatchLayout
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.data_plane.batch_materialization import (
     ConsumerSchedule, allocate_sequence_batch, copy_sample_into,
@@ -430,7 +431,12 @@ class FeatureDataLoader:
                 f"mixed target_repr values in batch: {sorted(map(repr, target_reprs))}"
             )
 
-        spec_sets = [set(ref.feature_specs) for ref in refs if ref.feature_specs]
+        sample_local = getattr(self.collate_fn, "sample_local_features", ())
+        spec_sets = [
+            set(ref.feature_specs).difference(sample_local)
+            for ref in refs
+            if ref.feature_specs
+        ]
         if spec_sets and any(spec_set != spec_sets[0] for spec_set in spec_sets[1:]):
             raise ValueError(f"mixed feature spec names in batch: {spec_sets}")
 
@@ -441,6 +447,8 @@ class FeatureDataLoader:
             if not ref.feature_specs:
                 continue
             for name, spec in ref.feature_specs.items():
+                if name in sample_local:
+                    continue
                 expected = first_specs[name]
                 if spec.dtype != expected.dtype or len(spec.shape) != len(
                     expected.shape
@@ -468,10 +476,15 @@ class FeatureDataLoader:
 
     def _make_batch(self, refs: List[SampleRef], batch_index=None) -> TrainBatch:
         self._validate_refs(refs)
-        layout = getattr(self.collate_fn, "sequence_batch_layout", None)
-        if self.direct_batch and layout is not None and self.per_sample_transform is None:
-            return self._make_direct_batch(refs, layout, batch_index)
         if self.direct_batch:
+            layout = getattr(self.collate_fn, "sequence_batch_layout", None)
+            if layout is not None and self.per_sample_transform is None:
+                if callable(layout):
+                    layout = layout(refs)
+                if layout is not None:
+                    if not isinstance(layout, SequenceBatchLayout):
+                        layout = SequenceBatchLayout(*layout)
+                    return self._make_direct_batch(refs, layout, batch_index)
             self._perf_add(direct_batch_fallback_batches=1.0)
         per_sample = [self._materialize(r) for r in refs]
         self._check_fetch_stop()
@@ -504,15 +517,19 @@ class FeatureDataLoader:
 
     def _make_direct_batch(self, refs, layout, batch_index):
         self._check_fetch_stop()
-        names = None
-        if (self.feature_demand and self.strategy == "dflash"
-                and self._consumer_schedule is not None and batch_index is not None
-                and not self._consumer_schedule.detailed_metrics(batch_index)):
-            names = set(refs[0].feature_specs) - {"target_last_hidden_states"}
-            self._perf_add(feature_demand_trimmed_batches=1.0)
-        tensors, destinations = allocate_sequence_batch(
-            refs, layout, device=self.device, names=names,
+        trim_diagnostics = bool(
+            self.feature_demand
+            and layout.diagnostic_keys
+            and self._consumer_schedule is not None
+            and batch_index is not None
+            and not self._consumer_schedule.detailed_metrics(batch_index)
         )
+        tensors, destinations = allocate_sequence_batch(
+            refs, layout, device=self.device, include_diagnostics=not trim_diagnostics,
+            pin_memory=self.pin_memory,
+        )
+        if trim_diagnostics:
+            self._perf_add(feature_demand_trimmed_batches=1.0)
         for ref, dest in zip(refs, destinations):
             self._check_fetch_stop(ref)
             _, handle = copy_sample_into(self.store, ref, dest)

@@ -20,8 +20,15 @@ from specforge.runtime.data_plane.segment_manifest import (
     RemoteManifestOwner, RemoteCapacityError, digest_manifest, validate_manifest,
     remote_allocation_charge,
 )
-from specforge.algorithms.common.hidden_states_data import build_collator
+from specforge.training.canonical_data import build_collator
 from specforge.inference.capture_protocol import attempt_keys
+
+
+def segment_collator(*, diagnostic_keys=()):
+    return build_collator(
+        keys=("input_ids", "loss_mask", "hidden_states", "target_last_hidden_states"),
+        diagnostic_keys=diagnostic_keys,
+    )
 
 
 class Fixture:
@@ -113,9 +120,10 @@ class TestSegmentManifest(unittest.TestCase):
             self.assertGreater(fixture.owner.health()['block_reused'], 0)
             self.assertEqual(fixture.cache.stats()['cache_adopted_samples'], 0)
             reader = fixture.reader()
-            data = FeatureDataLoader(reader, refs=[first, second], batch_size=2, strategy='dflash', collate_fn=build_collator())
+            data = FeatureDataLoader(reader, refs=[first, second], batch_size=2, strategy='dflash', collate_fn=segment_collator())
             actual = next(iter(data))
-            expected = build_collator()([
+            self.assertTrue(actual.metadata["direct_batch"])
+            expected = segment_collator()([
                 {'input_ids': torch.arange(n).view(1,n), 'loss_mask': torch.full((1,n), mask),
                  'hidden_states': features(n)['aux'].unsqueeze(0),
                  'target_last_hidden_states': features(n)['last_hidden'].unsqueeze(0)}
@@ -160,7 +168,10 @@ class TestSegmentManifest(unittest.TestCase):
             fixture = Fixture(directory)
             ref = fixture.publish('a', n=9)
             reader = fixture.reader()
-            data = FeatureDataLoader(reader, refs=[ref], batch_size=1, strategy='dflash', collate_fn=build_collator())
+            data = FeatureDataLoader(
+                reader, refs=[ref], batch_size=1, strategy='dflash',
+                collate_fn=segment_collator(diagnostic_keys=("target_last_hidden_states",)),
+            )
             data.configure_consumer_schedule(global_step=0, accumulation_steps=1,
                                              accumulation_remainder=0, log_interval=10, has_logger=True)
             actual = next(iter(data))

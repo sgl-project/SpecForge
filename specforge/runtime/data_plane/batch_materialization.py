@@ -10,6 +10,11 @@ from typing import Mapping
 
 import torch
 
+from specforge.algorithms.common.collation import (
+    SequenceBatchLayout,
+    select_batch_features,
+)
+
 
 @dataclass(frozen=True)
 class ConsumerSchedule:
@@ -26,28 +31,20 @@ class ConsumerSchedule:
         return self.has_logger and (step + 1) % self.log_interval == 0
 
 
-def allocate_sequence_batch(refs, layout, *, device, names=None):
+def allocate_sequence_batch(
+    refs, layout: SequenceBatchLayout, *, device, include_diagnostics=True, pin_memory=False
+):
     """Allocate final contiguous outputs; initialize only padding, not data rows."""
-    required, optional, axes = layout
-    available = [set(ref.feature_specs) for ref in refs]
-    for index, present in enumerate(available):
-        missing = set(required) - present
-        if missing:
-            raise KeyError(f"sample {index} missing required features {sorted(missing)}")
-    selected = list(required)
-    for name in optional:
-        present = [name in item for item in available]
-        if any(present) and not all(present):
-            raise KeyError(f"optional feature {name!r} must be present in every sample")
-        if all(present):
-            selected.append(name)
-    if names is not None:
-        selected = [name for name in selected if name in names]
-    max_length = max(int(ref.feature_specs['input_ids'].shape[-1]) for ref in refs)
+    specs = [ref.feature_specs for ref in refs]
+    selected = select_batch_features(specs, layout.required_keys, layout.optional_keys)
+    lengths = [int(spec["input_ids"].shape[-1]) for spec in specs]
+    max_length = max(lengths)
     output = {}
     destinations = [dict() for _ in refs]
     for name in selected:
-        axis = axes[name]
+        if not include_diagnostics and name in layout.diagnostic_keys:
+            continue
+        axis = layout.sequence_axes[name]
         first = refs[0].feature_specs[name]
         shape = tuple(first.shape)
         if axis != 1 or not shape or shape[0] != 1:
@@ -57,7 +54,10 @@ def allocate_sequence_batch(refs, layout, *, device, names=None):
             raise ValueError(f"unsupported feature dtype {first.dtype!r}")
         target = torch.device(device) if dtype.is_floating_point or dtype.is_complex else torch.device('cpu')
         batch_shape = (len(refs), max_length, *shape[2:])
-        batch = torch.empty(batch_shape, dtype=dtype, device=target)
+        batch = torch.empty(
+            batch_shape, dtype=dtype, device=target,
+            pin_memory=pin_memory and target.type == "cpu",
+        )
         for index, ref in enumerate(refs):
             spec = ref.feature_specs[name]
             length = int(spec.shape[axis])
@@ -69,6 +69,15 @@ def allocate_sequence_batch(refs, layout, *, device, names=None):
                 batch[index:index + 1, length:].zero_()
             destinations[index][name] = batch[index:index + 1, :length]
         output[name] = batch
+    if layout.default_attention_mask:
+        # The canonical streaming mask covers the captured input rows, including
+        # unsupervised tokens. It is generated locally, never read from the store.
+        mask = torch.zeros(
+            (len(refs), max_length), dtype=torch.bool, device="cpu", pin_memory=pin_memory
+        )
+        for index, length in enumerate(lengths):
+            mask[index, :length] = True
+        output["attention_mask"] = mask
     return output, destinations
 
 

@@ -2,6 +2,14 @@
 
 from functools import partial
 
+from specforge.algorithms.common.collation import (
+    SequenceBatchLayout,
+    pad_and_concatenate_features,
+)
+
+
+_SAMPLE_LOCAL_FEATURES = frozenset({"attention_mask", "position_ids", "lengths"})
+
 
 def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
     import torch
@@ -93,30 +101,35 @@ def build_normalizer(
     )
 
 
+def _sequence_keys(keys, first, *, has_attention_mask):
+    return (
+        *keys,
+        *(("attention_mask",) if has_attention_mask else ()),
+        *(("position_ids",) if "position_ids" in first else ()),
+    )
+
+
 def collate(features, *, keys):
     import torch
 
-    from specforge.algorithms.common.collation import pad_and_concatenate_features
-
+    if not features:
+        raise ValueError("cannot collate an empty feature batch")
     # Streaming records already have a batch dimension; add their real length
     # mask before padding. Padding tokens must never become context keys.
     features = [
         {
             **feature,
-            "attention_mask": feature.get(
-                "attention_mask",
-                torch.ones_like(feature["input_ids"], dtype=torch.bool),
-            ),
+            "attention_mask": torch.ones_like(feature["input_ids"], dtype=torch.bool),
         }
+        if "attention_mask" not in feature
+        else feature
         for feature in features
     ]
-    all_keys = (
-        *keys,
-        "attention_mask",
-        *(("position_ids",) if "position_ids" in features[0] else ()),
-    )
+    required_keys = _sequence_keys(keys, features[0], has_attention_mask=True)
     result = pad_and_concatenate_features(
-        features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
+        features,
+        sequence_axes=dict.fromkeys(required_keys, 1),
+        required_keys=required_keys,
     )
     if any("lengths" in feature for feature in features):
         if len(features) != 1:
@@ -125,8 +138,40 @@ def collate(features, *, keys):
     return result
 
 
-def build_collator(*, keys):
-    return partial(collate, keys=keys)
+def _sequence_batch_layout(refs, *, keys, diagnostic_keys):
+    specs = [ref.feature_specs for ref in refs]
+    if any(
+        not spec
+        or "lengths" in spec
+        or _SAMPLE_LOCAL_FEATURES.intersection(ref.feature_keys).difference(spec)
+        for ref, spec in zip(refs, specs)
+    ):
+        return None
+    # Mixed masks and dtypes use the tensor collator's defaulting and promotion.
+    masks = [spec.get("attention_mask") for spec in specs]
+    if len({mask.dtype if mask is not None else None for mask in masks}) > 1:
+        return None
+    if len({spec["position_ids"].dtype for spec in specs if "position_ids" in spec}) > 1:
+        return None
+    has_attention_mask = masks[0] is not None
+    required_keys = _sequence_keys(keys, specs[0], has_attention_mask=has_attention_mask)
+    return SequenceBatchLayout(
+        required_keys=required_keys,
+        optional_keys=(),
+        sequence_axes=dict.fromkeys(required_keys, 1),
+        default_attention_mask=not has_attention_mask,
+        diagnostic_keys=diagnostic_keys,
+    )
+
+
+def build_collator(*, keys, diagnostic_keys=()):
+    keys = tuple(keys)
+    collator = partial(collate, keys=keys)
+    collator.sequence_batch_layout = partial(
+        _sequence_batch_layout, keys=keys, diagnostic_keys=tuple(diagnostic_keys)
+    )
+    collator.sample_local_features = _SAMPLE_LOCAL_FEATURES
+    return collator
 
 
 def build_reader(hidden_states_path, *, strategy, keys, **kwargs):
