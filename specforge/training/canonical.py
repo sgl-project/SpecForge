@@ -91,6 +91,18 @@ def _objective_settings(cfg):
     )
 
 
+def _diagnostic_features(resolved):
+    # DFlash's protocol requests teacher logits for logging only. The selected
+    # loss and weighting can independently require them on every micro-batch.
+    if (
+        resolved.name == "dflash"
+        and resolved.objective.teacher_metrics
+        and "teacher_logits" not in (resolved.losses.requires | resolved.weighting.requires)
+    ):
+        return ("target_last_hidden_states",)
+    return ()
+
+
 def resolve_run(cfg, *, target_config=None):
     """Reuse deployment/data ports while resolving structure and loss separately."""
     from specforge.algorithms.common.providers import (
@@ -242,7 +254,11 @@ def resolve_run(cfg, *, target_config=None):
                 capture_method=requirements.capture_method,
                 target_representation=target_repr,
                 layout=server_layout,
-                build_collator=partial(canonical_data.build_collator, keys=keys),
+                build_collator=partial(
+                    canonical_data.build_collator,
+                    keys=keys,
+                    diagnostic_keys=_diagnostic_features(resolved),
+                ),
                 select_layout=None,
             ),
         )
@@ -614,6 +630,7 @@ def build_bundle(cfg, algorithm):
                 "name": algorithm.name,
                 "objective": runtime.objective_name,
                 "required_features": tuple(runtime.registration.inputs),
+                "diagnostic_features": _diagnostic_features(resolved),
             },
             resume_contract=contract,
             allowed_missing_checkpoint_keys=frozenset(),

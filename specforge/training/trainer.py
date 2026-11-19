@@ -585,7 +585,12 @@ class Trainer:
             return step
         except BaseException as exc:
             if self._on_fit_failure is not None:
-                self._on_fit_failure(exc)
+                try:
+                    self._on_fit_failure(exc)
+                except BaseException as secondary:
+                    note = f"on_fit_failure also failed: {type(secondary).__name__}: {secondary}"
+                    exc.add_note(note)
+                    logger.error(note, exc_info=True)
             raise
         finally:
             primary_exception = sys.exc_info()[1]

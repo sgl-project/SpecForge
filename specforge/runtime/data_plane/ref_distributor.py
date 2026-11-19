@@ -44,6 +44,8 @@ the clean ``.closed`` end-of-stream.
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import logging
 import os
 import threading
@@ -473,7 +475,7 @@ class RefDistributor:
                     adopt = getattr(self.feature_store, "adopt", None)
                     if callable(adopt):
                         adopt(ref)
-                    self.feature_store.abort(ref.sample_id, reason=reason)
+                    abort_feature_ref(self.feature_store, ref, reason=reason)
                 except Exception as exc:  # best effort before the loud failure
                     cleanup_errors.append(f"{ref.sample_id}: {exc}")
             self.source.mark_consumed(
