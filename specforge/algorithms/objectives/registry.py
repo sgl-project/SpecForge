@@ -20,6 +20,14 @@ class WindowStatistic:
     ratio_name: str
     argument_name: str
 
+    def __post_init__(self):
+        # The objective model's forward has these keywords of its own.
+        if self.argument_name in ("batch", "step", "total_steps", "prepass"):
+            raise ValueError(
+                f"a window statistic cannot be passed as {self.argument_name!r}: "
+                "the objective model's forward takes that keyword itself"
+            )
+
 
 @dataclass(frozen=True)
 class TrainingRequirements:
@@ -274,8 +282,9 @@ def build_objective_model(
         attention_backend: The attention backend the run trains with, for a
             protocol whose rollout depends on it.
         sequence_parallel: The process groups of the sequence-parallel axis
-            (ring group, Ulysses group and the reduction of loss statistics
-            over one sequence), when the run has one.
+            (the ring group, the Ulysses group and their product, over which
+            loss statistics of one sequence are reduced), when the run has
+            one.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -304,6 +313,16 @@ def build_objective_model(
         )
     if sequence_parallel is not None and not entry.training.supports_sequence_parallel:
         raise ValueError(f"objective {name!r} does not support sequence parallelism")
+    if attention_backend == "usp" and sequence_parallel is None:
+        raise ValueError("attention backend 'usp' needs the sequence-parallel groups")
+    if sequence_parallel is not None:
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+            raise ValueError(
+                "D-PACE weighting is not supported with sequence parallelism: "
+                "chain weights are normalized within each sequence shard"
+            )
     if resolved.execution.teacher_chunk_size:
         from torch import nn
 

@@ -3,7 +3,6 @@
 import copy
 import os
 from dataclasses import replace
-from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -12,7 +11,7 @@ from torch import nn
 from specforge.algorithms.objectives import build_objective_model
 from specforge.modeling import build_draft_model
 from specforge.training.canonical_data import shard_sequence
-from specforge.training.sequence_parallel import SequenceParallel, reduce_statistics
+from specforge.training.sequence_parallel import SequenceParallel
 from tests.test_modeling.test_canonical_eagle3 import install_mapping, model_config
 
 
@@ -92,9 +91,7 @@ def main():
                         if ring == "mixed"
                         else singles[rank] if ring else dist.group.WORLD
                     ),
-                    reduce_statistics=partial(
-                        reduce_statistics, group=dist.group.WORLD
-                    ),
+                    sequence_group=dist.group.WORLD,
                 ),
             )
             shard = shard_sequence(batch, rank=rank, size=size, overlap=3)

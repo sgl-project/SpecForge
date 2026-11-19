@@ -33,7 +33,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import ProgramSpec
+from specforge.training.contracts import ProgramSpec, RankFailure
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -168,6 +168,26 @@ class Trainer:
                 num_epochs=num_epochs,
                 max_steps=max_steps,
             )
+        # The step options are recorded for resume. They used to construct
+        # the step; each still has to describe the program that trains.
+        options = dict(strategy_kwargs or {})
+        unknown = sorted(set(options) - {"name", "objective", "required_features"})
+        if unknown:
+            raise ValueError(
+                f"step options {unknown} configure nothing: the step reads what "
+                "its program declares"
+            )
+        for option, value in options.items():
+            described = {
+                "name": lambda: algorithm_name,
+                "objective": lambda: program_spec.name,
+                "required_features": lambda: set(program_spec.inputs),
+            }[option]()
+            if (set(value) if option == "required_features" else value) != described:
+                raise ValueError(
+                    f"step option {option}={value!r} does not describe this run, "
+                    f"whose {option} is {described!r}"
+                )
         if isinstance(strategy_kwargs, StepRuntimeConfig):
             algorithm_checkpoint_extra = dict(strategy_kwargs.resume_contract)
             allowed_missing_checkpoint_keys = set(
@@ -468,16 +488,14 @@ class Trainer:
             failure = None
             try:
                 runner.load_resume(resume["backend"])
-            except Exception as error:
+            except RankFailure as error:
                 failure = error
             try:
-                runner.agree(
-                    None if failure is None else f"{type(failure).__name__}: {failure}"
-                )
-            except RuntimeError:
+                runner.agree(None if failure is None else str(failure))
+            except Exception:
                 if failure is not None:
                     # The rank that failed raises what it failed with.
-                    raise failure
+                    raise failure.__cause__ or failure
                 raise
         ack_fn = None
         if durable_ack:

@@ -34,10 +34,13 @@ def program_spec(model) -> ProgramSpec:
         reduction=registration.training.reduction,
         # A draft class names its transformer block; a draft without one
         # (EAGLE) is a single unit.
-        # Sorted: a draft class may hold the names in a set, whose order
-        # differs between the ranks' processes.
+        # A draft that names no block (EAGLE, or a module that is not a
+        # canonical draft class) is one unit. Sorted: a draft class may hold
+        # the names in a set, whose order differs between the ranks' processes.
         partition=PartitionHints(
-            blocks=tuple(sorted(model.draft_model._no_split_modules))
+            blocks=tuple(
+                sorted(getattr(model.draft_model, "_no_split_modules", None) or ())
+            )
         ),
     )
 
