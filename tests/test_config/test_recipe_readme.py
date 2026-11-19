@@ -8,6 +8,8 @@ from specforge.config import (
     DataConfig,
     DeploymentConfig,
     DisaggregatedDeploymentConfig,
+    DrafterConfig,
+    DrafterTrainerConfig,
     ManagedLocalCaptureServerConfig,
     ManagedLocalMooncakeConfig,
     ManagedLocalStackConfig,
@@ -28,6 +30,8 @@ class TestRecipeReadmeSync(unittest.TestCase):
         text = README.read_text(encoding="utf-8")
         schemas = (
             ("", Config),
+            ("drafters[]", DrafterConfig),
+            ("drafters[].trainer", DrafterTrainerConfig),
             ("model", ModelConfig),
             ("data", DataConfig),
             ("training", TrainingConfig),

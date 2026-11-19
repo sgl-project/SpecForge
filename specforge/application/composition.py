@@ -7,7 +7,7 @@ from typing import Callable
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration, AlgorithmRegistry
-from specforge.config import Config
+from specforge.config import Config, flatten_drafters
 
 
 @dataclass(frozen=True)
@@ -45,7 +45,10 @@ def resolve_run(
     *,
     target_config=None,
 ) -> ResolvedRun:
-    """Resolve and validate all algorithm-owned behavior exactly once."""
+    """Resolve and validate all algorithm-owned behavior exactly once.
+
+    A config with one drafter resolves as that drafter's single-draft config.
+    """
 
     from specforge.training.canonical import resolve_run as resolve_canonical_run
 
@@ -53,7 +56,10 @@ def resolve_run(
         raise ValueError(
             "Register canonical objectives instead of a combined algorithm registry"
         )
-    cfg, algorithm = resolve_canonical_run(cfg, target_config=target_config)
+    runs = flatten_drafters(cfg)
+    if len(runs) > 1:
+        raise ValueError("training several drafters at once is not supported yet")
+    cfg, algorithm = resolve_canonical_run(runs[0][1], target_config=target_config)
     return bind_run(cfg, algorithm)
 
 
