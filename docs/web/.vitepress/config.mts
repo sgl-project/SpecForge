@@ -138,6 +138,7 @@ export default defineConfig({
             { text: 'Speculative Decoding', link: '/concepts/speculative_decoding' },
             { text: 'EAGLE3', link: '/concepts/EAGLE3' },
             { text: 'DFlash2', link: '/concepts/DFlash2' },
+            { text: 'DMTP', link: '/concepts/DMTP' },
           ],
         },
         {

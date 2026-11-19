@@ -4,6 +4,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
 from torch.optim.lr_scheduler import LRScheduler as _LRScheduler
 
 
+def warmup_steps_from_ratio(ratio: float, total_steps: int) -> int:
+    """Return the number of complete optimizer steps in a warmup period."""
+    return int(ratio * total_steps)
+
+
 class _TwoStageScheduler(_LRScheduler):
     def __init__(self, optimizer, after_scheduler: _LRScheduler, last_epoch=-1):
         self.after_scheduler = after_scheduler
@@ -153,11 +158,6 @@ class ConstantWarmupLR(_WarmupScheduler):
 # trainer's logged ``lr`` after completing update g is the value for g + 1).
 
 
-def warmup_updates(warmup_ratio: float, total_steps: int) -> int:
-    """Warmup length used by ``BF16Optimizer``: ``int(warmup_ratio * total_steps)``."""
-    return int(warmup_ratio * total_steps)
-
-
 def constant_warmup_lr(update: int, base_lr: float, warmup_updates: int) -> float:
     """``constant`` schedule: ``update / W * base`` for ``update <= W``, else base.
 
@@ -305,5 +305,5 @@ __all__ = [
     "completed_updates_from_state",
     "constant_linear_decay_lr",
     "constant_warmup_lr",
-    "warmup_updates",
+    "warmup_steps_from_ratio",
 ]

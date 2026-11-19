@@ -11,12 +11,12 @@ from unittest import mock
 
 import torch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.checkpoint import STATE_FILE
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -92,7 +92,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
             )
         store.close()
 
-    def _build(self, *, resume_from=None, idle_timeout_s=None):
+    def _build(self, *, resume_from=None, idle_timeout_s=None, **kwargs):
         from specforge.launch import build_disagg_online_consumer
 
         captured = {}
@@ -124,8 +124,23 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
                 idle_timeout_s=idle_timeout_s,
+                **kwargs,
             )
         return trainer, captured, _FakeDistributor.latest
+
+    def test_two_window_consumer_publishes_dispatch_requirement(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            with self.subTest(policy=policy):
+                self.channel = StreamingRefChannel(os.path.join(self.work, policy))
+                _, _, distributor = self._build(batch_size=4, consumer_dispatch=policy)
+                self.assertEqual(self.channel.consumer_quantum(), 8)
+                self.assertEqual(distributor.kwargs["refs_per_rank_step"], 4)
+                self._build(
+                    resume_from=self._checkpoint(0),
+                    batch_size=4,
+                    consumer_dispatch=policy,
+                )
+                self.assertEqual(self.channel.consumer_quantum(), 8)
 
     def test_idle_timeout_is_unbounded_unless_explicitly_configured(self):
         _trainer, captured, distributor = self._build()

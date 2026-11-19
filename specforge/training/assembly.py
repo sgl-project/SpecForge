@@ -35,9 +35,6 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
-from specforge.training.provenance import (
-    model_resume_provenance as _model_resume_provenance,
-)
 
 
 @dataclass
@@ -108,25 +105,6 @@ def _device():
     return get_local_device()
 
 
-def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
-    """Construct the configured draft model without any legacy trainer code."""
-    from specforge.modeling.draft.registry import resolve_draft
-    from specforge.training.model_loading import resolve_draft_config
-
-    provider = algorithm.providers.model
-    draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
-    draft_model = provider.build_draft(cfg, draft_config)
-    architecture = provider.draft_config.architecture
-    expected_type = resolve_draft(architecture)
-    if not isinstance(draft_model, expected_type):
-        raise ValueError(
-            f"training.strategy={algorithm.name!r} requires {architecture}, but "
-            f"the resolved draft config builds "
-            f"{type(draft_model).__name__}"
-        )
-    return draft_config, draft_model
-
-
 def _load_text_tokenizer(cfg: Config):
     """Load tokenizer tooling used by current built-in text providers."""
     if cfg.model.input_modality != "text":
@@ -177,69 +155,8 @@ def _load_input_tools(
 
 
 def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
-    """Build the method-specific composite model and frozen target pieces."""
-    import torch
-
-    from specforge.modeling.target.target_utils import load_target_config
-    from specforge.modeling.target.target_utils import (
-        target_hidden_size as resolve_target_hidden_size,
-    )
-    from specforge.modeling.target.target_utils import (
-        target_vocab_size as resolve_target_vocab_size,
-    )
-
-    provider = algorithm.providers.model
-    draft_config, draft_model = _load_draft(cfg, algorithm)
-    needs_input_tools = provider.needs_input_tools(cfg, draft_model)
-    input_tools = _load_input_tools(cfg, algorithm) if needs_input_tools else None
-    target_config = load_target_config(
-        cfg.model.target_model_path,
-        cache_dir=cfg.model.cache_dir,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    target_hidden_size = resolve_target_hidden_size(target_config)
-    target_vocab_size = resolve_target_vocab_size(target_config)
-    draft_vocab_size = int(
-        getattr(draft_config, "draft_vocab_size", draft_config.vocab_size)
-    )
-
-    parts = provider.build_training_model(
-        cfg, draft_model, draft_config, target_config, input_tools
-    )
-    if cfg.mode == "online" and parts.capture_layers is None:
-        parts.capture_layers = provider.resolve_capture_layers(
-            cfg, draft_config, target_config
-        )
-
-    # Keep the composite and target parts bf16 while avoiding accidental target
-    # gradients. The optimizer still receives the strategy's trainable module.
-    if parts.target_head is not None and isinstance(parts.target_head, torch.nn.Module):
-        parts.target_head.requires_grad_(False)
-
-    return ModelBundle(
-        model=parts.model,
-        draft_model=draft_model,
-        draft_config=draft_config,
-        input_tools=input_tools,
-        target_head=parts.target_head,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        capture_layers=parts.capture_layers,
-        # This mapping also carries the provider-bound checkpoint policy. It is
-        # forwarded unchanged through every trainer-bearing topology.
-        strategy_kwargs=algorithm.providers.step.bind_runtime(
-            cfg,
-            draft_model,
-            parts.model,
-            model_provenance=_model_resume_provenance(
-                cfg,
-                draft_config,
-                target_config,
-                capture_layers=parts.capture_layers,
-            ),
-        ),
-    )
+    """Build the resolved canonical model, objective and frozen target pieces."""
+    return algorithm.providers.model.build_bundle(cfg, algorithm)
 
 
 class _ConfiguredOptimizerFactory:
@@ -373,11 +290,8 @@ def _prompt_cache_key(
         "train_only_last_turn": cfg.data.train_only_last_turn,
         "max_prompts": cfg.data.max_prompts,
         "target_model": cfg.model.target_model_path,
-        "draft_config": cfg.model.draft_model_config,
-        "draft_checkpoint": cfg.model.draft_checkpoint_path,
-        "draft_num_hidden_layers": cfg.model.draft_num_hidden_layers,
-        "draft_block_size": cfg.model.draft_block_size,
-        "strategy": cfg.training.strategy,
+        "draft_config": cfg.draft,
+        "strategy": cfg.training.objective,
         "input_modality": cfg.model.input_modality,
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -442,6 +356,10 @@ def _install_dataset_vocab_mapping(
     """Build, cache, and install one deterministic EAGLE vocabulary map."""
     if (
         cfg.model.vocab_mapping_path
+        or (
+            hasattr(bundle.draft_model, "vocabulary")
+            and bool(bundle.draft_model.vocabulary.ready)
+        )
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return
@@ -456,7 +374,12 @@ def _install_dataset_vocab_mapping(
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{key}.pt")
     if os.path.exists(path):
-        bundle.draft_model.load_vocab_mapping(path)
+        import torch
+
+        mapping = torch.load(path, map_location="cpu", weights_only=True)
+        bundle.draft_model.vocabulary.load_mapping(
+            t2d=mapping["t2d"], d2t=mapping["d2t"]
+        )
         return
 
     import torch
@@ -472,9 +395,7 @@ def _install_dataset_vocab_mapping(
     # Every rank derives the same mapping and installs it directly, so training
     # does not depend on a shared cache filesystem. Rank 0 alone persists the
     # reusable cache file, avoiding concurrent torch.save writes.
-    bundle.draft_model.d2t.copy_(d2t)
-    bundle.draft_model.t2d.copy_(t2d)
-    bundle.draft_model.vocab_mapping_loaded = True
+    bundle.draft_model.vocabulary.load_mapping(t2d=t2d, d2t=d2t)
     distributed = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
     )
@@ -494,6 +415,10 @@ def _ensure_offline_vocab_mapping(
         return
     if (
         cfg.model.vocab_mapping_path
+        or (
+            hasattr(bundle.draft_model, "vocabulary")
+            and bool(bundle.draft_model.vocabulary.ready)
+        )
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return
@@ -532,7 +457,7 @@ def _dataloader_num_workers(cfg: Config, algorithm: AlgorithmRegistration) -> in
         dataloader_num_workers = (
             algorithm.providers.model.default_dataloader_num_workers
         )
-    return dataloader_num_workers
+    return 4 if dataloader_num_workers is None else dataloader_num_workers
 
 
 def _profiling_options(cfg: Config):
@@ -596,12 +521,6 @@ def build_training_run(
     external SGLang servers; colocated online execution is intentionally absent.
     """
 
-    if algorithm.name != cfg.training.strategy:
-        raise ValueError(
-            "resolved algorithm does not match training.strategy: "
-            f"{algorithm.name!r} != {cfg.training.strategy!r}"
-        )
-
     t = cfg.training
     if t.role != "producer":
         import torch.distributed as dist
@@ -616,6 +535,7 @@ def build_training_run(
 
     if cfg.deployment.mode == "disaggregated":
         from specforge.training.disaggregated import build_disaggregated_run
+        from specforge.training.model_loading import preflight_draft_kernels
 
         run_logger = _configured_logger(cfg)
         try:
@@ -623,6 +543,9 @@ def build_training_run(
                 cfg,
                 algorithm=algorithm,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
+                    run_cfg, algorithm=algorithm
+                ),
+                preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
                 ),
                 prepare_prompts=lambda run_cfg, tokenizer, **kwargs: _prepare_prompts(
@@ -652,12 +575,12 @@ def build_training_run(
             eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
             draft_model=bundle.model,
             target_head=bundle.target_head,
-            ttt_length=t.ttt_length,
+            ttt_length=t.objective_options.get("ttt_length", 7),
             max_len=cfg.data.max_length,
             num_epochs=t.num_epochs,
             use_usp_preprocess=(t.attention_backend == "usp"),
             seed=t.seed,
-            resume_from=t.resume_from,
+            resume_from=cfg.resume_path,
             **_common_launch_kwargs(
                 cfg,
                 bundle,

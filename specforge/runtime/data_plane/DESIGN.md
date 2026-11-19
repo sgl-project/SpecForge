@@ -25,7 +25,7 @@ flowchart TD
   end
 
   subgraph DON[online disaggregated]
-    SGC[patched SGLang capture] --> MC[Mooncake store]
+    SGC[SGLang with the capture plugin capture] --> MC[Mooncake store]
     OP[producer] --> SRC[StreamingRefChannel]
     SRC --> RD[RefDistributor rank 0]
     RD --> I0[rank 0 InboxChannel]

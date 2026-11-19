@@ -20,15 +20,15 @@ def _online_payload(
     topology: str = "disaggregated",
 ) -> dict:
     payload = {
+        "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
         "model": {
             "target_model_path": "target",
-            "draft_model_config": "draft.json",
             "vocab_mapping_path": "mapping.pt",
             "target_backend": backend,
             "input_modality": modality,
         },
         "data": {"train_data_path": "train.jsonl"},
-        "training": {"strategy": "eagle3", "max_steps": 1},
+        "training": {"max_steps": 1},
         "deployment": {"mode": topology},
     }
     if topology == "disaggregated":
@@ -72,9 +72,9 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
         # silently ignored — training.md promises retired options stay loud.
         def _offline_payload(backend):
             return {
+                "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                 "model": {
                     "target_model_path": "target",
-                    "draft_model_config": "draft.json",
                     "vocab_mapping_path": "mapping.pt",
                     "target_backend": backend,
                 },
@@ -106,10 +106,10 @@ class ServerOnlyOnlineConfigTest(unittest.TestCase):
             )
         self.assertTrue(online_recipes)
         self.assertFalse(
-            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-7b-eagle3-online.yaml"))
+            any((EXAMPLE_CONFIG_DIR / "online").rglob("qwen2.5-vl-7b-eagle3.yaml"))
         )
         self.assertFalse(
-            any(EXAMPLE_CONFIG_DIR.rglob("qwen2.5-vl-32b-eagle3-online.yaml"))
+            any((EXAMPLE_CONFIG_DIR / "online").rglob("qwen2.5-vl-32b-eagle3.yaml"))
         )
 
     def test_application_resolution_accepts_the_server_only_contract(self):

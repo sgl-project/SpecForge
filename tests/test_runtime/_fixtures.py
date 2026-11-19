@@ -12,30 +12,84 @@ import os
 
 import torch
 
-TINY_DRAFT_CONFIG = {
-    "architectures": ["LlamaForCausalLMEagle3"],
-    "bos_token_id": 1,
-    "eos_token_id": 2,
-    "hidden_act": "silu",
-    "hidden_size": 64,
-    "initializer_range": 0.02,
-    "intermediate_size": 128,
-    "max_position_embeddings": 512,
-    "model_type": "llama",
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "num_hidden_layers": 1,
-    "pad_token_id": 0,
-    "rms_norm_eps": 1e-5,
-    "tie_word_embeddings": False,
-    "torch_dtype": "bfloat16",
-    "vocab_size": 256,
-    "draft_vocab_size": 64,
-}
-
 H = 64
 V = 256
 D = 64
+
+
+def tiny_config(
+    kind="eagle3",
+    *,
+    hidden=H,
+    vocab=V,
+    draft_layers=1,
+    block_size=4,
+    mask_token_id=0,
+    markov_rank=8,
+):
+    from dataclasses import replace
+
+    from tests.test_config.draft_fixtures import draft_config
+    from tests.test_config.test_draft_eagle3_spec import eagle_config
+    from tests.test_modeling.test_canonical_domino import model_config as domino_config
+    from tests.test_modeling.test_canonical_dspark import model_config as dspark_config
+
+    config = {
+        "eagle3": eagle_config,
+        "dflash": draft_config,
+        "domino": domino_config,
+        "dspark": dspark_config,
+    }[kind]()
+    spec = config.spec_config
+    features = replace(
+        spec.target_features,
+        target_layer_ids=(0, 1, 2) if kind == "eagle3" else (1,),
+        hidden_size=hidden,
+    )
+    if kind != "eagle3":
+        features = replace(features, mask_token_id=mask_token_id)
+        spec = replace(spec, block=replace(spec.block, block_size=block_size))
+    if kind == "domino":
+        spec = replace(
+            spec, gru=replace(spec.gru, hidden_size=hidden // 2, projection_size=hidden)
+        )
+    if kind == "dspark":
+        spec = replace(
+            spec, markov=replace(spec.markov, type="vanilla", rank=markov_rank)
+        )
+    return replace(
+        config,
+        hidden_size=hidden,
+        vocab_size=vocab,
+        draft_vocab_size=D if kind == "eagle3" else vocab,
+        max_position_embeddings=512,
+        target_bindings=(),
+        target_logit_transform=None,
+        layer_types=(config.layer_types[0],) * draft_layers,
+        attention_configs={
+            name: replace(node, head_dim=hidden // 4)
+            for name, node in config.attention_configs.items()
+        },
+        mlp_configs={
+            name: replace(node, intermediate_size=hidden * 2)
+            for name, node in config.mlp_configs.items()
+        },
+        spec_config=replace(spec, target_features=features),
+    )
+
+
+def build_strategy(model, target_head=None, **kwargs):
+    from torch.nn.parallel import DistributedDataParallel
+
+    from specforge.training.strategies.canonical import CanonicalTrainStrategy
+
+    runtime = model.module if isinstance(model, DistributedDataParallel) else model
+    return CanonicalTrainStrategy(
+        model,
+        name=runtime.objective_name,
+        objective=runtime.objective_name,
+        required_features=runtime.registration.inputs,
+    )
 
 
 def build_single_rank_distributed(port="29561"):
@@ -88,7 +142,9 @@ def init_rank_distributed(
 
 def write_draft_config(path):
     with open(path, "w") as f:
-        json.dump(TINY_DRAFT_CONFIG, f)
+        from specforge.config.draft.codec import encode_config
+
+        json.dump(encode_config(tiny_config()), f)
     return path
 
 
@@ -101,7 +157,7 @@ def write_target_head_dir(d, hidden=H, vocab=V):
         "model_type": "llama",
         "hidden_size": hidden,
         "vocab_size": vocab,
-        "num_hidden_layers": 1,
+        "num_hidden_layers": 4,
         "num_attention_heads": 4,
         "intermediate_size": 128,
     }
@@ -155,8 +211,8 @@ def build_offline_eagle3_loader(
     ref_slice: slice | None = None,
 ):
     """Build the canonical fixed-ref EAGLE3 loader used by runtime tests."""
-    from specforge.algorithms.builtin import builtin_algorithm_registry
     from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
+    from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
     algorithm = builtin_algorithm_registry().resolve("eagle3")
     provider = algorithm.providers.offline_for("text")
@@ -179,27 +235,39 @@ def build_offline_eagle3_loader(
     )
 
 
-def build_eagle3(workdir, ttt=3):
-    """Build (eagle3_model, target_head) sharing one set of weights, on cuda."""
-    from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
+def load_eagle3(
+    config_path, target_dir, vocab_path, *, ttt=3, backend="sdpa", **options
+):
+    from specforge.algorithms.objectives import build_objective_model
+    from specforge.config.draft.codec import decode_config
+    from specforge.modeling import build_draft_model
     from specforge.modeling.target.target_head import TargetHead
 
-    cfg = write_draft_config(os.path.join(workdir, "draft.json"))
-    target_dir = write_target_head_dir(os.path.join(workdir, "target"))
-    vocab_path = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
+    with open(config_path) as stream:
+        config = decode_config(json.load(stream))
+    draft = build_draft_model(
+        config, backend="sdpa" if backend in ("fa", "usp") else backend
+    ).to(device="cuda", dtype=torch.bfloat16)
+    draft.vocabulary.load_mapping(**torch.load(vocab_path, weights_only=True))
+    draft.embed_tokens.requires_grad_(False)
+    head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
+    model = build_objective_model(
+        draft, target_head=head.fc, options=dict(ttt_length=ttt, **options)
+    )
+    model.attention_backend = backend
+    if backend == "usp":
+        from specforge.training.sequence_parallel import configure_sequence_parallel
 
-    draft_config = AutoDraftModelConfig.from_file(cfg)
-    draft_model = AutoDraftModel.from_config(
-        draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
-    ).cuda()
-    draft_model.load_vocab_mapping(vocab_path)
-    draft_model.freeze_embedding()
-    target_head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-    eagle3_model = OnlineEagle3Model(
-        draft_model=draft_model, length=ttt, attention_backend="flex_attention"
-    ).cuda()
-    return eagle3_model, target_head
+        configure_sequence_parallel(model)
+    return model.cuda()
+
+
+def build_eagle3(workdir, ttt=3):
+    cfg = write_draft_config(os.path.join(workdir, "draft.json"))
+    target = write_target_head_dir(os.path.join(workdir, "target"))
+    vocab = write_vocab_mapping(os.path.join(workdir, "vocab_mapping.pt"))
+    model = load_eagle3(cfg, target, vocab, ttt=ttt)
+    return model, model.target_head
 
 
 # --- DFlash fixtures ---------------------------------------------------------
@@ -261,8 +329,9 @@ def write_offline_files_dspark(
     return d
 
 
-def build_dflash(
+def build_block_model(
     workdir,
+    kind,
     *,
     hidden=H,
     vocab=V,
@@ -272,158 +341,12 @@ def build_dflash(
     num_anchors=8,
     mask_token_id=0,
     attention_backend="sdpa",
-):
-    """Build a tiny OnlineDFlashModel on CUDA through the package model pieces.
-
-    Returns (dflash_model, hidden_states_width, target_dir, target_layer_ids).
-    target_dir holds the saved tiny Qwen3 target (load it as an HF DFlash target for
-    the ONLINE path); target_layer_ids are the capture layers (== set_capture_layers).
-    For draft_layers=1 the capture set is one target layer so width == hidden.
-    """
-    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
-
-    from specforge.algorithms.common.dflash_family_model import OnlineDFlashModel
-    from specforge.modeling.draft.dflash import DFlashDraftModel
-    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
-
-    # Tiny Qwen3 target saved to disk; the draft config is derived from it.
-    tcfg = Qwen3Config(
-        hidden_size=hidden,
-        intermediate_size=2 * hidden,
-        num_hidden_layers=target_layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=vocab,
-        max_position_embeddings=512,
-        rms_norm_eps=1e-5,
-        tie_word_embeddings=False,
-    )
-    torch.manual_seed(1234)
-    target_dir = os.path.join(workdir, "dflash_target")
-    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
-
-    draft_config = AutoConfig.from_pretrained(target_dir)
-    draft_config.num_hidden_layers = draft_layers
-    draft_config.layer_types = ["full_attention"] * draft_layers
-    draft_config.block_size = block_size
-    draft_config.num_target_layers = target_layers
-    draft_config.dflash_config = {"mask_token_id": mask_token_id}
-    draft_config._attn_implementation = attention_backend
-
-    draft_model = DFlashDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
-
-    target_components = TargetEmbeddingsAndHead.from_pretrained(
-        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
-    )
-
-    dflash_model = OnlineDFlashModel(
-        draft_model=draft_model,
-        target_lm_head=target_components.lm_head,
-        target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
-        attention_backend=attention_backend,
-        num_anchors=num_anchors,
-        loss_type="dflash",
-    ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
-    return dflash_model, width, target_dir, list(draft_model.target_layer_ids)
-
-
-def build_domino(
-    workdir,
-    *,
-    hidden=H,
-    vocab=V,
-    target_layers=4,
-    draft_layers=1,
-    block_size=4,
-    num_anchors=8,
-    mask_token_id=0,
-    attention_backend="sdpa",
-):
-    """Build a tiny OnlineDominoModel on CUDA through the package model pieces.
-
-    Domino uses a DFlash-backed DominoDraftModel with a GRU prefix + embed
-    projection head. Returns
-    (domino_model, hidden_states_width, target_dir, target_layer_ids).
-    """
-    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
-
-    from specforge.algorithms.common.dflash_family_model import OnlineDominoModel
-    from specforge.modeling.draft.domino import DominoDraftModel
-    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
-
-    tcfg = Qwen3Config(
-        hidden_size=hidden,
-        intermediate_size=2 * hidden,
-        num_hidden_layers=target_layers,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=vocab,
-        max_position_embeddings=512,
-        rms_norm_eps=1e-5,
-        tie_word_embeddings=False,
-    )
-    torch.manual_seed(1234)
-    target_dir = os.path.join(workdir, "domino_target")
-    Qwen3ForCausalLM(tcfg).save_pretrained(target_dir)
-
-    draft_config = AutoConfig.from_pretrained(target_dir)
-    draft_config.num_hidden_layers = draft_layers
-    draft_config.layer_types = ["full_attention"] * draft_layers
-    draft_config.block_size = block_size
-    draft_config.num_target_layers = target_layers
-    draft_config.dflash_config = {
-        "projector_type": "domino",
-        "emb_dim": hidden,
-        "gru_hidden_dim": hidden // 2,
-        "pure_draft_prefix_len": 0,
-        "shift_label": False,
-        "mask_token_id": mask_token_id,
-    }
-    draft_config._attn_implementation = attention_backend
-
-    draft_model = DominoDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
-
-    target_components = TargetEmbeddingsAndHead.from_pretrained(
-        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
-    )
-
-    domino_model = OnlineDominoModel(
-        draft_model=draft_model,
-        target_lm_head=target_components.lm_head,
-        target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
-        mask_token_id=mask_token_id,
-        attention_backend=attention_backend,
-        num_anchors=num_anchors,
-        shift_label=draft_model.shift_label,
-    ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
-    return domino_model, width, target_dir, list(draft_model.target_layer_ids)
-
-
-def build_dspark(
-    workdir,
-    *,
-    hidden=H,
-    vocab=V,
-    target_layers=4,
-    draft_layers=1,
-    block_size=4,
-    num_anchors=2,
     markov_rank=8,
-    mask_token_id=0,
-    attention_backend="sdpa",
 ):
-    """Build a tiny OnlineDSparkModel on CUDA without model downloads."""
-    from transformers import AutoConfig, Qwen3Config, Qwen3ForCausalLM
+    from transformers import Qwen3Config, Qwen3ForCausalLM
 
-    from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
-    from specforge.modeling.draft.dspark import DSparkDraftModel
+    from specforge.algorithms.objectives import build_objective_model
+    from specforge.modeling import build_draft_model
     from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     target_config = Qwen3Config(
@@ -432,50 +355,52 @@ def build_dspark(
         num_hidden_layers=target_layers,
         num_attention_heads=4,
         num_key_value_heads=2,
+        head_dim=hidden // 4,
         vocab_size=vocab,
         max_position_embeddings=512,
         rms_norm_eps=1e-5,
         tie_word_embeddings=False,
     )
     torch.manual_seed(1234)
-    target_dir = os.path.join(workdir, "dspark_target")
+    target_dir = os.path.join(workdir, kind + "_target")
     Qwen3ForCausalLM(target_config).save_pretrained(target_dir)
-
-    draft_config = AutoConfig.from_pretrained(target_dir)
-    draft_config.num_hidden_layers = draft_layers
-    draft_config.layer_types = ["full_attention"] * draft_layers
-    draft_config.block_size = block_size
-    draft_config.num_target_layers = target_layers
-    draft_config.dflash_config = {
-        "projector_type": "dspark",
-        "mask_token_id": mask_token_id,
-        "markov_rank": markov_rank,
-        "markov_head_type": "vanilla",
-        "confidence_head_alpha": 1.0,
-        "enable_confidence_head": True,
-        "confidence_head_with_markov": True,
-    }
-    draft_config._attn_implementation = attention_backend
-
-    draft_model = DSparkDraftModel(draft_config).to(device="cuda", dtype=torch.bfloat16)
-    draft_model.mask_token_id = mask_token_id
-    target_components = TargetEmbeddingsAndHead.from_pretrained(
-        target_dir,
-        lm_head_key="lm_head.weight",
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    dspark_model = OnlineDSparkModel(
-        draft_model=draft_model,
-        target_lm_head=target_components.lm_head,
-        target_embed_tokens=target_components.embed_tokens,
-        block_size=draft_model.block_size,
+    config = tiny_config(
+        kind,
+        hidden=hidden,
+        vocab=vocab,
+        draft_layers=draft_layers,
+        block_size=block_size,
         mask_token_id=mask_token_id,
-        attention_backend=attention_backend,
-        num_anchors=num_anchors,
-        dspark_ce_loss_alpha=0.1,
-        dspark_l1_loss_alpha=0.9,
-        dspark_confidence_head_alpha=1.0,
+        markov_rank=markov_rank,
+    )
+    draft = build_draft_model(config, backend=attention_backend).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    target = TargetEmbeddingsAndHead.from_pretrained(
+        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        draft.embed_tokens.weight.copy_(target.embed_tokens.weight)
+        draft.lm_head.weight.copy_(target.lm_head.weight)
+    draft.embed_tokens.requires_grad_(False)
+    draft.lm_head.requires_grad_(False)
+    if hasattr(draft, "initialize_transfer_space"):
+        draft.initialize_transfer_space()
+    options = dict(num_anchors=num_anchors)
+    model = build_objective_model(
+        draft, target_head=target.lm_head, options=options
     ).cuda()
-    width = len(draft_model.target_layer_ids) * hidden
-    return dspark_model, width
+    layers = list(config.spec_config.target_features.target_layer_ids)
+    return model, len(layers) * hidden, target_dir, layers
+
+
+def build_dflash(workdir, **options):
+    return build_block_model(workdir, "dflash", **options)
+
+
+def build_domino(workdir, **options):
+    return build_block_model(workdir, "domino", **options)
+
+
+def build_dspark(workdir, **options):
+    return build_block_model(workdir, "dspark", **options)[:2]

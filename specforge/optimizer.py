@@ -10,7 +10,7 @@ from specforge.lr_scheduler import (
     CosineAnnealingWarmupLR,
     completed_updates_from_state,
     constant_linear_decay_lr,
-    warmup_updates,
+    warmup_steps_from_ratio,
 )
 from specforge.utils import print_on_rank0
 
@@ -101,7 +101,7 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
-        warmup_steps = warmup_updates(warmup_ratio, total_steps)
+        warmup_steps = warmup_steps_from_ratio(warmup_ratio, total_steps)
         decay_kwargs = {}
         self.lr_decay_window = None
         if lr_scheduler == "constant_linear_decay":

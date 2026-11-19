@@ -26,7 +26,7 @@ from specforge.lr_scheduler import (
     completed_updates_from_state,
     constant_linear_decay_lr,
     constant_warmup_lr,
-    warmup_updates,
+    warmup_steps_from_ratio,
 )
 from specforge.optimizer import BF16Optimizer
 
@@ -110,8 +110,8 @@ def _flat_keys(state):
 
 class TestClosedForms(unittest.TestCase):
     def test_warmup_length(self):
-        self.assertEqual(warmup_updates(RATIO, TOTAL), W)
-        self.assertEqual(warmup_updates(S_RATIO, S_TOTAL), S_W)
+        self.assertEqual(warmup_steps_from_ratio(RATIO, TOTAL), W)
+        self.assertEqual(warmup_steps_from_ratio(S_RATIO, S_TOTAL), S_W)
 
     def test_scheduler_and_helpers_agree_bit_for_bit(self):
         for total, w, d, t in ((S_TOTAL, S_W, S_D, S_T), (TOTAL, W, D, T)):
@@ -410,10 +410,6 @@ class TestOptimizerBranch(unittest.TestCase):
 
 
 class TestConfig(unittest.TestCase):
-    MINIMAL = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft.json"},
-        "data": {"hidden_states_path": "/features"},
-    }
     COOLDOWN = dict(
         lr_scheduler="constant_linear_decay",
         lr_decay_start_update=D,
@@ -422,8 +418,9 @@ class TestConfig(unittest.TestCase):
 
     def _config(self, **training):
         from specforge.config import Config
+        from tests.test_config.test_schema import MINIMAL
 
-        payload = copy.deepcopy(self.MINIMAL)
+        payload = copy.deepcopy(MINIMAL)
         payload["training"] = {
             "max_steps": T,
             "total_steps": TOTAL,

@@ -4,7 +4,7 @@ SpecForge has one public training entry point for every strategy and runtime
 topology:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 The YAML file is the run contract. It selects the draft strategy, target model,
@@ -52,17 +52,17 @@ not filename suffixes, to determine these semantics. See the complete
 Use the command directly for every checked-in topology:
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml
+specforge train --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml
 ```
 
 `deployment.trainer.nproc_per_node` records the audited local process count.
 When it is greater than one, the CLI starts torch distributed itself:
 
 ```bash
-specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3-online.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.yaml
 ```
 
-Online target inference never runs in the trainer. A patched SGLang server owns
+Online target inference never runs in the trainer. A SGLang server running the capture plugin owns
 target parallelism and publishes captured features through Mooncake; every
 consumer rank is data parallel. Offline runs shard fixed feature references
 across trainer ranks and may additionally use EAGLE3 USP. See
@@ -76,7 +76,7 @@ validated `section.field=value` syntax:
 
 ```bash
 specforge train \
-  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml \
   training.learning_rate=5e-5 \
   training.max_steps=100 \
   output_dir=./outputs/eagle3-smoke
@@ -91,9 +91,10 @@ A run config has seven typed sections (`model`, `data`, `training`, `tracking`,
 `profiling`, `runtime`, and `deployment`) plus `run_id` and `output_dir`:
 
 ```yaml
+draft: specforge/config/draft/presets/qwen3-8b-eagle3.yaml
+
 model:
   target_model_path: Qwen/Qwen3-8B
-  draft_model_config: configs/qwen3-8b-eagle3.json
   target_backend: sglang
   vocab_mapping_path: cache/vocab_mapping/qwen3-8b.pt
   torch_dtype: bfloat16
@@ -105,7 +106,6 @@ data:
   cache_dir: ./cache
 
 training:
-  strategy: eagle3
   num_epochs: 10
   max_steps: 10000
   batch_size: 1
@@ -132,67 +132,52 @@ deployment:
 
 ### Draft configuration and model initialization
 
-`model.draft_model_config` accepts any of these equivalent config sources:
-
-- a local JSON file;
-- a local draft-model directory containing `config.json`;
-- a Hugging Face draft-model repository ID.
-
-It may be omitted for EAGLE3, P-EAGLE, and DFlash. In that case SpecForge
-derives a registered draft config from the target config. The defaults preserve
-the former trainers: one EAGLE3 layer, four P-EAGLE layers, and one DFlash layer
-with block size 16. This DFlash default selects `DFlashDraftModel`; DFlash2
-always requires an explicit draft config or pretrained config source. Typed
-overrides are available when creating a different fresh architecture:
+Use `draft` to provide a complete draft mapping or a YAML/JSON file. Presets in
+`specforge/config/draft/presets/` use the same format. The target model and filename
+do not choose the draft architecture. Copy a preset and edit its component nodes
+and `layer_types` to change the model.
 
 ```yaml
-model:
-  target_model_path: Qwen/Qwen3-8B
-  draft_num_hidden_layers: 2  # P-EAGLE or DFlash; EAGLE3 remains one layer
-  draft_block_size: 8         # DFlash only
+draft: specforge/config/draft/presets/qwen3-8b-dflash.yaml
+training:
+  attention_backend: flex_attention
+  objective_options:
+    num_anchors: 128
+  loss:
+    fused: true
+    execution:
+      chunk_size: 128
+      checkpoint: true
 ```
 
-For DFlash-family drafts, including DFlash2, configure the attention layout in
-the referenced draft JSON. Each entry corresponds to one draft layer; sliding
-layers share one positive window:
+Named `attention_configs` define GQA, MHA or MLA, including `is_causal` and
+`sliding_window` on each node. `layer_configs` composes attention and FFN nodes;
+`layer_types` selects the named layer for each position. Architecture settings
+live in `spec_config`. A checkpoint stores the expanded canonical configuration.
+There are no target-derived defaults or structural overrides in the run config.
 
-```json
-{
-  "num_hidden_layers": 5,
-  "layer_types": [
-    "sliding_attention",
-    "sliding_attention",
-    "sliding_attention",
-    "sliding_attention",
-    "full_attention"
-  ],
-  "use_sliding_window": true,
-  "sliding_window": 2048
-}
-```
-
-Use `"full_attention"` for every entry, `"use_sliding_window": false`, and
-`"sliding_window": null` for a full-only draft. The layout length must equal
-`num_hidden_layers`. A layer-count override may resize a uniform layout, but a
-mixed layout must be edited explicitly in the draft JSON.
-
-The `eager`, `sdpa`, and `flex_attention` backends support both layouts.
+See [draft training](/draft_training.md) for objectives, kernel options,
+sequence parallelism and checkpoint initialization.
 
 ### DFlash2
 
 DFlash2 is a draft-architecture variant of DFlash, not a separate capture
-strategy. Keep `training.strategy: dflash` and select it with a draft config
-whose architecture is `DFlash2DraftModel`. The target server still captures
-the same selected hidden states with `--spec-capture-method dflash`. Online
+protocol. Select it with a draft config whose architecture is
+`DFlash2DraftModel`; its default objective is `dflash2`. The target server still captures
+the same selected hidden states with `--speculative-algorithm DFLASH`. Online
 capture also retains the target's final hidden state for teacher-alignment
-telemetry; existing offline DFlash datasets remain compatible and omit only
-the teacher-only metrics. The objective never reads that hidden state. Set
-`training.dflash_teacher_metrics: false` to stop requesting it: the capture
+telemetry; for existing offline DFlash datasets without final target states, set
+`training.objective_options.teacher_metrics: false` to omit teacher-only metrics. The loss does not require that hidden state. Set
+`training.objective_options.teacher_metrics: false` to stop requesting it: the capture
 server no longer writes it and the trainer no longer fetches it, which removes
 one `hidden_size` row per token from every sample (a sixth of the payload with
 five target layers). The run then omits `dflash/teacher/*` and
 `dflash2/selector/self_conditioned_teacher_argmax_agreement`; every other
 metric and the loss are unchanged. Other strategies reject the setting.
+
+A canonical run (one with a `draft` config) does not request that hidden state
+unless `training.objective_options.teacher_metrics: true` is set; the default
+is `false`, and the same metrics are then omitted.
 
 The DFlash2 config additionally defines `conv_kernel_size` and
 `conv_group_size` for the local convolution, plus `selector_rank` and
@@ -205,9 +190,9 @@ Both objectives receive the configured fixed-decay or D-PACE position weight,
 and their combined numerator is normalized by the sum of valid effective token
 weights rather than by batch or anchor count.
 
-Set `training.dflash2_selector_loss_alpha` to scale the selector objective.
-`training.dflash2_selector_warmup_ratio` keeps that scale at zero for an initial
-fraction of optimizer steps, and `training.dflash2_selector_ramp_ratio` then
+Set `training.loss.terms.selector.coefficient` to scale the selector objective.
+`training.objective_options.selector_warmup_ratio` keeps that scale at zero for an initial
+fraction of optimizer steps, and `training.objective_options.selector_ramp_ratio` then
 ramps it linearly to the configured value. Both schedule ratios default to
 zero. A configured alpha of zero disables selector training and freezes its
 parameters; a positive alpha keeps the selector in the optimizer and autograd
@@ -216,7 +201,7 @@ from an identity kernel with a zero-initialized dynamic projection, and the
 selector starts as a unary no-op, so both additions initially preserve the
 corresponding DFlash computation.
 
-Set `training.dflash2_selector_stop_gradient: true` to keep the selector CE
+Set `training.objective_options.selector_stop_gradient: true` to keep the selector CE
 from updating the unary logits and draft hidden states. The selector parameters
 still train, and the primary DFlash/D-PACE/LK objective keeps its normal draft
 gradient path. The option defaults to `false`, preserving coupled training.
@@ -353,11 +338,11 @@ model/data paths and `cuda_visible_devices` lists for the local host.
 
 ```bash
 specforge train \
-  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml \
+  -c examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml \
   model.target_model_path=/path/to/Qwen3.6-27B
 ```
 
-Export the result with `specforge export --to hf`. Serving requires an SGLang
+Export for serving with `specforge export --converter sglang`. Serving requires an SGLang
 version that includes DFlash2 support (SGLang PR #35371); the serving algorithm
 name remains `DFLASH`, and the exported `DFlash2DraftModel` config enables the
 new path automatically.
@@ -366,35 +351,19 @@ See the dedicated [DFlash2 guide](../concepts/DFlash2.md) for the complete
 model-field constraints, offline feature workflow, selector schedule, and
 serving compatibility boundary.
 
-Domino and DSpark need their projector/head metadata, so they require an
-explicit draft config (or a pretrained warm-start source that contains
-`config.json`). The old Domino parser exposed an optional config flag, but its
-no-config branch immediately failed because those required projector fields
-had no defaults; the unified schema rejects that unusable combination early.
-
-There are two deliberately separate checkpoint operations:
+Choose checkpoint loading independently of the training objective:
 
 | Intent | Config field | Restored state |
 | --- | --- | --- |
-| Continue the same run | `training.resume_from` | draft weights, optimizer/scheduler, epoch/step/data position, and per-rank RNG |
-| Initialize a new run from weights | `model.draft_checkpoint_path` | draft weights only |
+| Continue a run | `resume` | draft, optimizer/scheduler, counters, data position and RNG |
+| Start a run with the same draft | `initialization.checkpoint` | configuration and draft weights |
+| Initialize a different draft | `draft` plus `initialization.weights_from` | explicitly mapped weights |
+| Copy native target modules | `draft` plus `initialization.from_target` | explicitly mapped target weights |
 
-A weights-only warm start accepts a Hugging Face model directory/repository or
-a SpecForge checkpoint directory, `training_state.pt`, or run root. If the warm
-source contains `config.json`, it also supplies the draft architecture unless
-`model.draft_model_config` is explicit. Warm start never restores optimizer
-state, counters, data position, or RNG, and it is mutually exclusive with
-`training.resume_from`:
-
-```yaml
-model:
-  target_model_path: Qwen/Qwen3-8B
-  draft_checkpoint_path: ./outputs/base/base-step1000
-```
-
-For an online disaggregated run, the producer may receive the same field. It
-uses only the warm source's draft configuration to derive the capture contract;
-the consumer alone loads the draft weights and optimizer.
+Initialization and resume are mutually exclusive. When loading a checkpoint,
+any supplied `draft` must equal its saved structure; use `weights_from` to change
+structure. Producers read only the capture/configuration contract; consumers load
+the draft weights and training state.
 
 Set exactly one data source:
 
@@ -407,21 +376,21 @@ The checked-in examples are the canonical starting points:
 
 | Strategy | Category | Config |
 | --- | --- | --- |
-| EAGLE3 | Online disaggregated, external | [`qwen3-8b-eagle3-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml) |
-| EAGLE3 | Offline colocated | [`qwen3-8b-eagle3-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml) |
-| EAGLE3 | Offline disaggregated | [`qwen3-8b-eagle3-offline-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3-offline-disaggregated.yaml) |
-| P-EAGLE | Online disaggregated, external | [`qwen3-8b-peagle-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-peagle-disaggregated.yaml) |
-| DFlash | Online disaggregated, external | [`qwen3-8b-dflash-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash-online.yaml) |
-| DFlash | Online disaggregated, managed-local | [`qwen3-8b-dflash-1server-dp7-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7-disaggregated.yaml) |
-| DFlash | Offline colocated | [`qwen3-8b-dflash-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml) |
-| DFlash2 | Online disaggregated, managed-local | [`qwen3.6-27b-dflash2-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2-disaggregated.yaml) |
-| Domino | Online disaggregated, external | [`qwen3-8b-domino-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) |
-| Domino | Online disaggregated, managed-local | [`qwen3-8b-domino-multiserver-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-multiserver-disaggregated.yaml) |
-| Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
-| DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
-| DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
-| MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-disaggregated-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-disaggregated-npu.yaml) |
+| EAGLE3 | Online disaggregated, external | [`qwen3-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml) |
+| EAGLE3 | Offline colocated | [`qwen3-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-eagle3.yaml) |
+| EAGLE3 | Offline disaggregated | [`qwen3-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/disaggregated/qwen3-8b-eagle3.yaml) |
+| P-EAGLE | Online disaggregated, external | [`qwen3-8b-peagle.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-peagle.yaml) |
+| DFlash | Online disaggregated, external | [`qwen3-8b-dflash.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-dflash.yaml) |
+| DFlash | Online disaggregated, managed-local | [`qwen3-8b-dflash-1server-dp7.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml) |
+| DFlash | Offline colocated | [`qwen3-8b-dflash.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-dflash.yaml) |
+| DFlash2 | Online disaggregated, managed-local | [`qwen3.6-27b-dflash2.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml) |
+| Domino | Online disaggregated, external | [`qwen3-8b-domino.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-8b-domino.yaml) |
+| Domino | Online disaggregated, managed-local | [`qwen3-8b-domino-2server-dp2.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml) |
+| Domino | Offline colocated | [`qwen3-8b-domino.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-domino.yaml) |
+| DSpark | Online disaggregated, external | [`qwen3-4b-dspark.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-dspark.yaml) |
+| DSpark | Offline colocated | [`qwen3-4b-dspark.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-4b-dspark.yaml) |
+| DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml) |
+| MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-npu.yaml) |
 
 ## Online and offline data
 
@@ -556,9 +525,9 @@ instead of materializing full-vocabulary fp32 logits:
 
 ```yaml
 training:
-  strategy: eagle3
-  compact_teacher: true
-  compact_teacher_chunk_size: 4096
+  loss:
+    execution:
+      teacher_chunk_size: 4096
 ```
 
 This lowers peak memory without changing the teacher distribution, at the cost
@@ -592,11 +561,15 @@ checked-in environment before installing SpecForge:
 ```bash
 python -m pip install -r requirements-rocm.txt
 python -m pip install -e . --no-deps
+python -m pip install --no-deps "liger-kernel>=0.8.3,<0.9"
 ```
 
 Use a model/backend combination supported by that PyTorch ROCm environment;
 HF + SDPA recipes are the portable baseline. PyTorch exposes ROCm devices
-through its `torch.cuda` API and distributed runs use NCCL.
+through its `torch.cuda` API and distributed runs use NCCL. DFlash drafts use
+Liger RMSNorm/SwiGLU by default on CUDA and ROCm, which is why Liger is
+installed without dependencies above; set `model.use_liger_kernel: false` to
+use the native Qwen3 modules.
 
 For Ascend, install the vendor-matched PyTorch and `torch_npu` packages first.
 The checked-in NPU recipes use an external NPU-compatible SGLang capture server
@@ -608,7 +581,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export HCCL_EXEC_TIMEOUT=7200
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
-specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml
+specforge train -c examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml
 ```
 
 The unified launcher supplies rank, world-size, and rendezvous variables. The
@@ -642,7 +615,7 @@ checkpoint contract. For an offline colocated run, override
 
 ```bash
 specforge train \
-  --config examples/configs/offline/colocated/qwen3-8b-eagle3-offline.yaml \
+  --config examples/configs/offline/colocated/qwen3-8b-eagle3.yaml \
   training.resume_from=./outputs/qwen3-8b-eagle3-offline/qwen3-8b-eagle3-offline-latest
 ```
 
@@ -675,60 +648,70 @@ Runtime checkpoints contain training state and are not serving model
 directories. Export the final checkpoint before loading it with SGLang or
 Transformers.
 
-For EAGLE3 SGLang serving:
+Canonical checkpoints carry their model configuration. Export them without a
+training YAML:
 
 ```bash
-specforge export --to sglang \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --output-dir ./exports/qwen3-8b-eagle3-sglang
+specforge export --converter sglang --checkpoint /path/to/checkpoint --output-dir ./serving
+specforge export --checkpoint /path/to/checkpoint --output-dir ./hf-model
 ```
 
-`--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
-For an EAGLE-family self-contained Hugging Face directory, provide the target model as
-the source of the frozen embedding when it is absent from the runtime
-checkpoint:
+Only canonical checkpoints containing `config.json` are supported. HF exports now contain canonical configuration and bundled code for
+Transformers, and cannot be served directly by SGLang. Except for native merge-back,
+both formats omit bound target embeddings and LM heads; HF callers must bind target weights before
+running the model. Restore vocabulary mappings before export; export does not
+replace checkpoint tensors.
 
-Serving weight names are a fail-silent boundary in SGLang: an unrecognized key
-may be skipped while the server still starts. The exporter therefore validates
-the required `fc.weight`, `norm.weight`, `lm_head.weight`, `t2d`, and `d2t`
-keys and rejects any remaining trainer prefix. `LlamaForCausalLMEagle3` uses an
-identity map for its `midlayer.*` and required keys; `embed_tokens.weight` is
-deliberately omitted because serving reuses the target model embedding. A new
-architecture (including a future MLA draft) must add an explicit, loader-version
-matched weight map and required-key contract before SGLang export is enabled.
-The export tests cover key structure and tensor round-trip; loading the result
-in a real speculative-decoding server and measuring acceptance remains a GPU
-serving validation step.
+SGLang conversion supports DFlash, DFlash2, Domino, DSpark, EAGLE3 and native
+dense Qwen3.5 MTP within the pinned serving format's representable structures.
+DSpine, DMTP and P-EAGLE require SGLang implementations before they can be
+exported. Mixed causality supports causal sliding layers with bidirectional full layers.
+See [draft export](/draft_export.md) for restrictions and validation.
+
+Export preserves tensor values and dtypes. HF uses `dtype="auto"` to load the
+saved precision when tensors share one floating-point dtype; SGLang casts to
+its serving dtype. Mixed-dtype HF artifacts retain the original tensors, but
+public loading requires an explicit dtype; SGLang export rejects mixed dtypes.
+
+MTP checkpoints trained before the #1014 fix (2026-11-09) used different RoPE
+and attention computations. Do not resume those runs; retrain from native MTP
+weights under the corrected model. A historical draft checkpoint is imported only
+after conversion with `scripts/convert_legacy_checkpoint.py`.
+
+For native MTP, use the ordinary YAML preset and explicit target mapping in
+[the preset guide](https://github.com/sgl-project/SpecForge/blob/main/specforge/config/draft/presets/README.md). A complete
+text-only offline recipe is available at
+`examples/configs/offline/colocated/qwen3.5-4b-native-mtp.yaml`.
 
 ```bash
-specforge export --to hf \
-  --checkpoint ./outputs/qwen3-8b-eagle3-disaggregated/qwen3-8b-eagle3-disaggregated-latest \
-  --draft-config configs/qwen3-8b-eagle3.json \
-  --embedding-source Qwen/Qwen3-8B \
-  --output-dir ./exports/qwen3-8b-eagle3-hf
+specforge export --export-mode native \
+  --checkpoint ./outputs/native-mtp/native-mtp-latest \
+  --target-model Qwen/Qwen3.5-4B \
+  --output-dir ./exports/Qwen3.5-4B-MTP
 ```
 
-Pass `--vocab-mapping /path/to/mapping.pt` when the checkpoint predates the
-mapping buffers or when you intentionally need to refresh them.
+Native export rewrites shards containing old MTP tensors and links unchanged
+shards; add `--copy-target` for a self-contained directory. A historical checkpoint
+must be converted to the canonical format first.
+Target computation mismatches
+fail instead of rewriting the target's settings to fit a draft.
 
-MTP is deployed by merging its trained native head back into the target model.
-The merge command accepts the same runtime checkpoint shapes as the generic
-exporter (`training_state.pt`, a step/latest directory, or the run output
-directory):
+The MTP trainer uses the composed model and canonical objective. Set
+`training.objective_options.objective_chunk_size` (default 4096; 0 disables
+chunking) to bound the token positions passed through the LM head and loss at
+once. Chunked training recomputes these intermediates during backward. The
+online NPU MTP recipe uses this path and the native preset.
 
-```bash
-python scripts/merge_mtp_to_base.py \
-  --base-model-path Qwen/Qwen3.5-4B \
-  --mtp-checkpoint-path ./outputs/qwen3.5-4b-mtp/qwen3.5-4b-mtp-latest \
-  --draft-config configs/qwen3.5-4b-mtp.json \
-  --output-path ./exports/Qwen3.5-4B-MTP
-```
+All training now uses canonical draft configuration. EAGLE3 supports cached
+FlashAttention and Ulysses/Ring sequence parallelism; trainer tensor parallelism
+remains unsupported. See [objective and backend options](/draft_training.md).
+The old model implementations and training wrappers have been removed.
 
-An already-exported HF MTP draft directory can also be passed as
-`--mtp-checkpoint-path`; in that case its own `config.json` is used and
-`--draft-config` may be omitted.
+Historical draft checkpoints and configuration formats are no longer accepted.
+Convert an old checkpoint's weights with `scripts/convert_legacy_checkpoint.py`
+(see [checkpoint boundary](/draft_training.md#checkpoint-and-configuration-boundary))
+and import them through `initialization.checkpoint`. Use canonical presets or
+inline canonical configurations for new training.
 
 ## Troubleshooting
 
