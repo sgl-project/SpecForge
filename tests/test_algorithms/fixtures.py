@@ -1,6 +1,5 @@
 """Resolved canonical capture contracts for runtime tests."""
 
-from dataclasses import replace
 from pathlib import Path
 
 from specforge.algorithms.registry import AlgorithmRegistry
@@ -40,15 +39,5 @@ def builtin_algorithm_registry(*, teacher_metrics=False, ttt_length=7):
                 ),
             )
         )
-        registration = resolve_run(cfg)[1]
-        from tests.test_runtime._fixtures import build_strategy
-
-        registration = replace(
-            registration,
-            providers=replace(
-                registration.providers,
-                step=replace(registration.providers.step, build=build_strategy),
-            ),
-        )
-        registrations.append(registration)
+        registrations.append(resolve_run(cfg)[1])
     return AlgorithmRegistry(registrations)

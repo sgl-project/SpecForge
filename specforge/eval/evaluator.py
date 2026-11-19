@@ -22,16 +22,26 @@ import torch
 from specforge.runtime.contracts import TrainBatch
 
 if TYPE_CHECKING:
-    from specforge.training.contracts import StepRunner
-    from specforge.training.strategies.base import StepContext
+    from specforge.training.contracts import StepContext, StepRunner
+
+
+def depth_ratios(ratios, prefix):
+    """Ratio pairs named ``<prefix>_<depth>``, in depth order."""
+    start = len(prefix) + 1
+    depths = sorted(
+        int(name[start:])
+        for name in ratios
+        if name.startswith(f"{prefix}_") and name[start:].isdigit()
+    )
+    return [ratios[f"{prefix}_{depth}"] for depth in depths]
 
 
 class Evaluator:
     """Aggregate a full eval pass into ``eval/*`` metrics.
 
-    ``eval/avg_acc``: for per-position (TTT) strategies, position-0 accuracy
-    from eval-set-wide correct/denom counts; for scalar strategies
-    (DFlash/Domino), the ``accuracy_denom``-weighted mean of batch accuracy.
+    ``eval/avg_acc``: for an objective that reports ``acc_<depth>`` pairs,
+    position-0 accuracy from eval-set-wide correct/denom counts; otherwise the
+    eval-set-wide ratio of its ``acc`` pair.
     """
 
     def run(
@@ -46,10 +56,9 @@ class Evaluator:
         ``runner.evaluation()`` pass, which is then pooled across ranks by
         ``runner.reduce_sum`` and ``runner.reduce_max``.
 
-        Additive loss and accuracy terms are used directly when the strategy
-        provides them. Scalar fallbacks use ``metrics['accuracy_denom']`` when
-        present, else the loss-token count. In a mixed pass, scalar batches feed
-        avg_loss only; their accuracy is not merged.
+        The loss is the ratio of the pass's summed numerators and denominators.
+        In a pass that mixes per-depth and single accuracy pairs, the batches
+        with a single pair feed avg_loss only.
         """
         # pp rows: [correct, denom, acceptance_rate*w, ploss*w] per TTT
         # position, float64 so counts stay exact past 2**24.
@@ -60,29 +69,24 @@ class Evaluator:
         # Entered on every rank, with or without batches of its own.
         with runner.evaluation(), torch.no_grad():
             for batch in batches if batches is not None else ():
-                out = runner.evaluate(batch, ctx)
-                m = out.metrics
-                # .mean() normalizes a shape-[1] loss to the 0-dim slot.
-                loss = (
-                    out.loss.detach().double().mean()
-                    if isinstance(out.loss, torch.Tensor)
-                    else torch.tensor(float(out.loss), dtype=torch.float64)
-                )
+                result = runner.evaluate(batch, ctx)
                 if sums is None:
-                    sums = torch.zeros(7, dtype=torch.float64, device=loss.device)
-                tokens = self._token_count(batch, m, device=sums.device)
-                if out.loss_terms is None:
-                    sums[0] += loss.to(sums.device) * tokens
-                    sums[1] += tokens
-                else:
-                    loss_numerator, loss_denominator = out.loss_terms
-                    sums[0] += self._sum64(loss_numerator, sums.device)
-                    sums[1] += self._sum64(loss_denominator, sums.device)
+                    sums = torch.zeros(
+                        7, dtype=torch.float64, device=result.numerator.device
+                    )
+                sums[0] += self._sum64(result.numerator, sums.device)
+                sums[1] += self._sum64(result.denominator, sums.device)
                 sums[4] += 1.0
 
-                if "acc_corrects" in m and "acc_denoms" in m:
-                    correct = self._stack(m["acc_corrects"])
-                    denom = self._stack(m["acc_denoms"])
+                counts = depth_ratios(result.ratios, "acc")
+                if counts:
+                    # Each depth's mean, weighted by the batch's loss tokens,
+                    # which the acceptance pairs carry.
+                    acceptance = depth_ratios(result.ratios, "acceptance_rate")
+                    losses = depth_ratios(result.ratios, "ploss")
+                    tokens = self._token_count(batch, acceptance, device=sums.device)
+                    correct = self._stack(n for n, _ in counts)
+                    denom = self._stack(d for _, d in counts)
                     if pp is None:
                         pp = torch.zeros(
                             4,
@@ -93,29 +97,18 @@ class Evaluator:
                     pp[0] += correct
                     pp[1] += denom
                     w = tokens.to(pp.device)
-                    if "acceptance_rates" in m:
-                        pp[2] += self._stack(m["acceptance_rates"]) * w
+                    if acceptance:
+                        pp[2] += self._stack(n / d for n, d in acceptance) * w
                         sums[5] += tokens
-                    if "plosses" in m:
-                        pp[3] += self._stack(m["plosses"]) * w
+                    if losses:
+                        pp[3] += (
+                            self._stack(n / d.where(d > 0, 1) for n, d in losses) * w
+                        )
                         sums[6] += tokens
-                elif "acc" in out.ratio_metrics:
-                    accuracy_numerator, accuracy_denominator = out.ratio_metrics["acc"]
+                elif "acc" in result.ratios:
+                    accuracy_numerator, accuracy_denominator = result.ratios["acc"]
                     sums[2] += self._sum64(accuracy_numerator, sums.device)
                     sums[3] += self._sum64(accuracy_denominator, sums.device)
-                elif "accuracy" in m:
-                    acc = m["accuracy"]
-                    acc = (
-                        acc.detach().double().mean().to(sums.device)
-                        if isinstance(acc, torch.Tensor)
-                        else torch.tensor(
-                            float(acc), dtype=torch.float64, device=sums.device
-                        )
-                    )
-                    denom = m.get("accuracy_denom")
-                    w = self._sum64(denom, sums.device) if denom is not None else tokens
-                    sums[2] += acc * w
-                    sums[3] += w
 
         # Fixed global schedule, identical on every rank: (1) SUM the scalar
         # sums, (2) MAX the per-position length — a global decision, so an
@@ -186,15 +179,14 @@ class Evaluator:
         return total
 
     @staticmethod
-    def _token_count(
-        batch: TrainBatch, metrics: Dict[str, Any], device
-    ) -> torch.Tensor:
+    def _token_count(batch: TrainBatch, acceptance, device) -> torch.Tensor:
         """This batch's token weight as a 0-dim float64 tensor (no host sync):
-        the strategy's loss denoms, else the loss mask, else 1."""
-        denoms = metrics.get("metric_loss_denoms")
-        if denoms:
+        the acceptance pairs' denominators, else the loss mask, else 1."""
+        if acceptance:
             return (
-                torch.stack([torch.as_tensor(d).detach().float() for d in denoms])
+                torch.stack(
+                    [torch.as_tensor(d).detach().float() for _, d in acceptance]
+                )
                 .sum()
                 .double()
                 .to(device)

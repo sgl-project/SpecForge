@@ -31,6 +31,7 @@ from specforge.algorithms.objectives.predictions import PredictionBatch, Predict
 from specforge.algorithms.objectives.projection import LinearProjection, Projection
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
+from tests.test_runtime._fixtures import fake_spec
 
 
 def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
@@ -134,7 +135,7 @@ def distributed_reduction(rank, rendezvous):
         from specforge.training.runner import DataParallelRunner
 
         runner = DataParallelRunner(
-            SimpleNamespace(), FSDPTrainingBackend(ParallelConfig())
+            SimpleNamespace(), FSDPTrainingBackend(ParallelConfig()), fake_spec()
         )
         request = SimpleNamespace(input_tensor=hidden)
         for mismatch in (False, True):

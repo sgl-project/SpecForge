@@ -72,8 +72,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 return "WRAPPED"
 
         class FakeRunner:
-            def __init__(self, strategy, backend):
-                cap["runner"] = (strategy, backend)
+            def __init__(self, program, backend, spec):
+                cap["runner"] = (program, backend, spec)
 
         class FakeController:
             def __init__(self, runner, **kw):
@@ -112,16 +112,6 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def ack_train_refs(self, tid, ids, *, global_step, optimizer_durable):
                 dfc_calls.append(("ack", tid, ids, global_step, optimizer_durable))
 
-        algorithm = SimpleNamespace(
-            name="eagle3",
-            providers=SimpleNamespace(
-                step=SimpleNamespace(
-                    build=lambda wrapped, *, target_head: SimpleNamespace(
-                        built_from=("STRAT", wrapped, target_head)
-                    )
-                )
-            ),
-        )
         model = SimpleNamespace(draft_model="DRAFT")
         dfc = FakeDataflowController()
 
@@ -134,13 +124,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
             TrainerController=FakeController,
         ):
             trainer = tr.Trainer(
-                algorithm_name=algorithm.name,
-                make_step_strategy=algorithm.providers.step.build,
+                algorithm_name="eagle3",
                 controller=dfc,
                 store=store,
                 ref_source=ref_source,
                 model=model,
-                target_head="HEAD",
+                program_spec="SPEC",
                 optimizer_factory="OPT",
                 run_id="run",
                 output_dir="/out",
@@ -216,11 +205,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
 
         # optimizer built over the inner draft AFTER FSDP wrap
         self.assertEqual(cap["prepare_model"], (model, "DRAFT"))
-        strategy, backend = cap["runner"]
-        self.assertEqual(strategy.built_from, ("STRAT", "WRAPPED", "HEAD"))
+        # the runner executes the wrapped model under the declarations it was given
+        program, backend, spec = cap["runner"]
+        self.assertEqual(program, "WRAPPED")
         self.assertIs(backend, trainer.backend)
+        self.assertEqual(spec, "SPEC")
 
-        # the run loop drives that runner and holds neither the strategy nor the backend
+        # the run loop drives that runner and holds neither the program nor the backend
         self.assertIs(cap["ctrl_runner"], trainer.runner)
         self.assertEqual(cap["ctrl_kw"]["strategy_name"], "eagle3")
         self.assertEqual(cap["ctrl_kw"]["accumulation_steps"], 3)

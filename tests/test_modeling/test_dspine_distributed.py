@@ -15,10 +15,11 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.contracts import StepContext
+from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
-from tests.test_runtime._fixtures import build_strategy, train_window
+from tests.test_runtime._fixtures import build_runner, train_window
 
 
 def fixed_anchors(valid, num_anchors, available=None):
@@ -53,8 +54,8 @@ def count_gradient_allreduce(state, bucket):
 class CountingRunner(DataParallelRunner):
     """Notes the gradient all-reduces issued by the end of each micro-batch."""
 
-    def __init__(self, strategy, backend, communication):
-        super().__init__(strategy, backend)
+    def __init__(self, program, backend, spec, communication):
+        super().__init__(program, backend, spec)
         self.communication = communication
         self.communication_counts = []
 
@@ -81,8 +82,7 @@ def distributed_step(rank, directory, accumulation_steps):
         communication = {"calls": 0}
         wrapped.register_comm_hook(communication, count_gradient_allreduce)
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
-        strategy = build_strategy(wrapped)
-        runner = CountingRunner(strategy, backend, communication)
+        runner = CountingRunner(wrapped, backend, program_spec(model), communication)
         train_window(
             runner,
             [
@@ -140,8 +140,7 @@ def fsdp_mixed_precision_step(rank, directory):
         backend = FSDPTrainingBackend(ParallelConfig())
         backend.prepare_model(wrapped, wrap=False)
         backend.set_optimizer(torch.optim.SGD(model.draft_model.parameters(), lr=0.0))
-        strategy = build_strategy(wrapped)
-        runner = DataParallelRunner(strategy, backend)
+        runner = build_runner(wrapped, backend)
         inputs = training_inputs()
         for name in ("hidden_states", "target_last_hidden_states"):
             inputs[name] = inputs[name].to(torch.bfloat16)

@@ -26,7 +26,7 @@ def supervision_weights(batch, spec):
 
 
 def prepare_supervised_rows(batch, config):
-    """Select projection rows before the strategy transfers the batch to CUDA."""
+    """Select projection rows before the runner transfers the batch to CUDA."""
     weights = supervision_weights(batch, config.spec_config)
     return {"mtp_supervised_rows": weights.flatten().nonzero().flatten()}
 

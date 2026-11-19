@@ -9,8 +9,8 @@
 """Domain ``Trainer``: the caller-facing training object.
 
 Composes (ref source + FeatureStore) -> FeatureDataLoader (the data path) and
-model + an injected step factory -> FSDPTrainingBackend -> DataParallelRunner ->
-TrainerController (the run loop) behind one object with a ``.fit()``.
+model -> FSDPTrainingBackend -> DataParallelRunner -> TrainerController (the
+run loop) behind one object with a ``.fit()``.
 Online / offline / disaggregated is invisible here: it is fully absorbed by the
 ref source + store the Trainer is handed — the loader IS the stream.
 """
@@ -33,7 +33,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import RankFailure
+from specforge.training.contracts import ProgramSpec, RankFailure
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -47,12 +47,11 @@ class Trainer:
         self,
         *,
         algorithm_name: str,
-        make_step_strategy: Callable,
         controller,  # runtime.control_plane.DataFlowController (metadata only)
         store: FeatureStore,
         ref_source: dict,  # {"refs": [...]} (offline) | {"queue": q} (online)
-        model,
-        target_head,
+        model,  # the program; its ``draft_model`` is what the optimizer trains
+        program_spec: ProgramSpec,  # what ``model`` declares
         optimizer_factory,
         run_id: str,
         output_dir: str,
@@ -169,16 +168,34 @@ class Trainer:
                 num_epochs=num_epochs,
                 max_steps=max_steps,
             )
+        # The step options are recorded for resume. They used to construct
+        # the step; each still has to describe the program that trains.
+        options = dict(strategy_kwargs or {})
+        unknown = sorted(set(options) - {"name", "objective", "required_features"})
+        if unknown:
+            raise ValueError(
+                f"step options {unknown} configure nothing: the step reads what "
+                "its program declares"
+            )
+        for option, value in options.items():
+            described = {
+                "name": lambda: algorithm_name,
+                "objective": lambda: program_spec.name,
+                "required_features": lambda: set(program_spec.inputs),
+            }[option]()
+            if (set(value) if option == "required_features" else value) != described:
+                raise ValueError(
+                    f"step option {option}={value!r} does not describe this run, "
+                    f"whose {option} is {described!r}"
+                )
         if isinstance(strategy_kwargs, StepRuntimeConfig):
             algorithm_checkpoint_extra = dict(strategy_kwargs.resume_contract)
             allowed_missing_checkpoint_keys = set(
                 strategy_kwargs.allowed_missing_checkpoint_keys
             )
-            resolved_strategy_kwargs = dict(strategy_kwargs)
         else:
             algorithm_checkpoint_extra = {}
             allowed_missing_checkpoint_keys = set()
-            resolved_strategy_kwargs = dict(strategy_kwargs or {})
 
         if allowed_missing_checkpoint_keys:
             draft_state_keys = set(model.draft_model.state_dict())
@@ -456,15 +473,10 @@ class Trainer:
         )
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
-        # AFTER wrapping; the strategy MUST run forward through the wrapped module so
+        # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
-        strategy = make_step_strategy(
-            wrapped,
-            target_head=target_head,
-            **resolved_strategy_kwargs,
-        )
-        runner = DataParallelRunner(strategy, backend)
+        runner = DataParallelRunner(wrapped, backend, program_spec)
         if resume is not None:
             # A rank whose own state does not restore tells the others, which
             # would otherwise wait for it in the first step's collectives.
@@ -535,7 +547,6 @@ class Trainer:
 
         # Runtime pieces remain inspectable behind the single Trainer lifecycle.
         self.algorithm_name = algorithm_name
-        self.make_step_strategy = make_step_strategy
         self.run_id = run_id
         self.output_dir = output_dir
         self.batch_size = batch_size

@@ -107,13 +107,10 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             strategy=algorithm.name,
         )
         reference_model.train()
-        reference_strategy = algorithm.providers.step.build(
-            reference_model, target_head=target_head
-        )
         with torch.no_grad():
             # The optimizer-window report pools both accumulation microbatches.
             losses = [
-                reference_strategy.forward_loss(batch).loss.detach()
+                fx.forward_program(reference_model, batch).loss.detach()
                 for batch in reference_loader
             ]
             expected_loss = torch.stack(losses).mean()

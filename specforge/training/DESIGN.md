@@ -29,11 +29,16 @@ loss denominator, the window's metrics, the replay statistics), normalizes the
 gradients and owns the RNG. One collective of a step is still issued elsewhere:
 an objective with the `global_microbatch` reduction (DSpark) reduces each
 term's denominator itself, inside the forward
-(`algorithms.objectives.base.microbatch_mean`). `DraftTrainStrategy` owns model-specific
-validation, forward/loss, target projection, and checkpoint filtering;
-`FSDPTrainingBackend` owns wrapping, backward, optimizer steps, distributed
-gradient norms, and full training state. What the frame and a runner exchange
-is declared in `contracts.py` (`StepRunner`, `PendingStep`, `StepMetrics`).
+(`algorithms.objectives.base.microbatch_mean`). The program the runner calls
+is the objective model itself (`algorithms.objectives.base.ObjectiveModel`): it
+owns the forward and the loss, the target projection, the host-side inputs it
+derives from a batch, and the mapping from a training state dict to the draft's
+own; `training/program.py` reads what it declares (`ProgramSpec`) from its
+registration. `FSDPTrainingBackend` owns wrapping, backward, optimizer steps,
+distributed gradient norms, and full training state. What the frame, a runner
+and a program exchange is declared in `contracts.py` (`StepRunner`,
+`PendingStep`, `StepMetrics`, `StepContext`, `ProgramSpec`,
+`TrainingProgram`).
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
@@ -51,7 +56,7 @@ flowchart TD
   FIT -->|append sample_ids| PA[pending_ack accumulator]
   FR -->|forward_backward per micro-batch| RN[DataParallelRunner]
   FR -->|apply_step at the boundary| RN
-  RN -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
+  RN -->|program call| ST[ObjectiveModel projection plus loss]
   RN -->|backward and optimizer step| BK[FSDPTrainingBackend]
   FR -->|StepMetrics| FIT
   FIT -->|global_step plus 1| BND[boundary actions]
@@ -151,6 +156,6 @@ not guarantees of throughput improvement.
 | `TrainerController` | `Evaluator.run` | compute |
 | `Evaluator` | `DataParallelRunner.evaluate` / `reduce_sum` / `reduce_max` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
-| `DataParallelRunner` | `CanonicalTrainStrategy.forward_loss` | compute |
+| `DataParallelRunner` | `ObjectiveModel.forward` | compute |
 | `DataParallelRunner` | `FSDPTrainingBackend.backward` | compute |
 | `DataParallelRunner` | `FSDPTrainingBackend.step` | compute |

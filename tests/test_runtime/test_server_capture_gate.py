@@ -456,15 +456,13 @@ class TestServerCaptureGate(unittest.TestCase):
             store.release(handle)
 
         # one real train step from the server-captured features
-        self._train_step(fetched, head)
+        self._train_step(fetched)
 
-    def _train_step(self, fetched, head):
+    def _train_step(self, fetched):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.contracts import TrainBatch
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.runner import DataParallelRunner
         from tests.test_runtime import _fixtures as fx
-        from tests.test_runtime._fixtures import build_strategy
 
         fx.build_single_rank_distributed(
             port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
@@ -481,7 +479,7 @@ class TestServerCaptureGate(unittest.TestCase):
                 dm, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
             )
         )
-        runner = DataParallelRunner(build_strategy(model, target_head=head), backend)
+        runner = fx.build_runner(model, backend)
         # batch_size=1 batches (ragged lengths), one step each
         for i, out in enumerate(fetched):
             batch = TrainBatch(
