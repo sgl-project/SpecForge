@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import dataclasses
+import os
 import unittest
 from unittest.mock import patch
 
@@ -12,8 +13,10 @@ from specforge.algorithms.objectives.registry import (
     protocol_registrations,
     resolve_objective,
 )
+from specforge.training.backends.plain import PlainRunner
 from specforge.training.contracts import StepContext
 from specforge.training.controller import TrainerController
+from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
 from tests.test_runtime.conformance import (
     DECLARATIONS,
@@ -24,8 +27,12 @@ from tests.test_runtime.conformance import (
     batch,
     declaration_cases,
     declared,
+    one_rank_cases,
+    one_rank_state,
+    plain_runner,
     protocol_violations,
     reference_runner,
+    trained_by_the_plain_runner,
 )
 from tests.test_runtime.test_canonical_end_to_end import drafts, recomputed_tolerance
 from tests.test_runtime.trajectories import cases, differences, record
@@ -37,6 +44,105 @@ class ReferenceProtocolTest(ProtocolChecks, unittest.TestCase):
 
 class ReferenceRunnerTest(RunnerChecks, unittest.TestCase):
     """The DDP / FSDP runner against itself: the jobs are deterministic."""
+
+
+class PlainProtocolTest(ProtocolChecks, unittest.TestCase):
+    """The run loop over the plain runner."""
+
+    make_runner = staticmethod(plain_runner)
+
+
+class PlainRunnerTest(RunnerChecks, unittest.TestCase):
+    """The plain runner against the reference runner, bit for bit."""
+
+    make_runner = staticmethod(plain_runner)
+
+    def test_job_of_several_ranks_is_refused(self):
+        program = KitProgram()
+        with self.assertRaisesRegex(ValueError, "this job has 2 ranks"):
+            PlainRunner(
+                program,
+                program.spec(),
+                optimizer_factory=lambda module: None,
+                world_size=2,
+            )
+
+    def test_trainable_module_declared_frozen_is_refused(self):
+        """As the reference refuses it: the optimizer would train it."""
+        program = KitProgram()
+        program.frozen = (program.linear,)
+        with self.assertRaisesRegex(ValueError, "only frozen parameters"):
+            plain_runner(program, program.spec())
+
+    def test_runner_issues_no_collective_inside_a_process_group(self):
+        """Not even in a group of several ranks that it was wrongly built in."""
+        program = KitProgram(reduction="microbatch")
+        runner = plain_runner(program, program.spec())
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("torch.distributed.all_reduce") as reduce,
+            patch("torch.distributed.all_gather_object") as gather,
+        ):
+            run_window(runner, [batch(0), batch(1)], StepContext(accumulation_steps=2))
+            runner.reduce_sum(torch.ones(1))
+            runner.reduce_max(torch.ones(1))
+            runner.agree(None, value="kernels")
+            for failure in ("disk full", ""):
+                # Any string is a failure, an empty one included.
+                with self.assertRaisesRegex(RuntimeError, f"rank 0: {failure}$"):
+                    runner.agree(failure)
+            saved = runner.checkpoint_state()
+        reduce.assert_not_called()
+        gather.assert_not_called()
+
+    def test_resume_needs_no_process_group(self):
+        program = KitProgram()
+        runner = plain_runner(program, program.spec())
+        run_window(runner, [batch(0)], StepContext())
+        saved = runner.checkpoint_state()
+        again = KitProgram()
+        no_group = RuntimeError("Default process group has not been initialized")
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            # Whatever an earlier test left initialized.
+            patch("torch.distributed.get_rank", side_effect=no_group),
+        ):
+            resumed = plain_runner(again, again.spec())
+            resumed.load_resume(copy.deepcopy(saved.rank))
+        self.assertEqual(
+            differences(
+                resumed.checkpoint_state().rank["optimizer"], saved.rank["optimizer"]
+            ),
+            [],
+        )
+
+
+class PlainTrajectoryTest(unittest.TestCase):
+    """One rank through ``specforge train`` on the host: the plain runner against DDP."""
+
+    def test_plain_runner_reproduces_the_reference_at_one_rank(self):
+        # On the host whatever the machine has: the gate is bitwise there.
+        with patch.dict(os.environ, {"SPECFORGE_DEVICE": "cpu"}):
+            placeable = {case.name for case in cases()}
+            selected = [case for case in one_rank_cases() if case.name in placeable]
+            self.assertEqual(len(selected), len(one_rank_cases()))
+            reference = record(selected)
+            plain = record(selected, around_training=trained_by_the_plain_runner)
+        # Metrics, learning rates, weights, optimizer and RNG state.
+        self.assertEqual(
+            differences(one_rank_state(plain), one_rank_state(reference)), []
+        )
+        # What does differ is where the optimizer state is written: once in the
+        # shared file under DDP, in the rank's file without a wrapper.
+        for name, updates in plain.items():
+            for update, expected in zip(updates, reference[name]):
+                self.assertNotIn("replicated_optimizer_state", update["shared"])
+                self.assertTrue(update["ranks"][0]["optimizer"])
+                self.assertTrue(expected["shared"]["replicated_optimizer_state"])
+                self.assertIsNone(expected["ranks"][0]["optimizer"])
+                self.assertEqual(update["replicas"], [])
 
 
 class _Unscaled(DataParallelRunner):

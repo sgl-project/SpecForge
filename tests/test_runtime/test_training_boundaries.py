@@ -56,6 +56,7 @@ RUNNER = (
     "specforge/training/runner.py",
     "specforge/training/backend.py",
     "specforge/optimizer.py",
+    "specforge/training/backends/**/*.py",
 )
 
 #: The contracts the parts are meant to share, whatever a rule forbids.
@@ -83,12 +84,14 @@ class Rule:
     scope: tuple[str, ...]
     forbidden: tuple[str, ...]
     excepted: dict[str, Excepted] = field(default_factory=dict)
+    #: Patterns of modules inside ``scope`` the rule does not cover.
+    outside: tuple[str, ...] = ()
 
     def modules(self) -> list[Path]:
         """The modules the rule covers."""
-        return sorted(
-            {path for pattern in self.scope for path in REPO_ROOT.glob(pattern)}
-        )
+        outside = {path for pattern in self.outside for path in REPO_ROOT.glob(pattern)}
+        inside = {path for pattern in self.scope for path in REPO_ROOT.glob(pattern)}
+        return sorted(inside - outside)
 
 
 _T = "torch.distributed"
@@ -238,6 +241,17 @@ RULES = (
             "specforge.modeling",
             "specforge.config.draft.registry",
         ),
+    ),
+    Rule(
+        "nothing imports a runner package; whoever assembles the trainer chooses one",
+        ("specforge/**/*.py",),
+        ("specforge.training.backends",),
+        outside=("specforge/training/backends/**/*.py",),
+    ),
+    Rule(
+        "the runner of one process names no process group",
+        ("specforge/training/backends/plain.py",),
+        DISTRIBUTED,
     ),
     Rule(
         "a program imports nothing that trains it",
@@ -560,7 +574,8 @@ class TrainingBoundaryTest(unittest.TestCase):
     def test_every_scope_matches_source(self):
         """A moved or renamed module would otherwise leave a rule checking nothing."""
         for rule in RULES:
-            self.assertTrue(rule.scope, rule.name)
+            # What is left once the rule's own exclusions are taken out.
+            self.assertTrue(rule.modules(), rule.name)
             for pattern in rule.scope:
                 with self.subTest(rule=rule.name, pattern=pattern):
                     self.assertTrue(list(REPO_ROOT.glob(pattern)))

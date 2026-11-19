@@ -47,7 +47,7 @@ state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
 ### Boundaries
 
 The parts meet through `contracts.py`. `tests/test_runtime/test_training_boundaries.py`
-reads five import rules from the source:
+reads seven import rules from the source:
 
 | Rule | Modules | May not reach |
 |---|---|---|
@@ -56,6 +56,8 @@ reads five import rules from the source:
 | The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling` |
 | A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
 | A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.nn.parallel` |
+| Nothing imports a runner package | every module outside `training/backends/` | `training.backends` |
+| The runner of one process names no process group | `backends/plain.py` | `torch.distributed`, `specforge.distributed` |
 
 The shared contracts are `training.contracts`, `runtime.contracts` and the
 value types of `config.draft`.
@@ -123,6 +125,19 @@ parallelism (it needs `flash_attn` and accelerators); the order of commits
 across ranks; a prepass in the protocol's ledger; evaluation with unequal
 denominators or an empty shard across ranks; frozen modules and partition
 blocks, which only a sharding runner acts on.
+
+`backends/plain.py` is the first such runner: `PlainRunner`, for a job of one
+rank. It shares the reference runner's window bookkeeping, normalization,
+replay RNG and optimizer, wraps nothing and issues no collective of its own;
+what a program's forward does (a model-parallel axis, a compiler that
+coordinates ranks) is the program's. It passes the kit.
+Recorded through `specforge train` at one rank on the host, against DDP in fp32
+on twelve cases, it equals the reference in every metric, learning rate, weight,
+optimizer and RNG value, and differs in where it writes its optimizer state:
+the rank's file, where DDP writes it once in the shared file. One-rank FSDP,
+the default sharding of the bundled recipes, is another reference (it casts
+buffers to fp32 while it runs) and was not compared. No configuration key
+selects the plain runner yet.
 
 ## Internal mechanics
 

@@ -531,8 +531,9 @@ class DataParallelRunner:
             if not math.isfinite(denominator_value) or denominator_value <= 0:
                 raise ValueError("global loss denominator must be finite and positive")
         # new_full fills on the device; new_tensor would be a synchronizing H2D.
+        world_size = self._world_size()
         scale = (
-            denominator.new_full((), self._world_size() * window.accumulation_steps)
+            denominator.new_full((), world_size * window.accumulation_steps)
             / denominator
         )
         self.backend.scale_gradients(scale)
@@ -550,7 +551,7 @@ class DataParallelRunner:
             # would otherwise pull every other one there.
             device=self._device(),
             process_group=self.backend.process_group,
-            reduce=True,
+            reduce=world_size > 1,
             sums=window.sum_totals,
         )
         if grad_norm is not None:
