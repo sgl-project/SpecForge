@@ -232,6 +232,22 @@ class TestObserver(unittest.TestCase):
         self.assertIn("last_hidden", both.error)
         self.assertIsNone(aux_only.error)
 
+    def test_a_request_fails_when_any_of_its_outputs_cannot_be_served(self):
+        spec = {**_spec("group", features=()), "outputs": []}
+        del spec["features"], spec["passthrough"]
+        req = _req("bad", 2, spec)
+        items, _ = capture.collect_capture_items([req], [2], [0])
+        self.assertIn("outputs must be a non-empty list", items[0].error)
+
+        spec["outputs"] = [_spec("a", features=("aux",)), _spec("b")]
+        device = _runtime().observer.after_forward(
+            SimpleNamespace(reqs=[_req("r", 2, spec)]),
+            _forward_batch([2]),
+            _logits_output(2, last=False),
+            can_run_graph=False,
+        )
+        self.assertIn("last_hidden", device.items[0].error)
+
     def test_partial_row_outputs_fail_every_capture_request(self):
         device = _runtime().observer.after_forward(
             SimpleNamespace(reqs=[_req("a", 2, _spec("a"))]),
@@ -591,6 +607,7 @@ class TestInstall(unittest.TestCase):
                     {
                         "existing": "value",
                         "spec_capture_backend": "plugin",
+                        "spec_capture_outputs": True,
                         "spec_capture_method": "dflash",
                         "spec_capture_aux_layer_ids": [1, 3],
                     },

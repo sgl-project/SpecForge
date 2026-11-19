@@ -111,6 +111,56 @@ def object_key(store_id: str, sample_id: str, gen: int, name: str) -> str:
     return f"{store_id}/{sample_id}/g{gen}/{name}"
 
 
+def spec_outputs(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The samples one request writes; a spec without ``outputs`` is its own."""
+    return spec["outputs"] if "outputs" in spec else [spec]
+
+
+def _object_keys(spec: Dict[str, Any]) -> List[str]:
+    """Every object key a request writes, over all of its outputs."""
+    keys = []
+    for output in spec_outputs(spec):
+        names = list((output.get("features") or {}).values())
+        names.extend(item["name"] for item in output.get("passthrough") or [])
+        keys.extend(
+            object_key(
+                str(spec["store_id"]),
+                str(output["sample_id"]),
+                int(spec.get("gen", 1)),
+                str(name),
+            )
+            for name in names
+        )
+    return list(dict.fromkeys(keys))
+
+
+def layer_columns(
+    captured: Optional[Sequence[int]], wanted: Sequence[int]
+) -> Optional[List[int]]:
+    """Where the ``wanted`` layers sit among the ``captured`` ones.
+
+    ``None`` means the capture already is the wanted layers. The model
+    concatenates the captured layers in ascending order, whatever the order of
+    the server flag, so a cut needs the reported ids to ascend too.
+    """
+    wanted = [int(layer) for layer in wanted]
+    captured = None if captured is None else [int(layer) for layer in captured]
+    if wanted == captured:
+        return None
+    if captured is None or captured != sorted(captured):
+        raise RuntimeError(
+            f"cannot cut layers {wanted} from a capture of layers {captured}; "
+            "launch the server with ascending "
+            "--return-aux-hidden-state-layer-ids"
+        )
+    missing = [layer for layer in wanted if layer not in captured]
+    if missing:
+        raise RuntimeError(
+            f"layers {missing} are not captured; the server captures {captured}"
+        )
+    return [captured.index(layer) for layer in wanted]
+
+
 class _CudaBytes:
     """Exposes a raw device allocation to ``torch.as_tensor`` without copying."""
 
@@ -425,19 +475,7 @@ class SpecCaptureSink:
         thread could run before the objects exist, and would race the NVLink
         arena. Only this request's generation and feature keys are removed.
         """
-        names = list((spec.get("features") or {}).values())
-        names.extend(item["name"] for item in spec.get("passthrough") or [])
-        keys = list(
-            dict.fromkeys(
-                object_key(
-                    str(spec["store_id"]),
-                    str(spec["sample_id"]),
-                    int(spec.get("gen", 1)),
-                    str(name),
-                )
-                for name in names
-            )
-        )
+        keys = _object_keys(spec)
         future = self._executor.submit(self._discard_keys, keys)
 
         def report_failure(done):
@@ -493,6 +531,22 @@ class SpecCaptureSink:
             ready_event.synchronize()
         return self.put_samples(samples)
 
+    def _cut_layers(self, aux: torch.Tensor, layer_ids: Sequence[int]) -> torch.Tensor:
+        """The blocks of ``aux`` holding ``layer_ids``, side by side in that order."""
+        columns = layer_columns(self.aux_layer_ids, layer_ids)
+        if columns is None:
+            return aux
+        width, rest = divmod(aux.shape[-1], len(self.aux_layer_ids))
+        if rest:
+            raise RuntimeError(
+                f"captured width {aux.shape[-1]} does not split into "
+                f"{len(self.aux_layer_ids)} equal layers"
+            )
+        return torch.cat(
+            [aux[..., column * width : (column + 1) * width] for column in columns],
+            dim=-1,
+        )
+
     def put_samples(self, samples: List[Sample]) -> List[Dict[str, Any]]:
         """Publish samples with one batched Mooncake call; return their results.
 
@@ -534,59 +588,79 @@ class SpecCaptureSink:
 
         for spec, aux, last_hidden in samples:
             store_id = str(spec["store_id"])
-            sample_id = str(spec["sample_id"])
             gen = int(spec.get("gen", 1))
             replace = bool(spec.get("replace", False))
-            features: Dict[str, str] = dict(spec.get("features") or {})
-            result_feats: Dict[str, Dict[str, Any]] = {}
-            common = dict(store_id=store_id, sample_id=sample_id, gen=gen)
+            written: List[Dict[str, Any]] = []
+            for output in spec_outputs(spec):
+                sample_id = str(output["sample_id"])
+                features: Dict[str, str] = dict(output.get("features") or {})
+                layer_ids = output.get("layer_ids")
+                result_feats: Dict[str, Dict[str, Any]] = {}
+                common = dict(store_id=store_id, sample_id=sample_id, gen=gen)
 
-            for artifact, tensor in (
-                (ARTIFACT_AUX, aux),
-                (ARTIFACT_LAST_HIDDEN, last_hidden),
-            ):
-                name = features.get(artifact)
-                if name is None:
-                    continue
-                if tensor is None:
-                    raise RuntimeError(
-                        f"spec_capture requested {artifact!r} but the server did "
-                        "not capture it; launch with "
-                        "--enable-return-aux-hidden-states"
+                for artifact, tensor in (
+                    (ARTIFACT_AUX, aux),
+                    (ARTIFACT_LAST_HIDDEN, last_hidden),
+                ):
+                    name = features.get(artifact)
+                    if name is None:
+                        continue
+                    if tensor is None:
+                        raise RuntimeError(
+                            f"spec_capture requested {artifact!r} but the server "
+                            "did not capture it; launch with "
+                            "--enable-return-aux-hidden-states"
+                        )
+                    if artifact == ARTIFACT_AUX and layer_ids is not None:
+                        tensor = self._cut_layers(tensor, layer_ids)
+                    stage(
+                        result_feats,
+                        replace=replace,
+                        name=name,
+                        tensor=tensor.unsqueeze(0),
+                        **common,
                     )
-                stage(
-                    result_feats,
-                    replace=replace,
-                    name=name,
-                    tensor=tensor.unsqueeze(0),
-                    **common,
-                )
-            for item in spec.get("passthrough") or []:
-                dtype = STR_DTYPE.get(str(item.get("dtype", "int64")))
-                if dtype is None:
-                    raise RuntimeError(
-                        f"spec_capture passthrough {item.get('name')!r}: "
-                        f"unsupported dtype {item.get('dtype')!r}"
+                for item in output.get("passthrough") or []:
+                    dtype = STR_DTYPE.get(str(item.get("dtype", "int64")))
+                    if dtype is None:
+                        raise RuntimeError(
+                            f"spec_capture passthrough {item.get('name')!r}: "
+                            f"unsupported dtype {item.get('dtype')!r}"
+                        )
+                    tensor = torch.tensor(item["data"], dtype=dtype).reshape(
+                        [int(d) for d in item["shape"]]
                     )
-                tensor = torch.tensor(item["data"], dtype=dtype).reshape(
-                    [int(d) for d in item["shape"]]
+                    stage(
+                        result_feats,
+                        replace=replace,
+                        name=str(item["name"]),
+                        tensor=tensor,
+                        **common,
+                    )
+                written.append(
+                    {
+                        "sample_id": sample_id,
+                        "store_id": store_id,
+                        "gen": gen,
+                        "aux_layer_ids": (
+                            self.aux_layer_ids
+                            if layer_ids is None
+                            else [int(layer) for layer in layer_ids]
+                        ),
+                        "features": result_feats,
+                    }
                 )
-                stage(
-                    result_feats,
-                    replace=replace,
-                    name=str(item["name"]),
-                    tensor=tensor,
-                    **common,
+            if "outputs" in spec:
+                results.append(
+                    {
+                        "sample_id": str(spec.get("sample_id")),
+                        "store_id": store_id,
+                        "gen": gen,
+                        "outputs": written,
+                    }
                 )
-            results.append(
-                {
-                    "sample_id": sample_id,
-                    "store_id": store_id,
-                    "gen": gen,
-                    "aux_layer_ids": self.aux_layer_ids,
-                    "features": result_feats,
-                }
-            )
+            else:
+                results.extend(written)
 
         for device in {t.device for t in tensors if t.is_cuda}:
             # Complete the contiguous copies this thread made.
@@ -695,7 +769,8 @@ class SpecCaptureSink:
         for meta, address in zip(feature_meta, addresses):
             meta["address"] = address
         for result in results:
-            result["arena"] = {"session": arena.session, "control": arena.control}
+            for output in spec_outputs(result):
+                output["arena"] = {"session": arena.session, "control": arena.control}
         if os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1":
             logger.info(
                 "[spec-capture-timing] nvlink_sink samples=%d objects=%d "

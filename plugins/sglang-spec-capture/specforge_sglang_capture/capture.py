@@ -15,6 +15,16 @@ A capture request carries its spec as a JSON string in
      "features": {"aux": <name>, "last_hidden": <name>},
      "passthrough": [{"name", "data", "shape", "dtype"}]}
 
+One forward can feed several samples, for example one per drafter that trains
+on the prompt. The spec then lists them in ``outputs`` in place of
+``features`` and ``passthrough``::
+
+    {"store_id", "sample_id", "gen", "replace",
+     "outputs": [{"sample_id", "features", "passthrough", "layer_ids"}]}
+
+``layer_ids`` cuts that output's ``aux`` down to those captured layers. The
+result mirrors the request: ``outputs`` holds one result per output.
+
 Per scheduler process, on the attention-TP writer rank:
 
 1. ``CaptureObserver`` (an SGLang ``ForwardObserver``) picks the prefill rows of
@@ -53,6 +63,7 @@ from specforge_sglang_capture.sink import (
     arena_bytes,
     gpu_put_enabled,
     nvlink_enabled,
+    spec_outputs,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +101,13 @@ def request_spec(req) -> Optional[Dict[str, Any]]:
             spec = json.loads(raw) if isinstance(raw, str) else raw
             if not isinstance(spec, dict):
                 raise ValueError(f"expected a JSON object, got {type(spec).__name__}")
+            outputs = spec.get("outputs")
+            if "outputs" in spec and not (
+                isinstance(outputs, list)
+                and outputs
+                and all(isinstance(output, dict) for output in outputs)
+            ):
+                raise ValueError("outputs must be a non-empty list of objects")
         except ValueError as exc:
             spec = {"_parse_error": f"invalid spec_capture: {exc}"}
     req._spec_capture_spec = spec
@@ -133,8 +151,12 @@ def collect_capture_items(
 
 
 def _missing_artifacts(spec: Dict[str, Any], available: Dict[str, bool]) -> List[str]:
-    features = spec.get("features") or {}
-    return [artifact for artifact in features if not available.get(artifact, False)]
+    wanted = dict.fromkeys(
+        artifact
+        for output in spec_outputs(spec)
+        for artifact in output.get("features") or {}
+    )
+    return [artifact for artifact in wanted if not available.get(artifact, False)]
 
 
 class CaptureObserver:

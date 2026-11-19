@@ -231,6 +231,81 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 )
         self.assertIsNone(self.sink._nvlink)
 
+    def _two_outputs(self):
+        """Two drafters on one prompt: layers 1 and 9, and layers 5 and 9."""
+        return {
+            "store_id": "test",
+            "sample_id": "run:t0",
+            "outputs": [
+                {
+                    "sample_id": "run-a:t0",
+                    "features": {"aux": "hidden_states"},
+                    "layer_ids": [1, 9],
+                    "passthrough": [
+                        {"name": "input_ids", "data": [5, 6, 7], "shape": [1, 3]}
+                    ],
+                },
+                {
+                    "sample_id": "run-b:t0",
+                    "features": {"aux": "hidden_states", "last_hidden": "target"},
+                    "layer_ids": [5, 9],
+                },
+            ],
+        }
+
+    def test_each_output_gets_its_own_layers_under_its_own_keys(self):
+        self.sink.aux_layer_ids = [1, 5, 9]
+        store = self.sink._store = _BufferStore()
+        aux = torch.arange(18, dtype=torch.float32).reshape(3, 6)  # width 2 a layer
+        last = -torch.ones(3, 2)
+        spec = self._two_outputs()
+        with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}, clear=True):
+            (result,) = self.sink.put_samples([(spec, aux, last)])
+
+        expected = {
+            "test/run-a:t0/g1/hidden_states": aux[:, [0, 1, 4, 5]],
+            "test/run-a:t0/g1/input_ids": torch.tensor([[5, 6, 7]]),
+            "test/run-b:t0/g1/hidden_states": aux[:, 2:],
+            "test/run-b:t0/g1/target": last,
+        }
+        self.assertEqual(
+            store.values,
+            {
+                key: value.contiguous().numpy().tobytes()
+                for key, value in expected.items()
+            },
+        )
+        self.assertEqual(result["sample_id"], "run:t0")
+        first, second = result["outputs"]
+        self.assertEqual(first["aux_layer_ids"], [1, 9])
+        self.assertEqual(second["aux_layer_ids"], [5, 9])
+        self.assertEqual(first["features"]["hidden_states"]["shape"], [1, 3, 4])
+        self.assertEqual(set(second["features"]), {"hidden_states", "target"})
+
+        # Cancelling the request reclaims every output's objects.
+        self.sink.discard_sample(spec).result(timeout=10)
+        self.assertEqual(store.values, {})
+
+    def test_an_output_that_cannot_be_cut_writes_nothing(self):
+        for captured, wanted, message in (
+            ([9, 1], [1], "ascending"),
+            (None, [1], "ascending"),
+            ([1, 9], [5], "not captured"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, message):
+                sink.layer_columns(captured, wanted)
+        self.assertIsNone(sink.layer_columns([9, 1], [9, 1]))
+        self.assertEqual(sink.layer_columns([1, 5, 9], [9, 1]), [2, 0])
+
+        self.sink.aux_layer_ids = [1, 5, 9]
+        store = self.sink._store = _BufferStore()
+        spec = self._two_outputs()
+        spec["outputs"][1]["layer_ids"] = [7]
+        with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, r"layers \[7\] are not captured"):
+                self.sink.put_samples([(spec, torch.ones(3, 6), torch.ones(3, 2))])
+        self.assertEqual(store.values, {})
+
     def test_nvlink_never_connects_to_the_store(self):
         env = {"MOONCAKE_PROTOCOL": "nvlink", ARENA_BYTES: "4096"}
         with (

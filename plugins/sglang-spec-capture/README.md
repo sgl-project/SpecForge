@@ -140,6 +140,17 @@ The response's `meta_info["spec_capture"]` holds `[result]`, where `result` is
 or `{sample_id, error}`. Objects are stored at
 `{store_id}/{sample_id}/g{gen}/{name}`.
 
+One prefill can write several samples, one per drafter of a multi-drafter run.
+The spec then lists them as `outputs: [{sample_id, features, passthrough,
+layer_ids}]` in place of `features` and `passthrough`, and the result holds one
+result per entry in `outputs`. `layer_ids` cuts that output's aux tensor down
+to those layers, so the server captures the sorted union of all drafters'
+layers. For example, on a server launched with
+`--return-aux-hidden-state-layer-ids 1 9 17`, an output with
+`layer_ids: [1, 17]` gets the first and third layer. A request's outputs are
+written together or not at all. The plugin advertises this as
+`spec_capture_outputs` in `/server_info`.
+
 ## Multi-node NVLink
 
 On GB200/GB300 NVL72 systems, `MOONCAKE_PROTOCOL=nvlink` moves captures from
