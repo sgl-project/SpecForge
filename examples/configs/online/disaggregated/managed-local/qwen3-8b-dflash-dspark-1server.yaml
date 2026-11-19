@@ -1,0 +1,72 @@
+# Two drafters from one capture stack: the target runs once per prompt, and
+# each drafter gets its own layers, trainer GPUs, checkpoints and log.
+model:
+  target_model_path: "Qwen/Qwen3-8B"
+  target_backend: "sglang"
+  trust_remote_code: true
+  torch_dtype: "bfloat16"
+data:
+  train_data_path: "./cache/dataset/perfectblend_qwen3-8b_regen.jsonl"
+  max_length: 3072
+  chat_template: "qwen"
+  build_dataset_num_proc: 32
+  cache_dir: "./cache"
+# Shared by both drafters; a drafter's own `training` keys go over these.
+training:
+  num_epochs: 10
+  batch_size: 2
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  objective_options:
+    num_anchors: 512
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+run_id: "qwen3-8b-drafters"
+output_dir: "./outputs/qwen3-8b-drafters"
+
+drafters:
+  - name: dflash
+    draft: "specforge/config/draft/presets/qwen3-8b-dflash.yaml"
+    training:
+      weighting:
+        kind: exponential
+        gamma: 7
+    trainer:
+      cuda_visible_devices: ["1", "2", "3"]
+  - name: dspark
+    draft: "specforge/config/draft/presets/qwen3-8b-dspark.yaml"
+    training:
+      weighting:
+        kind: exponential
+        gamma: 4.0
+      loss:
+        execution:
+          chunk_size: 128
+    trainer:
+      cuda_visible_devices: ["4", "5", "6", "7"]
+
+runtime:
+  # Per drafter. The store holds both drafters' unread samples, about 264 MiB
+  # per 3072-token prompt, so 96 prompts each stay under the 32 GiB segment.
+  in_flight_high_watermark: 96
+  in_flight_low_watermark: 48
+
+deployment:
+  mode: disaggregated
+  disaggregated:
+    control_dir: outputs/qwen3-8b-drafters/control
+    backend: mooncake
+    managed_local:
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 1073741824
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices:
+            - "0"
+          tp_size: 1
+          mem_fraction_static: 0.5

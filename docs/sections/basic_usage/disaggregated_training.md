@@ -285,6 +285,58 @@ publication, whose GPUDirect RDMA requirement no preflight checks: a missing
 register GPU memory, after `/health`. Set `gpu_put: false` on the entries to
 keep RDMA with host publication.
 
+## Several drafters, one capture stack
+
+One recipe can train several drafters at once. The target runs once per prompt,
+and the capture server writes one sample per drafter, each cut to that
+drafter's own layers:
+
+```text
+prompt -> target forward (once) -> one sample per drafter
+                                     |-> control_dir/dflash/refs.jsonl -> dflash trainer
+                                     '-> control_dir/dspark/refs.jsonl -> dspark trainer
+```
+
+List them under `drafters`. `model`, `data`, `runtime` and the capture servers
+stay shared, and `training` holds the defaults:
+
+```yaml
+run_id: qwen3
+output_dir: ./out
+training: {num_epochs: 10, learning_rate: 6.0e-4}
+drafters:
+  - name: dflash
+    draft: specforge/config/draft/presets/qwen3-8b-dflash.yaml
+    training: {learning_rate: 5.0e-4}   # goes over the default
+    trainer: {cuda_visible_devices: ["1", "2", "3"]}
+  - name: dspark
+    draft: specforge/config/draft/presets/qwen3-8b-dspark.yaml
+    trainer: {cuda_visible_devices: ["4", "5", "6", "7"]}
+```
+
+Each drafter is a plain single-draft run. Here `dflash` trains as
+`qwen3-dflash`, saves to `./out/dflash`, reads `control_dir/dflash/refs.jsonl`
+and logs to `control_dir/dflash/logs/trainer.log`. `specforge train -c run.yaml
+--plan` prints these names for every drafter, and the method and layers the
+capture servers run. A full recipe is
+[`qwen3-8b-dflash-dspark-1server.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3-8b-dflash-dspark-1server.yaml);
+the fields are in the
+[recipe reference](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/README.md).
+
+| Topic | What happens |
+| --- | --- |
+| Prompts | Every drafter trains on the same prompts in the same order. A prompt must pass each drafter's filter, so the strictest wins. `num_epochs` and `prompt_seed` are shared. |
+| Layers | The servers capture the sorted union of the drafters' layers: drafters on layers `1 9` and `1 5` need servers on `1 5 9`. Managed-local servers get these flags; launch external servers with the `capture` values from `--plan` and the current capture plugin. |
+| Capture method | When drafters name different methods, the servers run the first of `dspark`, `dflash`, `eagle3`. The same layer id gives the same tensor on Qwen3; other targets are unchecked. |
+| Pace | The watermarks count each drafter's unread samples on their own, and capture pauses on the fullest one. The slowest drafter sets the pace, so give the drafters GPUs for similar samples per second. |
+| Memory | The store holds every drafter's unread samples. With two drafters at the same watermark it needs about twice the room, so lower `runtime.in_flight_high_watermark` or raise the Mooncake segment. |
+| End of a drafter | A drafter that finishes first, for example on `max_steps`, drops out and the rest go on. Its unread samples, at most one high watermark, stay in the store until the run ends and still count toward the byte watermarks. A drafter that fails stops the run. |
+| Launch | On a `managed_local` stack, `specforge train -c run.yaml` starts everything, each trainer on its `trainer.cuda_visible_devices`. With external servers the trainers it starts all see the same GPUs, so start them one by one: `--role producer` once, then `--role consumer --drafter <name>` per drafter with its own `CUDA_VISIBLE_DEVICES`. |
+| One drafter alone | `specforge train -c run.yaml --drafter dflash` runs that drafter as its own single-draft run. |
+
+Not supported with `drafters` yet: resume, the NVLink transport,
+`inbox_server_url`, and prompts other than text.
+
 ## Split pools and multi-node consumers
 
 The same YAML launches either role explicitly:

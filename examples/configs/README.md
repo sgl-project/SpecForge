@@ -54,7 +54,10 @@ the capture server.
 
 Each entry is a plain single-draft run. With `drafters`, set `draft`,
 `initialization` and the trainer on each drafter, not at the top level; `model`,
-`data`, `runtime` and the capture servers are shared.
+`data`, `runtime` and the capture servers are shared. See
+[several drafters, one capture stack](../../docs/sections/basic_usage/disaggregated_training.md#several-drafters-one-capture-stack)
+and the example
+[`qwen3-8b-dflash-dspark-1server.yaml`](online/disaggregated/managed-local/qwen3-8b-dflash-dspark-1server.yaml).
 
 | Field | Default | What to write |
 | --- | --- | --- |

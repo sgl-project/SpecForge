@@ -7,6 +7,9 @@ kernels, the loss chunk (in flattened row x block units), chunk checkpointing,
 Liger, the Triton grouped convolution and the feature-loader workers. The
 canonical route has to resolve the same values. A deliberate change updates the
 fixture in the same commit and says why.
+
+A recipe with ``drafters`` has one record per drafter, ``<recipe>#<name>``,
+for the single-draft run that drafter flattens to.
 """
 
 import json
@@ -19,7 +22,7 @@ import torch
 import yaml
 
 from specforge.algorithms.objectives import resolve_objective
-from specforge.config import Config
+from specforge.config import Config, flatten_drafter
 from specforge.config.draft.codec import parse_draft
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.mlp.dense import DenseFFNSpec
@@ -96,19 +99,30 @@ def resolved_defaults(cfg, draft):
     }
 
 
+def recipe_runs(name):
+    """The single-draft configs of one recipe, keyed as in the fixture."""
+    cfg = Config.model_validate(yaml.safe_load((RECIPES / name).read_text()))
+    if not cfg.drafters:
+        return {name: cfg}
+    return {
+        f"{name}#{drafter.name}": flatten_drafter(cfg, drafter.name)
+        for drafter in cfg.drafters
+    }
+
+
 class RecipeExecutionDefaultsTest(unittest.TestCase):
     def test_every_recipe_is_recorded(self):
         recipes = sorted(
-            str(path.relative_to(RECIPES)) for path in RECIPES.rglob("*.yaml")
+            key
+            for path in RECIPES.rglob("*.yaml")
+            for key in recipe_runs(str(path.relative_to(RECIPES)))
         )
         self.assertEqual(recipes, sorted(EXPECTED))
 
     def test_canonical_route_resolves_the_recorded_defaults(self):
         for name, expected in EXPECTED.items():
             with self.subTest(recipe=name):
-                cfg = Config.model_validate(
-                    yaml.safe_load((RECIPES / name).read_text())
-                )
+                cfg = recipe_runs(name.partition("#")[0])[name]
                 payload = (
                     yaml.safe_load((ROOT / cfg.draft).read_text())
                     if isinstance(cfg.draft, str)

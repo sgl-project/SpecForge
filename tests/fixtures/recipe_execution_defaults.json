@@ -630,6 +630,24 @@
    "loss_checkpoint": true,
    "loss_chunk": 256
   },
+  "online/disaggregated/managed-local/qwen3-8b-dflash-dspark-1server.yaml#dflash": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3-8b-dflash-dspark-1server.yaml#dspark": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
   "online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml": {
    "attention_backend": "flex_attention",
    "dataloader_workers": 8,

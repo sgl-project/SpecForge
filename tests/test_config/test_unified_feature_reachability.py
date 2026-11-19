@@ -9,7 +9,7 @@ import yaml
 from pydantic import ValidationError
 
 from specforge.application import resolve_run
-from specforge.config import Config
+from specforge.config import Config, flatten_drafter
 from specforge.training.assembly import (
     _configured_logger,
     _dataloader_num_workers,
@@ -39,9 +39,16 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
         )
         self.assertTrue(paths)
 
+        configs = []
         for path in paths:
-            with self.subTest(config=path.name):
-                config = Config.from_file(str(path))
+            recipe = Config.from_file(str(path))
+            # A drafter is checked as the single-draft run it flattens to.
+            names = [drafter.name for drafter in recipe.drafters or ()]
+            configs += [
+                (f"{path.name}#{name}", flatten_drafter(recipe, name)) for name in names
+            ] or [(path.name, recipe)]
+        for label, config in configs:
+            with self.subTest(config=label):
                 # Native MTP presets use matching local metadata, without a Hub call.
                 target = dict(
                     model_type="qwen3_5",

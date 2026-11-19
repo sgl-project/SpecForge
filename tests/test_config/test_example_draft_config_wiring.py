@@ -35,14 +35,15 @@ class ExampleDraftConfigWiringTest(unittest.TestCase):
                 continue
             with self.subTest(recipe=str(path)):
                 config = load_config(str(path))
-                self.assertIsNotNone(config.draft)
-                source = config.draft
-                payload = (
-                    yaml.safe_load((ROOT / source).read_text())
-                    if isinstance(source, str)
-                    else source
-                )
-                parse_draft(payload, target_config=None)
+                drafts = [drafter.draft for drafter in config.drafters or ()]
+                for source in drafts or [config.draft]:
+                    self.assertIsNotNone(source)
+                    payload = (
+                        yaml.safe_load((ROOT / source).read_text())
+                        if isinstance(source, str)
+                        else source
+                    )
+                    parse_draft(payload, target_config=None)
                 self.assertNotIn("strategy", raw.get("training", {}))
                 self.assertNotIn("draft_model_config", raw["model"])
                 count += 1
