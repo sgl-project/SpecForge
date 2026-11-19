@@ -251,7 +251,7 @@ class DataParallelRunner:
                     key: value.pin_memory() if value.device.type == "cpu" else value
                     for key, value in prepared.items()
                 }
-            inputs = inputs | prepared
+            inputs = {**inputs, **prepared}
         tensors = {
             key: value.to(device, non_blocking=True) for key, value in inputs.items()
         }
@@ -348,8 +348,13 @@ class DataParallelRunner:
         if not self._evaluating:
             raise RuntimeError("evaluate belongs inside an evaluation() pass")
         ctx = replace(ctx, collect_detailed_metrics=self.spec.evaluation_diagnostics)
+        # A program with a statistic is told there is none pooled: it then
+        # uses the batch's own.
+        arguments = (
+            self._unwrapped.replay_arguments({}) if self.replay_statistics else {}
+        )
         with torch.no_grad():
-            return self._forward(batch, ctx)
+            return self._forward(batch, ctx, **arguments)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._check_training_call()
@@ -369,7 +374,12 @@ class DataParallelRunner:
             )
         state = _RngState(device, torch.get_rng_state(), accelerator)
         with torch.no_grad():
-            statistics = self._forward(batch, ctx, prepass=True).statistics
+            statistics = self._forward(
+                batch,
+                ctx,
+                prepass=True,
+                **self._unwrapped.replay_arguments({}, prepass=True),
+            ).statistics
         # Kept only for a prepass that ran: each one pairs with one replay.
         self._prepass_rng.append(state)
         return statistics

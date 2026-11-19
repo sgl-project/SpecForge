@@ -570,7 +570,7 @@ class CanonicalTrainingTest(unittest.TestCase):
 
             def _forward(self, batch, ctx, **replay):
                 result = super()._forward(batch, ctx, **replay)
-                if replay.get("alignment_ce") is not None:
+                if replay["alignment_ce"] is not None and not replay.get("prepass"):
                     self.replayed.append(result)
                 return result
 
@@ -678,7 +678,8 @@ class CanonicalTrainingTest(unittest.TestCase):
         prepass, replay = (
             call.kwargs["alignment_ce"] for call in runtime.objective.call_args_list
         )
-        self.assertEqual(prepass.item(), 0.0)
+        # Both pass through the wrapper, as every argument of the forward does.
+        self.assertEqual((prepass.item(), prepass.dtype), (0.0, torch.bfloat16))
         self.assertEqual(replay.dtype, torch.bfloat16)
         # 768 / 257 in fp32, then cast; the cast sums would give exactly 3.
         self.assertEqual(replay.item(), 2.984375)
