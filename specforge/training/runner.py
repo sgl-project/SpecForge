@@ -171,7 +171,7 @@ class DataParallelRunner:
     ``world size * window length / global denominator``.
 
     Under ``microbatch`` every term's denominator is pooled over the ranks
-    between a micro-batch's forward and its backward, in one reduction. The
+    between a micro-batch's forward and its backward, one reduction each. The
     loss that is differentiated is ``world size * sum_t c_t * numerator_t /
     pooled denominator_t``, which the wrapper's average over the ranks turns
     into the micro-batch's global mean; its denominator is one, so the
@@ -497,26 +497,23 @@ class DataParallelRunner:
             )
         if not pooled:
             return result.numerator, result.denominator
-        # Every rank holds the same terms in the same order. Denominators of
-        # one dtype share a reduction: a sum is rounded in the dtype it is
-        # taken in, so packing two dtypes together would change one of them.
-        device = self._device()
-        local = [denominator.to(device) for _, _, denominator in result.terms]
-        pooled_by_term = list(local)
-        for dtype in dict.fromkeys(denominator.dtype for denominator in local):
-            members = [i for i, d in enumerate(local) if d.dtype == dtype]
-            sums = self.reduce_sum(torch.stack([local[i] for i in members]))
-            for index, total in zip(members, sums):
-                pooled_by_term[index] = total
+        # Every rank holds the same terms in the same order. Each denominator
+        # is reduced on its own, in its own dtype and shape: a packed
+        # reduction rounds in one dtype and may sum the ranks of each element
+        # in another order. It is never differentiated.
+        pooled = [
+            self.reduce_sum(denominator.detach().clone())
+            for _, _, denominator in result.terms
+        ]
         world_size = self._world_size()
         loss = sum(
             coefficient
             * (world_size * numerator / denominator.where(denominator > 0, 1))
-            for (coefficient, numerator, _), denominator in zip(
-                result.terms, pooled_by_term
-            )
+            for (coefficient, numerator, _), denominator in zip(result.terms, pooled)
         )
-        return loss, pooled_by_term[0].new_ones(())
+        # The window counts its micro-batches with this one, in a dtype that
+        # holds the count whatever the terms' is.
+        return loss, torch.ones((), device=pooled[0].device)
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:

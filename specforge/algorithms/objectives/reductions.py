@@ -43,7 +43,6 @@ class PlanResult:
         """
         if with_terms and not normalize:
             raise ValueError("terms are returned with per-term normalization only")
-        one = self.terms[0].denominator.new_ones(())
         if normalize:
             # A denominator normalizes and is never differentiated, here or
             # where a runner pools it.
@@ -53,7 +52,7 @@ class PlanResult:
                     c * (term.numerator / d.where(d > 0, 1))
                     for c, term, d in zip(self.coefficients, self.terms, denominators)
                 ),
-                one,
+                denominators[0].new_ones(()),
                 self.ratios,
             )
             if with_terms:
@@ -70,7 +69,9 @@ class PlanResult:
                 self.terms[0].denominator,
                 self.ratios,
             )
-        return ObjectiveResult(self.loss, one, self.ratios)
+        return ObjectiveResult(
+            self.loss, self.terms[0].denominator.new_ones(()), self.ratios
+        )
 
 
 def combine_results(results):
