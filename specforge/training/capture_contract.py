@@ -3,10 +3,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
+from typing import Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+
+logger = logging.getLogger(__name__)
+
+#: Which method the servers run when drafters name different ones. SGLang's
+#: DSPARK capture falls back to the DFLASH hook on targets without their own.
+_METHOD_PRECEDENCE = ("dspark", "dflash", "eagle3")
 
 
 @dataclass(frozen=True)
@@ -16,6 +24,47 @@ class ServerCaptureContract:
     target_hidden_size: int
     target_vocab_size: int
     draft_vocab_size: int
+
+
+def combine_capture_contracts(
+    contracts: Sequence[ServerCaptureContract],
+) -> ServerCaptureContract:
+    """The method and layers the capture servers run to serve every drafter.
+
+    One drafter keeps its own contract. Several capture the sorted union of
+    their layers, from which the plugin cuts each drafter's own: drafters on
+    layers ``(1, 9)`` and ``(1, 5)`` give servers that capture ``(1, 5, 9)``.
+    The sizes of the result are the first drafter's.
+    """
+    first = contracts[0]
+    if len(contracts) == 1:
+        return first
+    for contract in contracts:
+        # The server concatenates layers in ascending order, so the plugin
+        # can only cut a drafter's layers in that order.
+        if list(contract.aux_layer_ids) != sorted(contract.aux_layer_ids):
+            raise ValueError(
+                "drafters sharing a capture stack need ascending target layer "
+                f"ids, got {list(contract.aux_layer_ids)}"
+            )
+    methods = {contract.method for contract in contracts}
+    unranked = sorted(methods - set(_METHOD_PRECEDENCE))
+    if len(methods) > 1 and unranked:
+        raise ValueError(f"cannot mix capture method {unranked} with {sorted(methods)}")
+    method = next(
+        (name for name in _METHOD_PRECEDENCE if name in methods), first.method
+    )
+    if len(methods) > 1:
+        logger.warning(
+            "drafters name capture methods %s; the servers run %s. The same "
+            "layer id gives the same tensor on Qwen3; other targets are unchecked",
+            sorted(methods),
+            method,
+        )
+    layers = sorted(
+        {layer for contract in contracts for layer in contract.aux_layer_ids}
+    )
+    return replace(first, method=method, aux_layer_ids=tuple(layers))
 
 
 def resolve_server_capture_contract(
@@ -62,4 +111,8 @@ def resolve_server_capture_contract(
     )
 
 
-__all__ = ["ServerCaptureContract", "resolve_server_capture_contract"]
+__all__ = [
+    "ServerCaptureContract",
+    "combine_capture_contracts",
+    "resolve_server_capture_contract",
+]

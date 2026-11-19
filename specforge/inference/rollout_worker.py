@@ -13,7 +13,8 @@ asks an external-server ``feature_source`` for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. A server-side capture source may instead return already-written
-``SampleRef``s via ``produce_refs``. It never hands a tensor to the controller.
+``SampleRef``s via ``produce_refs``: one per task, or a tuple with one per
+drafter that trains on the task. It never hands a tensor to the controller.
 Strategy-specific capture requirements live in ``CaptureConfig`` + the feature
 schema, not here.
 """
@@ -281,6 +282,14 @@ class RolloutWorker:
         for result in results:
             if isinstance(result, SampleRef):
                 refs.append(result)
+                continue
+            # Several drafters train on the prompt: one ref each, kept together.
+            if (
+                isinstance(result, tuple)
+                and result
+                and all(isinstance(ref, SampleRef) for ref in result)
+            ):
+                refs.extend(result)
                 continue
 
             task_id = getattr(result, "task_id", None)

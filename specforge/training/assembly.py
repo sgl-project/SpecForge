@@ -30,6 +30,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
@@ -258,8 +259,17 @@ def _tokenizer_chat_template_hash(tokenizer) -> Optional[str]:
 
 
 def _prompt_cache_key(
-    cfg: Config, *, tokenizer=None, path: Optional[str] = None
+    cfg: Config,
+    *,
+    tokenizer=None,
+    path: Optional[str] = None,
+    others: Sequence[Config] = (),
 ) -> str:
+    """Name the prepared prompts of *cfg*, or of it and the *others* together.
+
+    *others* are further drafters trained on the same prompts: their filters
+    apply too, so their drafts and objectives join the key.
+    """
     source_path = path or cfg.data.prompts_path or cfg.data.train_data_path
     content_hash = None
     if source_path and os.path.isfile(source_path):
@@ -283,7 +293,15 @@ def _prompt_cache_key(
         "strategy": cfg.training.objective,
         "input_modality": cfg.model.input_modality,
     }
+    if others:
+        identity["other_drafters"] = [
+            [other.draft, other.training.objective] for other in others
+        ]
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _passes_all(loss_mask, *, filters) -> bool:
+    return all(passes(loss_mask) for passes in filters)
 
 
 def _prepare_prompts(
@@ -294,11 +312,16 @@ def _prepare_prompts(
     draft_config,
     path: Optional[str] = None,
     cache_key: Optional[str] = None,
+    others: Sequence[tuple] = (),
 ) -> Sequence[dict]:
     """Prepare one prompt source with an optional path/cache namespace override.
 
     Training keeps the configured cache key. Evaluation supplies its own path
     and derived key so it can never read or overwrite the training prompt cache.
+
+    *others* lists ``(config, algorithm, draft_config)`` of further drafters
+    trained on the same prompts. Every drafter then sees the same samples: a
+    prompt must pass each one's filter, so the strictest wins.
     """
     if cfg.model.input_modality != "text":
         raise ValueError(
@@ -316,9 +339,31 @@ def _prepare_prompts(
         cache_key = (
             cfg.data.cache_key
             if path is None and cfg.data.cache_key is not None
-            else _prompt_cache_key(cfg, tokenizer=tokenizer, path=source_path)
+            else _prompt_cache_key(
+                cfg,
+                tokenizer=tokenizer,
+                path=source_path,
+                others=[other_cfg for other_cfg, _, _ in others],
+            )
         )
-    min_loss_tokens = algorithm.providers.model.minimum_loss_tokens(cfg, draft_config)
+    drafters = [(cfg, algorithm, draft_config), *others]
+    min_loss_tokens = max(
+        each.providers.model.minimum_loss_tokens(each_cfg, each_draft)
+        for each_cfg, each, each_draft in drafters
+    )
+    filters = [each.providers.model.loss_mask_filter for _, each, _ in drafters]
+    filters = [passes for passes in dict.fromkeys(filters) if passes is not None]
+    if len(filters) > 1:
+        loss_mask_filter = partial(_passes_all, filters=tuple(filters))
+    else:
+        loss_mask_filter = filters[0] if filters else None
+    if others:
+        print(
+            f"prompt filter shared by {len(drafters)} drafters: at least "
+            f"{min_loss_tokens} loss tokens"
+            + "".join(f", {passes.__name__}" for passes in filters),
+            flush=True,
+        )
     return prepare_prompt_tasks(
         source_path,
         tokenizer,
@@ -331,7 +376,7 @@ def _prepare_prompts(
         num_proc=cfg.data.build_dataset_num_proc,
         min_loss_tokens=min_loss_tokens,
         max_prompts=cfg.data.max_prompts,
-        loss_mask_filter=algorithm.providers.model.loss_mask_filter,
+        loss_mask_filter=loss_mask_filter,
     )
 
 
@@ -502,12 +547,17 @@ def build_training_run(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    drafters: Sequence[tuple] = (),
 ) -> TrainingRun:
     """Assemble one validated run from an already-resolved algorithm.
 
     Offline training may run in one process or with a disaggregated feature
     source.  Online training is always disaggregated and captures through
     external SGLang servers; colocated online execution is intentionally absent.
+
+    *drafters* holds each drafter's ``(config, algorithm)`` for the producer of
+    a multi-drafter run; *cfg* is then the shared config and *algorithm* the
+    first drafter's.
     """
 
     t = cfg.training
@@ -545,6 +595,7 @@ def build_training_run(
                 ),
                 optimizer_factory=_optimizer_factory,
                 logger=run_logger,
+                drafters=drafters,
             )
         except BaseException:
             _close_configured_logger(run_logger)

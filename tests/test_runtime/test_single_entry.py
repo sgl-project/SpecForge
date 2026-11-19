@@ -198,7 +198,8 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         preflight_model_bundle=preflight,
                     )
                 preflight.assert_not_called()
-                schema = adapter_cls.call_args.kwargs["schema"]
+                (output,) = adapter_cls.call_args.kwargs["outputs"]
+                schema = output.schema
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
 

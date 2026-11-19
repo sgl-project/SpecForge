@@ -95,25 +95,36 @@ def _claim_fresh_control_path(path: str, suffixes: Sequence[str]) -> None:
         os.fsync(stream.fileno())
 
 
-def _publish_role_assembly_failure(cfg: Config, exc: BaseException) -> None:
+def _publish_role_assembly_failure(
+    cfg: Config, exc: BaseException, drafters: Sequence[tuple] = ()
+) -> None:
     """Notify the peer when a role fails before its run closure is returned.
 
     Producer notification is allowed only after this process successfully
     claimed the attempt path.  That prevents a typo/retry using an occupied
-    path from poisoning another live producer's channel.
+    path from poisoning another live producer's channel. A producer for
+    several *drafters* notifies each drafter's channel.
     """
     env_name = "DISAGG_MANIFEST" if cfg.mode == "offline" else "DISAGG_REF_CHANNEL"
-    path = os.environ.get(env_name)
-    if not path:
-        return
-    if cfg.training.role == "producer":
-        claim = _read_control(path + _PRODUCER_CLAIM_SUFFIX)
-        if claim != f"pid={os.getpid()}":
-            return
-        failure_path = path + ".failed"
-    else:
-        failure_path = path + ".consumer_failed"
-    _publish_control_failure(failure_path, exc)
+    paths = _drafter_channel_paths(drafters) or [os.environ.get(env_name)]
+    for path in paths:
+        if not path:
+            continue
+        if cfg.training.role == "producer":
+            claim = _read_control(path + _PRODUCER_CLAIM_SUFFIX)
+            if claim != f"pid={os.getpid()}":
+                continue
+            failure_path = path + ".failed"
+        else:
+            failure_path = path + ".consumer_failed"
+        _publish_control_failure(failure_path, exc)
+
+
+def _drafter_channel_paths(drafters: Sequence[tuple]) -> list[str]:
+    """Each drafter's ref channel, from its own flattened config."""
+    from specforge.launch_plan import online_ref_channel
+
+    return [online_ref_channel(drafter_cfg) for drafter_cfg, _ in drafters]
 
 
 def _primary_rank() -> bool:
@@ -613,6 +624,7 @@ def _build_online(
     optimizer_factory: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
+    drafters: Sequence[tuple] = (),
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -622,10 +634,18 @@ def _build_online(
     )
 
     modality = cfg.model.input_modality
-    streaming = algorithm.providers.server_streaming_for(modality)
-    channel_path = _env("DISAGG_REF_CHANNEL")
-    if cfg.training.role == "producer":
-        _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    producer = cfg.training.role == "producer"
+    if drafters and not producer:
+        raise ValueError(
+            "only the producer serves several drafters; a trainer runs one "
+            "flattened drafter config"
+        )
+    # One (config, algorithm) per drafter: a single-draft run is a list of one.
+    runs = list(drafters) or [(cfg, algorithm)]
+    channel_paths = _drafter_channel_paths(drafters) or [_env("DISAGG_REF_CHANNEL")]
+    if producer:
+        for path in channel_paths:
+            _claim_fresh_control_path(path, _ONLINE_CONTROL_SUFFIXES)
     elif preflight_model_bundle is not None:
         # Check trainer dependencies before opening the store or waiting on
         # the producer, so a failed preflight owns no transport resources.
@@ -637,89 +657,142 @@ def _build_online(
     from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
-    channel = StreamingRefChannel(channel_path)
+    channels = [StreamingRefChannel(path) for path in channel_paths]
+    channel_path, channel = channel_paths[0], channels[0]
 
-    if cfg.training.role == "producer":
+    if producer:
         from specforge.algorithms.common.providers import resolve_server_capture_layout
         from specforge.inference.adapters.server_capture import (
+            CaptureOutput,
             ServerCaptureSchema,
             SGLangServerCaptureAdapter,
         )
-        from specforge.launch import build_disagg_online_producer
+        from specforge.launch import ProducerDrafter, build_disagg_online_producer
         from specforge.training.model_loading import resolve_draft_config
 
         # This check is independent of dataset size. Keep it before tokenizer
         # loading and prompt preparation so an invalid window fails cheaply.
-        in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
-        input_adapter = streaming.create_input_adapter(cfg)
+        for run_cfg, _ in runs:
+            in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(
+                run_cfg
+            )
+        streamings = [
+            run_algorithm.providers.server_streaming_for(modality)
+            for _, run_algorithm in runs
+        ]
+        input_adapters = [
+            streaming.create_input_adapter(run_cfg)
+            for streaming, (run_cfg, _) in zip(streamings, runs)
+        ]
+        input_adapter = input_adapters[0]
+        if len(runs) > 1 and any(item is not None for item in input_adapters):
+            # Other input kinds build their requests per algorithm.
+            raise ValueError("several drafters can only share text prompts")
+        first_cfg, first_algorithm = runs[0]
         input_tools = _load_input_tools(
-            cfg,
-            algorithm,
+            first_cfg,
+            first_algorithm,
             input_adapter=input_adapter,
         )
-        draft_config = resolve_draft_config(cfg)
+        draft_configs = [resolve_draft_config(run_cfg) for run_cfg, _ in runs]
         if input_adapter is None:
+            # Every drafter trains on the same prompts, so the others' filters
+            # apply to them as well.
+            others = [
+                (run_cfg, run_algorithm, draft_config)
+                for (run_cfg, run_algorithm), draft_config in zip(
+                    runs[1:], draft_configs[1:]
+                )
+            ]
             prompts = prepare_prompts(
-                cfg,
+                first_cfg,
                 input_tools,
-                draft_config=draft_config,
+                draft_config=draft_configs[0],
+                **({"others": others} if others else {}),
             )
         else:
             prompts = input_adapter.prepare_prompts(
-                cfg,
+                first_cfg,
                 input_tools,
-                draft_config=draft_config,
+                draft_config=draft_configs[0],
             )
         if not prompts:
-            raise ValueError(
-                f"no prompts satisfy {algorithm.name} training eligibility"
+            names = " and ".join(run_algorithm.name for _, run_algorithm in runs)
+            raise ValueError(f"no prompts satisfy {names} training eligibility")
+        producer_drafters, outputs = [], []
+        for (run_cfg, run_algorithm), streaming, path, run_channel in zip(
+            runs, streamings, channel_paths, channels
+        ):
+            if (
+                run_cfg.training.total_steps is None
+                and run_cfg.training.max_steps is None
+            ):
+                schedule = _online_schedule_payload(run_cfg, num_prompts=len(prompts))
+                _write_control(
+                    path + _ONLINE_SCHEDULE_SUFFIX,
+                    json.dumps(schedule, sort_keys=True),
+                )
+            layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
+                run_cfg, run_algorithm
             )
-        if cfg.training.total_steps is None and cfg.training.max_steps is None:
-            schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
-            _write_control(
-                channel_path + _ONLINE_SCHEDULE_SUFFIX,
-                json.dumps(schedule, sort_keys=True),
+            layout = resolve_server_capture_layout(
+                run_algorithm, run_cfg, modality=modality
             )
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
-            cfg, algorithm
-        )
-        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
-        capture_schema = ServerCaptureSchema(
-            aux_feature=layout.aux_feature,
-            last_hidden_feature=layout.last_hidden_feature,
-            passthrough=layout.passthrough,
-            attention_mask_feature=layout.attention_mask_feature,
-        )
+            producer_drafters.append(
+                ProducerDrafter(
+                    algorithm=run_algorithm,
+                    channel=run_channel,
+                    run_id=run_cfg.run_id,
+                    target_repr=streaming.target_representation,
+                    aux_hidden_state_layer_ids=layers,
+                    draft_vocab_size=draft_vocab,
+                )
+            )
+            outputs.append(
+                CaptureOutput(
+                    run_id=run_cfg.run_id,
+                    algorithm=run_algorithm.name,
+                    schema=ServerCaptureSchema(
+                        aux_feature=layout.aux_feature,
+                        last_hidden_feature=layout.last_hidden_feature,
+                        passthrough=layout.passthrough,
+                        attention_mask_feature=layout.attention_mask_feature,
+                    ),
+                    # One drafter ends the run when it stops; of several, the
+                    # ones still training keep getting captures.
+                    wanted=(
+                        (lambda: True)
+                        if len(runs) == 1
+                        else lambda run_channel=run_channel: (
+                            not run_channel.consumer_stopped()
+                        )
+                    ),
+                )
+            )
         adapters = [
             SGLangServerCaptureAdapter(
                 url,
                 store,
                 run_id=cfg.run_id,
-                algorithm=algorithm.name,
-                schema=capture_schema,
+                outputs=outputs,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
                 server_capture=_server_capture(cfg),
             )
             for url in _server_urls(cfg)
         ]
-        target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
         _workers, drive = build_disagg_online_producer(
-            algorithm=algorithm,
             modality=modality,
             prompts=prompts,
             feature_store=store,
-            channel=channel,
+            drafters=producer_drafters,
             feature_source=adapters if len(adapters) > 1 else adapters[0],
             num_rollout_workers=len(adapters),
             producer_concurrency=cfg.runtime.producer_concurrency,
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,
-            draft_vocab_size=draft_vocab,
-            target_repr=target_repr,
-            aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
             prompt_seed=_online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,
@@ -741,53 +814,65 @@ def _build_online(
             peer_wait_timeout_s=peer_wait_timeout_s,
         )
 
+        def consumers_stopped() -> bool:
+            """Every trainer has finished, or one of them has failed."""
+            return all(item.consumer_stopped() for item in channels) or any(
+                item.consumer_failure() is not None for item in channels
+            )
+
         def produce() -> int:
             produced = 0
             primary_exc = None
             try:
-                produced = drive(should_stop=channel.consumer_stopped)
+                produced = drive(should_stop=consumers_stopped)
                 deadline = (
                     time.monotonic() + peer_wait_timeout_s
                     if peer_wait_timeout_s is not None
                     else None
                 )
-                while not channel.consumer_stopped():
+                while not consumers_stopped():
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError(
                             "producer timed out waiting for the consumer result "
                             f"after {peer_wait_timeout_s:.0f}s"
                         )
                     time.sleep(0.25)
-                consumer_failure = channel.consumer_failure()
-                if consumer_failure is not None:
-                    raise RuntimeError(f"consumer failed: {consumer_failure}")
+                for (run_cfg, _), run_channel in zip(runs, channels):
+                    consumer_failure = run_channel.consumer_failure()
+                    if consumer_failure is not None:
+                        name = "consumer" if len(runs) == 1 else run_cfg.run_id
+                        raise RuntimeError(f"{name} failed: {consumer_failure}")
             except BaseException as exc:
                 primary_exc = exc
-                try:
-                    channel.fail(f"{type(exc).__name__}: {exc}")
-                except Exception as signal_exc:
-                    print(
-                        f"failed to publish producer failure: {signal_exc}",
-                        flush=True,
-                    )
+                for run_channel in channels:
+                    try:
+                        run_channel.fail(f"{type(exc).__name__}: {exc}")
+                    except Exception as signal_exc:
+                        print(
+                            f"failed to publish producer failure: {signal_exc}",
+                            flush=True,
+                        )
             cleanup_errors = []
-            try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"published-ref scan: {type(exc).__name__}: {exc}"
-                )
+            for path in channel_paths:
+                try:
+                    reader = StreamingRefChannel(path)
+                    while True:
+                        refs = reader.poll(max_n=1024)
+                        if not refs:
+                            break
+                        for ref in refs:
+                            try:
+                                store.abort(
+                                    ref.sample_id, reason="online-attempt-finished"
+                                )
+                            except Exception as exc:
+                                cleanup_errors.append(
+                                    f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                                )
+                except Exception as exc:
+                    cleanup_errors.append(
+                        f"published-ref scan: {type(exc).__name__}: {exc}"
+                    )
             try:
                 store.discard_external_attempts(
                     reason="online-attempt-unadopted-capture"
@@ -870,17 +955,24 @@ def build_disaggregated_run(
     optimizer_factory: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
+    drafters: Sequence[tuple] = (),
 ):
     """Assemble the configured producer or consumer role.
 
     ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
     producer, so dependencies ``build_model_bundle`` needs fail at startup.
+
+    ``drafters`` holds each drafter's ``(config, algorithm)`` for an online
+    producer that captures for several of them; ``cfg`` is then their shared
+    config. Each trainer runs its own flattened config without ``drafters``.
     """
     if cfg.training.role not in ("producer", "consumer"):
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
         )
     try:
+        if drafters and cfg.mode == "offline":
+            raise ValueError("several drafters require online training")
         if cfg.mode == "offline":
             return _build_offline(
                 cfg,
@@ -898,9 +990,10 @@ def build_disaggregated_run(
             optimizer_factory=optimizer_factory,
             logger=logger,
             preflight_model_bundle=preflight_model_bundle,
+            drafters=drafters,
         )
     except BaseException as exc:
-        _publish_role_assembly_failure(cfg, exc)
+        _publish_role_assembly_failure(cfg, exc, drafters)
         raise
 
 

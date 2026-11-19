@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
@@ -463,23 +465,121 @@ def _iter_epoch_online_prompt_batches(
         ]
 
 
+@dataclass(frozen=True)
+class ProducerDrafter:
+    """One drafter an online producer captures for.
+
+    Refs carrying ``run_id`` are published to ``channel``; the other fields
+    describe the capture this drafter's algorithm expects.
+    """
+
+    algorithm: AlgorithmRegistration
+    channel: Any
+    run_id: str
+    target_repr: Optional[str] = None
+    aux_hidden_state_layer_ids: Sequence[int] = ()
+    draft_vocab_size: Optional[int] = None
+    vocab_map_version: Optional[str] = None
+
+
+class _DrafterLane:
+    """A producer's flow-control and byte accounting for one drafter's channel."""
+
+    def __init__(self, drafter: ProducerDrafter, label: str) -> None:
+        self.channel = drafter.channel
+        self.run_id = drafter.run_id
+        #: How errors and logs name this drafter's trainer.
+        self.label = label
+        self.quantum: Optional[int] = None
+        self.produced = 0
+        self.published_bytes = 0
+        self.resident_bytes = 0
+        self.accounted_consumed = 0
+        self.published_sizes: deque = deque()
+        #: The trainer has stopped: no more refs are captured for it.
+        self.stopped = False
+
+    def reconcile_consumed(self) -> int:
+        """Bytes still resident after the trainer's latest acknowledgement."""
+        consumed, released_bytes = self.channel.consumed_state_remote()
+        if released_bytes is not None:
+            resident = self.published_bytes - released_bytes
+            if resident < 0:
+                raise RuntimeError("released bytes exceed published bytes")
+            self.resident_bytes = resident
+            self.accounted_consumed = consumed
+            self.published_sizes.clear()
+            return resident
+        # Integer-only channels acknowledge FIFO; source distributors publish
+        # exact bytes, including after a consumer restart.
+        delta = consumed - self.accounted_consumed
+        if delta < 0 or delta > len(self.published_sizes):
+            raise RuntimeError(
+                "producer byte accounting does not match the channel: "
+                f"consumed advanced by {delta} with "
+                f"{len(self.published_sizes)} published refs tracked"
+            )
+        for _ in range(delta):
+            self.resident_bytes -= self.published_sizes.popleft()
+        self.accounted_consumed = consumed
+        return self.resident_bytes
+
+
+def _drafter_capture_config(
+    drafter: ProducerDrafter,
+    *,
+    modality: str,
+    target_hidden_size: int,
+    target_vocab_size: Optional[int],
+):
+    """Check a drafter's target representation and build its capture contract."""
+    from specforge.inference.capture import CaptureConfig
+
+    algorithm = drafter.algorithm
+    streaming = algorithm.providers.server_streaming_for(modality)
+    contract = algorithm.spec.feature_contract("streaming", modality)
+    target_repr = drafter.target_repr
+    if target_repr is None:
+        target_repr = streaming.target_representation
+    allowed_target_representations = contract.allowed_target_representations
+    if allowed_target_representations and (
+        target_repr not in allowed_target_representations
+    ):
+        raise ValueError(
+            f"target representation {target_repr!r} is not supported by "
+            f"algorithm {algorithm.name!r} for modality {modality!r}; "
+            f"expected one of {sorted(allowed_target_representations)}"
+        )
+    if not allowed_target_representations and target_repr is not None:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
+            f"consume a target representation, got {target_repr!r}"
+        )
+    return CaptureConfig.from_strategy(
+        required_features=contract.required_tensors,
+        aux_hidden_state_layer_ids=tuple(drafter.aux_hidden_state_layer_ids or ()),
+        target_repr=target_repr,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=drafter.draft_vocab_size,
+        vocab_map_version=drafter.vocab_map_version,
+    )
+
+
 def _assemble_server_rollout_workers(
     *,
-    algorithm: AlgorithmRegistration,
-    modality: str,
+    captures: Sequence[Any],
+    strategy: str,
     controller: DataFlowController,
     store: FeatureStore,
     run_id: str,
-    target_hidden_size: int,
-    target_vocab_size: Optional[int],
-    draft_vocab_size: Optional[int],
-    target_repr: Optional[str],
-    aux_hidden_state_layer_ids,
-    vocab_map_version: Optional[str],
     num_rollout_workers: int,
     feature_source,
 ):
-    """Build workers over injected SGLang-server ref sources only."""
+    """Build workers over injected SGLang-server ref sources only.
+
+    ``captures`` holds one capture contract per drafter the sources serve.
+    """
 
     if feature_source is None:
         raise ValueError(
@@ -497,19 +597,9 @@ def _assemble_server_rollout_workers(
     else:
         sources = [feature_source] * num_rollout_workers
 
-    from specforge.inference.capture import CaptureConfig
     from specforge.inference.rollout_worker import RolloutWorker
 
-    contract = algorithm.spec.feature_contract("streaming", modality)
-    capture_config = CaptureConfig.from_strategy(
-        required_features=contract.required_tensors,
-        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
-        target_repr=target_repr,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        vocab_map_version=vocab_map_version,
-    )
+    capture_config = captures[0] if len(captures) == 1 else tuple(captures)
     return [
         RolloutWorker(
             controller,
@@ -518,7 +608,7 @@ def _assemble_server_rollout_workers(
             capture_config,
             run_id=run_id,
             worker_id=f"rollout-{index}",
-            strategy=algorithm.name,
+            strategy=strategy,
         )
         for index, source in enumerate(sources)
     ]
@@ -801,11 +891,11 @@ _ONLINE_PROMPT_REFILL_ROUNDS = 4
 
 def build_disagg_online_producer(
     *,
-    algorithm: AlgorithmRegistration,
+    algorithm: Optional[AlgorithmRegistration] = None,
     modality: str = "text",
     prompts,
     feature_store: FeatureStore,
-    channel,
+    channel=None,
     run_id: str,
     target_hidden_size: int,
     target_vocab_size: Optional[int] = None,
@@ -830,6 +920,7 @@ def build_disagg_online_producer(
     prompt_epochs: int = 1,
     prompt_seed: int = 0,
     prompt_ingest_batch_size: int = 4096,
+    drafters: Optional[Sequence[ProducerDrafter]] = None,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -878,6 +969,16 @@ def build_disagg_online_producer(
     watermark can overshoot by up to N * ``producer_concurrency`` * lease
     because each logical worker checks it independently before filling its
     request slots.
+
+    ``drafters`` trains several drafters from the one prompt stream and
+    replaces ``algorithm``, ``channel`` and the per-draft capture arguments.
+    Each captured prompt then yields one ref per drafter, published to that
+    drafter's channel in the same order. The ref watermarks apply to each
+    channel: production pauses on the fullest one while some drafter still
+    holds a full dispatch window. A drafter whose trainer has stopped gets no
+    more refs and leaves that rule; its unread samples stay in the store, and
+    in the byte watermarks, until the run ends. Any failure fails every
+    channel.
     """
     import concurrent.futures
     import os
@@ -898,24 +999,32 @@ def build_disagg_online_producer(
     def elapsed(start: float) -> str:
         return f"{time.perf_counter() - start:.3f}s"
 
-    streaming = algorithm.providers.server_streaming_for(modality)
-    contract = algorithm.spec.feature_contract("streaming", modality)
-    if target_repr is None:
-        target_repr = streaming.target_representation
-    allowed_target_representations = contract.allowed_target_representations
-    if allowed_target_representations and (
-        target_repr not in allowed_target_representations
-    ):
-        raise ValueError(
-            f"target representation {target_repr!r} is not supported by "
-            f"algorithm {algorithm.name!r} for modality {modality!r}; "
-            f"expected one of {sorted(allowed_target_representations)}"
+    if drafters is None:
+        drafters = [
+            ProducerDrafter(
+                algorithm=algorithm,
+                channel=channel,
+                run_id=run_id,
+                target_repr=target_repr,
+                aux_hidden_state_layer_ids=aux_hidden_state_layer_ids or (),
+                draft_vocab_size=draft_vocab_size,
+                vocab_map_version=vocab_map_version,
+            )
+        ]
+    drafters = list(drafters)
+    if not drafters:
+        raise ValueError("online producer requires at least one drafter")
+    single = len(drafters) == 1
+    strategy = "+".join(drafter.algorithm.name for drafter in drafters)
+    captures = [
+        _drafter_capture_config(
+            drafter,
+            modality=modality,
+            target_hidden_size=target_hidden_size,
+            target_vocab_size=target_vocab_size,
         )
-    if not allowed_target_representations and target_repr is not None:
-        raise ValueError(
-            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
-            f"consume a target representation, got {target_repr!r}"
-        )
+        for drafter in drafters
+    ]
     sleep = sleep or time.sleep
     producer_concurrency = int(producer_concurrency)
     if producer_concurrency < 1:
@@ -953,7 +1062,7 @@ def build_disagg_online_producer(
     base_prompt_count = len(prompts)
     producer_timing(
         "build_disagg_online_producer enter "
-        f"algorithm={algorithm.name} modality={modality} "
+        f"algorithm={strategy} modality={modality} "
         f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
         f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
@@ -974,18 +1083,12 @@ def build_disagg_online_producer(
     phase = time.perf_counter()
     producer_timing("assemble rollout workers start")
     workers = _assemble_server_rollout_workers(
-        algorithm=algorithm,
-        modality=modality,
+        captures=captures,
+        strategy=strategy,
         feature_source=feature_source,
         controller=controller,
         store=feature_store,
         run_id=run_id,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        target_repr=target_repr,
-        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
-        vocab_map_version=vocab_map_version,
         num_rollout_workers=num_rollout_workers,
     )
     if not workers:
@@ -998,7 +1101,7 @@ def build_disagg_online_producer(
     )
 
     def drive_producer(max_rounds: int = 1_000_000, should_stop=None) -> int:
-        """Drive all workers until the pool drains; returns refs published.
+        """Drive all workers until the pool drains; returns prompts captured.
 
         Every worker runs on its own thread (the blocking HTTP prefill call
         releases the GIL, so servers genuinely overlap) while this thread
@@ -1008,8 +1111,6 @@ def build_disagg_online_producer(
         calls per ``prompt_ingest_batch_size`` chunk of the plan, now pooled
         over the whole continuous run.
         """
-        from collections import deque
-
         drive_start = time.perf_counter()
         progress_interval = float(
             os.environ.get("DISAGG_PRODUCER_PROGRESS_INTERVAL", 30.0)
@@ -1022,18 +1123,36 @@ def build_disagg_online_producer(
             f"{flow_control.limits.resolved_low_watermark_refs} "
             f"progress_interval={progress_interval}"
         )
+        lanes = [
+            _DrafterLane(
+                drafter, "consumer" if single else f"consumer {drafter.run_id}"
+            )
+            for drafter in drafters
+        ]
+
+        def fail_channels(exc: BaseException, context: str) -> None:
+            for lane in lanes:
+                try:
+                    lane.channel.fail(f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    logger.exception(context)
+
         quantum_wait_start = time.monotonic()
         try:
             while True:
-                consumer_quantum = channel.consumer_quantum()
-                if consumer_quantum is not None:
+                for lane in lanes:
+                    if lane.quantum is None:
+                        lane.quantum = lane.channel.consumer_quantum()
+                    if lane.quantum is not None:
+                        continue
+                    consumer_failure = lane.channel.consumer_failure()
+                    if consumer_failure is not None:
+                        raise RuntimeError(
+                            f"{lane.label} failed before publishing its dispatch "
+                            f"requirement: {consumer_failure}"
+                        )
+                if all(lane.quantum is not None for lane in lanes):
                     break
-                consumer_failure = channel.consumer_failure()
-                if consumer_failure is not None:
-                    raise RuntimeError(
-                        "consumer failed before publishing its dispatch requirement: "
-                        f"{consumer_failure}"
-                    )
                 if (
                     peer_wait_timeout_s is not None
                     and time.monotonic() - quantum_wait_start > peer_wait_timeout_s
@@ -1043,46 +1162,62 @@ def build_disagg_online_producer(
                         f"window after {peer_wait_timeout_s:.0f}s"
                     )
                 sleep(backpressure_poll_s)
-            if in_flight_high_watermark < consumer_quantum:
-                raise ValueError(
-                    "producer in-flight high watermark "
-                    f"{in_flight_high_watermark} is smaller than the consumer's "
-                    f"dispatch quantum {consumer_quantum}; set "
-                    "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
-                )
             resolved_low_watermark = flow_control.limits.resolved_low_watermark_refs
-            if resolved_low_watermark < consumer_quantum:
-                # The consumer dispatches only complete groups of windows, so a
-                # paused producer must be resumable while the consumer still
-                # needs a full dispatch group: a low watermark below the
-                # quantum could leave both sides waiting on each other.
-                raise ValueError(
-                    "producer in-flight low watermark "
-                    f"{resolved_low_watermark} is smaller than the consumer's "
-                    f"dispatch quantum {consumer_quantum}; set "
-                    "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
-                )
+            for lane in lanes:
+                if in_flight_high_watermark < lane.quantum:
+                    raise ValueError(
+                        "producer in-flight high watermark "
+                        f"{in_flight_high_watermark} is smaller than the "
+                        f"{lane.label}'s dispatch quantum {lane.quantum}; set "
+                        "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
+                    )
+                if resolved_low_watermark < lane.quantum:
+                    # The consumer dispatches only complete groups of windows,
+                    # so a paused producer must be resumable while the consumer
+                    # still needs a full dispatch group: a low watermark below
+                    # the quantum could leave both sides waiting on each other.
+                    raise ValueError(
+                        "producer in-flight low watermark "
+                        f"{resolved_low_watermark} is smaller than the "
+                        f"{lane.label}'s dispatch quantum {lane.quantum}; set "
+                        "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
+                    )
             producer_timing(
-                f"consumer dispatch requirement ready quantum={consumer_quantum}"
+                "consumer dispatch requirement ready quantum="
+                + ",".join(str(lane.quantum) for lane in lanes)
             )
         except BaseException as exc:
-            try:
-                channel.fail(f"{type(exc).__name__}: {exc}")
-            except Exception:
-                logger.exception("failed to publish producer setup failure")
+            fail_channels(exc, "failed to publish producer setup failure")
             raise
         for w in workers:
             producer_timing(f"rollout worker start worker_id={w.worker_id}")
             w.start()
         publish_lock = threading.Lock()
-        state = {
-            "produced": 0,
-            "first_ref_logged": False,
-            "accounted_consumed": channel.consumed_remote(),
-            "resident_bytes": 0,
-            "published_bytes": 0,
-        }
-        published_sizes = deque()
+        state = {"first_ref_logged": False}
+        for lane in lanes:
+            lane.accounted_consumed = lane.channel.consumed_remote()
+
+        def produced_count() -> int:
+            """Prompts captured: the refs of the drafter that got the most."""
+            return max(lane.produced for lane in lanes)
+
+        def in_flight_text() -> str:
+            counts = [lane.channel.in_flight_remote() for lane in lanes]
+            if single:
+                return str(counts[0])
+            return ",".join(
+                f"{lane.run_id}:{count}" for lane, count in zip(lanes, counts)
+            )
+
+        def running_lanes() -> list:
+            """Drafters still training; one whose trainer stopped drops out."""
+            if not single:
+                for lane in lanes:
+                    if not lane.stopped and lane.channel.consumer_stopped():
+                        lane.stopped = True
+                        producer_timing(f"{lane.label} stopped; it gets no more refs")
+            return [lane for lane in lanes if not lane.stopped]
+
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
         # Set once the feeder will ingest nothing more (plan exhausted, stop,
@@ -1114,58 +1249,62 @@ def build_disagg_online_producer(
             # and come back — leaving then would strand it.
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
 
-        def reconcile_consumed_locked() -> int:
-            consumed, released_bytes = channel.consumed_state_remote()
-            if released_bytes is not None:
-                resident = state["published_bytes"] - released_bytes
-                if resident < 0:
-                    raise RuntimeError("released bytes exceed published bytes")
-                state["resident_bytes"] = resident
-                state["accounted_consumed"] = consumed
-                published_sizes.clear()
-                return resident
-            # Integer-only channels acknowledge FIFO; source distributors publish
-            # exact bytes, including after a consumer restart.
-            delta = consumed - state["accounted_consumed"]
-            if delta < 0 or delta > len(published_sizes):
-                raise RuntimeError(
-                    "producer byte accounting does not match the channel: "
-                    f"consumed advanced by {delta} with "
-                    f"{len(published_sizes)} published refs tracked"
-                )
-            for _ in range(delta):
-                state["resident_bytes"] -= published_sizes.popleft()
-            state["accounted_consumed"] = consumed
-            return state["resident_bytes"]
-
         def resident_bytes() -> int:
             # The distributor reports bytes for the actual released refs;
-            # consumption order may differ from publication order.
+            # consumption order may differ from publication order. A stopped
+            # drafter's unread samples stay in the store, so they still count.
             with publish_lock:
-                return reconcile_consumed_locked()
+                return sum(lane.reconcile_consumed() for lane in lanes)
+
+        def abort_refs(refs, reason: str) -> list:
+            """Free refs that will not be published; return the failures."""
+            errors = []
+            for ref in refs:
+                try:
+                    feature_store.abort(ref.sample_id, reason=reason)
+                except Exception as exc:
+                    errors.append(f"{ref.sample_id}: {type(exc).__name__}: {exc}")
+            return errors
 
         def publish_refs(w, refs, run_once_start: float) -> None:
             if not refs:
                 return
             with publish_lock:
-                current_bytes = reconcile_consumed_locked()
-                ref_sizes = [max(0, int(ref.estimated_bytes or 0)) for ref in refs]
-                projected_bytes = current_bytes + sum(ref_sizes)
+                # One batch per drafter, each in capture order. Another worker
+                # may mark a drafter stopped at any moment, so read that once.
+                late, batches = [], []
+                for lane in lanes:
+                    batch = [r for r in refs if single or r.run_id == lane.run_id]
+                    if lane.stopped:
+                        late.extend(batch)
+                    else:
+                        batches.append((lane, batch))
+                kept = [ref for _, batch in batches for ref in batch]
+                # A drafter that stopped while this capture ran never reads it.
+                cleanup_errors = abort_refs(late, "producer-drafter-stopped")
+                if len(kept) + len(late) != len(refs):
+                    cleanup_errors += abort_refs(refs, "producer-unknown-drafter")
+                    raise RuntimeError(
+                        "capture returned refs for run ids "
+                        f"{sorted({ref.run_id for ref in refs})}, expected "
+                        f"{[lane.run_id for lane in lanes]}; "
+                        f"cleanup errors={cleanup_errors}"
+                    )
+                if cleanup_errors:
+                    logger.error(
+                        "failed to free refs of a stopped drafter: %s", cleanup_errors
+                    )
+                current_bytes = sum(lane.reconcile_consumed() for lane in lanes)
+                sizes = [
+                    [max(0, int(ref.estimated_bytes or 0)) for ref in batch]
+                    for _, batch in batches
+                ]
+                projected_bytes = current_bytes + sum(map(sum, sizes))
                 if (
                     feature_store_max_resident_bytes is not None
                     and projected_bytes > feature_store_max_resident_bytes
                 ):
-                    cleanup_errors = []
-                    for ref in refs:
-                        try:
-                            feature_store.abort(
-                                ref.sample_id,
-                                reason="producer-resident-byte-hard-cap",
-                            )
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
+                    cleanup_errors = abort_refs(kept, "producer-resident-byte-hard-cap")
                     message = (
                         "producer feature-store hard cap exceeded: "
                         f"projected={projected_bytes} > "
@@ -1174,16 +1313,31 @@ def build_disagg_online_producer(
                     if cleanup_errors:
                         message += f"; cleanup errors={cleanup_errors}"
                     raise MemoryError(message)
-                _publish_refs_with_cleanup(
-                    channel=channel,
-                    feature_store=feature_store,
-                    refs=refs,
-                )
-                if channel.consumed_state_remote()[1] is None:
-                    published_sizes.extend(ref_sizes)
-                state["published_bytes"] += sum(ref_sizes)
-                state["resident_bytes"] = projected_bytes
-                state["produced"] += len(refs)
+                for index, ((lane, batch), batch_sizes) in enumerate(
+                    zip(batches, sizes)
+                ):
+                    try:
+                        _publish_refs_with_cleanup(
+                            channel=lane.channel,
+                            feature_store=feature_store,
+                            refs=batch,
+                        )
+                    except BaseException:
+                        # The other drafters' refs of this capture stay unpublished.
+                        unpublished = [r for _, b in batches[index + 1 :] for r in b]
+                        cleanup_errors = abort_refs(
+                            unpublished, "producer-ref-publication-failed"
+                        )
+                        if cleanup_errors:
+                            logger.error(
+                                "failed to free unpublished refs: %s", cleanup_errors
+                            )
+                        raise
+                    if lane.channel.consumed_state_remote()[1] is None:
+                        lane.published_sizes.extend(batch_sizes)
+                    lane.published_bytes += sum(batch_sizes)
+                    lane.resident_bytes += sum(batch_sizes)
+                    lane.produced += len(batch)
                 now = time.perf_counter()
                 should_log = not state["first_ref_logged"]
                 should_log = should_log or (
@@ -1195,8 +1349,8 @@ def build_disagg_online_producer(
                     producer_timing(
                         "published refs "
                         f"worker={w.worker_id} batch={len(refs)} "
-                        f"produced={state['produced']} "
-                        f"in_flight={channel.in_flight_remote()} "
+                        f"produced={produced_count()} "
+                        f"in_flight={in_flight_text()} "
                         f"pending={st['prompts_pending']} "
                         f"leased={st['prompts_leased']} "
                         f"request_elapsed={elapsed(run_once_start)} "
@@ -1243,7 +1397,10 @@ def build_disagg_online_producer(
                         if stopped:
                             accepting = False
 
-                        in_flight = channel.in_flight_remote()
+                        running = running_lanes()
+                        in_flight = [
+                            lane.channel.in_flight_remote() for lane in running
+                        ]
                         current_resident_bytes = resident_bytes()
                         # The consumer cannot acknowledge anything until a
                         # complete dispatch group is available. Byte
@@ -1251,11 +1408,17 @@ def build_disagg_online_producer(
                         # both roles; allow the required group to fill while
                         # the explicit hard byte cap remains enforced by
                         # publish_refs().
+                        # With several drafters the fullest channel feeds the
+                        # policy, and the pause holds while any of them has a
+                        # dispatch group to train on.
                         policy_paused = flow_control.should_pause(
-                            in_flight_refs=in_flight,
+                            in_flight_refs=max(in_flight, default=0),
                             resident_bytes=current_resident_bytes,
                         )
-                        paused = in_flight >= consumer_quantum and policy_paused
+                        paused = policy_paused and any(
+                            count >= lane.quantum
+                            for lane, count in zip(running, in_flight)
+                        )
                         if paused:
                             if backpressure_started is None:
                                 backpressure_started = time.monotonic()
@@ -1269,8 +1432,8 @@ def build_disagg_online_producer(
                                     "backpressure wait "
                                     f"worker={w.worker_id} "
                                     f"active_requests={len(futures)} "
-                                    f"produced={state['produced']} "
-                                    f"in_flight={in_flight} "
+                                    f"produced={produced_count()} "
+                                    f"in_flight={in_flight_text()} "
                                     f"resident_bytes={current_resident_bytes} "
                                     f"pending={st['prompts_pending']} "
                                     f"leased={st['prompts_leased']} "
@@ -1286,7 +1449,7 @@ def build_disagg_online_producer(
                                     "producer backpressure timed out after "
                                     f"{peer_wait_timeout_s:.0f}s waiting for "
                                     "consumer progress "
-                                    f"(in_flight={in_flight})"
+                                    f"(in_flight={in_flight_text()})"
                                 )
                         else:
                             backpressure_started = None
@@ -1315,7 +1478,7 @@ def build_disagg_online_producer(
                                 producer_timing(
                                     "pool drained "
                                     f"worker={w.worker_id} "
-                                    f"produced={state['produced']} "
+                                    f"produced={produced_count()} "
                                     f"elapsed={elapsed(drive_start)}"
                                 )
                                 return
@@ -1388,7 +1551,7 @@ def build_disagg_online_producer(
                 producer_timing(
                     "epoch ingested "
                     f"epoch={epoch + 1}/{prompt_epochs} "
-                    f"produced={state['produced']} "
+                    f"produced={produced_count()} "
                     f"prompts_failed={status['prompts_failed']} "
                     f"pending={status['prompts_pending']} "
                     f"leased={status['prompts_leased']} "
@@ -1477,6 +1640,16 @@ def build_disagg_online_producer(
                     t.join()
             if fatal:
                 raise fatal[0][1]
+            if not single:
+                # A failed trainer stops the run. Closing would end the other
+                # drafters' streams as if they were complete.
+                failed = [
+                    f"{lane.label} failed: {failure}"
+                    for lane in lanes
+                    if (failure := lane.channel.consumer_failure()) is not None
+                ]
+                if failed:
+                    raise RuntimeError("; ".join(failed))
             st = controller.status()
             stopped = feed["stopped"] or (should_stop is not None and should_stop())
             uningested = total_chunks - feed["ingested"]
@@ -1503,26 +1676,24 @@ def build_disagg_online_producer(
                 )
             producer_timing(
                 "drive_producer returning "
-                f"produced={state['produced']} prompts_failed={st['prompts_failed']} "
+                f"produced={produced_count()} prompts_failed={st['prompts_failed']} "
                 f"pending={st['prompts_pending']} leased={st['prompts_leased']} "
                 f"elapsed={elapsed(drive_start)}"
             )
-            produced = state["produced"]
+            produced = produced_count()
         except BaseException as exc:
             producer_timing(
-                f"drive_producer failing channel produced={state['produced']} "
+                f"drive_producer failing channel produced={produced_count()} "
                 f"elapsed={elapsed(drive_start)}"
             )
-            try:
-                channel.fail(f"{type(exc).__name__}: {exc}")
-            except Exception:
-                logger.exception("failed to publish producer failure sentinel")
+            fail_channels(exc, "failed to publish producer failure sentinel")
             raise
         producer_timing(
             f"drive_producer closing channel produced={produced} "
             f"elapsed={elapsed(drive_start)}"
         )
-        channel.close()  # successful EOF; a failure uses channel.fail()
+        for lane in lanes:
+            lane.channel.close()  # successful EOF; a failure uses channel.fail()
         return produced
 
     drive_producer.flow_control = flow_control
