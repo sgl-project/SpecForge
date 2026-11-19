@@ -52,34 +52,13 @@ Bundled code may import only torch, transformers and the standard library, so lo
 by Hub repo id needs nothing else; optional packages such as flash-attn are imported
 inside `try`, only when their backend is selected.
 
-A historical checkpoint needs `--target-model TARGET`, and also
-`--draft-config OLD.json` when it has no `config.json`. The target configuration
-resolves legacy target-derived semantics, and any copy of a target table that the
-checkpoint saved must equal the target's. Legacy training remains available during
-the migration for architectures that still have it (not MTP); its old checkpoints
-must use this import path. New HF exports always
-use canonical names and store each tensor in its own dtype; `config.json` declares
-a dtype only when all floating-point tensors share one.
-
-During migration, `--to hf` and `--to sglang` retain the original exporters and
-require `--draft-config`, except for MTP: its legacy model was removed, so MTP
-exports only through the canonical command. Use `--converter sglang` for DFlash-family serving exports.
-Legacy `--to` remains necessary when importing an external vocabulary mapping
-for an old EAGLE3 checkpoint. Only legacy
-`--to hf` accepts `--embedding-source` and copies that embedding. Canonical export
-rejects it and uses `--target-model` for import validation and configuration.
-`--format` is not needed. Use `--converter sglang` for canonical serving export.
-Legacy `--to` paths remain available during migration, including mixed-causality
-recipes that the pinned converter cannot express. For historical EAGLE3 checkpoints
-without vocabulary buffers, the existing legacy path accepts an explicit mapping:
-
-```bash
-specforge export --to sglang --checkpoint CHECKPOINT_PATH --draft-config OLD.json \
-  --vocab-mapping MAPPING --output-dir SERVING
-```
-
-Canonical export requires the mapping to be stored in the checkpoint. It preserves
-recorded `bos_token_id`, `eos_token_id`, and `pad_token_id` metadata.
+Export accepts canonical checkpoints containing `config.json`. Convert a
+historical checkpoint first with `scripts/convert_legacy_checkpoint.py`
+([usage](/draft_training.md#checkpoint-and-configuration-boundary)); export
+itself has no `--draft-config`. Token metadata
+(`bos_token_id`, `eos_token_id`, `pad_token_id`) is preserved.
+Use `--converter sglang` for serving conversion and `--target-model` for
+target metadata or native merge-back.
 
 Export does not replace vocabulary mappings or accept arbitrary weight renames.
 Restore those explicitly before exporting. Missing, unexpected or misshaped
@@ -101,11 +80,8 @@ specforge export --export-mode native --checkpoint CHECKPOINT_PATH --target-mode
   --output-dir MERGED_TARGET
 ```
 
-For compatibility, an old `--converter sglang` command with no export mode still
-performs native merge-back for Qwen3.5 MTP, with a migration warning. Replace
-`--converter sglang` with `--export-mode native`. This exception is fixed to the
-historical target/architecture pair; future registrations do not extend it.
-Legacy `--to` exporters (no longer available for MTP) do not accept `--export-mode`.
+Native merge-back requires explicit `--export-mode native`. The SGLang converter
+only writes standalone serving artifacts. The old merge CLI has been removed.
 
 The converter targets SGLang commit
 `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, also pinned in CI. Each artifact records

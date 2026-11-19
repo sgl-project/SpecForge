@@ -58,6 +58,8 @@ class StepContext:
 class DraftTrainStrategy(abc.ABC):
     name: str
     required_features: set
+    #: Whether an evaluation pass collects the detailed metrics as well.
+    evaluation_diagnostics: bool = False
 
     @abc.abstractmethod
     def trainable_module(self) -> nn.Module:

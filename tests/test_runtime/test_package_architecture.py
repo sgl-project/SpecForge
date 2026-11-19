@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import json
 import re
 import tokenize
 import tomllib
@@ -17,6 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # explicit makes an accidental reintroduction fail without importing torch or
 # optional inference backends.
 REMOVED_MODULE_FILES = (
+    "specforge/modeling/auto.py",
+    "specforge/modeling/draft/legacy.py",
+    "specforge/algorithms/builtin.py",
+    "specforge/algorithms/model_providers.py",
+    "specforge/checkpoint/formats/legacy.py",
     "specforge/modeling/target/base.py",
     "specforge/modeling/target/factory.py",
     "specforge/modeling/target/dflash_target_model.py",
@@ -203,7 +207,20 @@ LEGACY_ENTRY_GLOBS = (
     "examples/disagg/run_disagg_*.py",
 )
 
+# scripts/convert_legacy_checkpoint.py converts historical draft checkpoints; its
+# package is the one place outside specforge/ that keeps their decoders.
+LEGACY_CONVERTER_PACKAGE = REPO_ROOT / "scripts" / "legacy_checkpoint"
+
 LEGACY_API_NAMES = {
+    "AutoDraftModel",
+    "AutoDraftConfig",
+    "decode_legacy_config",
+    "OnlineDFlashModel",
+    "OnlineEagle3Model",
+    "OnlinePEagleModel",
+    "OnlineDSparkModel",
+    "OnlineDominoModel",
+    "OnlineDSpineModel",
     "AutoEagle3DraftModel",
     "AutoDistributedTargetModel",
     "CAPTURE_POLICIES",
@@ -255,23 +272,10 @@ DRAFT_MODEL_BUILDERS = CANONICAL_LAUNCH_EXPORTS - {
     "build_disagg_online_producer",
 }
 
-CANONICAL_DRAFT_CONFIGS = {
-    "glm-5.2-dspark.json",
-    "inkling-dspark.json",
-    "llama3-8B-eagle3.json",
-    "qwen3-4b-dspark.json",
-    "qwen3-8b-dspark.json",
-    "qwen3-8b-dflash.json",
-    "qwen3-8b-domino.json",
-    "qwen3-8b-eagle3.json",
-    "qwen3-8b-peagle.json",
-}
-
 CANONICAL_DATASET_PRESETS = ("ultrachat", "sharegpt")
 
 DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/__init__.py",
-    "specforge/core/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
     "specforge/modeling/target/__init__.py",
@@ -434,12 +438,25 @@ class TestPackageArchitecture(unittest.TestCase):
                         name = node.arg
                     elif isinstance(node, ast.keyword):
                         name = node.arg
-                    if name in LEGACY_API_NAMES:
+                    if name in LEGACY_API_NAMES and not (
+                        name == "decode_legacy_config"
+                        and LEGACY_CONVERTER_PACKAGE in path.parents
+                    ):
                         relative_path = path.relative_to(REPO_ROOT)
                         violations.append(f"{relative_path}:{node.lineno}: {name}")
         self.assertEqual(
             [], violations, "legacy API references:\n" + "\n".join(violations)
         )
+
+    def test_package_does_not_import_the_legacy_converter(self):
+        # HF export bundles code by following the package's imports.
+        violations = [
+            f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
+            for path in sorted((REPO_ROOT / "specforge").rglob("*.py"))
+            for line_number, module in _imported_modules(path)
+            if module.split(".")[0] in {"scripts", "legacy_checkpoint"}
+        ]
+        self.assertEqual([], violations, "converter imports:\n" + "\n".join(violations))
 
     def test_launch_exports_only_canonical_topology_builders(self):
         self.assertEqual(
@@ -702,51 +719,6 @@ class TestPackageArchitecture(unittest.TestCase):
         self.assertNotIn("return_logits=False", source)
         self.assertIn("OfflineCaptureClient", source)
         self.assertNotIn("ModelRunner", source)
-
-    def test_only_canonical_draft_configs_are_checked_in(self):
-        present = {path.name for path in (REPO_ROOT / "configs").glob("*.json")}
-        self.assertTrue(CANONICAL_DRAFT_CONFIGS.issubset(present))
-
-    def test_dspark_configs_are_qwen3_family(self):
-        dspark_configs = {}
-        for path in sorted((REPO_ROOT / "configs").glob("*.json")):
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if "DSparkDraftModel" in payload.get("architectures", []):
-                dspark_configs[path.name] = payload
-
-        self.assertEqual(
-            set(dspark_configs),
-            {
-                "deepseek-v4-flash-dspark.json",
-                "glm-5.2-dspark.json",
-                "inkling-dspark.json",
-                "kimi-k3-dspark.json",
-                "ling-3.0-tiny-dspark.json",
-                "minimax-m3-dspark.json",
-                "qwen3-4b-dspark.json",
-                "qwen3-8b-dspark.json",
-                "qwen3.6-27b-dspark.json",
-            },
-        )
-        for name, payload in dspark_configs.items():
-            with self.subTest(config=name):
-                self.assertEqual(payload["model_type"], "qwen3")
-                attention_mode = payload["dflash_config"]["attention_mode"]
-                # 'mla' carries its own head geometry and is validated by
-                # validate_dflash_mla_config, so a checked-in MLA DSpark config
-                # must extend this guard deliberately rather than slip through.
-                self.assertIn(attention_mode, {"gqa", "mha"})
-                num_heads = payload["num_attention_heads"]
-                num_kv_heads = payload["num_key_value_heads"]
-                self.assertEqual(num_heads % num_kv_heads, 0)
-                if attention_mode == "gqa":
-                    # DSparkDraftModel rejects gqa with num_key_value_heads >=
-                    # num_attention_heads and points at mha instead.
-                    self.assertLess(num_kv_heads, num_heads)
-                else:
-                    # validate_dflash_attention_config requires equal query and
-                    # KV head counts for mha.
-                    self.assertEqual(num_kv_heads, num_heads)
 
     def test_examples_and_scripts_do_not_bypass_the_cli(self):
         direct_imports = []

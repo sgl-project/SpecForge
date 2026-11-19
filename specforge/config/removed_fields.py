@@ -54,7 +54,7 @@ REMOVED_FIELDS = {
         "metadata_db_path": "deployment.disaggregated.consumer_state_dir (the directory that held consumer.sqlite)",
     },
     "initialization": {
-        "legacy_config": "nothing: only canonical checkpoints, which carry their config.json, can be imported",
+        "legacy_config": "scripts/convert_legacy_checkpoint.py --draft-config, which writes a canonical checkpoint; only those can be imported",
     },
 }
 

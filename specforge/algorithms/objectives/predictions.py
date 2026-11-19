@@ -104,7 +104,6 @@ class Predictions:
     draft_to_target: Tensor | None = None
     denominator: Tensor | None = None
     accuracy_name: str = "acc"
-    report_accuracy: bool = True
     chunk_safe: bool = True
     reduce_statistics: Callable | None = None
 
@@ -209,3 +208,8 @@ class PredictionBatch:
     diagnostics: Callable | None = (
         None  # Detached (ratio pairs, additive counts), run once after loss.
     )
+    #: Under "sum_means": callable(per-set PlanResults) returning detached ratio
+    #: pairs that name what each set's loss already computed.
+    set_metrics: Callable | None = None
+    # Optional protocol reduction after all chunks of a microbatch are combined.
+    finalize: Callable | None = None

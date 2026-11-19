@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.algorithms.metrics.blocks import (
     _expected_accepted_length_num,
     _scatter_accepted_prefix,
@@ -17,6 +16,7 @@ from specforge.algorithms.metrics.dflash_terms import (
     _DFlashTeacherTerms,
     _DFlashUnaryDiagnostics,
 )
+from specforge.algorithms.metrics.prefix import hard_label_prefix_counts
 
 
 def dflash_unary_diagnostics(

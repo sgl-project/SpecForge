@@ -1,27 +1,30 @@
 """Explicit Llama3 RoPE round-trips and preserves old/new field spellings."""
 
-import copy
 import dataclasses
 import json
 import unittest
 
 from specforge.config.draft.codec import decode_config, encode_config
 from specforge.config.draft.codec.components import decode_component, encode_component
-from specforge.config.draft.codec.legacy.rules import resolve_rope
 from specforge.config.draft.rope import Llama3RoPESpec
 from tests.test_config.draft_fixtures import draft_config
-from tests.test_config.test_draft_legacy_dflash import CONFIGS
 
 
-def llama3_payload():
-    return json.loads((CONFIGS / "llama3-70B-ealge3.json").read_text())
+def llama3_rope():
+    return Llama3RoPESpec(
+        interleaved=False,
+        rope_theta=500000,
+        partial_rotary_factor=1.0,
+        factor=8,
+        low_freq_factor=1,
+        high_freq_factor=4,
+        original_max_position_embeddings=8192,
+    )
 
 
 class Llama3RoPEConfigTest(unittest.TestCase):
     def test_bundled_recipe_rotary_settings_round_trip(self):
-        payload = llama3_payload()
-        before = copy.deepcopy(payload)
-        rope = resolve_rope(payload)
+        rope = llama3_rope()
         self.assertIsInstance(rope, Llama3RoPESpec)
         self.assertEqual(rope.factor, 8)
         self.assertEqual(rope.rope_theta, 500000)
@@ -30,27 +33,11 @@ class Llama3RoPEConfigTest(unittest.TestCase):
         restored = decode_config(json.loads(json.dumps(encode_config(node))))
         self.assertEqual(restored, node)
         self.assertEqual(hash(restored), hash(node))
-        self.assertEqual(payload, before)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             rope.factor = 2
 
-    def test_old_and_new_spellings_match_and_conflicts_fail(self):
-        payload = llama3_payload()
-        expected = resolve_rope(payload)
-        old_scaling = payload["rope_scaling"]
-        old_scaling["type"] = old_scaling.pop("rope_type")
-        self.assertEqual(resolve_rope(payload), expected)
-        payload["rope_parameters"] = encode_component("rope", expected)
-        payload["rope_parameters"].pop("interleaved")  # Canonical-only field.
-        self.assertEqual(resolve_rope(payload), expected)
-        payload["rope_parameters"]["factor"] = 16
-        with self.assertRaisesRegex(ValueError, "conflicting"):
-            resolve_rope(payload)
-
     def test_per_attention_override_and_partial_rotation(self):
-        rope = dataclasses.replace(
-            resolve_rope(llama3_payload()), partial_rotary_factor=0.5
-        )
+        rope = dataclasses.replace(llama3_rope(), partial_rotary_factor=0.5)
         base = draft_config()
         attention = dataclasses.replace(
             base.attention_configs["full"], rope_parameters=rope
@@ -63,7 +50,7 @@ class Llama3RoPEConfigTest(unittest.TestCase):
         self.assertEqual(node.rope_parameters, base.rope_parameters)
 
     def test_required_fields_and_frequency_boundaries(self):
-        payload = encode_component("rope", resolve_rope(llama3_payload()))
+        payload = encode_component("rope", llama3_rope())
         for name in payload:
             with self.assertRaisesRegex(ValueError, name):
                 decode_component(
@@ -86,13 +73,6 @@ class Llama3RoPEConfigTest(unittest.TestCase):
         self.assertEqual(step.high_freq_factor, step.low_freq_factor)
         with self.assertRaisesRegex(ValueError, "attention_factor"):
             decode_component("rope", payload | {"attention_factor": 1})
-
-    def test_legacy_requires_original_context_length(self):
-        payload = llama3_payload()
-        del payload["rope_scaling"]["original_max_position_embeddings"]
-        self.assertIn("max_position_embeddings", payload)
-        with self.assertRaisesRegex(ValueError, "original_max_position_embeddings"):
-            resolve_rope(payload)
 
 
 if __name__ == "__main__":

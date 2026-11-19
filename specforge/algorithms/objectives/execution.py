@@ -56,7 +56,7 @@ def selected_losses(predictions, loss):
     )
 
 
-def prepare_supervision(predictions, loss, weighting, execution):
+def prepare_supervision(predictions, loss, weighting, execution, *, teacher_mass=False):
     """Resolve targets and teacher data without projecting draft logits.
 
     Args:
@@ -64,6 +64,8 @@ def prepare_supervision(predictions, loss, weighting, execution):
         loss: Runtime loss selection, overridden by explicit per-term losses.
         weighting: Runtime position-weighting rule.
         execution: Execution options, including optional tiled teacher projection.
+        teacher_mass: Also return the teacher mass the draft vocabulary keeps
+            when no loss reads it, as a diagnostic does.
 
     Returns:
         Projected supervision with an empty draft output cache. Teacher logits
@@ -93,10 +95,14 @@ def prepare_supervision(predictions, loss, weighting, execution):
             teacher_ids = teacher.argmax(-1)
             if predictions.vocab_mask is not None:
                 # A callback may request a formula that reads the mass.
-                if predictions.compute is not None or any(
-                    "teacher_mass"
-                    in selected.context_statistics(fixed_denominator=True)
-                    for selected in losses
+                if (
+                    teacher_mass
+                    or predictions.compute is not None
+                    or any(
+                        "teacher_mass"
+                        in selected.context_statistics(fixed_denominator=True)
+                        for selected in losses
+                    )
                 ):
                     mass = (
                         teacher.float().softmax(-1)[..., predictions.vocab_mask].sum(-1)
@@ -234,15 +240,16 @@ def evaluate_predictions(
         ((prediction == target) * metric_weights).sum().detach(),
         metric_weights.sum().detach(),
     )
-    ratios[p.accuracy_name] = accuracy
-    if p.report_accuracy:
-        ratios["acc"] = accuracy
+    # a set under its own name also counts toward the pooled accuracy
+    ratios[p.accuracy_name] = ratios["acc"] = accuracy
     terms = tuple(
         ObjectiveResult(numerators[i], item.denominator)
         for i, item in enumerate(inputs)
     )
     coefficients = tuple(term.coefficient for term in p.plan.terms)
-    return PlanResult(terms, coefficients, p.plan.shared_reduction, ratios)
+    return PlanResult(
+        terms, coefficients, p.plan.shared_reduction, ratios, computation.partials
+    )
 
 
 @dataclass
@@ -649,6 +656,8 @@ def execute_batch(
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")
+    if batch.finalize is not None:
+        return batch.finalize(combine_results(results))
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
         # Prediction sets can have distinct plans; only their metrics are additive.
         ratios = {}
@@ -659,6 +668,8 @@ def execute_batch(
                     if name in ratios
                     else pair
                 )
+        if batch.set_metrics is not None:
+            ratios.update(batch.set_metrics(results))
         return ObjectiveResult(
             sum(item.loss for item in results),
             results[0].terms[0].denominator.new_ones(()),

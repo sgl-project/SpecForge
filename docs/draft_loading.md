@@ -23,10 +23,10 @@ or empty directory and materialized, gathered tensors. Normal HF canonical
 Hugging Face repositories; custom Python code is never imported from them.
 
 Canonical model classes use names such as `DFlashDraftModel`, `DSpineDraftModel`
-and `Eagle3DraftModel`. Names may also occur in legacy or serving implementations;
-`model_type: specforge_draft` identifies the canonical configuration. The legacy
-`AutoDraftConfig`/`AutoDraftModel` APIs reject canonical inputs; use the entry
-points above.
+and `Eagle3DraftModel`. `model_type: specforge_draft` identifies the canonical
+configuration. Use the public loading functions above; the old auto-model
+and legacy checkpoint APIs have been removed from the package
+(`scripts/convert_legacy_checkpoint.py` converts historical checkpoints).
 
 `load_draft` infers a single floating dtype from the stored weights; pass `dtype`
 explicitly for mixed-dtype checkpoints or an intentional conversion. It returns
@@ -48,8 +48,7 @@ model = initialize_draft(
 Omitting `mapping` selects matching canonical names, excluding `allow_new`.
 Every owned tensor must be assigned or explicitly new; unused source tensors
 are reported. A warm-start source supplies weights only and is not checked
-against the new target configuration; a legacy source's stored copies of
-target-bound tables count as source tensors. Mapping keys are draft
+against the new target configuration. Sources must be canonical draft checkpoints. Mapping keys are draft
 prefixes and values are source prefixes. A `*` matches one path segment.
 
 Target copies are declared separately:
@@ -71,11 +70,9 @@ are transformed. Copies cannot overlap warm-start assignments or `allow_new`.
 Current components use separate checkpoint tensors. A future component with
 fused parameters must supply its layout rather than relying on family guesses.
 
-Legacy draft imports use the existing configuration codec and format-owned
-weight renames. They require the target configuration. A `training_state.pt`
-without `config.json` additionally needs `legacy_config` (a dictionary or JSON
-file); tensors come only from `draft_state_dict`, via PyTorch's restricted
-unpickler, and recorded settings are checked as described below.
+The package reads canonical checkpoints only: every draft source must contain a
+canonical `config.json`. Convert a historical draft checkpoint once with
+`scripts/convert_legacy_checkpoint.py`, then load the directory it writes.
 Continuing a reduced-vocabulary EAGLE checkpoint requires its saved `t2d` and
 `d2t` mapping. A weights-only warm start can explicitly allow a new `vocabulary`;
 the caller must install its mapping before using logits.
@@ -89,13 +86,6 @@ a scratch or warm-start model then needs `finalize_initialization` as in
 Plans validate global metadata; Shard/Replicate DTensor destinations read only
 their local slices. Partial placements are rejected. CLI/training orchestration
 and export conversion will adopt these APIs in subsequent integration steps.
-
-Legacy imports check recorded capture, mask, residual and binding settings,
-including the DFlash-family `*_target_layer_ids`, `*_mask_token_id` and
-`*_block_size` records.
-A saved copy of a target-bound table must match the supplied target; importing
-must not silently replace trained weights. Hub imports also fetch
-`training_state.pt` for these structural records, without restoring training state.
 
 After copying and binding weights, `initialize_draft` calls the model's
 `finalize_initialization(loaded_keys=...)`. Models own derived-state initialization

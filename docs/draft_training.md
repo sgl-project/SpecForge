@@ -14,9 +14,8 @@ sampling/mask construction. EAGLE3 runs each TTT depth once over a differentiabl
 KV prefix with explicit dense visibility; it does not add algorithm hooks or mutable
 KV caches to the backbone.
 Reference and optimized loss implementations share the same executor.
-Training wrappers with capabilities not yet migrated, such as sequence parallelism,
-remain available and read the same named loss configuration. MTP/DMTP CE is evaluated
-in FP32 for stable log-softmax; it need not match the legacy BF16 reduction bitwise.
+MTP/DMTP CE is evaluated in FP32 for stable log-softmax; it need not match the
+legacy BF16 reduction bitwise.
 
 Loss and position weighting can be selected independently of the architecture:
 
@@ -127,10 +126,9 @@ position weights; omitting them preserves the protocol defaults. Capture inputs
 combine protocol and loss requirements. A teacher head is loaded only when the
 loss or protocol requires teacher logits; final-state inputs alone do not imply
 a head is needed.
-Legacy algorithm switches remain on the legacy route. On the canonical route,
-use loss/weighting for the common objective and objective_options for sampling
+Use loss/weighting for the common objective and objective_options for sampling
 and auxiliary training. DFlash2 selector_warmup_ratio/selector_ramp_ratio belong
-in objective_options. Nondefault legacy loss/sampling settings are rejected.
+in objective_options. Removed flat training options are rejected.
 
 ```yaml
 model:
@@ -171,9 +169,9 @@ Only one loading path may be selected:
   optional draft must equal the saved structure exactly. Training options and
   the original schedule horizon must still match the recorded run contract.
 
-`initialization.adapter` and `initialization.legacy_config` handle explicit
-external checkpoint import. `resume` and initialization are mutually exclusive;
-none of these fields may mix with legacy `model.draft_*` source fields.
+`initialization.adapter` selects a registered checkpoint reader. Built-in loading
+accepts canonical checkpoints only. `resume` and initialization are mutually exclusive;
+legacy `model.draft_*` source fields and `initialization.legacy_config` are rejected.
 
 Checkpoints contain the canonical `config.json` alongside the existing
 `training_state.pt` and per-rank optimizer/RNG files. The public loader reads only
@@ -192,13 +190,10 @@ server capture adapters now supply unshifted canonical records. DMTP currently
 accepts offline records with `mtp_hidden_states`; the generic capture service
 cannot produce frozen-MTP features and DMTP streaming fails validation.
 
-The new route supports eager attention (EAGLE3 and MTP also SDPA) and data parallel
-training, including FSDP and DDP. Frozen target bindings and the teacher head remain replicated outside
-FSDP, matching the existing training backend's frozen-table policy. The canonical
-model's requested dtype also controls FSDP computation. Other optimized backends and
-sequence-parallel execution remain on the legacy route. Online wiring is
-validated through capture contracts; a live SGLang capture run is not part of the
-current integration tests.
+Training supports the attention backends declared by each objective, DDP/FSDP,
+and USP for objectives that declare sequence-parallel support. Frozen target
+bindings and teacher heads remain replicated outside FSDP. Trainer TP remains
+restricted to one. There is no fallback to old training wrappers.
 
 DSpine training uses a graph-free prepass and RNG-preserving replay for every
 optimizer window, including a single microbatch. The strategy reduces backbone
@@ -207,13 +202,10 @@ Objective evaluation performs no collectives; the objective itself never reduces
 its alignment statistics across ranks. Transfer-space initialization and
 restoration remain owned by the public model loader.
 
-Legacy checkpoints keep their original full-resume path (`model.draft_*` plus
-`training.resume_from`), except MTP, whose legacy training path was removed. Importing one through `initialization.checkpoint` or
-`weights_from` reads weights and effective settings only; it does not translate
-optimizer shards, scheduler state or RNG. For legacy imports, explicit
-`model.mask_token_id`, `model.aux_hidden_state_layer_ids` and
-`training.norm_before_residual` must agree with recorded settings. Canonical YAML
-keeps these settings in its architecture nodes.
+Historical draft checkpoints cannot be loaded or resumed; convert their weights
+first (see [Checkpoint and configuration boundary](#checkpoint-and-configuration-boundary)).
+Canonical checkpoints support exact training resume; native target weights are
+copied through explicit `from_target` mappings.
 
 For scratch training, `model.load_target_embedding: true` copies the target table
 into an owned embedding with shape validation. Like legacy `load_embedding`, this
@@ -336,8 +328,7 @@ register compatible input kinds and required capabilities.
 
 Only the named configuration above is accepted. Flat loss dictionaries,
 separate `loss_execution`, old top-level loss flags, and loss coefficients in
-`objective_options` are rejected. Retained training wrappers consume the same
-configuration and reject formulas or scheduling they cannot execute.
+`objective_options` are rejected.
 
 - `chunk_size` counts complete prediction units (blocks for block protocols,
   independent rows for EAGLE/P-EAGLE/MTP). Omission preserves the protocol's
@@ -414,19 +405,17 @@ and checkpoint tensors do not change. Liger selection remains independent.
 
 Execution settings are saved and checked on full resume. Checkpoints must record
 the current named loss settings and execution policy; old loss metadata is not
-converted or assigned defaults. Fused runs must also record selected implementation
-identities. Use the standalone converter below for pre-named-loss checkpoints.
+converted or assigned defaults. All runs must record selected implementation
+identities, effective total steps, the current model provenance format and the
+RNG device type. These fields are written by the current checkpoint writer.
 
 MTP uses `loss.execution.chunk_size` to control loss projection chunks.
 Its objective's default chunk size remains 4096; `objective_options.objective_chunk_size`
 sets that default.
 
 `resume` and `training.resume_from` are alternative inputs for one resolved resume
-path. Neither is copied into the other. A canonical checkpoint supplied through
-`training.resume_from` also selects the canonical training route. Legacy DSpine
-imports through `initialization.checkpoint` must explicitly match saved training
-sampling settings in `training.objective_options`. Loss settings always come from
-the new training configuration; `weights_from` copies weights only.
+path. Neither is copied into the other. Loss settings always come from
+the new training configuration; `weights_from` copies canonical weights only.
 
 
 ### Extending loss execution
@@ -598,13 +587,12 @@ eager attention; block objectives register the shared consecutive-supervision fi
 `explicit_initialization=True` makes training refuse to start without an
 initialization choice or resume, and `host_inputs` computes extra batch tensors on
 the host before the device copy (MTP precomputes its supervised rows there). Canonical
-composition builds providers directly from these requirements; it does not resolve
-a legacy algorithm registration. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
+composition builds providers directly from these requirements. An optional `window_statistic=WindowStatistic(ratio_name=..., argument_name=...)`
 requests accumulation-window reduction and replay, passing the result to the
 objective by the declared argument name.
 
-`legacy_strategy` is separate registration metadata that preserves existing data
-and rendezvous identifiers; it does not select a legacy provider.
+`runtime_name` is separate registration metadata that preserves existing data
+and rendezvous identifiers; it does not select a provider.
 `supports_vocab_mapping` declares draft-vocabulary support.
 `dataloader_workers` is the objective's default worker count when
 `data.dataloader_num_workers` is unset: 8 for the block objectives (DFlash,
@@ -634,11 +622,17 @@ python scripts/prepare_hidden_states.py -c /configs/run.yaml \
 
 `--target-model-path` defaults to the run's `model.target_model_path`.
 `--draft /configs/eagle3.yaml` captures for the default objective and loss only.
-`-c`, `--draft` and the legacy `--draft-model-config` are mutually exclusive. The
+`-c` and `--draft` are mutually exclusive. The
 canonical YAML selects the architecture, capture layers and output schema.
 
 
-### Compatibility boundary
+### Checkpoint and configuration boundary
+
+Training accepts current canonical configuration and checkpoints only.
+Deployment settings belong under `deployment`; the former
+`training.deployment_mode`, `training.server_urls` and
+`training.metadata_db_path` fields are rejected. The training
+wrappers have been removed.
 
 Resume reads only current records; it never converts old loss metadata.
 Convert a pre-named-loss canonical checkpoint into a new directory:
@@ -670,8 +664,39 @@ Both CE/L1 weights must be specified to preserve a non-default mixture; changing
 only `ce_weight` does not derive `l1_weight`. Domino's old token formula maps to
 both `base` and `final`.
 
-Old training wrappers remain for full resume and parallel execution capabilities
-not yet migrated. They share numerical functions in `specforge/losses`.
+The package reads only the canonical draft format. A historical (pre-canonical)
+draft checkpoint is converted once, by a script that keeps the old configuration
+decoders outside the package:
+
+```bash
+PYTHONPATH=. python scripts/convert_legacy_checkpoint.py \
+  --checkpoint OLD_CHECKPOINT --target-model TARGET_MODEL \
+  --output-dir CANONICAL_CHECKPOINT
+```
+
+The output is a canonical draft directory for `initialization.checkpoint`,
+`initialization.weights_from` and `specforge export`: the decoded `config.json`
+and every weight under its canonical name, with values and dtypes unchanged.
+The source is only read, an existing output is refused, and optimizer, scheduler
+and RNG state are not converted. Supported sources are DFlash, DFlash2, Domino,
+DSpark, DSpine, EAGLE3, P-EAGLE and Qwen3.5 MTP checkpoints.
+
+- `--target-model` is the target the checkpoint was trained against. Its
+  configuration resolves target-derived settings. A saved copy of its embedding
+  or LM head must equal the target's table and is left out of the output; only
+  then are target weights read.
+- `--draft-config OLD.json` supplies the old configuration for a checkpoint
+  without `config.json` (a weights file, or a directory holding only
+  `training_state.pt`). Settings recorded in `training_state.pt` must agree
+  with it.
+- P-EAGLE needs `--mask-token-id` (the old `model.mask_token_id`) unless
+  `training_state.pt` records it. `--norm-before-residual` /
+  `--no-norm-before-residual` and `--capture-layers` supply the old
+  `training.norm_before_residual` and `model.aux_hidden_state_layer_ids`
+  (EAGLE3 and P-EAGLE) when the old configuration omits them; they may not
+  contradict recorded values.
+- DSpine training options stored in the old `dspine_config` are not part of a
+  draft directory. Set them in the run YAML.
 
 ### Inspecting loss implementations
 
@@ -694,7 +719,8 @@ names. Detailed diagnostics run only on logging steps, without gradients and in
 the loss's projection chunks (`loss.execution.chunk_size`; `0` keeps the set
 whole). They return additive counts and numerator/denominator pairs, which the
 trainer sums across accumulation and ranks before forming a ratio. They change
-neither the loss, the gradients nor the random state, and evaluation skips them.
+neither the loss, the gradients nor the random state. Evaluation skips them,
+except for EAGLE3, whose evaluation reports them.
 
 DFlash and DFlash2 report the hard-label, selector, prefix and sampled-anchor
 walk metrics, `ce_loss` (`lk_loss` for an LK token loss), `target_probability`
@@ -717,3 +743,22 @@ a draft without a confidence head omits the two confidence metrics. DSpine
 reports `dspine/backbone_ce`, `backbone_l1`, `refinement_loss`,
 `alignment_loss` and `candidate_coverage` on every step, from values its loss
 already computes.
+
+EAGLE3 reports the metrics of its wrapper too. On every step, from what its
+loss computes: the accuracy of each depth (`acc_<depth>`) and of all depths
+together (`acc`), and each depth's mean loss before its depth weight, as
+`ploss_<depth>` and `kl_loss_<depth>` (`lk_loss_<depth>` for an LK token loss);
+`kl_loss` or `lk_loss` is their weighted sum. D-PACE weighting, whose loss is
+not a sum of depth means, reports no depth losses. A logging step adds the
+expected acceptance of each depth, `acceptance_rate_<depth>` and
+`expected_acceptance_<depth>`: the mean over the depth's supervised positions
+of the probability mass the draft and the target share. `acceptance_rate` and
+`expected_acceptance` are the mean over the depths. Evaluation reports
+`eval/ploss_<depth>`, `eval/acceptance_rate_<depth>` and
+`eval/expected_acceptance_<depth>`.
+
+P-EAGLE reports, on a logging step, the correct and the supervised sampled
+positions of each depth as `position_<depth>_acc_sum` and
+`position_<depth>_acc_total`. The wrapper's `loss_sum`, `loss_total`,
+`full_acc_sum` and `full_acc_total` repeated `loss` and `acc` and are no longer
+logged.

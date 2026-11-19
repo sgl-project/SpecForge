@@ -4,7 +4,11 @@ import math
 import torch
 import torch.distributed as dist
 
-from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
+from specforge.lr_scheduler import (
+    ConstantWarmupLR,
+    CosineAnnealingWarmupLR,
+    warmup_steps_from_ratio,
+)
 from specforge.muon import (
     ADAMW,
     MUON,
@@ -153,7 +157,7 @@ class BF16Optimizer:
         self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
-            warmup_steps=int(warmup_ratio * total_steps),
+            warmup_steps=warmup_steps_from_ratio(warmup_ratio, total_steps),
         )
 
     def _build_muon(

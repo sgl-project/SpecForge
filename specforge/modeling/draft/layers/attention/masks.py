@@ -152,8 +152,8 @@ class AttentionLayout:
 
         def mask(b, h, q, k):
             # Flex evaluates padded block indices too. Keep closure indexing safe.
-            valid = (q < qlen) & (k < klen)
-            q, k = q.clamp(max=qlen - 1), k.clamp(max=klen - 1)
+            valid_q, valid_k = q < qlen, k < klen
+            q, k = torch.where(valid_q, q, 0), torch.where(valid_k, k, 0)
             if isinstance(visibility, Tensor):
                 allowed = visibility[
                     b % visibility.shape[0], h % visibility.shape[1], q, k
@@ -172,7 +172,7 @@ class AttentionLayout:
                     allowed = allowed & (
                         (distance < sliding_window) & (distance > -sliding_window)
                     )
-            return valid & allowed
+            return valid_q & valid_k & allowed
 
         return mask
 

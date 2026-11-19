@@ -284,7 +284,7 @@ def train(
 @click.option(
     "--copy-target",
     is_flag=True,
-    help="Copy unchanged native target shards instead of linking them.",
+    help="Copy unchanged native target shards. Required for exports across filesystems; otherwise shards are hard-linked.",
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
 @click.option(

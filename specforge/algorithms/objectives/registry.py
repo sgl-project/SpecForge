@@ -44,6 +44,9 @@ class TrainingRequirements:
     #: CUDA/ROCm trainer with a silu/swish draft. Only set where that
     #: combination was validated.
     liger_by_default: bool = False
+    #: Whether evaluation runs the objective's diagnostics, for an objective
+    #: whose evaluation reports them.
+    evaluation_diagnostics: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,18 +149,27 @@ class ResolvedObjective:
         return "teacher_logits" in self.registration.requires | self.losses.requires
 
 
-def objective_record(name, options):
+def _training_options(factory, options, training):
+    """Let a protocol inherit defaults from the run before constructing it."""
+    resolve = getattr(factory, "resolve_training_options", None)
+    return resolve(options, dict(training)) if resolve is not None else options
+
+
+def objective_record(name, options, *, training=None):
     """Options that fix the training trajectory: what a resume compares.
 
     An objective lists the options that only select what is logged in
     ``logging_options``; they are left out, for a saved record as well.
     """
-    logged = getattr(_PROTOCOLS[name].factory, "logging_options", ())
+    factory = _PROTOCOLS[name].factory
+    if training is not None:
+        options = _training_options(factory, options, training)
+    logged = getattr(factory, "logging_options", ())
     return {key: value for key, value in options.items() if key not in logged}
 
 
 def resolve_objective(
-    architecture, *, name=None, options=None, loss=None, weighting=None
+    architecture, *, name=None, options=None, loss=None, weighting=None, training=None
 ):
     """Resolve algorithm and loss settings without constructing a model.
 
@@ -165,6 +177,7 @@ def resolve_objective(
         architecture: Canonical draft architecture name.
         name: Optional protocol name; otherwise use the architecture's default.
         options: Algorithm-specific objective constructor options.
+        training: Optional run settings used by the protocol to fill omitted options.
         loss: Common mathematical loss configuration, or algorithm defaults.
         weighting: Common position-weighting configuration, or algorithm defaults.
 
@@ -183,6 +196,8 @@ def resolve_objective(
     if architecture not in entry.architectures:
         raise ValueError(f"objective {name!r} does not support {architecture}")
     options = dict(options or {})
+    if training is not None:
+        options = _training_options(entry.factory, options, training)
     objective = entry.factory(**options)
     if entry.resolve_requires is not None:
         entry = replace(
@@ -238,6 +253,7 @@ def build_objective_model(
     *,
     name=None,
     options=None,
+    training=None,
     frozen=(),
     target_head=None,
     loss=None,
@@ -249,6 +265,7 @@ def build_objective_model(
         draft_model: Constructed canonical draft model.
         name: Optional protocol name; defaults from the draft architecture.
         options: Algorithm-specific objective options.
+        training: Optional run settings used by the protocol to fill omitted options.
         frozen: Additional module/parameter paths to freeze.
         target_head: Optional teacher head; it is frozen and kept in eval mode.
         loss: Common mathematical loss configuration.
@@ -266,6 +283,7 @@ def build_objective_model(
         draft_model.config.draft.architecture,
         name=name,
         options=options,
+        training=training,
         loss=loss,
         weighting=weighting,
     )
