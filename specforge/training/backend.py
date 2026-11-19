@@ -26,6 +26,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from specforge.training.contracts import RankFailure
+
 
 def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
     """``tensor.mul_(factor)`` for every tensor, one fused launch per group.
@@ -430,22 +432,31 @@ class FSDPTrainingBackend(TrainingBackend):
         """
         if self.module is None:
             raise RuntimeError("state_dict called before prepare_model")
-        return {
-            "model": self._module_state_dict(),
-            "optimizer": (
+        # Gathering a sharded model is a collective: a rank that fails inside
+        # it is already apart from the others.
+        model = self._module_state_dict()
+        try:
+            # This rank's own work, once the gather is over.
+            optimizer = (
                 self.optimizer.state_dict() if self.optimizer is not None else None
-            ),
-            "rng": self._rng_state(),
-        }
+            )
+            rng = self._rng_state()
+        except Exception as error:
+            raise RankFailure(f"{type(error).__name__}: {error}") from error
+        return {"model": model, "optimizer": optimizer, "rng": rng}
 
     def load_state_dict(self, state: dict) -> None:
         """Restore whichever of module weights / optimizer / RNG the state carries."""
         if state.get("model") is not None:
             self._load_module_state_dict(state["model"])
-        if self.optimizer is not None and state.get("optimizer") is not None:
-            self.optimizer.load_state_dict(state["optimizer"])
-        if state.get("rng") is not None:
-            self._set_rng_state(state["rng"])
+        try:
+            # This rank's own state: its failure is this rank's alone.
+            if self.optimizer is not None and state.get("optimizer") is not None:
+                self.optimizer.load_state_dict(state["optimizer"])
+            if state.get("rng") is not None:
+                self._set_rng_state(state["rng"])
+        except Exception as error:
+            raise RankFailure(f"{type(error).__name__}: {error}") from error
 
     def _full_state_ctx(self, state_dict_config=None):
         """FULL_STATE_DICT context for a wrapped module; a no-op when unwrapped."""

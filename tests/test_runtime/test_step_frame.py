@@ -13,6 +13,7 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import (
     IncompleteWindow,
     PendingStep,
+    RankFailure,
     StepContext,
     StepMetrics,
 )
@@ -544,8 +545,8 @@ class RunnerCheckpointTest(unittest.TestCase):
         self.assertEqual(resumed.backend.optimizer.param_groups[0]["lr"], 0.025)
         torch.testing.assert_close(torch.rand(3), expected, rtol=0, atol=0)
 
-    def test_rank_without_model_state_selects_nothing(self):
-        """Only the first rank of a wrapped model holds the gathered weights."""
+    def test_only_the_first_rank_selects_the_draft_weights(self):
+        """The others hold nothing of the model, or under sharding a part of it."""
 
         class Program(_Program):
             def draft_state(self, state):
@@ -553,11 +554,43 @@ class RunnerCheckpointTest(unittest.TestCase):
 
         runner = runner_over(Program())
         self.assertEqual(list(runner.checkpoint_state().draft), ["w"])
-        full = runner.backend.state_dict
+        partial = {**runner.backend.state_dict(), "model": {"frozen_table": 0}}
+        for rank, selected in ((0, True), (1, False)):
+            with (
+                self.subTest(rank=rank),
+                mock.patch("torch.distributed.is_available", return_value=True),
+                mock.patch("torch.distributed.is_initialized", return_value=True),
+                mock.patch("torch.distributed.get_rank", return_value=rank),
+                mock.patch.object(runner.backend, "state_dict", lambda: partial),
+            ):
+                if selected:
+                    # The writer's selection is not skipped, whatever it holds.
+                    with self.assertRaises(RankFailure) as raised:
+                        runner.checkpoint_state()
+                    self.assertIsInstance(raised.exception.__cause__, KeyError)
+                else:
+                    self.assertEqual(runner.checkpoint_state().draft, {})
+
+    def test_failure_after_the_gather_is_this_ranks_alone(self):
+        runner = runner_over(_Program())
+        optimizer = runner.backend.optimizer
         with mock.patch.object(
-            runner.backend, "state_dict", lambda: {**full(), "model": {}}
+            optimizer, "state_dict", side_effect=MemoryError("masters")
         ):
-            self.assertEqual(runner.checkpoint_state().draft, {})
+            with self.assertRaisesRegex(RankFailure, "MemoryError: masters") as raised:
+                runner.checkpoint_state()
+        self.assertIsInstance(raised.exception.__cause__, MemoryError)
+        # Inside the gather the ranks are apart already: nothing to agree on.
+        with mock.patch.object(
+            runner.backend, "_module_state_dict", side_effect=MemoryError("gather")
+        ):
+            with self.assertRaisesRegex(MemoryError, "gather"):
+                runner.checkpoint_state()
+        with mock.patch.object(
+            optimizer, "load_state_dict", side_effect=ValueError("shape")
+        ):
+            with self.assertRaisesRegex(RankFailure, "ValueError: shape"):
+                runner.load_resume({"optimizer": {}, "rng": None})
 
 
 class RunnerRefusalTest(unittest.TestCase):
