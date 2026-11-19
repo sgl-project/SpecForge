@@ -23,6 +23,7 @@ from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.contracts import (
     IncompleteWindow,
+    RankFailure,
     StepMetrics,
     materialize_metrics,
 )
@@ -177,8 +178,7 @@ def _controller(strategy, backend, **options):
     """A run loop that drives ``strategy`` and ``backend`` through the step runner."""
     return TrainerController(
         DataParallelRunner(strategy, backend),
-        strategy=strategy,
-        backend=backend,
+        strategy_name=strategy.name,
         **options,
     )
 
@@ -718,6 +718,83 @@ class TestTrainerController(unittest.TestCase):
             self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))
             self.assertEqual(ckpt.global_step, 3)
 
+    def test_checkpoint_is_written_only_once_the_ranks_agree(self):
+        strat = FakeStrategy()
+        strat.kernels = lambda: {"0:0": "reference"}
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            with mock.patch.object(
+                ctrl.runner, "agree", side_effect=RuntimeError("ranks disagree")
+            ) as agree:
+                with self.assertRaisesRegex(RuntimeError, "ranks disagree"):
+                    ctrl.save_checkpoint(1)
+            agree.assert_called_once_with(
+                None, value=("loss kernels", {"0:0": "reference"})
+            )
+            self.assertEqual(os.listdir(d), [])
+
+    def test_rank_that_cannot_collect_its_state_says_so_in_the_agreement(self):
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            lost = MemoryError("optimizer masters")
+
+            def collect():
+                try:
+                    raise lost
+                except MemoryError as error:
+                    raise RankFailure("MemoryError: optimizer masters") from error
+
+            with (
+                mock.patch.object(ctrl.runner, "checkpoint_state", collect),
+                mock.patch.object(
+                    ctrl.runner, "agree", wraps=ctrl.runner.agree
+                ) as agree,
+                self.assertRaises(MemoryError) as raised,
+            ):
+                ctrl.save_checkpoint(1)
+            # The other ranks are told, and raise, before this one raises what
+            # it failed with.
+            agree.assert_called_once_with("MemoryError: optimizer masters", value=None)
+            self.assertIs(raised.exception, lost)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_failure_inside_the_gather_is_not_agreed(self):
+        """Its peers are inside the collective: the rank raises and the job ends."""
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            with (
+                mock.patch.object(
+                    ctrl.runner, "checkpoint_state", side_effect=MemoryError("gather")
+                ),
+                mock.patch.object(ctrl.runner, "agree") as agree,
+                self.assertRaisesRegex(MemoryError, "gather"),
+            ):
+                ctrl.save_checkpoint(1)
+            agree.assert_not_called()
+            self.assertEqual(os.listdir(d), [])
+
+    def test_rank_told_of_another_ranks_failure_writes_nothing(self):
+        strat = FakeStrategy()
+        with tempfile.TemporaryDirectory() as d:
+            ctrl = _controller(
+                strat, FakeBackend(strat.model), run_id="r", output_dir=d
+            )
+            told = RuntimeError("rank 1: MemoryError: optimizer masters")
+            with (
+                mock.patch.object(ctrl.runner, "agree", side_effect=told),
+                self.assertRaisesRegex(RuntimeError, "rank 1: MemoryError"),
+            ):
+                ctrl.save_checkpoint(1)
+            self.assertEqual(os.listdir(d), [])
+
     def test_max_steps_closes_prefetch_and_requeues_unyielded_refs(self):
         strat = FakeStrategy()
         backend = FakeBackend(strat.model)
@@ -880,8 +957,7 @@ class TestTrainerController(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as d:
                     ctrl = TrainerController(
                         Runner(),
-                        strategy=strat,
-                        backend=FakeBackend(strat.model),
+                        strategy_name=strat.name,
                         accumulation_steps=3,
                         run_id="r",
                         output_dir=d,

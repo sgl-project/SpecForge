@@ -295,6 +295,9 @@ class ExecutionSelection:
 
     The names dict is a live checkpoint mapping. Empty batches use the same
     selection, but the executor evaluates their zero-gradient reference path.
+    Ranks resolve independently, so a host missing an optional kernel package
+    would train with another implementation than the others: the step runner
+    compares the ranks' names before a checkpoint records them.
     """
 
     def __init__(self):
@@ -321,23 +324,6 @@ class ExecutionSelection:
         name = entry.name if entry else ("split" if len(group) > 1 else "reference")
         self.record(key, name, error=error, reasons=reasons)
         return entry
-
-    def agree(self):
-        """Require every rank to have resolved the same implementations.
-
-        A collective: the training layer calls it at a point every rank
-        reaches, never from a forward. Ranks resolve independently, so a host
-        missing an optional kernel package would otherwise train with a
-        different implementation than the others.
-        """
-        import torch.distributed as dist
-
-        if not dist.is_initialized():
-            return
-        resolved = [None] * dist.get_world_size()
-        dist.all_gather_object(resolved, dict(self.names))
-        if any(names != resolved[0] for names in resolved):
-            raise ValueError(f"Loss implementations differ across ranks: {resolved}")
 
     def record(self, key, name, *, error=None, reasons=()):
         """Record a main or auxiliary implementation once and check consistency."""

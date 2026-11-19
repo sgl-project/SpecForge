@@ -1093,6 +1093,47 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=checkpoint,
             )
 
+    def test_rank_that_cannot_restore_its_state_tells_the_others(self):
+        from specforge.training.runner import DataParallelRunner
+
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_agreed_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        source, _, _ = self._make_trainer(
+            os.path.join(workdir, "source"), feat_dir=feat_dir, max_steps=1
+        )
+        self.assertEqual(source.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "source", "rz-latest"))
+        original = DataParallelRunner.agree
+        told = []
+
+        def agree(runner, error, *, value=None):
+            told.append(error)
+            return original(runner, error, value=value)
+
+        resume = dict(
+            feat_dir=feat_dir, max_steps=2, max_grad_norm=2.0, resume_from=checkpoint
+        )
+        with (
+            mock.patch.object(DataParallelRunner, "agree", agree),
+            # This rank raises what it failed with, after the agreement.
+            self.assertRaisesRegex(ValueError, "max_grad_norm=1.0 but this run has"),
+        ):
+            self._make_trainer(os.path.join(workdir, "changed"), **resume)
+        self.assertEqual(len(told), 1)
+        self.assertRegex(told[0], "^ValueError: .*max_grad_norm=1.0 but this run has")
+        # A rank that restored hears of it and raises as well.
+        told_by_peer = RuntimeError("rank 1: ValueError: wrong master shape")
+        with (
+            mock.patch.object(DataParallelRunner, "agree", side_effect=told_by_peer),
+            self.assertRaisesRegex(RuntimeError, "rank 1: ValueError"),
+        ):
+            self._make_trainer(
+                os.path.join(workdir, "peer"),
+                feat_dir=feat_dir,
+                max_steps=2,
+                resume_from=checkpoint,
+            )
+
     def test_completed_checkpoint_resume_is_a_checkpoint_noop(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_complete_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
@@ -1130,8 +1171,7 @@ class TestFitReentry(unittest.TestCase):
         strategy = Strategy(model, seen)
         ctrl = TrainerController(
             DataParallelRunner(strategy, backend),
-            strategy=strategy,
-            backend=backend,
+            strategy_name=strategy.name,
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
@@ -1335,8 +1375,7 @@ class TestCheckpointResume(unittest.TestCase):
         strategy = build_strategy(model, target_head=head)
         ctrl = TrainerController(
             DataParallelRunner(strategy, backend),
-            strategy=strategy,
-            backend=backend,
+            strategy_name=strategy.name,
             run_id="r",
             output_dir=out_dir,
             max_steps=3,
@@ -1462,8 +1501,7 @@ class TestCheckpointResume(unittest.TestCase):
         _, backend_r, strategy_r = build_run()
         ctrl_r = TrainerController(
             DataParallelRunner(strategy_r, backend_r),
-            strategy=strategy_r,
-            backend=backend_r,
+            strategy_name=strategy_r.name,
             run_id="ref",
             output_dir=os.path.join(workdir, "ref"),
             max_steps=TOTAL,
@@ -1483,8 +1521,7 @@ class TestCheckpointResume(unittest.TestCase):
         model_a, backend_a, strategy_a = build_run()
         ctrl_a = TrainerController(
             DataParallelRunner(strategy_a, backend_a),
-            strategy=strategy_a,
-            backend=backend_a,
+            strategy_name=strategy_a.name,
             run_id="rez",
             output_dir=out_a,
             max_steps=CUT,
@@ -1548,8 +1585,7 @@ class TestCheckpointResume(unittest.TestCase):
         losses_b = []
         ctrl_b = TrainerController(
             DataParallelRunner(strategy_b, backend_b),
-            strategy=strategy_b,
-            backend=backend_b,
+            strategy_name=strategy_b.name,
             run_id="rez",
             output_dir=out_a,
             max_steps=TOTAL,

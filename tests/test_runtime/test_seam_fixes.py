@@ -212,8 +212,7 @@ class TestCheckpointRecord(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             ctrl = TrainerController(
                 DataParallelRunner(strat, backend),
-                strategy=strat,
-                backend=backend,
+                strategy_name=strat.name,
                 run_id="r",
                 output_dir=d,
             )
