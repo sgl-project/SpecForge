@@ -263,6 +263,8 @@ def build_objective_model(
     loss=None,
     weighting=None,
     frozen_modules=(),
+    attention_backend=None,
+    sequence_parallel=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -277,6 +279,12 @@ def build_objective_model(
         frozen_modules: Frozen modules of the composed model that a runner
             keeps out of sharding and out of the optimizer (bound target
             tables, the teacher head).
+        attention_backend: The attention backend the run trains with, for a
+            protocol whose rollout depends on it.
+        sequence_parallel: The process groups of the sequence-parallel axis
+            (the ring group, the Ulysses group and their product, over which
+            loss statistics of one sequence are reduced), when the run has
+            one.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -294,6 +302,27 @@ def build_objective_model(
         weighting=weighting,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    if (
+        attention_backend is not None
+        and attention_backend not in entry.training.attention_backends
+    ):
+        raise ValueError(
+            f"objective {name!r} does not train with attention backend "
+            f"{attention_backend!r}; it supports "
+            f"{sorted(entry.training.attention_backends)}"
+        )
+    if sequence_parallel is not None and not entry.training.supports_sequence_parallel:
+        raise ValueError(f"objective {name!r} does not support sequence parallelism")
+    if attention_backend == "usp" and sequence_parallel is None:
+        raise ValueError("attention backend 'usp' needs the sequence-parallel groups")
+    if sequence_parallel is not None:
+        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+            raise ValueError(
+                "D-PACE weighting is not supported with sequence parallelism: "
+                "chain weights are normalized within each sequence shard"
+            )
     if resolved.execution.teacher_chunk_size:
         from torch import nn
 
@@ -358,6 +387,8 @@ def build_objective_model(
         frozen_parameters=frozen,
         execution=resolved.execution,
         frozen_modules=frozen_modules,
+        attention_backend=attention_backend,
+        sequence_parallel=sequence_parallel,
     )
 
 

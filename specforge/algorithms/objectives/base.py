@@ -49,6 +49,8 @@ class ObjectiveModel(nn.Module):
         frozen_parameters=(),
         execution=None,
         frozen_modules=(),
+        attention_backend=None,
+        sequence_parallel=None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -67,6 +69,11 @@ class ObjectiveModel(nn.Module):
         # Frozen modules a runner neither shards nor optimizes: target tables
         # used only inside the loss, as whoever built this model declared them.
         self.frozen = tuple(dict.fromkeys(frozen_modules))
+        # The attention backend the run trains with, and the process groups of
+        # its sequence-parallel axis when it has one. A protocol that takes
+        # either reads it here; both are fixed for the model's lifetime.
+        self.attention_backend = attention_backend
+        self.sequence_parallel = sequence_parallel
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
