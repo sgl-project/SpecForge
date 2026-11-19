@@ -226,7 +226,7 @@ def soft_cross_entropy(logits, labels, teacher):
     requires=("logits", "labels", "teacher_logits"),
     contextual=True,
     scope="positions",
-    capabilities=("component_masks",),
+    capabilities=("component_masks", "masked_ce_l1"),
     context_statistics=(),
 )
 def ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
@@ -244,7 +244,12 @@ def combine_ce_l1(ce, l1, context, ce_weight, l1_weight):
             ce = ce * context.ce_mask
         if context.l1_mask is not None:
             l1 = l1 * context.l1_mask
-    return LossOutput(ce_weight * ce + l1_weight * l1, {"teacher_l1": raw_l1})
+    ce = ce_weight * ce
+    l1 = l1_weight * l1
+    statistics = {"teacher_l1": raw_l1}
+    if context is not None and context.ce_mask is not None:
+        statistics.update(masked_ce=ce, masked_l1=l1)
+    return LossOutput(ce + l1, statistics)
 
 
 @register_loss("cosine", input_kind="features")

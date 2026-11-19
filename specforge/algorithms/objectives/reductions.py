@@ -1,6 +1,6 @@
 """Add term statistics before applying their normalization and coefficients."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .base import ObjectiveResult, microbatch_mean
 
@@ -23,6 +23,7 @@ class PlanResult:
     coefficients: tuple[float, ...]
     shared_reduction: bool
     ratios: dict
+    partials: dict = field(default_factory=dict)
     scalar_terms: tuple[int, ...] = ()
     shared_positions: bool = False
 
@@ -115,11 +116,13 @@ def combine_results(results):
         )
         for i in range(len(first.terms))
     )
+    partials = {key: sum(r.partials[key] for r in results) for key in first.partials}
     return PlanResult(
         terms,
         first.coefficients,
         first.shared_reduction,
         ratios,
-        first.scalar_terms,
-        first.shared_positions,
+        partials,
+        scalar_terms=first.scalar_terms,
+        shared_positions=first.shared_positions,
     )

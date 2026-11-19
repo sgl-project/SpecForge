@@ -255,8 +255,11 @@ def evaluate_predictions(
         coefficients,
         p.plan.shared_reduction,
         ratios,
-        tuple(i for i, term in enumerate(p.plan.terms) if term.reduction == "scalar"),
-        p.plan.shared_positions,
+        computation.partials,
+        scalar_terms=tuple(
+            i for i, term in enumerate(p.plan.terms) if term.reduction == "scalar"
+        ),
+        shared_positions=p.plan.shared_positions,
     )
 
 
@@ -681,6 +684,8 @@ def execute_batch(
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")
+    if batch.finalize is not None:
+        return batch.finalize(combine_results(results))
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
         # Prediction sets can have distinct plans; only their metrics are additive.
         ratios = {}

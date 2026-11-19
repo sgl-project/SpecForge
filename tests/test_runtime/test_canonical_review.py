@@ -204,6 +204,40 @@ class CanonicalReviewTest(unittest.TestCase):
                     )
                     self.assertEqual(again.weighting.kind, "uniform")
 
+    def test_dspine_resolves_alignment_warmup_at_configuration_time(self):
+        from dataclasses import asdict
+
+        from specforge.algorithms.objectives import objective_record, resolve_objective
+        from specforge.training.canonical import _objective_settings
+        from tests.test_modeling.test_canonical_dspine import model_config
+
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for steps, expected in [(None, 0.5), (12, 1.0), (0, 1.0)]:
+                with self.subTest(steps=steps):
+                    cfg = run_config(
+                        target,
+                        model_config(),
+                        training={
+                            "warmup_ratio": 0.04,
+                            "objective_options": {"alignment_warmup_steps": steps},
+                        },
+                    )
+                    run = resolve_run(cfg)
+                    objective = resolve_objective(
+                        "DSpineDraftModel", **_objective_settings(run.config)
+                    ).objective
+                    self.assertEqual(objective.alignment_scale(12, 600), expected)
+                    # Older checkpoints stored the inherited ratio in the strategy options.
+                    old = asdict(objective)
+                    del old["alignment_warmup_ratio"]
+                    self.assertEqual(
+                        objective_record(
+                            "dspine", old, training={"warmup_ratio": 0.04}
+                        ),
+                        asdict(objective),
+                    )
+
     def test_logging_options_are_not_part_of_the_resume_record(self):
         from specforge.algorithms.objectives import objective_record
 

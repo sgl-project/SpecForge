@@ -25,6 +25,7 @@ class LossComputation:
         self.predicted = {}
         self.statistics = {}
         self.ratios = {}
+        self.partials = {}  # Additive scalars for protocol-specific batch reduction.
         self._calls = set()
         self.supplied = frozenset(self.predictions.term_values)
 
