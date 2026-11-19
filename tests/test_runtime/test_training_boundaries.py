@@ -387,7 +387,7 @@ def _sources() -> dict[str, _Source]:
                     origin = alias.name if alias.asname else root
                     imported[alias.asname or root] = origin
                 else:
-                    (origin,) = reached(_only(statement), package)
+                    (origin,) = reached(_only(statement, alias), package)
                     imported[alias.asname or alias.name] = origin
         from_imports = reached(ast.Module(body=imports, type_ignores=[]), package)
         defined = {
@@ -407,14 +407,13 @@ def _sources() -> dict[str, _Source]:
     return sources
 
 
-def _only(statement: ast.ImportFrom) -> ast.Module:
-    """One ``from ... import name`` per module, so each name has one origin."""
+def _only(statement: ast.ImportFrom, alias: ast.alias) -> ast.Module:
+    """``from ... import`` of one of the statement's names, which has one origin."""
     return ast.Module(
         body=[
             ast.ImportFrom(
                 module=statement.module, names=[alias], level=statement.level
             )
-            for alias in statement.names[:1]
         ],
         type_ignores=[],
     )
@@ -587,6 +586,10 @@ class BroughtAlongTest(unittest.TestCase):
             "specforge.training.runner.DataParallelRunner",
             brought_along("specforge.training.trainer.DataParallelRunner"),
         )
+        # Each name of one ``from ... import a, b`` has its own origin.
+        along = brought_along("specforge.training.trainer.ParallelConfig")
+        self.assertIn("specforge.training.backend.ParallelConfig", along)
+        self.assertNotIn("specforge.training.backend.FSDPTrainingBackend", along)
 
     def test_value_type_brings_nothing_forbidden(self):
         along = brought_along("specforge.training.contracts.StepContext")
