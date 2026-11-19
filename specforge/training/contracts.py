@@ -127,12 +127,23 @@ class CheckpointState:
     draft: Dict[str, torch.Tensor]
     #: This rank's own state for continuing the run; every rank's is saved.
     rank: Dict[str, Any]
-    #: State for continuing that is the same on every rank and is saved once,
-    #: or None.
+    #: The optimizer state where every rank holds the same one: saved once
+    #: and handed back to every rank on resume. None where each rank's is its
+    #: own, in ``rank``.
     replicated: Optional[Dict[str, Any]]
     #: The kernels this rank has realised so far, by the choice they answer.
     #: Ranks have to agree on them before a checkpoint records them.
     kernels: Mapping[str, str]
+
+
+class RankFailure(RuntimeError):
+    """This rank failed outside any collective, where its peers will succeed.
+
+    Whoever catches it reports it through ``StepRunner.agree`` and then
+    raises its cause, so the other ranks do not wait for this one in their
+    next collective. A failure inside a collective is not one: the ranks are
+    already apart there, and it propagates so the launcher tears the job down.
+    """
 
 
 class IncompleteWindow(RuntimeError):

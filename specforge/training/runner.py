@@ -33,6 +33,7 @@ from specforge.training.contracts import (
     CheckpointState,
     PendingStep,
     ProgramSpec,
+    RankFailure,
     StepContext,
     StepMetrics,
     TrainingProgram,
@@ -269,18 +270,32 @@ class DataParallelRunner:
         # and scheduler state, so that large state is saved once. Sharded
         # optimizer state is each rank's own, and so is every rank's RNG.
         replicated = self.backend.optimizer_state_is_replicated
-        return CheckpointState(
-            # The backend gathers the model on the first rank only; the others
-            # hold nothing to select from.
-            draft=(
-                self._unwrapped.draft_state(state["model"]) if state["model"] else {}
-            ),
-            rank={
-                "optimizer": None if replicated else state["optimizer"],
-                "rng": state["rng"],
-            },
-            replicated=state["optimizer"] if replicated else None,
-            kernels=self._unwrapped.kernel_record(),
+        try:
+            # This rank's own work, once the gather is over.
+            return CheckpointState(
+                # Only the rank that writes the shared file selects the
+                # draft's weights; what the others hold of the model is
+                # partial under sharding.
+                draft=(
+                    self._unwrapped.draft_state(state["model"])
+                    if self._first_rank()
+                    else {}
+                ),
+                rank={
+                    "optimizer": None if replicated else state["optimizer"],
+                    "rng": state["rng"],
+                },
+                replicated=state["optimizer"] if replicated else None,
+                kernels=dict(self._unwrapped.kernel_record()),
+            )
+        except Exception as error:
+            raise RankFailure(f"{type(error).__name__}: {error}") from error
+
+    @staticmethod
+    def _first_rank() -> bool:
+        """Whether this is the process that writes a checkpoint's shared file."""
+        return not (dist.is_available() and dist.is_initialized()) or (
+            dist.get_rank() == 0
         )
 
     def load_resume(self, state: Mapping[str, Any]) -> None:

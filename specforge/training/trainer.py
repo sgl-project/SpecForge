@@ -33,7 +33,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import ProgramSpec
+from specforge.training.contracts import ProgramSpec, RankFailure
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -463,16 +463,14 @@ class Trainer:
             failure = None
             try:
                 runner.load_resume(resume["backend"])
-            except Exception as error:
+            except RankFailure as error:
                 failure = error
             try:
-                runner.agree(
-                    None if failure is None else f"{type(failure).__name__}: {failure}"
-                )
-            except RuntimeError:
+                runner.agree(None if failure is None else str(failure))
+            except Exception:
                 if failure is not None:
                     # The rank that failed raises what it failed with.
-                    raise failure
+                    raise failure.__cause__ or failure
                 raise
         ack_fn = None
         if durable_ack:
