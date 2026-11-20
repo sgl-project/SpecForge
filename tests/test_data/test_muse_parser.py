@@ -356,6 +356,25 @@ class MuseParserTest(unittest.TestCase):
         self.assertNotIn("example_function_name_1", masked)
         self.assertNotIn("USER_PROMPT", masked)
 
+    def test_unterminated_final_span_is_supervised(self):
+        text = (
+            "<|start|>user<|message|>USER_PROMPT<|eot|>"
+            "<|start|>assistant to=self<|message|>CLOSED_REASONING<|eom|>"
+            "<|start|>assistant to=self<|message|>CUT_OFF_REASONING"
+        )
+        rendered = preprocess_conversations(
+            _CharTokenizer(),
+            [text],
+            TEMPLATE_REGISTRY.get("muse"),
+            max_length=20000,
+            is_preformatted=True,
+            tools=[[]],
+        )
+        masked = _masked_text(rendered)
+        self.assertIn("CLOSED_REASONING<|eom|>", masked)
+        self.assertTrue(masked.endswith("CUT_OFF_REASONING"))
+        self.assertNotIn("USER_PROMPT", masked)
+
 
 if __name__ == "__main__":
     unittest.main()
