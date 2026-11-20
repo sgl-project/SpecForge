@@ -111,6 +111,34 @@ def object_key(store_id: str, sample_id: str, gen: int, name: str) -> str:
     return f"{store_id}/{sample_id}/g{gen}/{name}"
 
 
+def spec_outputs(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The outputs of a spec; a spec without ``outputs`` is its one output."""
+    return spec["outputs"] if "outputs" in spec else [spec]
+
+
+def wanted_layer_indices(
+    captured: Optional[Sequence[int]], wanted: Sequence[int]
+) -> List[int]:
+    """The index of each ``wanted`` layer among the ``captured`` ones.
+
+    The model concatenates the captured layers in ascending order, whatever
+    the order of the server flag, so both lists must ascend. Example:
+    captured ``[1, 9, 17]`` and wanted ``[1, 17]`` give ``[0, 2]``.
+    """
+    captured, wanted = list(captured or ()), list(wanted)
+    if (
+        captured != sorted(captured)
+        or wanted != sorted(wanted)
+        or set(wanted) - set(captured)
+    ):
+        raise RuntimeError(
+            f"cannot cut layers {wanted} from a capture of layers {captured}; "
+            "both must ascend, and --return-aux-hidden-state-layer-ids must "
+            "include every wanted layer"
+        )
+    return [captured.index(layer) for layer in wanted]
+
+
 class _CudaBytes:
     """Exposes a raw device allocation to ``torch.as_tensor`` without copying."""
 
@@ -425,19 +453,20 @@ class SpecCaptureSink:
         thread could run before the objects exist, and would race the NVLink
         arena. Only this request's generation and feature keys are removed.
         """
-        names = list((spec.get("features") or {}).values())
-        names.extend(item["name"] for item in spec.get("passthrough") or [])
-        keys = list(
-            dict.fromkeys(
+        keys = []
+        for output in spec_outputs(spec):
+            names = list((output.get("features") or {}).values())
+            names.extend(item["name"] for item in output.get("passthrough") or [])
+            keys.extend(
                 object_key(
                     str(spec["store_id"]),
-                    str(spec["sample_id"]),
+                    str(output["sample_id"]),
                     int(spec.get("gen", 1)),
                     str(name),
                 )
                 for name in names
             )
-        )
+        keys = list(dict.fromkeys(keys))
         future = self._executor.submit(self._discard_keys, keys)
 
         def report_failure(done):
@@ -511,6 +540,7 @@ class SpecCaptureSink:
         sizes: List[int] = []
         replace_keys: List[str] = []
         results: List[Dict[str, Any]] = []
+        output_results: List[Dict[str, Any]] = []
         feature_meta: List[Dict[str, Any]] = []  # aligned with keys
 
         def stage(result_feats, *, store_id, sample_id, gen, replace, name, tensor):
@@ -532,12 +562,13 @@ class SpecCaptureSink:
             }
             feature_meta.append(result_feats[name])
 
-        for spec, aux, last_hidden in samples:
+        def stage_output(spec, output, aux, last_hidden):
             store_id = str(spec["store_id"])
-            sample_id = str(spec["sample_id"])
+            sample_id = str(output["sample_id"])
             gen = int(spec.get("gen", 1))
             replace = bool(spec.get("replace", False))
-            features: Dict[str, str] = dict(spec.get("features") or {})
+            features: Dict[str, str] = dict(output.get("features") or {})
+            aux_layer_ids = output.get("aux_layer_ids", self.aux_layer_ids)
             result_feats: Dict[str, Dict[str, Any]] = {}
             common = dict(store_id=store_id, sample_id=sample_id, gen=gen)
 
@@ -554,6 +585,10 @@ class SpecCaptureSink:
                         "not capture it; launch with "
                         "--enable-return-aux-hidden-states"
                     )
+                if artifact == ARTIFACT_AUX and aux_layer_ids != self.aux_layer_ids:
+                    indices = wanted_layer_indices(self.aux_layer_ids, aux_layer_ids)
+                    per_layer = tensor.unflatten(-1, (len(self.aux_layer_ids), -1))
+                    tensor = per_layer[..., indices, :].flatten(-2)
                 stage(
                     result_feats,
                     replace=replace,
@@ -561,7 +596,7 @@ class SpecCaptureSink:
                     tensor=tensor.unsqueeze(0),
                     **common,
                 )
-            for item in spec.get("passthrough") or []:
+            for item in output.get("passthrough") or []:
                 dtype = STR_DTYPE.get(str(item.get("dtype", "int64")))
                 if dtype is None:
                     raise RuntimeError(
@@ -578,24 +613,34 @@ class SpecCaptureSink:
                     tensor=tensor,
                     **common,
                 )
-            results.append(
-                {
-                    "sample_id": sample_id,
-                    "store_id": store_id,
-                    "gen": gen,
-                    "aux_layer_ids": self.aux_layer_ids,
-                    "features": result_feats,
-                }
-            )
+            return {
+                "sample_id": sample_id,
+                "store_id": store_id,
+                "gen": gen,
+                "aux_layer_ids": aux_layer_ids,
+                "features": result_feats,
+            }
+
+        for spec, aux, last_hidden in samples:
+            staged = [
+                stage_output(spec, output, aux, last_hidden)
+                for output in spec_outputs(spec)
+            ]
+            output_results.extend(staged)
+            if "outputs" in spec:
+                results.append({"sample_id": staged[0]["sample_id"], "outputs": staged})
+            else:
+                results.append(staged[0])
 
         for device in {t.device for t in tensors if t.is_cuda}:
             # Complete the contiguous copies this thread made.
             torch.cuda.current_stream(device).synchronize()
         materialize_ms = (time.perf_counter() - started) * 1000.0
         if store is None:
-            return self._publish_nvlink(
-                results, keys, tensors, replace_keys, feature_meta, started
+            self._publish_nvlink(
+                output_results, keys, tensors, replace_keys, feature_meta, started
             )
+            return results
         self._remove_many_quiet(replace_keys)
         registered: List[int] = []
         seen_storage = set()
@@ -683,8 +728,8 @@ class SpecCaptureSink:
         return results
 
     def _publish_nvlink(
-        self, results, keys, tensors, replace_keys, feature_meta, started
-    ) -> List[Dict[str, Any]]:
+        self, output_results, keys, tensors, replace_keys, feature_meta, started
+    ) -> None:
         # The writer thread's current device is not the scheduler's; use the
         # capture tensors' device.
         device = next((t.device for t in tensors if t.is_cuda), None)
@@ -694,15 +739,14 @@ class SpecCaptureSink:
         addresses = arena.publish(keys, tensors, replace_keys)
         for meta, address in zip(feature_meta, addresses):
             meta["address"] = address
-        for result in results:
+        for result in output_results:
             result["arena"] = {"session": arena.session, "control": arena.control}
         if os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1":
             logger.info(
-                "[spec-capture-timing] nvlink_sink samples=%d objects=%d "
+                "[spec-capture-timing] nvlink_sink outputs=%d objects=%d "
                 "bytes=%d total_ms=%.3f",
-                len(results),
+                len(output_results),
                 len(keys),
                 sum(t.element_size() * t.numel() for t in tensors),
                 (time.perf_counter() - started) * 1000.0,
             )
-        return results
