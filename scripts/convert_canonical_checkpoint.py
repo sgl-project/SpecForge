@@ -90,13 +90,15 @@ def convert_checkpoint(source, output):
         raise ValueError("Output must be outside the source checkpoint")
     if output.exists():
         raise FileExistsError(output)
+    staging = output.with_name(output.name + ".converting")
+    if source.is_relative_to(staging.resolve()):
+        raise ValueError("Staging directory must not contain the source checkpoint")
     state = torch.load(
         source / "training_state.pt", map_location="cpu", weights_only=True
     )
     converted = convert_record(state)
     # Build the copy beside the destination and rename it last, so a failed
     # conversion never leaves an unconverted checkpoint at the output path.
-    staging = output.with_name(output.name + ".converting")
     if staging.exists():
         shutil.rmtree(staging)
     try:
