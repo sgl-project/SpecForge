@@ -795,7 +795,14 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertIsNone(
             MooncakeFeatureStore(store=fake, store_id="run0").consumer_device()
         )
-        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+        with (
+            mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "cpu"}),
+            mock.patch.object(torch.cuda, "is_available", return_value=False),
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store._ascend_runtime_available",
+                return_value=False,
+            ),
+        ):
             self.assertIsNone(
                 MooncakeFeatureStore(
                     store=fake, store_id="run0", receive_buffers="pinned"
@@ -852,16 +859,30 @@ class TestMooncakeFeatureStore(unittest.TestCase):
 
     def test_pinned_consumer_respects_explicit_non_cuda_device(self):
         store = _store(receive_buffers="pinned")
-        for device_type in ("cpu", "npu"):
-            with (
-                self.subTest(device_type=device_type),
-                mock.patch.dict(
-                    os.environ,
-                    {"SPECFORGE_DEVICE": device_type, "LOCAL_RANK": "0"},
-                ),
-                mock.patch.object(torch.cuda, "is_available", return_value=True),
-            ):
-                self.assertIsNone(store.consumer_device())
+        with (
+            mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "cpu", "LOCAL_RANK": "0"}),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+        ):
+            self.assertIsNone(store.consumer_device())
+        store.close()
+        # NPU device delivery is a separate opt-in for the pinned pool.
+        store = _store(receive_buffers="pinned", npu_loader_h2d=True)
+        npu_device = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"SPECFORGE_DEVICE": "npu", "LOCAL_RANK": "0"}),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store._ascend_runtime_available",
+                return_value=True,
+            ),
+            mock.patch.object(torch, "npu", mock.Mock(), create=True),
+            mock.patch(
+                "specforge.runtime.data_plane.mooncake_store.torch.device",
+                return_value=npu_device,
+            ) as device,
+        ):
+            self.assertIs(store.consumer_device(), npu_device)
+            device.assert_called_once_with("npu", 0)
         store.close()
 
     def test_pinned_consumer_preserves_explicit_cuda_rank(self):

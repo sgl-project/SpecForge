@@ -50,6 +50,45 @@ class DisaggregatedDefaultsTest(unittest.TestCase):
                 )
                 self._assert_worker_mode(cfg, override, expected)
 
+    def test_worker_npu_h2d_uses_config_unless_environment_overrides_it(self):
+        for configured, override, expected in (
+            (None, None, False),
+            (True, None, True),
+            (True, "0", False),
+            (False, "1", True),
+        ):
+            with self.subTest(configured=configured, override=override):
+                deployment = {
+                    "control_dir": "/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://capture:30000"],
+                }
+                if configured is not None:
+                    deployment["npu_loader_h2d"] = configured
+                cfg = Config.model_validate(
+                    {
+                        "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
+                        "model": {"target_model_path": "target"},
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "deployment": {
+                            "mode": "disaggregated",
+                            "disaggregated": deployment,
+                        },
+                    }
+                )
+                env = dict(_ENDPOINTS)
+                if override is not None:
+                    env["DISAGG_NPU_LOADER_H2D"] = override
+                with (
+                    mock.patch.dict("os.environ", env, clear=True),
+                    mock.patch(
+                        "specforge.runtime.data_plane.mooncake_store._connect_store",
+                        return_value=(_FakeMooncakeStore(), _InjectedReplicateConfig),
+                    ),
+                ):
+                    store = _mooncake_store(cfg)
+                self.assertEqual(store.npu_loader_h2d, expected)
+
     def test_legacy_environment_worker_uses_pinned_by_default(self):
         cfg = Config.model_validate(
             {

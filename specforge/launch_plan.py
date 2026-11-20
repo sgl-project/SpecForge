@@ -390,6 +390,9 @@ def _disaggregated_env(
         values["DISAGG_CLIENT_BUFFER_SIZE"] = str(deployment.client_buffer_size)
         values["DISAGG_RECEIVE_BUFFERS"] = deployment.receive_buffers
         values["DISAGG_RECEIVE_POOL_BYTES"] = str(deployment.receive_pool_bytes)
+        values["DISAGG_NPU_LOADER_H2D"] = base_env.get(
+            "DISAGG_NPU_LOADER_H2D", "1" if deployment.npu_loader_h2d else "0"
+        )
 
     optional_values = {
         "MOONCAKE_METADATA_SERVER": deployment.mooncake_metadata_server,

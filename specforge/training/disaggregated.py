@@ -137,10 +137,14 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
     deployment = cfg.deployment.disaggregated
     receive_kwargs: Dict[str, Any] = {
-        "receive_buffers": deployment.receive_buffers if deployment else "pinned"
+        "receive_buffers": deployment.receive_buffers if deployment else "pinned",
+        "npu_loader_h2d": deployment.npu_loader_h2d if deployment else False,
     }
     if os.environ.get("DISAGG_RECEIVE_BUFFERS"):
         receive_kwargs["receive_buffers"] = os.environ["DISAGG_RECEIVE_BUFFERS"]
+    if os.environ.get("DISAGG_NPU_LOADER_H2D") is not None:
+        flag = os.environ["DISAGG_NPU_LOADER_H2D"].strip().lower()
+        receive_kwargs["npu_loader_h2d"] = flag in ("1", "true", "yes", "on")
     validate_receive_buffers(receive_kwargs["receive_buffers"], protocol)
     if protocol == "nvlink":
         # Currently only online NVLink capture uses the arena: objects stay on
