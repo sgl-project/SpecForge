@@ -1,0 +1,416 @@
+"""MoE load balancing: counts per expert over a step, the expert-bias update, and the aux loss."""
+
+import unittest
+from dataclasses import replace
+from types import SimpleNamespace
+
+import torch
+from torch import nn
+
+from specforge.algorithms.objectives import build_objective_model
+from specforge.algorithms.objectives.moe_balance import (
+    AUX_LOSS_TYPES,
+    MoEBalancer,
+    PreparedLoad,
+    count_tokens_per_expert,
+    dispatch_balance,
+    moe_balance_loss,
+)
+from specforge.algorithms.objectives.registry import resolve_objective
+from specforge.modeling import build_draft_model
+from specforge.modeling.draft.layers.inputs import ExpertRouting
+from specforge.modeling.draft.layers.mlp import MoEFFN
+from specforge.runtime.contracts import TrainBatch
+from specforge.training.strategies.canonical import CanonicalTrainStrategy
+from tests.test_algorithms.test_objectives import configurations, training_batch
+from tests.test_modeling.test_canonical_dspark import model_config as dense_config
+from tests.test_modeling.test_canonical_dspark import moe_model_config
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
+
+# The objectives whose models carry expert routing out of the forward today.
+BALANCED = ("DFlashDraftModel", "DSparkDraftModel")
+
+
+class MoEBalanceTest(unittest.TestCase):
+    def test_counts_and_dispatch_balance(self):
+        expert_ids = torch.tensor([[0, 1], [0, 2], [3, 3], [1, 2]])
+        keep = torch.tensor([True, True, False, True])
+        counts = count_tokens_per_expert(expert_ids, keep, 4)
+        self.assertEqual(counts.tolist(), [2, 2, 2, 0])
+        self.assertEqual(counts.dtype, torch.long)
+        uniform, collapsed = torch.tensor([3, 3, 3, 3]), torch.tensor([8, 0, 0, 0])
+        torch.testing.assert_close(dispatch_balance(uniform), torch.tensor(1.0))
+        torch.testing.assert_close(dispatch_balance(collapsed), torch.tensor(4.0))
+        self.assertEqual(dispatch_balance(torch.zeros(4, dtype=torch.long)).item(), 0)
+
+    def test_option_is_validated_and_needs_a_biased_moe_draft(self):
+        options = {"num_anchors": 2, "bias_update_rate": 0.001}
+        resolved = resolve_objective("DSparkDraftModel", options=options)
+        # The registry takes the balancing options for objectives that provide routing.
+        self.assertFalse(hasattr(resolved.objective, "bias_update_rate"))
+        self.assertEqual(
+            resolved.statistics_settings,
+            {"bias_update_rate": 0.001, "aux_loss_type": "batch_wise"},
+        )
+        resolve_objective("DFlashDraftModel", options={"bias_update_rate": 0.5})
+        for architecture in ("DFlash2DraftModel", "DominoDraftModel"):
+            # Their models do not carry expert routing out yet, so no option either.
+            with self.subTest(architecture=architecture), self.assertRaises(TypeError):
+                resolve_objective(architecture, options={"bias_update_rate": 0.5})
+        with self.assertRaises(ValueError):
+            resolve_objective("DSparkDraftModel", options={"bias_update_rate": -1.0})
+        with self.assertRaisesRegex(ValueError, "aux_loss_type"):
+            resolve_objective(
+                "DSparkDraftModel", options={"aux_loss_type": "sequence_wise"}
+            )
+        with self.assertRaises(ValueError):  # the term's coefficient is a loss setting
+            resolve_objective(
+                "DFlashDraftModel",
+                loss={"terms": {"moe_balance": {"coefficient": -0.1}}},
+            )
+        with self.assertRaises(TypeError):
+            resolve_objective("DFlashDraftModel", options={"aux_loss_coef": 0.1})
+        with self.assertRaisesRegex(ValueError, "MoE layers"):
+            build_objective_model(build_draft_model(dense_config()), options=options)
+        with self.assertRaisesRegex(ValueError, "expert_bias"):
+            build_objective_model(
+                build_draft_model(moe_model_config(expert_bias=False)), options=options
+            )
+        runtime = build_objective_model(
+            build_draft_model(moe_model_config()), options={"num_anchors": 2}
+        )
+        self.assertIsNone(runtime.statistics)
+        # The auxiliary loss alone needs no expert bias.
+        runtime = build_objective_model(
+            build_draft_model(moe_model_config(expert_bias=False)),
+            options={"num_anchors": 2},
+            loss={"terms": {"moe_balance": {"coefficient": 0.01}}},
+        )
+        self.assertEqual(runtime.statistics.rate, 0.0)
+        self.assertEqual(runtime.statistics.settings["aux_loss_type"], "batch_wise")
+
+    def test_a_step_pools_the_window_and_moves_each_bias_zero_mean(self):
+        config = moe_model_config()
+        model = build_draft_model(config)
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "bias_update_rate": 0.01},
+            target_head=nn.Linear(
+                32, config.vocab_size, bias=False
+            ),  # DSpark's teacher
+        )
+        balancer = runtime.statistics
+        self.assertIsInstance(balancer, MoEBalancer)
+        self.assertEqual(balancer.step(), {})  # nothing observed yet
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        before = layer.gate.expert_bias.clone()
+        torch.manual_seed(0)
+        for _ in range(2):  # two micro-batches of one optimizer step
+            runtime(training_batch(config), step=0, total_steps=2).loss.backward()
+        with torch.no_grad():  # a forward without gradients counts nothing
+            runtime(training_batch(config), step=0, total_steps=2)
+        (counts,) = balancer.counts
+        slots = config.spec_config.protocol.num_model_slots
+        # Both anchors of each micro-batch are kept: every slot routes to top-2 experts.
+        self.assertEqual(counts.sum().item(), 2 * 2 * slots * 2)
+        metrics = balancer.step()
+        self.assertEqual(set(metrics), {"moe/step_balance"})
+        self.assertEqual(balancer.counts, [None])
+        moved = (
+            layer.gate.expert_bias - before
+        )  # the sign step is test_router_contract's
+        self.assertTrue(torch.any(moved != 0))
+        torch.testing.assert_close(moved.sum(), torch.zeros(()))
+        torch.testing.assert_close(
+            metrics["moe/step_balance"], dispatch_balance(counts)
+        )
+        self.assertEqual(balancer.step(), {})
+
+    def test_dflash_and_dspark_balance_and_fold_the_loss_end_to_end(self):
+        """The two objectives that provide expert routing move the bias and fold the loss."""
+        node = moe_spec(experts=expert_spec(16), router=router_spec(expert_bias=True))
+        configs = [c for c in configurations() if c.architecture in BALANCED]
+        self.assertEqual([c.architecture for c in configs], list(BALANCED))
+        for config in configs:
+            with self.subTest(architecture=config.architecture):
+                moe_config = replace(
+                    config,
+                    mlp_configs={"moe": node},
+                    layer_configs={
+                        name: replace(layer, mlp="moe")
+                        for name, layer in config.layer_configs.items()
+                    },
+                )
+                torch.manual_seed(11)
+                model = build_draft_model(moe_config)
+                for module in model.modules():
+                    if isinstance(module, MoEFFN):
+                        module.experts_kernel = "loop"
+                head = nn.Linear(32, config.vocab_size, bias=False)
+                batch = training_batch(config)
+                plain = build_objective_model(
+                    model, options={"num_anchors": 2}, target_head=head
+                )
+                runtime = build_objective_model(
+                    model,
+                    options={"num_anchors": 2, "bias_update_rate": 0.01},
+                    loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
+                    target_head=head,
+                )
+                self.assertIsNone(plain.statistics)
+                self.assertIn("expert_routing", runtime.registration.provides)
+                balancer = runtime.statistics
+                self.assertEqual(len(balancer.layers), len(config.layer_types))
+                torch.manual_seed(1)
+                base = plain(batch, step=1, total_steps=10)
+                torch.manual_seed(1)
+                result = runtime(batch, step=1, total_steps=10)
+                # The term's value rides on the result; the executor weighted it.
+                aux, one = result.ratios["moe_balance"]
+                self.assertEqual(one.item(), 1.0)
+                self.assertGreater(aux.item(), 0.0)
+                self.assertNotIn("moe_balance", base.ratios)
+                torch.testing.assert_close(result.loss, base.loss + 0.5 * aux)
+                result.loss.backward()
+                for counts in balancer.counts:
+                    self.assertGreater(counts.sum().item(), 0)
+                self.assertEqual(set(balancer.step()), {"moe/step_balance"})
+
+    def test_layers_with_different_expert_counts_keep_their_own_statistics(self):
+        """An 8-expert and a 4-expert layer each balance and move their bias on their own load."""
+        config = moe_model_config()
+        wide = replace(config.mlp_configs["moe"], num_experts=8)
+        config = replace(
+            config,
+            mlp_configs={"moe8": wide, "moe4": config.mlp_configs["moe"]},
+            layer_configs={
+                "wide": replace(config.layer_configs["full_moe"], mlp="moe8"),
+                "narrow": replace(config.layer_configs["full_moe"], mlp="moe4"),
+            },
+            layer_types=("wide", "narrow"),
+        )
+        model = build_draft_model(config)
+        layers = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        self.assertEqual([layer.config.num_experts for layer in layers], [8, 4])
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "bias_update_rate": 0.01},
+            loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
+            target_head=nn.Linear(32, config.vocab_size, bias=False),
+        )
+        balancer, seen = runtime.statistics, []
+        balance = balancer.balance
+
+        def record(output, *, keep, **options):  # what the forward hands the statistics
+            seen.append((output, keep))
+            return balance(output, keep=keep, **options)
+
+        balancer.balance = record
+        torch.manual_seed(0)
+        result = runtime(training_batch(config), step=0, total_steps=2)
+        (output, keep) = seen[0]
+        counts = [
+            count_tokens_per_expert(routing.expert_ids, keep, size)
+            for routing, size in zip(output.expert_routing, (8, 4))
+        ]
+        self.assertEqual([tuple(c.shape) for c in counts], [(8,), (4,)])
+        # Each layer is normalized by its own expert count; the loss is their mean.
+        per_layer = [
+            moe_balance_loss(
+                SimpleNamespace(expert_routing=(routing,)), keep, PreparedLoad((c,))
+            )
+            for routing, c in zip(output.expert_routing, counts)
+        ]
+        torch.testing.assert_close(
+            result.ratios["moe_balance"][0], torch.stack(per_layer).mean().detach()
+        )
+        result.loss.backward()
+        before = [layer.gate.expert_bias.clone() for layer in layers]
+        metrics = runtime.statistics.step()
+        for layer, old, c in zip(layers, before, counts):
+            load = c.float()
+            delta = 0.01 * torch.sign(load.mean() - load)
+            torch.testing.assert_close(
+                layer.gate.expert_bias - old, delta - delta.mean()
+            )
+        torch.testing.assert_close(
+            metrics["moe/step_balance"],
+            torch.stack([dispatch_balance(c) for c in counts]).mean(),
+        )
+
+    def test_balance_term_counts_the_tokens_of_the_given_mask(self):
+        """The term takes the forward's token mask in routing order, whatever layout made it."""
+        config = moe_model_config()
+        model = build_draft_model(config)
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "bias_update_rate": 0.01},
+            target_head=nn.Linear(32, config.vocab_size, bias=False),
+        )
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        E, K = layer.config.num_experts, layer.config.num_experts_per_tok
+        torch.manual_seed(0)
+        scores = torch.randn(2 * 6, E).softmax(-1)
+        ids = scores.topk(K, dim=-1).indices
+        output = SimpleNamespace(
+            expert_routing=(ExpertRouting(ids, scores),), hidden_states=scores
+        )
+        keep = torch.tensor([[True] * 4 + [False] * 2, [False] + [True] * 5])
+        term, value = runtime.balance_term(output, keep, {})
+        self.assertEqual(
+            (term.output, term.reduction, value.item()), ("moe_balance", "scalar", 0.0)
+        )
+        (counts,) = runtime.statistics.counts
+        self.assertTrue(
+            torch.equal(counts, count_tokens_per_expert(ids, keep.reshape(-1), E))
+        )
+        self.assertEqual(counts.sum().item(), 9 * K)
+
+    def test_the_loss_matches_transformers(self):
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            load_balancing_loss_func,
+        )
+
+        torch.manual_seed(0)
+        B, S, E, K = 2, 6, 4, 2
+        logits = torch.randn(B * S, E, requires_grad=True)
+        scores = logits.softmax(-1)
+        expert_ids = scores.topk(K, dim=-1).indices
+        output = SimpleNamespace(expert_routing=(ExpertRouting(expert_ids, scores),))
+        mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])
+        for attention_mask in (None, mask):
+            with self.subTest(masked=attention_mask is not None):
+                want = load_balancing_loss_func((logits,), E, K, attention_mask)
+                keep = (
+                    torch.ones(B * S, dtype=torch.bool)
+                    if attention_mask is None
+                    else attention_mask.reshape(-1).bool()
+                )
+                load = PreparedLoad((count_tokens_per_expert(expert_ids, keep, E),))
+                # Transformers sums the K slots of each token: K times the per-token form.
+                torch.testing.assert_close(
+                    K * moe_balance_loss(output, keep, load), want
+                )
+        uniform = SimpleNamespace(
+            expert_routing=(ExpertRouting(expert_ids, torch.full((B * S, E), 1.0 / E)),)
+        )
+        torch.testing.assert_close(
+            moe_balance_loss(
+                uniform,
+                torch.ones(B * S, dtype=torch.bool),
+                PreparedLoad((torch.full((E,), 2),)),
+            ),
+            torch.tensor(1.0),
+        )
+        none = torch.zeros(B * S, dtype=torch.bool)
+        load = PreparedLoad((count_tokens_per_expert(expert_ids, none, E),))
+        loss = moe_balance_loss(output, none, load)
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertTrue(torch.all(logits.grad == 0))
+
+    def test_the_value_balances_against_its_own_or_this_steps_pooled_load(self):
+        model = build_draft_model(moe_model_config(expert_bias=False))
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        E = layer.config.num_experts
+        torch.manual_seed(0)
+        keep = torch.tensor([True] * 8 + [False] * 2)
+        outputs = []
+        for _ in range(2):
+            scores = torch.randn(10, E, requires_grad=True).softmax(-1)
+            ids = scores.topk(2, dim=-1).indices
+            outputs.append(
+                SimpleNamespace(expert_routing=(ExpertRouting(ids, scores),))
+            )
+        counts = [
+            count_tokens_per_expert(o.expert_routing[0].expert_ids, keep, E)
+            for o in outputs
+        ]
+        own = [
+            moe_balance_loss(o, keep, PreparedLoad((c,)))
+            for o, c in zip(outputs, counts)
+        ]
+        for aux_loss_type in AUX_LOSS_TYPES:
+            with self.subTest(aux_loss_type=aux_loss_type):
+                balancer = MoEBalancer(model, rate=0.0, aux_loss_type=aux_loss_type)
+                first = balancer.balance(outputs[0], keep=keep, pooled=True)
+                self.assertTrue(first.requires_grad)
+                # A step's first forward balances against its own load either way.
+                torch.testing.assert_close(first, own[0])
+                second = balancer.balance(outputs[1], keep=keep, pooled=True)
+                load = (
+                    counts[0] + counts[1]
+                    if aux_loss_type == "batch_wise"
+                    else counts[1]
+                )
+                torch.testing.assert_close(
+                    second, moe_balance_loss(outputs[1], keep, PreparedLoad((load,)))
+                )
+                if aux_loss_type == "batch_wise":
+                    self.assertTrue(
+                        torch.equal(balancer.pooled[0], counts[0] + counts[1])
+                    )
+                else:
+                    self.assertIsNone(balancer.pooled)
+                # Without pooling (evaluation: no grad, so not counted) every forward
+                # balances against its own load.
+                with torch.no_grad():
+                    torch.testing.assert_close(
+                        balancer.balance(outputs[1], keep=keep, pooled=False), own[1]
+                    )
+                # The optimizer step takes the pooled load as it is (batch_wise) and
+                # pools the window's counts itself otherwise; rate 0 moves no bias.
+                reduce, reductions = balancer._sum_over_ranks, []
+
+                def counted_reduce(counts, group):
+                    reductions.append(counts)
+                    return reduce(counts, group)
+
+                balancer._sum_over_ranks = counted_reduce
+                metrics = balancer.step()
+                self.assertEqual(set(metrics), {"moe/step_balance"})
+                self.assertEqual(
+                    len(reductions), 0 if aux_loss_type == "batch_wise" else 1
+                )
+                torch.testing.assert_close(
+                    metrics["moe/step_balance"], dispatch_balance(counts[0] + counts[1])
+                )
+                self.assertIsNone(balancer.pooled)
+        # No balancer while the bias stays and no balance term is on; the term alone needs one.
+        settings = {"bias_update_rate": 0.0, "aux_loss_type": "batch_wise"}
+        self.assertIsNone(MoEBalancer.from_settings(model, settings))
+        self.assertIsNotNone(
+            MoEBalancer.from_settings(model, settings, balance_term=True)
+        )
+
+    def test_the_strategy_prepares_the_load_and_pools_only_while_training(self):
+        config = moe_model_config(expert_bias=False)
+        model = build_draft_model(config)
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2},
+            loss={"terms": {"moe_balance": {"coefficient": 0.5}}},
+            target_head=nn.Linear(32, config.vocab_size, bias=False),
+        )
+        strategy = CanonicalTrainStrategy(
+            runtime, name="dspark", objective=runtime.objective, required_features=()
+        )
+        batch = TrainBatch(
+            sample_ids=["a"], strategy="dspark", tensors=training_batch(config)
+        )
+        out = strategy.forward_loss(batch)
+        aux = out.ratio_metrics["moe_balance"][0]
+        self.assertGreater(aux.item(), 0.0)
+        self.assertIsNotNone(runtime.statistics.pooled)  # training: this step's load
+        numerator, denominator = out.loss_terms
+        torch.testing.assert_close(out.loss, numerator / denominator)
+        runtime.statistics.step()
+        runtime.eval()
+        with torch.no_grad():
+            out = strategy.forward_loss(batch)
+        self.assertIn("moe_balance", out.ratio_metrics)
+        self.assertIsNone(runtime.statistics.pooled)  # evaluation: its own load
+
+
+if __name__ == "__main__":
+    unittest.main()

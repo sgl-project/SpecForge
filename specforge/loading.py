@@ -64,10 +64,13 @@ def _dtype(requested, checkpoint):
         if not isinstance(requested, torch.dtype) or not requested.is_floating_point:
             raise ValueError("dtype must be a floating-point torch.dtype")
         return requested
+    # The checkpoint's one floating dtype; a MoE router's expert_bias is fp32 whatever it is.
     types = {
         ref.info.dtype
-        for ref in checkpoint.weights.values()
-        if isinstance(ref.info.dtype, torch.dtype) and ref.info.dtype.is_floating_point
+        for name, ref in checkpoint.weights.items()
+        if not name.endswith(".expert_bias")
+        and isinstance(ref.info.dtype, torch.dtype)
+        and ref.info.dtype.is_floating_point
     }
     if len(types) != 1:
         raise ValueError(

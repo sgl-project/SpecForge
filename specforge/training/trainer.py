@@ -334,6 +334,22 @@ class Trainer:
                     persisted_contract[key] = current
                 comparison_current = current
                 comparison_persisted = persisted
+                if (
+                    key == "canonical_loss"
+                    and isinstance(persisted, dict)
+                    and isinstance(persisted.get("terms"), dict)
+                ):
+                    # A term the checkpoint never knew counts as off, so a record
+                    # from before that term existed resumes with it off.
+                    unknown = {
+                        name: term
+                        for name, term in current["terms"].items()
+                        if name not in persisted["terms"] and term["coefficient"] == 0
+                    }
+                    comparison_persisted = {
+                        **persisted,
+                        "terms": {**unknown, **persisted["terms"]},
+                    }
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,

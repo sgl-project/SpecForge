@@ -27,6 +27,7 @@ class LossComputation:
         self.ratios = {}
         self.partials = {}  # Additive scalars for protocol-specific batch reduction.
         self._calls = set()
+        self.supplied = frozenset(self.predictions.term_values)
 
     @property
     def teacher(self):
@@ -73,6 +74,8 @@ class LossComputation:
         """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
         for indices in groups:
+            if group is None and set(indices) <= self.supplied:
+                continue  # its value came with the predictions
             if any(i in self.numerators for i in indices):
                 raise ValueError("Loss terms must execute exactly once")
             result = self._execute(
@@ -99,6 +102,8 @@ class LossComputation:
         apply, including explicit masks for router or other model regularizers.
         Scalar terms run once over the full prediction set without token weighting.
         """
+        if index in self.supplied:
+            raise ValueError("The term's value came with the predictions")
         if index in self.numerators:
             raise ValueError("Loss terms must execute exactly once")
         terms = list(self.request.terms)
