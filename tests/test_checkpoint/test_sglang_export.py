@@ -1,5 +1,6 @@
 """Serving format boundaries, exact tensor layout, and native shard replacement."""
 
+import errno
 import json
 import unittest
 from dataclasses import dataclass, replace
@@ -289,8 +290,10 @@ class SGLangExportTest(unittest.TestCase):
                         tables["model.embed_tokens.weight"],
                     )
                 )
+                shard = restored.files["lm_head.weight"]
+                self.assertFalse(shard.is_symlink())
                 self.assertEqual(
-                    restored.files["lm_head.weight"].is_symlink(), not copy
+                    shard.samefile(target / "tables.safetensors"), not copy
                 )
                 for shard in (root / "served").glob("target-*.safetensors"):
                     self.assertFalse(
@@ -308,6 +311,20 @@ class SGLangExportTest(unittest.TestCase):
                     {"target.weight", *old_native},
                 )
                 if not copy:
+                    with (
+                        patch(
+                            "specforge.checkpoint.formats.native.writer.os.link",
+                            side_effect=OSError(errno.EXDEV, "cross-device link"),
+                        ),
+                        self.assertRaisesRegex(ValueError, "--copy-target"),
+                    ):
+                        export_draft(
+                            str(root / "draft"),
+                            str(root / "cross-device"),
+                            export_mode="native",
+                            target_model=str(target),
+                        )
+                    self.assertFalse((root / "cross-device").exists())
                     for path in (
                         ("attn_output_gate",),
                         ("hidden_act",),

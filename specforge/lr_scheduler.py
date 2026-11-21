@@ -4,6 +4,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
 from torch.optim.lr_scheduler import LRScheduler as _LRScheduler
 
 
+def warmup_steps_from_ratio(ratio: float, total_steps: int) -> int:
+    """Return the number of complete optimizer steps in a warmup period."""
+    return int(ratio * total_steps)
+
+
 class _TwoStageScheduler(_LRScheduler):
     def __init__(self, optimizer, after_scheduler: _LRScheduler, last_epoch=-1):
         self.after_scheduler = after_scheduler

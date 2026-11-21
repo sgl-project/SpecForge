@@ -156,7 +156,7 @@ Named `attention_configs` define GQA, MHA or MLA, including `is_causal` and
 live in `spec_config`. A checkpoint stores the expanded canonical configuration.
 There are no target-derived defaults or structural overrides in the run config.
 
-See [draft training](../../draft_training.md) for objectives, kernel options,
+See [draft training](/draft_training.md) for objectives, kernel options,
 sequence parallelism and checkpoint initialization.
 
 ### DFlash2
@@ -696,12 +696,12 @@ online NPU MTP recipe uses this path and the native preset.
 
 All training now uses canonical draft configuration. EAGLE3 supports cached
 FlashAttention and Ulysses/Ring sequence parallelism; trainer tensor parallelism
-remains unsupported. See [objective and backend options](../../draft_training.md).
+remains unsupported. See [objective and backend options](/draft_training.md).
 The old model implementations and training wrappers have been removed.
 
 Historical draft checkpoints and configuration formats are no longer accepted.
 Convert an old checkpoint's weights with `scripts/convert_legacy_checkpoint.py`
-(see [checkpoint boundary](../../draft_training.md#checkpoint-and-configuration-boundary))
+(see [checkpoint boundary](/draft_training.md#checkpoint-and-configuration-boundary))
 and import them through `initialization.checkpoint`. Use canonical presets or
 inline canonical configurations for new training.
 

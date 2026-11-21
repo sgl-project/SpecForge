@@ -104,7 +104,7 @@ An objective registers independently in `algorithms.objectives`: it declares the
 architectures, inputs, outputs and trainable modules it supports. The model owns
 learned execution, fusion and heads; the objective owns supervision and loss.
 `training.objective_options` contains training-only settings. See
-[draft training](../../draft_training.md) for loading and optimization options.
+[draft training](/draft_training.md) for loading and optimization options.
 
 Export uses `specforge export --converter sglang`. The converter checks the complete
 structure against supported serving implementations and rejects incompatible
@@ -158,7 +158,7 @@ optimized implementation where one applies and the reference elsewhere.
 `false` always evaluates the reference.
 An explicit `fused: true` for a categorical loss raises off
 CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
-[loss execution](../../draft_training.md#loss-execution)).
+[loss execution](/draft_training.md#loss-execution)).
 Domino selects its specialized CE kernel under the same flag.
 
 `training.loss.execution.chunk_size` sets the chunk size, and

@@ -199,6 +199,45 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                     )
                     resumed.fit()
 
+    def test_staging_directory_must_not_contain_source(self):
+        architecture, name, old_options, flat, _ = CASES[4]
+        old = {
+            "canonical_draft_config": {"architectures": [architecture]},
+            "canonical_objective": name,
+            "canonical_objective_options": {
+                **asdict(resolve_objective(architecture).objective),
+                **old_options,
+            },
+            "canonical_loss": flat,
+        }
+        for nested in (False, True):
+            with self.subTest(nested=nested), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "converted"
+                staging = Path(temp) / "converted.converting"
+                source = staging / "source" if nested else staging
+                source.mkdir(parents=True)
+                torch.save(old, source / "training_state.pt")
+                (source / "config.json").write_text('{"fixture": true}')
+                (source / "training_state_rank0.pt").write_bytes(b"shard")
+                if nested:
+                    (staging / "sibling").write_bytes(b"preserve me")
+                before = {
+                    p.relative_to(staging): p.read_bytes()
+                    for p in staging.rglob("*")
+                    if p.is_file()
+                }
+                with self.assertRaisesRegex(ValueError, "Staging directory"):
+                    convert_checkpoint(source, output)
+                self.assertFalse(output.exists())
+                self.assertEqual(
+                    before,
+                    {
+                        p.relative_to(staging): p.read_bytes()
+                        for p in staging.rglob("*")
+                        if p.is_file()
+                    },
+                )
+
     def test_fused_dspine_identities_and_invalid_destinations(self):
         resolved = resolve_objective("DSpineDraftModel")
         old = {

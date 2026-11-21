@@ -13,7 +13,11 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.controller import TrainerController, TrainerCore
 from specforge.training.strategies.base import StepContext
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
-from tests.test_modeling.test_dspine_distributed import fixed_anchors, uneven_batch
+from tests.test_modeling.test_dspine_distributed import (
+    fixed_anchors,
+    per_microbatch_objective,
+    uneven_batch,
+)
 from tests.test_runtime._fixtures import build_strategy
 
 
@@ -58,7 +62,7 @@ class DSpineAccumulationTest(unittest.TestCase):
                     )
                 )
                 split = copy.deepcopy(full)
-                (full_core, full_optimizer) = training_core(full, 1)
+                (_, full_optimizer) = training_core(full, 1)
                 (split_core, split_optimizer) = training_core(split, accumulation_steps)
                 for window in range(2):
                     batches = [uneven_batch(), uneven_batch()]
@@ -67,10 +71,10 @@ class DSpineAccumulationTest(unittest.TestCase):
                         for name in batches[0]
                     }
                     ctx = StepContext(global_step=300 + window, total_steps=600)
-                    expected = full_core.train_step(
-                        TrainBatch(["0", "1", "2", "3"], "dspine", inputs), ctx
-                    )
                     width = 4 // accumulation_steps
+                    expected = per_microbatch_objective(full, inputs, width, ctx)
+                    expected.backward()
+                    full_optimizer.step()
                     for microstep in range(accumulation_steps):
                         start = microstep * width
                         actual = split_core.train_step(
@@ -94,8 +98,8 @@ class DSpineAccumulationTest(unittest.TestCase):
                             len(split_optimizer.gradients), window + int(boundary)
                         )
                     self.assertLessEqual(
-                        abs(actual.loss - expected.loss),
-                        max(1e-12, 2e-06 * abs(expected.loss)),
+                        abs(actual.loss - expected.item()),
+                        max(1e-12, 2e-06 * abs(expected.item())),
                     )
                     for got, want in zip(
                         split_optimizer.gradients[-1], full_optimizer.gradients[-1]
