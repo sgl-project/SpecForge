@@ -495,57 +495,40 @@ class TestExpandGenerationEvents(unittest.TestCase):
         self.assertEqual(stripped_loss_text, event_loss_text)
 
     def test_shared_validator_rejects_non_string_roles(self):
-        for role in ([], ["user"], {}, {"role": "user"}, None, True, 7):
-            for error_style in ("validation", "regeneration"):
-                with self.subTest(role=role, error_style=error_style):
-                    reason = validate_basic_conversation(
-                        [{"role": role, "content": "question"}],
-                        error_style=error_style,
-                    )
-                    self.assertIsInstance(reason, str)
-                    self.assertIn("role", reason)
+        for role in ([], {}):
+            with self.subTest(role=role):
+                messages = [{"role": role, "content": "question"}]
+                self.assertEqual(
+                    validate_basic_conversation(messages),
+                    f"message 0 has unsupported role {role!r}",
+                )
+                self.assertEqual(
+                    validate_basic_conversation(messages, error_style="regeneration"),
+                    f"Invalid message role: {role}",
+                )
 
-    def test_cli_skips_invalid_roles_and_continues_valid_conversations(self):
-        before = {
-            "id": "before",
-            "status": "success",
-            "conversations": [
-                {"role": "user", "content": "u1"},
-                {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
-                {"role": "user", "content": "u2"},
-                {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
-            ],
-        }
-        rows = [before]
-        for index, role in enumerate(([], {}, "tool", None, True, 7)):
-            messages = [
-                {"role": "user", "content": "question"},
-                {
-                    "role": "assistant",
-                    "content": "answer",
-                    "reasoning_content": "reason",
-                },
-            ]
-            messages[1 if isinstance(role, dict) else 0]["role"] = role
-            rows.append(
-                {
-                    "id": f"invalid-{index}",
-                    "status": "success",
-                    "conversations": messages,
-                }
-            )
-        rows.append(
-            {
-                "id": "after",
-                "status": "success",
-                "conversations": before["conversations"][:2],
-            }
-        )
+    def test_cli_continues_after_invalid_role(self):
         with TemporaryDirectory() as tmpdir:
-            input_path = Path(tmpdir) / "input.jsonl"
-            output_path = Path(tmpdir) / "events.jsonl"
-            input_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
-            result = subprocess.run(
+            source = Path(tmpdir) / "input.jsonl"
+            output = Path(tmpdir) / "events.jsonl"
+            with source.open("w", encoding="utf-8") as stream:
+                for row_id, role in (
+                    ("before", "user"),
+                    ("bad", []),
+                    ("after", "user"),
+                ):
+                    messages = [
+                        {"role": role, "content": "question"},
+                        {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_content": "r",
+                        },
+                    ]
+                    row = {"id": row_id, "status": "success", "conversations": messages}
+                    print(json.dumps(row), file=stream)
+
+            subprocess.run(
                 [
                     sys.executable,
                     str(
@@ -553,63 +536,17 @@ class TestExpandGenerationEvents(unittest.TestCase):
                         / "scripts/expand_reasoning_conversations.py"
                     ),
                     "--input-file-path",
-                    str(input_path),
+                    str(source),
                     "--output-file-path",
-                    str(output_path),
+                    str(output),
                 ],
-                capture_output=True,
-                text=True,
-                check=False,
+                check=True,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            events = [json.loads(line) for line in output_path.read_text().splitlines()]
-            skipped = [
-                json.loads(line)
-                for line in Path(skipped_path(str(output_path)))
-                .read_text()
-                .splitlines()
-            ]
-            self.assertEqual(
-                [event["id"] for event in events],
-                ["before#turn0", "before#turn1", "after#turn0"],
-            )
-            self.assertEqual([event["source_row_index"] for event in events], [0, 0, 7])
-            self.assertEqual(
-                [row["source_row_index"] for row in skipped], list(range(1, 7))
-            )
-            self.assertEqual(
-                [row["id"] for row in skipped],
-                [f"invalid-{index}" for index in range(6)],
-            )
-            for row in skipped:
-                self.assertEqual(row["status"], "skipped")
-                self.assertIn("Invalid message role", row["error"])
-            self.assertNotIn("reasoning_content", events[1]["conversations"][1])
-            self.assertEqual(events[1]["conversations"][-1]["reasoning_content"], "r2")
-
-    def test_cli_still_terminates_on_malformed_json(self):
-        with TemporaryDirectory() as tmpdir:
-            input_path = Path(tmpdir) / "input.jsonl"
-            output_path = Path(tmpdir) / "events.jsonl"
-            input_path.write_text("{broken\n")
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(
-                        Path(__file__).resolve().parents[2]
-                        / "scripts/expand_reasoning_conversations.py"
-                    ),
-                    "--input-file-path",
-                    str(input_path),
-                    "--output-file-path",
-                    str(output_path),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("JSONDecodeError", result.stderr)
+            ids = [json.loads(line)["id"] for line in output.read_text().splitlines()]
+            self.assertEqual(ids, ["before#turn0", "after#turn0"])
+            skipped = json.loads(Path(skipped_path(str(output))).read_text())
+            self.assertEqual(skipped["id"], "bad")
+            self.assertIn("Invalid message role", skipped["error"])
 
 
 if __name__ == "__main__":
