@@ -171,6 +171,8 @@ def resolve_run(cfg, *, target_config=None):
             )
     # Retain the established strategy name for data/rendezvous identifiers.
     options = asdict(resolved.objective)
+    # The balancing options sit beside the objective's; build_bundle reads them back.
+    options.update(resolved.statistics_settings)
     if cfg.training.weighting is not None:
         # An explicit weighting replaces these. build_bundle resolves this
         # config again and must not read the objective's defaults as user input.
@@ -376,20 +378,23 @@ def preflight_kernels(cfg):
     if requested is None:
         from specforge.algorithms.objectives import resolve_objective
         from specforge.config.draft.mlp.dense import DenseFFNSpec
+        from specforge.config.draft.mlp.moe import MoEFFNSpec
 
         if trainer_platform() not in _LIGER_VALIDATED_PLATFORMS:
             return  # auto never enables Liger here, so there is nothing to read
         draft = resolve_config(cfg)
-        acts = {
-            node.hidden_act
-            for node in draft.mlp_configs.values()
-            if isinstance(node, DenseFFNSpec)
-        }
+        acts = set()  # what Liger's SwiGLU would replace: dense FFNs and shared experts
+        for node in draft.mlp_configs.values():
+            if isinstance(node, DenseFFNSpec):
+                acts.add(node.hidden_act)
+            elif isinstance(node, MoEFFNSpec) and node.shared_expert is not None:
+                acts.add(node.shared_expert.hidden_act)
         resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
         choice = liger_choice(
             None,
             by_default=resolved.registration.training.liger_by_default,
-            hidden_act="silu" if acts <= {"silu", "swish"} and acts else "other",
+            # routed experts keep their own kernel; without other FFNs Liger has its RMSNorm
+            hidden_act="silu" if acts <= {"silu", "swish"} else "other",
         )
         if not choice.enabled:
             return
@@ -435,6 +440,7 @@ def build_bundle(cfg, algorithm):
         configure_kernels,
         liger_hidden_act,
     )
+    from specforge.modeling.draft.layers.mlp import MoEFFN
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
 
@@ -545,7 +551,10 @@ def build_bundle(cfg, algorithm):
     logger.info(liger.describe())
     use_liger = liger.enabled
     use_fused_conv = configure_kernels(
-        model, use_liger=use_liger, use_fused_conv=cfg.model.use_fused_conv
+        model,
+        use_liger=use_liger,
+        use_fused_conv=cfg.model.use_fused_conv,
+        moe_experts_kernel=cfg.model.moe_experts_kernel,
     )
     if cfg.training.attention_backend == "flex_attention":
         _raise_flex_recompile_limit()
@@ -580,12 +589,14 @@ def build_bundle(cfg, algorithm):
         )
     )
     runtime.fsdp_param_dtype = dtype
+    options = objective_record(runtime.objective_name, asdict(runtime.objective))
+    if runtime.statistics is not None:
+        # Statistics settings join the contract only while on; earlier runs wrote none.
+        options.update(runtime.statistics.settings)
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
-        "canonical_objective_options": objective_record(
-            runtime.objective_name, asdict(runtime.objective)
-        ),
+        "canonical_objective_options": options,
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": use_fused_conv,
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
@@ -594,6 +605,9 @@ def build_bundle(cfg, algorithm):
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,
     }
+    if any(isinstance(module, MoEFFN) for module in model.modules()):
+        # Dense drafts never record the kernel, so their earlier checkpoints still resume.
+        contract["canonical_moe_experts_kernel"] = cfg.model.moe_experts_kernel
     from specforge.training.provenance import model_resume_provenance
 
     provenance = model_resume_provenance(

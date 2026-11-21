@@ -164,6 +164,7 @@ class _FakeDFlashModel(nn.Module):
         self.draft_model.register_parameter("w", nn.Parameter(torch.ones(1)))
         self.draft_model.config = SimpleNamespace(draft=None)
         self.registration = SimpleNamespace(training=TrainingRequirements())
+        self.statistics = None  # no per-forward statistics in this fake
 
     @property
     def w(self):
