@@ -157,6 +157,18 @@ def _ascend_runtime_available() -> bool:
         return False
 
 
+def _accelerator_module(device_type: str):
+    """The ``torch.cuda``/``torch.npu`` module behind a device type."""
+    if device_type == "cuda":
+        return torch.cuda
+    if device_type == "npu":
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            raise ValueError("NPU receive copies need torch_npu imported")
+        return npu
+    raise ValueError(f"no copy-stream support for device type {device_type!r}")
+
+
 def _bind_transport_device() -> None:
     """Bind this process's local NPU before Mooncake installs its transport.
 
@@ -407,7 +419,9 @@ class ReceiveBufferPool:
             # The caching allocator can return memory still used on this stream.
             torch.cuda.current_stream(device).synchronize()
         else:
-            pin = torch.cuda.is_available()
+            # torch_npu provides a pinned host allocator as well; without any
+            # accelerator, pinned mode degrades to pageable host buffers.
+            pin = torch.cuda.is_available() or _ascend_runtime_available()
             storage = torch.empty(nbytes, dtype=torch.uint8, pin_memory=pin)
         registered = False
         if not self._registration_disabled:
@@ -519,11 +533,12 @@ class ReceiveBufferPool:
 
     def copy_stream(self, device: torch.device):
         """Per-thread side stream for copies out of receive slots."""
+        module = _accelerator_module(device.type)
         if device.index is None:
-            device = torch.device("cuda", torch.cuda.current_device())
+            device = torch.device(device.type, module.current_device())
         stream = getattr(self._streams, "stream", None)
         if stream is None or stream.device != device:
-            stream = torch.cuda.Stream(device=device)
+            stream = module.Stream(device=device)
             self._streams.stream = stream
         return stream
 
@@ -582,6 +597,7 @@ class MooncakeFeatureStore(FeatureStore):
         clock: Callable[[], float] = time.monotonic,
         receive_buffers: str = "pageable",
         receive_pool_bytes: int = DEFAULT_RECEIVE_POOL_BYTES,
+        npu_loader_h2d: bool = False,
     ) -> None:
         self.auth = auth or AuthPolicy()
         self._credential = credential
@@ -619,6 +635,7 @@ class MooncakeFeatureStore(FeatureStore):
                 f"receive_buffers={receive_buffers!r} not in {RECEIVE_BUFFER_KINDS}"
             )
         self.receive_buffers = receive_buffers
+        self.npu_loader_h2d = bool(npu_loader_h2d)
         self._receive_pool: Optional[ReceiveBufferPool] = (
             ReceiveBufferPool(
                 store,
@@ -730,23 +747,35 @@ class MooncakeFeatureStore(FeatureStore):
         """Request device tensors so pooled copies run in the loader worker.
 
         Only floating-point features are placed on this device; integer
-        features stay on the host (see :func:`_stays_on_host`).
+        features stay on the host (see :func:`_stays_on_host`). NPU delivery
+        requires ``npu_loader_h2d`` so prefetched batches do not accumulate in
+        device memory unless explicitly requested.
         """
         if self.receive_buffers == "pageable":
             return None
-        if self.receive_buffers == "pinned":
-            from specforge.utils import get_device_type
+        from specforge.utils import get_device_type
 
-            # Visible CUDA devices do not override an explicit CPU/NPU trainer.
-            if get_device_type() != "cuda" or not torch.cuda.is_available():
+        device_type = get_device_type()
+        if self.receive_buffers == "pinned":
+            # Visible CUDA devices do not override an explicit CPU trainer.
+            if device_type == "cuda" and torch.cuda.is_available():
+                pass
+            elif (
+                device_type == "npu"
+                and self.npu_loader_h2d
+                and _ascend_runtime_available()
+            ):
+                pass
+            else:
                 return None
+        else:
+            device_type = "cuda"
         # Mirror init_distributed: the launcher's LOCAL_RANK names this rank's
         # device even before the process group has selected it.
+        module = _accelerator_module(device_type)
         local_rank = os.environ.get("LOCAL_RANK")
-        index = (
-            int(local_rank) if local_rank is not None else torch.cuda.current_device()
-        )
-        return torch.device("cuda", index)
+        index = int(local_rank) if local_rank is not None else module.current_device()
+        return torch.device(device_type, index)
 
     def close(self) -> None:
         """Release receive memory after loaders and removal drains have stopped.
@@ -827,12 +856,15 @@ class MooncakeFeatureStore(FeatureStore):
                 out = view.clone()
             else:
                 stream = pool.copy_stream(view.device if view.is_cuda else target)
-                with torch.cuda.stream(stream):
+                module = _accelerator_module(stream.device.type)
+                with module.stream(stream):
                     out = view.to(target, non_blocking=True, copy=True)
-                # RDMA cannot wait on a CUDA event before reusing this slot.
+                # RDMA cannot wait on a device event before reusing this slot.
                 stream.synchronize()
                 if out.is_cuda:
                     out.record_stream(torch.cuda.current_stream(target))
+                elif target.type == "npu" and hasattr(out, "record_stream"):
+                    out.record_stream(torch.npu.current_stream(target))
         except Exception:
             pool.release(slot, pooled, quarantine=True)
             raise
