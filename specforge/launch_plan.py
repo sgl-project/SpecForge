@@ -323,6 +323,11 @@ def _offline_producer_segment_size(
     return value
 
 
+def ref_channel_path(cfg: Config) -> str:
+    """Path of the ref channel the online producer and trainer of *cfg* share."""
+    return str(Path(cfg.deployment.disaggregated.control_dir) / "refs.jsonl")
+
+
 def _disaggregated_env(
     cfg: Config,
     base_env: Mapping[str, str],
@@ -350,7 +355,7 @@ def _disaggregated_env(
         values["DISAGG_CLIENT_SEGMENT_SIZE"] = "0"
         values.update(
             {
-                "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
+                "DISAGG_REF_CHANNEL": ref_channel_path(cfg),
                 "DISAGG_DB": str(consumer_state_dir / "consumer.sqlite"),
                 # SQLite/WAL stays on rank 0's local filesystem. Inboxes are
                 # shared normally or served by rank 0 when the HTTP relay is

@@ -5,6 +5,7 @@ import types
 import unittest
 from unittest import mock
 
+from specforge.application import ResolvedRun
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import (
@@ -96,7 +97,7 @@ class TestEvalAssembly(unittest.TestCase):
                 "specforge.launch.build_offline_runtime", return_value=trainer
             ) as build,
         ):
-            run = build_training_run(cfg, algorithm=ALGORITHM)
+            run = build_training_run((ResolvedRun(cfg, ALGORITHM),))
 
         self.assertIs(run.trainer, trainer)
         self.assertEqual(build.call_args.kwargs["eval_interval"], 7)
