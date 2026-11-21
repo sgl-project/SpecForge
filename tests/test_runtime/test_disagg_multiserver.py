@@ -31,6 +31,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from specforge.inference.adapters.server_capture import (
+    CaptureOutput,
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
 )
@@ -41,8 +42,7 @@ from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_runtime.test_server_capture import (
-    AUX_LAYERS,
-    HIDDEN,
+    _dflash_contract,
     _FakeMooncakeStore,
     _StubCaptureServer,
 )
@@ -69,9 +69,7 @@ def _prompts(n, seq=6):
 
 def _adapter(store, post_fn, url="http://server:30000"):
     layout = ALGORITHM.providers.server_streaming_for("text").layout
-    return SGLangServerCaptureAdapter(
-        url,
-        store,
+    output = CaptureOutput(
         run_id="run0",
         algorithm=ALGORITHM.name,
         schema=ServerCaptureSchema(
@@ -80,22 +78,20 @@ def _adapter(store, post_fn, url="http://server:30000"):
             passthrough=layout.passthrough,
             attention_mask_feature=layout.attention_mask_feature,
         ),
-        post_fn=post_fn,
+        capture=_dflash_contract(),
     )
+    return SGLangServerCaptureAdapter(url, store, outputs=[output], post_fn=post_fn)
 
 
 def _build(adapters, prompts, store, channel, **kw):
     channel.publish_consumer_quantum(kw.pop("consumer_quantum", 1))
     return build_disagg_online_producer(
-        algorithm=ALGORITHM,
+        strategy=ALGORITHM.name,
         feature_source=adapters,
         prompts=prompts,
         feature_store=store,
         channel=channel,
         run_id="run0",
-        target_hidden_size=HIDDEN,
-        target_repr=None,
-        aux_hidden_state_layer_ids=AUX_LAYERS,
         sleep=_SLEEP,
         **kw,
     )

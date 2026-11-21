@@ -16,7 +16,7 @@ from specforge.training.capture_contract import (
     ServerCaptureContract,
     resolve_server_capture_contract,
 )
-from specforge.training.disaggregated import _producer_capture_metadata
+from specforge.training.disaggregated import capture_output_for
 from tests.test_config.draft_fixtures import draft_config
 
 
@@ -93,7 +93,7 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
                     )
                     self.assertEqual(contract.target_hidden_size, 32)
 
-    def test_producer_metadata_delegates_to_the_shared_server_contract(self):
+    def test_capture_output_reads_the_shared_server_contract(self):
         resolved = resolve_run(_config())
         contract = ServerCaptureContract(
             method="dflash",
@@ -106,11 +106,21 @@ class DisaggregatedModelLoadingTest(unittest.TestCase):
             "specforge.training.capture_contract.resolve_server_capture_contract",
             return_value=contract,
         ) as resolve:
-            metadata = _producer_capture_metadata(
-                resolved.config,
-                resolved.algorithm,
-            )
-        self.assertEqual(metadata, ([3, 7], 64, 128, 32))
+            output = capture_output_for(resolved.config, resolved.algorithm)
+        capture = output.capture
+        self.assertEqual(
+            (output.run_id, output.algorithm),
+            (resolved.config.run_id, resolved.algorithm.name),
+        )
+        self.assertEqual(
+            (
+                capture.aux_hidden_state_layer_ids,
+                capture.target_hidden_size,
+                capture.target_vocab_size,
+                capture.draft_vocab_size,
+            ),
+            ((3, 7), 64, 128, 32),
+        )
         resolve.assert_called_once_with(
             resolved.config,
             algorithm=resolved.algorithm,

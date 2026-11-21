@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 
 from specforge.inference.adapters.server_capture import (
+    CaptureOutput,
     ServerCaptureFailure,
     ServerCaptureSchema,
     SGLangServerCaptureAdapter,
@@ -81,13 +82,17 @@ class OfflineCaptureClient:
             target_hidden_size=target_hidden_size,
         )
         self.store = store if store is not None else self._connect_store()
+        output = CaptureOutput(
+            run_id=self.run_id,
+            algorithm=layout.capture_method,
+            schema=ServerCaptureSchema(aux, last, ()),
+            capture=self.contract,
+        )
         self.adapters = [
             SGLangServerCaptureAdapter(
                 url,
                 self.store,
-                run_id=self.run_id,
-                algorithm=layout.capture_method,
-                schema=ServerCaptureSchema(aux, last, ()),
+                outputs=[output],
                 timeout_s=timeout_s,
                 target_model_version=target_model_path,
                 server_capture="plugin",
@@ -162,12 +167,12 @@ class OfflineCaptureClient:
                     f"{self.run_id}:{task.task_id}",
                     reason="offline-finished",
                 )
-            refs = adapter.produce_refs(tasks, capture=self.contract)
-            failures = [r for r in refs if isinstance(r, ServerCaptureFailure)]
+            results = adapter.produce_refs(tasks)
+            failures = [r for r in results if isinstance(r, ServerCaptureFailure)]
             if failures:
                 raise RuntimeError(f"offline server capture failed: {failures}")
             rows = []
-            for ref in refs:
+            for (ref,) in results:
                 tensors, handle = self.store.get(ref, device="cpu")
                 cleanup.callback(self.store.release, handle, reason="offline-finished")
                 rows.append(tensors)
