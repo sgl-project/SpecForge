@@ -41,6 +41,69 @@ class PaddingMask:
 
 
 @dataclass(frozen=True, eq=False, kw_only=True)
+class ContextBlocks:
+    """Independent query blocks, each reading a prefix of the target context.
+
+    Queries are ``context_lengths.shape[1]`` consecutive blocks of ``block_size``
+    slots; keys are the context rows followed by those queries. Block ``n`` of
+    row ``b`` sees the context rows before ``context_lengths[b, n]`` that are
+    ``context_valid``, and every slot of its own block. Inactive blocks see
+    nothing. Lengths lie in ``[0, context rows]``.
+    """
+
+    block_size: int
+    context_lengths: Tensor
+    context_valid: Tensor
+    active_blocks: Tensor
+
+    def __post_init__(self):
+        positive_int("block_size", self.block_size)
+        lengths, valid, active = (
+            self.context_lengths,
+            self.context_valid,
+            self.active_blocks,
+        )
+        if lengths.ndim != 2 or lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError("context_lengths must be integer [batch, blocks]")
+        if valid.ndim != 2 or valid.dtype != torch.bool:
+            raise ValueError("context_valid must be boolean [batch, context]")
+        if active.dtype != torch.bool or active.shape != lengths.shape:
+            raise ValueError("active_blocks must be boolean [batch, blocks]")
+        if valid.shape[0] not in (1, lengths.shape[0]):
+            raise ValueError("context_valid batch must broadcast to the blocks")
+        if not lengths.device == valid.device == active.device:
+            raise ValueError("context blocks must share a device")
+
+    @property
+    def num_context_rows(self) -> int:
+        return self.context_valid.shape[1]
+
+    @property
+    def num_queries(self) -> int:
+        return self.context_lengths.shape[1] * self.block_size
+
+    def compute_active_queries(self) -> Tensor:
+        return self.active_blocks.repeat_interleave(self.block_size, dim=1)
+
+    def compute_visibility(self) -> Tensor:
+        """Boolean [batch, 1, queries, context rows + queries] mask."""
+        batch, count = self.context_lengths.shape
+        device = self.context_lengths.device
+        rows = torch.arange(self.num_context_rows, device=device)
+        context_visible = (rows < self.context_lengths[..., None]) & self.context_valid[
+            :, None, :
+        ]
+        context_visible = context_visible.repeat_interleave(self.block_size, dim=1)
+        block_ids = torch.arange(count, device=device).repeat_interleave(
+            self.block_size
+        )
+        draft_visible = (block_ids[:, None] == block_ids[None, :]).expand(batch, -1, -1)
+        visible = torch.cat((context_visible, draft_visible), dim=-1)
+        visible &= self.compute_active_queries()[..., None]
+        return visible[:, None]
+
+
+@dataclass(frozen=True, eq=False, kw_only=True)
 class AttentionLayout:
     """Logical positions and visibility, with optional explicit active queries.
 
@@ -49,12 +112,17 @@ class AttentionLayout:
     visibility requires boolean active_queries [batch, Q]; it must not close over
     mutable state. Batch/head singleton axes broadcast. Reuse these objects across
     layers, but never mutate them while the forward/backward graph is live.
+
+    Context-then-block layouts pass ``context_blocks`` instead; it determines
+    visibility and active queries, and stays readable for components such as
+    recurrent attention that consume the block structure itself.
     """
 
     query_positions: Tensor
     key_positions: Tensor
-    visibility: Tensor | MaskMod
+    visibility: Tensor | MaskMod | None = None
     active_queries: Tensor | None = None
+    context_blocks: ContextBlocks | None = None
 
     def __post_init__(self):
         q, k = self.query_positions, self.key_positions
@@ -64,6 +132,26 @@ class AttentionLayout:
             raise ValueError("logical positions must be rank-two integer tensors")
         if q.device != k.device:
             raise ValueError("query/key positions must share a device")
+        blocks = self.context_blocks
+        if blocks is not None:
+            if not isinstance(blocks, ContextBlocks):
+                raise TypeError("context_blocks must be ContextBlocks")
+            if self.visibility is not None or self.active_queries is not None:
+                raise ValueError(
+                    "context_blocks determine visibility and active_queries"
+                )
+            if (
+                q.shape[1] != blocks.num_queries
+                or k.shape[1] != blocks.num_context_rows + blocks.num_queries
+                or blocks.context_lengths.device != q.device
+            ):
+                raise ValueError(
+                    "context_blocks must describe the context-then-query positions"
+                )
+            object.__setattr__(self, "visibility", blocks.compute_visibility())
+            object.__setattr__(self, "active_queries", blocks.compute_active_queries())
+        elif self.visibility is None:
+            raise ValueError("a layout requires visibility or context_blocks")
         batches = {q.shape[0], k.shape[0]} - {1}
         if isinstance(self.visibility, Tensor):
             allowed = self.visibility
