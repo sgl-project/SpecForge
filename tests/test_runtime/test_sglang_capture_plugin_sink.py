@@ -37,6 +37,8 @@ sys.path.insert(
 from specforge_sglang_capture import _capture_internal_state  # noqa: E402
 from specforge_sglang_capture import sink  # noqa: E402
 
+from specforge.application import resolve_run
+from specforge.config import Config
 from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
     SGLangServerCaptureAdapter,
@@ -49,6 +51,8 @@ from specforge.runtime.data_plane.mooncake_arena import (
 )
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.training.capture_contract import ServerCaptureContract
+from specforge.training.disaggregated import build_disaggregated_run
 from tests.test_runtime.test_server_capture import (
     HIDDEN,
     _FakeMooncakeStore,
@@ -523,10 +527,10 @@ class SpecCaptureSinkTest(unittest.TestCase):
         self.assertEqual(self.sink._nvlink.health()["free_bytes"], 1 << 20)
 
 
-class SeveralOutputsTest(unittest.TestCase):
-    """The adapter against the real sink: one prefill, one sample per drafter.
+class _SinkServerCase(unittest.TestCase):
+    """A capture server made of the real sink over a fake Mooncake store.
 
-    The server captures layers 2, 5 and 8; dflash reads 2 and 8, dspark 5 and 8.
+    It captures layers 2, 5 and 8.
     """
 
     def setUp(self):
@@ -538,6 +542,27 @@ class SeveralOutputsTest(unittest.TestCase):
         self.sink._store = self.backend
         self.addCleanup(self.sink._executor.shutdown)
         self.store = MooncakeFeatureStore(store=self.backend, store_id="run0")
+
+    def _aux(self, length):
+        return torch.arange(length * 3 * HIDDEN, dtype=torch.float32).reshape(
+            length, 3 * HIDDEN
+        )
+
+    def _post(self, url, json_body, timeout):
+        rows = []
+        for ids, params in zip(json_body["input_ids"], json_body["sampling_params"]):
+            spec = json.loads(params["custom_params"]["spec_capture"])
+            last = torch.ones(len(ids), HIDDEN)
+            (result,) = self.sink.put_samples([(spec, self._aux(len(ids)), last)])
+            rows.append({"meta_info": {"spec_capture": [result]}})
+        return rows
+
+
+class SeveralOutputsTest(_SinkServerCase):
+    """The adapter against the real sink: one prefill, one sample per drafter.
+
+    The server captures layers 2, 5 and 8; dflash reads 2 and 8, dspark 5 and 8.
+    """
 
     def _adapter(self, **dspark_capture):
         dflash = _output("dflash", run_id="run-dflash", teacher_metrics=False)
@@ -564,20 +589,6 @@ class SeveralOutputsTest(unittest.TestCase):
             outputs=outputs,
             post_fn=self._post,
         )
-
-    def _aux(self, length):
-        return torch.arange(length * 3 * HIDDEN, dtype=torch.float32).reshape(
-            length, 3 * HIDDEN
-        )
-
-    def _post(self, url, json_body, timeout):
-        rows = []
-        for ids, params in zip(json_body["input_ids"], json_body["sampling_params"]):
-            spec = json.loads(params["custom_params"]["spec_capture"])
-            last = torch.ones(len(ids), HIDDEN)
-            (result,) = self.sink.put_samples([(spec, self._aux(len(ids)), last)])
-            rows.append({"meta_info": {"spec_capture": [result]}})
-        return rows
 
     def _hidden_states(self, ref):
         tensors, handle = self.store.get(ref)
@@ -649,6 +660,119 @@ class SeveralOutputsTest(unittest.TestCase):
         self.assertFalse(failure.retryable)
         self.assertIn("run-dspark:t0", failure.reason)
         self.assertEqual(self.backend._d, {})
+
+
+class ProducerForSeveralRunsTest(_SinkServerCase):
+    """The online producer assembled from two hand-written run configs."""
+
+    LAYERS = {"dflash": (2, 8), "dspark": (5, 8)}
+
+    def setUp(self):
+        super().setUp()
+        root = tempfile.mkdtemp(prefix="producer_runs_")
+        self.runs = tuple(
+            resolve_run(
+                Config.model_validate(
+                    {
+                        "run_id": f"run-{name}",
+                        "model": {"target_model_path": "target"},
+                        "draft": f"specforge/config/draft/presets/qwen3-8b-{name}.yaml",
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "training": {"role": "producer"},
+                        "deployment": {
+                            "mode": "disaggregated",
+                            "disaggregated": {
+                                "control_dir": os.path.join(root, name),
+                                "backend": "mooncake",
+                                "server_urls": ["http://plugin:30000"],
+                                "server_capture": "plugin",
+                            },
+                        },
+                    }
+                )
+            )
+            for name in self.LAYERS
+        )
+        self.paths = [os.path.join(root, name, "refs.jsonl") for name in self.LAYERS]
+
+        def contract(cfg, *, algorithm):
+            return ServerCaptureContract(
+                method="dflash",
+                aux_layer_ids=self.LAYERS[cfg.run_id.removeprefix("run-")],
+                target_hidden_size=HIDDEN,
+                target_vocab_size=32,
+                draft_vocab_size=32,
+            )
+
+        def adapter(*args, **kwargs):
+            return SGLangServerCaptureAdapter(*args, post_fn=self._post, **kwargs)
+
+        patches = (
+            mock.patch.dict(os.environ, {"DISAGG_PEER_WAIT_TIMEOUT": "30"}),
+            mock.patch(
+                "specforge.training.disaggregated._mooncake_store",
+                return_value=self.store,
+            ),
+            mock.patch("specforge.training.assembly._load_input_tools"),
+            mock.patch("specforge.training.model_loading.resolve_draft_config"),
+            mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                side_effect=contract,
+            ),
+            mock.patch(
+                "specforge.inference.adapters.server_capture."
+                "SGLangServerCaptureAdapter",
+                side_effect=adapter,
+            ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _build(self, prepare_prompts):
+        return build_disaggregated_run(
+            self.runs,
+            build_model_bundle=mock.Mock(),
+            prepare_prompts=prepare_prompts,
+            optimizer_factory=mock.Mock(),
+            logger=mock.Mock(),
+        )
+
+    def test_one_producer_feeds_and_cleans_every_run(self):
+        prompts = [
+            {
+                "task_id": f"p{index}",
+                "payload": {"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 1, 1]},
+            }
+            for index in range(5)
+        ]
+        run = self._build(lambda *args, **kwargs: prompts)
+        for path in self.paths:
+            with open(path + ".schedule.json", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["num_prompts"], 5)
+
+        def train(path):
+            """A trainer that reads every ref and frees nothing."""
+            reader = StreamingRefChannel(path)
+            reader.publish_consumer_quantum(1)
+            while not reader.is_closed() or reader.poll():
+                time.sleep(0.001)
+            reader.mark_consumer_done()
+
+        for path in self.paths:
+            threading.Thread(target=train, args=(path,), daemon=True).start()
+        self.assertEqual(run.run(), 10)
+
+        for path in self.paths:
+            self.assertEqual(len(StreamingRefChannel(path).poll()), 5)
+        self.assertEqual(self.backend._d, {})
+
+    def test_a_producer_that_fails_to_start_tells_every_run(self):
+        with self.assertRaisesRegex(RuntimeError, "no data"):
+            self._build(mock.Mock(side_effect=RuntimeError("no data")))
+        for path in self.paths:
+            with open(path + ".failed", encoding="utf-8") as stream:
+                self.assertIn("RuntimeError: no data", stream.read())
 
 
 class NvlinkArenaTest(unittest.TestCase):

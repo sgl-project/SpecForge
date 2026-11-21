@@ -10,7 +10,7 @@ import types
 import unittest
 from unittest import mock
 
-from specforge.application import bind_run
+from specforge.application import ResolvedRun, bind_run
 from specforge.cli import (
     _bootstrap_single_process_env,
     _train,
@@ -25,7 +25,8 @@ from specforge.training.assembly import TrainingRun
 from specforge.training.capture_contract import ServerCaptureContract
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
-    _build_online,
+    _build_online_consumer,
+    _build_online_producer,
     _claim_fresh_control_path,
     _mooncake_store,
     build_disaggregated_run,
@@ -112,11 +113,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         return_value=trainer,
                     ),
                 ):
-                    run = _build_online(
+                    run = _build_online_consumer(
                         cfg,
                         algorithm=ALGORITHM,
                         build_model_bundle=lambda _cfg: bundle,
-                        prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
                         logger=None,
                         preflight_model_bundle=preflight,
@@ -163,7 +163,6 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
                 resolved = resolve_run(cfg)
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
-                preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
                 with (
                     mock.patch.dict(
                         os.environ,
@@ -196,16 +195,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         return_value=([], mock.Mock()),
                     ),
                 ):
-                    _build_online(
-                        cfg,
-                        algorithm=resolved.algorithm,
-                        build_model_bundle=mock.Mock(),
+                    _build_online_producer(
+                        (resolved,),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
-                        optimizer_factory=mock.Mock(),
-                        logger=None,
-                        preflight_model_bundle=preflight,
                     )
-                preflight.assert_not_called()
                 (output,) = adapter_cls.call_args.kwargs["outputs"]
                 schema = output.schema
                 self.assertEqual("hidden_states", schema.aux_feature)
@@ -347,14 +340,13 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False
                     ),
                     mock.patch(
-                        "specforge.training.disaggregated._build_online",
+                        f"specforge.training.disaggregated._build_online_{role}",
                         side_effect=fail_during_assembly,
                     ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "assembly exploded"):
                         build_disaggregated_run(
-                            cfg,
-                            algorithm=ALGORITHM,
+                            (ResolvedRun(cfg, ALGORITHM),),
                             build_model_bundle=mock.Mock(),
                             prepare_prompts=mock.Mock(),
                             optimizer_factory=mock.Mock(),
@@ -405,8 +397,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     self.assertRaisesRegex(ImportError, "liger missing"),
                 ):
                     build_disaggregated_run(
-                        cfg,
-                        algorithm=ALGORITHM,
+                        (ResolvedRun(cfg, ALGORITHM),),
                         build_model_bundle=build_model_bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
@@ -442,7 +433,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         ):
             from specforge.training.assembly import build_training_run
 
-            build_training_run(cfg, algorithm=ALGORITHM)
+            build_training_run((ResolvedRun(cfg, ALGORITHM),))
             build.call_args.kwargs["preflight_model_bundle"](cfg)
         preflight.assert_called_once_with(cfg, algorithm=ALGORITHM)
 
@@ -468,14 +459,13 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False),
             mock.patch(
-                "specforge.training.disaggregated._build_online",
+                "specforge.training.disaggregated._build_online_producer",
                 side_effect=RuntimeError("claim rejected"),
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "claim rejected"):
                 build_disaggregated_run(
-                    cfg,
-                    algorithm=ALGORITHM,
+                    (ResolvedRun(cfg, ALGORITHM),),
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
@@ -543,6 +533,7 @@ class TestCliLifecycle(unittest.TestCase):
         accelerate_utils.set_seed = mock.Mock()
         accelerate.utils = accelerate_utils
 
+        resolved = bind_run(cfg, ALGORITHM)
         with mock.patch.dict(
             sys.modules,
             {
@@ -552,12 +543,9 @@ class TestCliLifecycle(unittest.TestCase):
                 "specforge.training.assembly": assembly,
             },
         ):
-            self.assertEqual(_train(bind_run(cfg, ALGORITHM)), 3)
+            self.assertEqual(_train(resolved), 3)
 
-        assembly.build_training_run.assert_called_once_with(
-            cfg,
-            algorithm=ALGORITHM,
-        )
+        assembly.build_training_run.assert_called_once_with((resolved,))
         run.run.assert_called_once_with()
 
     def test_world_size_matches_the_configured_parallel_topology(self):
