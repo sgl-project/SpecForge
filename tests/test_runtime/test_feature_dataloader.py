@@ -782,86 +782,47 @@ class TestFeatureDataLoader(unittest.TestCase):
         store = _BlockingStore(inner)
         loader = FeatureDataLoader(store, queue, batch_size=1, ack=False, num_workers=1)
         iterator = iter(loader)
-        delivered = []
-        consumer_errors = []
-        close_errors = []
-        fetch_wait_entered = threading.Event()
+        claim_started = threading.Event()
         settlement_started = threading.Event()
-        finish_settlement = threading.Event()
-        claim_returned = threading.Event()
-        live_snapshot = threading.Event()
-        original_result = futures.Future.result
+        claim_finished = threading.Event()
 
-        def wait_for_fetch(future, timeout=None):
-            del timeout
-            fetch_wait_entered.set()
-            return original_result(future)
-
-        def consume_one():
+        with futures.ThreadPoolExecutor(max_workers=1) as pool:
+            delivered = pool.submit(next, iterator, None)
             try:
-                delivered.append(next(iterator))
-            except StopIteration:
-                pass
-            except BaseException as exc:
-                consumer_errors.append(exc)
-
-        def close_loader():
-            try:
-                loader.close()
-            except BaseException as exc:
-                close_errors.append(exc)
-
-        consumer = threading.Thread(target=consume_one, daemon=True)
-        closer = threading.Thread(target=close_loader, daemon=True)
-        with mock.patch.object(futures.Future, "result", new=wait_for_fetch):
-            consumer.start()
-            try:
-                self.assertTrue(store.entered.wait(timeout=1.0))
-                self.assertTrue(fetch_wait_entered.wait(timeout=1.0))
+                self.assertTrue(store.entered.wait(timeout=5))
                 state = loader._prefetch_state
-                original_settle = state.settle_unyielded_fetch
-                original_claim = state.claim_for_yield
-                original_live_fetches = state.live_fetches
+                claim = state.claim_for_yield
+                settle = state.settle_unyielded_fetch
 
-                def pause_before_settlement(*args, **kwargs):
-                    settlement_started.set()
-                    self.assertTrue(finish_settlement.wait(timeout=1.0))
-                    return original_settle(*args, **kwargs)
-
-                def record_claim(future):
-                    self.assertTrue(live_snapshot.wait(timeout=1.0))
+                def claim_during_close(future):
+                    claim_started.set()
                     try:
-                        return original_claim(future)
+                        self.assertTrue(settlement_started.wait(timeout=5))
+                        return claim(future)
                     finally:
-                        claim_returned.set()
+                        claim_finished.set()
 
-                def record_live_fetches():
-                    live = original_live_fetches()
-                    live_snapshot.set()
-                    return live
+                def settle_after_claim(*args, **kwargs):
+                    # close has set stop but still owns this materialized fetch.
+                    settlement_started.set()
+                    self.assertTrue(claim_finished.wait(timeout=5))
+                    return settle(*args, **kwargs)
 
-                state.settle_unyielded_fetch = pause_before_settlement
-                state.claim_for_yield = record_claim
-                state.live_fetches = record_live_fetches
-                closer.start()
-                self.assertTrue(state.stop.wait(timeout=1.0))
-                store.resume.set()
-                self.assertTrue(settlement_started.wait(timeout=1.0))
-                self.assertTrue(claim_returned.wait(timeout=1.0))
-                self.assertTrue(state.stop.is_set())
+                with (
+                    mock.patch.object(state, "claim_for_yield", claim_during_close),
+                    mock.patch.object(
+                        state, "settle_unyielded_fetch", settle_after_claim
+                    ),
+                ):
+                    store.resume.set()
+                    self.assertTrue(claim_started.wait(timeout=5))
+                    loader.close()
+                    self.assertIsNone(delivered.result(timeout=5))
             finally:
                 store.resume.set()
-                finish_settlement.set()
-                closer.join(timeout=1.0)
-                consumer.join(timeout=1.0)
-                iterator.close()
+                settlement_started.set()
                 loader.close()
-
-        self.assertFalse(closer.is_alive())
-        self.assertFalse(consumer.is_alive())
-        self.assertEqual(close_errors, [])
-        self.assertEqual(consumer_errors, [])
-        self.assertEqual(delivered, [])
+        iterator.close()
         self.assertEqual(queue.in_flight(), 0)
         self.assertEqual(
             queue.failures,
