@@ -31,6 +31,7 @@ import torch
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.data_plane.feature_store import FeatureStore
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
+from specforge.utils import print_with_rank
 
 PerSampleTransform = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
 CollateFn = Callable[[List[Dict[str, torch.Tensor]]], Dict[str, Any]]
@@ -185,6 +186,14 @@ class FeatureDataLoader:
         if num_workers < 0:
             raise ValueError("num_workers must be >= 0")
         self.num_workers = int(num_workers)
+        # PIN_MEMORY=0 disables pinned staging while keeping the prefetch pool:
+        # the two are independent knobs (prefetch is gated on ``num_workers``,
+        # pinning happens per batch in _make_batch). Workers pin without ever
+        # binding a device, so every first touch of CUDA happens concurrently
+        # across the pool and can fail with ``cudaErrorInvalidValue``; turning
+        # this off isolates that without giving up prefetch.
+        if os.environ.get("PIN_MEMORY", "1") == "0":
+            pin_memory = False
         self.pin_memory = bool(pin_memory)
         self._seek_batches = 0
         # Remote stores defer a physical free while the get() read-lease is live
@@ -289,6 +298,30 @@ class FeatureDataLoader:
                         f"feature {name!r}: {spec} vs {expected}"
                     )
 
+    def _warm_cuda_for_pinning(self) -> None:
+        """Initialise the CUDA context before the prefetch pool starts.
+
+        ``_make_batch`` pins CPU batches in the worker threads, and pinning
+        allocates page-locked memory through the CUDA driver. Those threads
+        never bind a device, so each one lazily initialises the context on its
+        own first call; with ``num_workers`` threads racing that initialisation
+        we observed ``cudaErrorInvalidValue`` from ``value.pin_memory()`` on the
+        very first batch (rank-dependent, every run). Priming once here leaves
+        the workers reusing an already-initialised context.
+        """
+        if not self.pin_memory or self.device != "cpu":
+            return
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.init()
+                # Allocate once so the context, the page-locked allocation path
+                # and the device are all known-good before any worker depends
+                # on them.
+                probe = torch.empty(1, dtype=torch.uint8, pin_memory=True)
+                del probe
+        except Exception as exc:  # priming is a mitigation, not a requirement
+            print_with_rank(f"pin_memory priming failed: {exc}")
+
     def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
         tensors, handle = self.store.get(ref, device=self.device)
         try:
@@ -384,6 +417,7 @@ class FeatureDataLoader:
         from collections import deque
         from concurrent.futures import ThreadPoolExecutor
 
+        self._warm_cuda_for_pinning()
         chunk_iter = iter(chunks)
         pending = deque()
         with ThreadPoolExecutor(
