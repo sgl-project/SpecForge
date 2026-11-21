@@ -157,6 +157,100 @@ Before rerunning, clear stale control state:
 - If the capture producer dies with `ACL_ERROR_RT_CONTEXT_NULL` (107002), the
   installed SpecForge predates the NPU transport bind — upgrade past #722.
 
+### Qwen3-30B-A3B-Instruct-2507 with EAGLE3.1 on 910B3
+
+The [Qwen EAGLE3.1 recipe](https://github.com/sgl-project/SpecForge/blob/5d4c6a1483afec88b19270d369d16b99492abfdf/examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml)
+ran online on three 64 GiB Ascend 910B3 devices. Two devices served the BF16
+target with SGLang TP2 and the third trained the draft with SDPA. The target
+was `Qwen/Qwen3-30B-A3B-Instruct-2507` at
+`0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe`.
+
+The run used driver 26.0.rc1, CANN/HCCL 9.1.0, Python 3.12.13,
+PyTorch 2.10.0+cpu with torch_npu 2.10.0.post6, Transformers 5.19.0,
+SGLang NPU kernels 2026.9.0, and Mooncake 0.3.14 over TCP.
+The capture server and inference benchmark loaded SGLang source at
+`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`. The
+[reproduction bundle](https://github.com/LUOseu/SpecForge/tree/ascend-910b3-eagle3-smoke-20261121/validation/ascend-eagle31-910b3)
+includes the Ascend image digest, installation commands, pinned ShareGPT
+preparation, vocabulary map generation, and the three-way evaluation command.
+
+Start the external Mooncake master as in step 1. In a separate shell, start
+the target with the auxiliary layer IDs from the EAGLE3.1 draft preset.
+Set `TARGET_MODEL` to the local model snapshot. Device lists for capture and
+training use the chip logic IDs reported by `npu-smi info -m`.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 SPECFORGE_SPEC_CAPTURE=1 \
+MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 MOONCAKE_PROTOCOL=tcp \
+MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
+MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=1073741824 SGLANG_SPEC_CAPTURE_GPU_PUT=0 \
+python -m sglang.launch_server --model-path "$TARGET_MODEL" \
+  --device npu --dtype bfloat16 --tp-size 2 --attention-backend ascend \
+  --skip-tokenizer-init --context-length 1024 --max-running-requests 1 \
+  --mem-fraction-static 0.8 --chunked-prefill-size -1 --disable-radix-cache \
+  --disable-cuda-graph --enable-return-aux-hidden-states \
+  --return-hidden-states-mode full --speculative-algorithm EAGLE3 \
+  --return-aux-hidden-state-layer-ids 1 23 44 --host 127.0.0.1 --port 30000
+```
+
+From the repository root, set `DATA` to the prepared directory containing
+`train.jsonl` and `vocab.pt`, and `RUN_BASE` to a fresh output directory.
+These eight-update runs use the same pretokenized prompts, vocabulary map,
+seed 0, batch size 1, learning rate 0.0001, and rollout depth 7.
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=2 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+curl --fail http://127.0.0.1:30000/health
+for method in eagle3.1 eagle3; do
+  run="qwen30b-910b3-$method"
+  out="$RUN_BASE/$run"
+  specforge train \
+    -c "examples/configs/online/disaggregated/external/qwen3-30b-a3b-$method.yaml" \
+    "model.target_model_path=$TARGET_MODEL" "model.vocab_mapping_path=$DATA/vocab.pt" \
+    'data.train_data_path=' "data.prompts_path=$DATA/train.jsonl" data.max_length=512 \
+    data.build_dataset_num_proc=1 data.dataloader_num_workers=0 \
+    training.attention_backend=sdpa deployment.trainer.nproc_per_node=1 \
+    training.num_epochs=1 training.warmup_ratio=0 training.max_steps=8 \
+    training.save_interval=8 training.log_interval=1 tracking.report_to=none \
+    "run_id=$run" "output_dir=$out" "deployment.disaggregated.control_dir=$out/control" \
+    "deployment.disaggregated.consumer_state_dir=$out/consumer-state" || exit 1
+  specforge export --converter sglang --target-model "$TARGET_MODEL" \
+    --checkpoint "$out/$run-step8" --output-dir "$out/sglang-export" || exit 1
+done
+```
+
+Each run captured all eight ShareGPT examples. Each token yielded 6,144
+auxiliary features and a 2,048-wide final hidden state. EAGLE3.1 applies a
+separate RMSNorm to each layer's features before projection. The final
+normalized draft state feeds the language-model head and the next draft
+step. The EAGLE3.1 export preserved all 18 tensors and sets `fc_norm` and
+`norm_output` to true. Use `--speculative-algorithm EAGLE3` for both
+serving exports. A separate eight-token SGLang request verified that both TP
+workers loaded all four norm weights, applied the three feature norms, and
+returned the final normalized tensor for speculative feedback.
+
+The serving comparison used the same two 910B3 devices, BF16 target, eight
+held-out ShareGPT prompts and concurrency 1. Each fresh server handled a
+warmup followed by eight greedy requests of 128 output tokens each. The
+drafts used three speculative steps, top-k 1 and four draft tokens. Mean
+acceptance length counts completion tokens per verification round, including
+the bonus token. Throughput counts completion tokens per timed wall second.
+
+| Serving mode | Output tokens | Verification rounds | Mean acceptance length | Output tokens/s |
+| --- | ---: | ---: | ---: | ---: |
+| Target only | 1,024 | — | — | 46.19 |
+| EAGLE3, step 8 | 1,024 | 971 | 1.0546 | 30.35 |
+| EAGLE3.1, step 8 | 1,024 | 964 | 1.0622 | 39.39 |
+
+The two draft runs produced identical token sequences on all eight prompts.
+Each matched the target-only output on four of eight prompts. Both drafts
+had lower throughput than the target-only run. This single timing pass and
+eight-update training budget measure the integration smoke test.
+[Stepwise training losses](https://github.com/LUOseu/SpecForge/blob/ascend-910b3-eagle3-smoke-20261121/validation/ascend-eagle31-910b3/results/train-loss.png)
+and the [downloadable serving checkpoints](https://github.com/LUOseu/SpecForge/releases/tag/ascend-910b3-eagle3-smoke-20261121)
+refer to these same two runs.
+
 ### Training DFlash 2 drafts
 
 DFlash 2 reuses the DFlash strategy and capture path end to end, so the
