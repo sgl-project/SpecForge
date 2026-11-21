@@ -8,8 +8,15 @@ def resolve_draft_config(cfg):
 
 
 def preflight_draft_kernels(cfg, *, algorithm):
+    from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS
+
     from .canonical import preflight_kernels
 
+    if cfg.model.moe_experts_kernel not in EXPERT_KERNELS:
+        raise ValueError(
+            f"unknown model.moe_experts_kernel {cfg.model.moe_experts_kernel!r}; "
+            f"expected one of {sorted(EXPERT_KERNELS)}"
+        )
     preflight_kernels(cfg)
 
 
