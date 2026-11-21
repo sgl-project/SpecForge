@@ -150,7 +150,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 Config.model_validate(payload)
 
     def test_watermark_overrides_are_applied_before_config_validation(self):
-        from specforge.training.disaggregated import _online_flow_window
+        from specforge.config.schema import resolve_dispatch_watermarks
 
         for policy in ("two_window_bucketed", "two_window_joint_balanced"):
             payload = _online_payload("dflash")
@@ -174,7 +174,7 @@ class ConfigSchemaTest(unittest.TestCase):
                             Config.model_validate(payload)
                     else:
                         self.assertEqual(
-                            _online_flow_window(Config.model_validate(payload)),
+                            resolve_dispatch_watermarks(Config.model_validate(payload)),
                             expected,
                         )
 

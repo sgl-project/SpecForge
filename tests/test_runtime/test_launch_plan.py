@@ -276,6 +276,31 @@ class LaunchPlanTest(unittest.TestCase):
             )
         )
 
+    def test_online_producer_plan_checks_dispatch_watermarks(self):
+        for policy in ("round_robin", "cost_balanced"):
+            with self.subTest(policy=policy):
+                raw = _config(mode="disaggregated", nproc=7).model_dump()
+                raw["training"]["accumulation_steps"] = 5
+                raw["runtime"].update(
+                    consumer_dispatch=policy,
+                    in_flight_high_watermark=48,
+                    in_flight_low_watermark=32,
+                )
+                cfg = Config.model_validate(raw)
+                with self.assertRaisesRegex(ValueError, "low watermark 32.*quantum 35"):
+                    build_launch_plan(cfg, config_path="run.yaml", env=MOONCAKE_ENV)
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    env={**MOONCAKE_ENV, "DISAGG_IN_FLIGHT_LOW_WATERMARK": "35"},
+                )
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    env=MOONCAKE_ENV,
+                    requested_role="consumer",
+                )
+
     def test_cuda_receive_buffers_validate_effective_external_protocol(self):
         for configured, override, valid in (
             ("tcp", "rdma", True),
