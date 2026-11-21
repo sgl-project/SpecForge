@@ -28,9 +28,11 @@ def validate_target_context(config: DraftConfig) -> None:
             "== hidden_size"
         )
     for name, attention in config.attention_configs.items():
-        if "target_context_kv" not in attention.capabilities():
+        # context enters as attended K/V rows or as the recurrent state before a block
+        if not {"target_context_kv", "target_context_state"} & attention.capabilities():
             raise ValueError(
-                f"attention_configs.{name}: architecture requires target_context_kv"
+                f"attention_configs.{name}: architecture requires target_context_kv "
+                "or target_context_state"
             )
 
 

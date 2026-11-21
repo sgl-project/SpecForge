@@ -88,7 +88,7 @@ tracking are also config features rather than custom launchers; see the
 ## Draft components and architectures
 
 Copy a YAML file from `specforge/config/draft/presets/` and pass its path as
-`draft` in the run config. Named `attention_configs` select GQA, MHA or MLA;
+`draft` in the run config. Named `attention_configs` select GQA, MHA, MLA or KDA;
 `mlp_configs` define FFNs; `layer_configs` composes these nodes and `layer_types`
 selects one named layer per position. Attention direction and sliding windows are
 explicit on each attention node. Changing components does not require a new

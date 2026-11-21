@@ -5,7 +5,7 @@ from torch import Tensor, nn
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.norm import NormSpec
 
-from .attention.backends import PreparedAttention
+from .attention.backends import PreparedLayout
 from .inputs import LayerInputs
 from .registry import build_component
 from .residual import ResidualConnection
@@ -75,7 +75,7 @@ class DecoderLayer(nn.Module):
     def forward(self, hidden: Tensor, inputs: LayerInputs) -> Tensor:
         if not isinstance(inputs, LayerInputs):
             raise TypeError("DecoderLayer requires LayerInputs")
-        if not isinstance(inputs.attention, PreparedAttention):
+        if not isinstance(inputs.attention, PreparedLayout):
             raise ValueError("DecoderLayer requires prepared attention")
         hidden = self.attention_connection(
             hidden, lambda stream: self._attention_update(stream, inputs)

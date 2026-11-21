@@ -1,7 +1,9 @@
 """Runtime attention backends and preparation scoped to one model forward."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 import torch
 from torch import Tensor
@@ -59,8 +61,23 @@ class AttentionBackend(ABC):
 
 
 @dataclass(frozen=True, eq=False)
-class PreparedAttention:
+class PreparedLayout:
+    """A layout an attention component prepared before the layer loop.
+
+    Each component checks for its own subclass; decoders only require that
+    preparation happened once per forward, outside the layers.
+    """
+
     layout: AttentionLayout
+
+
+Prepared = TypeVar("Prepared", bound=PreparedLayout)
+
+
+@dataclass(frozen=True, eq=False)
+class PreparedAttention(PreparedLayout):
+    """Softmax attention: a backend mask over the layout's visibility."""
+
     backend: AttentionBackend
     mask: object
     active_queries: Tensor
@@ -129,15 +146,34 @@ class AttentionPreparationScope:
 
     def __init__(self):
         self._cache = None
+        self._shared = None
 
     def __enter__(self):
         if self._cache is not None:
             raise RuntimeError("attention preparation is already active")
-        self._cache = []
+        self._cache, self._shared = [], []
         return self
 
     def __exit__(self, *exc):
-        self._cache = None
+        self._cache = self._shared = None
+
+    def share(self, key: tuple, build: Callable[[], Prepared]) -> Prepared:
+        """Reuse what an earlier layer built for the same key in this forward.
+
+        Key items compare by identity, like layout tensors in prepare().
+        """
+        if self._cache is None:
+            raise RuntimeError(
+                "prepare attention inside a per-forward preparation scope"
+            )
+        for cached_key, prepared in self._shared:
+            if len(cached_key) == len(key) and all(
+                a is b for a, b in zip(cached_key, key)
+            ):
+                return prepared
+        prepared = build()
+        self._shared.append((key, prepared))
+        return prepared
 
     def prepare(
         self,
