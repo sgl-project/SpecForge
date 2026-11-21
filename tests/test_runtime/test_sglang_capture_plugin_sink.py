@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -40,11 +41,14 @@ from specforge.inference.adapters.server_capture import (
     ServerCaptureFailure,
     SGLangServerCaptureAdapter,
 )
+from specforge.launch import build_disagg_online_producer
+from specforge.runtime.data_plane.drafter_channels import DrafterChannels
 from specforge.runtime.data_plane.mooncake_arena import (
     REF_METADATA_KEY,
     ArenaObjectClient,
 )
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from tests.test_runtime.test_server_capture import (
     HIDDEN,
     _FakeMooncakeStore,
@@ -599,6 +603,43 @@ class SeveralOutputsTest(unittest.TestCase):
         torch.testing.assert_close(self._hidden_states(dspark), aux[..., HIDDEN:])
         self.assertNotIn("target_last_hidden_states", dflash.feature_specs)
         self.assertIn("target_last_hidden_states", dspark.feature_specs)
+
+    def test_one_producer_feeds_every_drafters_channel(self):
+        root = tempfile.mkdtemp(prefix="several_outputs_")
+        paths = {
+            run_id: os.path.join(root, run_id, "refs.jsonl")
+            for run_id in ("run-dflash", "run-dspark")
+        }
+        for path in paths.values():
+            StreamingRefChannel(path).publish_consumer_quantum(1)
+        prompts = [
+            {
+                "task_id": f"p{index}",
+                "payload": {"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 1, 1]},
+            }
+            for index in range(3)
+        ]
+        _workers, drive = build_disagg_online_producer(
+            strategy="dflash+dspark",
+            feature_source=self._adapter(),
+            prompts=prompts,
+            feature_store=self.store,
+            channel=DrafterChannels(
+                [(run_id, StreamingRefChannel(path)) for run_id, path in paths.items()]
+            ),
+            run_id="run",
+        )
+
+        self.assertEqual(drive(), 6)
+        tasks = None
+        for run_id, path in paths.items():
+            trainer = StreamingRefChannel(path)
+            refs = trainer.poll()
+            self.assertTrue(trainer.is_closed())
+            self.assertEqual({ref.run_id for ref in refs}, {run_id})
+            self.assertEqual(len(refs), 3)
+            tasks = tasks or [ref.source_task_id for ref in refs]
+            self.assertEqual([ref.source_task_id for ref in refs], tasks)
 
     def test_one_bad_output_frees_every_output_of_the_prompt(self):
         adapter = self._adapter(target_hidden_size=HIDDEN + 1)
