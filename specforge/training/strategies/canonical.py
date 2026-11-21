@@ -1,6 +1,7 @@
 """Adapt additive objective results to the existing distributed trainer."""
 
 from dataclasses import replace
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,8 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
         self.host_inputs = inner.registration.training.host_inputs
         self.evaluation_diagnostics = inner.registration.training.evaluation_diagnostics
         self.draft_config = inner.draft_model.config.draft
+        # Stepped (and later pooled) here in the training layer, never inside the objective.
+        self.statistics = inner.statistics
         for key, value in inner.draft_model.named_parameters(remove_duplicate=False):
             if id(value) in seen:
                 self._duplicate_parameters.add(key)
@@ -42,6 +45,19 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
 
     def trainable_module(self):
         return self.model
+
+    def after_step(self, *, process_group=None):
+        if self.statistics is None:
+            return {}
+        return self.statistics.step(process_group=process_group)
+
+    def prepare_statistics(self, output, *, keep, pooled, process_group=None):
+        """The statistics-preparation stage: pooling over ranks is the training layer's, as the step is."""
+        if self.statistics is None:
+            return None
+        return self.statistics.balance(
+            output, keep=keep, pooled=pooled, process_group=process_group
+        )
 
     def before_checkpoint(self):
         # What rank 0 records for resume has to hold for every rank.
@@ -80,6 +96,11 @@ class CanonicalTrainStrategy(DraftTrainStrategy):
             step=ctx.global_step,
             total_steps=ctx.total_steps,
             collect_detailed_metrics=ctx.collect_detailed_metrics,
+            prepare_statistics=partial(
+                self.prepare_statistics,
+                pooled=self.model.training and torch.is_grad_enabled(),
+                process_group=ctx.process_group,
+            ),
             **(
                 {self.window_statistic.argument_name: window_value}
                 if self.window_statistic

@@ -8,7 +8,12 @@ import unittest
 from specforge.config.draft.attention import GQASpec, MHASpec
 from specforge.config.draft.conv import GroupedCausalConvSpec
 from specforge.config.draft.layer import LayerSpec
-from specforge.config.draft.mlp import DenseFFNSpec
+from specforge.config.draft.mlp import (
+    DenseFFNSpec,
+    MoEExpertSpec,
+    MoEFFNSpec,
+    MoERouterSpec,
+)
 from specforge.config.draft.norm import RMSNormSpec
 from specforge.config.draft.residual import StandardResidualSpec
 
@@ -34,10 +39,25 @@ def gqa(**overrides):
     )
 
 
+def moe(**overrides):
+    values = {
+        "num_experts": 8,
+        "num_experts_per_tok": 1,
+        "experts": MoEExpertSpec(intermediate_size=96, hidden_act="silu", gated=True),
+        "shared_expert": None,
+        "shared_expert_gate": False,
+        "router": MoERouterSpec(
+            scoring="softmax", normalize_top_k=False, route_scale=1.0, expert_bias=True
+        ),
+    }
+    return MoEFFNSpec(**{**values, **overrides})
+
+
 class DraftNodesTest(unittest.TestCase):
     def test_nodes_are_immutable_hashable_values(self):
         nodes = (
             gqa(),
+            moe(),
             DenseFFNSpec(intermediate_size=256, hidden_act="silu"),
             RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0),
             StandardResidualSpec(),
@@ -116,6 +136,52 @@ class DraftNodesTest(unittest.TestCase):
         ordinary = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=0)
         shifted = RMSNormSpec(has_weight=True, eps=1e-6, weight_offset=1)
         self.assertNotEqual(ordinary, shifted)
+
+    def test_moe_ffn_node(self):
+        expert = dict(intermediate_size=48, hidden_act="silu", gated=True)
+        router = dict(
+            scoring="softmax", normalize_top_k=False, route_scale=1.0, expert_bias=True
+        )
+        for build, message in (
+            (lambda: moe(num_experts_per_tok=9), "exceeds num_experts"),
+            (
+                lambda: moe(experts=MoEExpertSpec(**{**expert, "gated": False})),
+                "gated FFNs only",
+            ),
+            (lambda: moe(num_experts=0), "num_experts must be a positive integer"),
+            (lambda: moe(num_experts_per_tok=True), "num_experts_per_tok"),
+            (
+                lambda: MoEExpertSpec(**{**expert, "intermediate_size": -1}),
+                "intermediate_size",
+            ),
+            (
+                lambda: MoEExpertSpec(**{**expert, "hidden_act": "gelu_new"}),
+                "hidden_act",
+            ),
+            (lambda: MoEExpertSpec(**{**expert, "gated": 1}), "gated"),
+            (lambda: moe(shared_expert_gate=True), "requires a shared expert"),
+            (lambda: MoERouterSpec(**{**router, "scoring": "relu"}), "scoring"),
+            (lambda: MoERouterSpec(**{**router, "route_scale": 0}), "route_scale"),
+            (
+                lambda: MoERouterSpec(**{**router, "route_scale": float("inf")}),
+                "route_scale",
+            ),
+            (
+                lambda: MoERouterSpec(**{**router, "normalize_top_k": 1}),
+                "normalize_top_k",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    build()
+        for build, message in (
+            (lambda: moe(router=None), "router"),
+            (lambda: moe(shared_expert=expert), "shared_expert"),
+            (lambda: moe(experts=expert), "experts"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(TypeError, message):
+                    build()
 
     def test_ffn_convolution_and_references(self):
         for value in (True, 0, -1, 2.0, "2", None):

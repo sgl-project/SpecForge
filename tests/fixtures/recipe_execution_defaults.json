@@ -648,6 +648,15 @@
    "loss_checkpoint": true,
    "loss_chunk": 256
   },
+  "online/disaggregated/managed-local/qwen3-8b-moe-dspark.yaml": {
+   "attention_backend": "eager",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
   "online/disaggregated/managed-local/qwen3.5-4b-dflash-npu.yaml": {
    "attention_backend": "sdpa",
    "dataloader_workers": 8,

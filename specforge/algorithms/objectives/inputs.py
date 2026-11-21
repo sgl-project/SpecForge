@@ -71,6 +71,7 @@ class Blocks:
     weights: Tensor
     anchors: Tensor
     keep: Tensor
+    kept_tokens: Tensor  # [batch, blocks * slots]: every model token of a kept block
     label_positions: Tensor
     layer_inputs: tuple[LayerInputs, ...]
 
@@ -162,12 +163,14 @@ def prepare_blocks(
         ids.shape[0], -1, -1
     )
     visible = torch.cat((context_visible, draft_visible), dim=-1)
-    visible &= keep.repeat_interleave(size, dim=1)[..., None]
+    # The model's tokens: every slot of a kept block; a padded block's are inert.
+    kept_tokens = keep.repeat_interleave(size, dim=1)
+    visible &= kept_tokens[..., None]
     layout = AttentionLayout(
         query_positions=query,
         key_positions=keys,
         visibility=visible[:, None],
-        active_queries=keep.repeat_interleave(size, dim=1),
+        active_queries=kept_tokens,
     )
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)
@@ -180,6 +183,7 @@ def prepare_blocks(
         weights,
         anchors,
         keep,
+        kept_tokens,
         label_positions,
         entries,
     )
