@@ -3,6 +3,50 @@
 The inference plane is an external-server transport boundary. Online training
 does not load or execute a target model in a trainer or producer process.
 
+## Ownership of target execution
+
+Every forward pass through target layers that produces training features runs
+behind this plane, in an SGLang server with the capture plugin. That covers
+online capture and offline preparation: `specforge.offline_capture` uses the
+same plugin client and transport. No trainer, producer or data-preparation
+process runs such a forward.
+
+Reading target weights is not executing the target, and the training plane does
+read them:
+
+| What | Owner | What the training plane does with it |
+|---|---|---|
+| Target layers: prefill, tap hidden states, final hidden state | SGLang, reached through this plane | nothing; it receives the captured features |
+| Bound target tables (`target_bindings`: token embedding, LM head) and the teacher head | the target checkpoint | holds frozen copies, kept out of sharding, the optimizer and the draft's state dict |
+| Target tensors copied at initialization (`initialization.from_target`, `model.load_target_embedding`) | the draft, from then on | trains them as draft parameters |
+| Captured features | the data plane (`FeatureStore`) | reads them as `TrainBatch.tensors` |
+| Draft parameters | the training plane | the trainable state |
+
+The training plane applies the bound tables: an embedding lookup for draft
+inputs, and a projection of the captured final hidden state through the LM head
+when an objective needs teacher logits. Sending the hidden state and projecting
+it locally is far smaller than sending full-vocabulary logits per token.
+
+What follows from the rule:
+
+- At run time the only target-derived tensors a trainer receives are the
+  captured features in `TrainBatch`. It can be run, tested and compared on
+  recorded features with no server.
+- A training backend or a dedicated trainer
+  ([`../training/BACKENDS.md`](../training/BACKENDS.md)) does not add an
+  in-process target forward. A design that needs one changes this rule first,
+  with a check that its hidden states agree with the server's.
+
+What the rule does not cover today:
+
+- `verify_capture_specs` checks feature names, auxiliary layer ids and shapes
+  against the capture configuration. It does not check dtype or the capture
+  method; the server's dtype is adopted as returned.
+- DMTP's `mtp_hidden_states` are accepted only as precomputed records. Their
+  producer is outside this repository, so the rule is not enforced for it.
+- The legacy DFlash model's `spec_generate` helper takes a target module as an
+  argument. It is a generation utility, not on any training or preparation path.
+
 ## Responsibility
 
 `SGLangServerCaptureAdapter` sends model inputs and capture metadata to a
