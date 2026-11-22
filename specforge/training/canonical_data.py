@@ -3,14 +3,30 @@
 from functools import partial
 
 
-def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
+def _require_right_padding(mask):
+    if (mask[:, 1:] & ~mask[:, :-1]).any():
+        raise ValueError(
+            "cached EAGLE attention requires contiguous context with right-padding"
+        )
+
+
+def normalize_sample(
+    raw, *, keys, max_len, loss_mask_filter=None, require_right_padding=False
+):
     import torch
 
     result = {}
     length = None
-    for key in keys:
+    optional = (
+        ("attention_mask",)
+        if "attention_mask" in raw and "attention_mask" not in keys
+        else ()
+    )
+    for key in (*keys, *optional):
+        if key in ("position_ids", "lengths"):
+            continue  # These have independent position/document axes.
         value = raw[key]
-        rank = 1 if key in ("input_ids", "loss_mask") else 2
+        rank = 1 if key in ("input_ids", "loss_mask", "attention_mask") else 2
         if value.ndim == rank + 1 and value.shape[0] == 1:
             value = value.squeeze(0)
         if value.ndim != rank:
@@ -33,7 +49,23 @@ def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
             raise ValueError("lengths must contain positive document lengths")
         starts = lengths.cumsum(0) - lengths
         result["lengths"] = lengths.minimum(length - starts)[starts < length]
-    result["attention_mask"] = torch.ones_like(result["input_ids"], dtype=torch.bool)
+    if "position_ids" in raw:
+        positions = raw["position_ids"][..., :max_len]
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0)
+        elif positions.ndim == 2 and positions.shape[0] == 3:
+            positions = positions.unsqueeze(1)
+        if tuple(positions.shape) not in ((1, length), (3, 1, length)):
+            raise ValueError("position_ids must align with the capture sequence")
+        result["position_ids"] = positions
+    if "attention_mask" in result:
+        result["attention_mask"] = result["attention_mask"].bool()
+        if require_right_padding:
+            _require_right_padding(result["attention_mask"])
+    else:
+        result["attention_mask"] = torch.ones_like(
+            result["input_ids"], dtype=torch.bool
+        )
     return result
 
 
@@ -43,20 +75,31 @@ def shard_sequence(sample, *, rank, size, overlap):
 
     if "lengths" in sample:
         raise ValueError("packed documents are not supported with USP")
+    if "attention_mask" not in sample:
+        sample = {
+            **sample,
+            "attention_mask": torch.ones_like(sample["input_ids"], dtype=torch.bool),
+        }
+    _require_right_padding(sample["attention_mask"].bool())
     length = sample["input_ids"].shape[1]
     chunk = (length + size - 1) // size
     start, width = rank * chunk, chunk + overlap
     result = {}
     for name, tensor in sample.items():
-        part = tensor[:, start : start + width]
-        zeros = tensor.new_zeros(
-            tensor.shape[0], width - part.shape[1], *tensor.shape[2:]
+        axis = tensor.ndim - 1 if name == "position_ids" else 1
+        part = tensor.movedim(axis, 0)[start : start + width]
+        zeros = tensor.new_zeros(width - part.shape[0], *part.shape[1:])
+        result[name] = torch.cat((part, zeros)).movedim(0, axis).contiguous()
+    if "position_ids" not in result:
+        result["position_ids"] = (
+            torch.arange(start, start + width, device=sample["input_ids"].device)
+            .unsqueeze(0)
+            .expand(sample["input_ids"].shape[0], -1)
         )
-        result[name] = torch.cat((part, zeros), dim=1).contiguous()
-    result["position_ids"] = (
-        torch.arange(start, start + width, device=sample["input_ids"].device)
-        .unsqueeze(0)
-        .expand(sample["input_ids"].shape[0], -1)
+    # DDP/FSDP averages the rank-local gradient. Each shard gets an equal
+    # share of the unsharded denominator, independent of synthetic tail rows.
+    result["shard_loss_denominator"] = torch.tensor(
+        sample["input_ids"].numel() / size, device=sample["input_ids"].device
     )
     return result
 
@@ -71,11 +114,16 @@ def build_normalizer(
     keys,
     loss_mask_filter=None,
     overlap=1,
+    require_right_padding=False,
     use_usp_preprocess=False,
     **topology,
 ):
     normalizer = partial(
-        normalize_sample, keys=keys, max_len=max_len, loss_mask_filter=loss_mask_filter
+        normalize_sample,
+        keys=keys,
+        max_len=max_len,
+        loss_mask_filter=loss_mask_filter,
+        require_right_padding=require_right_padding,
     )
     if not use_usp_preprocess:
         return normalizer
@@ -110,14 +158,29 @@ def collate(features, *, keys):
         }
         for feature in features
     ]
-    all_keys = (
-        *keys,
-        "attention_mask",
-        *(("position_ids",) if "position_ids" in features[0] else ()),
-    )
+    separate = {"position_ids", "lengths", "shard_loss_denominator"}
+    all_keys = tuple(
+        key for key in keys if key not in separate and key != "attention_mask"
+    ) + ("attention_mask",)
     result = pad_and_concatenate_features(
         features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
     )
+    if any("position_ids" in feature for feature in features):
+        positions = []
+        for feature in features:
+            pos = feature.get("position_ids")
+            if pos is None:
+                ids = feature["input_ids"]
+                pos = torch.arange(ids.shape[1], device=ids.device).expand_as(ids)
+            width = result["input_ids"].shape[1] - pos.shape[-1]
+            positions.append(torch.nn.functional.pad(pos, (0, width)))
+        if any(pos.ndim == 3 for pos in positions):
+            positions = [pos.expand(3, -1, -1) for pos in positions]
+        result["position_ids"] = torch.cat(positions, dim=-2)
+    if "shard_loss_denominator" in features[0]:
+        result["shard_loss_denominator"] = torch.stack(
+            [feature["shard_loss_denominator"] for feature in features]
+        ).sum()
     if any("lengths" in feature for feature in features):
         if len(features) != 1:
             raise ValueError("packed documents require batch size one")
@@ -140,7 +203,11 @@ def build_reader(hidden_states_path, *, strategy, keys, **kwargs):
             "hidden_states": ("aux_hidden_state",),
             "target_last_hidden_states": ("hidden_state",),
         },
-        optional_features=("lengths",),
+        optional_features=(
+            ("lengths", "attention_mask", "position_ids")
+            if strategy == "eagle3"
+            else ("lengths",)
+        ),
         target_repr="hidden_state" if "target_last_hidden_states" in keys else None,
         **kwargs,
     )

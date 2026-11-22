@@ -60,6 +60,25 @@ def _load_yunchang_globals():
     return PROCESS_GROUP, set_seq_parallel_pg
 
 
+def _native_usp_groups(ulysses_size, ring_size, draft_sp_group):
+    """Build the two axes of each contiguous draft sequence-parallel group."""
+    # shard_sequence assigns consecutive token chunks in SP rank order.
+    # Ulysses first joins adjacent chunks, then ring peers exchange the
+    # resulting blocks while keeping the same head shard.
+    ranks = torch.arange(dist.get_world_size(), device="cpu").reshape(
+        -1, ring_size, ulysses_size
+    )
+
+    def group_for_axis(rows):
+        if rows.shape[-1] == ring_size * ulysses_size:
+            return draft_sp_group
+        members = rows.reshape(-1, rows.shape[-1]).tolist()
+        group, _ = dist.new_subgroups_by_enumeration(members)
+        return group
+
+    return group_for_axis(ranks), group_for_axis(ranks.transpose(1, 2))
+
+
 def _bind_local_device(device_type: str) -> int:
     """Bind this torchrun rank to one visible CUDA/NPU device."""
     if device_type == "cpu":
@@ -146,12 +165,10 @@ def init_distributed(
     # initialization; doing the same for NCCL also removes ambiguous rank/device
     # inference on heterogeneous hosts.
     local_rank = _bind_local_device(device_type)
-    # Yunchang probes the active CUDA device at import, which crashes
-    # NPU-only torch builds. Only USP needs it, so load it lazily when SP
-    # sizes exceed 1. For SP=1, the getters are populated from the singleton
-    # DeviceMesh group below; publishing None would make torch.distributed
-    # operations silently use the default WORLD group instead.
-    if sp_ulysses_size * sp_ring_size > 1:
+    # The Ascend cached-attention implementation uses HCCL for both SP
+    # dimensions. Other USP backends retain Yunchang's group layout.
+    sp_size = sp_ulysses_size * sp_ring_size
+    if sp_size > 1 and device_type != "npu":
         process_group, set_seq_parallel_pg = _load_yunchang_globals()
     else:
         process_group, set_seq_parallel_pg = None, None
@@ -170,13 +187,13 @@ def init_distributed(
     )
 
     assert (
-        world_size % (sp_ulysses_size * sp_ring_size) == 0
-    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_ulysses_size*sp_ring_size})"
+        world_size % sp_size == 0
+    ), f"World size ({world_size}) cannot be evenly divided by total SP size ({sp_size})"
 
-    draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
+    draft_dp_size = world_size // sp_size
     draft_device_mesh = dist.device_mesh.init_device_mesh(
         device_type,
-        (draft_dp_size, sp_ulysses_size * sp_ring_size),
+        (draft_dp_size, sp_size),
         mesh_dim_names=("draft_dp", "sp"),
     )
     if set_seq_parallel_pg is not None:
@@ -191,11 +208,13 @@ def init_distributed(
     if process_group is not None:
         sp_ulysses_group = process_group.ULYSSES_PG
         sp_ring_group = process_group.RING_PG
+    elif sp_size > 1:
+        sp_ulysses_group, sp_ring_group = _native_usp_groups(
+            sp_ulysses_size, sp_ring_size, draft_sp_group
+        )
     else:
-        # Both SP dimensions are 1 here. Reuse the per-rank singleton SP group
-        # so callers always receive a real group whose world size is 1.
-        sp_ulysses_group = draft_sp_group
-        sp_ring_group = draft_sp_group
+        # None would silently select WORLD instead of a singleton group.
+        sp_ulysses_group = sp_ring_group = draft_sp_group
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
