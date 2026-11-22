@@ -4,8 +4,7 @@ import unittest
 
 import torch
 
-from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
-from specforge.core.chunking import checkpointed_chunk_reduce
+from specforge.algorithms.metrics.prefix import hard_label_prefix_counts
 
 
 class PrefixMetricsTest(unittest.TestCase):
@@ -77,8 +76,13 @@ class PrefixMetricsTest(unittest.TestCase):
         expected = hard_label_prefix_counts(*inputs)
         for chunk_size in (0, 1, 2, 3):
             with self.subTest(chunk_size=chunk_size):
-                actual = checkpointed_chunk_reduce(
-                    hard_label_prefix_counts, *inputs, chunk_size=chunk_size, dim=1
-                )
+                width = chunk_size or inputs[0].shape[1]
+                chunks = [
+                    hard_label_prefix_counts(
+                        *(x[:, start : start + width] for x in inputs)
+                    )
+                    for start in range(0, inputs[0].shape[1], width)
+                ]
+                actual = tuple(sum(values) for values in zip(*chunks))
                 for value, reference in zip(actual, expected):
                     torch.testing.assert_close(value, reference)

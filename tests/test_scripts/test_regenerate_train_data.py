@@ -23,7 +23,7 @@ class TestRegenerateTrainData(unittest.TestCase):
             f"""python3 -m sglang.launch_server \
     --model unsloth/Llama-3.2-1B-Instruct \
     --tp 1 \
-    --cuda-graph-bs 4 \
+    --cuda-graph-bs-decode 4 \
     --dtype bfloat16 \
     --mem-frac=0.8 \
     --port {port}

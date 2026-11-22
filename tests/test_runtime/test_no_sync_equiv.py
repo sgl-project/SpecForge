@@ -26,32 +26,25 @@ def _worker(rank, world_size, workdir, results_dir):
 
     fx.init_rank_distributed(rank, world_size, port="29581")
 
-    from specforge.algorithms.eagle3.model import OnlineEagle3Model
-    from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
     from specforge.modeling.target.target_head import TargetHead
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
     from specforge.training.controller import TrainerCore
-    from specforge.training.strategies.base import Eagle3TrainStrategy
+    from tests.test_runtime._fixtures import build_strategy
 
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(True, warn_only=True)
 
     TTT, ACC = 3, 2
-    draft_config = AutoDraftModelConfig.from_file(os.path.join(workdir, "draft.json"))
+    config_path = os.path.join(workdir, "draft.json")
     target_dir = os.path.join(workdir, "target")
     vocab_path = os.path.join(workdir, "vm.pt")
     feat_dir = os.path.join(workdir, "features")
 
     def build_model():
-        dm = AutoDraftModel.from_config(
-            draft_config, attention_backend="flex_attention", torch_dtype=torch.bfloat16
-        ).cuda()
-        dm.load_vocab_mapping(vocab_path)
-        dm.freeze_embedding()
-        return OnlineEagle3Model(
-            draft_model=dm, length=TTT, attention_backend="flex_attention"
-        ).cuda()
+        return fx.load_eagle3(
+            config_path, target_dir, vocab_path, ttt=TTT, backend="sdpa"
+        )
 
     model_a = build_model()
     model_b = build_model()
@@ -90,7 +83,7 @@ def _worker(rank, world_size, workdir, results_dir):
         return _orig_no_sync(*args, **kwargs)
 
     backend_a.module.no_sync = _counting_no_sync
-    strat_a = Eagle3TrainStrategy(backend_a.module, target_head=head)
+    strat_a = build_strategy(backend_a.module, target_head=head)
     core_a = TrainerCore(strat_a, backend_a, accumulation_steps=ACC)
     for _ in range(ACC):
         rep_a = core_a.train_step(batch)
@@ -98,7 +91,7 @@ def _worker(rank, world_size, workdir, results_dir):
     # Path B: force the reduction on every micro-step (is_boundary=True), same math.
     backend_b = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
     backend_b.prepare_model(model_b, wrap=True, optimizer_target=model_b.draft_model)
-    strat_b = Eagle3TrainStrategy(backend_b.module, target_head=head)
+    strat_b = build_strategy(backend_b.module, target_head=head)
     for _ in range(ACC):
         out = strat_b.forward_loss(batch)
         backend_b.backward(out.loss / ACC, is_boundary=True)

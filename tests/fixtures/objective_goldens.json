@@ -1,0 +1,182 @@
+{
+ "dflash-lk_alpha-dpace": {
+  "gradient_norm": 5.500113909633037,
+  "gradient_tensors": 27,
+  "loss": 4.004751682281494
+ },
+ "dflash-lk_alpha-dpace-continuation-value-only": {
+  "gradient_norm": 12.446753693309148,
+  "gradient_tensors": 27,
+  "loss": 11.016319274902344
+ },
+ "dflash-lk_alpha-dpace-cumulative-confidence-only": {
+  "gradient_norm": 3.814937226374343,
+  "gradient_tensors": 27,
+  "loss": 2.9241437911987305
+ },
+ "dflash-lk_alpha-uniform": {
+  "gradient_norm": 4.478558054238243,
+  "gradient_tensors": 27,
+  "loss": 4.178532600402832
+ },
+ "dflash-lk_lambda-dpace": {
+  "gradient_norm": 3.801417547702318,
+  "gradient_tensors": 27,
+  "loss": 3.045104742050171
+ },
+ "dflash-lk_lambda-dpace-continuation-value-only": {
+  "gradient_norm": 8.601163882236342,
+  "gradient_tensors": 27,
+  "loss": 8.373760223388672
+ },
+ "dflash-lk_lambda-dpace-cumulative-confidence-only": {
+  "gradient_norm": 2.6366437184823748,
+  "gradient_tensors": 27,
+  "loss": 2.2234175205230713
+ },
+ "dflash-lk_lambda-uniform": {
+  "gradient_norm": 3.0948087253363705,
+  "gradient_tensors": 27,
+  "loss": 3.1762354373931885
+ },
+ "dflash-lk_tv-dpace": {
+  "gradient_norm": 0.08718920069452685,
+  "gradient_tensors": 27,
+  "loss": 0.9467887878417969
+ },
+ "dflash-lk_tv-dpace-continuation-value-only": {
+  "gradient_norm": 0.19288212992435366,
+  "gradient_tensors": 27,
+  "loss": 2.595669984817505
+ },
+ "dflash-lk_tv-dpace-cumulative-confidence-only": {
+  "gradient_norm": 0.06028012715370572,
+  "gradient_tensors": 27,
+  "loss": 0.6912441253662109
+ },
+ "dflash-lk_tv-uniform": {
+  "gradient_norm": 0.06925705763801734,
+  "gradient_tensors": 27,
+  "loss": 0.9846622943878174
+ },
+ "dflash-step0-train": {
+  "gradient_norm": 6.201921874104639,
+  "gradient_tensors": 27,
+  "loss": 4.212259292602539
+ },
+ "dflash-step1-eval": {
+  "gradient_norm": 6.201921874104639,
+  "gradient_tensors": 27,
+  "loss": 4.212259292602539
+ },
+ "dflash-step5-train": {
+  "gradient_norm": 6.201921874104639,
+  "gradient_tensors": 27,
+  "loss": 4.212259292602539
+ },
+ "dflash2-step0-train": {
+  "gradient_norm": 10.400425352848321,
+  "gradient_tensors": 38,
+  "loss": 4.477447986602783
+ },
+ "dflash2-step1-eval": {
+  "gradient_norm": 10.400425352848321,
+  "gradient_tensors": 38,
+  "loss": 4.477447986602783
+ },
+ "dflash2-step5-train": {
+  "gradient_norm": 10.400425352848321,
+  "gradient_tensors": 38,
+  "loss": 4.477447986602783
+ },
+ "dmtp": {
+  "gradient_norm": 5.4170260758956585,
+  "gradient_tensors": 30,
+  "loss": 4.169641971588135
+ },
+ "domino-shifted-step0-train": {
+  "gradient_norm": 5.739894283143199,
+  "gradient_tensors": 31,
+  "loss": 4.234778881072998
+ },
+ "domino-shifted-step1-eval": {
+  "gradient_norm": 5.736869137511254,
+  "gradient_tensors": 31,
+  "loss": 4.234894275665283
+ },
+ "domino-shifted-step5-train": {
+  "gradient_norm": 5.7256303657864605,
+  "gradient_tensors": 31,
+  "loss": 4.23535680770874
+ },
+ "domino-step0-train": {
+  "gradient_norm": 7.263074191040931,
+  "gradient_tensors": 31,
+  "loss": 4.237421035766602
+ },
+ "domino-step1-eval": {
+  "gradient_norm": 7.263074363676664,
+  "gradient_tensors": 31,
+  "loss": 4.237421035766602
+ },
+ "domino-step5-train": {
+  "gradient_norm": 7.263074191040931,
+  "gradient_tensors": 31,
+  "loss": 4.237421035766602
+ },
+ "dspark-step0-train": {
+  "gradient_norm": 3.061655253997437,
+  "gradient_tensors": 33,
+  "loss": 1.2190072536468506
+ },
+ "dspark-step1-eval": {
+  "gradient_norm": 3.061655253997437,
+  "gradient_tensors": 33,
+  "loss": 1.2190072536468506
+ },
+ "dspark-step5-train": {
+  "gradient_norm": 3.061655253997437,
+  "gradient_tensors": 33,
+  "loss": 1.2190072536468506
+ },
+ "dspine-step0-train": {
+  "gradient_norm": 13.55390043554813,
+  "gradient_tensors": 33,
+  "loss": 29.37940216064453
+ },
+ "dspine-step1-eval": {
+  "gradient_norm": 13.55390043554813,
+  "gradient_tensors": 33,
+  "loss": 29.37940216064453
+ },
+ "dspine-step5-train": {
+  "gradient_norm": 13.55390043554813,
+  "gradient_tensors": 33,
+  "loss": 29.37940216064453
+ },
+ "eagle3-length7": {
+  "gradient_norm": 0.9675911515600779,
+  "gradient_tensors": 14,
+  "loss": 3.3276615142822266
+ },
+ "eagle3-length9": {
+  "gradient_norm": 0.8961171267696235,
+  "gradient_tensors": 14,
+  "loss": 4.457488059997559
+ },
+ "mtp": {
+  "gradient_norm": 3.8812088502063165,
+  "gradient_tensors": 17,
+  "loss": 4.132400989532471
+ },
+ "peagle-length7": {
+  "gradient_norm": 2.528435116025731,
+  "gradient_tensors": 33,
+  "loss": 3.5371005535125732
+ },
+ "peagle-length9": {
+  "gradient_norm": 2.1094637547058848,
+  "gradient_tensors": 33,
+  "loss": 3.5800774097442627
+ }
+}
