@@ -10,13 +10,22 @@ def normalize_sample(raw, *, keys, max_len, loss_mask_filter=None):
     length = None
     for key in keys:
         value = raw[key]
-        rank = 1 if key in ("input_ids", "loss_mask") else 2
+        rank = 1 if key in ("input_ids", "loss_mask", "visual_score") else 2
         if value.ndim == rank + 1 and value.shape[0] == 1:
             value = value.squeeze(0)
         if value.ndim != rank:
             raise ValueError(
                 f"{key}: invalid capture tensor shape {tuple(value.shape)}"
             )
+        if key == "visual_score":
+            from specforge.data.visual_score import SCALE
+
+            if value.dtype != torch.int64 or value.numel() != raw["input_ids"].size(-1):
+                raise ValueError("visual_score must be int64 and match input_ids")
+            if (value < -1).any() or (value > SCALE).any():
+                raise ValueError(
+                    f"visual_score must contain -1 or scores in [0, {SCALE}]"
+                )
         value = value[:max_len]
         if length is not None and value.shape[0] != length:
             raise ValueError("capture tensors must have identical sequence lengths")

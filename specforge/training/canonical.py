@@ -190,16 +190,18 @@ def resolve_run(cfg, *, target_config=None):
     )
     target_repr = "hidden_state" if "target_last_hidden_states" in keys else None
     representations = frozenset({target_repr}) if target_repr else frozenset()
+    contract = FeatureContract(
+        mode=FeatureMode.OFFLINE,
+        modality=requirements.offline_modalities[0],
+        required_tensors=frozenset(keys),
+        optional_tensors=frozenset({"attention_mask"}),
+        allowed_target_representations=representations,
+        default_target_representation=target_repr,
+        storage=storage,
+    )
     contracts = [
-        FeatureContract(
-            mode=FeatureMode.OFFLINE,
-            modality="text",
-            required_tensors=frozenset(keys),
-            optional_tensors=frozenset({"attention_mask"}),
-            allowed_target_representations=representations,
-            default_target_representation=target_repr,
-            storage=storage,
-        )
+        replace(contract, modality=modality)
+        for modality in requirements.offline_modalities
     ]
     # Generic capture supplies aux/final target states. DMTP needs an external
     # frozen-MTP feature producer, so only precomputed records are accepted.
@@ -213,18 +215,23 @@ def resolve_run(cfg, *, target_config=None):
             passthrough=(("input_ids", "input_ids"), ("loss_mask", "loss_mask")),
         )
     )
-    offline = OfflineDataProvider(
-        modality="text",
-        normalizer_id=normalizer,
-        build_reader=partial(canonical_data.build_reader, strategy=family, keys=keys),
-        build_normalizer=partial(
-            canonical_data.build_normalizer,
-            keys=keys,
-            loss_mask_filter=requirements.loss_mask_filter,
-            overlap=getattr(resolved.objective, "ttt_length", 1),
-        ),
-        build_collator=partial(canonical_data.build_collator, keys=keys),
-        capture_layout=layout,
+    offline = tuple(
+        OfflineDataProvider(
+            modality=modality,
+            normalizer_id=normalizer,
+            build_reader=partial(
+                canonical_data.build_reader, strategy=family, keys=keys
+            ),
+            build_normalizer=partial(
+                canonical_data.build_normalizer,
+                keys=keys,
+                loss_mask_filter=requirements.loss_mask_filter,
+                overlap=getattr(resolved.objective, "ttt_length", 1),
+            ),
+            build_collator=partial(canonical_data.build_collator, keys=keys),
+            capture_layout=layout if modality == "text" else None,
+        )
+        for modality in requirements.offline_modalities
     )
     streaming = ()
     if layout is not None:
@@ -247,7 +254,7 @@ def resolve_run(cfg, *, target_config=None):
             ),
         )
         contracts.append(
-            replace(contracts[0], mode=FeatureMode.STREAMING, storage=None)
+            replace(contract, mode=FeatureMode.STREAMING, modality="text", storage=None)
         )
     vocab = requirements.supports_vocab_mapping
     if cfg.model.vocab_mapping_path and not vocab:
@@ -287,7 +294,7 @@ def resolve_run(cfg, *, target_config=None):
         algorithm_name=family,
         model=provider,
         step=step,
-        offline=(offline,),
+        offline=offline,
         server_streaming=streaming,
         vocab_mapping_modes=spec.feature_modes if vocab else frozenset(),
     )

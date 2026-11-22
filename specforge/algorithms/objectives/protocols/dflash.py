@@ -25,6 +25,7 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
         loss_mask_filter=has_consecutive_supervised_tokens,
         dataloader_workers=8,
         liger_by_default=True,
+        offline_modalities=("text", "multimodal"),
     ),
     architectures=("DFlashDraftModel",),
     inputs=("input_ids", "hidden_states", "loss_mask"),
@@ -43,9 +44,12 @@ class DFlashObjective:
     teacher_metrics: bool = False
     metric_top_k: int = 16
     loss_decay_gamma: float | None = None
+    full_block_anchors: bool = False
 
     #: Options that only select what is logged; not part of the resume record.
     logging_options = ("teacher_metrics", "metric_top_k")
+    # Omit the original sampler's default so earlier checkpoints still resume.
+    checkpoint_option_defaults = {"full_block_anchors": False}
     default_loss = TokenLoss(kind="ce")
     default_weighting_options = ("loss_decay_gamma",)
 
@@ -54,6 +58,8 @@ class DFlashObjective:
         return decay_weighting(self.loss_decay_gamma)
 
     def __post_init__(self):
+        if type(self.full_block_anchors) is not bool:
+            raise ValueError("full_block_anchors must be a boolean")
         check_options(
             counts={"num_anchors": self.num_anchors, "metric_top_k": self.metric_top_k},
             positive={"loss_decay_gamma": self.loss_decay_gamma},
@@ -65,6 +71,7 @@ class DFlashObjective:
             model.config.draft,
             batch,
             num_anchors=self.num_anchors,
+            full_block_anchors=self.full_block_anchors,
         )
         output = model(
             blocks.input_ids,

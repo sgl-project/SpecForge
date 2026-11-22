@@ -8,6 +8,7 @@ from . import (  # noqa: F401
     dspark,
     dspine,
     eagle3,
+    mmflash,
     mtp,
     peagle,
 )
