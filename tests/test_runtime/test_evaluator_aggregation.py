@@ -2,8 +2,8 @@
 """Evaluator aggregation gates: correct/denom counts are summed over the whole
 eval pass (all batches, all DP ranks) before any ratio or geometric sum, scalar
 accuracy is weighted by its own denominator, and zero batches globally returns
-``{}``. Plus CheckpointManager rotation/pointer/resume checks. CPU-only
-(fabricated per-step metrics); the DP gate spawns a 2-process gloo group."""
+``{}``. Plus CheckpointManager rotation/pointer/resume checks. The distributed
+gates use fabricated per-step metrics on two Gloo ranks or two available NPUs."""
 
 import json
 import os
@@ -135,6 +135,19 @@ class TestEvaluatorAggregation(unittest.TestCase):
         self.assertLess(m["eval/avg_acc"], 1.0)
         self.assertAlmostEqual(m["eval/avg_acc"], big / (big + 3), places=12)
 
+    def test_integer_loss_denominators_keep_float64_precision(self):
+        large = 2**24
+        outputs = [
+            StepOutput(
+                loss=torch.tensor(loss),
+                metrics={"metric_loss_denoms": [torch.tensor(count)]},
+            )
+            for loss, count in ((1.0, large + 1), (0.0, large))
+        ]
+        self.assertEqual(
+            self._run(outputs)["eval/avg_loss"], (large + 1) / (2 * large + 1)
+        )
+
     def test_scalar_strategy_degenerates_gracefully(self):
         from specforge.eval import Evaluator
 
@@ -244,11 +257,16 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _dp_worker(rank, world_size, port, results_dir):
+def _dp_worker(rank, world_size, port, results_dir, backend):
     import torch.distributed as dist
 
+    if backend == "hccl":
+        os.environ["LOCAL_RANK"] = str(rank)
+        os.environ["SPECFORGE_DEVICE"] = "npu"
+        torch.npu.set_device(rank)
+    device = torch.device("npu", rank) if backend == "hccl" else torch.device("cpu")
     dist.init_process_group(
-        "gloo",
+        backend,
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
@@ -258,20 +276,22 @@ def _dp_worker(rank, world_size, port, results_dir):
 
     # Scenario 1 — scalar accuracy, uneven shards, accuracy_denom != tokens:
     # both weight sets must be reduced across ranks independently.
-    if rank == 0:
-        outs = [_scalar_out(2.0, 0.5, tokens=8, denom=4)]
-    else:
-        outs = [
-            _scalar_out(8.0, 0.7, tokens=2, denom=1),
-            _scalar_out(4.0, 0.9, tokens=10, denom=5),
-        ]
+    with torch.device(device):
+        if rank == 0:
+            outs = [_scalar_out(2.0, 0.5, tokens=8, denom=4)]
+        else:
+            outs = [
+                _scalar_out(8.0, 0.7, tokens=2, denom=1),
+                _scalar_out(4.0, 0.9, tokens=10, denom=5),
+            ]
     it = iter(outs)
     scalar = Evaluator().run(lambda b: next(it), [_batch() for _ in outs])
 
     # Scenario 2 — ragged per-position shards: rank 1's shard is EMPTY. This
     # gates the Evaluator's OWN collectives only; a collective forward_fn
     # (FSDP) would additionally need equal per-rank batch counts — out of scope.
-    outs2 = [_step_output(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
+    with torch.device(device):
+        outs2 = [_step_output(1.0, corrects=[3, 2], denoms=[4, 4])] if rank == 0 else []
     it2 = iter(outs2)
     ragged = Evaluator().run(lambda b: next(it2), [_batch() for _ in outs2])
 
@@ -285,10 +305,24 @@ def _dp_worker(rank, world_size, port, results_dir):
 
 class TestEvaluatorDataParallel(unittest.TestCase):
     def test_dp_reduction_and_ragged_shards(self):
+        self._check_backend("gloo")
+
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.device_count() >= 2, "requires two NPUs"
+    )
+    def test_hccl_reduction_and_ragged_shards(self):
+        self._check_backend("hccl")
+
+    def _check_backend(self, backend):
         import torch.multiprocessing as mp
 
         results_dir = tempfile.mkdtemp(prefix="eval_dp_")
-        mp.spawn(_dp_worker, args=(2, _free_port(), results_dir), nprocs=2, join=True)
+        mp.spawn(
+            _dp_worker,
+            args=(2, _free_port(), results_dir, backend),
+            nprocs=2,
+            join=True,
+        )
 
         results = []
         for r in range(2):
