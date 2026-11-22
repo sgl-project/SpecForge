@@ -15,7 +15,7 @@ import os
 from typing import Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
-from specforge.runtime.contracts import SampleRef
+from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.control_plane.metadata_store import (
     InMemoryMetadataStore,
@@ -1031,7 +1031,7 @@ def build_disagg_online_producer(
                 consumer_failure = channel.consumer_failure()
                 if consumer_failure is not None:
                     raise RuntimeError(
-                        "consumer failed before publishing its optimizer window: "
+                        "consumer failed before publishing its dispatch requirement: "
                         f"{consumer_failure}"
                     )
                 if (
@@ -1039,7 +1039,7 @@ def build_disagg_online_producer(
                     and time.monotonic() - quantum_wait_start > peer_wait_timeout_s
                 ):
                     raise TimeoutError(
-                        "producer timed out waiting for the consumer optimizer "
+                        "producer timed out waiting for the consumer dispatch "
                         f"window after {peer_wait_timeout_s:.0f}s"
                     )
                 sleep(backpressure_poll_s)
@@ -1047,23 +1047,23 @@ def build_disagg_online_producer(
                 raise ValueError(
                     "producer in-flight high watermark "
                     f"{in_flight_high_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
+                    f"dispatch quantum {consumer_quantum}; set "
                     "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
                 )
             resolved_low_watermark = flow_control.limits.resolved_low_watermark_refs
             if resolved_low_watermark < consumer_quantum:
-                # The consumer dispatches only whole optimizer windows, so a
+                # The consumer dispatches only complete groups of windows, so a
                 # paused producer must be resumable while the consumer still
-                # needs up to one full window: a low watermark below the
+                # needs a full dispatch group: a low watermark below the
                 # quantum could leave both sides waiting on each other.
                 raise ValueError(
                     "producer in-flight low watermark "
                     f"{resolved_low_watermark} is smaller than the consumer's "
-                    f"global optimizer-step quantum {consumer_quantum}; set "
+                    f"dispatch quantum {consumer_quantum}; set "
                     "DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
                 )
             producer_timing(
-                f"consumer optimizer window ready quantum={consumer_quantum}"
+                f"consumer dispatch requirement ready quantum={consumer_quantum}"
             )
         except BaseException as exc:
             try:
@@ -1080,6 +1080,7 @@ def build_disagg_online_producer(
             "first_ref_logged": False,
             "accounted_consumed": channel.consumed_remote(),
             "resident_bytes": 0,
+            "published_bytes": 0,
         }
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
@@ -1114,7 +1115,17 @@ def build_disagg_online_producer(
             return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
 
         def reconcile_consumed_locked() -> int:
-            consumed = channel.consumed_remote()
+            consumed, released_bytes = channel.consumed_state_remote()
+            if released_bytes is not None:
+                resident = state["published_bytes"] - released_bytes
+                if resident < 0:
+                    raise RuntimeError("released bytes exceed published bytes")
+                state["resident_bytes"] = resident
+                state["accounted_consumed"] = consumed
+                published_sizes.clear()
+                return resident
+            # Integer-only channels acknowledge FIFO; source distributors publish
+            # exact bytes, including after a consumer restart.
             delta = consumed - state["accounted_consumed"]
             if delta < 0 or delta > len(published_sizes):
                 raise RuntimeError(
@@ -1128,9 +1139,8 @@ def build_disagg_online_producer(
             return state["resident_bytes"]
 
         def resident_bytes() -> int:
-            # Mooncake health is process-local and cannot observe deletes made by
-            # a remote consumer. Track the published-but-unacknowledged prefix
-            # from SampleRef.estimated_bytes and the channel's durable counter.
+            # The distributor reports bytes for the actual released refs;
+            # consumption order may differ from publication order.
             with publish_lock:
                 return reconcile_consumed_locked()
 
@@ -1169,7 +1179,9 @@ def build_disagg_online_producer(
                     feature_store=feature_store,
                     refs=refs,
                 )
-                published_sizes.extend(ref_sizes)
+                if channel.consumed_state_remote()[1] is None:
+                    published_sizes.extend(ref_sizes)
+                state["published_bytes"] += sum(ref_sizes)
                 state["resident_bytes"] = projected_bytes
                 state["produced"] += len(refs)
                 now = time.perf_counter()
@@ -1233,10 +1245,10 @@ def build_disagg_online_producer(
 
                         in_flight = channel.in_flight_remote()
                         current_resident_bytes = resident_bytes()
-                        # The consumer cannot acknowledge anything until one
-                        # complete optimizer window is available. Byte
+                        # The consumer cannot acknowledge anything until a
+                        # complete dispatch group is available. Byte
                         # backpressure below that ref quantum would deadlock
-                        # both roles; allow the required window to fill while
+                        # both roles; allow the required group to fill while
                         # the explicit hard byte cap remains enforced by
                         # publish_refs().
                         policy_paused = flow_control.should_pause(
@@ -1553,6 +1565,8 @@ def build_disagg_online_consumer(
     dataloader_num_workers: int = 0,
     profiling_options=None,
     async_ack: Optional[bool] = None,
+    consumer_dispatch: str = "cost_balanced",
+    dispatch_num_anchors: int = 512,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1724,6 +1738,9 @@ def build_disagg_online_consumer(
                 feature_store=feature_store,
                 refs_per_rank_step=batch_size * accumulation_steps,
                 refs_per_rank_batch=batch_size,
+                dispatch_policy=consumer_dispatch,
+                num_anchors=dispatch_num_anchors,
+                block_size=getattr(draft_model, "block_size", 16),
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
@@ -1741,7 +1758,9 @@ def build_disagg_online_consumer(
                     ),
                 ).start()
             channel.publish_consumer_quantum(
-                dp_size * batch_size * accumulation_steps,
+                consumer_dispatch_quantum(
+                    consumer_dispatch, dp_size * batch_size * accumulation_steps
+                ),
                 allow_existing=resume_from is not None,
             )
         except BaseException as exc:

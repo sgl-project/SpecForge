@@ -1,8 +1,9 @@
 # coding=utf-8
 """Model-agnostic selective loading from local or Hugging Face checkpoints.
 
-These helpers know nothing about any model family or key naming convention;
-callers provide the keys or the predicate.  Both sharded checkpoints
+These helpers know nothing about any model family or key naming convention.
+The public tensor loader accepts exact keys, a key filter, or no selector for
+an intentional full load. Both sharded checkpoints
 (``*.safetensors.index.json``) and single-file checkpoints are supported.
 """
 
@@ -15,6 +16,155 @@ from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from safetensors import safe_open
+
+_CANONICAL_LAYOUTS = (
+    ("single", "model.safetensors"),
+    ("index", "model.safetensors.index.json"),
+    ("single", "pytorch_model.bin"),
+    ("index", "pytorch_model.bin.index.json"),
+)
+
+
+def _resolve_weight_layout(
+    checkpoint_dir: str, *, allow_missing: bool = False
+) -> tuple[str, str]:
+    """Return (kind, path) for one deterministic checkpoint layout.
+
+    Hugging Face prefers safetensors when both safetensors and PyTorch weights
+    are present, so use the same precedence for the canonical file names. A
+    non-canonical layout is accepted only when it is unambiguous.
+    """
+
+    for kind, filename in _CANONICAL_LAYOUTS:
+        path = os.path.join(checkpoint_dir, filename)
+        if os.path.isfile(path):
+            return kind, path
+
+    index_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.index.json")))
+    if len(index_files) == 1:
+        return "index", index_files[0]
+    if len(index_files) > 1:
+        raise FileNotFoundError(
+            f"Multiple checkpoint index files found in {checkpoint_dir}: "
+            f"{[os.path.basename(path) for path in index_files]}"
+        )
+
+    weight_files = sorted(
+        glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))
+        + glob.glob(os.path.join(checkpoint_dir, "*.bin"))
+    )
+    if len(weight_files) == 1:
+        return "single", weight_files[0]
+    if len(weight_files) > 1:
+        raise FileNotFoundError(
+            f"Multiple unindexed checkpoint files found in {checkpoint_dir}: "
+            f"{[os.path.basename(path) for path in weight_files]}"
+        )
+    if allow_missing:
+        return "missing", ""
+    raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
+
+
+_HUB_CACHE_REPO_PREFIX = "models--"
+
+
+def _inside(path: str, root: str) -> bool:
+    """Return whether ``path`` is ``root`` itself or lives below it.
+
+    ``os.path.commonpath`` compares the text it is given, case included, so two
+    spellings of the same Windows directory (``C:\\Temp`` vs ``c:\\temp``) would
+    compare as unrelated. ``os.path.normcase`` folds that away on the platforms
+    that need it and is the identity on POSIX, which keeps a real escape a
+    mismatch on both.
+    """
+
+    try:
+        return os.path.normcase(os.path.commonpath([path, root])) == os.path.normcase(
+            root
+        )
+    except ValueError:
+        # Different drives on Windows: no common path, hence no containment.
+        return False
+
+
+def _hub_cache_repo_root(checkpoint_dir: str) -> Optional[str]:
+    """Return the cache repository directory of a Hugging Face snapshot, if any.
+
+    ``huggingface_hub`` stores one repository as ``blobs/<sha>`` next to
+    ``snapshots/<revision>/<file>``, where the snapshot entries are symbolic
+    links that point back into ``blobs``. A snapshot directory therefore
+    resolves its shards outside itself by design, but never outside the
+    ``models--<org>--<name>`` directory that holds both parts.
+    """
+
+    snapshots_dir = os.path.dirname(os.path.realpath(checkpoint_dir))
+    if os.path.basename(snapshots_dir) != "snapshots":
+        return None
+    repo_root = os.path.dirname(snapshots_dir)
+    if not os.path.basename(repo_root).startswith(_HUB_CACHE_REPO_PREFIX):
+        return None
+    if not os.path.isdir(os.path.join(repo_root, "blobs")):
+        return None
+    return repo_root
+
+
+def _check_shard_name(checkpoint_dir: str, shard: str, index_path: str) -> None:
+    """Reject a ``weight_map`` value that points outside the checkpoint.
+
+    ``weight_map`` values name shard files inside the checkpoint directory. A
+    value that is absolute, or that walks out of the directory with ``..``,
+    makes the loader read a tensor file the caller never pointed at; the
+    exported draft then ships those weights, so the index is refused instead of
+    followed.
+
+    Symbolic links are a separate case from the index value itself. A standard
+    Hugging Face snapshot names plain relative shards whose targets live in the
+    neighbouring ``blobs`` directory, and :func:`resolve_checkpoint_dir` returns
+    exactly such a snapshot directory, so those links are supported as long as
+    they stay inside the same cache repository. A link that leaves it is
+    refused like any other escape.
+    """
+
+    if os.path.isabs(shard):
+        raise ValueError(
+            f"Checkpoint index {index_path} maps a tensor to the absolute shard "
+            f"path {shard!r}; weight_map values must be shard file names inside "
+            f"{checkpoint_dir}"
+        )
+
+    directory = os.path.realpath(checkpoint_dir)
+    joined = os.path.join(directory, shard)
+    if _inside(os.path.normpath(joined), directory):
+        # Match file lookup: follow directory symlinks before interpreting '..'.
+        resolved = os.path.realpath(joined)
+        if _inside(resolved, directory):
+            return
+        repo_root = _hub_cache_repo_root(directory)
+        if repo_root is not None and _inside(resolved, repo_root):
+            return
+
+    raise ValueError(
+        f"Checkpoint index {index_path} maps a tensor to the shard {shard!r}, "
+        f"which leaves the checkpoint directory {checkpoint_dir}; weight_map values must be "
+        "shard file names inside the checkpoint directory"
+    )
+
+
+def _read_weight_map_file(index_path: str) -> Dict[str, str]:
+    with open(index_path, encoding="utf-8") as handle:
+        index = json.load(handle)
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Checkpoint index has no valid weight_map: {index_path}")
+    if not all(
+        isinstance(key, str) and isinstance(filename, str)
+        for key, filename in weight_map.items()
+    ):
+        raise ValueError(f"Checkpoint index has an invalid weight_map: {index_path}")
+    checkpoint_dir = os.path.dirname(index_path) or os.curdir
+    for filename in dict.fromkeys(weight_map.values()):
+        _check_shard_name(checkpoint_dir, filename, index_path)
+    return weight_map
 
 
 def resolve_checkpoint_dir(
@@ -35,175 +185,130 @@ def resolve_checkpoint_dir(
     )
 
 
-def read_weight_map(checkpoint_dir: str) -> Dict[str, str]:
-    """Return the ``weight_map`` of a sharded checkpoint, or {} if unsharded."""
+def _load_tensor_file(
+    path: str, predicate: Callable[[str], bool]
+) -> Dict[str, torch.Tensor]:
+    """Load matching tensors from one safetensors or PyTorch weight file."""
 
-    index_files = glob.glob(os.path.join(checkpoint_dir, "*.index.json"))
-    if not index_files:
+    if path.endswith(".safetensors"):
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            return {
+                key: handle.get_tensor(key) for key in handle.keys() if predicate(key)
+            }
+
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise TypeError(f"Checkpoint file does not contain a state dict: {path}")
+    return {key: value for key, value in state.items() if predicate(key)}
+
+
+def read_weight_map(checkpoint_dir: str) -> Dict[str, str]:
+    """Return the weight map of a sharded checkpoint, or {} if unsharded."""
+
+    try:
+        kind, path = _resolve_weight_layout(checkpoint_dir, allow_missing=True)
+    except FileNotFoundError:
+        if not glob.glob(os.path.join(checkpoint_dir, "*.index.json")):
+            return {}
+        raise
+    if kind != "index":
         return {}
-    with open(index_files[0], "r") as f:
-        index = json.load(f)
-    return index.get("weight_map", {})
+    return _read_weight_map_file(path)
 
 
 def list_checkpoint_keys(checkpoint_dir: str) -> List[str]:
     """List all tensor keys without loading tensor payloads."""
 
-    weight_map = read_weight_map(checkpoint_dir)
-    if weight_map:
-        return sorted(weight_map.keys())
-    for pattern in ("*.safetensors", "*.bin"):
-        files = sorted(glob.glob(os.path.join(checkpoint_dir, pattern)))
-        if files:
-            target = files[0]
-            if target.endswith(".safetensors"):
-                with safe_open(target, framework="pt") as f:
-                    return sorted(f.keys())
-            state = torch.load(target, map_location="cpu", weights_only=True)
-            return sorted(state.keys())
-    raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
+    kind, path = _resolve_weight_layout(checkpoint_dir)
+    if kind == "index":
+        return sorted(_read_weight_map_file(path))
+    if path.endswith(".safetensors"):
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            return sorted(handle.keys())
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise TypeError(f"Checkpoint file does not contain a state dict: {path}")
+    return sorted(state)
 
 
-def load_selected_tensors(
-    checkpoint_dir: str,
-    predicate: Callable[[str], bool],
-) -> Dict[str, torch.Tensor]:
-    """Load only the tensors whose key matches ``predicate``.
-
-    Sharded checkpoints open just the shards that hold selected keys.
-    """
-
-    weight_map = read_weight_map(checkpoint_dir)
-    selected: Dict[str, torch.Tensor] = {}
-    if weight_map:
-        shards = sorted({weight_map[k] for k in weight_map if predicate(k)})
-        for shard in shards:
-            shard_path = os.path.join(checkpoint_dir, shard)
-            if not os.path.exists(shard_path):
-                continue
-            with safe_open(shard_path, framework="pt") as f:
-                for key in f.keys():
-                    if predicate(key):
-                        selected[key] = f.get_tensor(key)
-        return selected
-
-    for pattern in ("*.safetensors", "*.bin"):
-        files = sorted(glob.glob(os.path.join(checkpoint_dir, pattern)))
-        if files:
-            target = files[0]
-            if target.endswith(".safetensors"):
-                with safe_open(target, framework="pt") as f:
-                    for key in f.keys():
-                        if predicate(key):
-                            selected[key] = f.get_tensor(key)
-            else:
-                state = torch.load(target, map_location="cpu", weights_only=True)
-                for key, value in state.items():
-                    if predicate(key):
-                        selected[key] = value
-            return selected
-    raise FileNotFoundError(f"No checkpoint found in {checkpoint_dir}")
-
-
-def load_tensors_by_keys(
-    checkpoint_dir: str, keys: Iterable[str]
-) -> Dict[str, torch.Tensor]:
-    """Load exactly ``keys`` (missing keys are simply absent from the result)."""
-
-    wanted = set(keys)
-    return load_selected_tensors(checkpoint_dir, lambda key: key in wanted)
-
-
-def merge_state_into_checkpoint(
-    base_checkpoint_dir: str,
-    state: Dict[str, torch.Tensor],
-    output_dir: str,
+def load_checkpoint_tensors(
+    path_or_repo: str,
     *,
-    shard_name: str,
-    drop_prefixes: Iterable[str] = (),
-) -> None:
-    """Merge a state dict into a copy of a base checkpoint (model-agnostic).
+    keys: Optional[Iterable[str]] = None,
+    key_filter: Optional[Callable[[str], bool]] = None,
+    cache_dir: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """Load tensors from a local or Hugging Face checkpoint.
 
-    Copies non-weight files, drops base weight entries under ``drop_prefixes``,
-    and merges ``state``.  Sharded bases get ``state`` written to a new
-    ``shard_name`` shard with the index ``weight_map`` updated in place (the
-    large base shards are never rewritten); single-file bases are rewritten
-    whole under their original file name.
+    ``keys`` requests an exact set and raises if any requested key is missing.
+    ``key_filter`` loads every matching tensor and permits zero matches. With
+    neither selector, the entire checkpoint is loaded; this can materialize a
+    large model in CPU memory, especially for PyTorch ``.bin`` checkpoints.
+    ``keys`` and ``key_filter`` are mutually exclusive.
+
+    Tensors retain their stored dtype and are always returned on CPU. Sharded
+    checkpoints open only the shards containing selected keys.
     """
 
-    import shutil
+    if keys is not None and key_filter is not None:
+        raise ValueError("keys and key_filter are mutually exclusive")
 
-    from safetensors.torch import save_file
-
-    os.makedirs(output_dir, exist_ok=True)
-    prefixes = tuple(drop_prefixes)
-
-    # Copy non-weight files so the output directory is self-contained.
-    for fname in os.listdir(base_checkpoint_dir):
-        src = os.path.join(base_checkpoint_dir, fname)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(output_dir, fname))
-
-    index_files = glob.glob(os.path.join(base_checkpoint_dir, "*.index.json"))
-    if index_files:
-        with open(index_files[0], "r") as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
-
-        old_keys = [k for k in weight_map if k.startswith(prefixes)]
-        for key in old_keys:
-            del weight_map[key]
-        if old_keys:
-            print(
-                f"Replaced {len(old_keys)} weight entries under {prefixes} "
-                "from base model."
-            )
-
-        # Write the incoming tensors to a dedicated shard; base shards untouched.
-        save_file(state, os.path.join(output_dir, shard_name))
-        for key in state.keys():
-            weight_map[key] = shard_name
-
-        index["weight_map"] = weight_map
-        with open(os.path.join(output_dir, os.path.basename(index_files[0])), "w") as f:
-            json.dump(index, f, indent=2)
-        return
-
-    # Single-file base: load, drop, merge, rewrite under the original name.
-    base_safetensors = glob.glob(os.path.join(base_checkpoint_dir, "*.safetensors"))
-    base_bins = glob.glob(os.path.join(base_checkpoint_dir, "*.bin"))
-    if not base_safetensors and not base_bins:
-        raise FileNotFoundError(f"No checkpoint found in {base_checkpoint_dir}")
-    base_state = (
-        load_selected_tensors(base_checkpoint_dir, lambda _key: True)
-        if base_safetensors
-        else torch.load(base_bins[0], map_location="cpu", weights_only=True)
-    )
-    out_name = os.path.basename(
-        base_safetensors[0] if base_safetensors else base_bins[0]
-    )
-
-    old_keys = [k for k in base_state if k.startswith(prefixes)]
-    for key in old_keys:
-        del base_state[key]
-    if old_keys:
-        print(
-            f"Replaced {len(old_keys)} weight entries under {prefixes} "
-            "from base model."
-        )
-
-    merged = {**base_state, **state}
-    if out_name.endswith(".safetensors"):
-        save_file(merged, os.path.join(output_dir, out_name))
+    wanted: Optional[set[str]] = None
+    if keys is not None:
+        if isinstance(keys, (str, bytes)):
+            raise TypeError("keys must be an iterable of tensor names, not a string")
+        wanted = set(keys)
+        if not all(isinstance(key, str) for key in wanted):
+            raise TypeError("keys must contain only tensor-name strings")
+        if not wanted:
+            return {}
+        predicate = wanted.__contains__
+    elif key_filter is not None:
+        if not callable(key_filter):
+            raise TypeError("key_filter must be callable")
+        predicate = key_filter
     else:
-        torch.save(merged, os.path.join(output_dir, out_name))
+        predicate = lambda _key: True
+
+    checkpoint_dir = resolve_checkpoint_dir(path_or_repo, cache_dir=cache_dir)
+    kind, path = _resolve_weight_layout(checkpoint_dir)
+    selected: Dict[str, torch.Tensor] = {}
+    if kind == "index":
+        weight_map = _read_weight_map_file(path)
+        keys_by_shard: Dict[str, set[str]] = {}
+        for key, shard in weight_map.items():
+            if predicate(key):
+                keys_by_shard.setdefault(shard, set()).add(key)
+
+        for shard, shard_keys in sorted(keys_by_shard.items()):
+            shard_path = os.path.join(checkpoint_dir, shard)
+            if not os.path.isfile(shard_path):
+                raise FileNotFoundError(
+                    f"Checkpoint index {path} references missing shard {shard_path}"
+                )
+            shard_tensors = _load_tensor_file(shard_path, lambda key: key in shard_keys)
+            missing_from_shard = sorted(shard_keys - shard_tensors.keys())
+            if missing_from_shard:
+                raise KeyError(
+                    f"Checkpoint shard {shard_path} is missing indexed tensors: "
+                    f"{missing_from_shard}"
+                )
+            selected.update(shard_tensors)
+    else:
+        selected = _load_tensor_file(path, predicate)
+
+    if wanted is not None:
+        missing = sorted(wanted - selected.keys())
+        if missing:
+            raise KeyError(
+                f"Checkpoint {checkpoint_dir} is missing requested tensors: {missing}"
+            )
+    return selected
 
 
 __all__ = [
     "list_checkpoint_keys",
-    "load_selected_tensors",
-    "load_tensors_by_keys",
-    "merge_state_into_checkpoint",
+    "load_checkpoint_tensors",
     "read_weight_map",
     "resolve_checkpoint_dir",
 ]

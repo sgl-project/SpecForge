@@ -21,12 +21,13 @@ from specforge.training.schedule import (
 
 class TestResolveTotalSteps(unittest.TestCase):
     @staticmethod
-    def _online_flow_config(*, high=1152, low=1024):
+    def _online_flow_config(*, high=1152, low=1024, policy="round_robin"):
         return SimpleNamespace(
             runtime=SimpleNamespace(
                 in_flight_high_watermark=high,
                 in_flight_low_watermark=low,
                 producer_lease=8,
+                consumer_dispatch=policy,
             ),
             training=SimpleNamespace(batch_size=8, accumulation_steps=32),
             deployment=SimpleNamespace(
@@ -57,6 +58,30 @@ class TestResolveTotalSteps(unittest.TestCase):
         with mock.patch.dict(os.environ, environment, clear=False):
             os.environ.pop("DISAGG_IN_FLIGHT_LOW_WATERMARK", None)
             self.assertEqual(_online_flow_window(cfg), (1024, None))
+
+    def test_two_window_flow_validates_environment_overrides(self):
+        for policy in ("two_window_bucketed", "two_window_joint_balanced"):
+            cfg = self._online_flow_config(high=4096, low=2048, policy=policy)
+            for high, low, error in ((14, 4, "low"), (7, 4, "high"), (14, 8, None)):
+                cfg.training.batch_size = 1
+                cfg.training.accumulation_steps = 1
+                with (
+                    self.subTest(policy=policy, high=high, low=low),
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "DISAGG_IN_FLIGHT_HIGH_WATERMARK": str(high),
+                            "DISAGG_IN_FLIGHT_LOW_WATERMARK": str(low),
+                        },
+                    ),
+                ):
+                    if error:
+                        with self.assertRaisesRegex(
+                            ValueError, f"{error} watermark.*quantum 8"
+                        ):
+                            _online_flow_window(cfg)
+                    else:
+                        self.assertEqual(_online_flow_window(cfg), (high, low))
 
     def test_finite_data_horizon_counts_optimizer_steps(self):
         self.assertEqual(

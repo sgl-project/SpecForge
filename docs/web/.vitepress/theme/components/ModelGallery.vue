@@ -35,7 +35,7 @@ interface Model {
 
 type SortKey = 'downloads' | 'likes' | 'recent' | 'name'
 
-const METHOD_ORDER = ['EAGLE3', 'DFlash', 'DSpark', 'Domino', 'Other']
+const METHOD_ORDER = ['EAGLE3', 'DFlash', 'DMTP', 'DSpark', 'Domino', 'Other']
 
 const models = ref<Model[]>(snapshot.models as Model[])
 const updated = ref<string>(snapshot.updated)
@@ -51,6 +51,7 @@ const page = ref(1)
 
 function detectMethod(id: string): string {
   const s = id.toLowerCase()
+  if (s.includes('dmtp') || s.includes('d-mtp')) return 'DMTP'
   if (s.includes('dspark')) return 'DSpark'
   if (s.includes('domino')) return 'Domino'
   if (s.includes('dflash')) return 'DFlash'
@@ -65,8 +66,10 @@ onMounted(async () => {
     const data = await res.json()
     const curated = new Map(models.value.map((m) => [m.id, m]))
     const merged: Model[] = []
+    const seen = new Set<string>()
     for (const item of data.items ?? []) {
       if (item.type !== 'model') continue
+      seen.add(item.id)
       const prev = curated.get(item.id)
       const author = item.authorData ?? {}
       merged.push({
@@ -89,6 +92,10 @@ onMounted(async () => {
       })
     }
     if (merged.length) {
+      // Keep curated releases that have not joined the HF collection yet.
+      for (const model of curated.values()) {
+        if (!seen.has(model.id)) merged.push(model)
+      }
       models.value = merged
       updated.value = data.lastUpdated ?? new Date().toISOString()
       live.value = true
@@ -529,6 +536,7 @@ function clear() {
 }
 .mg-method[data-method='EAGLE3'] { background: #1f7fc0; }
 .mg-method[data-method='DFlash'] { background: #7c3aed; }
+.mg-method[data-method='DMTP'] { background: #0f766e; }
 .mg-method[data-method='DSpark'] { background: #d97706; }
 .mg-method[data-method='Domino'] { background: #059669; }
 

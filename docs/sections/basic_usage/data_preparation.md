@@ -257,6 +257,13 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 
 ## Prepare offline target features
 
+First start a compatible SGLang plugin capture server and Mooncake using the
+[offline capture guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md). The commands below
+are CPU clients; `--server-urls` must point to servers configured for the same
+target, capture method and layer IDs. TP and attention-backend flags belong to
+the server. Optional `torchrun --standalone --nproc_per_node=N` launches N CPU
+clients with non-overlapping dataset shards.
+
 Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
 target features created by `scripts/prepare_hidden_states.py`. Select the same
 strategy and draft
@@ -265,16 +272,14 @@ the target layers captured and the checkpoint schema. For example, prepare the
 checked-in Qwen3-8B DFlash recipe with:
 
 ```bash
-torchrun --nproc_per_node=8 \
-    scripts/prepare_hidden_states.py \
-    --strategy dflash \
+python scripts/prepare_hidden_states.py \
+    --server-urls http://127.0.0.1:30000 \
     --target-model-path Qwen/Qwen3-8B \
-    --draft-model-config configs/qwen3-8b-dflash.json \
+    --draft specforge/config/draft/presets/qwen3-8b-dflash.yaml \
     --data-path ./cache/dataset/sharegpt_train.jsonl \
     --output-path ./cache/hidden_states/qwen3-8b-dflash-sharegpt \
     --chat-template qwen \
     --max-length 3072 \
-    --tp-size 1 \
     --batch-size 32
 ```
 
@@ -282,51 +287,23 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 
 | Strategy | Target model | Draft config | Output path used by the recipe |
 | --- | --- | --- | --- |
-| EAGLE3 | `Qwen/Qwen3-8B` | `configs/qwen3-8b-eagle3.json` | `cache/hidden_states/qwen3-8b-sharegpt` |
-| DFlash | `Qwen/Qwen3-8B` | `configs/qwen3-8b-dflash.json` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
-| Domino | `Qwen/Qwen3-8B` | `configs/qwen3-8b-domino.json` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
-| DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
+| EAGLE3 | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-eagle3.yaml` | `cache/hidden_states/qwen3-8b-sharegpt` |
+| DFlash | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-dflash.yaml` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
+| Domino | `Qwen/Qwen3-8B` | `specforge/config/draft/presets/qwen3-8b-domino.yaml` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
+| DSpark | `Qwen/Qwen3-4B` | `specforge/config/draft/presets/qwen3-4b-dspark.yaml` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
 
-`--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
-reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
-passing the same explicit config used by training is recommended for every
-strategy. Capture layers come from the resolved draft config. EAGLE3 retains
-target-derived defaults for legacy configs that do not define
-`eagle_config.eagle_aux_hidden_state_layer_ids`.
-
-Each output record contains the strategy's exact offline feature contract:
-
-| Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
-| --- | --- |
-| EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
-| DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
-
-For the DFlash family, `hidden_states` concatenates the target layers selected
-by the draft config. DSpark additionally stores the target model's final hidden
-state for its L1 and confidence objectives. Keep each strategy in a separate
-output directory; the offline reader validates the contract instead of
-silently adapting incompatible features.
-
-DFlash2 feature preparation still uses `--strategy dflash`; pass a
-`DFlash2DraftModel` config such as `configs/qwen3.6-27b-dflash2.json` so capture
-uses the intended `target_layer_ids`. Its convolution, selector, and selector
-loss schedule are draft/trainer concerns and do not add tensors to the offline
-record.
-
-D-PACE uses `training.strategy: dflash` and the DFlash feature schema. DTA also
-uses `--strategy dflash`, but feature preparation must receive its DTA draft
-config so the captured layer contract matches the training run.
-
-For preformatted input, add `--is-preformatted` to the same command and keep
-`--chat-template` aligned with the template already applied to the text:
+Pass either `--draft` (a canonical draft YAML, including the presets; the
+architecture's default objective and loss apply) or `-c RUN.yaml` (a canonical
+run file; capture then follows its draft, objective options, loss and
+weighting). Capture layers and output feature names are resolved from that
+complete draft. Options that change the required teacher features, such as
+DFlash's `objective_options.teacher_metrics`, are set in the run file.
 
 ```bash
-torchrun --nproc_per_node=8 \
-    scripts/prepare_hidden_states.py \
-    --strategy eagle3 \
+python scripts/prepare_hidden_states.py \
+    --server-urls http://127.0.0.1:30000 \
     --target-model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-config configs/llama3-8B-eagle3.json \
+    --draft specforge/config/draft/presets/llama3-8B-eagle3.yaml \
     --data-path ./your_preformatted_dataset.jsonl \
     --output-path ./cache/hidden_states/llama3.1-8b-eagle3 \
     --chat-template llama3 \
@@ -341,7 +318,7 @@ Launch the matching recipe after its `data.hidden_states_path` points at the
 generated directory:
 
 ```bash
-specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash-offline.yaml
+specforge train --config examples/configs/offline/colocated/qwen3-8b-dflash.yaml
 ```
 
 See the [Training](training.md) guide for the complete run schema and supported
