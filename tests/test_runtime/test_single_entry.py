@@ -133,9 +133,9 @@ class TestTrainingRunLifecycle(unittest.TestCase):
     def test_online_producer_requests_the_config_selected_capture_layout(self):
         import tempfile
 
-        for teacher_metrics, last_hidden in (
-            (True, "target_last_hidden_states"),
-            (False, None),
+        for teacher_metrics, last_hidden, prefix_mode in (
+            (True, "target_last_hidden_states", "auto"),
+            (False, None, False),
         ):
             with self.subTest(dflash_teacher_metrics=teacher_metrics):
                 root = tempfile.mkdtemp(prefix="producer_layout_")
@@ -160,6 +160,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 )
                 from specforge.application import resolve_run
 
+                cfg.deployment.disaggregated.server_capture_prefix_cache = prefix_mode
                 resolved = resolve_run(cfg)
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
                 preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
@@ -184,6 +185,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         "SGLangServerCaptureAdapter"
                     ) as adapter_cls,
                     mock.patch(
+                        "specforge.inference.prefix_cache.auto_prefix_cache_modes",
+                        return_value=[True],
+                    ) as auto_modes,
+                    mock.patch(
                         "specforge.launch.build_disagg_online_producer",
                         return_value=([], mock.Mock()),
                     ),
@@ -201,6 +206,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 schema = adapter_cls.call_args.kwargs["schema"]
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
+                self.assertEqual(
+                    adapter_cls.call_args.kwargs["prefix_cache"], prefix_mode == "auto"
+                )
+                self.assertEqual(auto_modes.call_count, int(prefix_mode == "auto"))
 
     def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)

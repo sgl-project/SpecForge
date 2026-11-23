@@ -55,6 +55,10 @@ def _req(rid, prompt_len, spec=None, *, finished=True):
         origin_input_ids=list(range(prompt_len)),
         sampling_params=SimpleNamespace(custom_params=custom_params),
         finished=lambda: finished,
+        extra_key="capture-run",
+        input_embeds=None,
+        multimodal_inputs=None,
+        lora_id=None,
     )
 
 
@@ -88,13 +92,22 @@ class FakeSink:
         return future
 
 
-def _runtime(*, is_writer=True, gpu_put=False, max_pending=2):
+def _runtime(
+    *,
+    is_writer=True,
+    gpu_put=False,
+    max_pending=2,
+    prefix_cache_bytes=0,
+    prefix_page_size=1,
+):
     return capture.CaptureRuntime(
         sink=FakeSink(),
         is_writer=is_writer,
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
         defer_response=mock.Mock(),
+        prefix_cache_bytes=prefix_cache_bytes,
+        prefix_page_size=prefix_page_size,
     )
 
 
@@ -142,6 +155,55 @@ class TestCollectItems(unittest.TestCase):
 
 
 class TestObserver(unittest.TestCase):
+    def test_prefix_hit_recovers_all_rows_and_isolated_miss_returns_no_tensors(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=2)
+        first = _req("first", 4, dict(_spec("first"), reuse_prefix=True))
+        original = _logits_output(4)
+        runtime.observer.after_forward(
+            SimpleNamespace(reqs=[first]),
+            _forward_batch([4]),
+            original,
+            can_run_graph=False,
+        )
+        self.assertEqual(runtime.prefix_cache.used_bytes, 2 * (6 + 2) * 4)
+        followup = _req("followup", 4, dict(_spec("followup"), reuse_prefix=True))
+        followup.origin_input_ids[-1] = 10
+        other = _req("other", 4, dict(_spec("other"), reuse_prefix=True))
+        other.extra_key = "other-run"
+        suffix = _logits_output(4)
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[followup, other]),
+            _forward_batch([2, 2], [2, 2]),
+            suffix,
+            can_run_graph=False,
+        )
+        torch.testing.assert_close(
+            device.aux,
+            torch.cat((original.hidden_states[:2], suffix.hidden_states[:2])),
+        )
+        torch.testing.assert_close(
+            device.last_hidden,
+            torch.cat((original.last_hidden_states[:2], suffix.last_hidden_states[:2])),
+        )
+        self.assertEqual(device.items[0].length, 4)
+        error = capture.error_result(device.items[1].spec, device.items[1].error)
+        self.assertEqual(error["error_code"], "prefix_cache_miss")
+        specforge_sglang_capture._flush_prefix_cache(
+            True, SimpleNamespace(_specforge_capture_runtime=runtime)
+        )
+        self.assertEqual(runtime.prefix_cache.used_bytes, 0)
+
+    def test_full_capture_at_one_page_needs_no_hidden_admission(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=4)
+        req = _req("short", 4, dict(_spec("short"), reuse_prefix=True))
+        out = _logits_output(4)
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[req]), _forward_batch([4]), out, can_run_graph=False
+        )
+        self.assertIs(device.aux, out.hidden_states)
+        self.assertIs(device.last_hidden, out.last_hidden_states)
+        self.assertEqual(runtime.prefix_cache.used_bytes, 0)
+
     def test_non_writer_ranks_and_decode_batches_capture_nothing(self):
         batch = SimpleNamespace(reqs=[_req("a", 2, _spec("a"))])
         out = _logits_output(2)
@@ -436,6 +498,7 @@ def _scheduler():
         output_streamer=SimpleNamespace(),
         defer_response=mock.Mock(),
         disaggregation_mode="null",
+        tree_cache=SimpleNamespace(page_size=256),
     )
     return scheduler
 
@@ -460,6 +523,22 @@ class TestInstall(unittest.TestCase):
             mock.patch.dict(os.environ, env or {"MOONCAKE_PROTOCOL": "tcp"}),
         ):
             return scheduler, capture.install(scheduler)
+
+    def test_uses_radix_page_size_for_hidden_admission(self):
+        scheduler, runtime = self._install(
+            env={
+                "MOONCAKE_PROTOCOL": "tcp",
+                "SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES": "4096",
+            }
+        )
+        self.assertEqual(runtime.prefix_cache.page_size, 256)
+        result = SimpleNamespace(internal_state={})
+        specforge_sglang_capture._capture_internal_state(result, scheduler)
+        self.assertEqual(result.internal_state["spec_capture_prefix_page_size"], 256)
+        scheduler.tree_cache.disable = True
+        result = SimpleNamespace(internal_state={})
+        specforge_sglang_capture._capture_internal_state(result, scheduler)
+        self.assertNotIn("spec_capture_prefix_page_size", result.internal_state)
 
     def test_wires_observer_completions_and_results(self):
         scheduler, runtime = self._install()
@@ -644,6 +723,7 @@ class TestRegister(unittest.TestCase):
                     "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
                     "after",
                 ),
+                ("sglang.srt.managers.scheduler.Scheduler.flush_cache", "after"),
             ],
         )
 

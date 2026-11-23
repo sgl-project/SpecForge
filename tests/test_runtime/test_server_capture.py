@@ -302,6 +302,7 @@ def _mk(
     teacher_metrics=True,
     server_capture="plugin",
     server_info_fn=None,
+    prefix_cache=False,
 ):
     backend = backend or _FakeMooncakeStore()
     if server is None:
@@ -317,11 +318,51 @@ def _mk(
         post_fn=server,
         server_capture=server_capture,
         server_info_fn=server_info_fn,
+        prefix_cache=prefix_cache,
     )
     return backend, server, store, adapter
 
 
 class TestServerCaptureAdapter(unittest.TestCase):
+    def test_prefix_miss_retries_only_missing_request(self):
+        backend = _FakeMooncakeStore()
+        server = _StubCaptureServer(backend)
+        calls = []
+
+        def post(url, json_body, timeout):
+            body = json_body
+            specs = _request_specs(body)
+            calls.append((body["extra_key"], specs))
+            if len(calls) == 1:
+                first = {key: [values[0]] for key, values in body.items()}
+                return server(url, first, timeout) + [
+                    {
+                        "meta_info": {
+                            "spec_capture": [
+                                {
+                                    "sample_id": specs[1]["sample_id"],
+                                    "error": "capture prefix hidden states are unavailable",
+                                    "error_code": "prefix_cache_miss",
+                                }
+                            ]
+                        }
+                    }
+                ]
+            return server(url, body, timeout)
+
+        _, _, _, adapter = _mk(
+            algorithm="dflash", server=post, backend=backend, prefix_cache=True
+        )
+        refs = adapter.produce_refs(
+            [_task(0, 5), _task(1, 6)], capture=_dflash_contract()
+        )
+        self.assertTrue(all(isinstance(ref, SampleRef) for ref in refs))
+        self.assertEqual(len(calls), 2)
+        (initial_keys, initial_specs), (retry_keys, retry_specs) = calls
+        self.assertEqual(initial_keys[0], initial_keys[1])
+        self.assertNotEqual(initial_keys[1], retry_keys[0])
+        self.assertEqual(retry_specs, [dict(initial_specs[1], reuse_prefix=False)])
+
     def test_generic_adapter_inputs_merge_with_runtime_owned_request_fields(self):
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend)

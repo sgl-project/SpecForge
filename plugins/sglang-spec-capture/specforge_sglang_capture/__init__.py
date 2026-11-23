@@ -44,6 +44,9 @@ def register() -> None:
     HookRegistry.register(
         f"{_SCHEDULER}.get_internal_state", _capture_internal_state, HookType.AFTER
     )
+    HookRegistry.register(
+        f"{_SCHEDULER}.flush_cache", _flush_prefix_cache, HookType.AFTER
+    )
 
 
 def _capture_streamer_class(streamer_class, scheduler, *args, **kwargs):
@@ -69,8 +72,21 @@ def _capture_internal_state(result, scheduler, *args, **kwargs):
         result.internal_state["spec_capture_backend"] = "plugin"
         result.internal_state["spec_capture_method"] = runtime.capture_method
         result.internal_state["spec_capture_aux_layer_ids"] = runtime.sink.aux_layer_ids
+        if runtime.prefix_cache is not None and not getattr(
+            scheduler.tree_cache, "disable", False
+        ):
+            result.internal_state["spec_capture_prefix_page_size"] = (
+                runtime.prefix_cache.page_size
+            )
         if runtime.is_writer:
             control = runtime.sink.control_endpoint()
             if control is not None:
                 result.internal_state["spec_capture_control"] = control
+    return result
+
+
+def _flush_prefix_cache(result, scheduler, *args, **kwargs):
+    runtime = getattr(scheduler, "_specforge_capture_runtime", None)
+    if result and runtime is not None and runtime.prefix_cache is not None:
+        runtime.prefix_cache.clear()
     return result

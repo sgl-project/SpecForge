@@ -200,6 +200,7 @@ class SGLangServerCaptureAdapter:
         target_model_version: str = "unknown",
         server_capture: str = "plugin",
         server_info_fn: Optional[Callable[[str, float], Mapping[str, Any]]] = None,
+        prefix_cache: bool = False,
     ) -> None:
         if server_capture not in ("auto", *SERVER_CAPTURE_BACKENDS):
             raise ValueError(
@@ -243,6 +244,7 @@ class SGLangServerCaptureAdapter:
         self.server_capture = server_capture
         self.server_info_fn = server_info_fn or _get_server_info
         self._server_capture_lock = threading.Lock()
+        self._prefix_namespace = uuid.uuid4().hex if prefix_cache else None
         self._healthy = True
 
     def _resolve_server_capture(self) -> str:
@@ -423,6 +425,61 @@ class SGLangServerCaptureAdapter:
         return ref
 
     # -- the RefSource entry point ----------------------------------------------
+    def _post_capture(self, body, count):
+        rows = _flatten_list_wrappers(
+            self.post_fn(
+                f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
+            )
+        )
+        if len(rows) != count:
+            raise RuntimeError(
+                f"spec-capture server returned {len(rows)} rows for {count} tasks"
+            )
+        return rows
+
+    @staticmethod
+    def _capture_sampling_params(payload):
+        # custom_params values are JSON scalars: one encoded spec per request.
+        return {
+            "temperature": 0.0,
+            "max_new_tokens": 0,
+            "custom_params": {
+                "spec_capture": json.dumps(payload, separators=(",", ":"))
+            },
+        }
+
+    def _retry_prefix_misses(self, tasks, body, payloads, rows):
+        misses = []
+        for i, (task, payload, row) in enumerate(
+            zip(tasks, payloads, rows, strict=True)
+        ):
+            if not payload.get("reuse_prefix") or not isinstance(row, dict):
+                continue
+            result = _capture_result_for_task(
+                (row.get("meta_info") or {}).get("spec_capture"),
+                task_id=task.task_id,
+                expected_sample_id=payload["sample_id"],
+            )
+            if result and result.get("error_code") == "prefix_cache_miss":
+                if str(result.get("sample_id")) != payload["sample_id"]:
+                    raise RuntimeError(
+                        f"prefix cache miss returned for the wrong task: {task.task_id}"
+                    )
+                misses.append(i)
+        if misses:
+            retry_body = {
+                "input_ids": [body["input_ids"][i] for i in misses],
+                "extra_key": [uuid.uuid4().hex for _ in misses],
+                "sampling_params": [
+                    self._capture_sampling_params(dict(payloads[i], reuse_prefix=False))
+                    for i in misses
+                ],
+            }
+            for i, row in zip(
+                misses, self._post_capture(retry_body, len(misses)), strict=True
+            ):
+                rows[i] = row
+
     def produce_refs(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Union["SampleRef", ServerCaptureFailure]]:  # noqa: F821
@@ -440,17 +497,16 @@ class SGLangServerCaptureAdapter:
         # targets. Retries need a new key because the prior attempt may have
         # populated its namespace before the response was lost.
         body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
-        sampling_params = {"temperature": 0.0, "max_new_tokens": 0}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
-        # custom_params values are JSON scalars: one encoded spec per request.
+        if self._prefix_namespace and self.request_input_adapter is None:
+            for i, (task, payload) in enumerate(
+                zip(tasks, capture_payloads, strict=True)
+            ):
+                if not task.attempt:
+                    body["extra_key"][i] = self._prefix_namespace
+                    payload["reuse_prefix"] = True
         body["sampling_params"] = [
-            {
-                **sampling_params,
-                "custom_params": {
-                    "spec_capture": json.dumps(payload, separators=(",", ":"))
-                },
-            }
-            for payload in capture_payloads
+            self._capture_sampling_params(payload) for payload in capture_payloads
         ]
         for payload in capture_payloads:
             feature_names = list(payload["features"].values())
@@ -463,15 +519,9 @@ class SGLangServerCaptureAdapter:
                 feature_names=feature_names,
                 server_url=self.base_url,
             )
-        rows = self.post_fn(
-            f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
-        )
-        rows = _flatten_list_wrappers(rows)
-        if len(rows) != len(tasks):
-            raise RuntimeError(
-                f"spec-capture server returned {len(rows)} rows for "
-                f"{len(tasks)} tasks"
-            )
+        rows = self._post_capture(body, len(tasks))
+        if self._prefix_namespace is not None:
+            self._retry_prefix_misses(tasks, body, capture_payloads, rows)
         capture_hint = _CAPTURE_HINTS[server_capture]
         out: List[Union[Any, ServerCaptureFailure]] = []
         successful_refs = []

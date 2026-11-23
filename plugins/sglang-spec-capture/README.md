@@ -140,6 +140,30 @@ The response's `meta_info["spec_capture"]` holds `[result]`, where `result` is
 or `{sample_id, error}`. Objects are stored at
 `{store_id}/{sample_id}/g{gen}/{name}`.
 
+## Prefix reuse
+
+For a fixed text target, set
+`deployment.disaggregated.server_capture_prefix_cache` to `true` to enable
+reuse, `false` to disable it (the default), or `auto` to decide at startup.
+Give each capture server a positive `SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` budget.
+Leave SGLang's radix cache enabled and reserve this device memory below
+`--mem-fraction-static`. The budget is per writer. Each producer adapter uses
+its own radix namespace.
+
+`auto` samples up to 512 prepared prompts, in a deterministic random order.
+It approximates lease assignment across endpoints and counts reusable full
+radix pages within a 64K-token history per advertised scheduler. It enables
+reuse on endpoints with at least 5% estimated token reuse. An endpoint that
+does not advertise an active hidden cache and radix page size uses full prefill.
+
+When SGLang reuses KV, the plugin joins the matching cached hidden rows with
+the new suffix before publication. The store still receives full-length
+tensors. Hidden admission keeps whole radix pages that a future request can
+reuse, leaving partial tails in the published capture. A hidden-cache miss or
+eviction retries the affected request once with a fresh radix namespace.
+Full prefill uses a fresh namespace for every request. Multimodal inputs,
+custom input adapters and lease retries use full prefill.
+
 ## Multi-node NVLink
 
 On GB200/GB300 NVL72 systems, `MOONCAKE_PROTOCOL=nvlink` moves captures from
