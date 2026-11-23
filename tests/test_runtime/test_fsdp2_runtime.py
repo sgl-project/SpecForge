@@ -10,6 +10,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from specforge.algorithms.objectives import build_objective_model
+from specforge.modeling import build_draft_model
 from specforge.optimizer import FP32Optimizer
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -17,8 +19,7 @@ from specforge.training.backends.fsdp2 import FSDP2TrainingBackend, _store_in_fp
 from specforge.training.contracts import PrecisionSpec
 from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
-from tests.test_algorithms.test_objective_contracts import build_runtime
-from tests.test_algorithms.test_objectives import training_batch
+from tests.test_algorithms.test_objectives import configurations, training_batch
 from tests.test_runtime._fixtures import train_window
 
 _GLOO = dist.is_available() and dist.is_gloo_available()
@@ -32,8 +33,19 @@ def _optimizer_factory(module):
 
 
 def _program(dtype=torch.bfloat16):
-    _, program = build_runtime("DFlashDraftModel", dtype=dtype)
-    return program
+    """A DFlash program built as ``build_bundle`` builds one: one dtype, and the
+    bound tables and the teacher head declared frozen."""
+    config = next(c for c in configurations() if c.architecture == "DFlashDraftModel")
+    torch.manual_seed(0)
+    draft = build_draft_model(config, dtype=dtype)
+    bound = [draft.get_submodule(name) for name in config.target_bindings]
+    for module in bound:
+        module.load_target_weight(
+            torch.randn(config.vocab_size, config.hidden_size, dtype=dtype)
+        )
+    width = training_batch(config)["target_last_hidden_states"].shape[-1]
+    head = nn.Linear(width, config.vocab_size, bias=False, dtype=dtype)
+    return build_objective_model(draft, target_head=head, frozen_modules=bound + [head])
 
 
 def _batches(program, count, seed):
@@ -143,6 +155,218 @@ def _resume_worker(rank, world, store_path, out_dir, sharding):
         dist.destroy_process_group()
 
 
+def _on_host_fsdp1():
+    """FSDP1 computes on the host only when told so."""
+    from unittest.mock import patch
+
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    original = FullyShardedDataParallel.__init__
+
+    def on_host(self, module, *args, **kwargs):
+        kwargs.setdefault("device_id", torch.device("cpu"))
+        original(self, module, *args, **kwargs)
+
+    return patch.object(FullyShardedDataParallel, "__init__", on_host)
+
+
+def _reference_backend(sharding):
+    from specforge.optimizer import BF16Optimizer
+
+    return FSDPTrainingBackend(
+        ParallelConfig(sharding_strategy=sharding, fsdp_process_group=dist.group.WORLD),
+        precision=PrecisionSpec.resolve(runtime="fsdp", model_dtype=torch.bfloat16),
+        optimizer_factory=lambda module: BF16Optimizer(
+            module, lr=1e-3, max_grad_norm=1.0, total_steps=10, warmup_ratio=0.0
+        ),
+    )
+
+
+def _written(backend, shapes):
+    """What the reference wrote, whole, from the writer's own shards.
+
+    Read from the FSDP1 wrap that wrote the state, where the code under test
+    replays that wrap elsewhere. ``shapes``: the trainable parameters' full
+    shapes, taken before the wrap. Rank 0 returns, per trainable parameter, its
+    fp32 master and, if the reference stepped it, its step and moments.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    optimizer = backend.optimizer
+    spans = {}
+    for unit in backend.module.modules():
+        if isinstance(unit, FSDP) and unit._handle is not None:
+            flat = unit._handle.flat_param
+            for param, info in zip(flat._params, flat._shard_param_infos):
+                spans[id(param)] = (
+                    (info.intra_param_start_idx, info.intra_param_end_idx + 1)
+                    if info.in_shard
+                    else None
+                )
+    mine = []
+    for param, master in zip(optimizer.model_params, optimizer.fp32_params):
+        span = spans.get(id(param), (0, param.numel())) if spans else (0, param.numel())
+        state = optimizer.optimizer.state.get(master, {})
+        mine.append((tuple(param.shape) if not spans else None, span, master, state))
+    everyone = [None] * dist.get_world_size()
+    dist.all_gather_object(everyone, mine, group=dist.group.WORLD)
+    if dist.get_rank() != 0:
+        return None
+    whole = []
+    for index, shape in enumerate(shapes):
+        numel = int(torch.Size(shape).numel())
+        master = torch.zeros(numel)
+        moments = {name: torch.zeros(numel) for name in ("exp_avg", "exp_avg_sq")}
+        steps = set()
+        for rank_parts in everyone:
+            _, span, values, state = rank_parts[index]
+            if span is None:
+                continue
+            master[span[0] : span[1]] = values.reshape(-1)
+            if state:
+                steps.add(float(state["step"]))
+                for name in moments:
+                    moments[name][span[0] : span[1]] = state[name].reshape(-1)
+        whole.append(
+            {
+                "master": master.view(shape),
+                "step": steps.pop() if steps else None,
+                **{name: value.view(shape) for name, value in moments.items()},
+            }
+        )
+    holds_nothing = any(
+        rank_parts[index][1] is None
+        for rank_parts in everyone
+        for index in range(len(shapes))
+    )
+    return {"whole": whole, "some_rank_holds_no_slice": holds_nothing}
+
+
+def _reference_worker(rank, world, store_path, out_dir, sharding):
+    """Train with the reference runtime and write its optimizer state."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        torch.manual_seed(0)
+        program = _program()
+        shapes = [p.shape for p in program.draft_model.parameters() if p.requires_grad]
+        backend = _reference_backend(sharding)
+        spec = program_spec(program)
+        with _on_host_fsdp1():
+            wrapped = backend.prepare_model(
+                program,
+                optimizer_target=program.draft_model,
+                frozen=program.frozen,
+                blocks=spec.partition.blocks,
+            )
+        runner = DataParallelRunner(wrapped, backend, spec)
+        for window in range(2):
+            train_window(runner, _batches(program, 2, seed=50 * window + rank))
+        torch.save(
+            {
+                "saved": backend.optimizer.state_dict(),
+                "written": _written(backend, shapes),
+            },
+            os.path.join(out_dir, f"reference{rank}.pt"),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _read_reference_worker(rank, world, store_path, out_dir, sharding):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        torch.manual_seed(0)
+        program = _program()
+        reference = torch.load(
+            os.path.join(out_dir, f"reference{rank}.pt"), weights_only=False
+        )
+        written = torch.load(
+            os.path.join(out_dir, "reference0.pt"), weights_only=False
+        )["written"]
+        runner, backend = _runner(program, "SHARD_GRAD_OP")
+        backend.load_state_dict({"optimizer": reference["saved"]})
+        trainable = [p for p in program.draft_model.parameters() if p.requires_grad]
+        report = {"some_rank_holds_no_slice": written["some_rank_holds_no_slice"]}
+        report["mismatches"] = _mismatches(backend, trainable, written["whole"])
+        batches = _batches(program, 2, seed=7 + rank)
+        report["loss"] = train_window(runner, batches).loss
+        torch.save(report, os.path.join(out_dir, f"read{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
+def _mismatches(backend, trainable, whole):
+    """Each trainable parameter whose restored master or state differs."""
+    wrong = []
+    for index, (param, expected) in enumerate(zip(trainable, whole)):
+        state = backend.optimizer.optimizer.state.get(param, {})
+        same = torch.equal(param.full_tensor(), expected["master"])
+        if expected["step"] is None:
+            same = same and not state
+        else:
+            same = (
+                same
+                and float(state["step"]) == expected["step"]
+                and torch.equal(state["exp_avg"].full_tensor(), expected["exp_avg"])
+                and torch.equal(
+                    state["exp_avg_sq"].full_tensor(), expected["exp_avg_sq"]
+                )
+            )
+        if not same:
+            wrong.append(index)
+    return wrong
+
+
+class _Pair(nn.Module):
+    """A trainable vector one rank's FSDP1 shard holds whole, beside a frozen
+    one in the same unit: that rank's masters look like DDP's."""
+
+    def __init__(self):
+        super().__init__()
+        self.vector = nn.Parameter(torch.randn(8))
+        self.fixed = nn.Parameter(torch.randn(8), requires_grad=False)
+
+    def forward(self, x):
+        return (self.vector * self.fixed * x).sum()
+
+
+def _pair_worker(rank, world, store_path, out_dir, _sharding):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        torch.manual_seed(0)
+        program = _Pair().to(torch.bfloat16)
+        shape = program.vector.shape
+        backend = _reference_backend("SHARD_GRAD_OP")
+        with _on_host_fsdp1():
+            backend.prepare_model(program)
+        x = torch.full((8,), 1.0 + rank, dtype=torch.bfloat16)
+        backend.backward(backend.module(x).float())
+        backend.optimizer.step()
+        saved = backend.optimizer.state_dict()
+        written = [_written(backend, [shape])]
+        dist.broadcast_object_list(written, src=0)
+        torch.manual_seed(0)
+        again = _Pair().to(torch.bfloat16)
+        resumed = _toy_backend("SHARD_GRAD_OP")
+        resumed.prepare_model(again)
+        resumed.load_state_dict({"optimizer": saved})
+        report = {
+            "whole_master_here": tuple(saved["fp32_params"][0].shape) == (8,),
+            "mismatches": _mismatches(resumed, [again.vector], written[0]["whole"]),
+        }
+        resumed.backward(again(x).float())
+        resumed.optimizer.step()
+        torch.save(report, os.path.join(out_dir, f"pair{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
+
+
 @unittest.skipUnless(_GLOO, "needs gloo")
 class FSDP2RuntimeTest(unittest.TestCase):
     def _run(self, worker, directory, sharding, world=2):
@@ -177,6 +401,34 @@ class FSDP2RuntimeTest(unittest.TestCase):
                         self.assertTrue(
                             torch.equal(resumed["next_weights"][name], value), name
                         )
+
+    def test_reads_the_reference_runtimes_optimizer_state_exactly(self):
+        for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):
+            with self.subTest(sharding=sharding), tempfile.TemporaryDirectory() as d:
+                self._run(_reference_worker, d, sharding)
+                self._run(_read_reference_worker, d, sharding)
+                for rank in range(2):
+                    read = torch.load(
+                        os.path.join(d, f"read{rank}.pt"), weights_only=False
+                    )
+                    self.assertEqual(read["mismatches"], [])
+                    self.assertTrue(torch.isfinite(torch.tensor(read["loss"])))
+                # Under FSDP1 some rank holds no slice of some parameter, and
+                # so no optimizer state for it.
+                self.assertEqual(
+                    read["some_rank_holds_no_slice"], sharding == "SHARD_GRAD_OP"
+                )
+
+    def test_ranks_agree_on_a_layout_one_rank_cannot_tell(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._run(_pair_worker, d, "SHARD_GRAD_OP")
+            reports = [
+                torch.load(os.path.join(d, f"pair{rank}.pt"), weights_only=False)
+                for rank in range(2)
+            ]
+            self.assertEqual([r["whole_master_here"] for r in reports], [True, False])
+            for report in reports:
+                self.assertEqual(report["mismatches"], [])
 
 
 class _Block(nn.Module):
