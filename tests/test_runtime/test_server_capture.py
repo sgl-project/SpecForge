@@ -651,13 +651,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
         _, _, store, adapter = _mk(server=server, backend=backend)
         controller = _FakeController()
         controller.leased = [_task(0, 4), _task(1, 4), _task(2, 7)]
-        worker = RolloutWorker(
-            controller,
-            store,
-            adapter,
-            run_id="run0",
-            worker_id="w0",
-        )
+        worker = RolloutWorker(controller, adapter, worker_id="w0")
         worker.start()
         refs = worker.run_once(max_tasks=8)
         self.assertEqual(len(refs), 2)

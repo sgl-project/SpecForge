@@ -467,8 +467,6 @@ def _assemble_server_rollout_workers(
     *,
     strategy: str,
     controller: DataFlowController,
-    store: FeatureStore,
-    run_id: str,
     num_rollout_workers: int,
     feature_source,
 ):
@@ -495,9 +493,7 @@ def _assemble_server_rollout_workers(
     return [
         RolloutWorker(
             controller,
-            store,
             source,
-            run_id=run_id,
             worker_id=f"rollout-{index}",
             strategy=strategy,
         )
@@ -934,8 +930,6 @@ def build_disagg_online_producer(
         strategy=strategy,
         feature_source=feature_source,
         controller=controller,
-        store=feature_store,
-        run_id=run_id,
         num_rollout_workers=num_rollout_workers,
     )
     if not workers:
