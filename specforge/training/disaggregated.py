@@ -682,8 +682,10 @@ def _build_online(
             SGLangServerCaptureAdapter,
         )
         from specforge.launch import build_disagg_online_producer
+        from specforge.runtime.data_plane.drafter_channels import DrafterChannels
         from specforge.training.model_loading import resolve_draft_config
 
+        channel = DrafterChannels({cfg.run_id: channel})
         # This check is independent of dataset size. Keep it before tokenizer
         # loading and prompt preparation so an invalid window fails cheaply.
         in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
@@ -790,18 +792,13 @@ def _build_online(
                     )
             cleanup_errors = []
             try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
+                for ref in channel.published_refs():
+                    try:
+                        store.abort(ref.sample_id, reason="online-attempt-finished")
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                        )
             except Exception as exc:
                 cleanup_errors.append(
                     f"published-ref scan: {type(exc).__name__}: {exc}"
