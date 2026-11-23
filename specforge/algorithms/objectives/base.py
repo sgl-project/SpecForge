@@ -29,6 +29,35 @@ class ObjectiveResult:
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
+def validate_anchor_sampling(name, training, anchor_sampling, anchor_seed):
+    """Refuse an anchor sampling an objective cannot honour, before any work.
+
+    Args:
+        name: The objective's name, for messages.
+        training: Its ``TrainingRequirements``.
+        anchor_sampling: "device" or "host".
+        anchor_seed: The run's seed for host draws.
+    """
+    if anchor_sampling not in ("device", "host"):
+        raise ValueError(f"unknown anchor_sampling: {anchor_sampling!r}")
+    if anchor_sampling == "device":
+        return
+    if not training.samples_anchors:
+        raise ValueError(
+            f"objective {name!r} samples no block anchors; "
+            "anchor_sampling='host' applies to block objectives only"
+        )
+    from .inputs import prepare_anchor_capacity
+
+    if training.host_inputs not in (None, prepare_anchor_capacity):
+        raise ValueError(
+            f"objective {name!r} derives host inputs besides the anchor capacity; "
+            "host-drawn anchors would replace them"
+        )
+    if anchor_seed is None:
+        raise ValueError("anchor_sampling='host' needs the run's anchor_seed")
+
+
 class ObjectiveModel(nn.Module):
     """One wrapped forward includes the draft and every differentiable loss path.
 
@@ -51,6 +80,8 @@ class ObjectiveModel(nn.Module):
         frozen_modules=(),
         attention_backend=None,
         sequence_parallel=None,
+        anchor_sampling="device",
+        anchor_seed=None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -74,6 +105,15 @@ class ObjectiveModel(nn.Module):
         # either reads it here; both are fixed for the model's lifetime.
         self.attention_backend = attention_backend
         self.sequence_parallel = sequence_parallel
+        # Where block anchors are drawn: "device" from the global generator in
+        # the forward, "host" before placement from (anchor_seed, sample id,
+        # epoch). Also fixed for the model's lifetime.
+        if registration is not None:
+            validate_anchor_sampling(
+                name, registration.training, anchor_sampling, anchor_seed
+            )
+        self.anchor_sampling = anchor_sampling
+        self.anchor_seed = anchor_seed
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
@@ -223,12 +263,34 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def host_inputs(self, tensors):
-        """Extra batch tensors the objective derives on the host, before placement."""
-        prepare = self.registration.training.host_inputs if self.registration else None
-        if prepare is None:
-            return {}
-        return prepare(tensors, self.draft_model.config.draft)
+    def host_inputs(self, tensors, *, sample_ids, epoch):
+        """Extra batch tensors the objective derives on the host, before placement.
+
+        Args:
+            tensors: The batch tensors, on the host.
+            sample_ids: The batch's sample ids, one per row.
+            epoch: The epoch the batch belongs to.
+        """
+        training = self.registration.training if self.registration else None
+        if self.anchor_sampling == "host":
+            # The anchors replace the anchor capacity, the only host input an
+            # objective that samples anchors has (``validate_anchor_sampling``).
+            from .inputs import host_anchor_inputs
+
+            if epoch is None:
+                raise ValueError("host-drawn anchors need the batch's epoch")
+            return host_anchor_inputs(
+                tensors,
+                num_anchors=self.objective.num_anchors,
+                seed=self.anchor_seed,
+                sample_ids=sample_ids,
+                epoch=epoch,
+                draws_per_anchor=training.draws_per_anchor,
+            )
+        prepare = training.host_inputs if training else None
+        return (
+            {} if prepare is None else prepare(tensors, self.draft_model.config.draft)
+        )
 
     def kernel_record(self):
         """The loss kernels resolved so far, by the group they compute."""
@@ -302,6 +364,18 @@ class ObjectiveModel(nn.Module):
             self.registration.training.window_statistic if self.registration else None
         )
         valid_tokens(batch)
+        if self.anchor_sampling == "host":
+            missing = {"anchors", "anchor_keep"} | (
+                {"anchor_draws"}
+                if self.registration.training.draws_per_anchor
+                else set()
+            )
+            missing -= batch.keys()
+            if missing:
+                raise ValueError(
+                    f"this model draws anchors on the host; the batch lacks "
+                    f"{sorted(missing)}: pass it through host_inputs first"
+                )
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
             key: value.detach() if isinstance(value, Tensor) else value

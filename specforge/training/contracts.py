@@ -38,6 +38,15 @@ if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
 
 
+#: Key of ``TrainBatch.metadata`` under which the run loop records the epoch a
+#: training batch belongs to, as it pulls the batch. A window can span an epoch
+#: boundary, so the epoch belongs to the batch, not to the window.
+EPOCH_METADATA_KEY = "epoch"
+#: The epoch an evaluation forward reports: one value for every pass, so a
+#: draw keyed on the epoch is the same at every evaluation.
+EVALUATION_EPOCH = -1
+
+
 @dataclass(frozen=True)
 class StepContext:
     """Schedule state for one optimizer window; values only.
@@ -148,9 +157,18 @@ class TrainingProgram(Protocol):
         """
 
     def host_inputs(
-        self, tensors: Mapping[str, torch.Tensor]
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        sample_ids: Sequence[str],
+        epoch: Optional[int],
     ) -> Mapping[str, torch.Tensor]:
-        """Extra batch tensors derived on the host, before the batch is placed."""
+        """Extra batch tensors derived on the host, before the batch is placed.
+
+        ``sample_ids`` are the batch's, one per row; ``epoch`` is the one the
+        run loop recorded on the batch (``EPOCH_METADATA_KEY``), or
+        ``EVALUATION_EPOCH`` in an evaluation pass.
+        """
 
     def kernel_record(self) -> Dict[str, str]:
         """The kernels realised so far, by the choice they answer."""

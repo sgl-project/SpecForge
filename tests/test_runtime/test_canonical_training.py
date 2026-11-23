@@ -90,6 +90,38 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertTrue(contract["trim"])
             self.assertEqual(contract["chunk_size"], 2)
 
+    def test_anchor_sampling_reaches_the_model_and_the_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for sampling, recorded in (("device", "device"), ("host", ("host", 7))):
+                cfg = run_config(
+                    target,
+                    draft_config(),
+                    training={
+                        "attention_backend": "eager",
+                        "anchor_sampling": sampling,
+                        "seed": 7,
+                    },
+                )
+                resolved = resolve_run(cfg)
+                bundle = build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm, topology=Topology()
+                )
+                self.assertEqual(bundle.model.anchor_sampling, sampling)
+                self.assertEqual(
+                    bundle.strategy_kwargs.resume_contract["canonical_anchor_sampling"],
+                    recorded,
+                )
+            # Refused while the run is resolved, before any data is read.
+            with self.assertRaisesRegex(ValueError, "block objectives only"):
+                resolve_run(
+                    run_config(
+                        target,
+                        eagle_config(target_width=32),
+                        training={"anchor_sampling": "host"},
+                    )
+                )
+
     def test_named_loss_settings_reach_capture_and_resume_contract(self):
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))

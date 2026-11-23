@@ -288,6 +288,38 @@ class CanonicalReviewTest(unittest.TestCase):
                         {"num_anchors": 512, "loss_decay_gamma": None},
                     )
 
+    def test_a_record_without_anchor_sampling_resumes_as_device_draws(self):
+        from tests.test_runtime import test_checkpoint_resume as resume_tests
+
+        harness = resume_tests.TestTrainerResumeEntrypoint()
+        if not torch.distributed.is_initialized():
+            harness.setUpClass()
+            self.addCleanup(harness.tearDownClass)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            features = resume_tests._write_feature_files(str(root / "features"), n=4)
+            trainer, _, _ = harness._make_trainer(
+                str(root / "run"), feat_dir=features, max_steps=1
+            )
+            trainer.fit()
+            source = str((root / "run" / "rz-latest").resolve())
+            # Written before the key existed: those runs drew on the device.
+            harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=2,
+                checkpoint_extra={"canonical_anchor_sampling": "device"},
+                resume_from=source,
+            )
+            with self.assertRaisesRegex(ValueError, "canonical_anchor_sampling"):
+                harness._make_trainer(
+                    str(root / "run"),
+                    feat_dir=features,
+                    max_steps=2,
+                    checkpoint_extra={"canonical_anchor_sampling": ("host", 42)},
+                    resume_from=source,
+                )
+
     def test_resume_accepts_a_record_saved_with_logging_options(self):
         from tests.test_runtime import test_checkpoint_resume as resume_tests
 

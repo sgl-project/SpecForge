@@ -29,6 +29,8 @@ from torch.nn.parallel import DistributedDataParallel
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
 from specforge.training.contracts import (
+    EPOCH_METADATA_KEY,
+    EVALUATION_EPOCH,
     CheckpointState,
     PendingStep,
     ProgramSpec,
@@ -239,9 +241,12 @@ class DataParallelRunner:
         return next(self.program.parameters()).device
 
     def _forward(
-        self, batch: TrainBatch, ctx: StepContext, **replay: Any
+        self, batch: TrainBatch, ctx: StepContext, *, epoch=None, **replay: Any
     ) -> "ObjectiveResult":
-        """Place one batch on the training device and run the program on it."""
+        """Place one batch on the training device and run the program on it.
+
+        ``epoch`` defaults to the one the run loop recorded on the batch.
+        """
         missing = sorted(set(self.spec.inputs) - batch.tensors.keys())
         if missing:
             raise ValueError(
@@ -250,7 +255,11 @@ class DataParallelRunner:
             )
         device = self._device()
         inputs = batch.tensors
-        prepared = self._unwrapped.host_inputs(inputs)
+        prepared = self._unwrapped.host_inputs(
+            inputs,
+            sample_ids=batch.sample_ids,
+            epoch=batch.metadata.get(EPOCH_METADATA_KEY) if epoch is None else epoch,
+        )
         if prepared:
             if device.type != "cpu":
                 # a pageable source makes the non_blocking copy wait for the host
@@ -363,7 +372,7 @@ class DataParallelRunner:
             self._unwrapped.replay_arguments({}) if self.replay_statistics else {}
         )
         with torch.no_grad():
-            return self._forward(batch, ctx, **arguments)
+            return self._forward(batch, ctx, epoch=EVALUATION_EPOCH, **arguments)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._refuse_after_failure()
