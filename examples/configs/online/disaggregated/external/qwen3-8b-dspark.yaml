@@ -31,6 +31,10 @@ training:
 run_id: qwen3-8b-dspark-disaggregated
 output_dir: outputs/qwen3-8b-dspark-disaggregated
 
+runtime:
+  in_flight_high_watermark: 1024
+  in_flight_low_watermark: 512
+
 deployment:
   mode: disaggregated
   trainer:
