@@ -465,17 +465,10 @@ def _iter_epoch_online_prompt_batches(
 
 def _assemble_server_rollout_workers(
     *,
-    algorithm: AlgorithmRegistration,
-    modality: str,
+    strategy: str,
     controller: DataFlowController,
     store: FeatureStore,
     run_id: str,
-    target_hidden_size: int,
-    target_vocab_size: Optional[int],
-    draft_vocab_size: Optional[int],
-    target_repr: Optional[str],
-    aux_hidden_state_layer_ids,
-    vocab_map_version: Optional[str],
     num_rollout_workers: int,
     feature_source,
 ):
@@ -497,28 +490,16 @@ def _assemble_server_rollout_workers(
     else:
         sources = [feature_source] * num_rollout_workers
 
-    from specforge.inference.capture import CaptureConfig
     from specforge.inference.rollout_worker import RolloutWorker
 
-    contract = algorithm.spec.feature_contract("streaming", modality)
-    capture_config = CaptureConfig.from_strategy(
-        required_features=contract.required_tensors,
-        aux_hidden_state_layer_ids=tuple(aux_hidden_state_layer_ids or ()),
-        target_repr=target_repr,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        vocab_map_version=vocab_map_version,
-    )
     return [
         RolloutWorker(
             controller,
             store,
             source,
-            capture_config,
             run_id=run_id,
             worker_id=f"rollout-{index}",
-            strategy=algorithm.name,
+            strategy=strategy,
         )
         for index, source in enumerate(sources)
     ]
@@ -801,18 +782,11 @@ _ONLINE_PROMPT_REFILL_ROUNDS = 4
 
 def build_disagg_online_producer(
     *,
-    algorithm: AlgorithmRegistration,
-    modality: str = "text",
+    strategy: str,
     prompts,
     feature_store: FeatureStore,
     channel,
     run_id: str,
-    target_hidden_size: int,
-    target_vocab_size: Optional[int] = None,
-    draft_vocab_size: Optional[int] = None,
-    target_repr: Optional[str] = None,
-    aux_hidden_state_layer_ids=None,
-    vocab_map_version: Optional[str] = None,
     num_rollout_workers: int = 1,
     feature_source=None,
     lease: int = 8,
@@ -835,11 +809,12 @@ def build_disagg_online_producer(
 
     Workers put() into a cross-node ``feature_store``; committed refs stream to
     the consumer via ``channel``. ``feature_source`` is an injected SGLang
-    server-capture transport; a *sequence* of sources fans out to one logical
-    worker per source (the multi-server topology). Each logical worker keeps
-    ``producer_concurrency`` capture calls in flight and replenishes a slot as
-    soon as that call completes. There is intentionally no in-process
-    target-model path.
+    server-capture transport that carries its own capture contract; a
+    *sequence* of sources fans out to one logical worker per source (the
+    multi-server topology). ``strategy`` only labels the workers and the logs.
+    Each logical worker keeps ``producer_concurrency`` capture calls in flight
+    and replenishes a slot as soon as that call completes. There is
+    intentionally no in-process target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -898,24 +873,6 @@ def build_disagg_online_producer(
     def elapsed(start: float) -> str:
         return f"{time.perf_counter() - start:.3f}s"
 
-    streaming = algorithm.providers.server_streaming_for(modality)
-    contract = algorithm.spec.feature_contract("streaming", modality)
-    if target_repr is None:
-        target_repr = streaming.target_representation
-    allowed_target_representations = contract.allowed_target_representations
-    if allowed_target_representations and (
-        target_repr not in allowed_target_representations
-    ):
-        raise ValueError(
-            f"target representation {target_repr!r} is not supported by "
-            f"algorithm {algorithm.name!r} for modality {modality!r}; "
-            f"expected one of {sorted(allowed_target_representations)}"
-        )
-    if not allowed_target_representations and target_repr is not None:
-        raise ValueError(
-            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
-            f"consume a target representation, got {target_repr!r}"
-        )
     sleep = sleep or time.sleep
     producer_concurrency = int(producer_concurrency)
     if producer_concurrency < 1:
@@ -953,7 +910,7 @@ def build_disagg_online_producer(
     base_prompt_count = len(prompts)
     producer_timing(
         "build_disagg_online_producer enter "
-        f"algorithm={algorithm.name} modality={modality} "
+        f"algorithm={strategy} "
         f"base_prompts={base_prompt_count} "
         f"prompt_epochs={prompt_epochs} "
         f"prompt_ingest_batch_size={prompt_ingest_batch_size} "
@@ -974,18 +931,11 @@ def build_disagg_online_producer(
     phase = time.perf_counter()
     producer_timing("assemble rollout workers start")
     workers = _assemble_server_rollout_workers(
-        algorithm=algorithm,
-        modality=modality,
+        strategy=strategy,
         feature_source=feature_source,
         controller=controller,
         store=feature_store,
         run_id=run_id,
-        target_hidden_size=target_hidden_size,
-        target_vocab_size=target_vocab_size,
-        draft_vocab_size=draft_vocab_size,
-        target_repr=target_repr,
-        aux_hidden_state_layer_ids=aux_hidden_state_layer_ids,
-        vocab_map_version=vocab_map_version,
         num_rollout_workers=num_rollout_workers,
     )
     if not workers:

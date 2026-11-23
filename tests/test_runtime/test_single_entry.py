@@ -6,11 +6,12 @@ import io
 import os
 import signal
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
 
-from specforge.application import bind_run
+from specforge.application import ResolvedRun, bind_run
 from specforge.cli import (
     _bootstrap_single_process_env,
     _train,
@@ -22,9 +23,11 @@ from specforge.cli import (
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import TrainingRun
+from specforge.training.capture_contract import ServerCaptureContract
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
-    _build_online,
+    _build_online_consumer,
+    _build_online_producer,
     _claim_fresh_control_path,
     _mooncake_store,
     build_disaggregated_run,
@@ -111,11 +114,10 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         return_value=trainer,
                     ),
                 ):
-                    run = _build_online(
+                    run = _build_online_consumer(
                         cfg,
                         algorithm=ALGORITHM,
                         build_model_bundle=lambda _cfg: bundle,
-                        prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
                         logger=None,
                         preflight_model_bundle=preflight,
@@ -162,7 +164,6 @@ class TestTrainingRunLifecycle(unittest.TestCase):
 
                 resolved = resolve_run(cfg)
                 prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
-                preflight = mock.Mock(side_effect=AssertionError("consumer-only check"))
                 with (
                     mock.patch.dict(
                         os.environ,
@@ -176,8 +177,15 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     mock.patch("specforge.training.assembly._load_input_tools"),
                     mock.patch("specforge.training.model_loading.resolve_draft_config"),
                     mock.patch(
-                        "specforge.training.disaggregated._producer_capture_metadata",
-                        return_value=([1, 2], 8, 32, 32),
+                        "specforge.training.capture_contract."
+                        "resolve_server_capture_contract",
+                        return_value=ServerCaptureContract(
+                            method="dflash",
+                            aux_layer_ids=(1, 2),
+                            target_hidden_size=8,
+                            target_vocab_size=32,
+                            draft_vocab_size=32,
+                        ),
                     ),
                     mock.patch(
                         "specforge.inference.adapters.server_capture."
@@ -188,17 +196,12 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         return_value=([], mock.Mock()),
                     ),
                 ):
-                    _build_online(
-                        cfg,
-                        algorithm=resolved.algorithm,
-                        build_model_bundle=mock.Mock(),
+                    _build_online_producer(
+                        (resolved,),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
-                        optimizer_factory=mock.Mock(),
-                        logger=None,
-                        preflight_model_bundle=preflight,
                     )
-                preflight.assert_not_called()
-                schema = adapter_cls.call_args.kwargs["schema"]
+                (output,) = adapter_cls.call_args.kwargs["outputs"]
+                schema = output.schema
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
 
@@ -338,14 +341,13 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False
                     ),
                     mock.patch(
-                        "specforge.training.disaggregated._build_online",
+                        f"specforge.training.disaggregated._build_online_{role}",
                         side_effect=fail_during_assembly,
                     ),
                 ):
                     with self.assertRaisesRegex(RuntimeError, "assembly exploded"):
                         build_disaggregated_run(
-                            cfg,
-                            algorithm=ALGORITHM,
+                            (ResolvedRun(cfg, ALGORITHM),),
                             build_model_bundle=mock.Mock(),
                             prepare_prompts=mock.Mock(),
                             optimizer_factory=mock.Mock(),
@@ -396,8 +398,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     self.assertRaisesRegex(ImportError, "liger missing"),
                 ):
                     build_disaggregated_run(
-                        cfg,
-                        algorithm=ALGORITHM,
+                        (ResolvedRun(cfg, ALGORITHM),),
                         build_model_bundle=build_model_bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
@@ -433,7 +434,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         ):
             from specforge.training.assembly import build_training_run
 
-            build_training_run(cfg, algorithm=ALGORITHM)
+            build_training_run((ResolvedRun(cfg, ALGORITHM),))
             build.call_args.kwargs["preflight_model_bundle"](cfg)
         preflight.assert_called_once_with(cfg, algorithm=ALGORITHM)
 
@@ -459,14 +460,13 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False),
             mock.patch(
-                "specforge.training.disaggregated._build_online",
+                "specforge.training.disaggregated._build_online_producer",
                 side_effect=RuntimeError("claim rejected"),
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "claim rejected"):
                 build_disaggregated_run(
-                    cfg,
-                    algorithm=ALGORITHM,
+                    (ResolvedRun(cfg, ALGORITHM),),
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
@@ -534,6 +534,7 @@ class TestCliLifecycle(unittest.TestCase):
         accelerate_utils.set_seed = mock.Mock()
         accelerate.utils = accelerate_utils
 
+        resolved = bind_run(cfg, ALGORITHM)
         with mock.patch.dict(
             sys.modules,
             {
@@ -543,13 +544,85 @@ class TestCliLifecycle(unittest.TestCase):
                 "specforge.training.assembly": assembly,
             },
         ):
-            self.assertEqual(_train(bind_run(cfg, ALGORITHM)), 3)
+            self.assertEqual(_train((resolved,)), 3)
 
-        assembly.build_training_run.assert_called_once_with(
-            cfg,
-            algorithm=ALGORITHM,
-        )
+        assembly.build_training_run.assert_called_once_with((resolved,))
         run.run.assert_called_once_with()
+
+    def _train_several_drafters(self, *args):
+        """Run ``specforge train`` on a two-drafter recipe; return what it trains."""
+        from click.testing import CliRunner
+
+        from specforge.cli import cli
+
+        root = tempfile.mkdtemp(prefix="several_drafters_")
+        preset = "specforge/config/draft/presets/qwen3-8b-{}.yaml"
+        recipe = Config.model_validate(
+            {
+                "run_id": "qwen3",
+                "model": {"target_model_path": "target", "target_backend": "sglang"},
+                "data": {"prompts_path": "prompts.jsonl"},
+                "training": {"max_steps": 1},
+                "drafters": [
+                    {"name": name, "draft": preset.format(name)}
+                    for name in ("dflash", "dspark")
+                ],
+                "deployment": _disaggregated_deployment(
+                    root, server_urls=["http://capture:30000"]
+                ),
+            }
+        )
+        trained = []
+        mooncake = {
+            "MOONCAKE_METADATA_SERVER": "http://mooncake:8080/metadata",
+            "MOONCAKE_MASTER_SERVER_ADDR": "mooncake:50051",
+        }
+        with (
+            mock.patch.dict(os.environ, mooncake),
+            mock.patch("specforge.cli.load_config", return_value=recipe),
+            mock.patch(
+                "specforge.training.model_loading.training_target_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "specforge.cli._train",
+                side_effect=lambda runs: trained.append(
+                    (runs, os.environ["DISAGG_REF_CHANNEL"])
+                ),
+            ),
+        ):
+            result = CliRunner().invoke(cli, ["train", "-c", "multi.yaml", *args])
+        return root, result, trained
+
+    def test_several_drafters_need_a_producer_and_one_trainer_each(self):
+        _, result, trained = self._train_several_drafters()
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--role consumer --drafter NAME", result.output)
+        self.assertEqual(trained, [])
+
+        _, result, trained = self._train_several_drafters("--drafter", "dspark")
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--drafter needs --role consumer", result.output)
+        self.assertEqual(trained, [])
+
+        _, result, trained = self._train_several_drafters("--role", "producer")
+        self.assertEqual(result.exit_code, 0, result.output)
+        ((runs, _),) = trained
+        self.assertEqual(
+            [(run.config.run_id, run.config.training.role) for run in runs],
+            [("qwen3-dflash", "producer"), ("qwen3-dspark", "producer")],
+        )
+
+        root, result, trained = self._train_several_drafters(
+            "--role", "consumer", "--drafter", "dspark"
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        ((runs, channel),) = trained
+        self.assertEqual(
+            [(run.config.run_id, run.config.training.role) for run in runs],
+            [("qwen3-dspark", "consumer")],
+        )
+        self.assertEqual(channel, os.path.join(root, "dspark", "refs.jsonl"))
 
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(

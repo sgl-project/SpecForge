@@ -110,7 +110,7 @@ class TestCliDispatch(unittest.TestCase):
             self.assertEqual(main(["train", "--config", "run.yaml"]), 0)
         load.assert_called_once_with("run.yaml", [])
         train.assert_called_once()
-        resolved = train.call_args.args[0]
+        (resolved,) = train.call_args.args[0]
         self.assertIsInstance(resolved, ResolvedRun)
         self.assertEqual(resolved.config.draft, cfg.draft)
         self.assertEqual(resolved.algorithm.name, "dflash")

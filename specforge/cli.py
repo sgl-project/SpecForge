@@ -118,10 +118,10 @@ def _validate_world_size(cfg: Config, world_size: int) -> None:
     cfg.validate_world_size(world_size)
 
 
-def _train(resolved) -> int:
+def _train(runs) -> int:
     from accelerate.utils import set_seed
 
-    cfg = resolved.config
+    cfg = runs[0].config
     # Make the typed recipe authoritative for the backend's existing FSDP
     # sharding seam in both direct and managed-local worker processes.
     os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
@@ -135,7 +135,7 @@ def _train(resolved) -> int:
         # group and must not initialize CUDA merely to publish feature refs.
         from specforge.application import build_application_run
 
-        return build_application_run(resolved).run()
+        return build_application_run(runs).run()
 
     from specforge.distributed import destroy_distributed, init_distributed
 
@@ -154,7 +154,7 @@ def _train(resolved) -> int:
         _validate_world_size(cfg, dist.get_world_size())
         from specforge.application import build_application_run
 
-        result = build_application_run(resolved).run()
+        result = build_application_run(runs).run()
         failed = False
         return result
     finally:
@@ -210,6 +210,12 @@ def cli() -> None:
     ),
 )
 @click.option(
+    "--drafter",
+    default=None,
+    metavar="NAME",
+    help="With --role consumer: the drafter of a 'drafters' recipe to train.",
+)
+@click.option(
     "--node-rank",
     type=int,
     default=None,
@@ -224,6 +230,7 @@ def cli() -> None:
 def train(
     config_path: str,
     role: str,
+    drafter: Optional[str],
     node_rank: Optional[int],
     plan: bool,
     overrides: Sequence[str],
@@ -234,21 +241,31 @@ def train(
     the config file, e.g. ``training.learning_rate=1e-4``.
     """
     overrides = list(overrides)
+    if drafter is not None and role != "consumer":
+        raise click.UsageError("--drafter needs --role consumer")
     cfg = load_config(config_path, overrides)
-    from specforge.application import bind_run, resolve_run
+    from specforge.application import bind_run, resolve_runs
     from specforge.launch_plan import build_launch_plan, run_commands
     from specforge.training.model_loading import training_target_config
 
     target_config = training_target_config(cfg)
-    resolved = resolve_run(cfg, target_config=target_config)
+    runs = resolve_runs(cfg, drafter=drafter, target_config=target_config)
     launch = build_launch_plan(
-        resolved.config,
-        algorithm=resolved.algorithm,
+        runs[0].config,
+        algorithm=runs[0].algorithm,
         config_path=config_path,
         overrides=overrides,
         requested_role=role,
         node_rank=node_rank,
+        drafter=drafter,
     )
+    if len(runs) > 1 and launch.role != "producer":
+        raise click.UsageError(
+            "this recipe trains several drafters, and one command cannot start "
+            "them all yet: run --role producer once, and --role consumer "
+            "--drafter NAME for each drafter. A managed_local stack cannot run "
+            "several drafters yet."
+        )
     if plan:
         print(launch.render())
         # The plan renders anywhere; launching it on this host would fail.
@@ -268,10 +285,13 @@ def train(
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        role_config = _config_for_role(resolved.config, launch.role)
+        role_runs = tuple(
+            bind_run(_config_for_role(run.config, launch.role), run.algorithm)
+            for run in runs
+        )
         try:
             with _worker_signal_unwind():
-                _train(bind_run(role_config, resolved.algorithm))
+                _train(role_runs)
         except _WorkerTermination as received:
             return 128 + received.signum
         return 0

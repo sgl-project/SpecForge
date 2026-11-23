@@ -498,18 +498,18 @@ def _common_launch_kwargs(
     )
 
 
-def build_training_run(
-    cfg: Config,
-    *,
-    algorithm: AlgorithmRegistration,
-) -> TrainingRun:
-    """Assemble one validated run from an already-resolved algorithm.
+def build_training_run(runs: Sequence) -> TrainingRun:
+    """Assemble one process from already-resolved runs.
+
+    Each run pairs a validated ``config`` with its ``algorithm``. Only an
+    online producer takes more than one: it captures once for all of them.
 
     Offline training may run in one process or with a disaggregated feature
     source.  Online training is always disaggregated and captures through
     external SGLang servers; colocated online execution is intentionally absent.
     """
 
+    cfg, algorithm = runs[0].config, runs[0].algorithm
     t = cfg.training
     if t.role != "producer":
         import torch.distributed as dist
@@ -529,8 +529,7 @@ def build_training_run(
         run_logger = _configured_logger(cfg)
         try:
             return build_disaggregated_run(
-                cfg,
-                algorithm=algorithm,
+                runs,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
                     run_cfg, algorithm=algorithm
                 ),

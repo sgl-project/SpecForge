@@ -7,6 +7,8 @@ __all__ = [
     "DataConfig",
     "DeploymentConfig",
     "DisaggregatedDeploymentConfig",
+    "DrafterConfig",
+    "DrafterTrainerConfig",
     "ManagedLocalMooncakeConfig",
     "ManagedLocalCaptureServerConfig",
     "ManagedLocalStackConfig",
@@ -16,6 +18,7 @@ __all__ = [
     "RuntimeConfig",
     "SGLANG_CAPTURE_CONTEXT_HEADROOM",
     "TrainerDeploymentConfig",
+    "flatten_drafters",
     "load_config",
     "apply_overrides",
 ]

@@ -862,6 +862,23 @@ class LaunchPlanTest(unittest.TestCase):
         )
         self.assertEqual((consumer.kind, consumer.role), ("command", "consumer"))
         self.assertIn("--nproc_per_node", consumer.commands[0].argv)
+        self.assertNotIn("--drafter", consumer.commands[0].argv)
+
+    def test_a_drafters_trainer_tells_its_workers_which_drafter_to_run(self):
+        consumer = build_launch_plan(
+            _config(mode="disaggregated", nproc=4),
+            config_path="run.yaml",
+            requested_role="consumer",
+            drafter="dspark",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+        argv = consumer.commands[0].argv
+        self.assertEqual(
+            argv[argv.index("--role") : argv.index("--role") + 4],
+            ("--role", "consumer", "--drafter", "dspark"),
+        )
 
     def test_managed_local_schema_round_trips_and_validates_resources(self):
         cfg = _managed_config("/fresh/managed-attempt")
@@ -2312,7 +2329,7 @@ class LaunchPlanTest(unittest.TestCase):
                     0,
                 )
 
-            projected = train.call_args.args[0]
+            (projected,) = train.call_args.args[0]
             self.assertEqual(projected.config.training.role, "producer")
             self.assertEqual(
                 projected.config.deployment.disaggregated.consumer_state_dir,

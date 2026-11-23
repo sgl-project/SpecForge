@@ -95,25 +95,33 @@ def _claim_fresh_control_path(path: str, suffixes: Sequence[str]) -> None:
         os.fsync(stream.fileno())
 
 
-def _publish_role_assembly_failure(cfg: Config, exc: BaseException) -> None:
-    """Notify the peer when a role fails before its run closure is returned.
+def _publish_role_assembly_failure(runs: Sequence, exc: BaseException) -> None:
+    """Notify the peers when a role fails before its run closure is returned.
 
     Producer notification is allowed only after this process successfully
     claimed the attempt path.  That prevents a typo/retry using an occupied
     path from poisoning another live producer's channel.
     """
-    env_name = "DISAGG_MANIFEST" if cfg.mode == "offline" else "DISAGG_REF_CHANNEL"
-    path = os.environ.get(env_name)
-    if not path:
-        return
-    if cfg.training.role == "producer":
-        claim = _read_control(path + _PRODUCER_CLAIM_SUFFIX)
-        if claim != f"pid={os.getpid()}":
-            return
-        failure_path = path + ".failed"
+    from specforge.launch_plan import online_ref_channel
+
+    cfg = runs[0].config
+    producer = cfg.training.role == "producer"
+    if cfg.mode == "online" and producer:
+        paths = [online_ref_channel(run.config) for run in runs]
     else:
-        failure_path = path + ".consumer_failed"
-    _publish_control_failure(failure_path, exc)
+        env_name = "DISAGG_MANIFEST" if cfg.mode == "offline" else "DISAGG_REF_CHANNEL"
+        paths = [os.environ.get(env_name)]
+    for path in paths:
+        if not path:
+            continue
+        if producer:
+            claim = _read_control(path + _PRODUCER_CLAIM_SUFFIX)
+            if claim != f"pid={os.getpid()}":
+                continue
+            failure_path = path + ".failed"
+        else:
+            failure_path = path + ".consumer_failed"
+        _publish_control_failure(failure_path, exc)
 
 
 def _primary_rank() -> bool:
@@ -592,235 +600,253 @@ def _build_offline(
     )
 
 
-def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
+def capture_output_for(cfg: Config, algorithm: AlgorithmRegistration):
+    """The sample one run takes from each captured prompt, from its config."""
+    from specforge.algorithms.common.providers import resolve_server_capture_layout
+    from specforge.inference.adapters.server_capture import (
+        CaptureOutput,
+        ServerCaptureSchema,
+    )
+    from specforge.inference.capture import CaptureConfig
     from specforge.training.capture_contract import resolve_server_capture_contract
-
-    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
-    return (
-        list(contract.aux_layer_ids),
-        contract.target_hidden_size,
-        contract.target_vocab_size,
-        contract.draft_vocab_size,
-    )
-
-
-def _build_online(
-    cfg: Config,
-    *,
-    algorithm: AlgorithmRegistration,
-    build_model_bundle: Callable,
-    prepare_prompts: Callable,
-    optimizer_factory: Callable,
-    logger: Callable,
-    preflight_model_bundle: Optional[Callable] = None,
-):
-    from specforge.training.assembly import (
-        TrainingRun,
-        _dataloader_num_workers,
-        _load_input_tools,
-        _profiling_options,
-    )
 
     modality = cfg.model.input_modality
     streaming = algorithm.providers.server_streaming_for(modality)
-    channel_path = _env("DISAGG_REF_CHANNEL")
-    if cfg.training.role == "producer":
-        _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
-    elif preflight_model_bundle is not None:
-        # Check trainer dependencies before opening the store or waiting on
-        # the producer, so a failed preflight owns no transport resources.
-        preflight_model_bundle(cfg)
-    # The producer owns capture and explicit attempt cleanup. The consumer must
-    # retain materialized features until DPAckController commits the optimizer
-    # boundary and explicitly aborts the acknowledged ids.
-    store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
-    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
-    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
-
-    channel = StreamingRefChannel(channel_path)
-
-    if cfg.training.role == "producer":
-        from specforge.algorithms.common.providers import resolve_server_capture_layout
-        from specforge.inference.adapters.server_capture import (
-            ServerCaptureSchema,
-            SGLangServerCaptureAdapter,
+    feature_contract = algorithm.spec.feature_contract("streaming", modality)
+    target_repr = streaming.target_representation
+    allowed_target_representations = feature_contract.allowed_target_representations
+    if allowed_target_representations and (
+        target_repr not in allowed_target_representations
+    ):
+        raise ValueError(
+            f"target representation {target_repr!r} is not supported by "
+            f"algorithm {algorithm.name!r} for modality {modality!r}; "
+            f"expected one of {sorted(allowed_target_representations)}"
         )
-        from specforge.launch import build_disagg_online_producer
-        from specforge.training.model_loading import resolve_draft_config
-
-        # This check is independent of dataset size. Keep it before tokenizer
-        # loading and prompt preparation so an invalid window fails cheaply.
-        in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
-        input_adapter = streaming.create_input_adapter(cfg)
-        input_tools = _load_input_tools(
-            cfg,
-            algorithm,
-            input_adapter=input_adapter,
+    if not allowed_target_representations and target_repr is not None:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
+            f"consume a target representation, got {target_repr!r}"
         )
-        draft_config = resolve_draft_config(cfg)
-        if input_adapter is None:
-            prompts = prepare_prompts(
-                cfg,
-                input_tools,
-                draft_config=draft_config,
-            )
-        else:
-            prompts = input_adapter.prepare_prompts(
-                cfg,
-                input_tools,
-                draft_config=draft_config,
-            )
-        if not prompts:
-            raise ValueError(
-                f"no prompts satisfy {algorithm.name} training eligibility"
-            )
-        if cfg.training.total_steps is None and cfg.training.max_steps is None:
-            schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
-            _write_control(
-                channel_path + _ONLINE_SCHEDULE_SUFFIX,
-                json.dumps(schedule, sort_keys=True),
-            )
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
-            cfg, algorithm
-        )
-        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
-        capture_schema = ServerCaptureSchema(
+    contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+    layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
+    return CaptureOutput(
+        run_id=cfg.run_id,
+        algorithm=algorithm.name,
+        schema=ServerCaptureSchema(
             aux_feature=layout.aux_feature,
             last_hidden_feature=layout.last_hidden_feature,
             passthrough=layout.passthrough,
             attention_mask_feature=layout.attention_mask_feature,
-        )
-        adapters = [
-            SGLangServerCaptureAdapter(
-                url,
-                store,
-                run_id=cfg.run_id,
-                algorithm=algorithm.name,
-                schema=capture_schema,
-                request_input_adapter=input_adapter,
-                target_model_version=cfg.model.target_model_path,
-                server_capture=_server_capture(cfg),
-            )
-            for url in _server_urls(cfg)
-        ]
-        target_repr = streaming.target_representation
-        peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
-        _workers, drive = build_disagg_online_producer(
-            algorithm=algorithm,
-            modality=modality,
-            prompts=prompts,
-            feature_store=store,
-            channel=channel,
-            feature_source=adapters if len(adapters) > 1 else adapters[0],
-            num_rollout_workers=len(adapters),
-            producer_concurrency=cfg.runtime.producer_concurrency,
-            run_id=cfg.run_id,
-            target_hidden_size=hidden_size,
-            target_vocab_size=target_vocab,
-            draft_vocab_size=draft_vocab,
+        ),
+        capture=CaptureConfig.from_strategy(
+            required_features=feature_contract.required_tensors,
+            aux_hidden_state_layer_ids=contract.aux_layer_ids,
             target_repr=target_repr,
-            aux_hidden_state_layer_ids=layers,
-            prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=_online_prompt_seed(cfg),
-            lease=cfg.runtime.producer_lease,
-            in_flight_high_watermark=in_flight_high_watermark,
-            in_flight_low_watermark=in_flight_low_watermark,
-            resident_high_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
-                else cfg.runtime.resident_high_watermark_bytes
-            ),
-            resident_low_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
-                else cfg.runtime.resident_low_watermark_bytes
-            ),
-            feature_store_max_resident_bytes=(
-                cfg.runtime.feature_store_max_resident_bytes
-            ),
-            peer_wait_timeout_s=peer_wait_timeout_s,
+            target_hidden_size=contract.target_hidden_size,
+            target_vocab_size=contract.target_vocab_size,
+            draft_vocab_size=contract.draft_vocab_size,
+        ),
+    )
+
+
+def _build_online_producer(runs: Sequence, *, prepare_prompts: Callable):
+    """Capture each prompt once and publish one ref to every run's channel.
+
+    The prompts, the store, the servers and the flow limits are shared, so
+    they are read from the first run.
+    """
+    from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
+    from specforge.launch import build_disagg_online_producer
+    from specforge.launch_plan import online_ref_channel
+    from specforge.runtime.data_plane.drafter_channels import DrafterChannels
+    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+    from specforge.training.assembly import TrainingRun, _load_input_tools
+    from specforge.training.model_loading import resolve_draft_config
+
+    cfg, algorithm = runs[0].config, runs[0].algorithm
+    channel_paths = [online_ref_channel(run.config) for run in runs]
+    for channel_path in channel_paths:
+        _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+    # The producer owns capture and explicit attempt cleanup.
+    store = _mooncake_store(cfg)
+    channel = DrafterChannels(
+        [
+            (run.config.run_id, StreamingRefChannel(channel_path))
+            for run, channel_path in zip(runs, channel_paths)
+        ]
+    )
+    # This check is independent of dataset size. Keep it before tokenizer
+    # loading and prompt preparation so an invalid window fails cheaply.
+    flow_windows = [_online_flow_window(run.config) for run in runs]
+    in_flight_high_watermark, in_flight_low_watermark = flow_windows[0]
+    streaming = algorithm.providers.server_streaming_for(cfg.model.input_modality)
+    input_adapter = streaming.create_input_adapter(cfg)
+    input_tools = _load_input_tools(
+        cfg,
+        algorithm,
+        input_adapter=input_adapter,
+    )
+    draft_config = resolve_draft_config(cfg)
+    if input_adapter is None:
+        prompts = prepare_prompts(
+            cfg,
+            input_tools,
+            draft_config=draft_config,
         )
+    else:
+        prompts = input_adapter.prepare_prompts(
+            cfg,
+            input_tools,
+            draft_config=draft_config,
+        )
+    if not prompts:
+        raise ValueError(f"no prompts satisfy {algorithm.name} training eligibility")
+    for run, channel_path in zip(runs, channel_paths):
+        training = run.config.training
+        if training.total_steps is None and training.max_steps is None:
+            schedule = _online_schedule_payload(run.config, num_prompts=len(prompts))
+            _write_control(
+                channel_path + _ONLINE_SCHEDULE_SUFFIX,
+                json.dumps(schedule, sort_keys=True),
+            )
+    outputs = [capture_output_for(run.config, run.algorithm) for run in runs]
+    adapters = [
+        SGLangServerCaptureAdapter(
+            url,
+            store,
+            outputs=outputs,
+            request_input_adapter=input_adapter,
+            target_model_version=cfg.model.target_model_path,
+            server_capture=_server_capture(cfg),
+        )
+        for url in _server_urls(cfg)
+    ]
+    peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
+    _workers, drive = build_disagg_online_producer(
+        strategy="+".join(run.algorithm.name for run in runs),
+        prompts=prompts,
+        feature_store=store,
+        channel=channel,
+        feature_source=adapters if len(adapters) > 1 else adapters[0],
+        num_rollout_workers=len(adapters),
+        producer_concurrency=cfg.runtime.producer_concurrency,
+        run_id=cfg.run_id,
+        prompt_epochs=cfg.training.num_epochs,
+        prompt_seed=_online_prompt_seed(cfg),
+        lease=cfg.runtime.producer_lease,
+        in_flight_high_watermark=in_flight_high_watermark,
+        in_flight_low_watermark=in_flight_low_watermark,
+        resident_high_watermark_bytes=(
+            int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
+            if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
+            else cfg.runtime.resident_high_watermark_bytes
+        ),
+        resident_low_watermark_bytes=(
+            int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
+            if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
+            else cfg.runtime.resident_low_watermark_bytes
+        ),
+        feature_store_max_resident_bytes=cfg.runtime.feature_store_max_resident_bytes,
+        peer_wait_timeout_s=peer_wait_timeout_s,
+    )
 
-        def produce() -> int:
-            produced = 0
-            primary_exc = None
-            try:
-                produced = drive(should_stop=channel.consumer_stopped)
-                deadline = (
-                    time.monotonic() + peer_wait_timeout_s
-                    if peer_wait_timeout_s is not None
-                    else None
-                )
-                while not channel.consumer_stopped():
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            "producer timed out waiting for the consumer result "
-                            f"after {peer_wait_timeout_s:.0f}s"
-                        )
-                    time.sleep(0.25)
-                consumer_failure = channel.consumer_failure()
-                if consumer_failure is not None:
-                    raise RuntimeError(f"consumer failed: {consumer_failure}")
-            except BaseException as exc:
-                primary_exc = exc
-                try:
-                    channel.fail(f"{type(exc).__name__}: {exc}")
-                except Exception as signal_exc:
-                    print(
-                        f"failed to publish producer failure: {signal_exc}",
-                        flush=True,
+    def produce() -> int:
+        produced = 0
+        primary_exc = None
+        try:
+            produced = drive(should_stop=channel.consumer_stopped)
+            deadline = (
+                time.monotonic() + peer_wait_timeout_s
+                if peer_wait_timeout_s is not None
+                else None
+            )
+            while not channel.consumer_stopped():
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "producer timed out waiting for the consumer result "
+                        f"after {peer_wait_timeout_s:.0f}s"
                     )
-            cleanup_errors = []
+                time.sleep(0.25)
+            consumer_failure = channel.consumer_failure()
+            if consumer_failure is not None:
+                raise RuntimeError(f"consumer failed: {consumer_failure}")
+        except BaseException as exc:
+            primary_exc = exc
             try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"published-ref scan: {type(exc).__name__}: {exc}"
+                channel.fail(f"{type(exc).__name__}: {exc}")
+            except Exception as signal_exc:
+                print(
+                    f"failed to publish producer failure: {signal_exc}",
+                    flush=True,
                 )
-            try:
-                store.discard_external_attempts(
-                    reason="online-attempt-unadopted-capture"
-                )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
-                )
-            try:
-                drain_feature_store_removals(store)
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"pending-remove drain: {type(exc).__name__}: {exc}"
-                )
-            if primary_exc is not None and cleanup_errors:
-                raise RuntimeError(
-                    f"producer failed ({type(primary_exc).__name__}: "
-                    f"{primary_exc}) and Mooncake cleanup also failed: "
-                    f"{cleanup_errors}"
-                ) from primary_exc
-            if primary_exc is not None:
-                raise primary_exc
-            if cleanup_errors:
-                raise RuntimeError(
-                    "producer could not clean all published Mooncake features: "
-                    f"{cleanup_errors}"
-                )
-            return produced
+        cleanup_errors = []
+        try:
+            for ref in channel.published_refs():
+                try:
+                    store.abort(ref.sample_id, reason="online-attempt-finished")
+                except Exception as exc:
+                    cleanup_errors.append(
+                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                    )
+        except Exception as exc:
+            cleanup_errors.append(f"published-ref scan: {type(exc).__name__}: {exc}")
+        try:
+            store.discard_external_attempts(reason="online-attempt-unadopted-capture")
+        except Exception as exc:
+            cleanup_errors.append(
+                f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
+            )
+        try:
+            drain_feature_store_removals(store)
+        except Exception as exc:
+            cleanup_errors.append(f"pending-remove drain: {type(exc).__name__}: {exc}")
+        if primary_exc is not None and cleanup_errors:
+            raise RuntimeError(
+                f"producer failed ({type(primary_exc).__name__}: "
+                f"{primary_exc}) and Mooncake cleanup also failed: "
+                f"{cleanup_errors}"
+            ) from primary_exc
+        if primary_exc is not None:
+            raise primary_exc
+        if cleanup_errors:
+            raise RuntimeError(
+                "producer could not clean all published Mooncake features: "
+                f"{cleanup_errors}"
+            )
+        return produced
 
-        return TrainingRun(execute=produce)
+    return TrainingRun(execute=produce)
 
+
+def _build_online_consumer(
+    cfg: Config,
+    *,
+    algorithm: AlgorithmRegistration,
+    build_model_bundle: Callable,
+    optimizer_factory: Callable,
+    logger: Callable,
+    preflight_model_bundle: Optional[Callable] = None,
+):
     from specforge.launch import build_disagg_online_consumer
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+    from specforge.training.assembly import (
+        TrainingRun,
+        _dataloader_num_workers,
+        _profiling_options,
+    )
 
+    modality = cfg.model.input_modality
+    channel_path = _env("DISAGG_REF_CHANNEL")
+    if preflight_model_bundle is not None:
+        # Check trainer dependencies before opening the store or waiting on
+        # the producer, so a failed preflight owns no transport resources.
+        preflight_model_bundle(cfg)
+    # The consumer must retain materialized features until DPAckController
+    # commits the optimizer boundary and explicitly aborts the acknowledged ids.
+    store = _mooncake_store(cfg, retain_on_release=True)
+    channel = StreamingRefChannel(channel_path)
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
@@ -862,9 +888,8 @@ def _build_online(
 
 
 def build_disaggregated_run(
-    cfg: Config,
+    runs: Sequence,
     *,
-    algorithm: AlgorithmRegistration,
     build_model_bundle: Callable,
     prepare_prompts: Callable,
     optimizer_factory: Callable,
@@ -873,34 +898,31 @@ def build_disaggregated_run(
 ):
     """Assemble the configured producer or consumer role.
 
+    ``runs`` pairs each ``config`` with its ``algorithm``. Only the online
+    producer takes more than one: it captures once for all of them.
     ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
     producer, so dependencies ``build_model_bundle`` needs fail at startup.
     """
+    cfg = runs[0].config
     if cfg.training.role not in ("producer", "consumer"):
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
         )
     try:
-        if cfg.mode == "offline":
-            return _build_offline(
-                cfg,
-                algorithm=algorithm,
-                build_model_bundle=build_model_bundle,
-                optimizer_factory=optimizer_factory,
-                logger=logger,
-                preflight_model_bundle=preflight_model_bundle,
-            )
-        return _build_online(
-            cfg,
-            algorithm=algorithm,
+        if cfg.mode == "online" and cfg.training.role == "producer":
+            return _build_online_producer(runs, prepare_prompts=prepare_prompts)
+        (run,) = runs
+        build = _build_offline if cfg.mode == "offline" else _build_online_consumer
+        return build(
+            run.config,
+            algorithm=run.algorithm,
             build_model_bundle=build_model_bundle,
-            prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
             logger=logger,
             preflight_model_bundle=preflight_model_bundle,
         )
     except BaseException as exc:
-        _publish_role_assembly_failure(cfg, exc)
+        _publish_role_assembly_failure(runs, exc)
         raise
 
 

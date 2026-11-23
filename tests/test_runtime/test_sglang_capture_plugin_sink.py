@@ -7,10 +7,12 @@ an ordinary device tensor.
 """
 
 import ctypes
+import dataclasses
 import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -35,15 +37,26 @@ sys.path.insert(
 from specforge_sglang_capture import _capture_internal_state  # noqa: E402
 from specforge_sglang_capture import sink  # noqa: E402
 
-from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
+from specforge.application import resolve_run
+from specforge.config import Config
+from specforge.inference.adapters.server_capture import (
+    ServerCaptureFailure,
+    SGLangServerCaptureAdapter,
+)
+from specforge.launch import build_disagg_online_producer
+from specforge.runtime.data_plane.drafter_channels import DrafterChannels
 from specforge.runtime.data_plane.mooncake_arena import (
     REF_METADATA_KEY,
     ArenaObjectClient,
 )
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+from specforge.training.capture_contract import ServerCaptureContract
+from specforge.training.disaggregated import build_disaggregated_run
 from tests.test_runtime.test_server_capture import (
-    _capture_schema,
-    _eagle3_contract,
+    HIDDEN,
+    _FakeMooncakeStore,
+    _output,
     _task,
 )
 
@@ -231,6 +244,80 @@ class SpecCaptureSinkTest(unittest.TestCase):
                 )
         self.assertIsNone(self.sink._nvlink)
 
+    def _two_outputs(self):
+        """Two drafters on one prompt: layers 1 and 9, and layers 5 and 9."""
+        return {
+            "store_id": "test",
+            "outputs": [
+                {
+                    "sample_id": "run-a:t0",
+                    "layer_ids": [1, 9],
+                    "features": {"aux": "hidden_states"},
+                    "passthrough": [
+                        {"name": "input_ids", "data": [5, 6, 7], "shape": [1, 3]}
+                    ],
+                },
+                {
+                    "sample_id": "run-b:t0",
+                    "layer_ids": [5, 9],
+                    "features": {"aux": "hidden_states", "last_hidden": "target"},
+                },
+            ],
+        }
+
+    def test_each_output_gets_its_own_layers_under_its_own_keys(self):
+        self.sink.aux_layer_ids = [1, 5, 9]
+        store = self.sink._store = _BufferStore()
+        aux = torch.arange(18, dtype=torch.float32).reshape(3, 6)  # width 2 a layer
+        last = -torch.ones(3, 2)
+        spec = self._two_outputs()
+        with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}, clear=True):
+            (result,) = self.sink.put_samples([(spec, aux, last)])
+
+        expected = {
+            "test/run-a:t0/g1/hidden_states": aux[:, [0, 1, 4, 5]],
+            "test/run-a:t0/g1/input_ids": torch.tensor([[5, 6, 7]]),
+            "test/run-b:t0/g1/hidden_states": aux[:, 2:],
+            "test/run-b:t0/g1/target": last,
+        }
+        self.assertEqual(
+            store.values,
+            {
+                key: value.contiguous().numpy().tobytes()
+                for key, value in expected.items()
+            },
+        )
+        self.assertEqual(result["sample_id"], "run-a:t0")
+        first, second = result["outputs"]
+        self.assertEqual(first["aux_layer_ids"], [1, 9])
+        self.assertEqual(second["aux_layer_ids"], [5, 9])
+        self.assertEqual(first["features"]["hidden_states"]["shape"], [1, 3, 4])
+        self.assertEqual(set(second["features"]), {"hidden_states", "target"})
+
+        # Cancelling the request reclaims every output's objects.
+        self.sink.discard_sample(spec).result(timeout=10)
+        self.assertEqual(store.values, {})
+
+    def test_an_output_that_cannot_be_cut_writes_nothing(self):
+        for captured, wanted in (
+            ([9, 1], [1]),
+            (None, [1]),
+            ([1, 9], [5]),
+            ([1, 9], [9, 1]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot cut layers"):
+                sink.wanted_layer_indices(captured, wanted)
+        self.assertEqual(sink.wanted_layer_indices([1, 5, 9], [1, 9]), [0, 2])
+
+        self.sink.aux_layer_ids = [1, 5, 9]
+        store = self.sink._store = _BufferStore()
+        spec = self._two_outputs()
+        spec["outputs"][1]["layer_ids"] = [7]
+        with mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, r"cannot cut layers \[7\]"):
+                self.sink.put_samples([(spec, torch.ones(3, 6), torch.ones(3, 2))])
+        self.assertEqual(store.values, {})
+
     def test_nvlink_never_connects_to_the_store(self):
         env = {"MOONCAKE_PROTOCOL": "nvlink", ARENA_BYTES: "4096"}
         with (
@@ -382,9 +469,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
         adapter = SGLangServerCaptureAdapter(
             "http://plugin:30000",
             store,
-            run_id="run0",
-            algorithm="eagle3",
-            schema=_capture_schema("eagle3"),
+            outputs=[_output("eagle3")],
             post_fn=post,
             server_capture="plugin",
         )
@@ -410,7 +495,7 @@ class SpecCaptureSinkTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_plugin_results_are_read_and_freed_by_current_arena_client(self):
         store, adapter, expected = self._plugin_client()
-        (ref,) = adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+        ((ref,),) = adapter.produce_refs([_task(0, 4)])
         locator = ref.metadata[REF_METADATA_KEY]
         self.assertEqual(locator["control"], self.sink.control_endpoint())
         self.assertEqual(set(locator["addresses"]), set(expected))
@@ -434,12 +519,260 @@ class SpecCaptureSinkTest(unittest.TestCase):
 
         adapter.post_fn = post_then_lose
         with self.assertRaisesRegex(TimeoutError, "response lost"):
-            adapter.produce_refs([_task(0, 4)], capture=_eagle3_contract())
+            adapter.produce_refs([_task(0, 4)])
         objects = len(self.sink._nvlink._objects)
         self.assertGreater(objects, 0)
         self.assertEqual(store.discard_external_attempts(), 1)
         self.assertEqual(_receive_frees(self.sink._nvlink, objects), objects)
         self.assertEqual(self.sink._nvlink.health()["free_bytes"], 1 << 20)
+
+
+class _SinkServerCase(unittest.TestCase):
+    """A capture server made of the real sink over a fake Mooncake store.
+
+    It captures layers 2, 5 and 8.
+    """
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"MOONCAKE_PROTOCOL": "tcp"}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        self.backend = _FakeMooncakeStore()
+        self.sink = sink.SpecCaptureSink([2, 5, 8])
+        self.sink._store = self.backend
+        self.addCleanup(self.sink._executor.shutdown)
+        self.store = MooncakeFeatureStore(store=self.backend, store_id="run0")
+
+    def _aux(self, length):
+        return torch.arange(length * 3 * HIDDEN, dtype=torch.float32).reshape(
+            length, 3 * HIDDEN
+        )
+
+    def _post(self, url, json_body, timeout):
+        rows = []
+        for ids, params in zip(json_body["input_ids"], json_body["sampling_params"]):
+            spec = json.loads(params["custom_params"]["spec_capture"])
+            last = torch.ones(len(ids), HIDDEN)
+            (result,) = self.sink.put_samples([(spec, self._aux(len(ids)), last)])
+            rows.append({"meta_info": {"spec_capture": [result]}})
+        return rows
+
+
+class SeveralOutputsTest(_SinkServerCase):
+    """The adapter against the real sink: one prefill, one sample per drafter.
+
+    The server captures layers 2, 5 and 8; dflash reads 2 and 8, dspark 5 and 8.
+    """
+
+    def _adapter(self, **dspark_capture):
+        dflash = _output("dflash", run_id="run-dflash", teacher_metrics=False)
+        dspark = _output("dspark", run_id="run-dspark")
+        outputs = [
+            dataclasses.replace(
+                dflash,
+                capture=dataclasses.replace(
+                    dflash.capture, aux_hidden_state_layer_ids=(2, 8)
+                ),
+            ),
+            dataclasses.replace(
+                dspark,
+                capture=dataclasses.replace(
+                    dspark.capture,
+                    aux_hidden_state_layer_ids=(5, 8),
+                    **dspark_capture,
+                ),
+            ),
+        ]
+        return SGLangServerCaptureAdapter(
+            "http://plugin:30000",
+            self.store,
+            outputs=outputs,
+            post_fn=self._post,
+        )
+
+    def _hidden_states(self, ref):
+        tensors, handle = self.store.get(ref)
+        self.addCleanup(self.store.release, handle)
+        return tensors["hidden_states"]
+
+    def test_each_drafter_reads_its_own_layers(self):
+        adapter = self._adapter()
+        ((dflash, dspark),) = adapter.produce_refs([_task(0, 4)])
+
+        self.assertEqual(
+            [(ref.sample_id, ref.run_id, ref.strategy) for ref in (dflash, dspark)],
+            [
+                ("run-dflash:t0", "run-dflash", "dflash"),
+                ("run-dspark:t0", "run-dspark", "dspark"),
+            ],
+        )
+        aux = self._aux(4)[None]
+        torch.testing.assert_close(
+            self._hidden_states(dflash),
+            torch.cat([aux[..., :HIDDEN], aux[..., 2 * HIDDEN :]], dim=-1),
+        )
+        torch.testing.assert_close(self._hidden_states(dspark), aux[..., HIDDEN:])
+        self.assertNotIn("target_last_hidden_states", dflash.feature_specs)
+        self.assertIn("target_last_hidden_states", dspark.feature_specs)
+
+    def test_one_producer_feeds_every_drafters_channel(self):
+        root = tempfile.mkdtemp(prefix="several_outputs_")
+        paths = {
+            run_id: os.path.join(root, run_id, "refs.jsonl")
+            for run_id in ("run-dflash", "run-dspark")
+        }
+        for path in paths.values():
+            StreamingRefChannel(path).publish_consumer_quantum(1)
+        prompts = [
+            {
+                "task_id": f"p{index}",
+                "payload": {"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 1, 1]},
+            }
+            for index in range(3)
+        ]
+        _workers, drive = build_disagg_online_producer(
+            strategy="dflash+dspark",
+            feature_source=self._adapter(),
+            prompts=prompts,
+            feature_store=self.store,
+            channel=DrafterChannels(
+                [(run_id, StreamingRefChannel(path)) for run_id, path in paths.items()]
+            ),
+            run_id="run",
+        )
+
+        self.assertEqual(drive(), 6)
+        tasks = None
+        for run_id, path in paths.items():
+            trainer = StreamingRefChannel(path)
+            refs = trainer.poll()
+            self.assertTrue(trainer.is_closed())
+            self.assertEqual({ref.run_id for ref in refs}, {run_id})
+            self.assertEqual(len(refs), 3)
+            tasks = tasks or [ref.source_task_id for ref in refs]
+            self.assertEqual([ref.source_task_id for ref in refs], tasks)
+
+    def test_one_bad_output_frees_every_output_of_the_prompt(self):
+        adapter = self._adapter(target_hidden_size=HIDDEN + 1)
+        (failure,) = adapter.produce_refs([_task(0, 4)])
+
+        self.assertIsInstance(failure, ServerCaptureFailure)
+        self.assertFalse(failure.retryable)
+        self.assertIn("run-dspark:t0", failure.reason)
+        self.assertEqual(self.backend._d, {})
+
+
+class ProducerForSeveralRunsTest(_SinkServerCase):
+    """The online producer assembled from two hand-written run configs."""
+
+    LAYERS = {"dflash": (2, 8), "dspark": (5, 8)}
+
+    def setUp(self):
+        super().setUp()
+        root = tempfile.mkdtemp(prefix="producer_runs_")
+        self.runs = tuple(
+            resolve_run(
+                Config.model_validate(
+                    {
+                        "run_id": f"run-{name}",
+                        "model": {"target_model_path": "target"},
+                        "draft": f"specforge/config/draft/presets/qwen3-8b-{name}.yaml",
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "training": {"role": "producer"},
+                        "deployment": {
+                            "mode": "disaggregated",
+                            "disaggregated": {
+                                "control_dir": os.path.join(root, name),
+                                "backend": "mooncake",
+                                "server_urls": ["http://plugin:30000"],
+                                "server_capture": "plugin",
+                            },
+                        },
+                    }
+                )
+            )
+            for name in self.LAYERS
+        )
+        self.paths = [os.path.join(root, name, "refs.jsonl") for name in self.LAYERS]
+
+        def contract(cfg, *, algorithm):
+            return ServerCaptureContract(
+                method="dflash",
+                aux_layer_ids=self.LAYERS[cfg.run_id.removeprefix("run-")],
+                target_hidden_size=HIDDEN,
+                target_vocab_size=32,
+                draft_vocab_size=32,
+            )
+
+        def adapter(*args, **kwargs):
+            return SGLangServerCaptureAdapter(*args, post_fn=self._post, **kwargs)
+
+        patches = (
+            mock.patch.dict(os.environ, {"DISAGG_PEER_WAIT_TIMEOUT": "30"}),
+            mock.patch(
+                "specforge.training.disaggregated._mooncake_store",
+                return_value=self.store,
+            ),
+            mock.patch("specforge.training.assembly._load_input_tools"),
+            mock.patch("specforge.training.model_loading.resolve_draft_config"),
+            mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                side_effect=contract,
+            ),
+            mock.patch(
+                "specforge.inference.adapters.server_capture."
+                "SGLangServerCaptureAdapter",
+                side_effect=adapter,
+            ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _build(self, prepare_prompts):
+        return build_disaggregated_run(
+            self.runs,
+            build_model_bundle=mock.Mock(),
+            prepare_prompts=prepare_prompts,
+            optimizer_factory=mock.Mock(),
+            logger=mock.Mock(),
+        )
+
+    def test_one_producer_feeds_and_cleans_every_run(self):
+        prompts = [
+            {
+                "task_id": f"p{index}",
+                "payload": {"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 1, 1]},
+            }
+            for index in range(5)
+        ]
+        run = self._build(lambda *args, **kwargs: prompts)
+        for path in self.paths:
+            with open(path + ".schedule.json", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["num_prompts"], 5)
+
+        def train(path):
+            """A trainer that reads every ref and frees nothing."""
+            reader = StreamingRefChannel(path)
+            reader.publish_consumer_quantum(1)
+            while not reader.is_closed() or reader.poll():
+                time.sleep(0.001)
+            reader.mark_consumer_done()
+
+        for path in self.paths:
+            threading.Thread(target=train, args=(path,), daemon=True).start()
+        self.assertEqual(run.run(), 10)
+
+        for path in self.paths:
+            self.assertEqual(len(StreamingRefChannel(path).poll()), 5)
+        self.assertEqual(self.backend._d, {})
+
+    def test_a_producer_that_fails_to_start_tells_every_run(self):
+        with self.assertRaisesRegex(RuntimeError, "no data"):
+            self._build(mock.Mock(side_effect=RuntimeError("no data")))
+        for path in self.paths:
+            with open(path + ".failed", encoding="utf-8") as stream:
+                self.assertIn("RuntimeError: no data", stream.read())
 
 
 class NvlinkArenaTest(unittest.TestCase):
