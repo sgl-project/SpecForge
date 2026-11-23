@@ -5,7 +5,10 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from specforge.modeling.draft.layers.attention.masks import AttentionLayout
+from specforge.modeling.draft.layers.attention.masks import (
+    AttentionLayout,
+    ContextBlocks,
+)
 from specforge.modeling.draft.layers.inputs import LayerInputs
 
 
@@ -122,7 +125,6 @@ def prepare_blocks(
     anchors, keep = sample_anchors(
         valid, num_anchors, None if capacity is None else capacity.numel()
     )
-    count = anchors.shape[1]
     spec, size = config.spec_config, config.spec_config.protocol.num_model_slots
     slots = torch.arange(size, device=ids.device)
     positions = anchors[..., None] + input_offset + slots
@@ -148,26 +150,18 @@ def prepare_blocks(
     query = positions.flatten(1)
     context = torch.arange(ids.shape[1], device=ids.device).expand(ids.shape[0], -1)
     keys = torch.cat((context, query), dim=1)
-    context_visible = (
-        context[:, None, None, :]
-        < (anchors + input_offset + context_offset)[..., None, None]
-    )
     padding = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.bool))
-    context_visible = context_visible & padding[:, None, None, :].bool()
-    context_visible = context_visible.expand(-1, -1, size, -1).reshape(
-        ids.shape[0], -1, ids.shape[1]
-    )
-    block_ids = torch.arange(count, device=ids.device).repeat_interleave(size)
-    draft_visible = (block_ids[:, None] == block_ids[None, :]).expand(
-        ids.shape[0], -1, -1
-    )
-    visible = torch.cat((context_visible, draft_visible), dim=-1)
-    visible &= keep.repeat_interleave(size, dim=1)[..., None]
     layout = AttentionLayout(
         query_positions=query,
         key_positions=keys,
-        visibility=visible[:, None],
-        active_queries=keep.repeat_interleave(size, dim=1),
+        context_blocks=ContextBlocks(
+            block_size=size,
+            context_lengths=(anchors + input_offset + context_offset).clamp(
+                0, ids.shape[1]
+            ),
+            context_valid=padding.bool(),
+            active_blocks=keep,
+        ),
     )
     entries = tuple(
         LayerInputs(position_ids=keys, attention_layout=layout)

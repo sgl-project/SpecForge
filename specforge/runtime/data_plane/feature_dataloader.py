@@ -83,8 +83,10 @@ class _QueuePrefetchState:
             self.fetches[future] = list(refs)
 
     def claim_for_yield(self, future: Any) -> Optional[List[SampleRef]]:
-        """Transfer a completed fetch and its refs to the consumer."""
+        """Transfer a completed fetch unless shutdown has stopped ownership transfers."""
         with self.fetches_lock:
+            if self.stop.is_set():
+                return None
             refs = self.fetches.pop(future, None)
             if refs is None:
                 return None
@@ -589,7 +591,8 @@ class FeatureDataLoader:
         with state.shutdown_lock:
             if state.shutdown_complete:
                 return
-            state.stop.set()
+            with state.fetches_lock:
+                state.stop.set()
             worker = state.thread
             if worker is not None and worker is not threading.current_thread():
                 worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)

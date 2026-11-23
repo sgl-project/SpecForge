@@ -33,7 +33,12 @@ from typing import Iterator, Optional, Sequence
 
 import click
 
-from specforge.config import Config, load_config
+from specforge.plugins import load_plugins
+
+# Activate platform plugins before importing the CLI configuration and training code.
+load_plugins()
+
+from specforge.config import Config, load_config  # noqa: E402
 
 
 class _WorkerTermination(BaseException):
