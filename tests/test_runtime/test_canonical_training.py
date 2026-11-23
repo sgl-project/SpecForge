@@ -650,7 +650,11 @@ class CanonicalTrainingTest(unittest.TestCase):
         reduce.assert_not_called()
 
     def test_dspine_replay_ratio_is_formed_before_a_wrapper_casts(self):
-        """Under FSDP's mixed precision the forward's inputs are cast on the way in."""
+        """A wrapper that casts the forward's inputs rounds the ratio, not its sums.
+
+        FSDP's mixed precision did cast them until the backend turned the root
+        cast off; ``test_fsdp_hands_the_program_its_inputs_uncast`` checks that.
+        """
         from unittest.mock import Mock
 
         from specforge.algorithms.objectives import build_objective_model
@@ -707,11 +711,93 @@ class CanonicalTrainingTest(unittest.TestCase):
         prepass, replay = (
             call.kwargs["alignment_ce"] for call in runtime.objective.call_args_list
         )
-        # Both pass through the wrapper, as every argument of the forward does.
+        # Both pass through the casting wrapper.
         self.assertEqual((prepass.item(), prepass.dtype), (0.0, torch.bfloat16))
         self.assertEqual(replay.dtype, torch.bfloat16)
         # 768 / 257 in fp32, then cast; the cast sums would give exactly 3.
         self.assertEqual(replay.item(), 2.984375)
+
+    def test_fsdp_hands_the_program_its_inputs_uncast(self):
+        """The sharding wrapper casts parameters for compute, not the program's tensors."""
+        from unittest.mock import Mock
+
+        import torch.distributed as dist
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        from specforge.algorithms.objectives import build_objective_model
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.frame import run_window
+        from specforge.training.program import program_spec
+        from specforge.training.runner import DataParallelRunner
+        from tests.test_modeling.test_canonical_dspine import initialized_model
+
+        if not (dist.is_available() and dist.is_gloo_available()):
+            self.skipTest("needs gloo")
+        original = FullyShardedDataParallel.__init__
+
+        def on_host(self, module, *args, **kwargs):
+            kwargs.setdefault("device_id", torch.device("cpu"))
+            original(self, module, *args, **kwargs)
+
+        class Runner(DataParallelRunner):
+            def reduce_sum(self, values):
+                # Sums whose ratio is not the ratio of their bfloat16 values.
+                return torch.tensor([768.0, 257.0]) if values.numel() == 2 else values
+
+        with TemporaryDirectory() as directory:
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{Path(directory) / 'store'}",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                model = initialized_model(dtype=torch.bfloat16)
+                head = torch.nn.Linear(32, 64, bias=False, dtype=torch.bfloat16)
+                runtime = build_objective_model(
+                    model,
+                    options={"num_anchors": 2, "alignment_warmup_steps": 0},
+                    target_head=head,
+                    frozen_modules=[model.embed_tokens, model.lm_head, head],
+                )
+                spec = program_spec(runtime)
+                backend = FSDPTrainingBackend(
+                    ParallelConfig(
+                        sharding_strategy="SHARD_GRAD_OP",
+                        fsdp_process_group=dist.group.WORLD,
+                    ),
+                    optimizer_factory=lambda module: torch.optim.SGD(
+                        module.parameters(), lr=0.0
+                    ),
+                )
+                with patch.object(FullyShardedDataParallel, "__init__", on_host):
+                    wrapped = backend.prepare_model(
+                        runtime,
+                        optimizer_target=runtime.draft_model,
+                        frozen=runtime.frozen,
+                        blocks=spec.partition.blocks,
+                    )
+                features = []
+                runtime.draft_model.register_forward_pre_hook(
+                    lambda _module, args: features.append(args[1].dtype)
+                )
+                runtime.objective = Mock(wraps=runtime.objective)
+                batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
+                run_window(
+                    Runner(wrapped, backend, spec),
+                    [batch],
+                    StepContext(global_step=1, total_steps=10),
+                )
+            finally:
+                dist.destroy_process_group()
+        replay = runtime.objective.call_args_list[-1].kwargs["alignment_ce"]
+        self.assertEqual(replay.dtype, torch.float32)
+        self.assertEqual(
+            replay.item(), (torch.tensor(768.0) / torch.tensor(257.0)).item()
+        )
+        # The draft still computes in bfloat16: the program casts its features.
+        self.assertTrue(features)
+        self.assertEqual(set(features), {torch.bfloat16})
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""

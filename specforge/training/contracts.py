@@ -146,9 +146,9 @@ class TrainingProgram(Protocol):
 
         For a prepass, a replay (``replay_values`` holds the pooled sums) and
         any other call (it is empty). Any arithmetic on the pooled sums, a
-        ratio and its zero guard for one, is done here, outside the wrapper:
-        a wrapper may cast what passes through its forward. Empty for a
-        program without a statistic.
+        ratio and its zero guard for one, is done here in the precision the
+        sums were pooled in, outside the wrapper. Empty for a program without
+        a statistic.
         """
 
     def host_inputs(
