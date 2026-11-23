@@ -35,6 +35,23 @@ def uneven_batch():
     return inputs
 
 
+def per_microbatch_objective(model, batch, width, ctx):
+    """Normalize refinement locally, with one detached alignment CE per window."""
+    size = batch["input_ids"].shape[0]
+    parts = [
+        {key: value[start : start + width] for key, value in batch.items()}
+        for start in range(0, size, width)
+    ]
+    step = dict(step=ctx.global_step, total_steps=ctx.total_steps)
+    with torch.no_grad():
+        pairs = [model(part, **step).ratios["dspine/backbone_ce"] for part in parts]
+        window_ce = sum(n for n, _ in pairs) / sum(d for _, d in pairs)
+    return (
+        sum(model(part, alignment_ce=window_ce, **step).numerator for part in parts)
+        / size
+    )
+
+
 def combined_batch(accumulation_steps):
     batches = [uneven_batch() for _ in range(accumulation_steps)]
     return {name: torch.cat([batch[name] for batch in batches]) for name in batches[0]}
@@ -172,9 +189,12 @@ class DSpineDistributedTest(unittest.TestCase):
                             fixed_anchors,
                         )
                     )
-                    loss = model(
-                        combined_batch(accumulation_steps), step=300, total_steps=600
-                    ).loss
+                    loss = per_microbatch_objective(
+                        model,
+                        combined_batch(accumulation_steps),
+                        1,
+                        StepContext(global_step=300, total_steps=600),
+                    )
                     loss.backward()
                     expected = {
                         name: parameter.grad
