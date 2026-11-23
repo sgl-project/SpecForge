@@ -142,9 +142,10 @@ or `{sample_id, error}`. Objects are stored at
 
 ## Prefix reuse
 
-For a fixed text target, set
-`deployment.disaggregated.server_capture_prefix_cache` to `true` to enable
-reuse, `false` to disable it (the default), or `auto` to decide at startup.
+For a fixed text target,
+`deployment.disaggregated.server_capture_prefix_cache` defaults to `auto`,
+which decides at startup. Set it to `true` to enable reuse or `false` to
+disable it explicitly.
 Give each capture server a positive `SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` budget.
 Leave SGLang's radix cache enabled and reserve this device memory below
 `--mem-fraction-static`. The budget is per writer. Each producer adapter uses

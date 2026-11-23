@@ -693,7 +693,7 @@ def _build_online(
         deployment = cfg.deployment.disaggregated
         server_urls = _server_urls(cfg)
         prompt_seed = _online_prompt_seed(cfg)
-        prefix_mode = deployment.server_capture_prefix_cache if deployment else False
+        prefix_mode = deployment.server_capture_prefix_cache if deployment else "auto"
         prefix_flags = [prefix_mode is True] * len(server_urls)
         if prefix_mode == "auto" and input_adapter is None:
             from specforge.inference.prefix_cache import auto_prefix_cache_modes
