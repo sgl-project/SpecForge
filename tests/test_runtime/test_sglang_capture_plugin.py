@@ -517,70 +517,72 @@ class _MatchParams:
     req: object
 
 
-def test_radix_match_shortens_an_uncovered_kv_hit_before_forward():
-    hidden = prefix_cache.HiddenPrefixCache(4096, 2, is_writer=False)
-    hidden.slots = {10: 0}
-    tree = SimpleNamespace(
-        _spec_capture_hidden=hidden,
-        path_device_indices=lambda node: torch.tensor([10, 11, 20, 21][:node]),
-    )
-    req = _req("match", 5, dict(_spec("match"), reuse_prefix=True))
+class TestRadixPrefixCache(unittest.TestCase):
+    def test_radix_match_shortens_an_uncovered_kv_hit_before_forward(self):
+        hidden = prefix_cache.HiddenPrefixCache(4096, 2, is_writer=False)
+        hidden.slots = {10: 0}
+        tree = SimpleNamespace(
+            _spec_capture_hidden=hidden,
+            path_device_indices=lambda node: torch.tensor([10, 11, 20, 21][:node]),
+        )
+        req = _req("match", 5, dict(_spec("match"), reuse_prefix=True))
 
-    def native_match(tree, params):
-        length = len(params.key)
-        return SimpleNamespace(device_prefix_len=length, last_device_node=length)
+        def native_match(tree, params):
+            length = len(params.key)
+            return SimpleNamespace(device_prefix_len=length, last_device_node=length)
 
-    params = _MatchParams((1, 2, 3, 4), req)
-    result = prefix_cache.match_prefix(native_match, tree, params)
-    assert result.device_prefix_len == 2
-    assert req._spec_capture_kv_page_heads == [10]
-    hidden.release(torch.tensor([10, 11]))
-    assert prefix_cache.match_prefix(native_match, tree, params).device_prefix_len == 0
-
-
-def test_hidden_budget_requests_kv_eviction_before_publishing_more_pages():
-    hidden = prefix_cache.HiddenPrefixCache(128, 2, is_writer=False)
-    old_req = _req("old", 5, dict(_spec("old"), reuse_prefix=True))
-    logits = _logits_output(5)
-    tensors = (logits.hidden_states, logits.last_hidden_states)
-    hidden.stage(old_req, 0, 5, tensors, copy=False)
-    hidden.insert([10, 20], old_req._spec_capture_pending_hidden)
-    req = _req("new", 7, dict(_spec("new"), reuse_prefix=True))
-    req.kv = SimpleNamespace(cache_protected_len=0, req_pool_idx=0)
-    logits = _logits_output(7)
-    hidden.stage(
-        req, 0, 7, (logits.hidden_states, logits.last_hidden_states), copy=False
-    )
-    evicted = []
-
-    def evict(params, *, allocation_reclaim_satisfied):
-        evicted.append(params.num_tokens)
-        # The first victim is a KV-only page, and another request pins page 20.
-        hidden.release(torch.tensor([90, 91]))
-        assert not allocation_reclaim_satisfied()
+        params = _MatchParams((1, 2, 3, 4), req)
+        result = prefix_cache.match_prefix(native_match, tree, params)
+        self.assertEqual(result.device_prefix_len, 2)
+        self.assertEqual(req._spec_capture_kv_page_heads, [10])
         hidden.release(torch.tensor([10, 11]))
-        assert not allocation_reclaim_satisfied()
+        self.assertEqual(
+            prefix_cache.match_prefix(native_match, tree, params).device_prefix_len, 0
+        )
 
-    tree = SimpleNamespace(
-        _spec_capture_hidden=hidden,
-        evict_for_alloc=evict,
-        full_evictable_size=lambda: 4,
-        req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.tensor([[30, 31, 40, 41, 50, 51, 60]])
-        ),
-    )
+    def test_hidden_budget_requests_kv_eviction_before_publishing_more_pages(self):
+        hidden = prefix_cache.HiddenPrefixCache(128, 2, is_writer=False)
+        old_req = _req("old", 5, dict(_spec("old"), reuse_prefix=True))
+        logits = _logits_output(5)
+        tensors = (logits.hidden_states, logits.last_hidden_states)
+        hidden.stage(old_req, 0, 5, tensors, copy=False)
+        hidden.insert([10, 20], old_req._spec_capture_pending_hidden)
+        req = _req("new", 7, dict(_spec("new"), reuse_prefix=True))
+        req.kv = SimpleNamespace(cache_protected_len=0, req_pool_idx=0)
+        logits = _logits_output(7)
+        hidden.stage(
+            req, 0, 7, (logits.hidden_states, logits.last_hidden_states), copy=False
+        )
+        evicted = []
 
-    def publish(tree, req, *, up_to):
-        assert up_to == 2
-        req.kv.cache_protected_len = up_to
+        def evict(params, *, allocation_reclaim_satisfied):
+            evicted.append(params.num_tokens)
+            # The first victim is a KV-only page, and another request pins page 20.
+            hidden.release(torch.tensor([90, 91]))
+            self.assertFalse(allocation_reclaim_satisfied())
+            hidden.release(torch.tensor([10, 11]))
+            self.assertFalse(allocation_reclaim_satisfied())
 
-    base_cache = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
-    base_cache.EvictParams = SimpleNamespace
-    with mock.patch.dict(sys.modules, {base_cache.__name__: base_cache}):
-        prefix_cache.checkpoint(publish, tree, req, up_to=7)
-    assert evicted == [4]
-    assert set(hidden.slots) == {20, 30}
-    assert req._spec_capture_pending_hidden is None
+        tree = SimpleNamespace(
+            _spec_capture_hidden=hidden,
+            evict_for_alloc=evict,
+            full_evictable_size=lambda: 4,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[30, 31, 40, 41, 50, 51, 60]])
+            ),
+        )
+
+        def publish(tree, req, *, up_to):
+            self.assertEqual(up_to, 2)
+            req.kv.cache_protected_len = up_to
+
+        base_cache = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
+        base_cache.EvictParams = SimpleNamespace
+        with mock.patch.dict(sys.modules, {base_cache.__name__: base_cache}):
+            prefix_cache.checkpoint(publish, tree, req, up_to=7)
+        self.assertEqual(evicted, [4])
+        self.assertEqual(set(hidden.slots), {20, 30})
+        self.assertIsNone(req._spec_capture_pending_hidden)
 
 
 class _UnifiedRadixCache:
