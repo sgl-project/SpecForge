@@ -259,6 +259,9 @@ class FSDPTrainingBackend(TrainingBackend):
                     mixed_precision=MixedPrecision(
                         param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
                         buffer_dtype=torch.float32,
+                        # The program casts what it computes with; the wrapper
+                        # leaves its inputs as the runner placed them, as DDP does.
+                        cast_root_forward_inputs=False,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
