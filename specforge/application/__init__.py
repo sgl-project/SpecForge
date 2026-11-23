@@ -7,6 +7,7 @@ from specforge.application.composition import (
     build_application_run,
     resolve_offline_capture,
     resolve_run,
+    resolve_runs,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "build_application_run",
     "resolve_offline_capture",
     "resolve_run",
+    "resolve_runs",
 ]

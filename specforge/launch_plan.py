@@ -842,6 +842,7 @@ def _worker_argv(
     config_path: str,
     role: Literal["all", "producer", "consumer"],
     overrides: Sequence[str],
+    drafter: Optional[str] = None,
 ) -> list[str]:
     return [
         *command_prefix,
@@ -850,6 +851,7 @@ def _worker_argv(
         config_path,
         "--role",
         role,
+        *(("--drafter", drafter) if drafter is not None else ()),
         *overrides,
     ]
 
@@ -865,9 +867,10 @@ def _trainer_command(
     distributed_entry: Sequence[str],
     node_rank: Optional[int],
     env: Mapping[str, str],
+    drafter: Optional[str] = None,
 ) -> CommandSpec:
     topology = cfg.deployment.trainer
-    worker = _worker_argv(worker_prefix, config_path, role, overrides)
+    worker = _worker_argv(worker_prefix, config_path, role, overrides, drafter)
     world_size = topology.nnodes * topology.nproc_per_node
     cfg.validate_world_size(world_size)
     if world_size == 1:
@@ -975,6 +978,7 @@ def build_launch_plan(
     overrides: Sequence[str] = (),
     requested_role: LaunchRole = "auto",
     node_rank: Optional[int] = None,
+    drafter: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
     worker_prefix: Optional[Sequence[str]] = None,
     torchrun_prefix: Optional[Sequence[str]] = None,
@@ -984,6 +988,9 @@ def build_launch_plan(
     ] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan.
+
+    *drafter* names the drafter this trainer runs, so the workers it starts
+    pick the same one.
 
     A managed-local stack on RDMA reads the host's HCAs from sysfs;
     *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
@@ -1139,6 +1146,7 @@ def build_launch_plan(
             distributed_entry=distributed_entry,
             node_rank=resolved_rank,
             env=consumer_env,
+            drafter=drafter,
         )
         if command.argv[: len(worker_prefix)] == worker_prefix:
             return LaunchPlan("worker", role, worker_env=consumer_env)

@@ -274,16 +274,21 @@ class TestResolveRun(unittest.TestCase):
 
         self.assertEqual(resolve.call_args.args[0], _flat(recipe)["dflash"])
 
-    def test_several_drafters_are_refused_before_resolving(self):
-        from specforge.application import resolve_run
+    def test_several_drafters_resolve_into_one_run_each(self):
+        from specforge.application import resolve_runs
 
-        with (
-            mock.patch("specforge.training.canonical.resolve_run") as resolve,
-            self.assertRaisesRegex(ValueError, "several drafters"),
+        cfg = Config.model_validate(_recipe(managed=False))
+        self.assertEqual(
+            [run.config.run_id for run in resolve_runs(cfg)],
+            ["qwen3-dflash", "qwen3-dspark"],
+        )
+        (dspark,) = resolve_runs(cfg, drafter="dspark")
+        self.assertEqual(dspark.config.run_id, "qwen3-dspark")
+        self.assertEqual(dspark.algorithm.name, "dspark")
+        with self.assertRaisesRegex(
+            ValueError, r"unknown drafter 'eagle'.*\['dflash', 'dspark'\]"
         ):
-            resolve_run(Config.model_validate(_recipe()))
-
-        resolve.assert_not_called()
+            resolve_runs(cfg, drafter="eagle")
 
 
 if __name__ == "__main__":

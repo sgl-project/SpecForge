@@ -54,9 +54,12 @@ the capture server.
 
 Each entry is a plain single-draft run. With `drafters`, set `draft`,
 `initialization` and the trainer on each drafter, not at the top level; `model`,
-`data`, `runtime` and the capture servers are shared. `specforge train` does not
-train several drafters at once yet; a recipe with one drafter runs as that
-drafter's single-draft run.
+`data`, `runtime` and the capture servers are shared. One `specforge train`
+command cannot start several drafters yet, so a `managed_local` stack cannot
+run them. Start the producer with `--role producer` and each trainer with
+`--role consumer --drafter <name>`, against capture servers that capture every
+drafter's layers. A recipe with one drafter runs as that drafter's single-draft
+run.
 
 | Field | Default | What to write |
 | --- | --- | --- |
