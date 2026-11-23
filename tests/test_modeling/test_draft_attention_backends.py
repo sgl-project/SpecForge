@@ -107,6 +107,24 @@ class TestAttentionBackends(unittest.TestCase):
     def test_flex(self):
         check_backend("flex_attention")
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA FlexAttention")
+    def test_compiled_tensor_visibility_with_partial_key_block(self):
+        keys = torch.arange(257, device="cuda").expand(2, -1)
+        layout = AttentionLayout(
+            query_positions=keys[:, -128:],
+            key_positions=keys,
+            visibility=torch.ones(2, 1, 128, 257, device="cuda", dtype=torch.bool),
+            active_queries=torch.ones(2, 128, device="cuda", dtype=torch.bool),
+        )
+        mask, _ = FlexAttentionBackend().prepare(
+            layout, batch_size=2, num_heads=32, is_causal=True, sliding_window=None
+        )
+        # Only the last real query can see key 256; padded indices stay invisible.
+        q = keys.new_tensor([126, 127, 127, 128])
+        k = keys.new_tensor([256, 256, 257, 0])
+        visible = mask.mask_mod(keys.new_tensor(0), keys.new_tensor(0), q, k)
+        self.assertEqual(visible.tolist(), [False, True, False, False])
+
     def test_eager_reuses_empty_rows(self):
         with AttentionPreparationScope() as scope:
             attention = scope.prepare(
