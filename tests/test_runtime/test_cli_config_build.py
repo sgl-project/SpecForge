@@ -62,7 +62,7 @@ class TestCliConfigBuild(unittest.TestCase):
             yaml.safe_dump(run_config, f)
 
         cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
-        run = build_application_run(resolve_run(cfg))
+        run = build_application_run((resolve_run(cfg),))
         trainer = run.trainer
 
         # package-level assembly is the single wiring the CLI executes
@@ -110,7 +110,7 @@ class TestCliDispatch(unittest.TestCase):
             self.assertEqual(main(["train", "--config", "run.yaml"]), 0)
         load.assert_called_once_with("run.yaml", [])
         train.assert_called_once()
-        resolved = train.call_args.args[0]
+        (resolved,) = train.call_args.args[0]
         self.assertIsInstance(resolved, ResolvedRun)
         self.assertEqual(resolved.config.draft, cfg.draft)
         self.assertEqual(resolved.algorithm.name, "dflash")

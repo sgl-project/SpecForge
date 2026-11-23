@@ -54,9 +54,23 @@ the capture server.
 
 Each entry is a plain single-draft run. With `drafters`, set `draft`,
 `initialization` and the trainer on each drafter, not at the top level; `model`,
-`data`, `runtime` and the capture servers are shared. `specforge train` does not
-train several drafters at once yet; a recipe with one drafter runs as that
-drafter's single-draft run.
+`data`, `runtime` and the capture servers are shared. On a `managed_local`
+stack one `specforge train` command starts the producer and one trainer per
+drafter. Without one, start the producer with `--role producer` and each
+trainer with `--role consumer --drafter NAME`, and launch the capture servers
+with every drafter's layers (a `managed_local` stack does that itself). A
+recipe with one drafter runs as that drafter's single-draft run.
+
+```yaml
+drafters:
+  - name: dflash
+    draft: specforge/config/draft/presets/qwen3-8b-dflash.yaml
+    training: {learning_rate: 5.0e-4}
+    trainer: {cuda_visible_devices: ["1", "2"]}
+  - name: dspark
+    draft: specforge/config/draft/presets/qwen3-8b-dspark.yaml
+    trainer: {cuda_visible_devices: ["3"]}
+```
 
 | Field | Default | What to write |
 | --- | --- | --- |

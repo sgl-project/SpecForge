@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from specforge.application import ResolvedRun
 from specforge.cli import _config_for_role, main
-from specforge.config import Config, apply_overrides
+from specforge.config import Config, apply_overrides, flatten_drafters
 from specforge.config.draft.codec import encode_config
 from specforge.launch_plan import (
     _SERVER_CAPTURE_REQUIREMENTS,
@@ -185,19 +185,32 @@ CAPTURE_CONTRACT = ServerCaptureContract(
 )
 
 
+def _drafters_config(control_dir, *, managed=True):
+    """Drafters ``dflash`` and ``dspark`` on one capture stack."""
+    raw = _managed_config(control_dir).model_dump()
+    draft = raw.pop("draft")
+    del raw["deployment"]["trainer"]
+    disaggregated = raw["deployment"]["disaggregated"]
+    del disaggregated["managed_local"]["trainer_cuda_visible_devices"]
+    devices = {"dflash": ["4", "5"], "dspark": ["6"]}
+    if not managed:
+        disaggregated.update(managed_local=None, server_urls=["http://capture:30000"])
+        devices = {"dflash": None, "dspark": None}
+    raw["drafters"] = [
+        {
+            "name": name,
+            "draft": draft,
+            "trainer": {"cuda_visible_devices": drafter_devices},
+        }
+        for name, drafter_devices in devices.items()
+    ]
+    return Config.model_validate(raw)
+
+
 def _drafter_runs(cfg):
-    """Runs ``dflash`` and ``dspark`` on the managed stack of *cfg*."""
-    runs = []
-    for name, devices in (("dflash", ["4", "5"]), ("dspark", ["6"])):
-        raw = cfg.model_dump()
-        raw["run_id"] = f"{cfg.run_id}-{name}"
-        raw["deployment"]["trainer"]["nproc_per_node"] = len(devices)
-        disaggregated = raw["deployment"]["disaggregated"]
-        disaggregated["control_dir"] = os.path.join(disaggregated["control_dir"], name)
-        disaggregated["store_id"] = cfg.run_id
-        disaggregated["managed_local"]["trainer_cuda_visible_devices"] = devices
-        runs.append(ResolvedRun(Config.model_validate(raw), ALGORITHM))
-    return tuple(runs)
+    return tuple(
+        ResolvedRun(run_cfg, ALGORITHM, name) for name, run_cfg in flatten_drafters(cfg)
+    )
 
 
 DRAFTER_CONTRACTS = {
@@ -888,11 +901,29 @@ class LaunchPlanTest(unittest.TestCase):
         )
         self.assertEqual((consumer.kind, consumer.role), ("command", "consumer"))
         self.assertIn("--nproc_per_node", consumer.commands[0].argv)
+        self.assertNotIn("--drafter", consumer.commands[0].argv)
+
+    def test_a_multi_rank_trainer_passes_drafter_to_its_workers(self):
+        cfg = _config(mode="disaggregated", nproc=4)
+        consumer = build_launch_plan(
+            cfg,
+            runs=(ResolvedRun(cfg, ALGORITHM, "dspark"),),
+            config_path="run.yaml",
+            requested_role="consumer",
+            worker_prefix=("specforge",),
+            torchrun_prefix=("torchrun",),
+            env=MOONCAKE_ENV,
+        )
+        argv = consumer.commands[0].argv
+        self.assertEqual(
+            argv[argv.index("--role") : argv.index("--role") + 4],
+            ("--role", "consumer", "--drafter", "dspark"),
+        )
 
     def test_a_managed_local_stack_starts_one_trainer_per_drafter(self):
         with tempfile.TemporaryDirectory() as root:
             control_dir = os.path.join(root, "attempt")
-            cfg = _managed_config(control_dir)
+            cfg = _drafters_config(control_dir)
             runs = _drafter_runs(cfg)
             with mock.patch(
                 "specforge.training.capture_contract.resolve_server_capture_contract",
@@ -945,6 +976,8 @@ class LaunchPlanTest(unittest.TestCase):
                 "run.yaml",
                 "--role",
                 "consumer",
+                "--drafter",
+                "dflash",
             ),
         )
         self.assertEqual(
@@ -956,6 +989,8 @@ class LaunchPlanTest(unittest.TestCase):
                 "run.yaml",
                 "--role",
                 "consumer",
+                "--drafter",
+                "dspark",
             ),
         )
         for trainer, name, devices in (
@@ -984,6 +1019,30 @@ class LaunchPlanTest(unittest.TestCase):
             children[1].worker_env["DISAGG_REF_CHANNEL"],
             os.path.join(control_dir, "dspark", "refs.jsonl"),
         )
+
+    def test_one_command_starts_several_drafters_only_on_a_managed_local_stack(self):
+        cfg = _drafters_config("/shared/attempt-1", managed=False)
+        runs = _drafter_runs(cfg)
+        for role in ("auto", "both", "consumer"):
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(ValueError, "--role consumer --drafter NAME"),
+            ):
+                build_launch_plan(
+                    cfg,
+                    runs=runs,
+                    config_path="run.yaml",
+                    requested_role=role,
+                    env=MOONCAKE_ENV,
+                )
+        producer = build_launch_plan(
+            cfg,
+            runs=runs,
+            config_path="run.yaml",
+            requested_role="producer",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual((producer.kind, producer.role), ("worker", "producer"))
 
     def test_managed_local_schema_round_trips_and_validates_resources(self):
         cfg = _managed_config("/fresh/managed-attempt")
@@ -2434,7 +2493,7 @@ class LaunchPlanTest(unittest.TestCase):
                     0,
                 )
 
-            projected = train.call_args.args[0]
+            (projected,) = train.call_args.args[0]
             self.assertEqual(projected.config.training.role, "producer")
             self.assertEqual(
                 projected.config.deployment.disaggregated.consumer_state_dir,

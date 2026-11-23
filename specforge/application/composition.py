@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, replace
+from typing import Callable, Sequence
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration, AlgorithmRegistry
@@ -12,10 +12,14 @@ from specforge.config import Config, flatten_drafters
 
 @dataclass(frozen=True)
 class ResolvedRun:
-    """A validated config paired with its one algorithm registration."""
+    """A validated config paired with its one algorithm registration.
+
+    *name* is the drafter this run trains; a config without ``drafters`` has none.
+    """
 
     config: Config
     algorithm: AlgorithmRegistration
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,17 +54,43 @@ def resolve_run(
     A config with one drafter resolves as that drafter's single-draft config.
     """
 
-    from specforge.training.canonical import resolve_run as resolve_canonical_run
-
     if registry is not None:
         raise ValueError(
             "Register canonical objectives instead of a combined algorithm registry"
         )
-    runs = flatten_drafters(cfg)
+    runs = resolve_runs(cfg, target_config=target_config)
     if len(runs) > 1:
-        raise ValueError("training several drafters at once is not supported yet")
-    cfg, algorithm = resolve_canonical_run(runs[0][1], target_config=target_config)
-    return bind_run(cfg, algorithm)
+        raise ValueError(
+            "resolve_run takes one run; use resolve_runs for several drafters"
+        )
+    return runs[0]
+
+
+def resolve_runs(
+    cfg: Config,
+    *,
+    drafter: str | None = None,
+    target_config=None,
+) -> tuple[ResolvedRun, ...]:
+    """Resolve every run of a config: one per drafter, or the config itself.
+
+    *drafter* keeps only that drafter's run, for the process that trains it.
+    """
+
+    from specforge.training.canonical import resolve_run as resolve_canonical_run
+
+    named_configs = flatten_drafters(cfg)
+    if drafter is not None:
+        names = [name for name, _ in named_configs if name is not None]
+        if drafter not in names:
+            raise ValueError(f"unknown drafter {drafter!r}; this recipe has {names}")
+    runs = []
+    for name, run_cfg in named_configs:
+        if drafter is not None and name != drafter:
+            continue
+        run_cfg, algorithm = resolve_canonical_run(run_cfg, target_config=target_config)
+        runs.append(replace(bind_run(run_cfg, algorithm), name=name))
+    return tuple(runs)
 
 
 def resolve_offline_capture(
@@ -135,21 +165,22 @@ def resolve_offline_capture(
 
 
 def build_application_run(
-    run: Config | ResolvedRun,
+    runs: Config | Sequence[ResolvedRun],
     registry: AlgorithmRegistry | None = None,
 ):
-    """Build one executable run from the public config contract."""
+    """Build one executable process from the public config contract.
+
+    *runs* is a config, or the resolved runs this process serves.
+    """
 
     from specforge.training.model_loading import training_target_config
 
-    if isinstance(run, ResolvedRun):
-        resolved = run
-    else:
-        target_config = training_target_config(run)
-        resolved = resolve_run(run, registry, target_config=target_config)
+    if isinstance(runs, Config):
+        target_config = training_target_config(runs)
+        runs = (resolve_run(runs, registry, target_config=target_config),)
     from specforge.training.assembly import build_training_run
 
-    return build_training_run((resolved,))
+    return build_training_run(tuple(runs))
 
 
 __all__ = [
@@ -159,4 +190,5 @@ __all__ = [
     "build_application_run",
     "resolve_offline_capture",
     "resolve_run",
+    "resolve_runs",
 ]

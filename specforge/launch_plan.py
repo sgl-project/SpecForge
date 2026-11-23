@@ -842,6 +842,7 @@ def _worker_argv(
     config_path: str,
     role: Literal["all", "producer", "consumer"],
     overrides: Sequence[str],
+    drafter: Optional[str] = None,
 ) -> list[str]:
     return [
         *command_prefix,
@@ -850,6 +851,7 @@ def _worker_argv(
         config_path,
         "--role",
         role,
+        *(("--drafter", drafter) if drafter is not None else ()),
         *overrides,
     ]
 
@@ -865,9 +867,10 @@ def _trainer_command(
     distributed_entry: Sequence[str],
     node_rank: Optional[int],
     env: Mapping[str, str],
+    drafter: Optional[str],
 ) -> CommandSpec:
     topology = cfg.deployment.trainer
-    worker = _worker_argv(worker_prefix, config_path, role, overrides)
+    worker = _worker_argv(worker_prefix, config_path, role, overrides, drafter)
     world_size = topology.nnodes * topology.nproc_per_node
     cfg.validate_world_size(world_size)
     if world_size == 1:
@@ -986,8 +989,10 @@ def build_launch_plan(
     """Resolve one validated config into a side-effect-free process plan.
 
     *cfg* is the config as loaded; it holds the stack every run shares. *runs*
-    are the runs this process is for, and ``--role both`` starts one trainer
-    for each of them.
+    are the runs this process is for: one, or one per drafter. ``--role both``
+    on a ``managed_local`` stack starts one trainer for each of them: drafters
+    ``a`` and ``b`` plan ``--role producer``, ``--role consumer --drafter a``
+    and ``--role consumer --drafter b``.
 
     A managed-local stack on RDMA reads the host's HCAs from sysfs;
     *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
@@ -1041,6 +1046,13 @@ def build_launch_plan(
                     f"exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
+    starts_every_trainer = role == "both" and managed_local is not None
+    if len(runs) > 1 and role != "producer" and not starts_every_trainer:
+        raise ValueError(
+            "one command starts several drafters only on a managed_local stack; "
+            "otherwise run --role producer once, and --role consumer --drafter "
+            "NAME for each drafter"
+        )
     trainer_runs = () if role == "producer" else runs
     if role == "both" and any(
         run.config.deployment.trainer.nnodes > 1 for run in trainer_runs
@@ -1111,7 +1123,7 @@ def build_launch_plan(
                 "torchrun worker"
             )
         if role != "producer":
-            ((run, trainer_env, _),) = trainers
+            run, trainer_env, _ = trainers[0]
             topology = run.config.deployment.trainer
             actual_world_size = int(base_env["WORLD_SIZE"])
             expected_world_size = topology.nnodes * topology.nproc_per_node
@@ -1137,7 +1149,7 @@ def build_launch_plan(
     if role == "producer":
         return LaunchPlan("worker", role, worker_env=producer_env)
     if role in ("all", "consumer"):
-        ((run, trainer_env, trainer_rank),) = trainers
+        run, trainer_env, trainer_rank = trainers[0]
         command = _trainer_command(
             run.config,
             config_path=config_path,
@@ -1148,6 +1160,7 @@ def build_launch_plan(
             distributed_entry=distributed_entry,
             node_rank=trainer_rank,
             env=trainer_env,
+            drafter=run.name,
         )
         if command.argv[: len(worker_prefix)] == worker_prefix:
             return LaunchPlan("worker", role, worker_env=trainer_env)
@@ -1204,6 +1217,7 @@ def build_launch_plan(
             distributed_entry=distributed_entry,
             node_rank=trainer_rank,
             env=trainer_env,
+            drafter=run.name,
         )
         for run, trainer_env, trainer_rank in trainers
     ]

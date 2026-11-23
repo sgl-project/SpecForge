@@ -6,6 +6,7 @@ import io
 import os
 import signal
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -543,10 +544,87 @@ class TestCliLifecycle(unittest.TestCase):
                 "specforge.training.assembly": assembly,
             },
         ):
-            self.assertEqual(_train(resolved), 3)
+            self.assertEqual(_train((resolved,)), 3)
 
         assembly.build_training_run.assert_called_once_with((resolved,))
         run.run.assert_called_once_with()
+
+    def _train_several_drafters(self, *args):
+        """Run ``specforge train`` on a two-drafter recipe; return what it trains."""
+        from click.testing import CliRunner
+
+        from specforge.cli import cli
+
+        root = tempfile.mkdtemp(prefix="several_drafters_")
+        preset = "specforge/config/draft/presets/qwen3-8b-{}.yaml"
+        recipe = Config.model_validate(
+            {
+                "run_id": "qwen3",
+                "model": {"target_model_path": "target", "target_backend": "sglang"},
+                "data": {"prompts_path": "prompts.jsonl"},
+                "training": {"max_steps": 1},
+                "drafters": [
+                    {"name": name, "draft": preset.format(name)}
+                    for name in ("dflash", "dspark")
+                ],
+                "deployment": _disaggregated_deployment(
+                    root, server_urls=["http://capture:30000"]
+                ),
+            }
+        )
+        trained = []
+        mooncake = {
+            "MOONCAKE_METADATA_SERVER": "http://mooncake:8080/metadata",
+            "MOONCAKE_MASTER_SERVER_ADDR": "mooncake:50051",
+        }
+        with (
+            mock.patch.dict(os.environ, mooncake),
+            mock.patch("specforge.cli.load_config", return_value=recipe),
+            mock.patch(
+                "specforge.training.model_loading.training_target_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "specforge.cli._train",
+                side_effect=lambda runs: trained.append(
+                    (runs, os.environ["DISAGG_REF_CHANNEL"])
+                ),
+            ),
+        ):
+            result = CliRunner().invoke(cli, ["train", "-c", "multi.yaml", *args])
+        return root, result, trained
+
+    def test_several_drafters_need_a_producer_and_one_trainer_each(self):
+        _, result, trained = self._train_several_drafters()
+        self.assertIsInstance(result.exception, ValueError)
+        self.assertIn("--role consumer --drafter NAME", str(result.exception))
+        self.assertEqual(trained, [])
+
+        _, result, trained = self._train_several_drafters("--drafter", "dspark")
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("--drafter needs --role consumer", result.output)
+        self.assertEqual(trained, [])
+
+        _, result, trained = self._train_several_drafters("--role", "producer")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(len(trained), 1)
+        runs, _ = trained[0]
+        self.assertEqual(
+            [(run.config.run_id, run.config.training.role) for run in runs],
+            [("qwen3-dflash", "producer"), ("qwen3-dspark", "producer")],
+        )
+
+        root, result, trained = self._train_several_drafters(
+            "--role", "consumer", "--drafter", "dspark"
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(len(trained), 1)
+        runs, channel = trained[0]
+        self.assertEqual(
+            [(run.config.run_id, run.config.training.role) for run in runs],
+            [("qwen3-dspark", "consumer")],
+        )
+        self.assertEqual(channel, os.path.join(root, "dspark", "refs.jsonl"))
 
     def test_world_size_matches_the_configured_parallel_topology(self):
         local = Config.model_validate(
