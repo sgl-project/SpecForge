@@ -468,8 +468,6 @@ def _assemble_server_rollout_workers(
     algorithm: AlgorithmRegistration,
     modality: str,
     controller: DataFlowController,
-    store: FeatureStore,
-    run_id: str,
     target_hidden_size: int,
     target_vocab_size: Optional[int],
     draft_vocab_size: Optional[int],
@@ -513,10 +511,8 @@ def _assemble_server_rollout_workers(
     return [
         RolloutWorker(
             controller,
-            store,
             source,
             capture_config,
-            run_id=run_id,
             worker_id=f"rollout-{index}",
             strategy=algorithm.name,
         )
@@ -978,8 +974,6 @@ def build_disagg_online_producer(
         modality=modality,
         feature_source=feature_source,
         controller=controller,
-        store=feature_store,
-        run_id=run_id,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
