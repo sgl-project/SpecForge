@@ -37,6 +37,10 @@ training:
 run_id: qwen3.6-27b-dspark-online
 output_dir: outputs/qwen3.6-27b-dspark-online
 
+runtime:
+  in_flight_high_watermark: 1024
+  in_flight_low_watermark: 512
+
 deployment:
   mode: disaggregated
   trainer:

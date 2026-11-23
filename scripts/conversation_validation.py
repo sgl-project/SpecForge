@@ -37,7 +37,7 @@ def validate_conversation(
 
         if role == "system" and not saw_user:
             continue
-        if role not in {"user", "assistant"}:
+        if not isinstance(role, str) or role not in {"user", "assistant"}:
             if error_style == "regeneration":
                 return f"Invalid message role: {role}"
             return f"message {index} has unsupported role {role!r}"

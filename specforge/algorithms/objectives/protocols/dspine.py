@@ -6,8 +6,9 @@ import torch
 import torch.nn.functional as F
 
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
+from specforge.lr_scheduler import warmup_steps_from_ratio
 
-from ..base import check_options
+from ..base import ObjectiveResult, check_options
 from ..configuration import LossDefinition
 from ..inputs import prepare_anchor_capacity, prepare_blocks
 from ..losses import LossContext, TokenLoss, decay_weighting
@@ -45,7 +46,8 @@ class DSpineObjective:
     num_anchors: int = 512
     loss_decay_gamma: float = 7.0
     top_k: int = 16
-    alignment_warmup_steps: int = 146
+    alignment_warmup_steps: int | None = None
+    alignment_warmup_ratio: float = 0.0
     replacement_layers: int = 3
     replacement_probability: float = 0.5
     replacement_hold_ratio: float = 1 / 6
@@ -57,7 +59,7 @@ class DSpineObjective:
         return {
             "token": LossDefinition(self.default_loss),
             "refinement": LossDefinition(
-                self.default_loss, capabilities=frozenset({"component_masks"})
+                self.default_loss, capabilities=frozenset({"masked_ce_l1"})
             ),
             "alignment": LossDefinition(TokenLoss("cosine"), 0.5),
         }
@@ -69,6 +71,26 @@ class DSpineObjective:
         return decay_weighting(self.loss_decay_gamma)
 
     default_loss = TokenLoss("ce_l1", {"ce_weight": 0.1, "l1_weight": 0.9})
+
+    @staticmethod
+    def resolve_training_options(options, training):
+        """Inherit the LR warmup only when the alignment schedule is unspecified."""
+        ratio = (
+            training.get("warmup_ratio", 0.0)
+            if options.get("alignment_warmup_steps") is None
+            else 0.0
+        )
+        return {"alignment_warmup_ratio": ratio, **options}
+
+    def alignment_scale(self, step, total_steps):
+        warmup = self.alignment_warmup_steps
+        if warmup is None:
+            if self.alignment_warmup_ratio and not total_steps:
+                raise ValueError("DSpine alignment warmup ratio requires total_steps")
+            warmup = warmup_steps_from_ratio(
+                self.alignment_warmup_ratio, total_steps or 0
+            )
+        return min(max(step, 0) / warmup, 1) if warmup else 1
 
     def __post_init__(self):
         check_options(
@@ -82,11 +104,16 @@ class DSpineObjective:
                 "replacement_layers": self.replacement_layers,
             },
             probabilities={
+                "alignment_warmup_ratio": self.alignment_warmup_ratio,
                 "replacement_probability": self.replacement_probability,
                 "replacement_hold_ratio": self.replacement_hold_ratio,
                 "replacement_end_ratio": self.replacement_end_ratio,
             },
         )
+        if self.alignment_warmup_ratio is None:
+            raise ValueError("alignment_warmup_ratio must be a probability")
+        if self.alignment_warmup_steps is not None and self.alignment_warmup_ratio:
+            raise ValueError("alignment warmup must use steps or ratio, not both")
         if self.candidate_mass_threshold >= 1:
             raise ValueError("candidate_mass_threshold must be below one")
         if not self.replacement_hold_ratio < self.replacement_end_ratio:
@@ -95,7 +122,14 @@ class DSpineObjective:
             )
 
     def __call__(
-        self, runtime, batch, *, step, total_steps, alignment_ce=None, **context
+        self,
+        runtime,
+        batch,
+        *,
+        step,
+        total_steps,
+        alignment_ce=None,
+        **context,
     ):
         model = runtime.draft_model
         blocks = prepare_blocks(
@@ -134,11 +168,7 @@ class DSpineObjective:
             replace_masks=masks,
             output_logits=False,
         )
-        beta = (
-            min(step / self.alignment_warmup_steps, 1)
-            if self.alignment_warmup_steps
-            else 1
-        )
+        beta = self.alignment_scale(step, total_steps)
 
         def compute(calc):
             calc.run((0,))
@@ -175,23 +205,32 @@ class DSpineObjective:
                 context=refinement_context,
             )
             codes = F.embedding(labels, model.transfer_codes).float()
-            alignment = calc.evaluate_term(
-                2,
-                predictions.context_inputs["layer_features"],
-                codes[:, :, None],
-            ).values
+            alignment = (
+                calc.evaluate_term(
+                    2,
+                    predictions.context_inputs["layer_features"],
+                    codes[:, :, None],
+                ).values
+                / model.backbone.num_layers
+            )
             ce_num = (terms.values * calc.weights).sum()
             denominator = calc.weights.sum().detach()
             coefficient = alignment_ce
             if coefficient is None:
                 totals = torch.stack((ce_num.detach(), denominator))
                 coefficient = totals[0] / totals[1].where(totals[1] > 0, 1)
-            calc.add(1, refinement.values)
+            # Keep the two masked means additive until all chunks are available.
+            weights = calc.request.terms[1].weights
+            calc.add(1, refinement.statistics["masked_ce"])
+            calc.partials.update(
+                ce_mass=(weights * refinement_context.ce_mask).sum(),
+                l1_mass=(weights * refinement_context.l1_mask).sum(),
+                l1_sum=(weights * refinement.statistics["masked_l1"]).sum(),
+            )
             calc.add(2, coefficient.detach() * alignment)
             calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
             for name, values in (
                 ("backbone_l1", terms.statistics["teacher_l1"]),
-                ("refinement_loss", refinement.values),
                 ("alignment_loss", alignment),
             ):
                 calc.ratios[f"dspine/{name}"] = (
@@ -201,6 +240,29 @@ class DSpineObjective:
             calc.ratios["dspine/candidate_coverage"] = (
                 (covered.any(-1) * predictions.mask).sum().detach(),
                 predictions.mask.sum().detach(),
+            )
+
+        def finalize(result):
+            backbone, ce, alignment = result.terms
+            stats = result.partials
+            supervised = result.ratios["acc"][1]
+            ce_mean = ce.numerator / stats["ce_mass"].where(stats["ce_mass"] > 0, 1)
+            l1_mean = stats["l1_sum"] / stats["l1_mass"].where(stats["l1_mass"] > 0, 1)
+            refinement = (ce_mean + l1_mean) * supervised
+            result.ratios["dspine/refinement_loss"] = (
+                refinement.detach(),
+                result.ratios["dspine/backbone_ce"][1],
+            )
+            token_weight, refinement_weight, alignment_weight = result.coefficients
+            numerator = (
+                token_weight * backbone.numerator
+                + refinement_weight * refinement
+                + alignment_weight * alignment.numerator
+            )
+            return ObjectiveResult(
+                numerator,
+                numerator.new_tensor(batch["input_ids"].shape[0]),
+                result.ratios,
             )
 
         predictions = runtime.block_predictions(
@@ -224,4 +286,6 @@ class DSpineObjective:
                 "layer_features": output.layer_features.movedim(0, -2),
             },
         )
-        return PredictionBatch((predictions,), chunk_size=block_chunk_size(batch))
+        return PredictionBatch(
+            (predictions,), chunk_size=block_chunk_size(batch), finalize=finalize
+        )

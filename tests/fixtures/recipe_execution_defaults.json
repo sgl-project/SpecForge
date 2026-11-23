@@ -450,6 +450,15 @@
    "loss_checkpoint": true,
    "loss_chunk": 128
   },
+  "online/disaggregated/external/qwen3-8b-dspine.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 32
+  },
   "online/disaggregated/external/qwen3-8b-eagle3.yaml": {
    "attention_backend": "flex_attention",
    "dataloader_workers": 4,

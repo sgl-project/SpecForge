@@ -140,19 +140,19 @@
   "loss": 1.2190072536468506
  },
  "dspine-step0-train": {
-  "gradient_norm": 1.1529164670423773,
+  "gradient_norm": 13.55390043554813,
   "gradient_tensors": 33,
-  "loss": 4.322795391082764
+  "loss": 29.37940216064453
  },
  "dspine-step1-eval": {
-  "gradient_norm": 1.1634935731131704,
+  "gradient_norm": 13.55390043554813,
   "gradient_tensors": 33,
-  "loss": 4.452512741088867
+  "loss": 29.37940216064453
  },
  "dspine-step5-train": {
-  "gradient_norm": 1.270627871665611,
+  "gradient_norm": 13.55390043554813,
   "gradient_tensors": 33,
-  "loss": 4.9713826179504395
+  "loss": 29.37940216064453
  },
  "eagle3-length7": {
   "gradient_norm": 0.9675911515600779,

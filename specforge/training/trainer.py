@@ -27,6 +27,7 @@ import torch
 from specforge.algorithms.common.providers import (
     MODEL_PROVENANCE_CONTRACT_KEY,
     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+    STEP_OPTIONS_CONTRACT_KEY,
     StepRuntimeConfig,
     checkpoint_key_fingerprint,
 )
@@ -299,13 +300,24 @@ class Trainer:
             ):
                 from specforge.algorithms.objectives import objective_record
 
-                # a record written while logging-only options were still saved
+                # Older runs passed LR warmup through the strategy. Reconstruct
+                # objective defaults from the saved settings before comparison.
+                step_options = dict(state.get(STEP_OPTIONS_CONTRACT_KEY, ()))
                 state = {
                     **state,
                     "canonical_objective_options": objective_record(
-                        resume_contract["canonical_objective"], saved_options
+                        resume_contract["canonical_objective"],
+                        saved_options,
+                        training=step_options,
                     ),
                 }
+                if "warmup_ratio" in step_options and "warmup_ratio" not in dict(
+                    resume_contract.get(STEP_OPTIONS_CONTRACT_KEY, ())
+                ):
+                    del step_options["warmup_ratio"]
+                    state[STEP_OPTIONS_CONTRACT_KEY] = tuple(
+                        sorted(step_options.items())
+                    )
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
             saved_loss = state.get("canonical_loss")

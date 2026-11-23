@@ -1,6 +1,6 @@
 """Prepare offline features using a SGLang capture plugin server and Mooncake.
 
-Start the capture service separately (see examples/offline/README.md), then:
+Start the capture service separately (see docs/sections/basic_usage/offline_capture.md), then:
 
     python scripts/prepare_hidden_states.py \
         --server-urls http://127.0.0.1:30000 \
