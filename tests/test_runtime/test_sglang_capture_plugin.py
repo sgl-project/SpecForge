@@ -16,6 +16,7 @@ import types
 import unittest
 import weakref
 from concurrent.futures import Future
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
 
@@ -33,7 +34,7 @@ sys.path.insert(
 )
 
 import specforge_sglang_capture  # noqa: E402
-from specforge_sglang_capture import capture  # noqa: E402
+from specforge_sglang_capture import capture, prefix_cache  # noqa: E402
 
 
 def _spec(sample_id, features=("aux", "last_hidden")):
@@ -53,7 +54,7 @@ def _req(rid, prompt_len, spec=None, *, finished=True):
     return SimpleNamespace(
         rid=rid,
         origin_input_ids=list(range(prompt_len)),
-        sampling_params=SimpleNamespace(custom_params=custom_params),
+        sampling_params=SimpleNamespace(custom_params=custom_params, max_new_tokens=0),
         finished=lambda: finished,
         extra_key="capture-run",
         input_embeds=None,
@@ -106,8 +107,13 @@ def _runtime(
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
         defer_response=mock.Mock(),
-        prefix_cache_bytes=prefix_cache_bytes,
-        prefix_page_size=prefix_page_size,
+        prefix_cache=(
+            prefix_cache.HiddenPrefixCache(
+                prefix_cache_bytes, prefix_page_size, is_writer=is_writer
+            )
+            if prefix_cache_bytes
+            else None
+        ),
     )
 
 
@@ -165,11 +171,14 @@ class TestObserver(unittest.TestCase):
             original,
             can_run_graph=False,
         )
-        self.assertEqual(runtime.prefix_cache.used_bytes, 2 * (6 + 2) * 4)
+        cache = runtime.prefix_cache
+        self.assertFalse(cache.slots)
+        cache.insert([10], first._spec_capture_pending_hidden)
         followup = _req("followup", 4, dict(_spec("followup"), reuse_prefix=True))
-        followup.origin_input_ids[-1] = 10
+        followup._spec_capture_kv_page_heads = [10]
         other = _req("other", 4, dict(_spec("other"), reuse_prefix=True))
         other.extra_key = "other-run"
+        other._spec_capture_kv_page_heads = [20]
         suffix = _logits_output(4)
         device = runtime.observer.after_forward(
             SimpleNamespace(reqs=[followup, other]),
@@ -188,10 +197,9 @@ class TestObserver(unittest.TestCase):
         self.assertEqual(device.items[0].length, 4)
         error = capture.error_result(device.items[1].spec, device.items[1].error)
         self.assertEqual(error["error_code"], "prefix_cache_miss")
-        specforge_sglang_capture._flush_prefix_cache(
-            True, SimpleNamespace(_specforge_capture_runtime=runtime)
-        )
-        self.assertEqual(runtime.prefix_cache.used_bytes, 0)
+        cache.release(torch.tensor([10, 11]))
+        self.assertFalse(cache.slots)
+        self.assertIsNone(cache.read(followup, 2))
 
     def test_full_capture_at_one_page_needs_no_hidden_admission(self):
         runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=4)
@@ -202,7 +210,8 @@ class TestObserver(unittest.TestCase):
         )
         self.assertIs(device.aux, out.hidden_states)
         self.assertIs(device.last_hidden, out.last_hidden_states)
-        self.assertEqual(runtime.prefix_cache.used_bytes, 0)
+        self.assertFalse(runtime.prefix_cache.slots)
+        self.assertFalse(hasattr(req, "_spec_capture_pending_hidden"))
 
     def test_non_writer_ranks_and_decode_batches_capture_nothing(self):
         batch = SimpleNamespace(reqs=[_req("a", 2, _spec("a"))])
@@ -473,16 +482,103 @@ class TestStreamer(unittest.TestCase):
         )
 
 
+@dataclass
+class _MatchParams:
+    key: tuple
+    req: object
+
+
+def test_radix_match_shortens_an_uncovered_kv_hit_before_forward():
+    hidden = prefix_cache.HiddenPrefixCache(4096, 2, is_writer=False)
+    hidden.slots = {10: 0}
+    tree = SimpleNamespace(
+        _spec_capture_hidden=hidden,
+        path_device_indices=lambda node: torch.tensor([10, 11, 20, 21][:node]),
+    )
+    req = _req("match", 5, dict(_spec("match"), reuse_prefix=True))
+
+    def native_match(tree, params):
+        length = len(params.key)
+        return SimpleNamespace(device_prefix_len=length, last_device_node=length)
+
+    params = _MatchParams((1, 2, 3, 4), req)
+    result = prefix_cache.match_prefix(native_match, tree, params)
+    assert result.device_prefix_len == 2
+    assert req._spec_capture_kv_page_heads == [10]
+    hidden.release(torch.tensor([10, 11]))
+    assert prefix_cache.match_prefix(native_match, tree, params).device_prefix_len == 0
+
+
+def test_hidden_budget_requests_kv_eviction_before_publishing_more_pages():
+    hidden = prefix_cache.HiddenPrefixCache(128, 2, is_writer=False)
+    old_req = _req("old", 5, dict(_spec("old"), reuse_prefix=True))
+    logits = _logits_output(5)
+    tensors = (logits.hidden_states, logits.last_hidden_states)
+    hidden.stage(old_req, 0, 5, tensors, copy=False)
+    hidden.insert([10, 20], old_req._spec_capture_pending_hidden)
+    req = _req("new", 7, dict(_spec("new"), reuse_prefix=True))
+    req.kv = SimpleNamespace(cache_protected_len=0, req_pool_idx=0)
+    logits = _logits_output(7)
+    hidden.stage(
+        req, 0, 7, (logits.hidden_states, logits.last_hidden_states), copy=False
+    )
+    evicted = []
+
+    def evict(params, *, allocation_reclaim_satisfied):
+        evicted.append(params.num_tokens)
+        # The first victim is a KV-only page, and another request pins page 20.
+        hidden.release(torch.tensor([90, 91]))
+        assert not allocation_reclaim_satisfied()
+        hidden.release(torch.tensor([10, 11]))
+        assert not allocation_reclaim_satisfied()
+
+    tree = SimpleNamespace(
+        _spec_capture_hidden=hidden,
+        evict_for_alloc=evict,
+        full_evictable_size=lambda: 4,
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.tensor([[30, 31, 40, 41, 50, 51, 60]])
+        ),
+    )
+
+    def publish(tree, req, *, up_to):
+        assert up_to == 2
+        req.kv.cache_protected_len = up_to
+
+    base_cache = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
+    base_cache.EvictParams = SimpleNamespace
+    with mock.patch.dict(sys.modules, {base_cache.__name__: base_cache}):
+        prefix_cache.checkpoint(publish, tree, req, up_to=7)
+    assert evicted == [4]
+    assert set(hidden.slots) == {20, 30}
+    assert req._spec_capture_pending_hidden is None
+
+
+class _UnifiedRadixCache:
+    page_size = logical_page_size = 256
+    cache_controller = linker = uocr_doc_reuse = None
+    disable = False
+    tree_core = SimpleNamespace(is_eagle=False)
+
+    def supports_mamba(self):
+        return False
+
+
 def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
     disaggregation = types.ModuleType("sglang.srt.disaggregation.utils")
     disaggregation.DisaggregationMode = SimpleNamespace(NULL="null")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     runtime_context.get_exec = lambda: SimpleNamespace(features=features)
-    runtime_context.get_parallel = lambda: SimpleNamespace(attn_tp_rank=attn_tp_rank)
+    runtime_context.get_parallel = lambda: SimpleNamespace(
+        attn_tp_rank=attn_tp_rank, pp_size=1
+    )
     runtime_context.get_schedule = lambda: SimpleNamespace(
         chunked_prefill_size=chunked_prefill_size
     )
+    radix = types.ModuleType("sglang.srt.mem_cache.unified_radix_cache")
+    radix.UnifiedRadixCache = _UnifiedRadixCache
     return {
+        radix.__name__: radix,
         "sglang.srt.disaggregation.utils": disaggregation,
         "sglang.srt.runtime_context": runtime_context,
     }
@@ -490,6 +586,9 @@ def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
 
 class _ModelRunner:
     forward_observer = None
+    model_config = SimpleNamespace(hidden_size=8)
+    max_total_num_tokens = 4096
+    dtype = torch.bfloat16
 
 
 def _scheduler():
@@ -498,7 +597,7 @@ def _scheduler():
         output_streamer=SimpleNamespace(),
         defer_response=mock.Mock(),
         disaggregation_mode="null",
-        tree_cache=SimpleNamespace(page_size=256),
+        tree_cache=_UnifiedRadixCache(),
     )
     return scheduler
 
@@ -524,18 +623,22 @@ class TestInstall(unittest.TestCase):
         ):
             return scheduler, capture.install(scheduler)
 
-    def test_uses_radix_page_size_for_hidden_admission(self):
-        scheduler, runtime = self._install(
-            env={
-                "MOONCAKE_PROTOCOL": "tcp",
-                "SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES": "4096",
-            }
-        )
+    def test_advertises_only_usable_radix_capacity(self):
+        env = {"MOONCAKE_PROTOCOL": "tcp"}
+        env["SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES"] = str(2 * 256 * 3 * 8 * 2)
+        scheduler, runtime = self._install(env=env)
         self.assertEqual(runtime.prefix_cache.page_size, 256)
+        self.assertIs(runtime.prefix_cache, scheduler.tree_cache._spec_capture_hidden)
         result = SimpleNamespace(internal_state={})
         specforge_sglang_capture._capture_internal_state(result, scheduler)
         self.assertEqual(result.internal_state["spec_capture_prefix_page_size"], 256)
-        scheduler.tree_cache.disable = True
+        self.assertEqual(
+            result.internal_state["spec_capture_prefix_capacity_tokens"], 512
+        )
+
+        env["SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES"] = "4096"
+        scheduler, runtime = self._install(env=env)
+        self.assertIsNone(runtime.prefix_cache)
         result = SimpleNamespace(internal_state={})
         specforge_sglang_capture._capture_internal_state(result, scheduler)
         self.assertNotIn("spec_capture_prefix_page_size", result.internal_state)
@@ -687,7 +790,9 @@ class TestRegister(unittest.TestCase):
     def _fake_hook_registry(self):
         registered = []
         module = types.ModuleType("sglang.srt.plugins.hook_registry")
-        module.HookType = SimpleNamespace(AFTER="after")
+        module.HookType = SimpleNamespace(
+            AFTER="after", BEFORE="before", AROUND="around"
+        )
         module.HookRegistry = SimpleNamespace(
             register=lambda target, hook, hook_type: registered.append(
                 (target, hook_type)
@@ -723,7 +828,11 @@ class TestRegister(unittest.TestCase):
                     "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
                     "after",
                 ),
-                ("sglang.srt.managers.scheduler.Scheduler.flush_cache", "after"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.match_prefix", "around"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.checkpoint_into_tree", "around"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}._apply_cache_action", "before"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}._reset_full", "before"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.on_release", "before"),
             ],
         )
 

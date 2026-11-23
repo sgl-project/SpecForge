@@ -25,26 +25,27 @@ def _server_geometry(url):
         )
     except Exception as exc:
         logger.warning("Prefix cache auto could not read %s/server_info: %s", url, exc)
-        return 0, 1
+        return 0, 1, 0
     states = info.get("internal_states") if isinstance(info, Mapping) else None
     if not isinstance(states, list) or not states:
-        return 0, 1
-    sizes = [
-        (
-            state.get("spec_capture_prefix_page_size")
-            if isinstance(state, Mapping)
-            else None
-        )
-        for state in states
-    ]
+        return 0, 1, 0
+    if any(not isinstance(state, Mapping) for state in states):
+        return 0, len(states), 0
+    sizes = [state.get("spec_capture_prefix_page_size") for state in states]
+    capacities = [state.get("spec_capture_prefix_capacity_tokens") for state in states]
     page_size = sizes[0]
     if (
         type(page_size) is not int
         or page_size < 1
         or any(size != page_size for size in sizes)
+        or any(type(cap) is not int or cap < page_size for cap in capacities)
     ):
-        return 0, len(states)
-    return page_size, len(states)
+        return 0, len(states), 0
+    return page_size, len(states), min(capacities)
+
+
+def supported_prefix_cache_modes(server_urls: Sequence[str]) -> list[bool]:
+    return [bool(_server_geometry(url)[0]) for url in server_urls]
 
 
 def auto_prefix_cache_modes(
@@ -60,7 +61,7 @@ def auto_prefix_cache_modes(
     geometry = [_server_geometry(url) for url in server_urls]
     totals = [0] * len(server_urls)
     reused = totals.copy()
-    if any(page_size for page_size, _ in geometry):
+    if any(page_size for page_size, _, _ in geometry):
         indices = random.Random(seed).sample(
             range(len(prompts)), min(_SAMPLE_COUNT, len(prompts))
         )
@@ -68,13 +69,14 @@ def auto_prefix_cache_modes(
         tokens_in_history = defaultdict(int)
         for i, index in enumerate(indices):
             round_index, endpoint = divmod(i // lease, len(server_urls))
-            page_size, replicas = geometry[endpoint]
+            page_size, replicas, capacity = geometry[endpoint]
             if not page_size:
                 continue
             ids = prompts[index]["payload"]["input_ids"]
             totals[endpoint] += len(ids)
             # Prefill keeps the last token outside a radix hit.
-            page_count = max(len(ids) - 1, 0) // page_size
+            history_limit = min(capacity, _HISTORY_TOKENS)
+            page_count = min(max(len(ids) - 1, 0), history_limit) // page_size
             if not page_count:
                 continue
             pages = tuple(
@@ -98,11 +100,11 @@ def auto_prefix_cache_modes(
             reused[endpoint] += shared_pages * page_size
             previous.append(pages)
             tokens_in_history[route] += page_count * page_size
-            while tokens_in_history[route] > _HISTORY_TOKENS:
+            while tokens_in_history[route] > history_limit:
                 tokens_in_history[route] -= len(previous.popleft()) * page_size
 
     flags = []
-    for url, (page_size, replicas), tokens, hit_tokens in zip(
+    for url, (page_size, replicas, _), tokens, hit_tokens in zip(
         server_urls, geometry, totals, reused, strict=True
     ):
         fraction = hit_tokens / tokens if tokens else 0.0

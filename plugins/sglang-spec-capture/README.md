@@ -143,27 +143,31 @@ or `{sample_id, error}`. Objects are stored at
 ## Prefix reuse
 
 For a fixed text target,
-`deployment.disaggregated.server_capture_prefix_cache` defaults to `auto`,
-which decides at startup. Set it to `true` to enable reuse or `false` to
-disable it explicitly.
-Give each capture server a positive `SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` budget.
-Leave SGLang's radix cache enabled and reserve this device memory below
-`--mem-fraction-static`. The budget is per writer. Each producer adapter uses
-its own radix namespace.
+`deployment.disaggregated.server_capture_prefix_cache` defaults to `auto`.
+Set it to `true` to enable reuse on supported servers or `false` to force
+full prefill. Give each capture writer a positive
+`SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` budget and reserve that device memory
+below `--mem-fraction-static`. The budget must hold at least one radix page of
+aux and last hidden states. Each producer adapter uses its own radix namespace.
 
-`auto` samples up to 512 prepared prompts, in a deterministic random order.
-It approximates lease assignment across endpoints and counts reusable full
-radix pages within a 64K-token history per advertised scheduler. It enables
-reuse on endpoints with at least 5% estimated token reuse. An endpoint that
-does not advertise an active hidden cache and radix page size uses full prefill.
+`auto` samples up to 512 prepared prompts in deterministic random order. It
+approximates lease assignment across endpoints and estimates reusable full
+pages in a history capped at 64K tokens and the advertised hidden capacity per
+scheduler. It enables endpoints with at least 5% estimated reuse.
 
-When SGLang reuses KV, the plugin joins the matching cached hidden rows with
-the new suffix before publication. The store still receives full-length
-tensors. Hidden admission keeps whole radix pages that a future request can
-reuse, leaving partial tails in the published capture. A hidden-cache miss or
-eviction retries the affected request once with a fresh radix namespace.
-Full prefill uses a fresh namespace for every request. Multimodal inputs,
-custom input adapters and lease retries use full prefill.
+The plugin coordinates admission with SGLang's on-device unified radix cache.
+It keeps hidden rows outside the radix tree, indexed by the KV page slots
+published by the cache. When the hidden pool needs space, SGLang's eviction
+policy selects KV pages and the plugin releases the corresponding hidden
+slots. Evicting KV for allocator pressure and resetting the tree also release
+their hidden slots. A capture request uses only the longest prefix available
+in both caches, determined before prefill. The store receives full-length
+tensors, and an unexpected missing hidden prefix still triggers one cold retry.
+
+Servers without a supported on-device unified cache or enough budget use full
+prefill. Host/external KV tiers, recurrent-state caches, pipeline parallelism,
+and multimodal or custom-input captures use the full-prefill path. Lease
+retries also use full prefill.
 
 ## Multi-node NVLink
 

@@ -7,10 +7,14 @@ def _prompts(rows):
     return [{"payload": {"input_ids": ids}} for ids in rows]
 
 
-def _server(page_size=4, replicas=1):
+def _server(page_size=4, replicas=1, capacity=65536):
     return {
         "internal_states": [
-            {"spec_capture_prefix_page_size": page_size} for _ in range(replicas)
+            {
+                "spec_capture_prefix_page_size": page_size,
+                "spec_capture_prefix_capacity_tokens": capacity,
+            }
+            for _ in range(replicas)
         ]
     }
 
@@ -57,3 +61,12 @@ def test_auto_reads_at_most_512_prepared_prompts(server_info):
     prompts.__getitem__.return_value = {"payload": {"input_ids": [1, 2, 3, 4, 5]}}
     auto_prefix_cache_modes(prompts, ["http://a"], lease=8, seed=0)
     assert prompts.__getitem__.call_count == 512
+
+
+@mock.patch("specforge.inference.prefix_cache._get_server_info")
+def test_auto_accounts_for_usable_hidden_capacity(server_info):
+    server_info.side_effect = [_server(capacity=3), _server(capacity=4), _server()]
+    prompts = _prompts([list(range(100)) + [token] for token in range(36)])
+    assert auto_prefix_cache_modes(
+        prompts, ["http://a", "http://b", "http://c"], lease=2, seed=0
+    ) == [False, False, True]

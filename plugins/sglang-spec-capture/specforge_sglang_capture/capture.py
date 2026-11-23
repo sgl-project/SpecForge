@@ -107,16 +107,17 @@ def error_result(spec: Dict[str, Any], error: str) -> Dict[str, Any]:
     return result
 
 
-def _prefix_namespace(req, spec):
-    if (
+def prefix_eligible(req, spec):
+    return (
         spec.get("reuse_prefix") is True
         and req.extra_key
+        and req.sampling_params.max_new_tokens == 0
         and req.input_embeds is None
         and req.multimodal_inputs is None
         and req.lora_id is None
-    ):
-        return req.extra_key
-    return None
+        and getattr(req, "positional_embed_overrides", None) is None
+        and getattr(req, "session", None) is None
+    )
 
 
 def collect_capture_items(
@@ -136,7 +137,7 @@ def collect_capture_items(
         if spec is not None:
             error = spec.get("_parse_error")
             prompt_len = len(req.origin_input_ids)
-            if error is None and prefix_len and not _prefix_namespace(req, spec):
+            if error is None and prefix_len and not prefix_eligible(req, spec):
                 error = (
                     f"{prefix_len} prompt tokens were served from the prefix "
                     "cache; spec capture needs a full prefill"
@@ -163,7 +164,10 @@ class CaptureObserver:
         self.runtime = runtime
 
     def after_forward(self, batch, forward_batch, logits_output, *, can_run_graph):
-        if not self.runtime.is_writer or not forward_batch.forward_mode.is_extend():
+        cache = self.runtime.prefix_cache
+        if not forward_batch.forward_mode.is_extend() or (
+            not self.runtime.is_writer and cache is None
+        ):
             return None
         items, num_rows = collect_capture_items(
             batch.reqs,
@@ -204,16 +208,25 @@ class CaptureObserver:
                         ),
                     )
             checked.append(item)
+        if cache is not None and aux is not None and last_hidden is not None:
+            req_by_id = {req.rid: req for req in batch.reqs}
+            for item in checked:
+                req = req_by_id[item.rid]
+                if item.error is None and prefix_eligible(req, item.spec):
+                    span = slice(item.start, item.start + item.length)
+                    cache.stage(
+                        req,
+                        item.prefix_len,
+                        item.prefix_len + item.length,
+                        (aux[span], last_hidden[span]),
+                        copy=can_run_graph,
+                    )
+        if not self.runtime.is_writer:
+            return None
         if any(item.prefix_len and item.error is None for item in checked):
             checked, aux, last_hidden = self._restore_prefixes(
                 batch.reqs, checked, aux, last_hidden
             )
-        elif (
-            self.runtime.prefix_cache is not None
-            and aux is not None
-            and last_hidden is not None
-        ):
-            self._admit_full_prefills(batch.reqs, checked, aux, last_hidden)
         return CaptureDeviceOutput.from_rows(
             self.runtime, checked, aux, last_hidden, copy=can_run_graph
         )
@@ -223,7 +236,6 @@ class CaptureObserver:
         req_by_id = {req.rid: req for req in reqs}
         parts = []
         restored = []
-        admissions = []
         hits = False
         cursor = 0
         for item in items:
@@ -231,8 +243,6 @@ class CaptureObserver:
                 restored.append(item)
                 continue
             req = req_by_id[item.rid]
-            namespace = _prefix_namespace(req, item.spec)
-            tokens = tuple(req.origin_input_ids) if namespace is not None else ()
             tensors = tuple(
                 (
                     tensor[item.start : item.start + item.length]
@@ -243,7 +253,7 @@ class CaptureObserver:
             )
             if item.prefix_len:
                 prefix = (
-                    cache.get(namespace, tokens[: item.prefix_len])
+                    cache.read(req, item.prefix_len)
                     if cache is not None
                     and all(tensor is not None for tensor in tensors)
                     else None
@@ -254,16 +264,6 @@ class CaptureObserver:
                 parts.append(prefix)
                 hits = True
             length = item.prefix_len + item.length
-            can_admit = (
-                cache is not None
-                and namespace is not None
-                and all(t is not None for t in tensors)
-            )
-            if can_admit:
-                if item.prefix_len:
-                    admissions.append((namespace, tokens, cursor, length))
-                else:
-                    cache.put(namespace, tokens, tensors)
             restored.append(dataclasses.replace(item, start=cursor, length=length))
             cursor += length
             parts.append(tensors)
@@ -282,31 +282,7 @@ class CaptureObserver:
             torch.cat(column, dim=0) if column[0] is not None else None
             for column in zip(*parts, strict=True)
         )
-        for namespace, tokens, start, length in admissions:
-            cache.put(
-                namespace, tokens, tuple(t[start : start + length] for t in tensors)
-            )
         return restored, *tensors
-
-    def _admit_full_prefills(self, reqs, items, aux, last_hidden):
-        cache = self.runtime.prefix_cache
-        eligible = [
-            item
-            for item in items
-            if item.error is None
-            and item.length > cache.page_size
-            and item.spec.get("reuse_prefix") is True
-        ]
-        if not eligible:
-            return
-        req_by_id = {req.rid: req for req in reqs}
-        for item in eligible:
-            req = req_by_id[item.rid]
-            if namespace := _prefix_namespace(req, item.spec):
-                span = slice(item.start, item.start + item.length)
-                cache.put(
-                    namespace, req.origin_input_ids, (aux[span], last_hidden[span])
-                )
 
 
 def _select_rows(
@@ -543,22 +519,61 @@ class CaptureRuntime:
         gpu_put: bool,
         max_pending_batches: int,
         defer_response: Callable[[Any, CaptureCompletion], None],
-        prefix_cache_bytes: int = 0,
-        prefix_page_size: int = 1,
+        prefix_cache: HiddenPrefixCache | None = None,
+        prefix_capacity_tokens: int = 0,
     ) -> None:
         self.sink = sink
         self.is_writer = is_writer
         self.gpu_put = gpu_put
         self.defer_response = defer_response
-        self.prefix_cache = (
-            HiddenPrefixCache(prefix_cache_bytes, prefix_page_size)
-            if prefix_cache_bytes
-            else None
-        )
+        self.prefix_cache = prefix_cache
+        self.prefix_capacity_tokens = prefix_capacity_tokens
         # rid -> result dict, read by the streamer when the request streams.
         self.results: Dict[str, Dict[str, Any]] = {}
         self.pending = PendingCaptures(self, max_pending_batches)
         self.observer = CaptureObserver(self)
+
+
+def _configure_prefix_cache(tree, model_runner, features, budget, is_writer):
+    if not budget:
+        return None, 0
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.runtime_context import get_parallel
+
+    if (
+        type(tree) is not UnifiedRadixCache
+        or tree.disable
+        or tree.cache_controller is not None
+        or tree.linker is not None
+        or tree.logical_page_size != tree.page_size
+        or tree.supports_mamba()
+        or tree.tree_core.is_eagle
+        or tree.uocr_doc_reuse is not None
+        or get_parallel().pp_size != 1
+    ):
+        logger.info("SpecForge prefix reuse is unavailable on this radix cache")
+        return None, 0
+
+    layers = features.return_aux_hidden_state_layer_ids
+    if not layers:
+        return None, 0
+    bytes_per_token = (
+        model_runner.model_config.hidden_size
+        * (len(layers) + 1)
+        * model_runner.dtype.itemsize
+    )
+    hidden = HiddenPrefixCache(
+        budget,
+        tree.page_size,
+        is_writer=is_writer,
+        max_tokens=model_runner.max_total_num_tokens,
+    )
+    pages = hidden.capacity(tree.page_size * bytes_per_token)
+    if not pages:
+        return None, 0
+
+    tree._spec_capture_hidden = hidden
+    return hidden, pages * tree.page_size
 
 
 def install(scheduler) -> CaptureRuntime:
@@ -603,14 +618,20 @@ def install(scheduler) -> CaptureRuntime:
         arena_bytes()
 
     prefix_cache_bytes = int(os.environ.get(PREFIX_CACHE_BYTES_ENV, "0"))
+    if prefix_cache_bytes < 0:
+        raise ValueError(f"{PREFIX_CACHE_BYTES_ENV} must be nonnegative")
+    is_writer = get_parallel().attn_tp_rank == 0
+    prefix_cache, prefix_capacity = _configure_prefix_cache(
+        scheduler.tree_cache, model_runner, features, prefix_cache_bytes, is_writer
+    )
     runtime = CaptureRuntime(
         sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
-        is_writer=get_parallel().attn_tp_rank == 0,
+        is_writer=is_writer,
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
-        prefix_cache_bytes=prefix_cache_bytes,
-        prefix_page_size=scheduler.tree_cache.page_size if prefix_cache_bytes else 1,
+        prefix_cache=prefix_cache,
+        prefix_capacity_tokens=prefix_capacity,
     )
     method = features.aux_hidden_state_capture
     runtime.capture_method = str(getattr(method, "name", method)).lower()
