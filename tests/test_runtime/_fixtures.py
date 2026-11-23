@@ -106,7 +106,7 @@ class FakeProgram(torch.nn.Module):
 
     frozen = ()
 
-    def host_inputs(self, tensors):
+    def host_inputs(self, tensors, *, sample_ids, epoch):
         return {}
 
     def replay_arguments(self, replay_values, *, prepass=False):

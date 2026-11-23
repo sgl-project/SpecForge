@@ -149,6 +149,7 @@ the capture server.
 | `training.resume_from` | `null` | Alias for `resume`. Restores a canonical full training checkpoint and excludes `initialization`. If both aliases are set they must agree. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
+| `training.anchor_sampling` | `device` | Where block objectives (DFlash, DFlash2, Domino, DSpark, DSpine, DMTP) draw anchors. `device` samples in the forward from the global generator. `host` samples before placement from `training.seed`, the sample id and the epoch: a sample's anchors do not depend on its rank, padding or the data-parallel size (a batch with no row of `num_anchors` valid positions still gives every row fewer slots). Same law, other draws; a resume must keep the mode and seed. Reproducible across launches only where sample ids are (single-epoch online prompts get fresh ids per launch); a padded repeat of a sample in one epoch repeats its draw. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 | Strategy | Fields and defaults |
 | --- | --- |

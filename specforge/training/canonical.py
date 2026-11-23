@@ -124,6 +124,15 @@ def resolve_run(cfg, *, target_config=None):
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+    from specforge.algorithms.objectives.base import validate_anchor_sampling
+
+    # At resolution, before a producer ingests data for a run that cannot train.
+    validate_anchor_sampling(
+        resolved.name,
+        resolved.registration.training,
+        cfg.training.anchor_sampling,
+        cfg.training.seed,
+    )
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
@@ -564,6 +573,8 @@ def build_bundle(cfg, algorithm, topology):
         + ([teacher] if teacher is not None else []),
         attention_backend=cfg.training.attention_backend,
         sequence_parallel=sequence_parallel,
+        anchor_sampling=cfg.training.anchor_sampling,
+        anchor_seed=cfg.training.seed,
     )
     runtime.fsdp_param_dtype = dtype
     contract = {
@@ -574,6 +585,13 @@ def build_bundle(cfg, algorithm, topology):
         ),
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": use_fused_conv,
+        # A resume keeps drawing anchors as the run did: the host draw keys on
+        # the seed, so it is part of the record.
+        "canonical_anchor_sampling": (
+            ("host", cfg.training.seed)
+            if cfg.training.anchor_sampling == "host"
+            else "device"
+        ),
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),

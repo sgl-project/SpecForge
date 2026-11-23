@@ -20,6 +20,7 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
     resolve_requires=diagnostic_requirements,
     training=TrainingRequirements(
         host_inputs=prepare_anchor_capacity,
+        samples_anchors=True,
         capture_method="dflash",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
