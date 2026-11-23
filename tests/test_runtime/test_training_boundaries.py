@@ -92,11 +92,10 @@ class Rule:
 
 
 _T = "torch.distributed"
-_S = "specforge.distributed"
 
 #: Modules that reach a process group today. The counts include what a helper
-#: of the package brings: every use of ``shard_tensor`` counts as the group
-#: reads in its body.
+#: of the package brings: every use of a helper counts as the group reads in
+#: its body.
 EXCEPTED_COLLECTIVES = {
     # A model-parallel axis: ranks of one group share a sequence or a tensor,
     # never samples.
@@ -122,42 +121,6 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.get_world_size": 1,
             f"{_T}.irecv": 1,
             f"{_T}.isend": 1,
-        },
-    ),
-    "specforge/layers/embedding.py": Excepted(
-        "tensor-parallel axis: an embedding sharded over the group, summed back",
-        {
-            _T: 1,
-            f"{_T}.ProcessGroup": 2,
-            f"{_T}.ReduceOp.SUM": 1,
-            f"{_T}.all_reduce": 1,
-            f"{_T}.get_rank": 3,
-            f"{_T}.get_world_size": 3,
-            f"{_S}.get_tp_group": 2,
-            f"{_S}.shard_tensor": 2,
-        },
-    ),
-    "specforge/layers/linear.py": Excepted(
-        "tensor-parallel axis: linear layers sharded over the group",
-        {
-            _T: 1,
-            f"{_T}.ProcessGroup": 14,
-            f"{_T}.get_rank": 16,
-            f"{_T}.get_world_size": 16,
-            f"{_S}.get_tp_group": 3,
-            f"{_S}.shard_tensor": 14,
-        },
-    ),
-    "specforge/layers/lm_head.py": Excepted(
-        "tensor-parallel axis: a head sharded over the group, gathered back",
-        {
-            _T: 1,
-            f"{_T}.ProcessGroup": 3,
-            f"{_T}.all_gather": 1,
-            f"{_T}.get_rank": 4,
-            f"{_T}.get_world_size": 4,
-            f"{_S}.get_tp_group": 2,
-            f"{_S}.shard_tensor": 3,
         },
     ),
     # Not a model-parallel axis: the run loop's and its helpers' own uses of
