@@ -287,7 +287,7 @@ class LaunchPlanTest(unittest.TestCase):
                     in_flight_low_watermark=32,
                 )
                 cfg = Config.model_validate(raw)
-                with self.assertRaisesRegex(ValueError, "low watermark 32.*quantum 35"):
+                with self.assertRaisesRegex(ValueError, "low watermark 32.*35 samples"):
                     build_launch_plan(cfg, config_path="run.yaml", env=MOONCAKE_ENV)
                 build_launch_plan(
                     cfg,

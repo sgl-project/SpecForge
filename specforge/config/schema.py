@@ -510,10 +510,9 @@ def resolve_dispatch_watermarks(
     required = consumer_dispatch_quantum(runtime.consumer_dispatch, window)
     for level, value in (("high", high), ("low", high if low is None else low)):
         if value < required:
-            batches = "one global batch" if required == window else "two global batches"
             raise ValueError(
                 f"{runtime.consumer_dispatch} {level} watermark {value} must cover "
-                f"at least {batches} (dispatch quantum {required})"
+                f"at least {required} samples per dispatch"
             )
     return high, low
 

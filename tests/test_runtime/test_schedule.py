@@ -43,11 +43,11 @@ class TestResolveTotalSteps(unittest.TestCase):
 
     def test_online_flow_window_rejects_small_watermarks_before_data_build(self):
         cfg = self._online_flow_config(high=64, low=32)
-        with self.assertRaisesRegex(ValueError, "high watermark 64.*quantum 1024"):
+        with self.assertRaisesRegex(ValueError, "high watermark 64.*1024 samples"):
             resolve_dispatch_watermarks(cfg)
 
         cfg = self._online_flow_config(high=1152, low=32)
-        with self.assertRaisesRegex(ValueError, "low watermark 32.*quantum 1024"):
+        with self.assertRaisesRegex(ValueError, "low watermark 32.*1024 samples"):
             resolve_dispatch_watermarks(cfg)
 
     def test_online_flow_window_preserves_high_only_environment_override(self):
@@ -77,7 +77,7 @@ class TestResolveTotalSteps(unittest.TestCase):
                 ):
                     if error:
                         with self.assertRaisesRegex(
-                            ValueError, f"{error} watermark.*quantum 8"
+                            ValueError, f"{error} watermark.*8 samples"
                         ):
                             resolve_dispatch_watermarks(cfg)
                     else:

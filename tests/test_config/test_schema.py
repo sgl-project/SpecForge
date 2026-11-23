@@ -124,7 +124,9 @@ class ConfigSchemaTest(unittest.TestCase):
                     "consumer_dispatch": policy,
                     "in_flight_high_watermark": 255,
                 }
-                with self.assertRaisesRegex(ValueError, "at least two global batches"):
+                with self.assertRaisesRegex(
+                    ValueError, "at least 256 samples per dispatch"
+                ):
                     Config.model_validate(payload)
                 payload["runtime"]["in_flight_high_watermark"] = 256
                 with self.assertRaisesRegex(ValueError, "low watermark"):
@@ -144,7 +146,7 @@ class ConfigSchemaTest(unittest.TestCase):
                     "in_flight_high_watermark": 14,
                     "in_flight_low_watermark": 4,
                 }
-                with self.assertRaisesRegex(ValueError, "low watermark.*quantum 8"):
+                with self.assertRaisesRegex(ValueError, "low watermark.*8 samples"):
                     Config.model_validate(payload)
                 payload["runtime"]["in_flight_low_watermark"] = 8
                 Config.model_validate(payload)
