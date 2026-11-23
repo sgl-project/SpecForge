@@ -30,12 +30,7 @@ from specforge.runtime.data_plane.mooncake_store import (
     MooncakeFeatureStore,
 )
 from specforge.training.disaggregated import _mooncake_store
-from tests.test_runtime.test_server_capture import (
-    _capture_schema,
-    _eagle3_contract,
-    _StubCaptureServer,
-    _task,
-)
+from tests.test_runtime.test_server_capture import _output, _StubCaptureServer, _task
 
 SESSION = "capture-host:15459"
 
@@ -135,9 +130,7 @@ class ArenaObjectClientTest(unittest.TestCase):
         self.adapter = SGLangServerCaptureAdapter(
             "http://server:30000",
             self.store,
-            run_id="run0",
-            algorithm="eagle3",
-            schema=_capture_schema("eagle3"),
+            outputs=[_output("eagle3")],
             post_fn=self.server,
         )
 
@@ -153,15 +146,15 @@ class ArenaObjectClientTest(unittest.TestCase):
 
         with mock.patch.object(self.adapter, "post_fn", side_effect=post_then_lose):
             with self.assertRaises(TimeoutError):
-                self.adapter.produce_refs([task], capture=_eagle3_contract())
-        prefix = f"run0/{self.adapter._sample_id(task)}/g1/"
+                self.adapter.produce_refs([task])
+        prefix = f"run0/{self.adapter.outputs[0].sample_id(task)}/g1/"
         keys = [key for key in self.arena.objects if key.startswith(prefix)]
         self.assertTrue(keys)
         return keys
 
     def _refs(self, *lengths):
         tasks = [_task(i, length) for i, length in enumerate(lengths)]
-        return self.adapter.produce_refs(tasks, capture=_eagle3_contract())
+        return [ref for (ref,) in self.adapter.produce_refs(tasks)]
 
     def test_reads_server_objects_and_frees_them_when_consumed(self):
         refs = self._refs(6, 9)
@@ -228,7 +221,9 @@ class ArenaObjectClientTest(unittest.TestCase):
             # The final drain must not turn an unlocated key into confirmed absence.
             with self.assertRaises(RuntimeError):
                 self.store.drain_pending_removals(max_attempts=1)
-        report = self.store.retry_sample_removals([self.adapter._sample_id(task)])
+        report = self.store.retry_sample_removals(
+            [self.adapter.outputs[0].sample_id(task)]
+        )
         self.assertEqual(report["remaining_ids"], [])
         for key in keys:
             self.assertTrue(self.arena.wait_freed(key), key)
@@ -243,14 +238,10 @@ class ArenaObjectClientTest(unittest.TestCase):
         adapter_b = SGLangServerCaptureAdapter(
             "http://other:30000",
             self.store,
-            run_id="run0",
-            algorithm="eagle3",
-            schema=self.adapter.schema,
+            outputs=self.adapter.outputs,
             post_fn=_ArenaCaptureServer(other),
         )
-        (ref,) = adapter_b.produce_refs(
-            [replace(task, attempt=1)], capture=_eagle3_contract()
-        )
+        ((ref,),) = adapter_b.produce_refs([replace(task, attempt=1)])
         self.assertEqual(
             set(ref.metadata[REF_METADATA_KEY]["controls"]),
             {self.arena.control, other.control},
@@ -300,7 +291,7 @@ class ArenaObjectClientTest(unittest.TestCase):
 
     def test_control_discovery_is_cached_between_capture_batches(self):
         self._refs(4)
-        self.adapter.produce_refs([_task(1, 5)], capture=_eagle3_contract())
+        self.adapter.produce_refs([_task(1, 5)])
         self.assertEqual(self.info_requests, ["http://server:30000/server_info"])
 
 

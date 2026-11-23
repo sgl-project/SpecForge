@@ -143,10 +143,7 @@ def build_application_run(
         resolved = resolve_run(run, registry, target_config=target_config)
     from specforge.training.assembly import build_training_run
 
-    return build_training_run(
-        resolved.config,
-        algorithm=resolved.algorithm,
-    )
+    return build_training_run((resolved,))
 
 
 __all__ = [
