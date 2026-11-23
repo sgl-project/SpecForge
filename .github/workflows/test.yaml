@@ -191,6 +191,13 @@ jobs:
           export PYTHONPATH=$PWD
           python -m unittest discover -s ./tests -p "test_*.py" -v
 
+      - name: Test optional TPU plugin
+        shell: bash
+        run: |
+          source sf/bin/activate
+          uv pip install --no-deps ./plugins/specforge-tpu
+          python -m unittest discover -s plugins/specforge-tpu/tests -v
+
       - name: Save cache
         run: |
           cp -p -r cache /github/home/
