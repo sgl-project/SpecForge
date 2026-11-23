@@ -44,7 +44,15 @@ ROOT = Path(__file__).resolve().parents[2]
 CUT, STEPS = 2, 4
 LEARNING_RATE = 1e-3
 # torchrun's rendezvous variables; an earlier in-process test may have left them set.
-DISTRIBUTED_ENV = ("RANK", "WORLD_SIZE", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT")
+DISTRIBUTED_ENV = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "NODE_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCHELASTIC_USE_AGENT_STORE",
+)
 # The pinned SGLang revision serves these; every other architecture must refuse.
 SGLANG_SERVED = {
     "DFlashDraftModel",
@@ -79,19 +87,22 @@ def drafts():
     ]
 
 
-def write_run(root, draft, *, records=3):
-    """Write a synthetic target, offline features and the run YAML; return its path."""
-    torch.manual_seed(0)
-    target = target_directory(root)
-    features = root / "features"
+def write_features(features, draft, records):
+    """Write fresh offline records from the current CPU RNG stream."""
     features.mkdir()
-    # Read over two epochs; with the default three records a four-step run
-    # crosses the epoch boundary.
     for index in range(records):
         record = {
             name: value[0].detach() for name, value in training_batch(draft).items()
         }
         torch.save(record, features / f"{index}.ckpt")
+
+
+def write_run(root, draft, *, records=3):
+    """Write a synthetic target, offline features and the run YAML; return its path."""
+    torch.manual_seed(0)
+    target = target_directory(root)
+    features = root / "features"
+    write_features(features, draft, records)
     raw = dict(
         draft=encode_config(draft),
         model=dict(

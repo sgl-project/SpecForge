@@ -772,6 +772,69 @@ class TestFeatureDataLoader(unittest.TestCase):
         self.assertEqual(store.health()["active_leases"], 0)
         self.assertIsNone(loader._prefetch_state)
 
+    def test_prefetch_close_settles_fetch_when_stop_precedes_claim(self):
+        inner = LocalFeatureStore("st")
+        ref = inner.put(
+            {"x": torch.tensor([1])}, sample_id="s0", metadata={"run_id": "run"}
+        )
+        queue = _RecordingQueue()
+        queue.put([ref])
+        store = _BlockingStore(inner)
+        loader = FeatureDataLoader(store, queue, batch_size=1, ack=False, num_workers=1)
+        iterator = iter(loader)
+        claim_started = threading.Event()
+        settlement_started = threading.Event()
+        claim_finished = threading.Event()
+
+        with futures.ThreadPoolExecutor(max_workers=1) as pool:
+            delivered = pool.submit(next, iterator, None)
+            try:
+                self.assertTrue(store.entered.wait(timeout=5))
+                state = loader._prefetch_state
+                claim = state.claim_for_yield
+                settle = state.settle_unyielded_fetch
+
+                def claim_during_close(future):
+                    claim_started.set()
+                    try:
+                        self.assertTrue(settlement_started.wait(timeout=5))
+                        return claim(future)
+                    finally:
+                        claim_finished.set()
+
+                def settle_after_claim(*args, **kwargs):
+                    # close has set stop but still owns this materialized fetch.
+                    settlement_started.set()
+                    self.assertTrue(claim_finished.wait(timeout=5))
+                    return settle(*args, **kwargs)
+
+                with (
+                    mock.patch.object(state, "claim_for_yield", claim_during_close),
+                    mock.patch.object(
+                        state, "settle_unyielded_fetch", settle_after_claim
+                    ),
+                ):
+                    store.resume.set()
+                    self.assertTrue(claim_started.wait(timeout=5))
+                    loader.close()
+                    self.assertIsNone(delivered.result(timeout=5))
+            finally:
+                store.resume.set()
+                settlement_started.set()
+                loader.close()
+        iterator.close()
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(
+            queue.failures,
+            [
+                (
+                    ["s0"],
+                    "loader_prefetch_closed_after_materialization_from_a_consume_once_store",
+                    False,
+                )
+            ],
+        )
+
     def test_prefetch_close_is_bounded_if_store_get_stalls(self):
         import specforge.runtime.data_plane.feature_dataloader as loader_module
 
