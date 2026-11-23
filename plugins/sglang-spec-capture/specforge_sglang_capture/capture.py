@@ -224,65 +224,54 @@ class CaptureObserver:
         if not self.runtime.is_writer:
             return None
         if any(item.prefix_len and item.error is None for item in checked):
-            checked, aux, last_hidden = self._restore_prefixes(
-                batch.reqs, checked, aux, last_hidden
+            return self._restore_prefixes(
+                batch.reqs, checked, aux, last_hidden, copy=can_run_graph
             )
         return CaptureDeviceOutput.from_rows(
             self.runtime, checked, aux, last_hidden, copy=can_run_graph
         )
 
-    def _restore_prefixes(self, reqs, items, aux, last_hidden):
+    def _restore_prefixes(self, reqs, items, aux, last_hidden, *, copy):
         cache = self.runtime.prefix_cache
         req_by_id = {req.rid: req for req in reqs}
+        can_restore = cache is not None and aux is not None and last_hidden is not None
         parts = []
-        restored = []
+        rebased = []
         hits = False
         cursor = 0
-        for item in items:
+        for i, item in enumerate(items):
             if item.error is not None:
-                restored.append(item)
+                rebased.append(item)
                 continue
-            req = req_by_id[item.rid]
-            tensors = tuple(
-                (
-                    tensor[item.start : item.start + item.length]
-                    if tensor is not None
-                    else None
-                )
-                for tensor in (aux, last_hidden)
-            )
             if item.prefix_len:
                 prefix = (
-                    cache.read(req, item.prefix_len)
-                    if cache is not None
-                    and all(tensor is not None for tensor in tensors)
+                    cache.read(req_by_id[item.rid], item.prefix_len)
+                    if can_restore
                     else None
                 )
                 if prefix is None:
-                    restored.append(dataclasses.replace(item, error=PREFIX_CACHE_MISS))
+                    item = dataclasses.replace(item, error=PREFIX_CACHE_MISS)
+                    items[i] = item
+                    rebased.append(item)
                     continue
                 parts.append(prefix)
                 hits = True
+            if can_restore:
+                span = slice(item.start, item.start + item.length)
+                parts.append((aux[span], last_hidden[span]))
             length = item.prefix_len + item.length
-            restored.append(dataclasses.replace(item, start=cursor, length=length))
+            rebased.append(dataclasses.replace(item, start=cursor, length=length))
             cursor += length
-            parts.append(tensors)
         if not hits:
-            # Preserve original offsets when returning the original tensors.
-            return (
-                [
-                    new if new.error else old
-                    for old, new in zip(items, restored, strict=True)
-                ],
-                aux,
-                last_hidden,
+            return CaptureDeviceOutput.from_rows(
+                self.runtime, items, aux, last_hidden, copy=copy
             )
 
-        tensors = tuple(
-            torch.cat(column, dim=0) if column[0] is not None else None
-            for column in zip(*parts, strict=True)
+        # The concatenations allocate fresh storage, including for graph outputs.
+        aux_parts, last_parts = zip(*parts, strict=True)
+        return CaptureDeviceOutput(
+            self.runtime, rebased, torch.cat(aux_parts), torch.cat(last_parts)
         )
-        return restored, *tensors
 
 
 def _select_rows(

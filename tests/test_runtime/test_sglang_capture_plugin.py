@@ -179,27 +179,56 @@ class TestObserver(unittest.TestCase):
         other = _req("other", 4, dict(_spec("other"), reuse_prefix=True))
         other.extra_key = "other-run"
         other._spec_capture_kv_page_heads = [20]
-        suffix = _logits_output(4)
+        cold = _req("cold", 3, _spec("cold"))
+        suffix = _logits_output(7)
+        expected_aux = torch.cat(
+            (
+                original.hidden_states[:2],
+                suffix.hidden_states[:2],
+                suffix.hidden_states[4:],
+            )
+        )
+        expected_last = torch.cat(
+            (
+                original.last_hidden_states[:2],
+                suffix.last_hidden_states[:2],
+                suffix.last_hidden_states[4:],
+            )
+        )
         device = runtime.observer.after_forward(
-            SimpleNamespace(reqs=[followup, other]),
-            _forward_batch([2, 2], [2, 2]),
+            SimpleNamespace(reqs=[followup, other, cold]),
+            _forward_batch([2, 2, 3], [2, 2, 0]),
             suffix,
-            can_run_graph=False,
+            can_run_graph=True,
         )
-        torch.testing.assert_close(
-            device.aux,
-            torch.cat((original.hidden_states[:2], suffix.hidden_states[:2])),
-        )
-        torch.testing.assert_close(
-            device.last_hidden,
-            torch.cat((original.last_hidden_states[:2], suffix.last_hidden_states[:2])),
-        )
+        # A subsequent graph replay can overwrite the suffix buffers.
+        suffix.hidden_states.zero_()
+        suffix.last_hidden_states.zero_()
+        torch.testing.assert_close(device.aux, expected_aux)
+        torch.testing.assert_close(device.last_hidden, expected_last)
         self.assertEqual(device.items[0].length, 4)
+        self.assertEqual(device.items[2].start, 4)
         error = capture.error_result(device.items[1].spec, device.items[1].error)
         self.assertEqual(error["error_code"], "prefix_cache_miss")
         cache.release(torch.tensor([10, 11]))
         self.assertFalse(cache.slots)
         self.assertIsNone(cache.read(followup, 2))
+
+    def test_prefix_miss_keeps_following_cold_rows(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=2)
+        miss = _req("miss", 4, dict(_spec("miss"), reuse_prefix=True))
+        cold = _req("cold", 3, _spec("cold"))
+        out = _logits_output(5)
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[miss, cold]),
+            _forward_batch([2, 3], [2, 0]),
+            out,
+            can_run_graph=False,
+        )
+        self.assertEqual(device.items[0].error, capture.PREFIX_CACHE_MISS)
+        self.assertEqual(device.items[1].start, 0)
+        torch.testing.assert_close(device.aux, out.hidden_states[2:])
+        torch.testing.assert_close(device.last_hidden, out.last_hidden_states[2:])
 
     def test_full_capture_at_one_page_needs_no_hidden_admission(self):
         runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=4)

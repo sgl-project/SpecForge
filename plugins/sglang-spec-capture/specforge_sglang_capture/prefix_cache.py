@@ -120,7 +120,12 @@ class HiddenPrefixCache:
     def read(self, req, length):
         heads = getattr(req, "_spec_capture_kv_page_heads", ())
         count = length // self.page_size
-        if length % self.page_size or len(heads) < count or not self.buffers:
+        if (
+            not count
+            or length % self.page_size
+            or len(heads) < count
+            or not self.buffers
+        ):
             return None
         slots = [self.slots.get(head) for head in heads[:count]]
         if None in slots:
