@@ -34,7 +34,7 @@ from specforge.runtime.data_plane.mooncake_rdma import (
 )
 
 if TYPE_CHECKING:
-    from specforge.algorithms.registry import AlgorithmRegistration
+    from specforge.application import ResolvedRun
 
 LaunchRole = Literal["auto", "all", "producer", "consumer", "both"]
 PlanKind = Literal["worker", "command", "supervisor", "managed_supervisor"]
@@ -822,19 +822,19 @@ def _managed_local_services(
 
 
 def _trainer_preflight_checks(
-    cfg: Config,
-    algorithm: Optional["AlgorithmRegistration"],
+    runs: Sequence["ResolvedRun"],
 ) -> tuple[Callable[[], None], ...]:
     """Trainer-side import checks a supervisor runs before it spawns anything.
 
     The supervisor runs on the trainer host, so its device matches the
     trainer's; the trainer rank still owns the authoritative resolution.
     """
-    if algorithm is None:
-        return ()
     from specforge.training.model_loading import preflight_draft_kernels
 
-    return (partial(preflight_draft_kernels, cfg, algorithm=algorithm),)
+    return tuple(
+        partial(preflight_draft_kernels, run.config, algorithm=run.algorithm)
+        for run in runs
+    )
 
 
 def _worker_argv(
@@ -970,7 +970,7 @@ def _validate_capture_urls(
 def build_launch_plan(
     cfg: Config,
     *,
-    algorithm: Optional["AlgorithmRegistration"] = None,
+    runs: Sequence["ResolvedRun"],
     config_path: str,
     overrides: Sequence[str] = (),
     requested_role: LaunchRole = "auto",
@@ -984,6 +984,10 @@ def build_launch_plan(
     ] = None,
 ) -> LaunchPlan:
     """Resolve one validated config into a side-effect-free process plan.
+
+    *cfg* is the config as loaded; it holds the stack every run shares. *runs*
+    are the runs this process is for, and ``--role both`` starts one trainer
+    for each of them.
 
     A managed-local stack on RDMA reads the host's HCAs from sysfs;
     *rdma_device_resolver* replaces that probe (``(rdma_devices, *, defaulted,
@@ -1009,10 +1013,6 @@ def build_launch_plan(
     distributed = _distributed_state(base_env)
     deployment = cfg.deployment.disaggregated
     managed_local = deployment.managed_local if deployment is not None else None
-    if managed_local is not None and algorithm is None:
-        raise ValueError(
-            "managed_local launch planning requires a resolved algorithm registration"
-        )
     managed_child = base_env.get(_MANAGED_CHILD_ENV) == "1"
     if managed_local is not None:
         if managed_child:
@@ -1041,19 +1041,19 @@ def build_launch_plan(
                     f"exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
-    topology = cfg.deployment.trainer
-    if role == "both" and topology.nnodes > 1:
+    trainer_runs = () if role == "producer" else runs
+    if role == "both" and any(
+        run.config.deployment.trainer.nnodes > 1 for run in trainer_runs
+    ):
         raise ValueError(
             "automatic disaggregated --role both supports one trainer node only; "
             "launch producer and each consumer node explicitly"
         )
-    resolved_rank = (
-        _resolved_node_rank(cfg, node_rank, base_env)
-        if role in ("all", "consumer", "both")
-        else None
-    )
+    trainer_ranks = [
+        _resolved_node_rank(run.config, node_rank, base_env) for run in trainer_runs
+    ]
     producer_env: dict[str, str] = {}
-    consumer_env: dict[str, str] = {}
+    trainer_envs: list[dict[str, str]] = [{} for _ in trainer_runs]
     if cfg.deployment.mode == "disaggregated":
         role_base_env = base_env
         managed_environment: dict[str, str] = {}
@@ -1073,8 +1073,10 @@ def build_launch_plan(
             role_base_env = {**base_env, **managed_environment}
         if role in ("producer", "both"):
             producer_env = _disaggregated_env(cfg, role_base_env, role="producer")
-        if role in ("consumer", "both"):
-            consumer_env = _disaggregated_env(cfg, role_base_env, role="consumer")
+        trainer_envs = [
+            _disaggregated_env(run.config, role_base_env, role="consumer")
+            for run in trainer_runs
+        ]
         if managed_local is not None:
             device_visibility_env = _device_visibility_env_var()
             producer_env.update(managed_environment)
@@ -1082,21 +1084,25 @@ def build_launch_plan(
                 device_visibility_env
             )
             producer_env[_MANAGED_CHILD_ENV] = "1"
-            consumer_env.update(managed_environment)
-            consumer_env[device_visibility_env] = ",".join(
-                managed_local.trainer_cuda_visible_devices
-            )
-            consumer_env[_MANAGED_CHILD_ENV] = "1"
+            for run, trainer_env in zip(trainer_runs, trainer_envs):
+                run_managed_local = run.config.deployment.disaggregated.managed_local
+                trainer_env.update(managed_environment)
+                trainer_env[device_visibility_env] = ",".join(
+                    run_managed_local.trainer_cuda_visible_devices
+                )
+                trainer_env[_MANAGED_CHILD_ENV] = "1"
 
     _validate_capture_urls(cfg, role=role, base_env=base_env)
-    _validate_consumer_database(
-        cfg,
-        role=role,
-        launch_env=consumer_env,
-        base_env=base_env,
-        distributed=distributed,
-        node_rank=resolved_rank,
-    )
+    trainers = list(zip(trainer_runs, trainer_envs, trainer_ranks))
+    for run, trainer_env, trainer_rank in trainers:
+        _validate_consumer_database(
+            run.config,
+            role=role,
+            launch_env=trainer_env,
+            base_env=base_env,
+            distributed=distributed,
+            node_rank=trainer_rank,
+        )
     if distributed:
         assert role != "both"
         if role == "producer" and int(base_env["WORLD_SIZE"]) > 1:
@@ -1105,6 +1111,8 @@ def build_launch_plan(
                 "torchrun worker"
             )
         if role != "producer":
+            ((run, trainer_env, _),) = trainers
+            topology = run.config.deployment.trainer
             actual_world_size = int(base_env["WORLD_SIZE"])
             expected_world_size = topology.nnodes * topology.nproc_per_node
             if actual_world_size != expected_world_size:
@@ -1114,8 +1122,8 @@ def build_launch_plan(
                     f"({topology.nnodes} * {topology.nproc_per_node} = "
                     f"{expected_world_size})"
                 )
-            cfg.validate_world_size(actual_world_size)
-        worker_env = producer_env if role == "producer" else consumer_env
+            run.config.validate_world_size(actual_world_size)
+        worker_env = producer_env if role == "producer" else trainer_env
         return LaunchPlan("worker", role, worker_env=worker_env)
 
     worker_prefix = tuple(worker_prefix or (sys.executable, "-m", "specforge.cli"))
@@ -1129,19 +1137,20 @@ def build_launch_plan(
     if role == "producer":
         return LaunchPlan("worker", role, worker_env=producer_env)
     if role in ("all", "consumer"):
+        ((run, trainer_env, trainer_rank),) = trainers
         command = _trainer_command(
-            cfg,
+            run.config,
             config_path=config_path,
             role=role,
             overrides=overrides,
             worker_prefix=worker_prefix,
             torchrun_prefix=torchrun_prefix,
             distributed_entry=distributed_entry,
-            node_rank=resolved_rank,
-            env=consumer_env,
+            node_rank=trainer_rank,
+            env=trainer_env,
         )
         if command.argv[: len(worker_prefix)] == worker_prefix:
-            return LaunchPlan("worker", role, worker_env=consumer_env)
+            return LaunchPlan("worker", role, worker_env=trainer_env)
         if deployment is not None:
             return LaunchPlan(
                 "command",
@@ -1152,9 +1161,17 @@ def build_launch_plan(
         return LaunchPlan("command", role, commands=(command,))
 
     if managed_local is not None:
-        from specforge.training.capture_contract import resolve_server_capture_contract
+        from specforge.training.capture_contract import (
+            combine_capture_contracts,
+            resolve_server_capture_contract,
+        )
 
-        contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
+        contract = combine_capture_contracts(
+            [
+                resolve_server_capture_contract(run.config, algorithm=run.algorithm)
+                for run in runs
+            ]
+        )
         requested_capture = requested_server_capture(cfg, base_env)
         server_capture: str = requested_capture
         server_capture_error: Optional[str] = None
@@ -1176,22 +1193,25 @@ def build_launch_plan(
         tuple(_worker_argv(worker_prefix, config_path, "producer", overrides)),
         producer_env,
     )
-    consumer = _trainer_command(
-        cfg,
-        config_path=config_path,
-        role="consumer",
-        overrides=overrides,
-        worker_prefix=worker_prefix,
-        torchrun_prefix=torchrun_prefix,
-        distributed_entry=distributed_entry,
-        node_rank=resolved_rank,
-        env=consumer_env,
-    )
+    trainer_commands = [
+        _trainer_command(
+            run.config,
+            config_path=config_path,
+            role="consumer",
+            overrides=overrides,
+            worker_prefix=worker_prefix,
+            torchrun_prefix=torchrun_prefix,
+            distributed_entry=distributed_entry,
+            node_rank=trainer_rank,
+            env=trainer_env,
+        )
+        for run, trainer_env, trainer_rank in trainers
+    ]
     if managed_local is not None:
         return LaunchPlan(
             "managed_supervisor",
             "both",
-            commands=(producer, consumer),
+            commands=(producer, *trainer_commands),
             services=_managed_local_services(
                 cfg,
                 contract=contract,
@@ -1214,14 +1234,14 @@ def build_launch_plan(
                 cfg, managed_environment
             ),
             managed_rdma_error=managed_rdma_error,
-            preflight_checks=_trainer_preflight_checks(cfg, algorithm),
+            preflight_checks=_trainer_preflight_checks(runs),
             shutdown_grace_s=managed_local.shutdown_grace_s,
         )
     return LaunchPlan(
         "supervisor",
         "both",
-        commands=(producer, consumer),
-        preflight_checks=_trainer_preflight_checks(cfg, algorithm),
+        commands=(producer, *trainer_commands),
+        preflight_checks=_trainer_preflight_checks(runs),
         shutdown_grace_s=deployment.shutdown_grace_s,
     )
 

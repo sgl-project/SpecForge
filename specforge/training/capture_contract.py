@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
@@ -16,6 +17,20 @@ class ServerCaptureContract:
     target_hidden_size: int
     target_vocab_size: int
     draft_vocab_size: int
+
+
+def combine_capture_contracts(
+    contracts: Sequence[ServerCaptureContract],
+) -> ServerCaptureContract:
+    """Combine capture layers, keeping the first contract's other settings."""
+    first = contracts[0]
+    aux_layer_ids = first.aux_layer_ids
+    if any(contract.aux_layer_ids != aux_layer_ids for contract in contracts):
+        layers = set()
+        for contract in contracts:
+            layers.update(contract.aux_layer_ids)
+        aux_layer_ids = tuple(sorted(layers))
+    return replace(first, aux_layer_ids=aux_layer_ids)
 
 
 def resolve_server_capture_contract(
@@ -62,4 +77,8 @@ def resolve_server_capture_contract(
     )
 
 
-__all__ = ["ServerCaptureContract", "resolve_server_capture_contract"]
+__all__ = [
+    "ServerCaptureContract",
+    "combine_capture_contracts",
+    "resolve_server_capture_contract",
+]

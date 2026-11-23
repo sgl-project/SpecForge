@@ -237,8 +237,8 @@ def train(
     target_config = training_target_config(cfg)
     resolved = resolve_run(cfg, target_config=target_config)
     launch = build_launch_plan(
-        resolved.config,
-        algorithm=resolved.algorithm,
+        cfg,
+        runs=(resolved,),
         config_path=config_path,
         overrides=overrides,
         requested_role=role,

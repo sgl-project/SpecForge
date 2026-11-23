@@ -20,6 +20,7 @@ from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
+from specforge.application import ResolvedRun
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
 from specforge.config.draft.codec import encode_config
@@ -82,7 +83,8 @@ def build_launch_plan(cfg, **kwargs):
     """
     kwargs.setdefault("rdma_device_resolver", _fake_rdma_devices)
     kwargs.setdefault("capture_module_probe", _installed_capture("plugin"))
-    return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
+    kwargs.setdefault("runs", (ResolvedRun(cfg, ALGORITHM),))
+    return _build_launch_plan(cfg, **kwargs)
 
 
 def _managed_raw(control_dir="/fresh/managed-transport", **mooncake):
@@ -181,6 +183,29 @@ CAPTURE_CONTRACT = ServerCaptureContract(
     target_vocab_size=151936,
     draft_vocab_size=151936,
 )
+
+
+def _drafter_runs(cfg):
+    """Runs ``dflash`` and ``dspark`` on the managed stack of *cfg*."""
+    runs = []
+    for name, devices in (("dflash", ["4", "5"]), ("dspark", ["6"])):
+        raw = cfg.model_dump()
+        raw["run_id"] = f"{cfg.run_id}-{name}"
+        raw["deployment"]["trainer"]["nproc_per_node"] = len(devices)
+        disaggregated = raw["deployment"]["disaggregated"]
+        disaggregated["control_dir"] = os.path.join(disaggregated["control_dir"], name)
+        disaggregated["store_id"] = cfg.run_id
+        disaggregated["managed_local"]["trainer_cuda_visible_devices"] = devices
+        runs.append(ResolvedRun(Config.model_validate(raw), ALGORITHM))
+    return tuple(runs)
+
+
+DRAFTER_CONTRACTS = {
+    "specforge-run-dflash": replace(CAPTURE_CONTRACT, aux_layer_ids=(1, 9)),
+    "specforge-run-dspark": replace(
+        CAPTURE_CONTRACT, method="dspark", aux_layer_ids=(1, 5)
+    ),
+}
 
 
 def _managed_plan(root):
@@ -443,9 +468,10 @@ class LaunchPlanTest(unittest.TestCase):
                     return_value=CAPTURE_CONTRACT,
                 ),
             ):
+                cfg = Config.model_validate(raw)
                 return _build_launch_plan(
-                    Config.model_validate(raw),
-                    algorithm=ALGORITHM,
+                    cfg,
+                    runs=(ResolvedRun(cfg, ALGORITHM),),
                     config_path="run.yaml",
                     env={},
                     capture_module_probe=_installed_capture("plugin"),
@@ -862,6 +888,102 @@ class LaunchPlanTest(unittest.TestCase):
         )
         self.assertEqual((consumer.kind, consumer.role), ("command", "consumer"))
         self.assertIn("--nproc_per_node", consumer.commands[0].argv)
+
+    def test_a_managed_local_stack_starts_one_trainer_per_drafter(self):
+        with tempfile.TemporaryDirectory() as root:
+            control_dir = os.path.join(root, "attempt")
+            cfg = _managed_config(control_dir)
+            runs = _drafter_runs(cfg)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                side_effect=lambda run_cfg, algorithm: DRAFTER_CONTRACTS[
+                    run_cfg.run_id
+                ],
+            ):
+                plan = build_launch_plan(
+                    cfg,
+                    runs=runs,
+                    config_path="run.yaml",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env={},
+                )
+            os.makedirs(os.path.join(control_dir, "logs"))
+            children = [
+                build_launch_plan(
+                    cfg,
+                    runs=(run,),
+                    config_path="run.yaml",
+                    requested_role="consumer",
+                    worker_prefix=("specforge",),
+                    torchrun_prefix=("torchrun",),
+                    env=trainer.env,
+                    rdma_device_resolver=_unexpected_rdma_devices,
+                )
+                for run, trainer in zip(runs, plan.commands[1:])
+            ]
+
+        self.assertEqual((plan.kind, plan.role), ("managed_supervisor", "both"))
+        self.assertEqual(plan.managed_root, control_dir)
+        self.assertEqual(len(plan.preflight_checks), 2)
+        producer, dflash, dspark = plan.commands
+        self.assertEqual(
+            producer.argv,
+            ("specforge", "train", "--config", "run.yaml", "--role", "producer"),
+        )
+        self.assertEqual(producer.env["DISAGG_STORE_ID"], "specforge-run")
+        self.assertEqual(
+            dflash.argv,
+            (
+                "torchrun",
+                "--standalone",
+                "--nproc_per_node",
+                "2",
+                "specforge",
+                "train",
+                "--config",
+                "run.yaml",
+                "--role",
+                "consumer",
+            ),
+        )
+        self.assertEqual(
+            dspark.argv,
+            (
+                "specforge",
+                "train",
+                "--config",
+                "run.yaml",
+                "--role",
+                "consumer",
+            ),
+        )
+        for trainer, name, devices in (
+            (dflash, "dflash", "4,5"),
+            (dspark, "dspark", "6"),
+        ):
+            self.assertEqual(trainer.env["CUDA_VISIBLE_DEVICES"], devices)
+            self.assertEqual(trainer.env["DISAGG_STORE_ID"], "specforge-run")
+            self.assertEqual(
+                trainer.env["DISAGG_REF_CHANNEL"],
+                os.path.join(control_dir, name, "refs.jsonl"),
+            )
+            self.assertEqual(
+                trainer.env["DISAGG_DB"],
+                os.path.join(control_dir, name, "consumer.sqlite"),
+            )
+        argv = plan.services[1].command.argv
+        self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+        layer_index = argv.index("--return-aux-hidden-state-layer-ids")
+        self.assertEqual(argv[layer_index + 1 : layer_index + 4], ("1", "5", "9"))
+        self.assertEqual(
+            [(child.kind, child.role) for child in children],
+            [("command", "consumer"), ("worker", "consumer")],
+        )
+        self.assertEqual(
+            children[1].worker_env["DISAGG_REF_CHANNEL"],
+            os.path.join(control_dir, "dspark", "refs.jsonl"),
+        )
 
     def test_managed_local_schema_round_trips_and_validates_resources(self):
         cfg = _managed_config("/fresh/managed-attempt")
