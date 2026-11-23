@@ -145,6 +145,7 @@ export default defineConfig({
           text: 'Basic Usage',
           items: [
             { text: 'Data Preparation', link: '/basic_usage/data_preparation' },
+            { text: 'Offline Feature Capture', link: '/basic_usage/offline_capture' },
             { text: 'Training', link: '/basic_usage/training' },
             { text: 'Disaggregated Training', link: '/basic_usage/disaggregated_training' },
             { text: 'AMD ROCm Tutorial', link: '/basic_usage/AMD/amd_rocm' },

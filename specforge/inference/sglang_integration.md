@@ -41,7 +41,7 @@ to plugin servers through `--server-urls`. The CPU client checks the target,
 capture method and layer order, reads Mooncake features, and writes the existing
 algorithm-specific `.ckpt` or `.ckpt.gz` files before releasing temporary objects.
 There is no local ModelRunner or SGLang patch in the preparation client.
-See [offline preparation](../../examples/offline/README.md) for server setup,
+See [offline preparation](../../docs/sections/basic_usage/offline_capture.md) for server setup,
 worker sharding and resume behavior.
 
 Training from already prepared feature files does not require a capture server.

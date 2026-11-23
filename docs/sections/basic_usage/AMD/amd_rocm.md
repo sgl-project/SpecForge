@@ -150,7 +150,7 @@ radix cache selects the `extra_buffer` strategy, which asserts CUDA/MUSA/NPU
 (FLA) at server init and fails on ROCm:
 
 Start the compatible plugin server and Mooncake following the
-[offline guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md), with
+[offline guide](../offline_capture.md), with
 `SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1`
 and server flags `--attention-backend aiter --disable-radix-cache
 --mem-fraction-static 0.8 --context-length 2560`. Then run the CPU client:
