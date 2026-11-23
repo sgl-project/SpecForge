@@ -80,7 +80,10 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--moe-dp-size": ("--moe-data-parallel-size",),
     "--dcp-replicate-q-proj": ("--no-dcp-replicate-q-proj",),
     "--enable-tp-lm-head-all-to-all": ("--no-enable-tp-lm-head-all-to-all",),
-    "--smg-http-sidecar-port": ("--grpc-http-sidecar-port",),
+    "--enable-flashmla-prefill-token-packing": (
+        "--no-enable-flashmla-prefill-token-packing",
+    ),
+    "--allow-local-media-files": ("--no-allow-local-media-files",),
     "--speculative-draft-model-path": ("--speculative-draft-model",),
     "--hisparse-config": ("--hierarchical-sparse-attention-extra-config",),
     "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),

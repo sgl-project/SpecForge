@@ -1765,10 +1765,6 @@ class LaunchPlanTest(unittest.TestCase):
 
     def test_passthrough_rejects_aliases_of_the_same_option(self):
         pairs = (
-            (
-                ("--smg-http-sidecar-port", "31000"),
-                ("--grpc-http-sidecar-port", "32000"),
-            ),
             (("--pp-size", "1"), ("--pipeline-parallel-size", "2")),
             (
                 ("--speculative-draft-model-path", "a"),

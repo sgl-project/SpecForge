@@ -437,7 +437,7 @@ class CaptureRuntime:
 
 def install(scheduler) -> CaptureRuntime:
     """Validate the server configuration and wire capture into ``scheduler``."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 
     if scheduler.disaggregation_mode != DisaggregationMode.NULL:

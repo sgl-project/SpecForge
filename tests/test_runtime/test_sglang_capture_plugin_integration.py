@@ -143,10 +143,13 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
         enter_scope(self, published_topology(ranks={"dp_rank": 0}))
 
     def _scheduler(self, outputs, runtime):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.scheduler_components.output_streamer import (
             SchedulerOutputStreamer,
+        )
+        from sglang.srt.managers.scheduler_components.request_retirer import (
+            RequestRetirer,
         )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from specforge_sglang_capture.capture import capture_streamer_class
@@ -164,6 +167,8 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
         scheduler = object.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.output_streamer = streamer
+        scheduler.request_retirer = object.__new__(RequestRetirer)
+        scheduler.init_deferred_responses()
         runtime.defer_response = scheduler.defer_response
         streamer.spec_capture_results = runtime.results
         return scheduler
@@ -225,14 +230,14 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
 
         # Only the plain request streams while the capture is being written.
         self.assertEqual([o.rids for o in outputs], [["plain"]])
-        self.assertTrue(scheduler.has_pending_deferred_outputs())
+        self.assertTrue(scheduler.deferred_responses.has_pending())
 
         deadline = time.monotonic() + 30
         while not outputs[1:] and time.monotonic() < deadline:
-            scheduler.stream_released_deferred_outputs()
+            scheduler.deferred_responses.stream_released()
             time.sleep(0.01)
         self.assertEqual(outputs[1].rids, ["cap"])
-        self.assertFalse(scheduler.has_pending_deferred_outputs())
+        self.assertFalse(scheduler.deferred_responses.has_pending())
 
         # The objects hold the capture request's rows, byte for byte.
         def stored(name, like):
