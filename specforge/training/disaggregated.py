@@ -24,8 +24,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
-from specforge.config.schema import resolve_ref_watermarks
-from specforge.runtime.contracts import consumer_dispatch_quantum
+from specforge.config.schema import resolve_dispatch_watermarks
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -254,48 +253,6 @@ def _online_prompt_seed(cfg: Config) -> int:
     """Resolve prompt ordering independently while preserving old configs."""
     configured = getattr(cfg.training, "prompt_seed", None)
     return cfg.training.seed if configured is None else configured
-
-
-def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
-    """Resolve and validate producer ref watermarks before prompt preparation.
-
-    The consumer needs one or two complete optimizer windows before dispatch.
-    Validating this contract only after tokenizing/materializing prompts can
-    waste tens of minutes and many GiB for a large online dataset.
-    """
-    from specforge.runtime.control_plane.flow_control import FlowControlLimits
-
-    high, low = resolve_ref_watermarks(
-        cfg.runtime.in_flight_high_watermark, cfg.runtime.in_flight_low_watermark
-    )
-    limits = FlowControlLimits(
-        high_watermark_refs=high,
-        low_watermark_refs=low,
-        max_prompt_lease_per_worker=cfg.runtime.producer_lease,
-    )
-    trainer = cfg.deployment.trainer
-    consumer_quantum = consumer_dispatch_quantum(
-        cfg.runtime.consumer_dispatch,
-        trainer.nnodes
-        * trainer.nproc_per_node
-        * cfg.training.batch_size
-        * cfg.training.accumulation_steps,
-    )
-    if high < consumer_quantum:
-        raise ValueError(
-            "producer in-flight high watermark "
-            f"{high} is smaller than the consumer's dispatch "
-            f"quantum {consumer_quantum}; set "
-            "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
-        )
-    if limits.resolved_low_watermark_refs < consumer_quantum:
-        raise ValueError(
-            "producer in-flight low watermark "
-            f"{limits.resolved_low_watermark_refs} is smaller than the "
-            f"consumer's dispatch quantum {consumer_quantum}; "
-            "set DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
-        )
-    return high, low
 
 
 def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
@@ -650,7 +607,9 @@ def _build_online(
 
         # This check is independent of dataset size. Keep it before tokenizer
         # loading and prompt preparation so an invalid window fails cheaply.
-        in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
+        in_flight_high_watermark, in_flight_low_watermark = resolve_dispatch_watermarks(
+            cfg
+        )
         input_adapter = streaming.create_input_adapter(cfg)
         input_tools = _load_input_tools(
             cfg,
