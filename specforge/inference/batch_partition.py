@@ -34,35 +34,6 @@ class TargetBatchPartition:
         if not 0 <= self.rank < self.size:
             raise ValueError(f"target TP rank {self.rank} is outside [0, {self.size})")
 
-    @classmethod
-    def from_distributed(cls, configured_size: int) -> "TargetBatchPartition":
-        """Resolve the local target-TP rank and verify the configured group."""
-        import torch.distributed as dist
-
-        configured_size = int(configured_size)
-        if configured_size < 1:
-            raise ValueError(
-                f"configured target TP size must be >= 1, got {configured_size}"
-            )
-        if not (dist.is_available() and dist.is_initialized()):
-            if configured_size != 1:
-                raise RuntimeError(
-                    "target tp_size > 1 requires an initialized distributed "
-                    "process group"
-                )
-            return cls()
-
-        from specforge.distributed import get_tp_group
-
-        group = get_tp_group()
-        actual_size = dist.get_world_size(group)
-        if actual_size != configured_size:
-            raise ValueError(
-                "configured target TP size does not match the initialized group: "
-                f"configured={configured_size}, actual={actual_size}"
-            )
-        return cls(rank=dist.get_rank(group), size=actual_size)
-
     def target_batch_size(self, local_batch_size: int) -> int:
         if local_batch_size < 0:
             raise ValueError(
