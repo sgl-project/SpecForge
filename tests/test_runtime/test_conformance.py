@@ -409,9 +409,10 @@ class MutationTest(unittest.TestCase):
         found = self.changed("gradients scaled by the world size")
         for name, lines in found.items():
             with self.subTest(case=name):
-                self.assertIn(
-                    f"recording.{name}[0].logged[0].metrics.grad_norm: values differ",
-                    lines,
+                where = f"recording.{name}[0].logged[0].metrics.grad_norm: "
+                self.assertTrue(
+                    any(line.startswith(where) for line in lines),
+                    f"{where} not among {lines}",
                 )
 
     def test_shifted_schedule_shows_in_the_first_applied_rate(self):

@@ -13,7 +13,11 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import IncompleteWindow, StepContext
 from specforge.training.controller import TrainerController
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
-from tests.test_modeling.test_dspine_distributed import fixed_anchors, uneven_batch
+from tests.test_modeling.test_dspine_distributed import (
+    fixed_anchors,
+    per_microbatch_objective,
+    uneven_batch,
+)
 from tests.test_runtime._fixtures import build_runner, train_window
 
 
@@ -53,7 +57,7 @@ class DSpineAccumulationTest(unittest.TestCase):
                     )
                 )
                 split = copy.deepcopy(full)
-                (full_runner, full_optimizer) = training_runner(full)
+                (_, full_optimizer) = training_runner(full)
                 (split_runner, split_optimizer) = training_runner(split)
                 for window in range(2):
                     batches = [uneven_batch(), uneven_batch()]
@@ -62,12 +66,10 @@ class DSpineAccumulationTest(unittest.TestCase):
                         for name in batches[0]
                     }
                     ctx = StepContext(global_step=300 + window, total_steps=600)
-                    expected = train_window(
-                        full_runner,
-                        [TrainBatch(["0", "1", "2", "3"], "dspine", inputs)],
-                        ctx,
-                    )
                     width = 4 // accumulation_steps
+                    expected = per_microbatch_objective(full, inputs, width, ctx)
+                    expected.backward()
+                    full_optimizer.step()
                     actual = train_window(
                         split_runner,
                         [
@@ -86,8 +88,8 @@ class DSpineAccumulationTest(unittest.TestCase):
                     # One optimizer step per window, however it is split.
                     self.assertEqual(len(split_optimizer.gradients), window + 1)
                     self.assertLessEqual(
-                        abs(actual.loss - expected.loss),
-                        max(1e-12, 2e-06 * abs(expected.loss)),
+                        abs(actual.loss - expected.item()),
+                        max(1e-12, 2e-06 * abs(expected.item())),
                     )
                     for got, want in zip(
                         split_optimizer.gradients[-1], full_optimizer.gradients[-1]

@@ -211,3 +211,5 @@ class PredictionBatch:
     #: Under "sum_means": callable(per-set PlanResults) returning detached ratio
     #: pairs that name what each set's loss already computed.
     set_metrics: Callable | None = None
+    # Optional protocol reduction after all chunks of a microbatch are combined.
+    finalize: Callable | None = None

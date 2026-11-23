@@ -12,26 +12,26 @@ training step is shown to leave training unchanged:
     python -m tests.test_runtime.trajectories record after.pt    # on the change
     python -m tests.test_runtime.trajectories compare before.pt after.pt
 
-Both recordings have to come from the same machine and torch build: across
-those, floating-point results differ in the last bits.
+Use the same recorder, machine and torch build on both revisions. Recorder
+changes can alter the stored fields and fixtures. By default the matrix runs
+the topologies the host can place, including four-rank EAGLE3 sequence
+parallelism when CUDA, FlashAttention and Yunchang are available.
 """
 
 import argparse
+import math
 import os
-import random
 import re
-import shutil
-import socket
 import struct
 import sys
-import time
-from contextlib import closing, nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 from torch.nn.modules.module import register_module_forward_pre_hook
 from torch.nn.parallel import DistributedDataParallel
@@ -42,7 +42,11 @@ from torch.optim.optimizer import (
 
 from specforge.training.checkpoint import STATE_FILE
 from specforge.utils import get_device_type
-from tests.test_runtime.test_canonical_end_to_end import drafts, write_run
+from tests.test_runtime.test_canonical_end_to_end import (
+    drafts,
+    write_features,
+    write_run,
+)
 
 EPOCHS = 2
 BATCHES_PER_EPOCH = 3
@@ -74,6 +78,9 @@ SHARED_STATE = (
     "epoch_batch",
     "epoch_samples",
     "world_size",
+    "sampler_seed",
+    "offline_sampler_version",
+    "source_dataset_size",
 )
 # Half of a run's updates warm up: the shortest run has one warmup update.
 WARMUP_RATIO = 0.5
@@ -91,34 +98,108 @@ class Case:
     dtype: str = "float32"
     log_interval: int = 1
     evaluated: bool = False
+    empty_eval_rank: int | None = None
+    sp_ulysses_size: int = 1
+    batch_size: int = 1
 
     @property
     def name(self):
-        return (
+        name = (
             f"{self.architecture}/ranks{self.world_size}"
             f"/accumulation{self.accumulation_steps}/{self.sharding}/{self.dtype}"
-            f"/log{self.log_interval}" + ("/evaluated" if self.evaluated else "")
+            f"/log{self.log_interval}"
         )
+        if self.evaluated:
+            name += "/evaluated"
+        if self.empty_eval_rank is not None:
+            name += f"/empty-eval-rank{self.empty_eval_rank}"
+        if self.sp_ulysses_size > 1:
+            name += f"/ulysses{self.sp_ulysses_size}/lk_lambda"
+        if self.batch_size > 1:
+            name += f"/batch{self.batch_size}"
+        return name
+
+    @property
+    def batches_per_epoch(self):
+        # SP peers share one sample. Each data replica therefore reads more
+        # records from the same dataset of three records per global rank.
+        return BATCHES_PER_EPOCH * self.sp_ulysses_size
+
+    @property
+    def window_size(self):
+        return self.accumulation_steps * self.sp_ulysses_size
 
     @property
     def updates(self):
         """Optimizer updates the run reaches: windows span the epoch boundary."""
-        return EPOCHS * BATCHES_PER_EPOCH // self.accumulation_steps
+        return EPOCHS * self.batches_per_epoch // self.window_size
+
+
+# One reference for each additional world size used by a bundled trainer recipe.
+_RECIPE_CASES = (
+    ("DFlash2DraftModel", 3),
+    ("DFlashDraftModel", 7),
+    ("Eagle3DraftModel", 8),
+    ("MTPDraftModel", 10),
+    ("DFlashDraftModel", 14),
+)
+
+_USP_CASE = Case(
+    "Eagle3DraftModel",
+    world_size=4,
+    accumulation_steps=2,
+    dtype="bfloat16",
+    sp_ulysses_size=2,
+)
 
 
 def every_case(ranks=()):
-    """Every architecture under every topology, and under each extra world size."""
+    """Canonical runs, plus DDP and FSDP for every draft at any requested size."""
     topologies = list(TOPOLOGIES)
     for world_size in ranks:
+        if world_size < 1:
+            raise ValueError(f"--ranks requires positive world sizes, got {world_size}")
         wider = dict(world_size=world_size, accumulation_steps=2)
         topologies += [wider, wider | _SHARDED | dict(dtype="bfloat16")]
-    return list(
-        dict.fromkeys(
-            Case(draft.architecture, **topology)
-            for draft in drafts()
-            for topology in topologies
+    selected = [
+        Case(draft.architecture, **topology)
+        for draft in drafts()
+        for topology in topologies
+    ]
+    selected.extend(
+        Case(
+            architecture,
+            world_size=world,
+            accumulation_steps=2,
+            dtype="bfloat16",
+            **_SHARDED,
         )
+        for architecture, world in _RECIPE_CASES
     )
+    selected.append(_USP_CASE)
+    selected.append(Case("DFlashDraftModel", accumulation_steps=2, batch_size=2))
+    selected.append(
+        Case("DFlashDraftModel", **_TWO_RANKS, evaluated=True, empty_eval_rank=1)
+    )
+    return list(dict.fromkeys(selected))
+
+
+def _usp_available(device_type):
+    if device_type != "cuda" or torch.version.hip is not None:
+        return False
+    if any(
+        torch.cuda.get_device_capability(i)[0] < 8 for i in range(_USP_CASE.world_size)
+    ):
+        return False
+    from specforge.modeling.draft.layers.attention.backends.cached_flash import (
+        _std_flash_attn_varlen_func,
+    )
+
+    try:
+        from yunchang.comm import SeqAllToAll4D
+    except ImportError:
+        return False
+    return _std_flash_attn_varlen_func is not None and SeqAllToAll4D is not None
 
 
 def cases(ranks=()):
@@ -128,11 +209,27 @@ def cases(ranks=()):
     unless the host has an accelerator to compute on, so a CPU trainer records
     the DDP cases only.
     """
+    ranks = tuple(ranks)
+    selected = every_case(ranks)
     device_type = get_device_type()
     if device_type == "cpu":
-        return [case for case in every_case(ranks) if case.sharding == "NO_SHARD"]
+        return [
+            case
+            for case in selected
+            if case.sharding == "NO_SHARD" and case.sp_ulysses_size == 1
+        ]
     devices = torch.get_device_module(device_type).device_count()
-    return [case for case in every_case(ranks) if case.world_size <= devices]
+    if any(world > devices for world in ranks):
+        raise ValueError(
+            f"--ranks {list(ranks)} requires more than the {devices} visible "
+            f"{device_type} devices"
+        )
+    return [
+        case
+        for case in selected
+        if case.world_size <= devices
+        and (case.sp_ulysses_size == 1 or _usp_available(device_type))
+    ]
 
 
 def _vary_records(features):
@@ -151,53 +248,47 @@ def _vary_records(features):
         torch.save(record, path)
 
 
-def _evaluation(root, world_size):
-    """Set two of the run's records per rank aside as its evaluation data."""
+def _evaluation(root, case, draft):
+    """Give the evaluation loader independent features and any rank-local shard."""
     held_out = root / "evaluation"
-    held_out.mkdir()
-    for path in sorted((root / "features").iterdir())[: 2 * world_size]:
-        shutil.copy(path, held_out)
-    return [f"data.eval_hidden_states_path={held_out}", "training.eval_interval=1"]
+    write_features(held_out, draft, 2 * case.world_size)
+    _vary_records(held_out)
+    overrides = [f"data.eval_hidden_states_path={held_out}", "training.eval_interval=1"]
+    rank_overrides = {}
+    if case.empty_eval_rank is not None:
+        # Offline sharding pads a nonempty manifest to equal lengths. Give this
+        # DDP rank its own empty manifest so it joins just the eval reductions.
+        empty = root / "empty-evaluation"
+        empty.mkdir()
+        rank_overrides[case.empty_eval_rank] = [f"data.eval_hidden_states_path={empty}"]
+    return overrides, rank_overrides
 
 
-def _free_port():
-    """A free port below the range the system hands out on its own.
-
-    The port is released before the run binds it. A port the system assigned
-    could be assigned again in between, to any process that asks for one.
-    """
-    # Not the seeded generator: every run reseeds it, so two recorders at once
-    # would draw the same ports.
-    ports = random.SystemRandom()
-    while True:
-        port = ports.randrange(10000, 30000)
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as listener:
-            try:
-                listener.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-
-
-def _rendezvous_port(output, rank):
-    """Rank 0 picks the port just before its run binds it; the others read it."""
-    path = Path(output) / "rendezvous-port"
+@contextmanager
+def _worker_environment(output, rank, world_size):
+    """Give one local run a live rendezvous store, as a torchrun agent would."""
+    address = "127.0.0.1"
+    ports = dist.FileStore(str(Path(output) / "rendezvous"), world_size)
     if rank == 0:
-        port = _free_port()
-        pending = path.with_suffix(".pending")
-        pending.write_text(str(port))
-        pending.replace(path)
-        return port
-    deadline = time.monotonic() + 120
-    while not path.exists():
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"rank 0 published no rendezvous port in {output}")
-        time.sleep(0.01)
-    return int(path.read_text())
+        # Keep the server alive across the CLI call. All ranks, including zero,
+        # connect as clients after the OS has bound the server's ephemeral port.
+        server = dist.TCPStore(address, 0, is_master=True)
+        ports.set("port", str(server.port))
+    environment = {
+        "RANK": str(rank),
+        "LOCAL_RANK": str(rank),
+        "NODE_RANK": "0",
+        "WORLD_SIZE": str(world_size),
+        "MASTER_ADDR": address,
+        "MASTER_PORT": ports.get("port").decode(),
+        "TORCHELASTIC_USE_AGENT_STORE": "True",
+    }
+    with patch.dict(os.environ, environment):
+        yield
 
 
 def _on_host(value):
-    """A detached host copy of nested optimizer state."""
+    """Snapshot nested tensors without changing numeric or sequence types."""
     if torch.is_tensor(value):
         return value.detach().cpu().clone()
     if isinstance(value, dict):
@@ -246,7 +337,6 @@ class _Replica:
             return
         self.updates.append(
             {
-                "optimizer": _on_host(optimizer.state_dict()),
                 "optimized": [
                     _on_host(parameter)
                     for group in optimizer.param_groups
@@ -267,6 +357,7 @@ class _Replica:
             update = self.updates[-1]
             update["weights"] = _on_host(self._model.state_dict())
             # The trainer's scheduler has advanced as well by now.
+            update["optimizer"] = _on_host(self._optimizer.state_dict())
             update["next_lr"] = [group["lr"] for group in self._optimizer.param_groups]
             self._weights_due = False
 
@@ -282,56 +373,48 @@ def _train_rank(rank, world_size, runs, around_training):
 
     # Ranks share this host's cores; one thread each keeps the sums in one order.
     torch.set_num_threads(1)
-    for config, overrides, output in runs:
+    for config, overrides, output, rank_overrides in runs:
         logged = []
-        rendezvous = {
-            "RANK": str(rank),
-            "LOCAL_RANK": str(rank),
-            "WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(_rendezvous_port(output, rank)),
-            # Set by a torchrun this recorder may itself run under; it would
-            # make rank 0 look for a store instead of hosting one.
-            "TORCHELASTIC_USE_AGENT_STORE": "False",
-        }
         with (
-            patch.dict(os.environ, rendezvous),
+            _worker_environment(output, rank, world_size),
             # The console logger every rank keeps when no tracker is configured.
             patch(
                 "specforge.training.assembly._logger",
-                lambda metrics, step: logged.append((step, dict(metrics))),
+                lambda metrics, step: logged.append((step, _on_host(metrics))),
             ),
             _Replica() as replica,
             around_training() if around_training else nullcontext(),
         ):
-            status = main(["train", "-c", config, *overrides])
+            status = main(
+                ["train", "-c", config, *overrides, *rank_overrides.get(rank, ())]
+            )
             if status != 0:
                 raise RuntimeError(f"specforge train exited with {status}: {config}")
             ended = {"logged": logged, "replica": replica.ended()}
         torch.save(ended, Path(output) / f"ended-rank{rank}.pt")
 
 
-def _on_device(values):
-    """Metrics as float64 tensors: computed on the training device, like the weights."""
-    return {
-        name: torch.tensor(value, dtype=torch.float64)
-        for name, value in values.items()
-        if not name.startswith("perf/")
-    }
-
-
 def _logged(events, case):
     """What the rank logged, by update: its training and its evaluation metrics."""
     trained, evaluated = {}, {}
-    for step, metrics in events:
+    for step, values in events:
+        if type(step) is not int:
+            raise TypeError(
+                f"{case.name}: logger step must be int, got {type(step).__name__}"
+            )
+        metrics = {
+            name: value
+            for name, value in values.items()
+            if not name.startswith("perf/")
+        }
         if any(name.startswith("eval/") for name in metrics):
-            kind, entry = evaluated, _on_device(metrics)
+            kind, entry = evaluated, metrics
         else:
             kind = trained
             entry = {
                 # Computed on the host; the same on every device.
                 "lr": metrics.pop("lr"),
-                "metrics": _on_device(metrics),
+                "metrics": metrics,
             }
         if step in kind:
             raise RuntimeError(f"{case.name}: a rank logged update {step} twice")
@@ -431,17 +514,29 @@ def record(selected, *, around_training=None):
                 config = write_run(
                     root,
                     by_name[case.architecture],
-                    records=BATCHES_PER_EPOCH * world_size,
+                    records=BATCHES_PER_EPOCH * world_size * case.batch_size,
                 )
                 _vary_records(root / "features")
                 output = root / "run"
                 output.mkdir()
-                overrides = _evaluation(root, world_size) if case.evaluated else []
+                overrides, rank_overrides = [], {}
+                if case.evaluated:
+                    overrides, rank_overrides = _evaluation(
+                        root, case, by_name[case.architecture]
+                    )
+                if case.sp_ulysses_size > 1:
+                    overrides += [
+                        "training.attention_backend=usp",
+                        f"training.sp_ulysses_size={case.sp_ulysses_size}",
+                        "training.objective_options.ttt_length=2",
+                        "training.loss.terms={token: {kind: lk_lambda}}",
+                    ]
                 overrides += [
                     f"output_dir={output}",
                     f"model.torch_dtype={case.dtype}",
                     f"deployment.trainer.nproc_per_node={world_size}",
                     f"training.fsdp_sharding={case.sharding}",
+                    f"training.batch_size={case.batch_size}",
                     f"training.accumulation_steps={case.accumulation_steps}",
                     f"training.num_epochs={EPOCHS}",
                     # One more than the data holds: an extra update would show.
@@ -451,14 +546,14 @@ def record(selected, *, around_training=None):
                     "training.save_interval=1",
                     f"training.log_interval={case.log_interval}",
                 ]
-                runs.append((str(config), overrides, str(output)))
+                runs.append((str(config), overrides, str(output), rank_overrides))
             multiprocessing.spawn(
                 _train_rank,
                 args=(world_size, runs, around_training),
                 nprocs=world_size,
                 join=True,
             )
-            for case, (_, _, output) in zip(group, runs):
+            for case, (_, _, output, _) in zip(group, runs):
                 recording[case.name] = _read_case(Path(output), case)
     return recording
 
@@ -471,12 +566,11 @@ def _same_bits(actual, expected):
     )
 
 
-def differences(actual, expected, *, atol=0.0, where="recording"):
+def differences(actual, expected, *, atol=0.0, where="recording", _metric_values=False):
     """List where two recordings differ.
 
-    Everything is compared exactly, bit for bit, except that floating-point
-    tensors may differ by ``atol``: on an accelerator two runs of one revision
-    agree only that far.
+    Floating tensors and device-computed metrics may differ by ``atol``.
+    Other Python floats (including learning rates) and all types stay exact.
     """
     if type(actual) is not type(expected):
         return [f"{where}: {type(actual).__name__} != {type(expected).__name__}"]
@@ -490,7 +584,15 @@ def differences(actual, expected, *, atol=0.0, where="recording"):
             difference
             for key, value in expected.items()
             for difference in differences(
-                actual[key], value, atol=atol, where=f"{where}.{key}"
+                actual[key],
+                value,
+                atol=atol,
+                where=f"{where}.{key}",
+                # The logger materializes device results as Python floats.
+                # Only these two fields of the recording contain such metrics.
+                _metric_values=_metric_values
+                or (key == "evaluated" and "checkpoint" in expected)
+                or (key == "metrics" and "lr" in expected),
             )
         ]
     if isinstance(expected, (list, tuple)):
@@ -500,7 +602,11 @@ def differences(actual, expected, *, atol=0.0, where="recording"):
             difference
             for index, value in enumerate(expected)
             for difference in differences(
-                actual[index], value, atol=atol, where=f"{where}[{index}]"
+                actual[index],
+                value,
+                atol=atol,
+                where=f"{where}[{index}]",
+                _metric_values=_metric_values,
             )
         ]
     if torch.is_tensor(expected):
@@ -515,7 +621,12 @@ def differences(actual, expected, *, atol=0.0, where="recording"):
             same = _same_bits(actual, expected)
         return [] if same else [f"{where}: values differ"]
     if isinstance(expected, float):
-        same = struct.pack("<d", actual) == struct.pack("<d", expected)
+        if _metric_values and atol:
+            same = math.isclose(actual, expected, abs_tol=atol, rel_tol=0) or (
+                math.isnan(actual) and math.isnan(expected)
+            )
+        else:
+            same = struct.pack("<d", actual) == struct.pack("<d", expected)
     else:
         same = actual == expected
     return [] if same else [f"{where}: {actual!r} != {expected!r}"]
@@ -545,12 +656,16 @@ def main(arguments=None):
     options = parser.parse_args(arguments)
     if options.command == "record":
         select = every_case if options.every_case else cases
-        recording = record(select(options.ranks))
+        try:
+            selected = select(options.ranks)
+        except ValueError as exc:
+            recorder.error(str(exc))
+        recording = record(selected)
         torch.save(recording, options.output)
         print(f"recorded {len(recording)} cases to {options.output}")
         return 0
-    actual = torch.load(options.actual, weights_only=False)
-    expected = torch.load(options.expected, weights_only=False)
+    actual = torch.load(options.actual, map_location="cpu", weights_only=True)
+    expected = torch.load(options.expected, map_location="cpu", weights_only=True)
     found = differences(actual, expected, atol=options.atol)
     for difference in found[:50]:
         print(difference)
