@@ -247,7 +247,9 @@ def evaluate_predictions(
         for i, item in enumerate(inputs)
     )
     coefficients = tuple(term.coefficient for term in p.plan.terms)
-    return PlanResult(terms, coefficients, p.plan.shared_reduction, ratios)
+    return PlanResult(
+        terms, coefficients, p.plan.shared_reduction, ratios, computation.partials
+    )
 
 
 @dataclass
@@ -655,6 +657,8 @@ def execute_batch(
         ]
     if not results:
         raise ValueError("protocol must produce at least one prediction set")
+    if batch.finalize is not None:
+        return batch.finalize(combine_results(results))
     if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
         # Prediction sets can have distinct plans; only their metrics are additive.
         ratios = {}

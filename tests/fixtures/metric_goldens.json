@@ -649,13 +649,13 @@
   "teacher_top1_prob": 0.4299035966396332
  },
  "dspine": {
-  "acc": 0.11538461595773697,
-  "dspine/alignment_loss": 1.4680765867233276,
-  "dspine/backbone_ce": 7.589792251586914,
-  "dspine/backbone_l1": 1.470707893371582,
-  "dspine/candidate_coverage": 0.3076923191547394,
-  "dspine/refinement_loss": 0.7389774918556213,
-  "loss": 2.936070442199707
+  "acc": 0.3461538553237915,
+  "dspine/alignment_loss": 0.6927199363708496,
+  "dspine/backbone_ce": 4.871046543121338,
+  "dspine/backbone_l1": 1.4261175394058228,
+  "dspine/candidate_coverage": 0.6538461446762085,
+  "dspine/refinement_loss": 1.2967329025268555,
+  "loss": 50.118507385253906
  },
  "eagle3": {
   "acc": 0.4615384638309479,

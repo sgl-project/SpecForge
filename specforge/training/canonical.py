@@ -79,6 +79,7 @@ def _objective_settings(cfg):
     return dict(
         name=cfg.training.objective,
         options=cfg.training.objective_options,
+        training=cfg.training,
         loss=cfg.training.loss,
         weighting=cfg.training.weighting,
     )
