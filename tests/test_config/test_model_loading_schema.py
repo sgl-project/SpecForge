@@ -1,139 +1,71 @@
-# coding=utf-8
-"""Typed contract for draft config resolution and weights-only warm starts."""
+"""Training sources and architecture overrides use canonical fields only."""
 
 import unittest
 
 from pydantic import ValidationError
 
-from specforge.application import resolve_run
 from specforge.config import Config
 
-ONLINE_DEPLOYMENT = {
-    "mode": "disaggregated",
-    "disaggregated": {
-        "control_dir": "/control",
-        "backend": "mooncake",
-        "server_urls": ["http://127.0.0.1:30000"],
-    },
-}
 
-
-def _payload(strategy: str, **model_overrides):
-    model = {
-        "target_model_path": "target/model",
-        **model_overrides,
+def payload(**extra):
+    return {
+        "model": {"target_model_path": "target/model"},
+        "data": {"hidden_states_path": "/features"},
+        **extra,
     }
-    data = (
-        {"train_data_path": "/train.jsonl"}
-        if strategy == "peagle"
-        else {"hidden_states_path": "/features"}
-    )
-    if strategy in ("eagle3", "peagle"):
-        model["vocab_mapping_path"] = "/mapping.pt"
-    payload = {
-        "model": model,
-        "data": data,
-        "training": {"strategy": strategy},
-    }
-    if strategy == "peagle":
-        model["target_backend"] = "sglang"
-        payload["training"]["max_steps"] = 1
-        payload["deployment"] = ONLINE_DEPLOYMENT
-    return payload
 
 
 class ModelLoadingSchemaTest(unittest.TestCase):
-    def test_working_legacy_auto_config_strategies_can_omit_source(self):
-        for strategy in ("eagle3", "peagle", "dflash"):
-            with self.subTest(strategy=strategy):
-                cfg = Config.model_validate(_payload(strategy))
-                resolve_run(cfg)
-                self.assertIsNone(cfg.model.draft_model_config)
-
-    def test_specialized_dflash_architectures_still_require_a_config(self):
-        with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
-            resolve_run(Config.model_validate(_payload("domino")))
-        with self.assertRaisesRegex(ValueError, "requires model.draft_model_config"):
-            resolve_run(
-                Config.model_validate(
-                    {
-                        **_payload("dflash"),
-                        "model": {
-                            **_payload("dflash")["model"],
-                            "target_backend": "sglang",
-                        },
-                        "training": {
-                            "strategy": "dspark",
-                            "role": "consumer",
-                            "total_steps": 1,
-                        },
-                        "data": {"train_data_path": "/train.jsonl"},
-                        "deployment": ONLINE_DEPLOYMENT,
-                    }
-                )
-            )
-
-        # A warm-start HF repository or local directory can provide config.json.
-        cfg = Config.model_validate(
-            _payload("domino", draft_checkpoint_path="org/domino-draft")
-        )
-        resolve_run(cfg)
-        self.assertEqual(cfg.model.draft_checkpoint_path, "org/domino-draft")
-
-    def test_typed_architecture_overrides_are_strategy_scoped(self):
-        dflash = Config.model_validate(
-            _payload(
-                "dflash",
-                draft_num_hidden_layers=3,
-                draft_block_size=8,
-            )
-        )
-        resolve_run(dflash)
-        self.assertEqual(dflash.model.draft_num_hidden_layers, 3)
-        self.assertEqual(dflash.model.draft_block_size, 8)
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "requires model.draft_num_hidden_layers=1",
+    def test_every_algorithm_requires_an_explicit_source(self):
+        with self.assertRaisesRegex(ValidationError, "draft"):
+            Config.model_validate(payload())
+        for source in (
+            {"draft": "draft.yaml"},
+            {"initialization": {"checkpoint": "org/draft"}},
+            {"resume": "/run/checkpoint"},
         ):
-            resolve_run(
-                Config.model_validate(_payload("eagle3", draft_num_hidden_layers=2))
-            )
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support model.draft_block_size",
+            with self.subTest(source=source):
+                Config.model_validate(payload(**source))
+
+    def test_architecture_fields_cannot_override_the_draft(self):
+        for field in (
+            "draft_model_config",
+            "draft_checkpoint_path",
+            "draft_num_hidden_layers",
+            "draft_block_size",
+            "mask_token_id",
+            "aux_hidden_state_layer_ids",
         ):
-            resolve_run(Config.model_validate(_payload("peagle", draft_block_size=8)))
+            raw = payload(draft="draft.yaml")
+            raw["model"][field] = 1
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValidationError, field),
+            ):
+                Config.model_validate(raw)
 
     def test_warm_start_and_full_resume_are_mutually_exclusive(self):
         with self.assertRaisesRegex(ValidationError, "mutually exclusive"):
             Config.model_validate(
-                {
-                    **_payload("eagle3", draft_checkpoint_path="/base/checkpoint"),
-                    "training": {
-                        "strategy": "eagle3",
-                        "resume_from": "/run/checkpoint",
-                    },
-                }
+                payload(
+                    initialization={"checkpoint": "/base/checkpoint"},
+                    resume="/run/checkpoint",
+                )
             )
 
-    def test_disaggregated_producer_can_resolve_warm_start_metadata(self):
-        payload = _payload(
-            "dflash",
-            draft_checkpoint_path="org/dflash-draft",
+    def test_producer_keeps_the_same_checkpoint_source(self):
+        raw = payload(initialization={"checkpoint": "org/draft"})
+        raw.update(
+            data={"train_data_path": "/train.jsonl"},
+            training={"role": "producer", "total_steps": 1},
+            deployment={
+                "mode": "disaggregated",
+                "disaggregated": {
+                    "control_dir": "/control",
+                    "backend": "mooncake",
+                    "server_urls": ["http://127.0.0.1:30000"],
+                },
+            },
         )
-        payload["model"]["target_backend"] = "sglang"
-        payload["data"] = {"train_data_path": "/train.jsonl"}
-        payload["training"] = {
-            "strategy": "dflash",
-            "role": "producer",
-            "total_steps": 1,
-        }
-        payload["deployment"] = ONLINE_DEPLOYMENT
-        cfg = Config.model_validate(payload)
-        resolve_run(cfg)
-        self.assertEqual(cfg.model.draft_checkpoint_path, "org/dflash-draft")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        config = Config.model_validate(raw)
+        self.assertEqual(config.initialization.checkpoint, "org/draft")

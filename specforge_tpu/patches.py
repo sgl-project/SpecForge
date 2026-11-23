@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Callable, Mapping
+from functools import partial
+from importlib import import_module
 from typing import Any
 
 import torch
 
-from specforge_tpu import hooks, shapes
+from specforge_tpu import shapes
 
 
 def _pick_ports(count: int) -> list[int]:
@@ -74,23 +76,24 @@ def _get_local_device() -> torch.device:
 
 def apply() -> None:
     # Registers torch.compile(backend="tpu").
-    import torch_tpu._internal.compile  # noqa: F401
+    import_module("torch_tpu._internal.compile")
 
+    from specforge import distributed, launch_plan, utils
+    from specforge.algorithms.common import batch_shapes
+
+    # Resolve the backends, wrappers and bucket configuration before changing core.
+    backends = distributed._DISTRIBUTED_BACKENDS
+    bind_device = partial(_bind_local_device, distributed._bind_local_device)
+    trainer_command = partial(_trainer_command, launch_plan._trainer_command)
+    buckets = shapes.seq_buckets()
     _resolve_rank_topology()
 
-    # First: later imports bind get_local_device by name.
-    hooks.replace("specforge.utils.get_local_device", _get_local_device)
-
-    from specforge import distributed
-
-    distributed._DISTRIBUTED_BACKENDS["tpu"] = "tpu_dist"
-    hooks.around("specforge.distributed._bind_local_device", _bind_local_device)
-    hooks.around("specforge.launch_plan._trainer_command", _trainer_command)
-    hooks.around(
-        "specforge.algorithms.common.hidden_states_data._padded_collator",
-        shapes.padded_collator,
-    )
-    hooks.around(
-        "specforge.training.strategies.base._cpu_max_valid_anchors",
-        shapes.shape_only_max_valid_anchors,
-    )
+    utils.get_local_device = _get_local_device
+    backends["tpu"] = "tpu_dist"
+    distributed._bind_local_device = bind_device
+    launch_plan._trainer_command = trainer_command
+    if buckets:
+        batch_shapes.padded_sequence_length = partial(
+            shapes.bucket_for, buckets=buckets
+        )
+    batch_shapes.anchor_capacity = shapes.anchor_capacity

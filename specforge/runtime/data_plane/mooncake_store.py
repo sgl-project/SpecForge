@@ -78,6 +78,10 @@ from specforge.runtime.data_plane.feature_store import (
     FeatureStore,
     spec_from_tensor,
 )
+from specforge.runtime.data_plane.mooncake_rdma import (
+    check_rdma_environment,
+    resolve_rdma_devices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +93,16 @@ MOONCAKE_OBJECT_HAS_LEASE = -706  # remove() during a live read lease
 _MOONCAKE_SETUP_DEFAULTS = {
     "global_segment_size": 1 << 30,  # 1 GiB per-node segment
     "local_buffer_size": 1 << 30,
-    "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
+    # Every client of one store must use the same protocol, and SpecForge
+    # cannot see an external server's, so the default stays explicit tcp.
+    "protocol": "tcp",
+    # Empty under rdma selects this node's usable HCAs (see _connect_store).
     "rdma_devices": "",
 }
+_RDMA_OPT_OUT = (
+    "set MOONCAKE_PROTOCOL=tcp (deployment.disaggregated.mooncake_protocol or "
+    "managed_local.mooncake.protocol) for every capture server and trainer"
+)
 
 _GET_RETRY_DELAYS_S = (2.0, 4.0, 8.0)
 # TRANSFER_FAIL and a lease that expired during transfer are retryable with a
@@ -179,9 +190,24 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "official wheel (`mooncake-transfer-engine` for CUDA < 13, or "
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
+    setup_kwargs = dict(setup_kwargs)
+    if setup_kwargs.get("protocol") == "rdma":
+        # Mooncake would auto-discover HCAs for an empty list and fall back to
+        # TCP silently, and drops a listed device it cannot use without a warning.
+        setup_kwargs["rdma_devices"] = resolve_rdma_devices(
+            setup_kwargs.get("rdma_devices") or None,
+            selected_by="MOONCAKE_PROTOCOL is rdma",
+            devices_setting="MOONCAKE_RDMA_DEVICES",
+            opt_out=_RDMA_OPT_OUT,
+        )
+        check_rdma_environment(
+            os.environ,
+            where="this process's environment",
+            opt_out=_RDMA_OPT_OUT,
+            devices=setup_kwargs["rdma_devices"],
+        )
     # Ascend's transport needs a bound device context (see _bind_transport_device).
     _bind_transport_device()
-    setup_kwargs = dict(setup_kwargs)
     if _ascend_runtime_available():
         # Ascend rejects the wildcard-location staging-buffer registration
         # ("location:* is not supported"); zero-copy clients can drop it.
@@ -648,6 +674,9 @@ class MooncakeFeatureStore(FeatureStore):
         # Samples whose remote remove() failed. gc() performs bounded
         # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
+        # Failed local puts may leave objects from a generation that was never
+        # published. Keep these separate from the sample's live generation.
+        self._partial_put_pending: Dict[Tuple[str, int], Tuple[List[str], int]] = {}
         # (sample_id, generation) logically freed in THIS process. Mooncake's
         # remove() is lease-deferred (an object keeps a short read-lease), so the
         # bytes can linger after release/abort; this makes the B5 "no
@@ -900,8 +929,24 @@ class MooncakeFeatureStore(FeatureStore):
         # One object per tensor, DMA'd straight from its storage. The shared put
         # config requests hard pinning when the Mooncake client supports it.
         # staged keeps the source tensors alive across the synchronous puts.
-        for name, t in staged.items():
-            self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+        attempted_names: List[str] = []
+        try:
+            for name, t in staged.items():
+                # A failed RPC may still have published its key.
+                attempted_names.append(name)
+                self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+        except BaseException:
+            with self._lock:
+                attempt = (sample_id, gen)
+                self._partial_put_pending[attempt] = (attempted_names, 0)
+                try:
+                    self._try_partial_put_free_locked(attempt)
+                except Exception:
+                    # Preserve both the original put error and cleanup ownership.
+                    logger.exception(
+                        "Failed to roll back partial Mooncake put %s", attempt
+                    )
+            raise
         # Overwrite-safe: drop the prior generation's tensor keys so a stale
         # ref's keys are gone (its get() then raises -> no use-after-free).
         if prior_gen is not None and prior_gen != gen:
@@ -913,13 +958,14 @@ class MooncakeFeatureStore(FeatureStore):
             if leaked:
                 logger.warning(
                     "MooncakeFeatureStore re-put of %s gen %s: removing prior "
-                    "generation %s tensors %s failed; remote objects may be "
-                    "orphaned (and the stale ref stays readable until reclaimed)",
+                    "generation %s tensors %s failed; scheduling retry via gc()",
                     sample_id,
-                    prior_gen,
+                    gen,
                     prior_gen,
                     leaked,
                 )
+                with self._lock:
+                    self._partial_put_pending[(sample_id, prior_gen)] = (leaked, 0)
         with self._lock:
             self._generation[sample_id] = gen
             self._put_time[sample_id] = self._clock()
@@ -959,6 +1005,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise ValueError(
                 f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
             )
+        self._locate(sample_ref)
         with self._lock:
             gen = int(gen)
             self._generation[sample_ref.sample_id] = gen
@@ -977,12 +1024,24 @@ class MooncakeFeatureStore(FeatureStore):
         *,
         generation: int,
         feature_names: List[str],
+        server_url: Optional[str] = None,
     ) -> None:
         """Track server-owned keys before an HTTP response makes a ref adoptable."""
         names = list(dict.fromkeys(str(name) for name in feature_names))
         if not names:
             raise ValueError("external capture attempt must name at least one feature")
         with self._lock:
+            track = getattr(self._store, "track_capture_attempt", None)
+            if track is not None:
+                if server_url is None:
+                    raise ValueError("arena capture attempts require a server_url")
+                track(
+                    [
+                        self._tkey(str(sample_id), int(generation), name)
+                        for name in names
+                    ],
+                    server_url,
+                )
             self._external_provisional[(str(sample_id), int(generation))] = names
 
     def discard_external_attempts(
@@ -1064,6 +1123,7 @@ class MooncakeFeatureStore(FeatureStore):
                     f"refusing use-after-free"
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
+        self._locate(sample_ref)
         out, gen = self._get_tensors(sample_ref, wanted, device)
         # Pooled reads already placed every feature (integer features on the
         # host); pageable reads land on the host and move here.
@@ -1087,6 +1147,24 @@ class MooncakeFeatureStore(FeatureStore):
             )
             self._active_leases[handle.lease_token] = handle
         return out, handle
+
+    def _locate(self, sample_ref: SampleRef) -> None:
+        """Pass server-owned object locations to backends that need them.
+
+        The arena backend (``mooncake_arena.ArenaObjectClient``) has no
+        master to resolve keys; the capture server's addresses ride on the ref.
+        """
+        locate = getattr(self._store, "locate_ref_objects", None)
+        gen = sample_ref.metadata.get("generation")
+        if locate is None or gen is None:
+            return
+        locate(
+            {
+                name: self._tkey(sample_ref.sample_id, int(gen), name)
+                for name in sample_ref.feature_keys
+            },
+            sample_ref.metadata,
+        )
 
     def _get_tensors(
         self, ref: SampleRef, wanted: List[str], device="cpu"
@@ -1114,6 +1192,25 @@ class MooncakeFeatureStore(FeatureStore):
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
+    def _try_partial_put_free_locked(
+        self, attempt: Tuple[str, int], *, force: bool = False
+    ) -> bool:
+        """Remove keys from an unpublished generation, retaining failed keys."""
+        names, attempts = self._partial_put_pending[attempt]
+        sample_id, generation = attempt
+        remaining = [
+            name
+            for name in names
+            if not self._store_remove(
+                self._tkey(sample_id, generation, name), force=force
+            )
+        ]
+        if remaining:
+            self._partial_put_pending[attempt] = (remaining, attempts)
+            return False
+        del self._partial_put_pending[attempt]
+        return True
+
     def _try_physical_free(
         self,
         sample_id: str,
@@ -1244,9 +1341,29 @@ class MooncakeFeatureStore(FeatureStore):
                         self.max_release_attempts,
                         self._release_pending.get(sample_id, 0) + 1,
                     )
+            partial_pending = [
+                attempt
+                for attempt in self._partial_put_pending
+                if attempt[0] in target_ids
+            ]
+            for attempt in partial_pending:
+                if self._try_partial_put_free_locked(attempt, force=True):
+                    removed += 1
+                    self._stats["force_freed"] += 1
+                else:
+                    names, count = self._partial_put_pending[attempt]
+                    self._partial_put_pending[attempt] = (
+                        names,
+                        min(self.max_release_attempts, count + 1),
+                    )
             remaining = [
                 sample_id
                 for sample_id in self._release_pending
+                if sample_id in target_ids
+            ]
+            remaining += [
+                sample_id
+                for sample_id, _ in self._partial_put_pending
                 if sample_id in target_ids
             ]
         return {
@@ -1254,7 +1371,7 @@ class MooncakeFeatureStore(FeatureStore):
             "removed_bytes": removed_bytes,
             "release_pending": len(remaining),
             "remaining_ids": remaining,
-            "attempts": 1 if pending else 0,
+            "attempts": 1 if pending or partial_pending else 0,
         }
 
     def drain_pending_removals(
@@ -1304,7 +1421,12 @@ class MooncakeFeatureStore(FeatureStore):
                     for sample_id in self._release_pending
                     if target_ids is None or sample_id in target_ids
                 ]
-                if not pending:
+                partial_pending = [
+                    key
+                    for key in self._partial_put_pending
+                    if target_ids is None or key[0] in target_ids
+                ]
+                if not pending and not partial_pending:
                     return {
                         "removed": removed,
                         "removed_bytes": removed_bytes,
@@ -1343,10 +1465,34 @@ class MooncakeFeatureStore(FeatureStore):
                             self.max_release_attempts,
                             self._release_pending.get(sample_id, 0) + 1,
                         )
+                for key in partial_pending:
+                    label = f"{key[0]}/g{key[1]}"
+                    try:
+                        physically_removed = self._try_partial_put_free_locked(
+                            key, force=True
+                        )
+                    except Exception as exc:
+                        last_errors[label] = f"{type(exc).__name__}: {exc}"
+                        physically_removed = False
+                    if physically_removed:
+                        removed += 1
+                        self._stats["force_freed"] += 1
+                        last_errors.pop(label, None)
+                    else:
+                        names, count = self._partial_put_pending[key]
+                        self._partial_put_pending[key] = (
+                            names,
+                            min(self.max_release_attempts, count + 1),
+                        )
                 remaining = [
                     sample_id
                     for sample_id in self._release_pending
                     if target_ids is None or sample_id in target_ids
+                ]
+                remaining += [
+                    f"{sid}/g{generation}"
+                    for sid, generation in self._partial_put_pending
+                    if target_ids is None or sid in target_ids
                 ]
             if not remaining:
                 return {
@@ -1363,6 +1509,11 @@ class MooncakeFeatureStore(FeatureStore):
                 sample_id
                 for sample_id in self._release_pending
                 if target_ids is None or sample_id in target_ids
+            ]
+            remaining += [
+                f"{sid}/g{generation}"
+                for sid, generation in self._partial_put_pending
+                if target_ids is None or sid in target_ids
             ]
         preview = remaining[:16]
         detail = f"; last errors={last_errors}" if last_errors else ""
@@ -1405,12 +1556,21 @@ class MooncakeFeatureStore(FeatureStore):
                     freed += 1
                 else:
                     self._release_pending[sid] = attempts
+            for key, (_, attempts) in list(self._partial_put_pending.items()):
+                if attempts >= self.max_release_attempts:
+                    continue
+                if self._try_partial_put_free_locked(key):
+                    freed += 1
+                else:
+                    remaining, _ = self._partial_put_pending[key]
+                    self._partial_put_pending[key] = (remaining, attempts + 1)
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
         return {
             "force_freed": freed,
             "force_freed_bytes": freed_bytes,
-            "release_pending": len(self._release_pending),
+            "release_pending": len(self._release_pending)
+            + len(self._partial_put_pending),
         }
 
     def health(self) -> Dict[str, Any]:
@@ -1432,7 +1592,8 @@ class MooncakeFeatureStore(FeatureStore):
                 "resident_bytes": sum(self._sample_bytes.values()),
                 "max_resident_bytes": self.max_resident_bytes,
                 "auth_required": self.auth.required,
-                "release_pending": len(self._release_pending),
+                "release_pending": len(self._release_pending)
+                + len(self._partial_put_pending),
                 "oldest_age_s": max(ages) if ages else 0.0,
                 "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,
                 "force_freed_total": self._stats["force_freed"],

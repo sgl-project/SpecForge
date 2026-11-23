@@ -25,9 +25,9 @@ def register() -> None:
     global _registered
     if _registered or not tpu_selected():
         return
-    _registered = True
-    # Children (torchrun ranks, services) inherit the choice.
-    os.environ["SPECFORGE_DEVICE"] = "tpu"
     from specforge_tpu import patches
 
     patches.apply()
+    # Children (torchrun ranks, services) inherit the successful choice.
+    os.environ["SPECFORGE_DEVICE"] = "tpu"
+    _registered = True

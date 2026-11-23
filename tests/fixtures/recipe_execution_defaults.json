@@ -1,0 +1,735 @@
+{
+ "recipes": {
+  "offline/colocated/deepseek-v3-671b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/gpt-oss-120b-dspark-tpu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "offline/colocated/ling-3.0-tiny-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "offline/colocated/ling-flash-2.0-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/llama3.1-8b-eagle3.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/qwen2.5-7b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/qwen3-4b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "offline/colocated/qwen3-8b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 512
+  },
+  "offline/colocated/qwen3-8b-domino.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "offline/colocated/qwen3-8b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "offline/colocated/qwen3-8b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/qwen3-coder-480b-a35b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/qwen3.5-35b-a3b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/colocated/qwen3.5-4b-dflash-amd.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "offline/colocated/qwen3.5-4b-native-mtp.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": false,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 4096
+  },
+  "offline/disaggregated/qwen2.5-7b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "offline/disaggregated/qwen3-8b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/deepseek-v2-lite-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/deepseek-v3-671b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/deepseek-v4-flash-dspark-amd.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/deepseek-v4-flash-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/gemma3-1b-eagle3.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/glm-5.2-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/gpt-oss-120b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/gpt-oss-20b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/inkling-dspark.yaml": {
+   "attention_backend": "eager",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/kimi-k3-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 0,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/lfm2.5-1.2b-instruct-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/ling-flash-2.0-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/llama3.1-8b-eagle3.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/llama3.3-70b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/llama4-scout-17b-16e-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/longcat-flash-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/longcat-flash-eagle3.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/minimax-m3-dspark-amd.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/phi4-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen2.5-0.5b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen2.5-0.5b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-235b-a22b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-30b-a3b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-32b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-4b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 512
+  },
+  "online/disaggregated/external/qwen3-4b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3-4b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-8b-dflash-1server-dp4.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 512
+  },
+  "online/disaggregated/external/qwen3-8b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 512
+  },
+  "online/disaggregated/external/qwen3-8b-domino-1server-dp4.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3-8b-domino.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3-8b-dpace.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 512
+  },
+  "online/disaggregated/external/qwen3-8b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3-8b-dspine.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 32
+  },
+  "online/disaggregated/external/qwen3-8b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-8b-peagle.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-coder-30b-a3b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-coder-480b-a35b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-coder-next-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3-next-80b-a3b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3.5-35b-a3b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3.5-35b-a3b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/external/qwen3.5-4b-dflash-amd.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3.5-4b-dflash-npu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3.5-4b-dflash2-npu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": true,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwen3.5-4b-domino-npu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3.6-27b-dflash-1server-dp2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3.6-27b-dflash.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3.6-27b-domino.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3.6-27b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/external/qwen3.8-27b-dflash2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": true,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": false,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/external/qwq-32b-eagle3.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": null,
+   "loss_chunk": 0
+  },
+  "online/disaggregated/managed-local/qwen3-8b-dflash-1server-dp7.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3-8b-domino-1server-dp7.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3-8b-domino-2server-dp2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3.5-4b-dflash-npu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3.5-4b-mtp-npu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 4,
+   "fused_conv": false,
+   "fused_loss": false,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 4096
+  },
+  "online/disaggregated/managed-local/qwen3.6-27b-dflash-1server-dp2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/managed-local/qwen3.6-27b-dflash-2server-dp2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/managed-local/qwen3.6-27b-dflash2.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": true,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": false,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/managed-local/qwen3.6-27b-dspark.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
+  "online/disaggregated/managed-local/qwen3.8-27b-dflash2-4server-dp4.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": true,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": false,
+   "loss_chunk": 256
+  },
+  "online/disaggregated/managed-local/qwen3.8-27b-dflash2-5server-dp3-h200.yaml": {
+   "attention_backend": "flex_attention",
+   "dataloader_workers": 8,
+   "fused_conv": true,
+   "fused_loss": true,
+   "liger": true,
+   "loss_checkpoint": false,
+   "loss_chunk": 256
+  }
+ },
+ "recorded_at": "dddef4b3",
+ "trainer": "cuda"
+}

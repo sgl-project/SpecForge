@@ -15,7 +15,7 @@ python ./scripts/prepare_data.py --dataset sharegpt
 ## 2. Use the checked-in run config
 
 The canonical recipe is
-[`examples/configs/online/disaggregated/external/llama3.1-8b-eagle3-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/llama3.1-8b-eagle3-online.yaml).
+[`examples/configs/online/disaggregated/external/llama3.1-8b-eagle3.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/llama3.1-8b-eagle3.yaml).
 It already points at the ShareGPT output from step 1 and records the target,
 draft architecture, SGLang backend, optimizer settings, and output directory in
 the same typed contract used by every other training method. Edit that file or
@@ -25,7 +25,7 @@ create a second copy of the recipe in documentation.
 ## 3. Train
 
 ```bash
-specforge train --config examples/configs/online/disaggregated/external/llama3.1-8b-eagle3-online.yaml
+specforge train --config examples/configs/online/disaggregated/external/llama3.1-8b-eagle3.yaml
 ```
 
 The recipe points at an external SGLang capture server and starts the
@@ -45,8 +45,8 @@ the SGLang speculative decoder. Online resume is consumer-only and reuses the
 retained transport state; export the final checkpoint before serving:
 
 ```bash
-specforge export --to sglang \
+specforge export --converter sglang \
   --checkpoint ./outputs/llama3.1-8b-eagle3-online/llama3.1-8b-eagle3-online-latest \
-  --draft-config configs/llama3-8B-eagle3.json \
+  --target-model /path/to/Llama-3.1-8B-Instruct \
   --output-dir ./exports/llama3.1-8b-eagle3-sglang
 ```

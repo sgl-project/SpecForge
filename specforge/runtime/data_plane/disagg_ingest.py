@@ -66,10 +66,18 @@ def ingest_offline_features(
     refs: List[SampleRef] = []
     for index, path in enumerate(paths):
         raw = load_feature_file(path)
+        for key, aliases in getattr(reader, "feature_aliases", {}).items():
+            if key not in raw:
+                source = next((name for name in aliases if name in raw), None)
+                if source is not None:
+                    raw[key] = raw[source]
         missing = [key for key in feature_keys if key not in raw]
         if missing:
             raise KeyError(f"{path} missing required offline feature keys {missing}")
-        tensors = {key: raw[key] for key in feature_keys}
+        selected = feature_keys + tuple(
+            key for key in getattr(reader, "optional_features", ()) if key in raw
+        )
+        tensors = {key: raw[key] for key in selected}
         input_ids = raw["input_ids"]
         ref = store.put(
             tensors,
