@@ -21,11 +21,11 @@ RUN pip install --no-cache-dir mooncake-transfer-engine-non-cuda==0.3.13.post1 o
 WORKDIR /opt/specforge
 COPY pyproject.toml version.txt README.md LICENSE MANIFEST.in ./
 COPY specforge ./specforge
-COPY specforge_tpu ./specforge_tpu
+COPY plugins/specforge-tpu ./plugins/specforge-tpu
 COPY examples ./examples
 COPY scripts ./scripts
 # --no-deps: torch, transformers and sglang come pinned from the base image.
-RUN pip install --no-deps --no-build-isolation -e . \
+RUN pip install --no-deps --no-build-isolation -e . ./plugins/specforge-tpu \
  && python3 -c "import mooncake.store, specforge_tpu, specforge.cli"
 
 CMD ["/bin/bash"]

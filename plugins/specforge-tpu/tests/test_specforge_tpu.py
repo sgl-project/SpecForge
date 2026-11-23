@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from specforge_tpu import patches, shapes
 
 from specforge.launch_plan import CommandSpec
-from specforge_tpu import patches, shapes
 
 
 class ShapesTest(unittest.TestCase):
@@ -23,6 +23,7 @@ class ShapesTest(unittest.TestCase):
 
     def check_registered_shapes(self, buckets, expected_length):
         import specforge_tpu
+
         from specforge import distributed, launch_plan, utils
         from specforge.algorithms.common import batch_shapes
         from specforge.algorithms.objectives.inputs import (
