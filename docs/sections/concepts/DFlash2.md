@@ -219,7 +219,7 @@ auxiliary layer IDs must exactly match `spec_config.target_features.target_layer
 
 Offline DFlash2 uses the normal DFlash feature preparation path. First start
 the matching plugin server and Mooncake using the
-[offline capture guide](https://github.com/sgl-project/SpecForge/blob/main/examples/offline/README.md):
+[offline capture guide](../basic_usage/offline_capture.md):
 
 ```bash
 python scripts/prepare_hidden_states.py \
