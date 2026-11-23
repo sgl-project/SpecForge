@@ -24,6 +24,7 @@ from specforge.config import SGLANG_CAPTURE_CONTEXT_HEADROOM, Config, ModelConfi
 from specforge.config.schema import (
     SGLANG_PASSTHROUGH_FIELDS,
     SGLANG_SECRET_FLAGS,
+    resolve_dispatch_watermarks,
     sglang_field_flag,
     validate_receive_buffers,
 )
@@ -1036,6 +1037,8 @@ def build_launch_plan(
                     f"exists: {deployment.control_dir}"
                 )
     role = _resolve_role(cfg, requested_role, distributed=distributed)
+    if cfg.mode == "online" and role in ("producer", "both"):
+        resolve_dispatch_watermarks(cfg, env=base_env)
     topology = cfg.deployment.trainer
     if role == "both" and topology.nnodes > 1:
         raise ValueError(
