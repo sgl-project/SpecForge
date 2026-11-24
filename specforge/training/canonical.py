@@ -133,6 +133,28 @@ def resolve_run(cfg, *, target_config=None):
         cfg.training.anchor_sampling,
         cfg.training.seed,
     )
+    from specforge.lr_scheduler import registered_lr_schedulers
+    from specforge.optimizer import (
+        registered_optimizers,
+        registered_param_group_policies,
+    )
+
+    if cfg.training.optimizer not in registered_optimizers():
+        raise ValueError(
+            f"unsupported training.optimizer={cfg.training.optimizer!r}; "
+            f"expected one of {list(registered_optimizers())}"
+        )
+    if cfg.training.param_group_policy not in registered_param_group_policies():
+        raise ValueError(
+            "unsupported training.param_group_policy="
+            f"{cfg.training.param_group_policy!r}; "
+            f"expected one of {list(registered_param_group_policies())}"
+        )
+    if cfg.training.lr_scheduler not in registered_lr_schedulers():
+        raise ValueError(
+            f"unsupported training.lr_scheduler={cfg.training.lr_scheduler!r}; "
+            f"expected one of {list(registered_lr_schedulers())}"
+        )
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig

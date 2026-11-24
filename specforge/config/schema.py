@@ -1074,9 +1074,15 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
+    optimizer: str = Field(default="adamw", min_length=1)
+    optimizer_options: dict = Field(default_factory=dict)
+    param_group_policy: str = Field(default="default", min_length=1)
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    lr_scheduler: str = Field(default="cosine", min_length=1)
+    lr_scheduler_options: dict = Field(default_factory=dict)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
+    min_lr_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.

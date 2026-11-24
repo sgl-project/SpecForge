@@ -65,6 +65,35 @@ class StepContext:
 
 
 @dataclass(frozen=True)
+class OptimizerSpec:
+    """Declarative optimizer configuration consumed by the shared registry.
+
+    The runtime constructs the optimizer over the wrapped trainable module so
+    parameter names and sharded/DTensor layouts stay intact.
+    """
+
+    kind: str = "adamw"
+    lr: float = 1e-4
+    weight_decay: float = 0.0
+    betas: Tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    param_group_policy: str = "default"
+    offload_master: bool = False
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SchedulerSpec:
+    """Declarative learning-rate schedule consumed by the shared registry."""
+
+    kind: str = "cosine"
+    total_steps: Optional[int] = None
+    warmup_ratio: float = 0.015
+    min_lr_ratio: float = 0.0
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class PartitionHints:
     """What a runner that shards parameters has to keep together."""
 

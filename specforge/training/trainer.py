@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
@@ -34,7 +35,12 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import ProgramSpec, RankFailure
+from specforge.training.contracts import (
+    OptimizerSpec,
+    ProgramSpec,
+    RankFailure,
+    SchedulerSpec,
+)
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -56,7 +62,10 @@ class Trainer:
         ref_source: dict,  # {"refs": [...]} (offline) | {"queue": q} (online)
         model,  # the program; its ``draft_model`` is what the optimizer trains
         program_spec: ProgramSpec,  # what ``model`` declares
-        optimizer_factory,
+        optimizer_factory=None,
+        optimizer_spec: Optional[OptimizerSpec] = None,
+        scheduler_spec: Optional[SchedulerSpec] = None,
+        max_grad_norm: Optional[float] = None,
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -236,14 +245,41 @@ class Trainer:
                 num_epochs=num_epochs,
             )
 
-        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
-        if effective_total_steps is None and configure_schedule is not None:
+        if optimizer_factory is not None and optimizer_spec is not None:
             raise ValueError(
-                "a configured optimizer on a streaming source requires total_steps "
-                "or max_steps"
+                "pass either optimizer_factory or optimizer_spec, not both"
             )
-        if configure_schedule is not None:
-            configure_schedule(effective_total_steps)
+        if optimizer_spec is not None:
+            if scheduler_spec is None:
+                raise ValueError("optimizer_spec requires scheduler_spec")
+            if max_grad_norm is None:
+                raise ValueError("optimizer_spec requires max_grad_norm")
+            if effective_total_steps is None:
+                if scheduler_spec.total_steps is None:
+                    raise ValueError(
+                        "a configured optimizer on a streaming source requires "
+                        "total_steps or max_steps"
+                    )
+            elif scheduler_spec.total_steps is None:
+                scheduler_spec = replace(
+                    scheduler_spec, total_steps=effective_total_steps
+                )
+            elif scheduler_spec.total_steps != effective_total_steps:
+                raise ValueError(
+                    "optimizer/controller schedule mismatch: "
+                    f"{scheduler_spec.total_steps} != {effective_total_steps}"
+                )
+        else:
+            configure_schedule = getattr(
+                optimizer_factory, "configure_total_steps", None
+            )
+            if effective_total_steps is None and configure_schedule is not None:
+                raise ValueError(
+                    "a configured optimizer on a streaming source requires total_steps "
+                    "or max_steps"
+                )
+            if configure_schedule is not None:
+                configure_schedule(effective_total_steps)
 
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
@@ -491,7 +527,16 @@ class Trainer:
             sharding_strategy=fsdp_sharding,
             ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend_kwargs: dict[str, object] = {}
+        if optimizer_factory is not None:
+            backend_kwargs["optimizer_factory"] = optimizer_factory
+        if optimizer_spec is not None:
+            backend_kwargs["optimizer_spec"] = optimizer_spec
+        if scheduler_spec is not None:
+            backend_kwargs["scheduler_spec"] = scheduler_spec
+        if max_grad_norm is not None:
+            backend_kwargs["max_grad_norm"] = max_grad_norm
+        backend = FSDPTrainingBackend(parallel, **backend_kwargs)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
@@ -648,6 +693,7 @@ class Trainer:
                 "TrainerController.close_profiler",
                 self._controller.close_profiler,
             )
+            capture_cleanup("TrainingBackend.close", self.backend.close)
             if self._on_fit_finally is not None:
                 capture_cleanup("on_fit_finally", self._on_fit_finally)
             close_logger = getattr(self._logger, "close", None)

@@ -164,39 +164,31 @@ def build_model_bundle(
     return algorithm.providers.model.build_bundle(cfg, algorithm, topology)
 
 
-class _ConfiguredOptimizerFactory:
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self.total_steps = cfg.training.total_steps or cfg.training.max_steps
+def _optimizer_spec(cfg: Config):
+    from specforge.training.contracts import OptimizerSpec
 
-    def configure_total_steps(self, total_steps: int) -> None:
-        if self.total_steps is None:
-            self.total_steps = total_steps
-        elif self.total_steps != total_steps:
-            raise ValueError(
-                "optimizer/controller schedule mismatch: "
-                f"{self.total_steps} != {total_steps}"
-            )
-
-    def __call__(self, draft_module):
-        from specforge.optimizer import BF16Optimizer
-
-        if self.total_steps is None:
-            raise RuntimeError("optimizer total_steps was not resolved before assembly")
-        t = self.cfg.training
-        return BF16Optimizer(
-            draft_module,
-            lr=t.learning_rate,
-            max_grad_norm=t.max_grad_norm,
-            warmup_ratio=t.warmup_ratio,
-            lr_scheduler=t.lr_scheduler,
-            total_steps=self.total_steps,
-            offload_master=t.optimizer_cpu_offload,
-        )
+    t = cfg.training
+    return OptimizerSpec(
+        kind=t.optimizer,
+        lr=t.learning_rate,
+        weight_decay=t.weight_decay,
+        param_group_policy=t.param_group_policy,
+        offload_master=t.optimizer_cpu_offload,
+        extra=dict(t.optimizer_options),
+    )
 
 
-def _optimizer_factory(cfg: Config):
-    return _ConfiguredOptimizerFactory(cfg)
+def _scheduler_spec(cfg: Config):
+    from specforge.training.contracts import SchedulerSpec
+
+    t = cfg.training
+    return SchedulerSpec(
+        kind=t.lr_scheduler,
+        total_steps=t.total_steps or t.max_steps,
+        warmup_ratio=t.warmup_ratio,
+        min_lr_ratio=t.min_lr_ratio,
+        extra=dict(t.lr_scheduler_options),
+    )
 
 
 def _logger(metrics, step):
@@ -483,7 +475,9 @@ def _common_launch_kwargs(
     return dict(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
-        optimizer_factory=_optimizer_factory(cfg),
+        optimizer_spec=_optimizer_spec(cfg),
+        scheduler_spec=_scheduler_spec(cfg),
+        max_grad_norm=t.max_grad_norm,
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
@@ -562,7 +556,6 @@ def build_training_run(
                     algorithm=algorithm,
                     **kwargs,
                 ),
-                optimizer_factory=_optimizer_factory,
                 logger=run_logger,
             )
         except BaseException:
