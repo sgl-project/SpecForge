@@ -294,8 +294,6 @@ class ModelConfig(StrictConfigModel):
     #: it (CUDA/ROCm, FP16/BF16/FP32, power-of-two group size up to 1024);
     #: ``true`` fails when it cannot be used; ``false`` keeps the eager one.
     use_fused_conv: Optional[bool] = None
-    #: MoE routed-expert kernel, grouped_mm or loop; probed at startup, no fallback.
-    moe_experts_kernel: str = "grouped_mm"
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     #: t2d/d2t vocab-mapping tensor file for the draft ("" = model has none).

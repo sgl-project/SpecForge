@@ -143,9 +143,6 @@ class MoEBalanceTest(unittest.TestCase):
                 )
                 torch.manual_seed(11)
                 model = build_draft_model(moe_config)
-                for module in model.modules():
-                    if isinstance(module, MoEFFN):
-                        module.experts_kernel = "loop"
                 head = nn.Linear(32, config.vocab_size, bias=False)
                 batch = training_batch(config)
                 plain = build_objective_model(

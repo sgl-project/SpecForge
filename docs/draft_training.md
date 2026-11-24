@@ -222,12 +222,10 @@ objective and is described under Loss execution. This option does not change
 parameter names or canonical configuration and is recorded in the training resume
 contract.
 
-`model.moe_experts_kernel` selects the routed-expert kernel of MoE drafts:
-`grouped_mm` (default) runs every expert in one `F.grouped_mm` call, which torch
-accepts only when `hidden_size` and the expert `intermediate_size` are multiples
-of 8 for bf16/fp16 or 4 for fp32; `loop` runs one matmul pair per expert on any
-device. Startup probes the chosen kernel on every MoE layer and fails rather
-than falling back; MoE drafts record the choice in the training resume contract.
+MoE drafts run their routed experts with one `F.grouped_mm` call per projection,
+which torch accepts only when `hidden_size` and the expert `intermediate_size`
+are multiples of 8 for bf16/fp16 or 4 for fp32. Startup probes every MoE layer
+and fails with that rule rather than falling back.
 
 A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
 holds the expert count, top-k, an `experts` sub-node (per-expert

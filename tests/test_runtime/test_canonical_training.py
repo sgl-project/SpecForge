@@ -17,7 +17,7 @@ from specforge.config.draft.codec import encode_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.loading import load_draft
-from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
+from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
 from specforge.training.strategies.base import StepContext
@@ -105,15 +105,11 @@ def moe_draft_config(intermediate_size=16):
     )
 
 
-def moe_run_config(target, draft, kernel, bias_update_rate=0.0, aux_loss_coef=0.0):
+def moe_run_config(target, draft, bias_update_rate=0.0, aux_loss_coef=0.0):
     return run_config(
         target,
         draft,
-        model={
-            "target_model_path": str(target),
-            "torch_dtype": "float32",
-            "moe_experts_kernel": kernel,
-        },
+        model={"target_model_path": str(target), "torch_dtype": "float32"},
         training={
             "attention_backend": "eager",
             "max_steps": 1,
@@ -598,14 +594,12 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
 
-    def _train_and_resume_moe(
-        self, root, kernel, bias_update_rate=0.0, aux_loss_coef=0.0
-    ):
+    def _train_and_resume_moe(self, root, bias_update_rate=0.0, aux_loss_coef=0.0):
         self._init_group(root)
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel, bias_update_rate, aux_loss_coef)
+        cfg = moe_run_config(target, draft, bias_update_rate, aux_loss_coef)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
@@ -629,7 +623,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             final / "training_state.pt", map_location="cpu", weights_only=True
         )
         self.assertEqual(state["global_step"], 2)
-        self.assertEqual(state["canonical_moe_experts_kernel"], kernel)
         trained = state["draft_state_dict"]
         for suffix in ("gate.weight", "experts.gate_up_proj", "experts.down_proj"):
             name = next(key for key in trained if key.endswith(suffix))
@@ -642,14 +635,8 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertEqual(trained[bias_key].dtype, torch.float32)
         else:
             self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
-        # The kernel is part of the resume contract, like the Liger choice.
-        other = next(name for name in EXPERT_KERNELS if name != kernel)
-        raw["model"]["moe_experts_kernel"] = other
         raw["training"]["max_steps"] = 3
-        with self.assertRaisesRegex(ValueError, "canonical_moe_experts_kernel"):
-            build_application_run(Config.model_validate(raw)).run()
         # Balancing joins the contract only while on; switching it either way is a change.
-        raw["model"]["moe_experts_kernel"] = kernel
         raw["training"]["objective_options"]["bias_update_rate"] = (
             0.0 if bias_update_rate else 0.001
         )
@@ -669,7 +656,7 @@ class CanonicalTrainingTest(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
     def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
-        """A dense run's contract is what pre-MoE runs wrote, whatever kernel or off balancing it names."""
+        """A dense run's contract is what pre-MoE runs wrote: off balancing adds nothing, and older records resume."""
         with TemporaryDirectory() as temp:
             root = Path(temp)
             self._init_group(root)
@@ -694,7 +681,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             state = torch.load(
                 checkpoint / "training_state.pt", map_location="cpu", weights_only=True
             )
-            self.assertNotIn("canonical_moe_experts_kernel", state)
             self.assertTrue(
                 set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
             )
@@ -711,7 +697,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             torch.save(old, checkpoint / "training_state.pt")
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(checkpoint))
-            raw["model"]["moe_experts_kernel"] = "loop"
             raw["training"]["max_steps"] = 2
             raw["training"]["objective_options"].update(aux_loss_type="microbatch_wise")
             build_application_run(Config.model_validate(raw)).run()
@@ -721,17 +706,14 @@ class CanonicalTrainingTest(unittest.TestCase):
                 weights_only=True,
             )
             self.assertEqual(final["global_step"], 2)
-            self.assertNotIn("canonical_moe_experts_kernel", final)
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
-    def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
-        # grouped_mm also balances: the bias moves, is saved and moves again after resume.
-        balancing = {"grouped_mm": dict(bias_update_rate=0.001, aux_loss_coef=0.01)}
-        for kernel in sorted(EXPERT_KERNELS):
-            with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
-                self._train_and_resume_moe(
-                    Path(temp), kernel, **balancing.get(kernel, {})
-                )
+    def test_moe_draft_trains_saves_and_resumes(self):
+        # The bias moves, is saved and moves again after resume; the term is on.
+        with TemporaryDirectory() as temp:
+            self._train_and_resume_moe(
+                Path(temp), bias_update_rate=0.001, aux_loss_coef=0.01
+            )
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model

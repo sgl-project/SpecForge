@@ -440,7 +440,6 @@ def build_bundle(cfg, algorithm):
         configure_kernels,
         liger_hidden_act,
     )
-    from specforge.modeling.draft.layers.mlp import MoEFFN
     from specforge.training.assembly import ModelBundle, _device
     from specforge.training.model_loading import training_target_config
 
@@ -554,7 +553,6 @@ def build_bundle(cfg, algorithm):
         model,
         use_liger=use_liger,
         use_fused_conv=cfg.model.use_fused_conv,
-        moe_experts_kernel=cfg.model.moe_experts_kernel,
     )
     if cfg.training.attention_backend == "flex_attention":
         _raise_flex_recompile_limit()
@@ -605,9 +603,6 @@ def build_bundle(cfg, algorithm):
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,
     }
-    if any(isinstance(module, MoEFFN) for module in model.modules()):
-        # Dense drafts never record the kernel, so their earlier checkpoints still resume.
-        contract["canonical_moe_experts_kernel"] = cfg.model.moe_experts_kernel
     from specforge.training.provenance import model_resume_provenance
 
     provenance = model_resume_provenance(
