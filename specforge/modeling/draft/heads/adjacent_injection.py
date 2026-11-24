@@ -56,7 +56,7 @@ class AdjacentInjection(nn.Module):
         self.bias = nn.Parameter(torch.empty(config.message_size, **options))
         self._zero_identity_paths()
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         # Legacy builds this head after post_init, retaining nn.Linear defaults.
         for linear in (self.message, self.receiver_gate, *self.readouts):
             init.kaiming_uniform_(linear.weight, a=math.sqrt(5))

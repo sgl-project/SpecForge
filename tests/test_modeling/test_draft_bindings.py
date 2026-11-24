@@ -178,7 +178,7 @@ class BindingTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not bound"):
             head(torch.randn(1, 8))
         head.load_target_weight(torch.ones(16, 8))
-        head.reset_draft_parameters()
+        head.reset_draft_parameters(initializer_range=0.02)
         torch.testing.assert_close(
             head.weight, torch.ones_like(head.weight), rtol=0, atol=0
         )

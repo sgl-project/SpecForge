@@ -84,7 +84,7 @@ class DraftVocabularyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "materialize"):
             install(meta)
         meta.to_empty(device="cpu")
-        meta.reset_draft_parameters()
+        meta.reset_draft_parameters(initializer_range=0.02)
         self.assertFalse(meta.ready)
         install(meta)
         meta.to(dtype=torch.bfloat16)

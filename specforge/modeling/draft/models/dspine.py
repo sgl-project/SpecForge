@@ -68,7 +68,7 @@ class DSpineDraftModel(DraftPreTrainedModel):
         self.register_buffer("transfer_ready", torch.tensor(False, device=device))
         self.post_init()
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         init.zeros_(self.transfer_codes)
         init.zeros_(self.transfer_ready)
 

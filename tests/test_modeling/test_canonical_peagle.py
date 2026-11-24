@@ -59,7 +59,7 @@ class CanonicalPEagleTest(unittest.TestCase):
 
     def test_custom_linear_initialization_takes_precedence(self):
         class CustomLinear(torch.nn.Linear):
-            def reset_draft_parameters(self):
+            def reset_draft_parameters(self, *, initializer_range):
                 torch.nn.init.constant_(self.weight, 0.25)
 
         model = build_draft_model(model_config())
