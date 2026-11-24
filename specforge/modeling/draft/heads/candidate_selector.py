@@ -44,15 +44,15 @@ class CandidateSelector(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.reset_draft_parameters()
+        self.reset_draft_parameters(initializer_range=initializer_range)
 
-    def reset_draft_parameters(self) -> None:
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         """Initialize own factors while respecting HF's loaded-tensor flags.
 
         The owning pretrained model initializes the child Linear separately.
         Standalone construction preserves the existing Linear initialization.
         """
-        init.normal_(self.predecessor_codebook, std=self.initializer_range)
+        init.normal_(self.predecessor_codebook, std=initializer_range)
         # The transition must start as a no-op so a fresh DFlash2 selector is
         # numerically identical to the unary DFlash proposal. The successor
         # factor learns first; the other bilinear factors receive signal once it

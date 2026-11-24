@@ -134,14 +134,14 @@ class DominoGRUTest(unittest.TestCase):
             device="meta",
         )
         head.to_empty(device="cpu")
-        head.prefix_gru.reset_draft_parameters()
+        head.prefix_gru.reset_draft_parameters(initializer_range=0.02)
         for parameter in head.prefix_gru.parameters():
             self.assertTrue(torch.isfinite(parameter).all())
             self.assertLessEqual(parameter.abs().max().item(), 3**-0.5)
             with torch.no_grad():
                 parameter.fill_(7)
             parameter._is_hf_initialized = True
-        head.prefix_gru.reset_draft_parameters()
+        head.prefix_gru.reset_draft_parameters(initializer_range=0.02)
         for parameter in head.prefix_gru.parameters():
             torch.testing.assert_close(parameter, torch.full_like(parameter, 7))
 
