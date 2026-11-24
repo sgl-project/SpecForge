@@ -433,7 +433,10 @@ is selected. The selected path is logged during setup and recorded for resume.
 `model.use_liger_kernel` follows the same three settings. Unset enables Liger
 RMSNorm/SwiGLU on a CUDA/ROCm trainer for the objectives that declare it as
 their default (DFlash and DFlash2) when the draft's FFNs use `silu`/`swish`;
-`true` enables it for any objective and fails where it cannot run.
+`true` enables it for any objective and fails where it cannot run. Liger's
+SwiGLU never covers a MoE draft's routed experts, only dense FFNs and gated
+shared experts; on a draft without those, such as the bundled MoE preset
+(`shared_expert: null`), `use_liger_kernel` means Liger RMSNorm only.
 
 The block objectives (DFlash, DFlash2, Domino, DSpark, DSpine) project and
 checkpoint 128 blocks per batch row at a time unless

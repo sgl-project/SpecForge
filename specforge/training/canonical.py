@@ -329,13 +329,16 @@ def liger_choice(requested, *, by_default, hidden_act, platform=None):
     """Resolve model.use_liger_kernel for a trainer platform (default: this one).
 
     An unset flag enables Liger only for objectives that declare it as their
-    default, on a CUDA/ROCm trainer with a silu/swish draft. ``true`` never
-    degrades silently: it raises where Liger cannot run.
+    default, on a CUDA/ROCm trainer with a silu/swish draft. ``hidden_act``
+    None means nothing in the draft uses SwiGLU (a MoE draft with only
+    routed experts): Liger then covers RMSNorm alone, which still counts.
+    ``true`` never degrades silently: it raises where Liger cannot run.
     """
     platform = platform or trainer_platform()
     if requested is False:
         return LigerChoice(False, "model.use_liger_kernel=false")
-    supported_activation = hidden_act in ("silu", "swish")
+    supported_activation = hidden_act is None or hidden_act in ("silu", "swish")
+    coverage = ", RMSNorm only" if hidden_act is None else ""
     if requested is None:
         if not by_default:
             return LigerChoice(False, "auto: not a default for this objective")
@@ -347,7 +350,7 @@ def liger_choice(requested, *, by_default, hidden_act, platform=None):
             return LigerChoice(
                 False, f"auto: draft hidden_act {hidden_act!r} is not silu/swish"
             )
-        return LigerChoice(True, f"auto: {platform} trainer")
+        return LigerChoice(True, f"auto: {platform} trainer{coverage}")
     if platform not in _LIGER_VALIDATED_PLATFORMS + _LIGER_UNVALIDATED_PLATFORMS:
         raise ValueError(
             "model.use_liger_kernel=true requires a Triton GPU backend: CUDA or "
@@ -362,8 +365,10 @@ def liger_choice(requested, *, by_default, hidden_act, platform=None):
             "key or set it to false to use the PyTorch MLP."
         )
     if platform in _LIGER_UNVALIDATED_PLATFORMS:
-        return LigerChoice(True, f"explicit, unvalidated in SpecForge on {platform}")
-    return LigerChoice(True, "explicit")
+        return LigerChoice(
+            True, f"explicit, unvalidated in SpecForge on {platform}{coverage}"
+        )
+    return LigerChoice(True, f"explicit{coverage}")
 
 
 def preflight_kernels(cfg):
@@ -383,18 +388,23 @@ def preflight_kernels(cfg):
         if trainer_platform() not in _LIGER_VALIDATED_PLATFORMS:
             return  # auto never enables Liger here, so there is nothing to read
         draft = resolve_config(cfg)
-        acts = set()  # what Liger's SwiGLU would replace: dense FFNs and shared experts
+        acts = (
+            set()
+        )  # what Liger's SwiGLU would replace: dense FFNs, gated shared experts
         for node in draft.mlp_configs.values():
             if isinstance(node, DenseFFNSpec):
                 acts.add(node.hidden_act)
             elif isinstance(node, MoEFFNSpec) and node.shared_expert is not None:
-                acts.add(node.shared_expert.hidden_act)
+                if node.shared_expert.gated:
+                    acts.add(node.shared_expert.hidden_act)
         resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
         choice = liger_choice(
             None,
             by_default=resolved.registration.training.liger_by_default,
-            # routed experts keep their own kernel; without other FFNs Liger has its RMSNorm
-            hidden_act="silu" if acts <= {"silu", "swish"} else "other",
+            # routed experts never use SwiGLU; with nothing else Liger has its RMSNorm
+            hidden_act=(
+                None if not acts else "silu" if acts <= {"silu", "swish"} else "other"
+            ),
         )
         if not choice.enabled:
             return
