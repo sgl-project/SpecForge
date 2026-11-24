@@ -1,6 +1,6 @@
 # Training backends: program, step layer, parallel runtime (`specforge.training`)
 
-**Status: seventh revision — aligned with the `#1204–#1215` and `backend-13..20` implementation stack.**
+**Status: seventh revision — aligned with the `#1204–#1215`, `#1234–#1237`, and `#1242–#1245` implementation stack.**
 The design that runs on `main` today is [`DESIGN.md`](DESIGN.md); the cross-plane picture is
 [`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md). Compared with the sixth revision, this
 revision reflects what building and testing the first two runtimes (`PlainRunner` and
@@ -61,9 +61,9 @@ kernel and precision choices are requested, realised, agreed across ranks and re
 |---|---|---|
 | 1 | The target is frozen and only prefills. A captured feature depends on target weights and tokens, not on the draft. There is no weight sync and no staleness, and recorded features can be replayed into any runtime | workload |
 | 2 | Target execution belongs to the inference plane ([`../inference/DESIGN.md`](../inference/DESIGN.md#ownership-of-target-execution)). A trainer never runs target layers | decision |
-| 3 | The loss denominator is not guaranteed to be known before the forward: DSpine's replay statistic and draft-dependent weightings depend on the draft's own predictions, and under default `training.anchor_sampling: device` block objectives sample anchors inside forward. Updates are therefore normalised after the backward. Opting into `training.anchor_sampling: host` moves block-objective anchor draws out of forward onto the host (keyed on seed, sample id and epoch), removing rank/padding dependence while keeping draft-dependent objectives as declared exceptions | workload + `backend-16` |
+| 3 | The loss denominator is not guaranteed to be known before the forward: DSpine's replay statistic and draft-dependent weightings depend on the draft's own predictions, and under default `training.anchor_sampling: device` block objectives sample anchors inside forward. Updates are therefore normalised after the backward. Opting into `training.anchor_sampling: host` moves block-objective anchor draws out of forward onto the host (keyed on seed, sample id and epoch), removing rank/padding dependence while keeping draft-dependent objectives as declared exceptions | workload + `#1237` |
 | 4 | The unit the training plane executes uniformly is a program: `program(tensors, ...) -> ObjectiveResult`. An objective may drive the draft several times per batch (EAGLE3 rollout and `fusion`, DSpine two-pass window, deferred chunked `project` / `lm_head`) and may or may not materialize full logits. A runtime cannot assume logits exist | workload |
-| 5 | The frozen target tables are large and are never sharded or optimized; the trainable draft is a few layers. Today `training.runtime: fsdp` wraps the draft in FSDP1 (`SHARD_GRAD_OP` / `FULL_SHARD`) or DDP (`NO_SHARD`), which accumulates and reduces gradients in `model.torch_dtype` (`bf16`) under `no_sync()`. `training.runtime: fsdp2` holds trainable parameters in `fp32`, computes in `model.torch_dtype` and accumulates/reduces gradients in `fp32` | fact (`main` + `backend-18`) |
+| 5 | The frozen target tables are large and are never sharded or optimized; the trainable draft is a few layers. Today `training.runtime: fsdp` wraps the draft in FSDP1 (`SHARD_GRAD_OP` / `FULL_SHARD`) or DDP (`NO_SHARD`), which accumulates and reduces gradients in `model.torch_dtype` (`bf16`) under `no_sync()`. `training.runtime: fsdp2` holds trainable parameters in `fp32`, computes in `model.torch_dtype` and accumulates/reduces gradients in `fp32` | fact (`main` + `#1244`) |
 | 6 | The artifact is the product: a canonical draft directory written at the declared artifact dtype goes to export and to SGLang. Which runtime or optimizer produced it must not show | decision |
 | 7 | Canonical training has one model-parallel axis today: sequence parallelism (ring and Ulysses attention) for an objective that declares `supports_sequence_parallel` (EAGLE3 under `attention_backend: usp`). Trainer tensor-parallel size is one (`training/canonical.py`). Four things happen in four places: the data plane cuts sequences into per-rank shards; attention exchanges data on groups bound at construction (`training/sequence_parallel.py`); LK losses sum per-sequence statistics over the sequence-parallel group inside the objective; and the accumulation count is multiplied by the sequence-parallel size (`training/assembly.py`) while the wrapper synchronises gradients over the world | fact |
 
@@ -76,7 +76,7 @@ This is fixed outside the training plane and every runtime fits inside it.
   `evaluate` (see [Rank symmetry](#rank-symmetry)).
 - **The world is initialized once**, in `specforge.cli`: `init_distributed` creates the process
   groups in a fixed order and returns one frozen `Topology` value (`specforge/distributed.py`),
-  replacing the legacy module-global getters (`backend-14`). `set_seed(training.seed)` seeds every
+  replacing the legacy module-global getters (`#1235`). `set_seed(training.seed)` seeds every
   rank identically. The data plane then creates its own acknowledgement group where a run uses one
   (`runtime/control_plane/dp_ack.py`).
 - **A runtime consumes that `Topology` explicitly.** It does not initialize or destroy the world,
@@ -97,26 +97,26 @@ This is fixed outside the training plane and every runtime fits inside it.
 On `main` (`d4391211`), `Trainer -> TrainerController -> TrainerCore -> CanonicalTrainStrategy -> FSDPTrainingBackend`
 ([`DESIGN.md`](DESIGN.md)) mixes window walking, cross-sample collectives, gradient scaling and
 model wrapping across layers. The table below tracks each coupling against its status in the stacked
-PRs (`#1204–#1215`, `backend-13..20`) and the remaining follow-up work:
+PRs (`#1204–#1215`, `#1234–#1237`, `#1242–#1245`) and the remaining follow-up work:
 
-| Original coupling / hazard | Status in stack (`#1204–#1215`, `backend-13..20`) | Remaining work |
+| Original coupling / hazard | Status in stack (`#1204–#1215`, `#1234–#1237`, `#1242–#1245`) | Remaining work |
 |---|---|---|
-| Post-construction attributes (`frozen_target_modules`, `fsdp_param_dtype`, SP groups, `_no_split_modules` via `getattr`) | **Resolved** (`#1211`, `#1212`, `backend-17`): `program.frozen`, `ProgramSpec.partition.blocks`, bound `SequenceParallel` groups, explicit `PrecisionSpec` | Remove `ObjectiveModel.forward`'s remaining `embed_tokens.weight.dtype` inference (`base.py`) when unwrapping root |
-| Cross-sample collectives outside the runner (`microbatch_mean`, DSpine replay, evaluator, `CheckpointManager._all_ok`, `ExecutionSelection.agree`) | **Resolved** (`#1206–#1210`, `#1213`): all cross-sample collectives run through the runner/runtime, enforced by AST import scan | Move `CheckpointManager`'s remaining rank broadcast only if delivery item 12 (three-part checkpoints / dedicated trainer) is needed |
-| Structure and weight loading fused in `build_bundle` | **Resolved** (`backend-20`): `construct_draft` / `ProgramWeights` build the program without weights; `program.load_weights()` streams host-staged tables when the runtime chooses | Move `FSDP2TrainingBackend` to shard before `load_weights()` when meta-device init is wanted |
-| Process-global topology in `specforge.distributed` | **Resolved** (`backend-13`, `backend-14`): unused TP layers deleted; nine globals/getters replaced by one `Topology` value | Evolve `Topology` to back multi-axis layouts with PyTorch `DeviceMesh` (HSDP / CP / EP) |
-| Fixed precision & `bf16` gradient accumulation under FSDP1 `no_sync()` | **Resolved** (`backend-17`, `backend-18`, `backend-19`): `PrecisionSpec`, `training.runtime: fsdp \| fsdp2`, `FSDP2TrainingBackend` (`fp32` grad accum/reduce) and FSDP1→FSDP2 checkpoint resume | GPU A/B verification (loss band + serving acceptance length) before flipping default and retiring FSDP1 |
-| Implicit `world_size` rescale assuming the wrapper averages across ranks | **Partially resolved**: moved into `DataParallelRunner` (`#1206`) and guarded by conformance mutation (`#1214`) | Have `TrainingBackend` declare `grad_reduction: Literal["mean", "sum"]` explicitly so SUM-reducing runtimes cannot silently mis-scale |
-| Update mechanics (global grad norm, clip, finite/denom checks, `zero_grad`) hidden inside `BF16Optimizer` / `FP32Optimizer` via `getattr` | **Still coupled** (`backend-18` mirrors `BF16Optimizer`'s contract in `FP32Optimizer`) | **Next (`runtime-update` + registries)**: move norm, clip, checks and `zero_grad` into the runtime; extract shared Optimizer and stateless LR registries |
-| Whole `ObjectiveModel` wrapped by FSDP instead of only `program.draft` | **Mitigated** (`backend-15`, `backend-18`): `cast_root_forward_inputs=False` prevents wrapper casts on objective/replay tensors while keeping root params gathered for post-forward calls | **Next**: route `project`/`fusion`/trainable `lm_head` through wrapped submodules and pass explicit `compute_dtype` so runtime wraps only `program.draft` |
-| Double-bookkeeping & large classes (`controller.py` 712L, `trainer.py` 662L, `runner.py` 595L) | **Open**: window counters duplicated across `frame.py` (`received`) and `runner.py` (`_micro`, `_window_steps`, `_pending`); step counters duplicated in `_TwoStageScheduler`; 220L resume check inside `Trainer.__init__` | **Next**: collapse `frame.py` + `DataParallelRunner`'s window state into a stateless `StepExecutor`, switch to stateless LR functions, and move resume validation to `checkpoint.py` |
+| Post-construction attributes (`frozen_target_modules`, `fsdp_param_dtype`, SP groups, `_no_split_modules` via `getattr`) | **Resolved** (`#1211`, `#1212`, `#1243`): `program.frozen`, `ProgramSpec.partition.blocks`, bound `SequenceParallel` groups, explicit `PrecisionSpec` (including `buffer_dtype`) | Remove `ObjectiveModel.forward`'s remaining `embed_tokens.weight.dtype` inference (`base.py`) when unwrapping root |
+| Cross-sample collectives outside the runner (`microbatch_mean`, DSpine replay, evaluator, `CheckpointManager._all_ok`, `ExecutionSelection.agree`) | **Resolved** (`#1206–#1210`, `#1213`): all cross-sample collectives run through the runner/runtime, enforced by AST import scan | Move `CheckpointManager`'s remaining rank broadcast only if delivery item 13 (three-part checkpoints / dedicated trainer) is needed |
+| Partial checkpoint visible on shard write failure | **Fixed (`#1247`)**: rank shards write first → `_all_ok` → rank 0 atomically writes `config.json` and `training_state.pt` last → `_all_ok` → `*-latest` | Separate three-file on-disk layout remains deferred until a dedicated trainer requires it |
+| `after_step` buffer updates (e.g. MoE `#1179` expert router bias) | **Added (`#1248`)**: `ProgramSpec.after_step_statistics` + `TrainingProgram.apply_statistics`, pooled via `reduce_sum` after optimizer step succeeds and before checkpoint | Adopt in MoE `#1179` (`moe_balance.py`) to remove its direct `dist.all_reduce` |
+| Process-global topology in `specforge.distributed` | **Resolved** (`#1234`, `#1235`): unused TP layers deleted; nine globals/getters replaced by one `Topology` value | Evolve `Topology` to back multi-axis layouts with PyTorch `DeviceMesh` (HSDP / CP / EP) |
+| Implicit `world_size` rescale & update mechanics hidden in `BF16Optimizer` via `getattr` | **Resolved** (`#1242`): explicit `grad_reduction: Literal["mean", "sum"]`, runtime-owned global grad-norm/clip/checks/`zero_grad`, shared Optimizer & LR Scheduler registries | Convert stateful `LRScheduler` wrappers into stateless `compute_lr(global_step, SchedulerSpec)` functions |
+| Fixed precision & `bf16` gradient accumulation under FSDP1 `no_sync()` | **Resolved** (`#1243`, `#1244`, `#1245`): `PrecisionSpec`, `training.runtime: fsdp \| fsdp2`, `FSDP2TrainingBackend` (`fp32` grad accum/reduce) and lazy-layout FSDP1→FSDP2 checkpoint resume | GPU A/B verification (loss band + serving acceptance length) before flipping default and retiring FSDP1 |
+| Whole `ObjectiveModel` wrapped by FSDP instead of only `program.draft` | **Mitigated** (`#1236`, `#1244`): `cast_root_forward_inputs=False` prevents wrapper casts on objective/replay tensors while keeping root params gathered for post-forward calls | **Next**: route `project`/`fusion`/trainable `lm_head` through wrapped submodules and pass explicit `compute_dtype` so runtime wraps only `program.draft` |
+| Double-bookkeeping & large classes (`controller.py` 712L, `trainer.py` 662L, `runner.py` 595L) | **Open**: window counters duplicated across `frame.py` (`received`) and `runner.py` (`_micro`, `_window_steps`, `_pending`); 220L resume check inside `Trainer.__init__` | **Next**: collapse `frame.py` + `DataParallelRunner`'s window state into a stateless `StepExecutor`, switch to stateless LR functions, and move resume validation to `checkpoint.py` |
 
 ## The contract
 
 ### Architecture: one stateless step layer over a narrow runtime
 
 Building both `PlainRunner` (`#1215`, which overrode only 3 methods of `DataParallelRunner`) and
-`FSDP2TrainingBackend` (`backend-18`, which plugged directly under `DataParallelRunner`) proved
+`FSDP2TrainingBackend` (`#1244`, which plugged directly under `DataParallelRunner`) proved
 where the real boundary sits:
 
 - **Shared SpecForge orchestration** (`RunLoop` in `controller.py` + stateless `StepExecutor` in
@@ -210,6 +210,7 @@ class ProgramSpec:
     name: str
     inputs: Tuple[str, ...]
     replay_statistics: Tuple[str, ...] = ()
+    after_step_statistics: Tuple[str, ...] = ()  # pooled after optimizer step, before checkpoint
     evaluation_diagnostics: bool = False
     reduction: Literal["window", "microbatch"] = "window"
     partition: PartitionHints = PartitionHints()
@@ -244,12 +245,12 @@ class SchedulerSpec:                         # target contract for stateless LR 
 
 class TrainingProgram(Protocol):             # today's ObjectiveModel
     frozen: Tuple[torch.nn.Module, ...]      # target tables, teacher head: never sharded/optimized
-    def load_weights(self) -> None: ...      # streams pending DraftWeights + teacher table + vocab mapping
     def __call__(self, tensors: Mapping[str, Tensor], *, step: int, total_steps: Optional[int],
                  collect_detailed_metrics: bool, prepass: bool = False,
                  **statistics: Optional[Tensor]) -> ObjectiveResult: ...
     def replay_arguments(self, replay_values: Mapping[str, Tensor], *,
                          prepass: bool = False) -> Mapping[str, Optional[Tensor]]: ...
+    def apply_statistics(self, values: Mapping[str, Tensor]) -> Mapping[str, Any]: ...  # post-step, no collective, same on every rank
     def host_inputs(self, tensors: Mapping[str, Tensor], *,
                     sample_ids: Sequence[str], epoch: Optional[int]) -> Mapping[str, Tensor]: ...
     def kernel_record(self) -> Dict[str, str]: ...
@@ -282,11 +283,10 @@ substitutes a value.
 
 | Value | Holds | Status |
 |---|---|---|
-| `Topology` | `rank`, `world_size`, `local_rank`, `(tp, sp_ulysses, sp_ring)` sizes & ranks, `device_type`, and the constructed process groups (evolving to a single PyTorch `DeviceMesh` owner for HSDP / CP / EP) | **Implemented** (`backend-14`, `specforge/distributed.py`) |
-| `PrecisionSpec` & `TrainingRuntime` | `parameter_dtype`, `compute_dtype`, `gradient_dtype`, `master_dtype`, `artifact_dtype`, plus reserved `low_bit` (FP8) policy; selected by `training.runtime` (`fsdp` \| `fsdp2`) | **Implemented** (`backend-17`, `backend-18`) except `low_bit` |
-| `ProgramWeights` / `DraftWeights` | deferred weight plan, teacher head table and vocabulary mapping loaded explicitly via `program.load_weights()` | **Implemented** (`backend-20`, `specforge/loading.py`) |
+| `Topology` | `rank`, `world_size`, `local_rank`, `(tp, sp_ulysses, sp_ring)` sizes & ranks, `device_type`, and the constructed process groups (evolving to a single PyTorch `DeviceMesh` owner for HSDP / CP / EP) | **Implemented** (`#1235`, `specforge/distributed.py`) |
+| `PrecisionSpec` & `TrainingRuntime` | `parameter_dtype`, `compute_dtype`, `gradient_dtype`, `master_dtype`, `artifact_dtype`, `buffer_dtype`, plus reserved `low_bit` (FP8) policy; selected by `training.runtime` (`fsdp` \| `fsdp2`) | **Implemented** (`#1243`, `#1244`) except `low_bit` |
+| `OptimizerSpec` & `SchedulerSpec` | structured optimizer kind/hyperparams/param-group policy and LR schedule kind/warmup/min_lr | **Implemented** (`#1242`; stateless pure-function LR curves next) |
 | `Kernels` | requested policy for choices that leave the math alone: `training.attention_backend`, `training.loss.execution`, tri-state switches (`training.loss.fused`, `model.use_fused_conv`, `model.use_liger_kernel`), plus target slots for **block `torch.compile`** and **activation checkpointing** | Partial (`loss_implementations` + build flags exist; unified `Kernels` + `transforms.py` next) |
-| `OptimizerSpec`, `SchedulerSpec`, `ClipSpec` | structured optimizer kind/hyperparams/param-group policy, stateless LR schedule kind/warmup/decay, clip norm | **Next** (replaces hardcoded `BF16Optimizer`/`FP32Optimizer` wiring) |
 | `RunSpec` | accumulation window, horizon, seed, `anchor_sampling`, cadences | Implicit in `TrainingConfig` / `TrainerController` today |
 
 - **Requested at startup, realised when the facts exist.** An explicit kernel request that cannot
@@ -303,7 +303,7 @@ substitutes a value.
 
 ### Wrapping boundary: root wrap today vs. draft-only wrap next
 
-Today, both `FSDPTrainingBackend` and `FSDP2TrainingBackend` (`backend-15`, `backend-18`) wrap the
+Today, both `FSDPTrainingBackend` and `FSDP2TrainingBackend` (`#1236`, `#1244`) wrap the
 program root (`ObjectiveModel`) with `cast_root_forward_inputs=False` / `cast_forward_inputs=False`
 and `ignored_modules` / `ignored_params` for `program.frozen`. That immediately fixes the FSDP
 input-cast bug (e.g., DSpine's `fp32` replay ratio is no longer truncated to `bf16`) while keeping
@@ -337,6 +337,21 @@ of two yield three updates).
   `anchor_sampling == "device"`).
 - **A short window raises `IncompleteWindow`.** Only end-of-stream can leave a window short; no
   partial update is applied and no sample acknowledgements are committed.
+- **Two declared step-statistic delivery points (`ProgramSpec`)** — neither sends a process group
+  into the program, and neither adds a method to `TrainingBackend`:
+  - **`replay` (`replay_statistics`)**: pooled over the window and DP ranks via `reduce_sum` in a
+    prepass before the gradient pass, then returned through `ctx.replay_values` /
+    `replay_arguments` (DSpine alignment CE).
+  - **`after_step` (`after_step_statistics`, disjoint from `replay_statistics`)**: additive counts
+    returned in `ObjectiveResult.statistics` during training forwards, summed over the window,
+    pooled once across all DP ranks via `reduce_sum` **only after the optimizer update succeeds**
+    (so a failed finite/denominator check never mutates draft state), and delivered to
+    `program.apply_statistics(pooled)` on every rank **before** any checkpoint snapshot is taken.
+    `apply_statistics` issues no collective, updates draft buffers deterministically so all ranks
+    stay identical (and `checkpoint_state()` captures the update), and may return post-step scalar
+    metrics to merge into `StepMetrics`. Concrete consumer: MoE `#1179` (`moe_balance.py`), which
+    updates per-layer `expert_bias` once per optimizer window from global expert token counts and
+    reports `moe/step_balance`.
 - **Two training reductions (`ProgramSpec.reduction`)**:
   - `window` (default): `sum(numerator) / sum(denominator)` over all micro-batches and DP ranks.
     Each numerator is divided by `A` before backward; at the boundary, if
@@ -393,7 +408,7 @@ transforms and registries) keeps every module within **~150–300 lines**:
 | `training/controller.py` (`RunLoop`) | Macro cadence (`global_step`, `epoch`, durable acks, eval/ckpt/log triggers, stage & MFU telemetry) | Tensors, `backward()`, micro-batch loops, `torch.distributed` |
 | `training/step.py` (`StepExecutor`) | Stateless `run_window` & `run_evaluation` (`1..A` loop, `microbatch` pool, DSpine replay + RNG fork, lazy metric packing) | Cross-window mutable counters, wrapper setup, optimizer/clipping math |
 | `training/backends/transforms.py` | Composable pure functions over `program.draft`: `apply_low_bit`, `apply_activation_checkpointing`, `apply_compile` | Loop state, collectives, optimizer state |
-| `training/backends/fsdp2.py` | `FSDP2TrainingBackend`: `fully_shard`, `load_weights`, `no_sync`/`backward`, rescale/norm/clip/step/zero, `DTensor` state + `reference_state.py` | Objective names, replay logic, LR formulas, inline FP8/compile/AC implementations |
+| `training/backends/fsdp2.py` | `FSDP2TrainingBackend`: `fully_shard`, `no_sync`/`backward`, rescale/norm/clip/step/zero, `DTensor` state + `reference_state.py` | Objective names, replay logic, LR formulas, inline FP8/compile/AC implementations |
 | `training/optim/registry.py` | Shared Optimizer Registry + `named_parameters()` grouping (`AdamW`, `Muon`, `AdamW8bit`) | Distributed collectives, gradient clipping |
 | `training/optim/schedulers.py` | Stateless pure LR curves (`cosine`, `constant`, `wsd`, `linear`, `min_lr_ratio`) | Stateful `LRScheduler` subclasses |
 
@@ -422,18 +437,17 @@ Why FSDP2 first instead of torchtitan (which itself runs PyTorch FSDP2, `torch.c
   work out of the box and 2D matrix optimizers (`Muon` / `DistributedMuon`) attach cleanly through
   the shared Optimizer Registry.
 
-What is implemented in `backend-18..20`:
+What is implemented in `#1242–#1245`:
 
-- `specforge/training/backends/fsdp2.py::FSDP2TrainingBackend`: upcasts trainable draft parameters
-  to `fp32` (preserving tied weights), leaves `program.frozen` unsharded in its built dtype, applies
-  `fully_shard` per declared block and at root, disables gradient sync and post-backward resharding
-  on non-boundary micro-batches, and exports canonical draft weights in `PrecisionSpec.artifact_dtype`.
-- `specforge/training/backends/reference_state.py` (`backend-19`): converts DDP and FSDP1
-  `BF16Optimizer` checkpoints (replaying FSDP1 `FlatParameter._shard_param_infos` one parameter at a
-  time on CPU) into FSDP2 `DTensor` shards so existing runs switch to `fsdp2` seamlessly on resume.
-- `specforge/loading.py` (`backend-20`): separates draft/program construction (`ProgramWeights`)
-  from host-staged weight loading (`program.load_weights()`), removing duplicate GPU table staging
-  during EAGLE3 load (~1.16 GiB/rank on Qwen3-8B) and preparing post-shard loading.
+- `specforge/training/backends/fsdp2.py::FSDP2TrainingBackend` (`#1244`): upcasts trainable draft
+  parameters to `fp32` (preserving tied weights), leaves `program.frozen` unsharded in its built
+  dtype, applies `fully_shard` per declared block and at root, disables gradient sync and
+  post-backward resharding on non-boundary micro-batches, drives registry-built optimizers directly
+  (`#1242`), and exports canonical draft weights in `PrecisionSpec.artifact_dtype`.
+- `specforge/training/backends/reference_state.py` (`#1245`): converts DDP and FSDP1
+  `BF16Optimizer` checkpoints (replaying FSDP1 `FlatParameter._shard_param_infos` lazily on CPU one
+  parameter at a time) into FSDP2 `DTensor` shards so existing runs switch to `fsdp2` seamlessly on
+  resume.
 - Known torch 2.14 limit: a parameter that receives no gradient on micro-batches `1..A-1` and
   receives one on micro-batch `A` triggers FSDP2's uniform-gradient-dtype reduce-scatter error;
   conditional/MoE drafts must guard unused experts or stay on `fsdp` until handled.
@@ -475,11 +489,33 @@ ratio (while offline training captures 100% of trainer speedups directly).
 `checkpoint_state()` gathers the canonical draft weights (cast to `PrecisionSpec.artifact_dtype`),
 rank-local/replicated optimizer state, rank-local RNG state and realised `kernels`; `RunLoop`
 agrees across ranks via `agree` before committing `CheckpointManager.save`. `fsdp2` reads both its
-own checkpoints and legacy `fsdp` checkpoints on resume. Splitting on-disk files into separate
-resume-state and run-record files is deferred unless an external whole-trainer replacement requires
-it.
+own checkpoints and legacy `fsdp` checkpoints on resume.
 
-### Numerics classes and conformance (`#1213`, `#1214`, `backend-18`)
+**Atomic publication guarantee (fixed now; independent of the deferred three-file split `[A3, A4]`):**
+readers (`specforge/checkpoint/resolve.py::resolve_run_directory`) treat the presence of
+`training_state.pt` as the sole definition of a complete checkpoint for both explicit step paths
+and automatic run-root discovery. A partial checkpoint directory must therefore never become visible
+to readers when any rank fails to write its shard:
+
+1. Flush durable sample commits up to `step`, gather `checkpoint_state()`, and agree across ranks
+   on `RankFailure` and realised `kernels` before touching disk.
+2. Rank 0 rewinds stale `>= step` directories; all ranks agree (`_all_ok`) before creating files.
+3. Every rank atomically writes `training_state_rank{r}.pt`.
+4. **First write agreement (`_all_ok`)**: every rank confirms its shard write succeeded; any rank's
+   failure raises on every rank **before `config.json` or `training_state.pt` is written**.
+5. **Single commit point**: rank 0 atomically writes `config.json` (when present) and **last**
+   atomically writes `training_state.pt`.
+6. **Second write agreement (`_all_ok`)**: every rank observes any commit write failure before
+   rank 0 moves `{run_id}-latest` and rotates old checkpoints.
+7. Final agreement (`_all_ok`) so no rank proceeds before publication completes or hangs on a
+   rank-0 pointer/rotation error.
+
+A two-rank fault-injection test (failing rank 1's shard write) verifies that `save()` raises on all
+ranks and that neither explicit step resolution nor run-root auto-discovery selects the partial
+checkpoint directory. Splitting on-disk files further into separate resume-state and run-record
+files remains deferred unless an external whole-trainer replacement requires it.
+
+### Numerics classes and conformance (`#1213`, `#1214`, `#1244`)
 
 | Class | Meaning | Gate |
 |---|---|---|
@@ -508,14 +544,15 @@ Prerequisite met on `main` (`d4391211`): legacy step strategies retired.
 | 2 | Step frame, `DataParallelRunner`, eval, checkpoint state, strategy removal, `microbatch` reduction, declarations, bound SP groups (`#1206–#1212`) | behaviour-preserving | **Implemented** | 90+ recorded trajectories bit-identical to `main` |
 | 3 | AST import boundaries & mutation-tested conformance kit (`#1213`, `#1214`) | tests / guardrails | **Implemented** | Shrinking allowlists; all 3 mutations caught |
 | 4 | `PlainRunner` (`#1215`) | optional | **Implemented (hold)** | Bit-identical at 1 rank on CPU; hold merge unless decision O2 adopts it |
-| 5 | Delete unused TP layers, single `Topology` value, `cast_root_forward_inputs=False`, `PrecisionSpec`, `ProgramWeights` build/load split (`backend-13, 14, 15, 17, 20`) | behaviour-preserving (+ FSDP replay precision fix) | **Implemented** | 97 reference trajectories bit-identical (only DSpine FSDP bf16 replay rounding fixes); zero `distributed` globals |
-| 6 | Host-side deterministic anchor sampling (`backend-16`, `training.anchor_sampling: host`) | new (`equivalent`, opt-in) | **Implemented** | Same sampling law; rank/DP-invariant; GPU A/B before default flip |
-| 7 | `FSDP2TrainingBackend` (`training.runtime: fsdp2`) + FSDP1→FSDP2 checkpoint resume (`backend-18`, `backend-19`) | new (`equivalent`, opt-in) | **Implemented** | Conformance kit + 18 FSDP2 trajectories + `fp32` accum oracle (`1e-6`) + cross-runtime resume tests |
-| 8 | **Stateless `StepExecutor` + runtime-owned update + Optimizer & stateless LR registries** (remove duplicated window/LR counters, move clip/norm/checks/`zero_grad` & `grad_reduction` to runtime, slim `trainer.py`) | behaviour-preserving + extensibility | **Next** | Bitwise trajectories on default AdamW/cosine; unit + conformance tests for WSD, param groups and Muon on FSDP2 |
-| 9 | **Permanent MFU / stage observability + GPU A/B of `fsdp2`** | measurement / rollout | **Next** | Per-stage timing + Trainer/Server MFU logs; GPU loss band + SGLang serving acceptance length across families before flipping default to `fsdp2` |
-| 10 | **Draft-only wrapping + `transforms.py`** (`base.py` explicit `compute_dtype`, wrapped `entry_submodules`, `torch.library.custom_op` for custom Triton ops, per-block `torch.compile`, selective AC, optional `torchao` FP8, gated metric reduction) | optimization (`equivalent` where numerics move) | **Next** | Step-time / MFU improvement + acceptance-length parity |
-| 11 | **Multi-axis `DeviceMesh` in `Topology`** (HSDP, CP, EP) | scale / coverage | **Planned** | Full-DP denominator reduction test + multi-axis GPU trajectories (including EAGLE3 USP on FSDP2) |
-| 12 | Three-part on-disk checkpoints, external engine (torchtitan) / dedicated trainer | deferred | **Deferred** | Only if a concrete workload outgrows PyTorch-native FSDP2 |
+| 5 | Delete unused TP layers, single `Topology` value, `cast_root_forward_inputs=False` (`#1234–#1236`) | behaviour-preserving (+ FSDP replay precision fix) | **Implemented** | 97 reference trajectories bit-identical (only DSpine FSDP bf16 replay rounding fixes); zero `distributed` globals |
+| 6 | Host-side deterministic anchor sampling (`#1237`, `training.anchor_sampling: host`) | new (`equivalent`, opt-in) | **Implemented** | Same sampling law; rank/DP-invariant; GPU A/B before default flip |
+| 7 | Runtime-owned updates, `grad_reduction`, shared Optimizer/LR registries & `PrecisionSpec` (`#1242`, `#1243`) | behaviour-preserving + extensibility | **Implemented** | Bitwise trajectories on default AdamW/cosine; registry tests + runtime-owned clip/norm/checks/`zero_grad` |
+| 8 | `FSDP2TrainingBackend` (`training.runtime: fsdp2`) + lazy-layout FSDP1→FSDP2 checkpoint resume (`#1244`, `#1245`) | new (`equivalent`, opt-in) | **Implemented** | Conformance kit + 18 FSDP2 trajectories + `fp32` accum oracle (`1e-6`) + cross-runtime resume tests |
+| 9 | **Atomic checkpoint publication (`#1247`) & `after_step` statistics delivery (`#1248`)** | correctness + MoE contract | **Implemented** | 2-rank shard-write-failure test (partial dir never visible to explicit/auto resume); 2-rank `after_step` buffer update + checkpoint + failed-step no-mutation tests |
+| 10 | **Stateless `StepExecutor` + stateless LR curves + slim `trainer.py`** (remove duplicated window/LR counters, move resume validation to `checkpoint.py`) | behaviour-preserving cleanup | **Next** | Bitwise reference & FSDP2 trajectories; zero cross-window fields in `step.py` |
+| 11 | **Permanent MFU / stage observability + GPU A/B of `fsdp2`** | measurement / rollout | **Next** | Per-stage timing + Trainer/Server MFU logs; GPU loss band + SGLang serving acceptance length across families before flipping default to `fsdp2` |
+| 12 | **Draft-only wrapping + `transforms.py`** (`base.py` explicit `compute_dtype`, wrapped `entry_submodules`, `torch.library.custom_op` for custom Triton ops, per-block `torch.compile`, selective AC, optional `torchao` FP8, gated metric reduction) | optimization (`equivalent` where numerics move) | **Next** | Step-time / MFU improvement + acceptance-length parity |
+| 13 | **Multi-axis `DeviceMesh` in `Topology`** (HSDP, CP, EP) & deferred three-part checkpoints / external engines | scale / deferred | **Planned / Deferred** | Full-DP denominator reduction test + multi-axis GPU trajectories; external engines only if a workload outgrows native FSDP2 |
 
 ## Decisions
 
@@ -523,19 +560,20 @@ Prerequisite met on `main` (`d4391211`): legacy step strategies retired.
 
 | # | Decision | Resolution |
 |---|---|---|
-| S1 | Primary second runtime | **PyTorch-native FSDP2** (`training.runtime: fsdp2`), not torchtitan (`backend-18`) |
-| S2 | Pluggable backend boundary | Narrow **`TrainingBackend` runtime** beneath one shared stateless `StepExecutor` |
-| S3 | Config key & relation to `fsdp_sharding` | `training.runtime: fsdp \| fsdp2` (default `fsdp`); reuses `training.fsdp_sharding` (`SHARD_GRAD_OP`, `FULL_SHARD`, `NO_SHARD`) |
-| S4 | Artifact dtype rule | Always written at `PrecisionSpec.artifact_dtype` (`model.torch_dtype`), even when `fsdp2` stores trainable masters in `fp32` |
-| S5 | Existing checkpoint compatibility | `fsdp2` resumes directly from existing DDP and FSDP1 checkpoints (`backend-19`, `reference_state.py`) |
-| S6 | Host-side anchor sampling | Opt-in behind `training.anchor_sampling: host` (default `device`), recorded in the resume contract (`backend-16`) |
-| S7 | Deferred weight loading | `ProgramWeights` / `program.load_weights()` separates structure build from host-staged weight loading (`backend-20`) |
+| S1 | Primary second runtime | **PyTorch-native FSDP2** (`training.runtime: fsdp2`), not torchtitan (`#1244`) |
+| S2 | Pluggable backend boundary | Narrow **`TrainingBackend` runtime** beneath one shared step layer (`#1242`) |
+| S3 | Config key & relation to `fsdp_sharding` | `training.runtime: fsdp \| fsdp2` (default `fsdp`); reuses `training.fsdp_sharding` (`SHARD_GRAD_OP`, `FULL_SHARD`, `NO_SHARD`) (`#1244`) |
+| S4 | Artifact dtype rule | Always written at `PrecisionSpec.artifact_dtype` (`model.torch_dtype`), even when `fsdp2` stores trainable masters in `fp32` (`#1243`, `#1244`) |
+| S5 | Existing checkpoint compatibility | `fsdp2` resumes directly from existing DDP and FSDP1 checkpoints (`#1245`, `reference_state.py`) |
+| S6 | Host-side anchor sampling | Opt-in behind `training.anchor_sampling: host` (default `device`), recorded in the resume contract (`#1237`) |
+| S7 | Atomic checkpoint publication | Rank shards write and agree (`_all_ok`) before rank 0 atomically writes `config.json` and `training_state.pt` last (`#1247`) |
+| S8 | `after_step` statistics delivery | `ProgramSpec.after_step_statistics` + `TrainingProgram.apply_statistics`, pooled via `reduce_sum` after optimizer step and before checkpoint (`#1248`, for MoE `#1179`) |
 
 ### Still open for maintainers
 
 | # | Decision | What settles it |
 |---|---|---|
-| O1 | **When to flip default `training.runtime` to `fsdp2` and retire FSDP1** | GPU A/B per model family: loss band + SGLang serving acceptance length + throughput/memory on `backend-18..20` |
+| O1 | **When to flip default `training.runtime` to `fsdp2` and retire FSDP1** | GPU A/B per model family: loss band + SGLang serving acceptance length + throughput/memory on `#1244` / `#1245` |
 | O2 | **Whether to merge or drop `PlainRunner` (`#1215`)** | Whether a wrapper-free 1-process runtime earns its maintenance cost once `fsdp2` exists |
 | O3 | **Whether to flip `training.anchor_sampling` default to `host`** | GPU acceptance-length A/B; flipping it makes block-objective anchors rank- and DP-invariant by default |
 | O4 | **First low-bit (FP8) recipe and default sensitive-module pins** | Step-time profiling + SGLang acceptance-length A/B on H200 / GB300 recipes |
