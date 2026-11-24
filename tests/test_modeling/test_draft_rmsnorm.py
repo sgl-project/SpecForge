@@ -80,12 +80,12 @@ class RMSNormTest(unittest.TestCase):
             with torch.device("meta"):
                 module = RMSNorm(node, hidden_size=8)
             module.to_empty(device="cpu")
-            module.reset_draft_parameters()
+            module.reset_draft_parameters(initializer_range=0.02)
             torch.testing.assert_close(module.weight, torch.full((8,), 1.0 - offset))
             with torch.no_grad():
                 module.weight.fill_(7)
             module.weight._is_hf_initialized = True
-            module.reset_draft_parameters()
+            module.reset_draft_parameters(initializer_range=0.02)
             torch.testing.assert_close(module.weight, torch.full((8,), 7.0))
 
     def test_invalid_inputs_fail_before_parameter_allocation(self):

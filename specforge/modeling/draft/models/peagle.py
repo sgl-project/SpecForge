@@ -79,7 +79,7 @@ class PEagleDraftModel(DraftPreTrainedModel):
         else:
             super()._init_weights(module)
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         # Legacy P-EAGLE starts this vector with standard-normal entries.
         init.normal_(self.mask_hidden, mean=0, std=1)
 

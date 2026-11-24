@@ -84,6 +84,10 @@ class Predictions:
     computed terms. Every declared term must execute exactly once. Without a
     procedure, all plan groups execute directly. Statistics retain gradients;
     the algorithm decides where supervision must be detached.
+
+    term_values holds already normalized scalars for scalar terms whose value
+    the algorithm computed once over the whole set (a routing regularizer);
+    the executor adds each once after chunking and runs no formula for it.
     """
 
     hidden: Tensor
@@ -100,6 +104,7 @@ class Predictions:
     requires: frozenset[str] = frozenset()
     default_loss: TokenLoss = field(default_factory=lambda: TokenLoss(kind="ce"))
     plan: LossPlan = field(default_factory=LossPlan)
+    term_values: dict[int, Tensor] = field(default_factory=dict)
     vocab_mask: Tensor | None = None
     draft_to_target: Tensor | None = None
     denominator: Tensor | None = None
@@ -127,6 +132,16 @@ class Predictions:
         for term in self.plan.terms:
             if term.mask is not None and term.mask.shape != shape:
                 raise ValueError("Loss masks must align with prediction units")
+        for index, value in self.term_values.items():
+            if (
+                not 0 <= index < len(self.plan.terms)
+                or self.plan.terms[index].reduction != "scalar"
+            ):
+                raise ValueError("term_values must name scalar terms of the plan")
+            if value.ndim != 0:
+                raise ValueError("A term value is one already normalized scalar")
+            if any(index in group for group in self.plan.joint_groups):
+                raise ValueError("A term whose value is supplied runs no formula")
         aligned = [*self.projection_inputs.values(), *self.context_inputs.values()]
         if self.teacher is not None:
             aligned.append(self.teacher.values)

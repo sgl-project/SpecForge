@@ -65,7 +65,7 @@ class SelectorInitializationTest(unittest.TestCase):
             module.predecessor_codebook.fill_(3)
             module.successor_codebook.fill_(7)
         module.predecessor_codebook._is_hf_initialized = True
-        module.reset_draft_parameters()
+        module.reset_draft_parameters(initializer_range=0.02)
         torch.testing.assert_close(
             module.predecessor_codebook,
             torch.full_like(module.predecessor_codebook, 3),
@@ -81,7 +81,7 @@ class SelectorInitializationTest(unittest.TestCase):
         module.successor_codebook._is_hf_initialized = True
         with torch.no_grad():
             module.successor_codebook.fill_(5)
-        module.reset_draft_parameters()
+        module.reset_draft_parameters(initializer_range=0.02)
         torch.testing.assert_close(
             module.successor_codebook,
             torch.full_like(module.successor_codebook, 5),

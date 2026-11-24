@@ -56,6 +56,15 @@ class KernelDefaultsTest(unittest.TestCase):
         self.assertFalse(choice(None, True, "cpu"))
         self.assertFalse(choice(None, True, "npu"))
         self.assertFalse(choice(None, True, "cuda", hidden_act="gelu"))
+        # Nothing using SwiGLU (a routed-only MoE draft): Liger still covers RMSNorm.
+        self.assertTrue(choice(None, True, "cuda", hidden_act=None))
+        self.assertTrue(choice(True, True, "cuda", hidden_act=None))
+        self.assertIn(
+            "RMSNorm only",
+            liger_choice(
+                None, by_default=True, hidden_act=None, platform="cuda"
+            ).reason,
+        )
         self.assertFalse(choice(False, True, "cuda"))
         self.assertTrue(choice(True, False, "cuda"))
         with self.assertRaisesRegex(ValueError, "requires a Triton GPU backend"):
