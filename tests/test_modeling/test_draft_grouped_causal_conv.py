@@ -130,7 +130,7 @@ class GroupedCausalConvTest(unittest.TestCase):
     def test_identity_initialization_meta_and_partial_restore(self):
         module = make_conv(device="meta")
         module.to_empty(device="cpu")
-        module.reset_draft_parameters()
+        module.reset_draft_parameters(initializer_range=0.02)
         hidden = torch.randn(2, 8, 16)
         prepared, coefficients = module.prepare(hidden)
         torch.testing.assert_close(prepared, hidden, rtol=0, atol=0)
@@ -143,7 +143,7 @@ class GroupedCausalConvTest(unittest.TestCase):
                 for name, parameter in module.named_parameters():
                     parameter.fill_(7)
                     parameter._is_hf_initialized = name == loaded_name
-            module.reset_draft_parameters()
+            module.reset_draft_parameters(initializer_range=0.02)
             fresh = make_conv()
             for name, parameter in module.named_parameters():
                 expected = (

@@ -119,7 +119,7 @@ the capture server.
 | Field | Default | What to write |
 | --- | --- | --- |
 | `training.objective` | `null` | Canonical objective registration; omission uses the architecture's default. |
-| `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. |
+| `training.objective_options` | `{}` | Options for the selected canonical objective, such as `num_anchors` or `ttt_length`. Unknown options fail validation. For MoE drafts, DFlash and DSpark take `bias_update_rate` (`0`): the step every router's fp32 `expert_bias` moves per optimizer step toward the under-loaded experts, from token counts pooled over micro-batches and ranks; `0` keeps the bias fixed. |
 | `training.frozen` | `[]` | Canonical module or parameter paths excluded from training; persisted in the resume contract. |
 | `training.loss` | `{}` | Named loss terms, for example `{terms: {token: {kind: kl}}}`; `{}` keeps the objective's default loss. A loss that needs teacher logits also adds `target_last_hidden_states` to the required features. Persisted in the resume contract. |
 | `training.loss.fused` | `null` (auto) | Auto uses optimized loss implementations where they apply (CUDA/ROCm, FP16/BF16/FP32, Triton installed) and the reference formulas elsewhere. `true` requires them and fails where they cannot run; `false` forces the reference. Retained EAGLE3/P-EAGLE wrappers require their fused kernel and reject `false`. |

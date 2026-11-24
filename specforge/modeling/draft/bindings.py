@@ -33,7 +33,7 @@ class _TargetWeight(nn.Module):
         )
         self._bound = False
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         # Generic HF initialization must never synthesize target weights or
         # overwrite an installed target tensor.
         pass

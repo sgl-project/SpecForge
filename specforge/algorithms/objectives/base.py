@@ -2,9 +2,23 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch
 from torch import Tensor, nn
+
+
+class StepStatistics(Protocol):
+    """Per-forward statistics an objective observes; the training layer applies them each optimizer step."""
+
+    @property
+    def settings(
+        self,
+    ) -> dict[str, object]: ...  # what built them; the resume contract records it
+
+    def observe(self, output, *, keep: Tensor) -> tuple[Tensor, ...]: ...  # counts
+
+    def step(self, *, process_group=None) -> dict[str, Tensor]: ...
 
 
 @dataclass
@@ -51,6 +65,7 @@ class ObjectiveModel(nn.Module):
         weighting=None,
         frozen_parameters=(),
         execution=None,
+        statistics: StepStatistics | None = None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -59,6 +74,9 @@ class ObjectiveModel(nn.Module):
         self.execution = execution or LossExecution()
         self.loss_implementations = ExecutionSelection()
         self.draft_model = draft_model
+        self.statistics = (
+            statistics  # observed per forward, stepped by the training layer
+        )
         self.objective = objective
         self.registration = registration
         self.objective_name = name
@@ -188,6 +206,17 @@ class ObjectiveModel(nn.Module):
             },
             **options,
         )
+
+    def observe_statistics(self, output, keep) -> None:
+        """Hand this forward and its counted tokens to the statistics, when there are any.
+
+        ``keep`` marks the forward's tokens that count, in the routing's token
+        order (any shape that flattens to it): a block protocol's kept-block
+        tokens, a sequence protocol's supervised positions.
+        """
+        if self.statistics is None:
+            return
+        self.statistics.observe(output, keep=keep.reshape(-1))
 
     def block_predictions(self, output, blocks, batch, **options):
         """Build deferred predictions for complete algorithm proposal blocks.
