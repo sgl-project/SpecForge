@@ -412,7 +412,7 @@ class TestStreamer(unittest.TestCase):
 
 
 def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
-    disaggregation = types.ModuleType("sglang.srt.disaggregation.utils")
+    disaggregation = types.ModuleType("sglang.srt.disaggregation.mode")
     disaggregation.DisaggregationMode = SimpleNamespace(NULL="null")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     runtime_context.get_exec = lambda: SimpleNamespace(features=features)
@@ -421,7 +421,7 @@ def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
         chunked_prefill_size=chunked_prefill_size
     )
     return {
-        "sglang.srt.disaggregation.utils": disaggregation,
+        "sglang.srt.disaggregation.mode": disaggregation,
         "sglang.srt.runtime_context": runtime_context,
     }
 

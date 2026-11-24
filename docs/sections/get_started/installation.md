@@ -22,13 +22,13 @@ uv pip install wheel setuptools setuptools-rust setuptools-scm
 uv pip install -v -e . --no-build-isolation --prerelease=allow
 # Install SGLang explicitly; SpecForge's package dependencies do not install it.
 uv pip install --no-build-isolation --prerelease=allow \
-  "sglang @ git+https://github.com/sgl-project/sglang.git@c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0#subdirectory=python"
+  "sglang @ git+https://github.com/sgl-project/sglang.git@c19e9c7d19a873498c4fee1d789596c1a2b6e6f0#subdirectory=python"
 uv pip install --no-deps plugins/sglang-spec-capture
 uv pip install mooncake-transfer-engine-cuda13
 ```
 
-Install SGLang commit `c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0` manually
-using the command above for capture workloads. SpecForge pins Torch `2.14.1`
+Install SGLang commit `c19e9c7d19a873498c4fee1d789596c1a2b6e6f0`, on the
+`release/v1.0.0` branch, manually using the command above for capture workloads. SpecForge pins Torch `2.14.1`
 and Transformers `5.19.0`, but does not install SGLang automatically.
 Normal installer caches are reused. Online
 training and offline feature preparation use the capture plugin; see the

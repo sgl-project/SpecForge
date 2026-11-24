@@ -53,7 +53,7 @@ jobs:
       SPECFORGE_CI_CACHE: /github/home/specforge-ci-v2
       FLASH_ATTN_VERSION: 2.8.3.post2
       # Both CI environments need the plugin's forward-observer/completion APIs.
-      SGLANG_COMMIT: c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0
+      SGLANG_COMMIT: c19e9c7d19a873498c4fee1d789596c1a2b6e6f0
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

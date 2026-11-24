@@ -84,7 +84,7 @@ Native merge-back requires explicit `--export-mode native`. The SGLang converter
 only writes standalone serving artifacts. The old merge CLI has been removed.
 
 The converter targets SGLang commit
-`c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0`, also pinned in CI. Each artifact records
+`c19e9c7d19a873498c4fee1d789596c1a2b6e6f0`, also pinned in CI. Each artifact records
 that revision and the converter version in `config.json`'s `specforge_artifact`
 field. Conversion needs neither SGLang nor a
 GPU. Load/re-export/continued training use the canonical checkpoint; public draft
