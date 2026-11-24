@@ -55,6 +55,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
             draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="launch",
             output_dir=os.path.join(workdir, "out"),
             ttt_length=TTT,

@@ -32,6 +32,7 @@ from specforge.runtime.data_plane import (
 
 if TYPE_CHECKING:
     from specforge.distributed import Topology
+    from specforge.training.contracts import TrainingRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ def _assemble_trainer(
     ref_source: dict,  # {"refs": [...]} re-iterable (offline) | {"queue": q} stream (online)
     model,
     optimizer_factory,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     batch_size: int,
@@ -121,6 +123,7 @@ def _assemble_trainer(
         model=model,
         program_spec=program_spec(model),
         optimizer_factory=optimizer_factory,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -525,6 +528,7 @@ def build_offline_runtime(
     draft_model,
     target_head,
     optimizer_factory,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
@@ -609,6 +613,7 @@ def build_offline_runtime(
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
         optimizer_factory=optimizer_factory,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -647,6 +652,7 @@ def build_disagg_offline_runtime(
     draft_model,
     target_head,
     optimizer_factory,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
@@ -727,6 +733,7 @@ def build_disagg_offline_runtime(
         ref_source={"refs": refs, "refs_for_epoch": refs_for_epoch},
         model=draft_model,
         optimizer_factory=optimizer_factory,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -1508,6 +1515,7 @@ def build_disagg_online_consumer(
     channel,
     draft_model,
     optimizer_factory,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     target_head=None,
@@ -1839,6 +1847,7 @@ def build_disagg_online_consumer(
             },
             model=draft_model,
             optimizer_factory=optimizer_factory,
+            runtime=runtime,
             run_id=run_id,
             output_dir=output_dir,
             batch_size=batch_size,

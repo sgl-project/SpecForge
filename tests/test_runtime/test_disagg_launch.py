@@ -204,6 +204,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             draft_model=eagle3_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="e2e",
             output_dir=os.path.join(work, "out"),
             max_len=512,

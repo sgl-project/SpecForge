@@ -13,6 +13,7 @@ from unittest.mock import patch
 from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
 from specforge.training.disaggregated import _build_offline
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -87,6 +88,7 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
                 topology=None,
                 build_model_bundle=lambda *_args, **_kwargs: None,
                 optimizer_factory=lambda *_args, **_kwargs: None,
+                training_runtime=lambda _cfg: reference_runtime(),
                 logger=lambda *_args, **_kwargs: None,
             )
             yield run, write_manifest, manifest

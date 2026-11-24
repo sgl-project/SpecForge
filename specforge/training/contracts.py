@@ -64,6 +64,84 @@ class StepContext:
     replay_values: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
 
+#: Runtimes ``training.runtime`` names, and how each holds the trainable draft.
+RUNTIMES = ("fsdp", "fsdp2")
+
+
+@dataclass(frozen=True)
+class PrecisionSpec:
+    """How the trainable draft's numbers are stored, computed, reduced and written.
+
+    Resolved once for a run (``resolve``) and handed to the trainer. The
+    runtime refuses a combination it cannot hold, and checks the trainable
+    parameters are stored as declared and the optimizer keeps the declared
+    masters. Under ``fsdp`` the separate fp32 master copy is
+    ``BF16Optimizer``'s, and the artifact is written in the parameter dtype.
+    Frozen modules (bound target tables, the teacher head) keep the dtype they
+    were built in and are not described here.
+    """
+
+    #: What the trainable parameters are stored in.
+    parameter_dtype: torch.dtype
+    #: What the runtime gives the parameters in for forward and backward. A
+    #: module may cast further inside (Domino's GRU runs fp16 on Ascend).
+    compute_dtype: torch.dtype
+    #: What gradients accumulate in across micro-batches and are reduced in
+    #: across ranks.
+    gradient_dtype: torch.dtype
+    #: The optimizer's own copy of the parameters, when it keeps one; None
+    #: when the parameters themselves are the masters.
+    master_dtype: Optional[torch.dtype]
+    #: What checkpoints and exports write the draft's weights in.
+    artifact_dtype: torch.dtype
+
+    @classmethod
+    def resolve(cls, *, runtime: str, model_dtype: torch.dtype) -> "PrecisionSpec":
+        """The precision a runtime trains a draft built in ``model_dtype`` with.
+
+        ``fsdp`` (DDP / FSDP1): parameters, compute, gradients and the artifact
+        in ``model_dtype``; ``BF16Optimizer`` keeps fp32 masters. ``fsdp2``:
+        fp32 parameters that are the masters, compute in ``model_dtype``, fp32
+        gradients; the artifact in ``model_dtype``.
+        """
+        if not model_dtype.is_floating_point:
+            raise ValueError(f"model dtype must be floating point, not {model_dtype}")
+        if runtime == "fsdp":
+            return cls(
+                parameter_dtype=model_dtype,
+                compute_dtype=model_dtype,
+                gradient_dtype=model_dtype,
+                master_dtype=torch.float32,
+                artifact_dtype=model_dtype,
+            )
+        if runtime == "fsdp2":
+            return cls(
+                parameter_dtype=torch.float32,
+                compute_dtype=model_dtype,
+                gradient_dtype=torch.float32,
+                master_dtype=None,
+                artifact_dtype=model_dtype,
+            )
+        raise ValueError(f"unknown runtime {runtime!r}; expected one of {RUNTIMES}")
+
+
+@dataclass(frozen=True)
+class TrainingRuntime:
+    """The data-parallel runtime that trains the draft, and its precision.
+
+    Resolved once for a run and handed to the trainer, which builds that
+    runtime; the runtime honours the precision or refuses it.
+    """
+
+    #: One of ``RUNTIMES``.
+    name: str
+    precision: PrecisionSpec
+
+    @classmethod
+    def resolve(cls, name: str, *, model_dtype: torch.dtype) -> "TrainingRuntime":
+        return cls(name, PrecisionSpec.resolve(runtime=name, model_dtype=model_dtype))
+
+
 @dataclass(frozen=True)
 class PartitionHints:
     """What a runner that shards parameters has to keep together."""

@@ -15,6 +15,7 @@ from specforge.training.assembly import (
 )
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -178,6 +179,7 @@ class TestEvalLaunch(unittest.TestCase):
         transform = mock.Mock(name="transform")
         algorithm = self._offline_algorithm(reader)
         eval_factory = mock.Mock(name="eval_factory")
+        runtime = reference_runtime()
         trainer = object()
         with (
             mock.patch("specforge.launch.DataFlowController"),
@@ -201,6 +203,7 @@ class TestEvalLaunch(unittest.TestCase):
                 draft_model=object(),
                 target_head=object(),
                 optimizer_factory=object(),
+                runtime=runtime,
                 run_id="run",
                 output_dir="/out",
                 seed=31,
@@ -208,6 +211,7 @@ class TestEvalLaunch(unittest.TestCase):
             )
 
         self.assertIs(result, trainer)
+        self.assertIs(assemble.call_args.kwargs["runtime"], runtime)
         self.assertEqual(assemble.call_args.kwargs["eval_interval"], 3)
         self.assertIs(assemble.call_args.kwargs["eval_data_factory"], eval_factory)
         self.assertTrue(

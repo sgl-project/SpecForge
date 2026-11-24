@@ -200,7 +200,9 @@ def trained_by_the_plain_runner():
     class Assembly:
         """Stands in for the backend ``Trainer`` constructs and wraps with."""
 
-        def __init__(self, parallel, *, optimizer_factory):
+        def __init__(self, parallel, *, optimizer_factory, precision):
+            # The plain runner trains in the dtype the program was built in.
+            del precision
             self.world_size = parallel.world_size
             self.optimizer_factory = optimizer_factory
 

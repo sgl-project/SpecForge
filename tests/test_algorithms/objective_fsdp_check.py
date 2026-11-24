@@ -15,7 +15,7 @@ from specforge.training.contracts import StepContext
 from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objectives import dflash2_config, training_batch
-from tests.test_runtime._fixtures import FakeProgram, fake_spec
+from tests.test_runtime._fixtures import FakeProgram, fake_spec, reference_runtime
 
 
 def main():
@@ -32,7 +32,8 @@ def main():
         with torch.no_grad():
             reference = runtime(batch, step=0, total_steps=10).loss
         backend = FSDPTrainingBackend(
-            ParallelConfig(world_size=2, param_dtype=torch.float32)
+            ParallelConfig(world_size=2),
+            precision=reference_runtime(torch.float32).precision,
         )
         wrapped = backend.prepare_model(
             runtime,

@@ -68,6 +68,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     draft_model=fit_model,
                     target_head=fit_head,
                     optimizer_factory=_optimizer_factory,
+                    runtime=fx.reference_runtime(torch.bfloat16),
                     run_id="fit-path",
                     output_dir=os.path.join(work, "fit-output"),
                     ttt_length=3,
@@ -81,6 +82,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                 backend = FSDPTrainingBackend(
                     ParallelConfig.from_topology(topology),
                     optimizer_factory=_optimizer_factory,
+                    precision=fx.reference_runtime(torch.bfloat16).precision,
                 )
                 wrapped = backend.prepare_model(
                     runner_model,

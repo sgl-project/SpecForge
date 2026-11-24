@@ -38,6 +38,7 @@ from specforge.config import Config
 
 if TYPE_CHECKING:
     from specforge.distributed import Topology
+    from specforge.training.contracts import TrainingRuntime
 
 
 @dataclass
@@ -193,6 +194,17 @@ class _ConfiguredOptimizerFactory:
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
         )
+
+
+def _training_runtime(cfg: Config) -> TrainingRuntime:
+    """The runtime that trains this run's draft, and its precision: decided here."""
+    import torch
+
+    from specforge.training.contracts import TrainingRuntime
+
+    return TrainingRuntime.resolve(
+        "fsdp", model_dtype=getattr(torch, cfg.model.torch_dtype)
+    )
 
 
 def _optimizer_factory(cfg: Config):
@@ -484,6 +496,7 @@ def _common_launch_kwargs(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
         optimizer_factory=_optimizer_factory(cfg),
+        runtime=_training_runtime(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
@@ -561,6 +574,7 @@ def build_training_run(
                     **kwargs,
                 ),
                 optimizer_factory=_optimizer_factory,
+                training_runtime=_training_runtime,
                 logger=run_logger,
             )
         except BaseException:

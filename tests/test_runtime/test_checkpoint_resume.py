@@ -193,6 +193,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.data_plane.feature_store import LocalFeatureStore
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
         from specforge.training.trainer import Trainer
+        from tests.test_runtime._fixtures import reference_runtime
 
         Composite, _ = _fake_seam()
         seen = [] if seen is None else seen
@@ -218,6 +219,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     warmup_ratio=0.0,
                     total_steps=(total_steps if total_steps is not None else max_steps),
                 ),
+                runtime=reference_runtime(),
                 run_id=run_id,
                 output_dir=out_dir,
                 batch_size=2,
@@ -897,6 +899,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.control_plane import DataFlowController
         from specforge.runtime.data_plane.feature_store import LocalFeatureStore
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+        from tests.test_runtime._fixtures import reference_runtime
 
         Program, _ = _fake_seam()
 
@@ -984,6 +987,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         warmup_ratio=0.0,
                         total_steps=100,
                     ),
+                    runtime=reference_runtime(),
                     run_id="direct",
                     output_dir=output_dir,
                     batch_size=2,

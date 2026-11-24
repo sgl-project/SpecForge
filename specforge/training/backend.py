@@ -17,14 +17,14 @@ from __future__ import annotations
 import abc
 import contextlib
 import os
-from dataclasses import dataclass
+from dataclasses import KW_ONLY, dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from specforge.training.contracts import RankFailure
+from specforge.training.contracts import PrecisionSpec, RankFailure
 
 if TYPE_CHECKING:
     from specforge.distributed import Topology
@@ -62,7 +62,7 @@ class ParallelConfig:
 
     world_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
-    param_dtype: torch.dtype = torch.bfloat16
+    _: KW_ONLY
     fsdp_process_group: Any = None
 
     @classmethod
@@ -71,7 +71,6 @@ class ParallelConfig:
         topology: Topology,
         *,
         sharding_strategy: str = "SHARD_GRAD_OP",
-        param_dtype: torch.dtype = torch.bfloat16,
     ) -> "ParallelConfig":
         """Wrap over the topology's world group."""
         # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
@@ -81,7 +80,6 @@ class ParallelConfig:
         return cls(
             world_size=topology.world_size,
             sharding_strategy=sharding_strategy,
-            param_dtype=param_dtype,
             fsdp_process_group=topology.world_group,
         )
 
@@ -137,9 +135,11 @@ class TrainingBackend(abc.ABC):
 
 
 class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend for the canonical SpecForge training math: FSDP with
-    ``use_orig_params=True`` / bf16 mixed precision over the configured process
-    group, optimizer targeting the inner trainable submodule."""
+    """The ``fsdp`` runtime: DDP for ``NO_SHARD``, FSDP1 (``use_orig_params``)
+    otherwise, over the configured process group. Parameters, compute,
+    gradients and the artifact share the parameter dtype the ``PrecisionSpec``
+    declares; the optimizer keeps the declared master weights and targets the
+    inner trainable submodule."""
 
     name = "fsdp"
 
@@ -148,9 +148,42 @@ class FSDPTrainingBackend(TrainingBackend):
         parallel_config: ParallelConfig,
         *,
         optimizer_factory=None,
+        precision: Optional[PrecisionSpec] = None,
     ) -> None:
+        """
+        Args:
+            parallel_config: How to wrap, and over which group.
+            optimizer_factory: Builds the optimizer over the trainable module.
+            precision: How the trainable draft is held and computed; the
+                sharding wrapper needs it, an unwrapped program does not.
+
+        Raises:
+            ValueError: ``precision`` asks for compute or gradients in another
+                dtype than the parameters: DDP and FSDP1 compute in the
+                parameter dtype and, between gradient synchronizations,
+                accumulate in it. Or it asks for an artifact in another dtype
+                than the parameters, which this runtime writes as stored.
+        """
+        if precision is not None and not (
+            precision.parameter_dtype
+            == precision.compute_dtype
+            == precision.gradient_dtype
+        ):
+            raise ValueError(
+                "the fsdp runtime stores, computes and accumulates gradients in one "
+                f"dtype; {precision} asks for more than one"
+            )
+        if (
+            precision is not None
+            and precision.artifact_dtype != precision.parameter_dtype
+        ):
+            raise ValueError(
+                "the fsdp runtime writes the weights in the dtype they are stored "
+                f"in; {precision} asks for another"
+            )
         self.parallel_config = parallel_config
         self._optimizer_factory = optimizer_factory
+        self.precision = precision
         self.module: Optional[nn.Module] = None
         self.optimizer = None
         self._wrapped = False
@@ -198,7 +231,11 @@ class FSDPTrainingBackend(TrainingBackend):
                 decoder's compute. Empty: one root unit.
 
         Raises:
-            ValueError: A module in ``frozen`` holds a trainable parameter.
+            ValueError: A module in ``frozen`` holds a trainable parameter; the
+                trainable parameters (of ``optimizer_target`` when given) are
+                not in the declared parameter dtype; FSDP1 is asked to wrap
+                without a ``PrecisionSpec``; or the optimizer the factory
+                builds keeps other master weights than declared.
         """
         frozen = tuple(frozen)
         if any(
@@ -207,6 +244,17 @@ class FSDPTrainingBackend(TrainingBackend):
             for parameter in module.parameters()
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
+        if self.precision is not None:
+            # The precision a run declares is the precision that runs.
+            target = model if optimizer_target is None else optimizer_target
+            stored = {p.dtype for p in target.parameters() if p.requires_grad}
+            if stored - {self.precision.parameter_dtype}:
+                raise ValueError(
+                    f"trainable parameters are {sorted(map(str, stored))}; the run "
+                    f"declares {self.precision.parameter_dtype}"
+                )
+        elif wrap and self.parallel_config.sharding_strategy != "NO_SHARD":
+            raise ValueError("the sharding wrapper needs the run's PrecisionSpec")
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -257,7 +305,8 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
+                        param_dtype=self.precision.compute_dtype,
+                        reduce_dtype=self.precision.gradient_dtype,
                         buffer_dtype=torch.float32,
                         # The program casts what it computes with; the wrapper
                         # leaves its inputs as the runner placed them, as DDP does.
@@ -288,11 +337,27 @@ class FSDPTrainingBackend(TrainingBackend):
             self.ignored_frozen_modules = ignored_frozen_modules
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
-            self.optimizer = self._optimizer_factory(target)
-            self._configure_optimizer_grad_norm()
+            self.set_optimizer(self._optimizer_factory(target))
         return self.module
 
     def set_optimizer(self, optimizer) -> None:
+        """Train with ``optimizer``.
+
+        Raises:
+            ValueError: It keeps other master weights than the
+                ``PrecisionSpec`` declares.
+            TypeError: With a ``PrecisionSpec``, it is an optimizer whose
+                master weights ``master_dtype_of`` does not know.
+        """
+        if self.precision is not None:
+            from specforge.optimizer import master_dtype_of
+
+            masters = master_dtype_of(optimizer)
+            if masters != self.precision.master_dtype:
+                raise ValueError(
+                    f"{type(optimizer).__name__} keeps master_dtype={masters}; "
+                    f"the run declares master_dtype={self.precision.master_dtype}"
+                )
         self.optimizer = optimizer
         self._configure_optimizer_grad_norm()
 

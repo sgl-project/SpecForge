@@ -34,7 +34,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import ProgramSpec, RankFailure
+from specforge.training.contracts import ProgramSpec, RankFailure, TrainingRuntime
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -57,6 +57,7 @@ class Trainer:
         model,  # the program; its ``draft_model`` is what the optimizer trains
         program_spec: ProgramSpec,  # what ``model`` declares
         optimizer_factory,
+        runtime: TrainingRuntime,  # which runtime trains, with what precision
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -87,6 +88,8 @@ class Trainer:
         on_fit_failure: Optional[Callable[[BaseException], None]] = None,
         on_fit_finally: Optional[Callable[[], None]] = None,
     ):
+        if runtime.name != "fsdp":
+            raise ValueError(f"unknown training runtime {runtime.name!r}")
         ref_source = dict(ref_source)
         data_prepositioned = bool(ref_source.pop("prepositioned", False))
         defer_queue_ack = bool(ref_source.pop("defer_ack_until_durable", False))
@@ -484,7 +487,9 @@ class Trainer:
             del state, saved_weights
 
         parallel = ParallelConfig.from_topology(topology)
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        backend = FSDPTrainingBackend(
+            parallel, optimizer_factory=optimizer_factory, precision=runtime.precision
+        )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).

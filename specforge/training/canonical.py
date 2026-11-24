@@ -576,7 +576,6 @@ def build_bundle(cfg, algorithm, topology):
         anchor_sampling=cfg.training.anchor_sampling,
         anchor_seed=cfg.training.seed,
     )
-    runtime.fsdp_param_dtype = dtype
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,

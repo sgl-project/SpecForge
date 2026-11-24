@@ -344,3 +344,20 @@ class BF16Optimizer:
 
     def get_learning_rate(self):
         return self.optimizer.param_groups[0]["lr"]
+
+
+def master_dtype_of(optimizer) -> torch.dtype | None:
+    """The dtype ``optimizer`` keeps its own copy of the parameters in.
+
+    None for a ``torch.optim.Optimizer``, which updates the parameters it was
+    given.
+
+    Raises:
+        TypeError: ``optimizer`` is neither a ``BF16Optimizer`` nor a
+            ``torch.optim.Optimizer``.
+    """
+    if isinstance(optimizer, BF16Optimizer):
+        return torch.float32
+    if isinstance(optimizer, torch.optim.Optimizer):
+        return None
+    raise TypeError(f"unknown optimizer {type(optimizer).__name__}")

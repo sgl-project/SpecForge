@@ -65,10 +65,13 @@ def _worker(rank, world_size, workdir, results_dir):
         )
 
     pc = ParallelConfig.from_topology(topology)
+    precision = fx.reference_runtime(torch.bfloat16).precision
 
     # Path A: no_sync via the runner's accumulation window (reduce once, on the
     # boundary).
-    backend_a = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
+    backend_a = FSDPTrainingBackend(
+        pc, optimizer_factory=opt_factory, precision=precision
+    )
     backend_a.prepare_model(model_a, wrap=True, optimizer_target=model_a.draft_model)
     # Count deferrals: every NON-boundary micro-step must enter no_sync(), so
     # the boundary backward is the single reduction per optimizer step.
@@ -84,7 +87,9 @@ def _worker(rank, world_size, workdir, results_dir):
     rep_a = fx.train_window(runner_a, [batch] * ACC)
 
     # Path B: force the reduction on every micro-step (is_boundary=True), same math.
-    backend_b = FSDPTrainingBackend(pc, optimizer_factory=opt_factory)
+    backend_b = FSDPTrainingBackend(
+        pc, optimizer_factory=opt_factory, precision=precision
+    )
     backend_b.prepare_model(model_b, wrap=True, optimizer_target=model_b.draft_model)
     for _ in range(ACC):
         out = fx.forward_program(backend_b.module, batch)

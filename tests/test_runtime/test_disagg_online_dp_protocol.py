@@ -137,6 +137,7 @@ def _rank0_setup_error_worker(
 
         from specforge.distributed import Topology
         from specforge.launch import build_disagg_online_consumer
+        from tests.test_runtime._fixtures import reference_runtime
 
         try:
             build_disagg_online_consumer(
@@ -145,6 +146,7 @@ def _rank0_setup_error_worker(
                 channel=_PathOnlyChannel(os.path.join(work_dir, "refs.jsonl")),
                 draft_model=None,
                 optimizer_factory=None,
+                runtime=reference_runtime(),
                 run_id="setup-error-run",
                 output_dir=work_dir,
                 metadata_db_path=metadata_db_path,
@@ -415,6 +417,7 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
         )
+        from tests.test_runtime._fixtures import reference_runtime
 
         captured = {}
 
@@ -443,6 +446,7 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
                 channel=channel,
                 draft_model=object(),
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="consumer-lifecycle",
                 output_dir=work,
                 inbox_dir=os.path.join(work, "inboxes"),

@@ -761,6 +761,7 @@ class CanonicalTrainingTest(unittest.TestCase):
         from specforge.training.program import program_spec
         from specforge.training.runner import DataParallelRunner
         from tests.test_modeling.test_canonical_dspine import initialized_model
+        from tests.test_runtime._fixtures import reference_runtime
 
         if not (dist.is_available() and dist.is_gloo_available()):
             self.skipTest("needs gloo")
@@ -800,6 +801,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                     optimizer_factory=lambda module: torch.optim.SGD(
                         module.parameters(), lr=0.0
                     ),
+                    precision=reference_runtime(
+                        torch.bfloat16, master_dtype=None
+                    ).precision,
                 )
                 with patch.object(FullyShardedDataParallel, "__init__", on_host):
                     wrapped = backend.prepare_model(
