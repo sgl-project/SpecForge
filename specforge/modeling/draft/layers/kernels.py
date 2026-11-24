@@ -15,18 +15,25 @@ from .mlp.moe import MoEFFN, SharedExpert
 from .norm.rms import RMSNorm
 
 
+def _uses_swiglu(module) -> bool:
+    """Whether Liger's SwiGLU could replace this module: dense FFNs and gated shared experts."""
+    return isinstance(module, DenseFFN) or (
+        isinstance(module, SharedExpert) and module.config.gated
+    )
+
+
 def liger_hidden_act(model):
-    """Activation Liger's SwiGLU has to implement for this draft's dense FFNs and shared experts."""
+    """Activation Liger's SwiGLU has to implement for this draft, or None when nothing uses SwiGLU.
+
+    Routed experts never use it, and a non-gated shared expert runs act(up);
+    a draft with neither a dense FFN nor a gated shared expert leaves Liger
+    its RMSNorm only.
+    """
     activations = sorted(
-        {
-            m.config.hidden_act
-            for m in model.modules()
-            if isinstance(m, (DenseFFN, SharedExpert))
-        }
+        {m.config.hidden_act for m in model.modules() if _uses_swiglu(m)}
     )
     unsupported = [name for name in activations if name not in ("silu", "swish")]
-    # A draft whose FFNs are all routed experts leaves Liger only its RMSNorm.
-    return unsupported[0] if unsupported else (activations or ["silu"])[0]
+    return unsupported[0] if unsupported else (activations or [None])[0]
 
 
 def load_liger_kernels():
@@ -119,11 +126,6 @@ def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
         if isinstance(module, RMSNorm):
             # the Liger kernel scales by a weight; weightless norms stay on PyTorch
             module.liger_norm = rms_norm if module.weight is not None else None
-        elif isinstance(
-            module, (DenseFFN, SharedExpert)
-        ) and module.config.hidden_act in {
-            "silu",
-            "swish",
-        }:
+        elif _uses_swiglu(module) and module.config.hidden_act in {"silu", "swish"}:
             module.liger_swiglu = swiglu
     return fused_conv

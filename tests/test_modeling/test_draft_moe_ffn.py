@@ -217,14 +217,16 @@ class MoEFFNTest(unittest.TestCase):
             MoEFFN(moe_spec(), hidden_size=H), MoEFFN(qwen_spec(), hidden_size=H)
         )
         configure_kernels(aligned)  # F.grouped_mm accepts multiples of 8
-        # Liger's SwiGLU sees the shared expert; routed-only FFNs leave it the RMSNorm.
+        # Liger's SwiGLU sees gated shared experts only; routed-only FFNs and
+        # non-gated shared experts (act(up), never SwiGLU) leave Liger its RMSNorm.
         self.assertEqual(liger_hidden_act(aligned), "silu")
-        self.assertEqual(liger_hidden_act(aligned[0]), "silu")
-        relu2 = MoEFFN(
-            moe_spec(shared_expert=expert_spec(hidden_act="relu2", gated=False)),
-            hidden_size=H,
-        )
-        self.assertEqual(liger_hidden_act(relu2), "relu2")
+        self.assertIsNone(liger_hidden_act(aligned[0]))
+        for hidden_act in ("relu2", "silu"):
+            ungated = MoEFFN(
+                moe_spec(shared_expert=expert_spec(hidden_act=hidden_act, gated=False)),
+                hidden_size=H,
+            )
+            self.assertIsNone(liger_hidden_act(ungated), hidden_act)
         # torch accepts F.grouped_mm only with 16-byte strides; the probe reports
         # the layer, torch's reason and the width rule.
         for dtype, hidden_size, intermediate_size in (
