@@ -109,6 +109,9 @@ class FakeProgram(torch.nn.Module):
     def host_inputs(self, tensors, *, sample_ids, epoch):
         return {}
 
+    def load_weights(self):
+        pass
+
     def replay_arguments(self, replay_values, *, prepass=False):
         """The pooled sums as they came, under ``replay_values``."""
         return {"replay_values": dict(replay_values)} if replay_values else {}

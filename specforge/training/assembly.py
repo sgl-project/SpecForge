@@ -374,10 +374,7 @@ def _install_dataset_vocab_mapping(
     """Build, cache, and install one deterministic EAGLE vocabulary map."""
     if (
         cfg.model.vocab_mapping_path
-        or (
-            hasattr(bundle.draft_model, "vocabulary")
-            and bool(bundle.draft_model.vocabulary.ready)
-        )
+        or bundle.model.vocabulary_ready
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return
@@ -395,9 +392,7 @@ def _install_dataset_vocab_mapping(
         import torch
 
         mapping = torch.load(path, map_location="cpu", weights_only=True)
-        bundle.draft_model.vocabulary.load_mapping(
-            t2d=mapping["t2d"], d2t=mapping["d2t"]
-        )
+        bundle.model.install_vocabulary_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
         return
 
     import torch
@@ -413,7 +408,7 @@ def _install_dataset_vocab_mapping(
     # Every rank derives the same mapping and installs it directly, so training
     # does not depend on a shared cache filesystem. Rank 0 alone persists the
     # reusable cache file, avoiding concurrent torch.save writes.
-    bundle.draft_model.vocabulary.load_mapping(t2d=t2d, d2t=d2t)
+    bundle.model.install_vocabulary_mapping(t2d=t2d, d2t=d2t)
     distributed = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
     )
@@ -433,10 +428,7 @@ def _ensure_offline_vocab_mapping(
         return
     if (
         cfg.model.vocab_mapping_path
-        or (
-            hasattr(bundle.draft_model, "vocabulary")
-            and bool(bundle.draft_model.vocabulary.ready)
-        )
+        or bundle.model.vocabulary_ready
         or bundle.draft_vocab_size == bundle.target_vocab_size
     ):
         return

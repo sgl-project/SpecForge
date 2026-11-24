@@ -13,7 +13,15 @@ from safetensors.torch import save_file
 from specforge.checkpoint import save_draft
 from specforge.checkpoint.resolve import _ADAPTERS, register_adapter
 from specforge.checkpoint.tensors import TensorStore
-from specforge.loading import initialize_draft, load_draft, read_draft
+from specforge.checkpoint.weight_plan import WeightPlan
+from specforge.loading import (
+    DraftWeights,
+    construct_draft,
+    construct_initialized_draft,
+    initialize_draft,
+    load_draft,
+    read_draft,
+)
 from specforge.modeling import build_draft_model
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.test_canonical_dflash import inputs_for
@@ -199,3 +207,25 @@ class LoadingTest(unittest.TestCase):
             (path / "config.json").write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, "serving-only"):
                 read_draft(path)
+
+    def test_a_draft_constructed_on_meta_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "real device"):
+            construct_initialized_draft(draft_config(), device="meta")
+        with self.assertRaisesRegex(ValueError, "real device"):
+            construct_draft("unread", device=torch.device("meta"))
+
+    def test_a_reduced_vocabulary_saved_unmapped_loads_no_mapping(self):
+        unmapped = torch.zeros(8, dtype=torch.bool), torch.zeros(4, dtype=torch.long)
+        mapped = torch.arange(8) < 4, torch.zeros(4, dtype=torch.long)
+        identity = torch.ones(4, dtype=torch.bool), torch.zeros(4, dtype=torch.long)
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.safetensors"
+            for (t2d, d2t), expected in (
+                (unmapped, False),
+                (mapped, True),
+                (identity, True),
+            ):
+                save_file({"vocabulary.t2d": t2d, "vocabulary.d2t": d2t}, path)
+                plan = WeightPlan(tuple(sorted(TensorStore(path).refs().items())))
+                weights = DraftWeights(plan, finishes_initialization=False)
+                self.assertEqual(weights.loads_vocabulary_mapping, expected)

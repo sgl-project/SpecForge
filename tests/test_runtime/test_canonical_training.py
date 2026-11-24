@@ -82,6 +82,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             self.assertEqual(bundle.model.execution.chunk_size, 2)
             self.assertFalse(bundle.model.execution.checkpoint)
             contract = bundle.strategy_kwargs.resume_contract[
@@ -107,6 +108,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 bundle = build_model_bundle(
                     resolved.config, algorithm=resolved.algorithm, topology=Topology()
                 )
+                bundle.model.load_weights()
                 self.assertEqual(bundle.model.anchor_sampling, sampling)
                 self.assertEqual(
                     bundle.strategy_kwargs.resume_contract["canonical_anchor_sampling"],
@@ -121,6 +123,147 @@ class CanonicalTrainingTest(unittest.TestCase):
                         training={"anchor_sampling": "host"},
                     )
                 )
+
+    def test_the_program_is_built_without_its_weights_until_loaded(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            cfg = run_config(
+                target, draft_config(), training={"attention_backend": "eager"}
+            )
+            resolved = resolve_run(cfg)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
+            program = bundle.model
+            self.assertTrue(program.weights_pending)
+            batch = training_batch(
+                program.draft_model.config.draft,
+                device=next(program.draft_model.parameters()).device,
+            )
+            # Nothing trains on the random initialization by mistake.
+            with self.assertRaisesRegex(ValueError, "load_weights"):
+                program(batch, step=0, total_steps=10)
+            program.load_weights()
+            self.assertFalse(program.weights_pending)
+            weights = dict(program.named_parameters())
+            for name in program.draft_model.config.draft.target_bindings:
+                self.assertIn(f"draft_model.{name}.weight", weights)
+            with torch.no_grad():
+                for value in weights.values():
+                    value.add_(1)
+            written = {name: value.detach().clone() for name, value in weights.items()}
+            program.load_weights()  # a no-op once written
+            for name, value in written.items():
+                self.assertTrue(torch.equal(weights[name], value), name)
+            with torch.no_grad():
+                self.assertTrue(
+                    torch.isfinite(program(batch, step=0, total_steps=10).loss)
+                )
+
+    def test_a_mapping_installed_before_the_load_arrives_with_the_weights(self):
+        from specforge.algorithms.objectives.base import ProgramWeights
+
+        loaded = []
+
+        class Plan:
+            loads_vocabulary_mapping = False
+
+            def load(self, model):
+                loaded.append("draft")
+
+        class Vocabulary:
+            ready = False
+
+            def load_mapping(self, *, t2d, d2t):
+                loaded.append(("mapping", t2d, d2t))
+
+        class Draft(torch.nn.Module):
+            vocabulary = Vocabulary()
+
+        from specforge.algorithms.objectives.base import ObjectiveModel
+
+        program = ObjectiveModel.__new__(ObjectiveModel)
+        torch.nn.Module.__init__(program)
+        program.draft_model = Draft()
+        program.target_head = None
+        program._pending_weights = ProgramWeights(draft=Plan())
+        self.assertFalse(program.vocabulary_ready)
+        program.install_vocabulary_mapping(t2d="t", d2t="d")
+        self.assertTrue(program.vocabulary_ready)
+        self.assertEqual(loaded, [])
+        program.load_weights()
+        self.assertEqual(loaded, ["draft", ("mapping", "t", "d")])
+
+    def test_a_load_that_failed_part_way_resumes_at_the_failed_step(self):
+        from specforge.algorithms.objectives.base import ObjectiveModel, ProgramWeights
+
+        loaded = []
+
+        class Plan:
+            loads_vocabulary_mapping = False
+
+            def load(self, model):
+                loaded.append("draft")
+
+        class Head(torch.nn.Module):
+            def load_target_weight(self, table):
+                loaded.append(("teacher", table))
+
+        reads = iter([OSError("shard unavailable"), "table"])
+
+        def teacher_table():
+            value = next(reads)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        program = ObjectiveModel(
+            torch.nn.Module(),
+            None,
+            Head(),
+            loss_configuration=None,
+            weights=ProgramWeights(draft=Plan(), teacher_table=teacher_table),
+        )
+        with self.assertRaisesRegex(OSError, "shard unavailable"):
+            program.load_weights()
+        self.assertTrue(program.weights_pending)
+        # The draft's finalizer must not run twice (DSpine refuses it).
+        program.load_weights()
+        self.assertFalse(program.weights_pending)
+        self.assertEqual(loaded, ["draft", ("teacher", "table")])
+
+    def test_a_mapping_installed_after_the_load_must_equal_the_loaded_one(self):
+        from specforge.algorithms.objectives.base import ObjectiveModel, ProgramWeights
+        from specforge.modeling.draft.models.vocabulary import DraftVocabulary
+
+        class Draft(torch.nn.Module):
+            def __init__(self, vocab_size):
+                super().__init__()
+                self.vocabulary = DraftVocabulary(
+                    vocab_size=vocab_size, draft_vocab_size=4
+                )
+
+        class Plan:
+            loads_vocabulary_mapping = False
+
+        # An equal-sized vocabulary maps by identity from its construction.
+        pending = ProgramWeights(draft=Plan())
+        self.assertTrue(
+            ObjectiveModel(
+                Draft(4), None, loss_configuration=None, weights=pending
+            ).vocabulary_ready
+        )
+        program = ObjectiveModel(Draft(8), None, loss_configuration=None)
+        self.assertFalse(program.vocabulary_ready)
+        t2d, d2t = torch.arange(8) < 4, torch.zeros(4, dtype=torch.long)
+        program.install_vocabulary_mapping(t2d=t2d, d2t=d2t)
+        self.assertTrue(program.vocabulary_ready)
+        program.install_vocabulary_mapping(t2d=t2d, d2t=d2t)
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            program.install_vocabulary_mapping(
+                t2d=torch.arange(8) >= 4, d2t=torch.full((4,), 4)
+            )
+        self.assertTrue(torch.equal(program.draft_model.vocabulary.t2d, t2d))
 
     def test_named_loss_settings_reach_capture_and_resume_contract(self):
         with TemporaryDirectory() as temp:
@@ -140,6 +283,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             self.assertIsNotNone(bundle.model.target_head)
             term = bundle.model.loss_configuration.terms["token"]
             self.assertEqual(term.loss.kind, "kl")
@@ -165,6 +309,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             self.assertIsNotNone(bundle.draft_model)
 
     def test_target_tables_are_reused_and_owned_embedding_is_initialized(self):
@@ -197,6 +342,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     algorithm=resolved.algorithm,
                     topology=Topology(),
                 )
+                bundle.model.load_weights()
             self.assertIs(bundle.target_head, bundle.draft_model.lm_head)
             self.assertEqual(reads.count("lm_head.weight"), 1)
             draft = peagle_config(target_width=32)
@@ -204,6 +350,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             expected = load_file(target / "model.safetensors")[
                 "model.embed_tokens.weight"
             ]
@@ -226,6 +373,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             torch.testing.assert_close(
                 bundle.draft_model.embed_tokens.weight,
                 bundle.draft_model.lm_head.weight,
@@ -304,6 +452,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             bundle = build_model_bundle(
                 resolved.config, algorithm=resolved.algorithm, topology=Topology()
             )
+            bundle.model.load_weights()
             self.assertEqual(bundle.draft_config.target_logit_transform.multiplier, 8)
             from safetensors.torch import load_file
 
@@ -314,14 +463,14 @@ class CanonicalTrainingTest(unittest.TestCase):
             resolved.config.draft["spec_config"]["target_features"][
                 "target_layer_ids"
             ] = [99]
-            with patch("specforge.loading.initialize_draft") as initialize:
+            with patch("specforge.loading.construct_initialized_draft") as construct:
                 with self.assertRaisesRegex(ValueError, "target_layer_ids"):
                     build_model_bundle(
                         resolved.config,
                         algorithm=resolved.algorithm,
                         topology=Topology(),
                     )
-                initialize.assert_not_called()
+                construct.assert_not_called()
 
     def test_all_architectures_resolve_and_assemble(self):
         with TemporaryDirectory() as temp:
@@ -339,6 +488,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                         algorithm=resolved.algorithm,
                         topology=Topology(),
                     )
+                    bundle.model.load_weights()
                     self.assertEqual(bundle.draft_config, draft)
                     self.assertIs(bundle.model.draft_model, bundle.draft_model)
                     layout = resolved.algorithm.providers.offline_for(
@@ -377,6 +527,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                         algorithm=resolved.algorithm,
                         topology=Topology(),
                     )
+                    bundle.model.load_weights()
                     needs_teacher = kind != "ce"
                     layout = resolved.algorithm.providers.offline_for(
                         "text"

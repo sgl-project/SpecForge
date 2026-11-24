@@ -288,6 +288,7 @@ def build_objective_model(
     sequence_parallel=None,
     anchor_sampling="device",
     anchor_seed=None,
+    weights=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -314,6 +315,9 @@ def build_objective_model(
             (anchor_seed, sample id, epoch). Only an objective that samples
             anchors accepts "host".
         anchor_seed: The run's seed for host-drawn anchors.
+        weights: The ``ProgramWeights`` the draft and teacher were built
+            without; the returned model refuses to run until
+            ``load_weights()`` writes them. None for loaded modules.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -423,6 +427,7 @@ def build_objective_model(
         sequence_parallel=sequence_parallel,
         anchor_sampling=anchor_sampling,
         anchor_seed=anchor_seed,
+        weights=weights,
     )
 
 

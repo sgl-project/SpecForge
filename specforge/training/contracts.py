@@ -248,6 +248,12 @@ class TrainingProgram(Protocol):
         ``EVALUATION_EPOCH`` in an evaluation pass.
         """
 
+    def load_weights(self) -> None:
+        """Write the weights the program was built without; a no-op once written.
+
+        The runtime calls it once its storage is ready, before the first forward.
+        """
+
     def kernel_record(self) -> Dict[str, str]:
         """The kernels realised so far, by the choice they answer."""
 

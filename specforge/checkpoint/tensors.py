@@ -61,6 +61,7 @@ class TensorStore:
         self.root = root.resolve()
         self.metadata, self.files = {}, {}
         self._loaded = {}
+        self._identities = {}
         weight_map = None
         if layout.name.endswith(".index.json"):
             weight_map = read_weight_map_file(str(layout))
@@ -71,6 +72,7 @@ class TensorStore:
             file = self.root / filename
             if Path(filename).is_absolute() or ".." in Path(filename).parts:
                 raise ValueError(f"checkpoint shard leaves its directory: {filename}")
+            self._identities[file] = _file_identity(file)
             # HF snapshot caches legitimately link shard files to their blob store.
             if file.suffix == ".safetensors":
                 with safe_open(file, framework="pt", device="cpu") as handle:
@@ -113,6 +115,10 @@ class TensorStore:
 
     def read(self, key, region=None):
         file = self.files[key]
+        # A read can come long after the headers (a deferred load), and the
+        # run's provenance records the shards' stat identity in between.
+        if _file_identity(file) != self._identities[file]:
+            raise RuntimeError(f"{file} changed after its header was read")
         if file.suffix == ".safetensors":
             with safe_open(file, framework="pt", device="cpu") as handle:
                 return (
@@ -124,6 +130,12 @@ class TensorStore:
             self._loaded[file] = _torch_state(file)
         value = self._loaded[file][key]
         return value if region is None else value[region]
+
+
+def _file_identity(file):
+    # the (size, mtime) quick check of specforge.training.provenance
+    stat = file.stat()
+    return stat.st_size, stat.st_mtime_ns
 
 
 def _safe_dtype(name):

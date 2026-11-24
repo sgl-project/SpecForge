@@ -177,3 +177,13 @@ class TensorStoreTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "duplicate.*a"):
                 TensorStore(root)
+
+    def test_a_file_changed_after_its_header_was_read_is_refused(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.safetensors"
+            save_file({"weight": torch.zeros(2)}, path)
+            store = TensorStore(path)
+            torch.testing.assert_close(store.read("weight"), torch.zeros(2))
+            save_file({"weight": torch.ones(3)}, path)
+            with self.assertRaisesRegex(RuntimeError, "changed after its header"):
+                store.read("weight")

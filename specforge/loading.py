@@ -1,5 +1,7 @@
 """Public draft loading: files and weight plans, never training state."""
 
+from dataclasses import dataclass
+
 import torch
 
 from specforge.checkpoint import apply_weight_plan, make_weight_plan
@@ -18,6 +20,51 @@ from specforge.config.draft import DraftConfig
 from specforge.config.draft.codec.target import validate_target
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.models.vocabulary import DraftVocabulary
+
+
+@dataclass(frozen=True)
+class DraftWeights:
+    """What a constructed draft still has to receive to be the one requested.
+
+    A weight plan (copies under canonical keys and bound target tables) and
+    whether the draft then finishes its own initialization (scratch or new
+    structure: derived state such as DSpine's transfer space). Construction
+    draws the random initialization; ``load`` writes only what the plan names.
+    """
+
+    plan: object
+    finishes_initialization: bool
+
+    @property
+    def loads_vocabulary_mapping(self) -> bool:
+        """Whether the plan writes a vocabulary mapping (``t2d`` and ``d2t``).
+
+        Decided from the values, as the loaded vocabulary decides it: a reduced
+        vocabulary saved before it had a mapping (all-false ``t2d``, all-zero
+        ``d2t``) loads, but maps nothing.
+        """
+        weights = dict(self.plan.weights)
+        for name, t2d in weights.items():
+            if not name.endswith(".t2d"):
+                continue
+            # half a mapping is refused when the plan is written
+            d2t = weights.get(name[: -len("t2d")] + "d2t")
+            if d2t is not None and (
+                t2d.info.shape == d2t.info.shape
+                or t2d.read().any().item()
+                or d2t.read().any().item()
+            ):
+                return True
+        return False
+
+    def load(self, model) -> None:
+        """Write the plan into ``model``, then let it finish initializing."""
+        apply_weight_plan(model, self.plan)
+        _validate_vocabulary(model, self.plan)
+        if self.finishes_initialization:
+            model.finalize_initialization(
+                loaded_keys=frozenset(dict(self.plan.weights))
+            )
 
 
 def _target_config(source, cache_dir):
@@ -59,6 +106,15 @@ def read_draft(
     )
 
 
+def _require_real_device(device):
+    if device is not None and torch.device(device).type == "meta":
+        # to_empty would keep garbage wherever the plan writes nothing (new
+        # tensors): construction is what initializes them
+        raise ValueError(
+            "construct the draft on a real device; a meta draft cannot be loaded"
+        )
+
+
 def _dtype(requested, checkpoint):
     if requested is not None:
         if not isinstance(requested, torch.dtype) or not requested.is_floating_point:
@@ -88,7 +144,7 @@ def _validate_vocabulary(model, plan):
             raise ValueError("load t2d and d2t together as one vocabulary mapping")
 
 
-def load_draft(
+def construct_draft(
     source,
     *,
     target=None,
@@ -99,11 +155,13 @@ def load_draft(
     backend="eager",
     cache_dir=None,
 ):
-    """Restore canonical draft weights; optional draft is an equality check.
+    """Construct the draft a checkpoint describes; its weights come with ``load``.
 
-    Constructs on meta for preflight, then constructs the real model once and
-    copies into its initialized tensors. Missing weights are never randomized.
+    Returns:
+        ``(model, DraftWeights)``. The model holds its random initialization
+        until ``DraftWeights.load(model)`` copies the checkpoint into it.
     """
+    _require_real_device(device)
     target_config = _target_config(target, cache_dir)
     checkpoint = read_checkpoint(
         source,
@@ -135,12 +193,22 @@ def load_draft(
     for key, value in checkpoint.hf_metadata.items():
         if key not in skipped:
             setattr(model.config, key, value)
-    apply_weight_plan(model, plan)
-    _validate_vocabulary(model, plan)
+    return model, DraftWeights(plan, finishes_initialization=False)
+
+
+def load_draft(source, **options):
+    """Restore canonical draft weights; optional draft is an equality check.
+
+    Constructs on meta for preflight, then constructs the real model once and
+    copies into its initialized tensors. Missing weights are never randomized.
+    Takes ``construct_draft``'s arguments.
+    """
+    model, weights = construct_draft(source, **options)
+    weights.load(model)
     return model.eval()
 
 
-def initialize_draft(
+def construct_initialized_draft(
     draft,
     *,
     target=None,
@@ -155,7 +223,7 @@ def initialize_draft(
     backend="eager",
     cache_dir=None,
 ):
-    """Construct scratch/new-structure weights, optionally copying explicit sources.
+    """Construct a scratch/new-structure draft; its weights come with ``load``.
 
     This entry point accepts neither checkpoint continuation nor training resume;
     those use load_draft and the training layer's state restoration respectively.
@@ -165,6 +233,7 @@ def initialize_draft(
     """
     if type(draft) is not DraftConfig:
         raise TypeError("draft must be a resolved DraftConfig")
+    _require_real_device(device)
     target_config = _target_config(target, cache_dir)
     if target_config is not None:
         validate_target(draft, target_config)
@@ -215,10 +284,26 @@ def initialize_draft(
         if missing:
             raise ValueError(f"Frozen parameters require loaded weights: {missing}")
     model = build_draft_model(draft, device=device, dtype=dtype, backend=backend)
-    apply_weight_plan(model, plan)
-    _validate_vocabulary(model, plan)
-    model.finalize_initialization(loaded_keys=frozenset(dict(plan.weights)))
+    return model, DraftWeights(plan, finishes_initialization=True)
+
+
+def initialize_draft(draft, **options):
+    """Construct scratch/new-structure weights, optionally copying explicit sources.
+
+    Takes ``construct_initialized_draft``'s arguments; the weights are loaded
+    and the draft finishes its initialization before it is returned.
+    """
+    model, weights = construct_initialized_draft(draft, **options)
+    weights.load(model)
     return model
 
 
-__all__ = ["apply_weight_plan", "initialize_draft", "load_draft", "read_draft"]
+__all__ = [
+    "DraftWeights",
+    "apply_weight_plan",
+    "construct_draft",
+    "construct_initialized_draft",
+    "initialize_draft",
+    "load_draft",
+    "read_draft",
+]

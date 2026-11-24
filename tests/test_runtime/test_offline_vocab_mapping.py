@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from specforge.algorithms.objectives.base import ObjectiveModel
 from specforge.config import Config
 from specforge.modeling.draft.models.vocabulary import DraftVocabulary
 from specforge.training.assembly import (
@@ -28,6 +29,16 @@ class _DraftWithMapping(torch.nn.Module):
         self.vocabulary = DraftVocabulary(
             vocab_size=target_vocab_size, draft_vocab_size=draft_vocab_size
         )
+
+
+def _bundle(draft, *, target_vocab_size, draft_vocab_size):
+    """What the mapping steps read: a program over ``draft``, already loaded."""
+    return SimpleNamespace(
+        model=ObjectiveModel(draft, None, loss_configuration=None),
+        draft_model=draft,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+    )
 
 
 class OfflineVocabMappingTest(unittest.TestCase):
@@ -64,8 +75,8 @@ class OfflineVocabMappingTest(unittest.TestCase):
             counts = Counter({1: 3, 2: 2, 3: 1})
 
             for target_vocab_size, draft_vocab_size in ((8, 4), (9, 4), (8, 5)):
-                bundle = SimpleNamespace(
-                    draft_model=_DraftWithMapping(
+                bundle = _bundle(
+                    _DraftWithMapping(
                         target_vocab_size=target_vocab_size,
                         draft_vocab_size=draft_vocab_size,
                     ),
@@ -150,22 +161,14 @@ class OfflineVocabMappingTest(unittest.TestCase):
                 }
             )
             first_draft = _DraftWithMapping()
-            first = SimpleNamespace(
-                draft_model=first_draft,
-                target_vocab_size=8,
-                draft_vocab_size=4,
-            )
+            first = _bundle(first_draft, target_vocab_size=8, draft_vocab_size=4)
             _ensure_offline_vocab_mapping(cfg, first, ALGORITHM)
             cached = list((root / "cache" / "vocab_mapping").glob("*.pt"))
             self.assertEqual(len(cached), 1)
             self.assertTrue(first_draft.vocabulary.ready)
 
             second_draft = _DraftWithMapping()
-            second = SimpleNamespace(
-                draft_model=second_draft,
-                target_vocab_size=8,
-                draft_vocab_size=4,
-            )
+            second = _bundle(second_draft, target_vocab_size=8, draft_vocab_size=4)
             _ensure_offline_vocab_mapping(cfg, second, ALGORITHM)
 
         self.assertTrue(second_draft.vocabulary.ready)

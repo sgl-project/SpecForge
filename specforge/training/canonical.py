@@ -419,6 +419,7 @@ def build_bundle(cfg, algorithm, topology):
         objective_record,
         resolve_objective,
     )
+    from specforge.algorithms.objectives.base import ProgramWeights
     from specforge.checkpoint.target import TargetWeights
     from specforge.config.draft.codec import encode_config
     from specforge.config.draft.codec.target import (
@@ -426,7 +427,7 @@ def build_bundle(cfg, algorithm, topology):
         resolve_target_logits,
     )
     from specforge.config.schema import ModelConfig
-    from specforge.loading import initialize_draft, load_draft
+    from specforge.loading import construct_draft, construct_initialized_draft
     from specforge.modeling.draft.bindings import BoundLMHead
     from specforge.modeling.draft.layers.kernels import (
         configure_kernels,
@@ -479,11 +480,11 @@ def build_bundle(cfg, algorithm, topology):
         cache_dir=cfg.model.cache_dir,
     )
     if source:
-        model = load_draft(
+        model, draft_weights = construct_draft(
             source,
             **common,
             adapter=init.adapter if init else None,
-        ).train()
+        )
     else:
         weights = init.weights_from if init else None
         from_target = dict(init.from_target or {}) if init else {}
@@ -503,7 +504,7 @@ def build_bundle(cfg, algorithm, topology):
             ).key
             # legacy load_embedding parity: follow model.torch_dtype
             cast_copies = ("embed_tokens.weight",)
-        model = initialize_draft(
+        model, draft_weights = construct_initialized_draft(
             **common,
             weights_from=weights.checkpoint if weights else None,
             mapping=weights.mapping if weights else None,
@@ -513,6 +514,7 @@ def build_bundle(cfg, algorithm, topology):
             cast_target_copies=cast_copies,
         )
     teacher = None
+    teacher_table = None
     if resolved.requires_teacher:
         transform = resolve_target_logits(target_weights.config)
         if isinstance(model.lm_head, BoundLMHead) and model.lm_head.config == transform:
@@ -525,7 +527,8 @@ def build_bundle(cfg, algorithm, topology):
                 device=device,
                 dtype=dtype,
             )
-            teacher.load_target_weight(target_weights.resolve("lm_head").read())
+            # Read when the program's weights are loaded, as the draft's are.
+            teacher_table = target_weights.resolve("lm_head").read
     if teacher is not None and hasattr(model, "vocabulary"):
         width = bound_vocab_size(target)
         if model.vocabulary.vocab_size != width:
@@ -546,19 +549,12 @@ def build_bundle(cfg, algorithm, topology):
     )
     if cfg.training.attention_backend == "flex_attention":
         _raise_flex_recompile_limit()
+    vocabulary_mapping = None
     if hasattr(model, "vocabulary") and cfg.model.vocab_mapping_path:
         mapping = torch.load(
             cfg.model.vocab_mapping_path, map_location=device, weights_only=True
         )
-        # a loaded or copied vocabulary was trained with its own mapping
-        if bool(model.vocabulary.ready) and (
-            not torch.equal(model.vocabulary.t2d, mapping["t2d"])
-            or not torch.equal(model.vocabulary.d2t, mapping["d2t"])
-        ):
-            raise ValueError(
-                "vocab_mapping_path disagrees with the loaded draft vocabulary"
-            )
-        model.vocabulary.load_mapping(t2d=mapping["t2d"], d2t=mapping["d2t"])
+        vocabulary_mapping = (mapping["t2d"], mapping["d2t"])
     sequence_parallel = None
     if cfg.training.attention_backend == "usp":
         from .sequence_parallel import sequence_parallel_groups
@@ -575,6 +571,11 @@ def build_bundle(cfg, algorithm, topology):
         sequence_parallel=sequence_parallel,
         anchor_sampling=cfg.training.anchor_sampling,
         anchor_seed=cfg.training.seed,
+        weights=ProgramWeights(
+            draft=draft_weights,
+            teacher_table=teacher_table,
+            vocabulary_mapping=vocabulary_mapping,
+        ),
     )
     contract = {
         "canonical_draft_config": encode_config(draft),

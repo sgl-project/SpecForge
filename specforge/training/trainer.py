@@ -209,6 +209,9 @@ class Trainer:
             algorithm_checkpoint_extra = {}
             allowed_missing_checkpoint_keys = set()
 
+        # The weights the program was built without, before anything reads or
+        # overwrites them; this runtime writes them before it wraps.
+        model.load_weights()
         if allowed_missing_checkpoint_keys:
             draft_state_keys = set(model.draft_model.state_dict())
             unknown_allowed_missing = allowed_missing_checkpoint_keys - draft_state_keys

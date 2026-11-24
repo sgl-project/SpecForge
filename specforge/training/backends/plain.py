@@ -31,7 +31,8 @@ class PlainRunner(DataParallelRunner):
     compiler that coordinates ranks.
 
     Args:
-        program: The program, placed on its device.
+        program: The program, placed on its device. Its weights are loaded
+            (``load_weights``) before the optimizer is built.
         spec: What the program declares.
         optimizer_factory: Builds the optimizer over ``optimizer_target``.
         optimizer_target: The module the optimizer trains; the program when
@@ -66,6 +67,8 @@ class PlainRunner(DataParallelRunner):
                     f"the program is on {device} and the process's current "
                     f"{device.type} device is {current}"
                 )
+        # The optimizer clones its fp32 masters when it is built.
+        program.load_weights()
         backend = FSDPTrainingBackend(
             ParallelConfig(), optimizer_factory=optimizer_factory
         )

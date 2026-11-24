@@ -112,7 +112,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def ack_train_refs(self, tid, ids, *, global_step, optimizer_durable):
                 dfc_calls.append(("ack", tid, ids, global_step, optimizer_durable))
 
-        model = SimpleNamespace(draft_model="DRAFT", frozen=("TABLE",))
+        model = SimpleNamespace(
+            draft_model="DRAFT", frozen=("TABLE",), load_weights=lambda: None
+        )
         declared = SimpleNamespace(partition=SimpleNamespace(blocks=("Block",)))
         cap["program_spec"] = declared
         dfc = FakeDataflowController()

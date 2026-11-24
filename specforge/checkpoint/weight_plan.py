@@ -183,21 +183,23 @@ def apply_weight_plan(model, plan):
     for name, (value, _) in {**destinations, **bound}.items():
         if value.is_meta:
             raise ValueError(f"{name}: materialize the model before applying weights")
+    # Sources are read on the host and copied straight into the destination
+    # (copy_ casts on the host too): no device-sized staging copy of a table.
     seen = set()
     for name, ref in plan.weights:
         if id(state[name]) not in seen:
             local, region = destinations[name]
-            local.copy_(ref.read(region).to(device=local.device, dtype=local.dtype))
+            local.copy_(ref.read(region))
             seen.add(id(state[name]))
     for name, ref in plan.bindings:
         module = model.get_submodule(name)
         local, region = bound[name]
-        value = ref.read(region).to(device=local.device, dtype=local.dtype)
+        value = ref.read(region)
         if region is not None:
             from torch.distributed.tensor import DTensor
 
             value = DTensor.from_local(
-                value,
+                value.to(device=local.device, dtype=local.dtype),
                 module.weight.device_mesh,
                 module.weight.placements,
                 run_check=False,

@@ -1,7 +1,8 @@
 """Objective contracts and the composite module executed by distributed training."""
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +28,35 @@ class ObjectiveResult:
     @property
     def loss(self):
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
+
+
+@dataclass(frozen=True)
+class ProgramWeights:
+    """What a constructed objective model still has to receive.
+
+    Built with the program; written by ``ObjectiveModel.load_weights`` when the
+    runtime that trains it has the storage ready (today: before it wraps).
+    Each part is None once written.
+
+    Attributes:
+        draft: The draft's weight plan (``specforge.loading.DraftWeights``):
+            copies under canonical keys, bound target tables, and whether the
+            draft then finishes its own initialization.
+        teacher_table: Reads the target's LM head for a teacher head that is
+            not the draft's own; None without one.
+        vocabulary_mapping: ``(t2d, d2t)`` to install after the draft's weights;
+            a mapping those weights carry must equal it.
+    """
+
+    draft: Optional[object]
+    teacher_table: Optional[Callable[[], Tensor]] = None
+    vocabulary_mapping: Optional[Tuple[Tensor, Tensor]] = None
+
+    @property
+    def provides_vocabulary_mapping(self) -> bool:
+        return self.vocabulary_mapping is not None or (
+            self.draft is not None and bool(self.draft.loads_vocabulary_mapping)
+        )
 
 
 def validate_anchor_sampling(name, training, anchor_sampling, anchor_seed):
@@ -82,6 +112,7 @@ class ObjectiveModel(nn.Module):
         sequence_parallel=None,
         anchor_sampling="device",
         anchor_seed=None,
+        weights=None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -113,10 +144,77 @@ class ObjectiveModel(nn.Module):
                 name, registration.training, anchor_sampling, anchor_seed
             )
         self.anchor_sampling = anchor_sampling
+        # Weights still to be written (``load_weights``); None once written, or
+        # for a model built from loaded modules.
+        self._pending_weights = weights
         self.anchor_seed = anchor_seed
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
+
+    @property
+    def weights_pending(self) -> bool:
+        """Whether ``load_weights`` still has weights to write."""
+        return self._pending_weights is not None
+
+    def load_weights(self) -> None:
+        """Write the weights this model was built without; a no-op once written.
+
+        The draft's plan first (then its own initialization), the teacher's
+        table, and the vocabulary mapping last. A step is not repeated once
+        written, so a load that failed part way can be retried.
+
+        Raises:
+            ValueError: The draft's weights carry a vocabulary mapping that
+                differs from the one this model was given.
+        """
+        weights = self._pending_weights
+        if weights is None:
+            return
+        if weights.draft is not None:
+            weights.draft.load(self.draft_model)
+            weights = self._pending_weights = replace(weights, draft=None)
+        if weights.teacher_table is not None:
+            self.target_head.load_target_weight(weights.teacher_table())
+            weights = self._pending_weights = replace(weights, teacher_table=None)
+        if weights.vocabulary_mapping is not None:
+            self._load_vocabulary_mapping(*weights.vocabulary_mapping)
+        self._pending_weights = None
+
+    def _load_vocabulary_mapping(self, t2d, d2t):
+        vocabulary = self.draft_model.vocabulary
+        # a loaded or copied vocabulary was trained with its own mapping
+        if bool(vocabulary.ready) and (
+            not torch.equal(vocabulary.t2d, t2d.to(vocabulary.t2d.device))
+            or not torch.equal(vocabulary.d2t, d2t.to(vocabulary.d2t.device))
+        ):
+            raise ValueError(
+                "vocab_mapping_path disagrees with the loaded draft vocabulary"
+            )
+        vocabulary.load_mapping(t2d=t2d, d2t=d2t)
+
+    @property
+    def vocabulary_ready(self) -> bool:
+        """Whether the draft has (or will have, once loaded) a vocabulary mapping."""
+        pending = self._pending_weights
+        if pending is not None and pending.provides_vocabulary_mapping:
+            return True
+        # also an equal-sized vocabulary's identity mapping, from construction
+        vocabulary = getattr(self.draft_model, "vocabulary", None)
+        return vocabulary is not None and bool(vocabulary.ready)
+
+    def install_vocabulary_mapping(self, *, t2d, d2t) -> None:
+        """Give the draft a vocabulary mapping: now, or with its pending weights.
+
+        Raises:
+            ValueError: The draft's loaded vocabulary has a different mapping.
+        """
+        if self._pending_weights is not None:
+            self._pending_weights = replace(
+                self._pending_weights, vocabulary_mapping=(t2d, d2t)
+            )
+            return
+        self._load_vocabulary_mapping(t2d, d2t)
 
     def adopt_recorded_execution(self, recorded):
         """Continue a resumed run with the fused setting its checkpoint recorded.
@@ -363,6 +461,10 @@ class ObjectiveModel(nn.Module):
         statistic = (
             self.registration.training.window_statistic if self.registration else None
         )
+        if self._pending_weights is not None:
+            raise ValueError(
+                "this model was built without its weights; call load_weights() first"
+            )
         valid_tokens(batch)
         if self.anchor_sampling == "host":
             missing = {"anchors", "anchor_keep"} | (
