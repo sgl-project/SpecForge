@@ -170,10 +170,21 @@ class DraftNodesTest(unittest.TestCase):
                 lambda: MoERouterSpec(**{**router, "normalize_top_k": 1}),
                 "normalize_top_k",
             ),
+            # top-1 with renormalization: the one weight is always 1
+            (
+                lambda: moe(
+                    router=MoERouterSpec(**{**router, "normalize_top_k": True})
+                ),
+                "normalizes to 1",
+            ),
         ):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
                     build()
+        normalized = MoERouterSpec(**{**router, "normalize_top_k": True})
+        self.assertEqual(
+            moe(num_experts_per_tok=2, router=normalized).router, normalized
+        )
         for build, message in (
             (lambda: moe(router=None), "router"),
             (lambda: moe(shared_expert=expert), "shared_expert"),

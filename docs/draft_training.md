@@ -234,8 +234,9 @@ holds the expert count, top-k, an `experts` sub-node (per-expert
 `intermediate_size`, `hidden_act`, `gated`), an optional `shared_expert` sub-node
 of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
 MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
-`sigmoid` scoring, top-k renormalization, `route_scale`, and a fp32 `expert_bias`
-that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
+`sigmoid` scoring, top-k renormalization (rejected with top-1, where it would fix
+every weight at 1 and leave the router no task-loss gradient), `route_scale`, and
+a fp32 `expert_bias` that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
 `experts.down_proj`).
 The preset `specforge/config/draft/presets/qwen3-8b-moe-dspark.yaml` with its
 recipe trains a DSpark draft whose every FFN is a MoE of 8 experts with top-1
