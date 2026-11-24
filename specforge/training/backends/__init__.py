@@ -6,9 +6,10 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Step runners beyond the reference.
+"""Runtimes beyond the reference.
 
-Today one module, ``plain``, built on the reference runner's own classes.
-Nothing in the training plane imports this package: a runner is chosen by
-whoever assembles the trainer, and no configuration key selects one yet.
+``plain``: one process, no wrapper, built on the reference runner's classes;
+no configuration key selects it. ``fsdp2``: FSDP2 with fp32 masters, selected
+by ``training.runtime: fsdp2``. Only ``Trainer``, which builds the runtime the
+run chose, imports this package.
 """

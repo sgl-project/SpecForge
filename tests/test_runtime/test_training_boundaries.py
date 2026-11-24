@@ -194,10 +194,14 @@ RULES = (
         ),
     ),
     Rule(
-        "nothing imports a runner package; whoever assembles the trainer chooses one",
+        "only the trainer, which builds the runtime the run chose, imports a runner "
+        "package",
         ("specforge/**/*.py",),
         ("specforge.training.backends",),
-        outside=("specforge/training/backends/**/*.py",),
+        outside=(
+            "specforge/training/backends/**/*.py",
+            "specforge/training/trainer.py",
+        ),
     ),
     Rule(
         "the runner of one process names no process group",

@@ -243,13 +243,16 @@ class DomainTrainerWiringTest(unittest.TestCase):
             },
         )
 
-    def test_runtime_other_than_fsdp_is_refused(self):
+    def test_an_unknown_runtime_is_refused(self):
         import torch
 
         from specforge.training.contracts import TrainingRuntime
 
-        runtime = TrainingRuntime.resolve("fsdp2", model_dtype=torch.bfloat16)
-        with self.assertRaisesRegex(ValueError, "unknown training runtime 'fsdp2'"):
+        precision = TrainingRuntime.resolve("fsdp", model_dtype=torch.float32).precision
+        runtime = TrainingRuntime("torchtitan", precision)
+        with self.assertRaisesRegex(
+            ValueError, "unknown training runtime 'torchtitan'"
+        ):
             self._build({"refs": list(range(6))}, runtime=runtime)
 
     def test_throughput_scale_counts_only_data_parallel_ranks(self):

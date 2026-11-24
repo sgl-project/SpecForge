@@ -69,6 +69,14 @@ TOPOLOGIES = (
     _TWO_RANKS | _SHARDED | dict(evaluated=True),
     dict(world_size=4, accumulation_steps=2, dtype="bfloat16") | _SHARDED,
 )
+# The FSDP2 runtime (fp32 masters, bf16 compute, fp32 gradients) under the
+# reference's bf16 topologies: replicated and sharded. Their trajectories are
+# their own; each is compared with its reference twin within a tolerance.
+FSDP2_TOPOLOGIES = (
+    _TWO_RANKS | dict(dtype="bfloat16", runtime="fsdp2"),
+    dict(world_size=4, accumulation_steps=2, dtype="bfloat16", runtime="fsdp2")
+    | _SHARDED,
+)
 # What a checkpoint's shared file says about the run's progress and weights.
 SHARED_STATE = (
     "draft_state_dict",
@@ -101,6 +109,8 @@ class Case:
     empty_eval_rank: int | None = None
     sp_ulysses_size: int = 1
     batch_size: int = 1
+    #: ``training.runtime``: "fsdp" (DDP / FSDP1, the reference) or "fsdp2".
+    runtime: str = "fsdp"
 
     @property
     def name(self):
@@ -117,6 +127,8 @@ class Case:
             name += f"/ulysses{self.sp_ulysses_size}/lk_lambda"
         if self.batch_size > 1:
             name += f"/batch{self.batch_size}"
+        if self.runtime != "fsdp":
+            name += f"/{self.runtime}"
         return name
 
     @property
@@ -155,7 +167,7 @@ _USP_CASE = Case(
 
 def every_case(ranks=()):
     """Canonical runs, plus DDP and FSDP for every draft at any requested size."""
-    topologies = list(TOPOLOGIES)
+    topologies = list(TOPOLOGIES) + list(FSDP2_TOPOLOGIES)
     for world_size in ranks:
         if world_size < 1:
             raise ValueError(f"--ranks requires positive world sizes, got {world_size}")
@@ -205,9 +217,9 @@ def _usp_available(device_type):
 def cases(ranks=()):
     """The cases this host can place.
 
-    An accelerator run needs one device per rank. FSDP refuses a CPU model
+    An accelerator run needs one device per rank. FSDP1 refuses a CPU model
     unless the host has an accelerator to compute on, so a CPU trainer records
-    the DDP cases only.
+    the DDP and FSDP2 cases only.
     """
     ranks = tuple(ranks)
     selected = every_case(ranks)
@@ -216,7 +228,9 @@ def cases(ranks=()):
         return [
             case
             for case in selected
-            if case.sharding == "NO_SHARD" and case.sp_ulysses_size == 1
+            # FSDP2 computes on the host; FSDP1 refuses to.
+            if (case.sharding == "NO_SHARD" or case.runtime == "fsdp2")
+            and case.sp_ulysses_size == 1
         ]
     devices = torch.get_device_module(device_type).device_count()
     if any(world > devices for world in ranks):
@@ -536,6 +550,11 @@ def record(selected, *, around_training=None):
                     f"model.torch_dtype={case.dtype}",
                     f"deployment.trainer.nproc_per_node={world_size}",
                     f"training.fsdp_sharding={case.sharding}",
+                    *(
+                        [f"training.runtime={case.runtime}"]
+                        if case.runtime != "fsdp"
+                        else []
+                    ),
                     f"training.batch_size={case.batch_size}",
                     f"training.accumulation_steps={case.accumulation_steps}",
                     f"training.num_epochs={EPOCHS}",

@@ -166,8 +166,11 @@ def build_model_bundle(
 
 
 class _ConfiguredOptimizerFactory:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, precision) -> None:
         self.cfg = cfg
+        # A separate master copy (BF16Optimizer) or parameters that are the
+        # masters (FP32Optimizer), as the run's precision says.
+        self.keeps_masters = precision.master_dtype is not None
         self.total_steps = cfg.training.total_steps or cfg.training.max_steps
 
     def configure_total_steps(self, total_steps: int) -> None:
@@ -180,11 +183,20 @@ class _ConfiguredOptimizerFactory:
             )
 
     def __call__(self, draft_module):
-        from specforge.optimizer import BF16Optimizer
+        from specforge.optimizer import BF16Optimizer, FP32Optimizer
 
         if self.total_steps is None:
             raise RuntimeError("optimizer total_steps was not resolved before assembly")
         t = self.cfg.training
+        if not self.keeps_masters:
+            return FP32Optimizer(
+                draft_module,
+                lr=t.learning_rate,
+                max_grad_norm=t.max_grad_norm,
+                warmup_ratio=t.warmup_ratio,
+                lr_scheduler=t.lr_scheduler,
+                total_steps=self.total_steps,
+            )
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
@@ -203,12 +215,12 @@ def _training_runtime(cfg: Config) -> TrainingRuntime:
     from specforge.training.contracts import TrainingRuntime
 
     return TrainingRuntime.resolve(
-        "fsdp", model_dtype=getattr(torch, cfg.model.torch_dtype)
+        cfg.training.runtime, model_dtype=getattr(torch, cfg.model.torch_dtype)
     )
 
 
 def _optimizer_factory(cfg: Config):
-    return _ConfiguredOptimizerFactory(cfg)
+    return _ConfiguredOptimizerFactory(cfg, _training_runtime(cfg).precision)
 
 
 def _logger(metrics, step):

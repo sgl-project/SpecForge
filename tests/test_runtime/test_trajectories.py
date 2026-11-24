@@ -33,6 +33,11 @@ from tests.test_runtime.trajectories import (
 )
 
 
+def _is_ddp(case):
+    """The reference runtime replicating: DDP, whose replicas the recorder sees."""
+    return case.runtime == "fsdp" and case.sharding == "NO_SHARD"
+
+
 def _scheduled_states(case):
     optimizer = torch.optim.SGD([torch.zeros(())], lr=LEARNING_RATE)
     scheduler = CosineAnnealingWarmupLR(
@@ -143,7 +148,7 @@ class TrajectoryTest(unittest.TestCase):
         """DDP saves rank 0's state; every rank's process holds the same bits."""
         for recording in (self.first, self.second):
             for case in self.cases:
-                if case.sharding != "NO_SHARD":
+                if not _is_ddp(case):
                     continue
                 with self.subTest(case=case.name):
                     for update, schedule in zip(
@@ -175,7 +180,7 @@ class TrajectoryTest(unittest.TestCase):
                             )
 
     def test_saved_optimizer_corruption_is_detected(self):
-        case = next(case for case in self.cases if case.sharding == "NO_SHARD")
+        case = next(case for case in self.cases if _is_ddp(case))
         update = self.first[case.name][0]
         saved = update["shared"]["replicated_optimizer_state"]
         replica = update["replicas"][0]

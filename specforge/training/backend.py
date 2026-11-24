@@ -441,7 +441,24 @@ class FSDPTrainingBackend(TrainingBackend):
         return {"model": model, "optimizer": optimizer, "rng": rng}
 
     def load_state_dict(self, state: dict) -> None:
-        """Restore whichever of module weights / optimizer / RNG the state carries."""
+        """Restore whichever of module weights / optimizer / RNG the state carries.
+
+        Raises:
+            ValueError: The optimizer state was written by the fsdp2 runtime,
+                whose parameters are the masters: resume it with that runtime.
+        """
+        from specforge.optimizer import FP32Optimizer
+
+        saved = state.get("optimizer")
+        if (
+            isinstance(saved, dict)
+            and FP32Optimizer.FORMAT_KEY in saved
+            and not isinstance(self.optimizer, FP32Optimizer)
+        ):
+            raise ValueError(
+                "this checkpoint was written by training.runtime=fsdp2 (fp32 "
+                "parameters are the masters); resume it with training.runtime=fsdp2"
+            )
         if state.get("model") is not None:
             self._load_module_state_dict(state["model"])
         try:

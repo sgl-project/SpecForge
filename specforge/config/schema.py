@@ -1070,6 +1070,14 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    #: The data-parallel runtime. ``fsdp`` (DDP for ``NO_SHARD``, FSDP1
+    #: otherwise) stores the trainable draft in ``model.torch_dtype``,
+    #: accumulates and reduces gradients in it, and keeps fp32 masters in the
+    #: optimizer. ``fsdp2`` stores the trainable draft in fp32 (the masters),
+    #: computes in ``model.torch_dtype``, and accumulates and reduces gradients in
+    #: fp32. Checkpoints keep the draft in ``model.torch_dtype`` either way; an
+    #: ``fsdp2`` run resumes from an ``fsdp`` checkpoint.
+    runtime: Literal["fsdp", "fsdp2"] = "fsdp"
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
@@ -1143,6 +1151,18 @@ class TrainingConfig(StrictConfigModel):
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
             )
+        if self.runtime == "fsdp2":
+            if self.optimizer_cpu_offload:
+                raise ValueError(
+                    "training.runtime=fsdp2 keeps the fp32 masters in the "
+                    "parameters; training.optimizer_cpu_offload has no copy to "
+                    "move to the host"
+                )
+            if self.attention_backend == "usp":
+                raise ValueError(
+                    "training.runtime=fsdp2 is untested with sequence "
+                    "parallelism (attention_backend=usp)"
+                )
         return self
 
 

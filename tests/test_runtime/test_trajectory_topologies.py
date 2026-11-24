@@ -52,7 +52,13 @@ class TrajectoryTopologiesTest(unittest.TestCase):
                 self.assertFalse(output.exists())
         with patch.object(trajectories, "get_device_type", return_value="cpu"):
             cpu = trajectories.cases([3])
-            self.assertTrue(all(case.sharding == "NO_SHARD" for case in cpu))
+            # FSDP1 refuses to compute on the host; FSDP2 shards there.
+            self.assertTrue(
+                all(case.sharding == "NO_SHARD" for case in cpu if case.runtime == "fsdp")
+            )
+            self.assertIn(
+                ("fsdp2", "SHARD_GRAD_OP"), {(case.runtime, case.sharding) for case in cpu}
+            )
             self.assertTrue(all(case.sp_ulysses_size == 1 for case in cpu))
             self.assertIn(3, {case.world_size for case in cpu})
         with self.assertRaisesRegex(ValueError, "positive world sizes"):

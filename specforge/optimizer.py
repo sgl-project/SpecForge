@@ -346,18 +346,243 @@ class BF16Optimizer:
         return self.optimizer.param_groups[0]["lr"]
 
 
+def _local(tensor):
+    """The rank's own part of a sharded tensor; the tensor itself otherwise."""
+    from torch.distributed.tensor import DTensor
+
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _like(value, param):
+    """A saved per-parameter value laid out as ``param``: this rank's part of
+    it, sharded as ``param`` is (global shape and stride given, since uneven
+    shards do not determine them). Scalars (the step) are kept as saved."""
+    from torch.distributed.tensor import DTensor
+
+    if not (isinstance(param, DTensor) and torch.is_tensor(value) and value.ndim):
+        return value
+    local = _local(param)
+    if value.shape != local.shape:
+        raise ValueError(
+            f"saved optimizer state of shape {tuple(value.shape)} does not match "
+            f"this rank's shard {tuple(local.shape)}"
+        )
+    return DTensor.from_local(
+        value.to(local.device),
+        param.device_mesh,
+        param.placements,
+        run_check=False,
+        shape=param.shape,
+        stride=param.stride(),
+    )
+
+
+class FP32Optimizer:
+    """AdamW over trainable parameters that are themselves the fp32 masters.
+
+    For a runtime that stores the trainable draft in fp32 and computes in a
+    lower precision (FSDP2's mixed precision), so gradients arrive, accumulate
+    and are reduced in fp32 and there is no second copy to keep. The step has
+    ``BF16Optimizer``'s contract: it clips by the global gradient norm, checks
+    that norm and the loss denominator in one host read before any state
+    changes, steps the schedule and clears the gradients.
+
+    Parameters may be sharded (``DTensor``); the norm is then the global one.
+    The state it saves is this rank's: its parameter shards and moments.
+    """
+
+    checks_loss_denominator = True
+    #: Key whose presence marks a state this optimizer wrote.
+    FORMAT_KEY = "parameters_are_masters"
+
+    def __init__(
+        self,
+        model,
+        lr,
+        weight_decay=0.0,
+        max_grad_norm=0.5,
+        total_steps=800_000,
+        warmup_ratio=0.015,
+        lr_scheduler="cosine",
+    ):
+        self.model_params = [p for p in model.parameters() if p.requires_grad]
+        wrong = sorted({str(p.dtype) for p in self.model_params} - {"torch.float32"})
+        if wrong:
+            raise ValueError(
+                f"FP32Optimizer trains fp32 parameters; found {wrong}. A runtime "
+                "that keeps low-precision parameters pairs with BF16Optimizer"
+            )
+        self.max_grad_norm = max_grad_norm
+        fused = (
+            True
+            if self.model_params and all(p.is_cuda for p in self.model_params)
+            else None
+        )
+        self._fused = fused
+        self.optimizer = torch.optim.AdamW(
+            self.model_params, lr=lr, weight_decay=weight_decay, fused=fused
+        )
+        self.last_grad_norm = None
+        scheduler_types = {
+            "constant": ConstantWarmupLR,
+            "cosine": CosineAnnealingWarmupLR,
+        }
+        if lr_scheduler not in scheduler_types:
+            raise ValueError(
+                f"unsupported lr_scheduler={lr_scheduler!r}; "
+                f"expected one of {sorted(scheduler_types)}"
+            )
+        self.lr_scheduler_type = lr_scheduler
+        self.scheduler = scheduler_types[lr_scheduler](
+            self.optimizer,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps_from_ratio(warmup_ratio, total_steps),
+        )
+
+    def _global_grad_norm(self):
+        from torch.distributed.tensor import DTensor
+
+        grads = [p.grad for p in self.model_params if p.grad is not None]
+        if not grads:
+            device = self.model_params[0].device if self.model_params else "cpu"
+            return torch.zeros((), dtype=torch.float32, device=device)
+        norm = torch.nn.utils.get_total_norm(grads, norm_type=2.0)
+        return norm.full_tensor() if isinstance(norm, DTensor) else norm
+
+    def step(self, *, loss_denominator=None):
+        """Clip, update, and return the pre-clip global grad norm."""
+        grad_norm = self._global_grad_norm()
+        checked = [grad_norm]
+        if loss_denominator is not None:
+            checked.append(loss_denominator)
+        host_values = torch.stack(
+            [
+                value.detach().reshape(()).to(grad_norm.device, torch.float32)
+                for value in checked
+            ]
+        ).tolist()
+        if loss_denominator is not None:
+            denominator = host_values[-1]
+            if not math.isfinite(denominator) or denominator <= 0:
+                self.optimizer.zero_grad(set_to_none=True)
+                raise ValueError("global loss denominator must be finite and positive")
+        if not math.isfinite(host_values[0]):
+            self.optimizer.zero_grad(set_to_none=True)
+            self.last_grad_norm = grad_norm.detach()
+            raise FloatingPointError(
+                "refusing optimizer step with non-finite global grad norm "
+                f"(max_grad_norm={self.max_grad_norm})"
+            )
+        torch.nn.utils.clip_grads_with_norm_(
+            self.model_params, self.max_grad_norm, grad_norm
+        )
+        self.last_grad_norm = grad_norm.detach()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step()
+        return self.last_grad_norm
+
+    def state_dict(self):
+        """This rank's state: moments and parameter shards, as local tensors."""
+        optimizer = self.optimizer.state_dict()
+        optimizer["state"] = {
+            index: {key: _local(value) for key, value in state.items()}
+            for index, state in optimizer["state"].items()
+        }
+        return {
+            "optimizer_state_dict": optimizer,
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "lr_scheduler_type": self.lr_scheduler_type,
+            "max_grad_norm": self.max_grad_norm,
+            "fp32_params": [_local(p.detach()).cpu() for p in self.model_params],
+            self.FORMAT_KEY: True,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore this rank's moments, parameter shards and schedule.
+
+        Raises:
+            ValueError: The state was not written by this optimizer, or its
+                schedule, clipping or shapes differ from this run's.
+        """
+        from torch.distributed.tensor import DTensor
+
+        if self.FORMAT_KEY not in state_dict:
+            raise ValueError(
+                "this optimizer state was not written by the fsdp2 runtime "
+                "(FP32Optimizer); resume it with the runtime that wrote it"
+            )
+        saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
+        if saved_scheduler_type != self.lr_scheduler_type:
+            raise ValueError(
+                "checkpoint optimizer used lr_scheduler="
+                f"{saved_scheduler_type!r} but this run has "
+                f"lr_scheduler={self.lr_scheduler_type!r}"
+            )
+        saved_max_grad_norm = state_dict.get("max_grad_norm")
+        if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
+            self.max_grad_norm
+        ):
+            raise ValueError(
+                "checkpoint optimizer used max_grad_norm="
+                f"{saved_max_grad_norm} but this run has "
+                f"max_grad_norm={self.max_grad_norm}"
+            )
+        saved = state_dict["fp32_params"]
+        if len(saved) != len(self.model_params):
+            raise ValueError(
+                f"checkpoint carries {len(saved)} fp32 parameters but this rank "
+                f"has {len(self.model_params)}"
+            )
+        with torch.no_grad():
+            for index, (value, param) in enumerate(zip(saved, self.model_params)):
+                local = _local(param)
+                if value.shape != local.shape:
+                    raise ValueError(
+                        f"fp32 parameter {index} shape mismatch: checkpoint "
+                        f"{tuple(value.shape)} vs current {tuple(local.shape)}"
+                    )
+                local.copy_(value.to(local.device, local.dtype))
+        optimizer = dict(state_dict["optimizer_state_dict"])
+        optimizer["state"] = {
+            index: {
+                key: _like(value, self.model_params[int(index)])
+                for key, value in state.items()
+            }
+            for index, state in optimizer["state"].items()
+        }
+        self.optimizer.load_state_dict(optimizer)
+        # ``load_state_dict`` adopts the saved groups' kernel flags: re-apply
+        # this run's, with step counters where that kernel reads them.
+        for group in self.optimizer.param_groups:
+            group["fused"] = self._fused
+            if self._fused:
+                group["foreach"] = None
+        for param, state in self.optimizer.state.items():
+            step = state.get("step")
+            if isinstance(step, torch.Tensor):
+                state["step"] = (
+                    step.to(device=_local(param).device, dtype=torch.float32)
+                    if self._fused
+                    else step.cpu()
+                )
+        self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
+
+    def get_learning_rate(self):
+        return self.optimizer.param_groups[0]["lr"]
+
+
 def master_dtype_of(optimizer) -> torch.dtype | None:
     """The dtype ``optimizer`` keeps its own copy of the parameters in.
 
-    None for a ``torch.optim.Optimizer``, which updates the parameters it was
-    given.
+    None for an ``FP32Optimizer``, whose parameters are the masters, and for a
+    ``torch.optim.Optimizer``, which updates the parameters it was given.
 
     Raises:
-        TypeError: ``optimizer`` is neither a ``BF16Optimizer`` nor a
-            ``torch.optim.Optimizer``.
+        TypeError: ``optimizer`` is none of these.
     """
     if isinstance(optimizer, BF16Optimizer):
         return torch.float32
-    if isinstance(optimizer, torch.optim.Optimizer):
+    if isinstance(optimizer, (FP32Optimizer, torch.optim.Optimizer)):
         return None
     raise TypeError(f"unknown optimizer {type(optimizer).__name__}")
