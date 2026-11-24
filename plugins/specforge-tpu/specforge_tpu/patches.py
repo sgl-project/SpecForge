@@ -10,6 +10,7 @@ from importlib import import_module
 from typing import Any
 
 import torch
+
 from specforge_tpu import shapes
 
 
@@ -52,12 +53,12 @@ def _trainer_command(original: Callable[..., Any], cfg: Any, **kwargs: Any) -> A
 def _resolve_rank_topology() -> None:
     # Any torch.tpu call that touches the PjRt client (e.g. accelerate's
     # set_seed before init_distributed) needs the topology of the whole group.
-    if "WORLD_SIZE" not in os.environ:
+    if "TORCH_TPU_TOPOLOGY" in os.environ or "WORLD_SIZE" not in os.environ:
         return
     from torch_tpu._internal.utils import hardware
 
     world_size = int(os.environ["WORLD_SIZE"])
-    os.environ.setdefault("TORCH_TPU_TOPOLOGY", hardware.get_tpu_topology(world_size))
+    os.environ["TORCH_TPU_TOPOLOGY"] = hardware.get_tpu_topology(world_size)
 
 
 def _bind_local_device(original: Callable[[str], int], device_type: str) -> int:

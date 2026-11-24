@@ -9,9 +9,31 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from specforge_tpu import patches, shapes
 
 from specforge.launch_plan import CommandSpec
+from specforge_tpu import patches, shapes
+
+
+class ActivationTest(unittest.TestCase):
+    def test_registration_requires_explicit_tpu_device(self):
+        import specforge_tpu
+
+        with (
+            mock.patch.dict(os.environ, clear=True),
+            mock.patch("importlib.util.find_spec", return_value=object()),
+            mock.patch.object(patches, "apply") as apply,
+        ):
+            specforge_tpu.register()
+            os.environ["SPECFORGE_DEVICE"] = "cuda"
+            specforge_tpu.register()
+            apply.assert_not_called()
+
+    def test_explicit_topology_skips_detection(self):
+        with mock.patch.dict(
+            os.environ, {"WORLD_SIZE": "8", "TORCH_TPU_TOPOLOGY": "custom"}
+        ):
+            patches._resolve_rank_topology()
+            self.assertEqual(os.environ["TORCH_TPU_TOPOLOGY"], "custom")
 
 
 class ShapesTest(unittest.TestCase):
@@ -23,7 +45,6 @@ class ShapesTest(unittest.TestCase):
 
     def check_registered_shapes(self, buckets, expected_length):
         import specforge_tpu
-
         from specforge import distributed, launch_plan, utils
         from specforge.algorithms.common import batch_shapes
         from specforge.algorithms.objectives.inputs import (

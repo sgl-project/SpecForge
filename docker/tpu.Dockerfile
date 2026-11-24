@@ -7,8 +7,7 @@
 ARG BASE_IMAGE=us-central1-docker.pkg.dev/cloud-tpu-inference-test/junyanxu-vllm-tpu/sglang-torchtpu:latest
 FROM ${BASE_IMAGE}
 
-# Set to an empty value to pad only to the longest sequence in each batch.
-ENV SPECFORGE_TPU_SEQ_BUCKETS=512,1024,2048,3072,4096,6144,8192,12288,16384
+ENV SPECFORGE_DEVICE=tpu
 
 # The stock mooncake-transfer-engine wheel links libcuda; the non-CUDA build
 # still needs the RDMA userspace libraries even on TCP.

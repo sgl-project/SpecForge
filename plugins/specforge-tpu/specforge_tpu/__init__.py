@@ -7,27 +7,16 @@ seams listed in specforge_tpu.patches.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 
 _registered = False
 
 
-def tpu_selected() -> bool:
-    """SPECFORGE_DEVICE=tpu, or unset with torch_tpu installed."""
-    device = os.environ.get("SPECFORGE_DEVICE")
-    if device:
-        return device == "tpu"
-    return importlib.util.find_spec("torch_tpu") is not None
-
-
 def register() -> None:
     global _registered
-    if _registered or not tpu_selected():
+    if _registered or os.environ.get("SPECFORGE_DEVICE") != "tpu":
         return
     from specforge_tpu import patches
 
     patches.apply()
-    # Children (torchrun ranks, services) inherit the successful choice.
-    os.environ["SPECFORGE_DEVICE"] = "tpu"
     _registered = True
