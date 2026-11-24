@@ -56,6 +56,7 @@ LIFECYCLE = (
 RUNNER = (
     "specforge/training/runner.py",
     "specforge/training/backend.py",
+    "specforge/training/backends/**/*.py",
     "specforge/optimizer.py",
 )
 
@@ -85,17 +86,22 @@ class Excepted:
 
 @dataclass(frozen=True)
 class Rule:
-    """Modules matching ``scope`` reach nothing under ``forbidden``."""
+    """Modules matching ``scope`` (minus ``outside``) reach nothing under ``forbidden``."""
 
     name: str
     scope: tuple[str, ...]
     forbidden: tuple[str, ...]
     excepted: dict[str, Excepted] = field(default_factory=dict)
+    outside: tuple[str, ...] = ()
 
     def modules(self) -> list[Path]:
         """The modules the rule covers."""
+        excluded = {
+            path for pattern in self.outside for path in REPO_ROOT.glob(pattern)
+        }
         return sorted(
             {path for pattern in self.scope for path in REPO_ROOT.glob(pattern)}
+            - excluded
         )
 
 
@@ -234,6 +240,16 @@ RULES = (
             "specforge.optimizer",
             "torch.optim",
             "torch.nn.parallel",
+        ),
+    ),
+    Rule(
+        "only the trainer, which builds the runtime the run chose, imports a runtime "
+        "package",
+        ("specforge/**/*.py",),
+        ("specforge.training.backends",),
+        outside=(
+            "specforge/training/backends/**/*.py",
+            "specforge/training/trainer.py",
         ),
     ),
 )

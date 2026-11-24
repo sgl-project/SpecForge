@@ -26,6 +26,10 @@ from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
 
+#: Marker key recorded in FSDP2 runtime-owned optimizer state dicts so the
+#: reference runtime can refuse them even when loaded directly.
+FSDP2_OPTIMIZER_FORMAT_KEY = "parameters_are_masters"
+
 
 def local_tensor(tensor: Any) -> Any:
     """This rank's local shard of a DTensor, or ``tensor`` itself otherwise."""
@@ -572,6 +576,11 @@ class BF16Optimizer:
         """Restore optimizer/scheduler state and, when present, the rank-local
         fp32 master params; without them the masters are re-cloned from the
         bf16 weights and the resume is not numerically faithful."""
+        if FSDP2_OPTIMIZER_FORMAT_KEY in state_dict:
+            raise ValueError(
+                "this optimizer state was written by the fsdp2 runtime; "
+                "resume it with training.runtime=fsdp2"
+            )
         saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
         if saved_scheduler_type != self.lr_scheduler_type:
             raise ValueError(
@@ -650,6 +659,7 @@ def master_dtype_of(optimizer) -> Optional[torch.dtype]:
 
 __all__ = [
     "BF16Optimizer",
+    "FSDP2_OPTIMIZER_FORMAT_KEY",
     "build_optimizer",
     "build_param_groups",
     "like_parameter",

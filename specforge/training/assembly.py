@@ -172,7 +172,7 @@ def _training_runtime(cfg: Config) -> TrainingRuntime:
     from specforge.training.contracts import TrainingRuntime
 
     return TrainingRuntime.resolve(
-        "fsdp",
+        cfg.training.runtime,
         model_dtype=getattr(torch, cfg.model.torch_dtype),
         sharding_strategy=cfg.training.fsdp_sharding,
     )

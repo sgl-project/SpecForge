@@ -276,6 +276,33 @@ class DomainTrainerWiringTest(unittest.TestCase):
         ):
             self._build({"refs": list(range(6))}, runtime=unknown)
 
+    def test_fsdp2_runtime_wires_fsdp2_backend(self):
+        import torch
+
+        import specforge.training.backends.fsdp2 as fsdp2_mod
+        from specforge.training.contracts import TrainingRuntime
+
+        fsdp2_rt = TrainingRuntime.resolve("fsdp2", model_dtype=torch.bfloat16)
+        constructed = {}
+
+        class FakeFSDP2:
+            def __init__(self, parallel, **kw):
+                constructed["parallel"] = parallel
+                constructed["kw"] = kw
+
+            def prepare_model(self, model, *, optimizer_target, frozen, blocks):
+                constructed["prepare_model"] = (model, optimizer_target, frozen, blocks)
+                return "WRAPPED_FSDP2"
+
+            def close(self):
+                constructed["closed"] = True
+
+        with mock.patch.object(fsdp2_mod, "FSDP2TrainingBackend", FakeFSDP2):
+            trainer, cap, _, _ = self._build({"refs": list(range(6))}, runtime=fsdp2_rt)
+        self.assertIsInstance(trainer.backend, FakeFSDP2)
+        self.assertEqual(constructed["kw"]["precision"], fsdp2_rt.precision)
+        self.assertEqual(cap["ctrl_kw"]["checkpoint_extra"]["runtime"], "fsdp2")
+
     def test_throughput_scale_counts_only_data_parallel_ranks(self):
         _, cap, _, _ = self._build(
             {"refs": list(range(6))},
