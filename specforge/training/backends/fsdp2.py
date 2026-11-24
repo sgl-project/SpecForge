@@ -97,6 +97,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         self._trainable: Tuple[nn.Parameter, ...] = ()
         self._artifact_dtypes: Dict[str, torch.dtype] = {}
         self._owned_groups: Tuple[Any, ...] = ()
+        self._reference_layout: Optional[dict] = None
 
     def _validate_precision(self, precision: PrecisionSpec) -> None:
         if not (
@@ -131,6 +132,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         optimizer_target: Optional[nn.Module] = None,
         frozen_modules: Tuple[nn.Module, ...] = (),
         blocks: Tuple[str, ...] = (),
+        retain_reference_layout: bool = False,
     ) -> nn.Module:
         """Store the trainable draft in fp32 and shard it with FSDP2.
 
@@ -142,6 +144,11 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             frozen_modules: Frozen modules of ``model``: kept as built,
                 replicated.
             blocks: Class names of the modules sharded as one unit each.
+            retain_reference_layout: Capture a meta-device copy of the
+                unwrapped module tree so ``load_state_dict`` can translate an
+                ``fsdp`` (FSDP1/DDP) checkpoint. Kept False on fresh runs so no
+                extra module graph is retained, and freed as soon as
+                ``load_state_dict`` finishes.
 
         Raises:
             ValueError: A frozen module holds a trainable parameter, or
@@ -156,6 +163,18 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
         target = model if optimizer_target is None else optimizer_target
+        if retain_reference_layout:
+            from .reference_state import empty_structure
+
+            names = {id(module): name for name, module in model.named_modules()}
+            self._reference_layout = dict(
+                structure=empty_structure(model),
+                trainable=names[id(target)],
+                frozen=tuple(names[id(module)] for module in frozen),
+                blocks=tuple(blocks),
+            )
+        else:
+            self._reference_layout = None
         self._artifact_dtypes = _store_in_fp32(
             model,
             frozen_modules=frozen_modules,
@@ -334,6 +353,71 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             raise RankFailure(f"{type(error).__name__}: {error}") from error
         return {"model": model, "optimizer": optimizer, "rng": rng}
 
+    def load_state_dict(self, state: dict) -> None:
+        """Restore optimizer and RNG state; reads the reference runtime's too.
+
+        An optimizer state without :attr:`FORMAT_KEY` is the reference
+        runtime's (``BF16Optimizer`` under DDP or FSDP1): every rank reads it,
+        one parameter at a time, and keeps its own shard. Any retained
+        reference layout is released as soon as loading completes.
+        """
+        try:
+            saved = state.get("optimizer")
+            if saved is not None and self.FORMAT_KEY not in saved:
+                try:
+                    # Past the conversion's collectives: a failure is this rank's.
+                    converted = self._from_reference(saved)
+                except ValueError as error:
+                    raise RankFailure(f"{type(error).__name__}: {error}") from error
+                state = {**state, "optimizer": converted}
+            super().load_state_dict(state)
+        finally:
+            self._reference_layout = None
+
+    def _from_reference(self, saved: Mapping[str, Any]) -> dict:
+        from .reference_state import read_reference_state
+
+        if self._reference_layout is None:
+            raise ValueError(
+                "resuming from the fsdp runtime's optimizer state requires "
+                "retain_reference_layout=True in prepare_model"
+            )
+        group = self.parallel_config.fsdp_process_group or dist.group.WORLD
+        replay_group = None
+        if dist.is_initialized():
+            if dist.get_world_size(group) != dist.get_world_size():
+                raise ValueError(
+                    "reading the fsdp runtime's optimizer state needs this runtime's "
+                    "group to be the whole job, as the reference's was"
+                )
+            if dist.get_backend(group) != "gloo":
+                # The replay runs FSDP1 on the host. Over the whole job, in its
+                # rank order: the order the reference sharded in.
+                replay_group = group = dist.new_group(backend="gloo")
+        try:
+            state = read_reference_state(
+                saved,
+                shapes=[p.shape for p in self._trainable],
+                group=group,
+                keep=lambda index, full: _local_part(full, self._trainable[index]),
+                **self._reference_layout,
+            )
+        finally:
+            if replay_group is not None:
+                dist.destroy_process_group(replay_group)
+        return {
+            "optimizer_state_dict": {
+                # A parameter the reference never stepped starts afresh.
+                "state": {index: dict(s) for index, s in enumerate(state.states) if s},
+                "param_groups": state.param_groups,
+            },
+            "scheduler_state_dict": state.scheduler_state_dict,
+            "lr_scheduler_type": state.lr_scheduler_type,
+            "max_grad_norm": state.max_grad_norm,
+            "fp32_params": list(state.masters),
+            self.FORMAT_KEY: True,
+        }
+
     def _load_module_state_dict(self, model_state: dict) -> None:
         raise ValueError(
             "the fsdp2 runtime restores optimizer and RNG state; the program's "
@@ -383,6 +467,35 @@ def _store_in_fp32(
             if name not in owner._non_persistent_buffers_set:
                 artifact[f"{prefix}.{name}" if prefix else name] = built
     return artifact
+
+
+def _local_part(full: torch.Tensor, param) -> torch.Tensor:
+    """This rank's part of the whole tensor ``full``, cut on the host as
+    ``param`` is sharded (``torch.chunk`` per sharded mesh dimension, empty
+    parts last, as ``Shard`` splits)."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    if not isinstance(param, DTensor):
+        return full
+    part = full
+    coordinate = param.device_mesh.get_coordinate()
+    for mesh_dim, placement in enumerate(param.placements):
+        if isinstance(placement, Shard):
+            chunks = torch.chunk(
+                part, param.device_mesh.size(mesh_dim), dim=placement.dim
+            )
+            index = coordinate[mesh_dim]
+            part = (
+                chunks[index]
+                if index < len(chunks)
+                else part.narrow(placement.dim, 0, 0)
+            )
+    if part.shape != param.to_local().shape:
+        raise ValueError(
+            f"a part of shape {tuple(part.shape)} for this rank's shard of shape "
+            f"{tuple(param.to_local().shape)}"
+        )
+    return part.contiguous()
 
 
 def _broadcast_replicas(program: nn.Module, group) -> None:

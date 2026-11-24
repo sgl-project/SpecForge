@@ -315,6 +315,7 @@ class Trainer:
         # masters (cloned at build) start from them; this rank's own optimizer/RNG
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
         resume = None
+        resuming_from_fsdp = False
         if resume_from:
             state = (
                 resume_state
@@ -331,6 +332,15 @@ class Trainer:
                 "world_size": topology.world_size,
                 **persisted_contract,
             }
+            # One-way migration: an fsdp2 run may resume a checkpoint written
+            # by the reference fsdp runtime (or a legacy checkpoint without a
+            # recorded runtime), provided compute_dtype and artifact_dtype
+            # match. The reverse (fsdp2 -> fsdp) is refused below.
+            saved_runtime = state.get("runtime")
+            resuming_from_fsdp = runtime.name == "fsdp2" and saved_runtime in (
+                None,
+                "fsdp",
+            )
             saved_options = state.get("canonical_objective_options")
             if "canonical_objective" in resume_contract and isinstance(
                 saved_options, dict
@@ -392,8 +402,21 @@ class Trainer:
                     # this run writes keep recording what it follows.
                     current = model.adopt_recorded_execution(persisted)
                     persisted_contract[key] = current
+                if resuming_from_fsdp and key in ("runtime", "fsdp_sharding"):
+                    continue
                 comparison_current = current
                 comparison_persisted = persisted
+                if resuming_from_fsdp and key == "precision" and persisted_available:
+                    # Migration preserves compute and artifact dtypes; parameter,
+                    # gradient, master and buffer dtypes change by design.
+                    comparison_current = {
+                        field: current[field]
+                        for field in ("compute_dtype", "artifact_dtype")
+                    }
+                    comparison_persisted = {
+                        field: persisted.get(field)
+                        for field in ("compute_dtype", "artifact_dtype")
+                    }
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,
@@ -543,12 +566,14 @@ class Trainer:
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(
-            model,
+        prepare_kwargs: dict[str, object] = dict(
             optimizer_target=model.draft_model,
             frozen_modules=model.frozen_modules,
             blocks=program_spec.partition.blocks,
         )
+        if resuming_from_fsdp:
+            prepare_kwargs["retain_reference_layout"] = True
+        wrapped = backend.prepare_model(model, **prepare_kwargs)
         runner = DataParallelRunner(wrapped, backend, program_spec)
         if resume is not None:
             # A rank whose own state does not restore tells the others, which
