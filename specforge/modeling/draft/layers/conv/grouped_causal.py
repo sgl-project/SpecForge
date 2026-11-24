@@ -12,7 +12,7 @@ from ..registry import register_component_builder
 
 
 class _KernelProjection(nn.Linear):
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         init.zeros_(self.weight)
 
 
@@ -63,15 +63,18 @@ class GroupedCausalConv(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.reset_draft_parameters()
+        self._reset()
 
-    def reset_draft_parameters(self):
+    def _reset(self) -> None:
         # Check the full tensor before initializing a view: the view does not
         # inherit HF's loaded-tensor flag during partial checkpoint restoration.
         if not getattr(self.base_kernel, "_is_hf_initialized", False):
             init.zeros_(self.base_kernel)
             init.ones_(self.base_kernel[:, 0])
-        self.kernel_projection.reset_draft_parameters()
+        init.zeros_(self.kernel_projection.weight)
+
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
+        self._reset()
 
     def _validate_hidden(self, hidden: Tensor) -> None:
         if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:

@@ -222,6 +222,48 @@ objective and is described under Loss execution. This option does not change
 parameter names or canonical configuration and is recorded in the training resume
 contract.
 
+MoE drafts run their routed experts with one `F.grouped_mm` call per projection,
+which torch accepts only when `hidden_size` and the expert `intermediate_size`
+are multiples of 8 for bf16/fp16 or 4 for fp32. Startup probes every MoE layer
+and fails with that rule rather than falling back.
+
+A draft's FFN may be a mixture of experts. The `mlp_configs` node `type: moe`
+holds the expert count, top-k, an `experts` sub-node (per-expert
+`intermediate_size`, `hidden_act`, `gated`), an optional `shared_expert` sub-node
+of the same shape (gated as in Qwen and DeepSeek, or Nemotron's non-gated `relu2`
+MLP) with an optional sigmoid `shared_expert_gate`, and a `router` sub-node: `softmax` or
+`sigmoid` scoring, top-k renormalization (rejected with top-1, where it would fix
+every weight at 1 and leave the router no task-loss gradient), `route_scale`, and
+a fp32 `expert_bias` that shifts the choice only. Experts are stored and exported fused (`experts.gate_up_proj`,
+`experts.down_proj`).
+The preset `specforge/config/draft/presets/qwen3-8b-moe-dspark.yaml` with its
+recipe trains a DSpark draft whose every FFN is a MoE of 8 experts with top-1
+routing.
+
+Load balancing is DeepSeek-V3's aux-loss-free bias update. The DFlash and DSpark
+objectives take `bias_update_rate` in `training.objective_options` (`0`, the
+default, keeps the bias fixed; the recipe uses `0.001`). Over one optimizer step
+the trainer counts, across micro-batches and ranks, the tokens of kept blocks
+each MoE layer routed to each expert, then moves every router's `expert_bias` by
+that rate toward the under-loaded experts with a zero-mean sign step; the bias
+shifts which experts are chosen, not their weights. `moe/step_balance` reports
+the dispatch's balance: 1 when uniform, E / K when the same K experts take every
+token.
+
+The auxiliary loss is DeepSeek-V3's load-balance loss on the router scores,
+E × Σ_e share_e × P_e per MoE layer with its own expert count, averaged (1 when
+balanced). It is the named loss term `moe_balance`, weighted by
+`training.loss.terms.moe_balance.coefficient` (`0`, the default, skips it; the
+recipe uses `0.005`) and reported under that name. `aux_loss_type` in
+`training.objective_options` picks the load behind share_e: `microbatch_wise`
+is this forward's own, `batch_wise` (the default) this optimizer step's so far,
+pooled over micro-batches and ranks, as in torchtitan and Megatron. The
+strategy prepares that load (the only collective) and hands it to the forward,
+whose objective returns the term's value with its normalization; the shared
+loss flow applies the coefficient and combines it with the other terms, so
+objective evaluation still performs no collectives, and evaluation forwards
+balance against their own load.
+
 ### Loss execution
 
 The preferred configuration names mathematical terms and uses one shared fusion
@@ -391,7 +433,10 @@ is selected. The selected path is logged during setup and recorded for resume.
 `model.use_liger_kernel` follows the same three settings. Unset enables Liger
 RMSNorm/SwiGLU on a CUDA/ROCm trainer for the objectives that declare it as
 their default (DFlash and DFlash2) when the draft's FFNs use `silu`/`swish`;
-`true` enables it for any objective and fails where it cannot run.
+`true` enables it for any objective and fails where it cannot run. Liger's
+SwiGLU never covers a MoE draft's routed experts, only dense FFNs and gated
+shared experts; on a draft without those, such as the bundled MoE preset
+(`shared_expert: null`), `use_liger_kernel` means Liger RMSNorm only.
 
 The block objectives (DFlash, DFlash2, Domino, DSpark, DSpine) project and
 checkpoint 128 blocks per batch row at a time unless

@@ -10,10 +10,14 @@ import torch
 from safetensors.torch import load_file, save_file
 from transformers import Qwen3Config
 
+from specforge.algorithms.objectives.moe_balance import BALANCING_OPTIONS
 from specforge.application.composition import build_application_run, resolve_run
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
+from specforge.config.draft.layer import LayerSpec
+from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.loading import load_draft
+from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
 from specforge.training.strategies.base import StepContext
@@ -22,6 +26,7 @@ from tests.test_algorithms.test_objectives import configurations, training_batch
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
 from tests.test_modeling.test_canonical_peagle import model_config as peagle_config
+from tests.test_modeling.test_draft_moe_ffn import expert_spec, moe_spec, router_spec
 
 
 def target_directory(root):
@@ -60,7 +65,78 @@ def run_config(target, draft, **updates):
     return Config.model_validate(raw)
 
 
+def write_features(root, draft):
+    torch.manual_seed(0)
+    features = root / "features"
+    features.mkdir()
+    for index in range(2):
+        batch = training_batch(draft)
+        torch.save(
+            {
+                key: batch[key][0].detach()
+                for key in (
+                    "input_ids",
+                    "loss_mask",
+                    "hidden_states",
+                    "target_last_hidden_states",
+                )
+            },
+            features / f"{index}.ckpt",
+        )
+
+
+def moe_draft_config(intermediate_size=16):
+    node = moe_spec(
+        experts=expert_spec(intermediate_size),
+        shared_expert=expert_spec(16),
+        shared_expert_gate=True,
+        router=router_spec(expert_bias=True),
+    )
+    return draft_config(
+        mlp_configs={
+            "dense": DenseFFNSpec(intermediate_size=64, hidden_act="silu"),
+            "moe": node,
+        },
+        layer_configs={
+            "full_dense": LayerSpec(attention="full", mlp="dense"),
+            "full_moe": LayerSpec(attention="full", mlp="moe"),
+        },
+        layer_types=("full_dense", "full_moe"),
+    )
+
+
+def moe_run_config(target, draft, bias_update_rate=0.0, aux_loss_coef=0.0):
+    return run_config(
+        target,
+        draft,
+        model={"target_model_path": str(target), "torch_dtype": "float32"},
+        training={
+            "attention_backend": "eager",
+            "max_steps": 1,
+            "total_steps": 2,
+            "save_interval": 1,
+            "log_interval": 1,
+            "objective_options": {
+                "num_anchors": 2,
+                "bias_update_rate": bias_update_rate,
+                "aux_loss_type": "batch_wise",
+            },
+            "loss": {"terms": {"moe_balance": {"coefficient": aux_loss_coef}}},
+        },
+    )
+
+
 class CanonicalTrainingTest(unittest.TestCase):
+    def _init_group(self, root):
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "nccl" if torch.cuda.is_available() else "gloo",
+                init_method=f"file://{root / 'rendezvous'}",
+                rank=0,
+                world_size=1,
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+
     def test_loss_execution_reaches_runtime_and_resume_contract(self):
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))
@@ -384,15 +460,7 @@ class CanonicalTrainingTest(unittest.TestCase):
     def _train_and_resume(self, tied, mtp=False):
         with TemporaryDirectory() as temp:
             root = Path(temp)
-            owns_group = not torch.distributed.is_initialized()
-            if owns_group:
-                torch.distributed.init_process_group(
-                    "nccl" if torch.cuda.is_available() else "gloo",
-                    init_method=f"file://{root / 'rendezvous'}",
-                    rank=0,
-                    world_size=1,
-                )
-                self.addCleanup(torch.distributed.destroy_process_group)
+            self._init_group(root)
             target = target_directory(root)
             draft = draft_config(
                 tie_word_embeddings=tied,
@@ -420,22 +488,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 }
                 tables = load_file(target / "model.safetensors")
                 save_file(tables | native, target / "model.safetensors")
-            features = root / "features"
-            features.mkdir()
-            for index in range(2):
-                batch = training_batch(draft)
-                torch.save(
-                    {
-                        key: batch[key][0].detach()
-                        for key in (
-                            "input_ids",
-                            "loss_mask",
-                            "hidden_states",
-                            "target_last_hidden_states",
-                        )
-                    },
-                    features / f"{index}.ckpt",
-                )
+            write_features(root, draft)
             cfg = run_config(
                 target,
                 draft,
@@ -540,6 +593,127 @@ class CanonicalTrainingTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
+
+    def _train_and_resume_moe(self, root, bias_update_rate=0.0, aux_loss_coef=0.0):
+        self._init_group(root)
+        target = target_directory(root)
+        draft = moe_draft_config()
+        write_features(root, draft)
+        cfg = moe_run_config(target, draft, bias_update_rate, aux_loss_coef)
+        build_application_run(cfg).run()
+        checkpoint = root / "output" / "specforge-run-step1"
+        model = load_draft(checkpoint, target=target, dtype=torch.float32)
+        (layer,) = [m for m in model.modules() if isinstance(m, MoEFFN)]
+        bias = layer.gate.expert_bias
+        self.assertEqual(bias.dtype, torch.float32)
+        if bias_update_rate:
+            # One zero-mean sign step moved and saved the bias (at most 1.5 x rate).
+            self.assertGreater(torch.count_nonzero(bias).item(), 0)
+            self.assertLessEqual(bias.abs().max().item(), 1.5 * bias_update_rate + 1e-9)
+            torch.testing.assert_close(bias.sum(), torch.zeros(()), atol=1e-6, rtol=0)
+        else:
+            self.assertEqual(torch.count_nonzero(bias).item(), 0)
+        before = {name: tensor.clone() for name, tensor in model.state_dict().items()}
+        raw = cfg.model_dump()
+        raw.update(draft=None, resume=str(checkpoint))
+        raw["training"]["max_steps"] = 2
+        build_application_run(Config.model_validate(raw)).run()
+        final = root / "output" / "specforge-run-step2"
+        state = torch.load(
+            final / "training_state.pt", map_location="cpu", weights_only=True
+        )
+        self.assertEqual(state["global_step"], 2)
+        trained = state["draft_state_dict"]
+        for suffix in ("gate.weight", "experts.gate_up_proj", "experts.down_proj"):
+            name = next(key for key in trained if key.endswith(suffix))
+            self.assertFalse(torch.equal(before[name], trained[name]), name)
+            self.assertTrue(torch.isfinite(trained[name]).all(), name)
+        bias_key = next(key for key in trained if key.endswith("gate.expert_bias"))
+        if bias_update_rate:
+            # The resumed step moved the restored bias again.
+            self.assertFalse(torch.equal(before[bias_key], trained[bias_key]))
+            self.assertEqual(trained[bias_key].dtype, torch.float32)
+        else:
+            self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
+        raw["training"]["max_steps"] = 3
+        # Balancing joins the contract only while on; switching it either way is a change.
+        raw["training"]["objective_options"]["bias_update_rate"] = (
+            0.0 if bias_update_rate else 0.001
+        )
+        with self.assertRaisesRegex(ValueError, "canonical_objective_options"):
+            build_application_run(Config.model_validate(raw)).run()
+        # The balance term's coefficient is part of the named loss record; turning
+        # the term on also brings the statistics' settings into the record.
+        raw["training"]["objective_options"]["bias_update_rate"] = bias_update_rate
+        raw["training"]["loss"]["terms"]["moe_balance"]["coefficient"] = (
+            0.0 if aux_loss_coef else 0.01
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "canonical_loss" if aux_loss_coef else "canonical_objective_options",
+        ):
+            build_application_run(Config.model_validate(raw)).run()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
+    def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
+        """A dense run's contract is what pre-MoE runs wrote: off balancing adds nothing, and older records resume."""
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._init_group(root)
+            target = target_directory(root)
+            draft = draft_config()
+            write_features(root, draft)
+            cfg = run_config(
+                target,
+                draft,
+                model={"target_model_path": str(target), "torch_dtype": "float32"},
+                training={
+                    "attention_backend": "eager",
+                    "max_steps": 1,
+                    "total_steps": 2,
+                    "save_interval": 1,
+                    "log_interval": 1,
+                    "objective_options": {"num_anchors": 2},
+                },
+            )
+            build_application_run(cfg).run()
+            checkpoint = root / "output" / "specforge-run-step1"
+            state = torch.load(
+                checkpoint / "training_state.pt", map_location="cpu", weights_only=True
+            )
+            self.assertTrue(
+                set(BALANCING_OPTIONS).isdisjoint(state["canonical_objective_options"])
+            )
+            # A record from before the balance term existed resumes with it off.
+            terms = state["canonical_loss"]["terms"]
+            self.assertEqual(terms["moe_balance"]["coefficient"], 0.0)
+            old = {
+                **state,
+                "canonical_loss": {
+                    **state["canonical_loss"],
+                    "terms": {k: v for k, v in terms.items() if k != "moe_balance"},
+                },
+            }
+            torch.save(old, checkpoint / "training_state.pt")
+            raw = cfg.model_dump()
+            raw.update(draft=None, resume=str(checkpoint))
+            raw["training"]["max_steps"] = 2
+            raw["training"]["objective_options"].update(aux_loss_type="microbatch_wise")
+            build_application_run(Config.model_validate(raw)).run()
+            final = torch.load(
+                root / "output" / "specforge-run-step2" / "training_state.pt",
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.assertEqual(final["global_step"], 2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
+    def test_moe_draft_trains_saves_and_resumes(self):
+        # The bias moves, is saved and moves again after resume; the term is on.
+        with TemporaryDirectory() as temp:
+            self._train_and_resume_moe(
+                Path(temp), bias_update_rate=0.001, aux_loss_coef=0.01
+            )
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model

@@ -22,7 +22,7 @@ class OffsetNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(width))
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range):
         init.zeros_(self.weight)
 
 
@@ -31,7 +31,7 @@ class BufferScale(nn.Module):
         super().__init__()
         self.register_buffer("scale", torch.empty(4), persistent=persistent)
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range):
         init.constant_(self.scale, 2)
 
 
@@ -42,7 +42,7 @@ class ZeroProjection(nn.Module):
             self.gate = nn.Parameter(torch.empty(1))
         self.proj = nn.Linear(width, width, bias=False)
 
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range):
         if hasattr(self, "gate"):
             init.ones_(self.gate)
         init.zeros_(self.proj.weight)

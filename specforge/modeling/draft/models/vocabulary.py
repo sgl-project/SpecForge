@@ -28,13 +28,16 @@ class DraftVocabulary(nn.Module):
             "d2t", torch.empty(draft_vocab_size, device=device, dtype=torch.long)
         )
         self._ready = False
-        self.reset_draft_parameters()
+        self._reset()
 
-    def reset_draft_parameters(self):
+    def _reset(self) -> None:
         identity = self.vocab_size == self.draft_vocab_size
         init.constant_(self.t2d, identity)
         init.zeros_(self.d2t)
         self._ready = identity and not self.t2d.is_meta
+
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
+        self._reset()
 
     @property
     def ready(self) -> bool:

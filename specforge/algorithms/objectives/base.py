@@ -2,9 +2,27 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch
 from torch import Tensor, nn
+
+
+class StepStatistics(Protocol):
+    """Per-forward statistics an objective observes; the training layer prepares their pooling and applies them each optimizer step."""
+
+    @property
+    def settings(
+        self,
+    ) -> dict[str, object]: ...  # what built them; the resume contract records it
+
+    def observe(self, output, *, keep: Tensor) -> tuple[Tensor, ...]: ...  # counts
+
+    def balance(
+        self, output, *, keep: Tensor, pooled: bool, process_group=None
+    ) -> Tensor: ...  # counts, then this forward's regularizer, already normalized
+
+    def step(self, *, process_group=None) -> dict[str, Tensor]: ...
 
 
 @dataclass
@@ -51,6 +69,7 @@ class ObjectiveModel(nn.Module):
         weighting=None,
         frozen_parameters=(),
         execution=None,
+        statistics: StepStatistics | None = None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -59,6 +78,9 @@ class ObjectiveModel(nn.Module):
         self.execution = execution or LossExecution()
         self.loss_implementations = ExecutionSelection()
         self.draft_model = draft_model
+        self.statistics = (
+            statistics  # observed per forward, stepped by the training layer
+        )
         self.objective = objective
         self.registration = registration
         self.objective_name = name
@@ -188,6 +210,38 @@ class ObjectiveModel(nn.Module):
             },
             **options,
         )
+
+    def balance_term(self, output, keep, context):
+        """A protocol's balance term and its value for this forward.
+
+        ``keep`` marks the forward's tokens that count, in the routing's token
+        order (any shape that flattens to it): a block protocol's kept-block
+        tokens, a sequence protocol's supervised positions. The term's
+        coefficient is the configured ``moe_balance`` loss term's. While it is
+        on, the statistics' regularizer runs through the training layer's
+        ``prepare_statistics`` hook when the forward has one, which pools the
+        load over ranks; a direct call balances against this forward's own
+        load. Off, the statistics still count for the bias step and the value
+        is zero.
+        """
+        from .losses import TokenLoss
+        from .plan import LossTerm
+
+        configured = self.loss_configuration.terms.get("moe_balance")
+        value = None
+        if self.statistics is not None:
+            keep = keep.reshape(-1)
+            prepare = context.get("prepare_statistics")
+            if configured is None or configured.coefficient == 0:
+                self.statistics.observe(output, keep=keep)
+            elif prepare is None:
+                value = self.statistics.balance(output, keep=keep, pooled=False)
+            else:
+                value = prepare(output, keep=keep)
+        if value is None:
+            value = output.hidden_states.new_zeros(())
+        term = LossTerm("moe_balance", 1.0, TokenLoss("value"), reduction="scalar")
+        return term, value
 
     def block_predictions(self, output, blocks, batch, **options):
         """Build deferred predictions for complete algorithm proposal blocks.

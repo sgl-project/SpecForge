@@ -1,4 +1,4 @@
-"""Optional Liger RMSNorm/SwiGLU and Triton convolution kernels.
+"""Optional Liger RMSNorm/SwiGLU and Triton convolution kernels, and the routed-expert kernel.
 
 None of them changes checkpoint parameters.
 """
@@ -11,16 +11,29 @@ import torch
 
 from .conv.grouped_causal import GroupedCausalConv
 from .mlp.dense import DenseFFN
+from .mlp.moe import MoEFFN, SharedExpert
 from .norm.rms import RMSNorm
 
 
+def _uses_swiglu(module) -> bool:
+    """Whether Liger's SwiGLU could replace this module: dense FFNs and gated shared experts."""
+    return isinstance(module, DenseFFN) or (
+        isinstance(module, SharedExpert) and module.config.gated
+    )
+
+
 def liger_hidden_act(model):
-    """Activation Liger's SwiGLU has to implement for this draft's dense FFNs."""
+    """Activation Liger's SwiGLU has to implement for this draft, or None when nothing uses SwiGLU.
+
+    Routed experts never use it, and a non-gated shared expert runs act(up);
+    a draft with neither a dense FFN nor a gated shared expert leaves Liger
+    its RMSNorm only.
+    """
     activations = sorted(
-        {m.config.hidden_act for m in model.modules() if isinstance(m, DenseFFN)}
+        {m.config.hidden_act for m in model.modules() if _uses_swiglu(m)}
     )
     unsupported = [name for name in activations if name not in ("silu", "swish")]
-    return unsupported[0] if unsupported else (activations or ["none"])[0]
+    return unsupported[0] if unsupported else (activations or [None])[0]
 
 
 def load_liger_kernels():
@@ -53,6 +66,10 @@ def fused_conv_unsupported(convolutions):
 def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
     """Select the optional kernels of a built draft.
 
+    MoE layers always run F.grouped_mm; every one is probed here, so widths it
+    rejects (not multiples of 8 for bf16/fp16, 4 for fp32) fail at startup
+    rather than fall back.
+
     Args:
         use_liger: Resolved Liger choice; True fails where Liger cannot run.
         use_fused_conv: True requires the Triton grouped convolution and fails
@@ -81,12 +98,25 @@ def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
             "Triton" if fused_conv else "eager",
             f" (auto: {reason})" if reason and use_fused_conv is None else "",
         )
+    for module in model.modules():
+        if not isinstance(module, MoEFFN):
+            continue
+        try:
+            module.experts.probe()
+        except RuntimeError as error:
+            weight = module.experts.gate_up_proj
+            raise ValueError(
+                f"F.grouped_mm cannot run a MoE layer (hidden_size {weight.shape[-1]}, "
+                f"intermediate_size {module.config.experts.intermediate_size}, "
+                f"{weight.dtype} on {weight.device.type}): {error}; hidden_size and "
+                "intermediate_size must be multiples of 8 (bf16/fp16) or 4 (fp32)"
+            ) from error
 
     if not use_liger:
         for module in model.modules():
             if isinstance(module, RMSNorm):
                 module.liger_norm = None
-            elif isinstance(module, DenseFFN):
+            elif isinstance(module, (DenseFFN, SharedExpert)):
                 module.liger_swiglu = None
         return fused_conv
     if any(p.device.type != "cuda" for p in model.parameters()):
@@ -96,9 +126,6 @@ def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
         if isinstance(module, RMSNorm):
             # the Liger kernel scales by a weight; weightless norms stay on PyTorch
             module.liger_norm = rms_norm if module.weight is not None else None
-        elif isinstance(module, DenseFFN) and module.config.hidden_act in {
-            "silu",
-            "swish",
-        }:
+        elif _uses_swiglu(module) and module.config.hidden_act in {"silu", "swish"}:
             module.liger_swiglu = swiglu
     return fused_conv
