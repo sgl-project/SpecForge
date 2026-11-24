@@ -1,6 +1,7 @@
 """Default objective coverage and independently checked token alignment."""
 
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import torch
@@ -33,6 +34,10 @@ def configurations():
         dmtp_config(),
         mtp_config(target_bindings=(), target_logit_transform=None),
         eagle_config(),
+        replace(
+            eagle_config(normalize=True, norm_output=True),
+            architecture="ParallelReconsiderationDraftModel",
+        ),
         peagle_config(),
     ]
 
@@ -41,7 +46,8 @@ def training_batch(config, device="cpu"):
     spec = config.spec_config
     width = (
         3 * spec.target_features.hidden_size
-        if config.architecture in ("Eagle3DraftModel", "PEagleDraftModel")
+        if config.architecture
+        in ("Eagle3DraftModel", "ParallelReconsiderationDraftModel", "PEagleDraftModel")
         else 64
     )
     final_width = (
@@ -97,7 +103,10 @@ class ObjectiveTest(unittest.TestCase):
                     if hasattr(model, "initialize_transfer_space"):
                         model.initialize_transfer_space()
                     options = {"num_anchors": 2} if config.spec_config.protocol else {}
-                    if config.architecture == "Eagle3DraftModel":
+                    if config.architecture in (
+                        "Eagle3DraftModel",
+                        "ParallelReconsiderationDraftModel",
+                    ):
                         options["ttt_length"] = 2
                     if config.architecture == "PEagleDraftModel":
                         options.update(num_depths=2)
@@ -127,7 +136,7 @@ class ObjectiveTest(unittest.TestCase):
                     self.assertTrue(
                         all(t.grad is None for t in batch.values() if t.requires_grad)
                     )
-        self.assertEqual(len(objective_registrations()), 9)
+        self.assertEqual(len(objective_registrations()), len(configurations()))
 
     def test_block_alignment_and_empty_supervision(self):
         config = dmtp_config()

@@ -9,5 +9,6 @@ from . import (  # noqa: F401
     dspine,
     eagle3,
     mtp,
+    parallel_reconsideration,
     peagle,
 )
