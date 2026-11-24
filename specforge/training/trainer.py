@@ -27,6 +27,7 @@ import torch
 from specforge.algorithms.common.providers import (
     MODEL_PROVENANCE_CONTRACT_KEY,
     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY,
+    STEP_OPTIONS_CONTRACT_KEY,
     StepRuntimeConfig,
     checkpoint_key_fingerprint,
 )
@@ -36,41 +37,6 @@ from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
 logger = logging.getLogger(__name__)
-
-
-def _legacy_scheduler_total_steps(state: Mapping[str, object]) -> Optional[int]:
-    """Recover the BF16 optimizer horizon from a pre-contract checkpoint.
-
-    Older checkpoints did not copy the effective horizon into the shared
-    trainer contract, but their rank-local cosine scheduler persisted both the
-    warmup length and post-warmup ``T_max``.  Reading those two immutable
-    scheduler fields preserves resume compatibility without guessing from a
-    possibly changed ``max_steps`` value.
-    """
-    backend = state.get("backend")
-    if not isinstance(backend, Mapping):
-        return None
-    optimizer = backend.get("optimizer")
-    if not isinstance(optimizer, Mapping):
-        return None
-    scheduler = optimizer.get("scheduler_state_dict")
-    if not isinstance(scheduler, Mapping):
-        return None
-    after_scheduler = scheduler.get("after_scheduler_dict")
-    if not isinstance(after_scheduler, Mapping):
-        return None
-    warmup_steps = scheduler.get("warmup_epochs")
-    cosine_steps = after_scheduler.get("T_max")
-    if (
-        isinstance(warmup_steps, bool)
-        or not isinstance(warmup_steps, int)
-        or isinstance(cosine_steps, bool)
-        or not isinstance(cosine_steps, int)
-        or warmup_steps < 0
-        or cosine_steps < 1
-    ):
-        return None
-    return warmup_steps + cosine_steps
 
 
 class Trainer:
@@ -309,9 +275,63 @@ class Trainer:
                 "world_size": world_size,
                 **persisted_contract,
             }
+            saved_options = state.get("canonical_objective_options")
+            if "canonical_objective" in resume_contract and isinstance(
+                saved_options, dict
+            ):
+                from specforge.algorithms.objectives import objective_record
+
+                # Older runs passed LR warmup through the strategy. Reconstruct
+                # objective defaults from the saved settings before comparison.
+                step_options = dict(state.get(STEP_OPTIONS_CONTRACT_KEY, ()))
+                state = {
+                    **state,
+                    "canonical_objective_options": objective_record(
+                        resume_contract["canonical_objective"],
+                        saved_options,
+                        training=step_options,
+                    ),
+                }
+                if "warmup_ratio" in step_options and "warmup_ratio" not in dict(
+                    resume_contract.get(STEP_OPTIONS_CONTRACT_KEY, ())
+                ):
+                    del step_options["warmup_ratio"]
+                    state[STEP_OPTIONS_CONTRACT_KEY] = tuple(
+                        sorted(step_options.items())
+                    )
+            # Every checkpoint written before named loss terms stores a flat
+            # canonical_loss, whatever else its record holds.
+            saved_loss = state.get("canonical_loss")
+            if (
+                resume_contract.get("canonical_loss") is not None
+                and isinstance(saved_loss, dict)
+                and "terms" not in saved_loss
+            ):
+                raise ValueError(
+                    "checkpoint uses an old canonical_loss record; convert it with "
+                    "scripts/convert_canonical_checkpoint.py before resuming"
+                )
             for key, current in resume_contract.items():
+                if key == "canonical_loss_implementations":
+                    saved = state.get(key)
+                    if saved is None:
+                        raise ValueError(
+                            "checkpoint does not record resolved loss implementations"
+                        )
+                    # Compare on real inputs before the first kernel execution.
+                    model.loss_implementations.restore(saved)
+                    continue
                 persisted = state.get(key)
                 persisted_available = key in state
+                if (
+                    key == "canonical_loss_execution"
+                    and persisted_available
+                    and persisted != current
+                ):
+                    # An unset fused follows the checkpoint, and the checkpoints
+                    # this run writes keep recording what it follows.
+                    current = model.adopt_recorded_execution(persisted)
+                    persisted_contract[key] = current
                 comparison_current = current
                 comparison_persisted = persisted
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
@@ -325,20 +345,12 @@ class Trainer:
                     ) = model_provenance_for_resume_comparison(
                         current,
                         persisted,
-                        cache_root=output_dir,
                     )
                 if key == "effective_total_steps" and key not in state:
-                    persisted = _legacy_scheduler_total_steps(state)
-                    comparison_persisted = persisted
-                    persisted_available = persisted is not None
-                    if not persisted_available:
-                        raise ValueError(
-                            f"checkpoint {resume_from} does not record "
-                            "effective_total_steps and its saved scheduler does "
-                            "not expose a recoverable horizon; the restored "
-                            "optimizer schedule cannot be proven to match this run"
-                        )
-                if key in custom_checkpoint_extra and key not in state:
+                    raise ValueError(
+                        f"checkpoint {resume_from} does not record effective_total_steps"
+                    )
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "
@@ -352,6 +364,28 @@ class Trainer:
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]
+            if "canonical_draft_config" in algorithm_checkpoint_extra:
+                # Canonical artifacts store shared parameters once. Expand only
+                # aliases already established by model construction; missing
+                # independent parameters still fail the strict check below.
+                saved_weights = dict(saved_weights)
+                aliases = {}
+                for name, parameter in model.draft_model.named_parameters(
+                    remove_duplicate=False
+                ):
+                    aliases.setdefault(id(parameter), []).append(name)
+                for names in aliases.values():
+                    source = next(
+                        (
+                            saved_weights[name]
+                            for name in names
+                            if name in saved_weights
+                        ),
+                        None,
+                    )
+                    if source is not None:
+                        for name in names:
+                            saved_weights.setdefault(name, source)
             load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             missing_keys = set(load_result.missing_keys)

@@ -1,24 +1,28 @@
-"""Out-of-tree platform plugins.
+"""Platform plugins loaded when SpecForge's CLI is imported.
 
-A plugin is a zero-argument callable published under the ``specforge.plugins``
-entry-point group. It runs once per process, before any training module is
-imported, and decides by itself whether its platform is active.
+A plugin publishes a zero-argument callable in the ``specforge.plugins``
+entry-point group and decides whether its platform is active.
 """
 
-from __future__ import annotations
-
-from importlib.metadata import entry_points
+from functools import cache
+from importlib.metadata import EntryPoint, entry_points
 
 PLUGIN_GROUP = "specforge.plugins"
 
-_loaded = False
 
-
-def load_plugins() -> None:
-    """Call every installed plugin once per process."""
-    global _loaded
-    if _loaded:
-        return
-    _loaded = True
-    for entry_point in entry_points(group=PLUGIN_GROUP):
+@cache
+def _activate(entry_point: EntryPoint) -> None:
+    """Remember successful activations so a retry skips earlier plugins."""
+    try:
         entry_point.load()()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to activate SpecForge plugin {entry_point.name!r}"
+        ) from exc
+
+
+@cache
+def load_plugins() -> None:
+    """Activate the installed CLI plugins before the CLI imports configuration."""
+    for entry_point in entry_points(group=PLUGIN_GROUP):
+        _activate(entry_point)

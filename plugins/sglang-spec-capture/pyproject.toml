@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge-sglang-capture"
+version = "0.1.0"
+description = "SGLang plugin: SpecForge server-side spec capture into Mooncake"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# Installed into the SGLang server environment, which provides torch, sglang
+# and mooncake; no dependencies are declared so the server's pins are kept.
+dependencies = []
+
+[project.entry-points."sglang.srt.plugins"]
+specforge_spec_capture = "specforge_sglang_capture:register"
+
+[tool.setuptools]
+packages = ["specforge_sglang_capture"]

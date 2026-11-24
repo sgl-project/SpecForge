@@ -17,6 +17,7 @@ export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
 
 export LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 CUDA_VISIBLE_DEVICES=2 \
+  SPECFORGE_SPEC_CAPTURE=1 \
   python -m sglang.launch_server \
     --model-path Qwen/Qwen3.6-27B \
     --dtype bfloat16 \
@@ -27,9 +28,9 @@ CUDA_VISIBLE_DEVICES=2 \
     --chunked-prefill-size -1 \
     --disable-radix-cache \
     --disable-cuda-graph \
-    --enable-spec-capture \
-    --spec-capture-method dflash \
-    --spec-capture-aux-layer-ids 1 16 31 46 61 \
+    --enable-return-aux-hidden-states --return-hidden-states-mode full \
+    --speculative-algorithm DFLASH \
+    --return-aux-hidden-state-layer-ids 1 16 31 46 61 \
     --host 127.0.0.1
 
 # Check sglang capture whether run success.
@@ -43,7 +44,7 @@ CONSUMER_STATE_DIR=${OUTPUT_DIR}/consumer-state
 
 # producer
 CUDA_VISIBLE_DEVICES=2 specforge train \
-    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino-online.yaml \
+    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino.yaml \
     --role producer \
     "run_id=${RUN_ID}" \
     "output_dir=${OUTPUT_DIR}" \
@@ -53,7 +54,7 @@ CUDA_VISIBLE_DEVICES=2 specforge train \
 
 # consumer
 CUDA_VISIBLE_DEVICES=3 specforge train \
-    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino-online.yaml \
+    -c examples/configs/online/disaggregated/external/qwen3.6-27b-domino.yaml \
     --role consumer \
     "run_id=${RUN_ID}" \
     "output_dir=${OUTPUT_DIR}" \

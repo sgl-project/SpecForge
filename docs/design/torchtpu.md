@@ -1,7 +1,7 @@
 # SpecForge on TorchTPU
 
-gpt-oss-120B DSpark（[configs/gpt-oss-120B-dspark.json](../../configs/gpt-oss-120B-dspark.json)）在 TPU 上 online 训练：
-target 抓取在 sglang-torchtpu，draft 训练在 torch_tpu。所有 TPU 代码在 `specforge_tpu/`，核心代码不出现 tpu 分支。
+gpt-oss-120B DSpark（[specforge/config/draft/presets/gpt-oss-120B-dspark.yaml](../../specforge/config/draft/presets/gpt-oss-120B-dspark.yaml)）在 TPU 上 online 训练：
+target 抓取在 sglang-torchtpu，draft 训练在 torch_tpu。所有 TPU 代码在 `plugins/specforge-tpu/`，核心代码不出现 tpu 分支。
 
 ## 1. 结构
 
@@ -12,7 +12,7 @@ target 抓取在 sglang-torchtpu，draft 训练在 torch_tpu。所有 TPU 代码
  │ sglang-torchtpu  TP=8                │  /generate │  ├─ producer  (CPU, 不碰芯片)          │
  │  └─ plugin specforge_tpu.sglang_capture◄──────────┤  │    refs.jsonl                      │
  │      aux[1,9,17,25,33] + post-norm   │            │  └─ consumer torchrun ×8, tpu_dist   │
- │      last hidden ──► Mooncake (tcp) ─┼───────────►│       DDP + sdpa, S 按 bucket pad    │
+ │      last hidden ──► Mooncake (tcp) ─┼───────────►│       DDP + sdpa, S 默认按 batch 补齐    │
  └──────────────────────────────────────┘            └──────────────────────────────────────┘
 ```
 
@@ -31,7 +31,7 @@ sglang        ── load_plugins() ──► entry point "sglang.srt.plugins" �
 | plugin 加载时设 `TORCH_TPU_TOPOLOGY` | `set_seed` 在 `init_distributed` 之前就会初始化 PjRt |
 | `_trainer_command` | torchrun 各 rank 共享父进程选的 slicebuilder 端口 |
 | `build_launch_plan` | producer 子进程设 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`：`torch.manual_seed` 会独占全部芯片 |
-| `_padded_collator`、`_cpu_max_valid_anchors` | S pad 到 `SPECFORGE_TPU_SEQ_BUCKETS`，anchor 宽度只依赖 bucket；超出最大 bucket 直接报错 |
+| `padded_sequence_length`、`anchor_capacity` | 设置 `SPECFORGE_TPU_SEQ_BUCKETS` 时按桶补齐，anchor 宽度只依赖 bucket；超出最大 bucket 直接报错 |
 | `SGLangServerCaptureAdapter.__init__` | wire codec：spec 以 JSON 放进 `sampling_params.custom_params` |
 
 ## 3. Capture 插件（specforge_tpu/sglang_capture）

@@ -3,10 +3,11 @@
 # SERVER_HOST / TRAINER_HOST are the two pods' DNS names; override on the CLI.
 model:
   target_model_path: /models/gpt/gpt-oss-120b
-  draft_model_config: configs/gpt-oss-120B-dspark.json
   target_backend: sglang
   embedding_key: model.embed_tokens.weight
   torch_dtype: bfloat16
+
+draft: specforge/config/draft/presets/gpt-oss-120B-dspark.yaml
 
 data:
   train_data_path: ./cache/dataset/perfectblend_train.jsonl
@@ -16,7 +17,6 @@ data:
   build_dataset_num_proc: 32
 
 training:
-  strategy: dspark
   num_epochs: 1
   batch_size: 1
   accumulation_steps: 4
@@ -25,8 +25,11 @@ training:
   max_grad_norm: 1.0
   attention_backend: sdpa
   fsdp_sharding: NO_SHARD
-  num_anchors: 512
-  loss_decay_gamma: 4.0
+  objective_options:
+    num_anchors: 512
+  weighting:
+    kind: exponential
+    gamma: 4.0
   save_interval: 500
   log_interval: 10
   dist_timeout: 30

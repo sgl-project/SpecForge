@@ -13,7 +13,7 @@ For one-off changes, use dotted overrides rather than adding another launcher:
 
 ```bash
 specforge train \
-  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3-disaggregated.yaml \
+  --config examples/configs/online/disaggregated/external/qwen3-8b-eagle3.yaml \
   model.target_model_path=/models/my-target \
   data.train_data_path=/datasets/my-training-data.jsonl \
   training.learning_rate=5e-5
@@ -85,95 +85,123 @@ EAGLE3 offline sequence parallelism is selected with
 tracking are also config features rather than custom launchers; see the
 [training guide](../basic_usage/training.md) for their validated combinations.
 
-## DFlash-family attention modes
+## Draft components and architectures
 
-DFlash-family draft models select their attention parameterization with
-`dflash_config.attention_mode`: `gqa` (the default), `mha`, or `mla`. The mode
-swaps only the attention projections inside the shared decoder layer; the
-`DFlashDraftModel`, `DFlash2DraftModel`, `DominoDraftModel`, and
-`DSparkDraftModel` architectures, target-context injection, per-layer
-full/sliding masks, objectives, capture contract, and
-`eager`/`sdpa`/`flex_attention` backend selection are identical across modes.
-Multi-head Latent Attention is therefore a draft JSON change, not a new
-architecture:
+Copy a YAML file from `specforge/config/draft/presets/` and pass its path as
+`draft` in the run config. Named `attention_configs` select GQA, MHA or MLA;
+`mlp_configs` define FFNs; `layer_configs` composes these nodes and `layer_types`
+selects one named layer per position. Attention direction and sliding windows are
+explicit on each attention node. Changing components does not require a new
+training launcher.
 
-```json
-{
-  "architectures": ["DSparkDraftModel"],
-  "hidden_size": 4096,
-  "num_attention_heads": 32,
-  "q_lora_rank": 1536,
-  "kv_lora_rank": 512,
-  "qk_nope_head_dim": 128,
-  "qk_rope_head_dim": 64,
-  "v_head_dim": 128,
-  "dflash_config": {
-    "projector_type": "dspark",
-    "attention_mode": "mla"
-  }
-}
-```
+The canonical codec parses complete configurations into frozen nodes before model
+construction. Architecture schemas register in `config.draft`; model classes use
+`register_draft_model` in `modeling.draft.models`. Component schemas and builders
+register separately. `build_draft_model` dispatches on the single `architectures`
+entry and constructs the declared components without reading files.
 
-MLA dimensions and behavior use the standard top-level Hugging Face fields:
-`q_lora_rank` (`null` selects a direct query projection), `kv_lora_rank`, the
-head dims (`qk_nope_head_dim` may be zero; `qk_rope_head_dim` must be even),
-and `rope_interleave` for the rotation convention (omitted means interleaved,
-the DeepSeek default; `false` selects NeoX-style half rotation). Omitting
-`attention_mode` preserves the existing GQA path; `"mha"` requires equal
-query/KV head counts.
+An objective registers independently in `algorithms.objectives`: it declares the
+architectures, inputs, outputs and trainable modules it supports. The model owns
+learned execution, fusion and heads; the objective owns supervision and loss.
+`training.objective_options` contains training-only settings. See
+[draft training](/draft_training.md) for loading and optimization options.
 
-MLA is a training-side mode: checkpoints train, evaluate through
-`spec_generate`, and export through `--to hf`. SGLang serving of DFlash-family
-drafts currently implements the GQA/MHA layout only, so plan benchmarks
-accordingly. DFlash2 otherwise follows the same mode selection; its convolution
-and selector do not change the attention projection contract.
+Export uses `specforge export --converter sglang`. The converter checks the complete
+structure against supported serving implementations and rejects incompatible
+component combinations.
 
-## Draft architectures
+## Fused token losses
 
-Draft classes register through `@register_draft`. The key defaults to the
-class name and must match the single entry in the draft JSON's
-`architectures` list:
+Import losses from `specforge.losses.fused`. Unprefixed functions are eager.
+
+| API pair (eager / fused) | Label input | Per-token objective |
+| --- | --- | --- |
+| `ce_loss` / `fused_ce_loss` | Teacher logits `[B, T, V]` | CE against the teacher argmax |
+| `tv_loss` / `fused_tv_loss` | Teacher logits `[B, T, V]` | `1 - sum(min(p, q))` |
+| `ce_l1_loss` / `fused_ce_l1_loss` | Explicit token IDs `[...]`; optional teacher logits `[..., V]` | CE and optional `sum(abs(p - q))`, returned separately |
+
+Here `p = softmax(draft_logits)` and `q = softmax(teacher_logits)`.
+The joint CE/L1 API uses the supplied token IDs even when they differ from the
+teacher argmax. For normalized distributions, `TV = L1 / 2`. Its backward shares
+draft normalization and combines both loss gradients before casting to the
+input dtype. This is useful when CE and teacher L1/TV train the same logits.
 
 ```python
-from transformers import PretrainedConfig
+from specforge.losses.fused import fused_ce_l1_loss
 
-from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.registry import register_draft
-
-
-class MyDraftConfig(PretrainedConfig):
-    model_type = "my-draft"
-
-
-@register_draft
-class MyEagle3Draft(Eagle3DraftModel):
-    config_class = MyDraftConfig
-
-    def __init__(self, config, **kwargs):
-        super().__init__(config)
-        ...
+logits = lm_head(hidden)                    # [..., V], BF16/FP16/FP32 on CUDA
+terms = fused_ce_l1_loss(
+    logits,
+    target_ids,                             # [...], int64, values in [0, V)
+    teacher_logits=teacher_logits,          # optional [..., V], not probabilities
+)
+per_token_loss = 0.1 * terms.cross_entropy + 0.9 * terms.teacher_l1
+loss = (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1)
+loss.backward()
 ```
 
-Import the module from `specforge/modeling/draft/__init__.py` so registration
-runs before config resolution. A minimal draft config then contains:
+The returned `CEL1Loss` contains unreduced FP32 losses. Without teacher logits,
+`teacher_l1` is `None`; use `terms.cross_entropy` alone. Both inputs use the same
+device and vocabulary. There is no `ignore_index`: masked positions still need
+valid token IDs. Teacher logits never receive gradients. Masks, coefficients
+and reduction belong to the caller; use `0.5 * terms.teacher_l1` for TV.
 
-```json
-{
-  "architectures": ["MyEagle3Draft"],
-  "model_type": "my-draft",
-  "vocab_size": 128256,
-  "draft_vocab_size": 32000
-}
-```
+`top_k=K` additionally returns differentiable `topk_values` and integer
+`topk_ids` with shape `[..., K]`, for DFlash2's selector. `argmax_ids` and the
+optional draft/teacher top-1 probabilities are detached diagnostics. The
+fused implementation requires CUDA and Triton; use `ce_l1_loss` on CPU.
+Importing the public module does not require Triton. The eager reference promotes low-precision
+CE to FP32 and preserves explicitly supplied FP64 inputs for numerical checks.
 
-Point `model.draft_model_config` at that JSON. `AutoDraftModelConfig` and the
-model assembler resolve both the config and model class from the registry; do
-not add a method-specific training launcher.
+`training.loss.fused` is unset by default: objectives then use an
+optimized implementation where one applies and the reference elsewhere.
+`false` always evaluates the reference.
+An explicit `fused: true` for a categorical loss raises off
+CUDA/ROCm or outside FP16/BF16/FP32; it does not fall back (see
+[loss execution](/draft_training.md#loss-execution)).
+Domino selects its specialized CE kernel under the same flag.
 
-An architecture alone does not define a new loss. A genuinely new training
-algorithm also needs a pure `AlgorithmSpec`, executable `AlgorithmProviders`,
-and one immutable `AlgorithmRegistration` under `specforge/algorithms`. Its
-step provider may construct a `DraftTrainStrategy`, while its model and data
-providers own algorithm-specific assembly. Add builtin registrations to the
-explicit catalog used by the application composition root; do not add a
-method-specific launcher or a second mutable registry.
+`training.loss.execution.chunk_size` sets the chunk size, and
+`training.loss.execution.checkpoint` (default `true`) controls recomputation of
+each chunk's projection and objective. The executor checkpoints only when the
+prediction set is actually split.
+Without checkpointing, all chunks can retain
+logits until backward: smaller chunks do not bound total saved-logits memory.
+DFlash always skips its zero-weight anchor projection in multi-slot objectives;
+DSpark supervises every slot. Detailed diagnostics retain the full blocks.
+
+The selector consumes top-k candidates and hidden states, computes its own CE,
+and joins the logits backward only through candidate values. Its direct hidden
+state gradient is separate; `training.objective_options.selector_stop_gradient` detaches
+both inputs.
+Weights, masks and loss coefficients are applied outside the logits operators.
+
+## Canonical draft component changes
+
+Legacy training is retired; the canonical component path is the only one.
+Its schema version 1 is provisional until the canonical-format cutover (design
+step 6). Intermediate configurations must include the current explicit structural
+fields, including RoPE `interleaved`, attention `qk_norm_*`, and RMSNorm
+`has_weight`; they are not a stable checkpoint interchange format yet. After the
+cutover, incompatible changes require a schema migration.
+
+Canonical RoPE computes frequencies, phases, and cosine/sine tables in FP32.
+Rotation also computes in FP32 and casts once to the Q/K dtype. This follows
+SGLang's base rotary embedding, which keeps an FP32 cosine/sine cache on CUDA
+for head sizes 64, 128, 256 and 512, and intentionally changes BF16 numerics
+relative to legacy frequency/table rounding. For other head sizes, and for
+SGLang's multi-axis rotary embedding, SGLang casts the cache to the activation
+dtype before rotating, so such drafts differ from serving by at least that
+rounding. Linear scaling divides positions; dynamic NTK
+uses a fixed `factor * original_max_position_embeddings`, independent of previous
+calls. Legacy EAGLE dynamic configurations remain unsupported. Continued training
+can therefore differ numerically; acceptance impact must be measured before the
+training cutover.
+
+Runtime attention names are `eager`, `sdpa`, `flex_attention`, and `fa`, matching
+training configuration. `usp` is available for canonical EAGLE3 offline
+training: the objective's cached rollout selects it together with the
+sequence-parallel groups, and `resolve_attention_backend("usp")` itself still
+fails explicitly.
+Flex defaults to the general TRITON kernel for sparse short-query batches; an
+explicit `FlexAttentionBackend(kernel_backend="FLASH")` uses `(256, 128)` blocks.
