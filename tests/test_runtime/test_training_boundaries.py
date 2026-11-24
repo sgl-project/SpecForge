@@ -168,11 +168,10 @@ EXCEPTED_COLLECTIVES = {
         {f"{_T}.broadcast_object_list": 1},
     ),
     "specforge/training/checkpoint.py": Excepted(
-        "checkpoint sequence: the gather of write errors, the barrier, rank 0's "
+        "checkpoint sequence: the gather of write errors, rank 0's "
         "best-checkpoint verdict, broadcast, the gather of resume descriptors",
         {
             f"{_T}.all_gather_object": 2,
-            f"{_T}.barrier": 1,
             f"{_T}.broadcast_object_list": 1,
         },
         reads=(
