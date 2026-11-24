@@ -1,0 +1,8 @@
+.git
+cache
+outputs
+.scratch
+.hf_cache
+**/__pycache__
+docs
+assets

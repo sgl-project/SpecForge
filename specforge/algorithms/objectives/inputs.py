@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from specforge.algorithms.common import batch_shapes
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     ContextBlocks,
@@ -83,7 +84,7 @@ def prepare_anchor_capacity(batch, config):
     if batch["loss_mask"].device.type != "cpu":
         return {}
     valid = valid_tokens(batch)
-    count = int((valid[:, :-1] & valid[:, 1:]).sum(-1).max())
+    count = batch_shapes.anchor_capacity(valid)
     return {"anchor_capacity": torch.empty(count, dtype=torch.bool)}
 
 

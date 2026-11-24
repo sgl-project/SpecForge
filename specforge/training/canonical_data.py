@@ -93,7 +93,7 @@ def build_normalizer(
     )
 
 
-def collate(features, *, keys):
+def collate(features, *, keys, pad_to_length=None):
     import torch
 
     from specforge.algorithms.common.collation import pad_and_concatenate_features
@@ -116,7 +116,10 @@ def collate(features, *, keys):
         *(("position_ids",) if "position_ids" in features[0] else ()),
     )
     result = pad_and_concatenate_features(
-        features, sequence_axes=dict.fromkeys(all_keys, 1), required_keys=all_keys
+        features,
+        sequence_axes=dict.fromkeys(all_keys, 1),
+        required_keys=all_keys,
+        pad_to_length=pad_to_length,
     )
     if any("lengths" in feature for feature in features):
         if len(features) != 1:
@@ -126,7 +129,11 @@ def collate(features, *, keys):
 
 
 def build_collator(*, keys):
-    return partial(collate, keys=keys)
+    from specforge.algorithms.common import batch_shapes
+
+    return partial(
+        collate, keys=keys, pad_to_length=batch_shapes.padded_sequence_length
+    )
 
 
 def build_reader(hidden_states_path, *, strategy, keys, **kwargs):
