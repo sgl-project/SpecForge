@@ -42,11 +42,23 @@ def dflash2_config():
     )
 
 
+def reconsideration_config():
+    base = eagle_config()
+    return dataclasses.replace(
+        base,
+        architecture="ParallelReconsiderationDraftModel",
+        spec_config=dataclasses.replace(
+            base.spec_config, normalize_features=True, norm_output=True
+        ),
+    )
+
+
 EXPECTED = {
     "DMTPDraftModel": dmtp_config,
     "MTPDraftModel": mtp_config,
     "PEagleDraftModel": peagle_config,
     "Eagle3DraftModel": eagle_config,
+    "ParallelReconsiderationDraftModel": reconsideration_config,
     "DominoDraftModel": lambda: draft_config(
         architecture="DominoDraftModel", spec_config=domino_spec()
     ),
