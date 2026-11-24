@@ -87,3 +87,8 @@ class MoEFFNSpec(FFNSpec):
             raise ValueError("shared_expert_gate requires a shared expert")
         if not isinstance(self.router, MoERouterSpec):
             raise TypeError("router must be MoERouterSpec")
+        if self.num_experts_per_tok == 1 and self.router.normalize_top_k:
+            raise ValueError(
+                "normalize_top_k requires num_experts_per_tok > 1: "
+                "a single weight normalizes to 1"
+            )
