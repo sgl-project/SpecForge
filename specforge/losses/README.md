@@ -5,7 +5,8 @@ not register algorithms or choose execution policies.
 
 | Module | Purpose |
 | --- | --- |
-| `fused.py` | Reference and fused token losses |
+| `distribution.py` | Per-position PyTorch formulas for aligned draft and teacher logits |
+| `fused.py` | Fused token losses, the explicit-label CE/L1 reference, and existing reference imports |
 | `domino.py` | Weighted loss for base logits and suffix corrections |
 | `lk.py` | Acceptance metrics and LK losses |
 | `position_weights.py` | Detached position weighting |
