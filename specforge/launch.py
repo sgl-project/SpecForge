@@ -843,10 +843,11 @@ def build_disagg_online_producer(
     Workers put() into a cross-node ``feature_store``; committed refs stream to
     the consumer via ``channel``. ``feature_source`` is an injected SGLang
     server-capture transport; a *sequence* of sources fans out to one logical
-    worker per source (the multi-server topology). Each legacy worker keeps
+    worker per source (the multi-server topology). Each logical worker keeps
     ``producer_concurrency`` capture calls in flight and replenishes a slot as
-    soon as that call completes. Each negotiated endpoint completes one lease at a time,
-    bounded by its advertised atomic begin capacity. The hard cap must fit a full lease;
+    soon as that call completes. Negotiated capture adapters register the
+    currently ready leases together per endpoint, then generate and publish
+    each lease independently. Prepared leases occupy bounded capture slots;
     negotiated output byte reservations include all unfinished server writes
     in the global feature-store hard cap until publication or exact cleanup.
     There is intentionally no in-process target-model path.
@@ -1388,147 +1389,397 @@ def build_disagg_online_producer(
             if getattr(source, "_capture_protocol", None) is None:
                 return run_worker_legacy(w)
 
+            # The endpoint's atomic reservation bound also limits each lease.
+            # Discover it before taking prompts so even a lease configured above
+            # the server capacity can be fulfilled without returning/failing it.
+            capacity_fn = getattr(source, "registration_capacity", None)
+            registration_capacity = capacity_fn() if callable(capacity_fn) else None
+            endpoint_lease = (
+                min(worker_lease, registration_capacity)
+                if registration_capacity is not None
+                else worker_lease
+            )
+
+            # One endpoint's network registration has its own executor. The
+            # coordinator only leases, reserves credits and harvests futures;
+            # an in-flight begin never blocks independent ref publication.
+            records = []
+            futures = {}
+            preparing = registering = cleaning = None
+            failures = submitted = 0
+            accepting = True
+            backpressure_started = None
+            capacity_blocked = False
+            next_registration_at = 0.0
             from specforge.inference.capture_protocol import CaptureCapacityDeclined
 
-            # Each endpoint drives one complete lease on its own worker thread.
-            # The lease still batches tasks up to the endpoint's atomic bound.
-            capacity = source.registration_capacity()
-            endpoint_lease = min(worker_lease, capacity) if capacity else worker_lease
-            failures = 0
+            def release_credit(record):
+                with publish_lock:
+                    state["reserved_bytes"] -= record["credit"]
+                    record["credit"] = 0
 
-            def stopped():
-                health = w.health()["state"]
-                if health in ("stopped", "draining"):
-                    inactive[w.worker_id] = health
-                    return True
-                return abort.is_set() or (should_stop is not None and should_stop())
-
-            def wait_for_progress(since):
-                if (
-                    peer_wait_timeout_s is not None
-                    and time.monotonic() - since >= peer_wait_timeout_s
-                ):
-                    raise TimeoutError(
-                        "producer backpressure timed out waiting for consumer progress"
-                    )
-                sleep(backpressure_poll_s)
-
-            def reserve(size):
+            def reserve(record):
+                if record["credit"]:
+                    return True  # Same leased attempt retains its original credit.
+                size = record["prepared"]["estimated_bytes"]
                 if size is None or feature_store_max_resident_bytes is None:
-                    return 0
-                if size > feature_store_max_resident_bytes:
-                    raise MemoryError(
-                        "producer feature-store hard cap exceeded: "
-                        f"sample reservation={size} > limit={feature_store_max_resident_bytes} bytes"
-                    )
+                    return True
                 with publish_lock:
-                    used = reconcile_consumed_locked() + state["reserved_bytes"]
-                    if used + size > feature_store_max_resident_bytes:
-                        return None
-                    state["reserved_bytes"] += size
-                    return size
-
-            def release(credit):
-                with publish_lock:
-                    state["reserved_bytes"] -= credit
-
-            submitted = 0
-            while submitted < round_budget and not stopped():
-                if ingest_closed.is_set() and pool_drained():
-                    return
-                since = time.monotonic()
-                while True:
-                    in_flight = channel.in_flight_remote()
-                    if in_flight < consumer_quantum or not flow_control.should_pause(
-                        in_flight_refs=in_flight, resident_bytes=resident_bytes()
+                    if abort.is_set():
+                        return False
+                    current = reconcile_consumed_locked()
+                    if size > feature_store_max_resident_bytes:
+                        raise MemoryError(
+                            "producer feature-store hard cap exceeded: "
+                            f"sample reservation={size} > limit={feature_store_max_resident_bytes} bytes"
+                        )
+                    if (
+                        current + state["reserved_bytes"] + size
+                        > feature_store_max_resident_bytes
                     ):
-                        break
-                    if stopped():
-                        return
-                    wait_for_progress(since)
-                tasks = w.lease_tasks(endpoint_lease)
-                if not tasks:
-                    sleep(backpressure_poll_s)
-                    continue
-                submitted += 1
-                start = time.perf_counter()
-                prepared = None
-                credit = 0
-                worker_owns_lease = False
-                failure = None
+                        return False
+                    state["reserved_bytes"] += size
+                    record["credit"] = size
+                    return True
+
+            def failed(exc):
+                nonlocal failures, accepting
+                failures += 1
+                if failures >= max_worker_failures:
+                    accepting = False
+                    dead[w.worker_id] = str(exc)
+
+            def clean_batch(group):
+                source.discard_prepared_batches([r["prepared"] for r in group])
+
+            with (
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=producer_concurrency,
+                    thread_name_prefix=f"capture-{w.worker_id}",
+                ) as executor,
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"prepare-{w.worker_id}",
+                ) as preparation,
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"register-{w.worker_id}",
+                ) as registration,
+            ):
                 try:
-                    try:
-                        groups = source.prepare_refs_batches([tasks], capture=w.capture)
-                        if len(groups) != 1:
-                            raise ValueError(
-                                f"capture preparation returned {len(groups)} groups for one lease"
-                            )
-                        prepared = groups[0]
-                    except Exception as exc:
-                        failure = exc
-                    if failure is None:
-                        since = time.monotonic()
-                        while not stopped():
-                            granted = reserve(prepared["estimated_bytes"])
-                            if granted is not None:
-                                credit = granted
-                                try:
-                                    source.register_prepared_batches([prepared])
-                                except CaptureCapacityDeclined:
-                                    # The server explicitly granted no writer. Reuse
-                                    # the original intent, leaving credit for peers.
-                                    release(credit)
-                                    credit = 0
-                                except Exception as exc:
-                                    failure = exc
-                                    break
+                    while True:
+                        health_state = w.health()["state"]
+                        if health_state in ("stopped", "draining"):
+                            accepting = False
+                            inactive[w.worker_id] = health_state
+                        if abort.is_set() or (
+                            should_stop is not None and should_stop()
+                        ):
+                            accepting = False
+                        # Harvest generates first, including while a different
+                        # registration or uncertain-attempt cleanup is blocked.
+                        for future in list(futures):
+                            if not future.done():
+                                continue
+                            record = futures.pop(future)
+                            # A cancelled queued future never entered run_leased.
+                            record["settled"] = not future.cancelled()
+                            try:
+                                refs = future.result()
+                            except Exception as exc:
+                                record.update(stage="cleanup", error=exc)
+                                failed(exc)
+                            else:
+                                failures = 0
+                                credit = record["credit"]
+                                missing = source.unreturned_prepared(
+                                    record["prepared"], refs
+                                )
+                                if missing is not None:
+                                    # Per-task errors settle controller leases but
+                                    # can still own server reservations or writes.
+                                    # Publish successes now; retain only failed
+                                    # identities and their credits until drained.
+                                    failed_credit = (
+                                        missing["estimated_bytes"] if credit else 0
+                                    )
+                                    record.update(
+                                        prepared=missing,
+                                        tasks=missing["tasks"],
+                                        credit=failed_credit,
+                                        stage="cleanup",
+                                    )
+                                    credit -= failed_credit
                                 else:
+                                    record["credit"] = 0
+                                    records.remove(record)
+                                publish_refs(w, refs, record["start"], credit)
+
+                        if cleaning is not None and cleaning[0].done():
+                            future, group = cleaning
+                            future.result()  # Failure retains original ownership and aborts the driver.
+                            for record in group:
+                                release_credit(record)
+                                if not record["settled"]:
+                                    w.fail_leased(
+                                        record["tasks"],
+                                        str(record["error"]),
+                                        unhealthy=not record.get("cancelled", False),
+                                    )
+                                records.remove(record)
+                            cleaning = None
+
+                        if registering is not None and registering[0].done():
+                            future, group = registering
+                            registering = None
+                            try:
+                                future.result()
+                            except CaptureCapacityDeclined:
+                                capacity_blocked = True
+                                next_registration_at = (
+                                    time.monotonic() + backpressure_poll_s
+                                )
+                                for record in group:
+                                    # No grant means no outstanding writer. Other
+                                    # endpoints can borrow this credit until retry.
+                                    release_credit(record)
+                                    record["stage"] = "pending"
+                            except Exception as exc:
+                                failed(exc)
+                                for record in group:
+                                    record.update(stage="cleanup", error=exc)
+                            else:
+                                capacity_blocked = False
+                                for record in group:
+                                    if (
+                                        not accepting
+                                        or abort.is_set()
+                                        or w.health()["state"]
+                                        in ("stopped", "draining")
+                                        or (should_stop is not None and should_stop())
+                                    ):
+                                        accepting = False
+                                        record.update(
+                                            stage="cleanup",
+                                            error="producer-stopped",
+                                            cancelled=True,
+                                        )
+                                        continue
+                                    record["stage"] = "generate"
+                                    future = executor.submit(
+                                        w.run_leased,
+                                        record["tasks"],
+                                        max_tasks=endpoint_lease,
+                                        prepared=record["prepared"],
+                                    )
+                                    futures[future] = record
+
+                        if preparing is not None and preparing[0].done():
+                            future, group = preparing
+                            preparing = None
+                            try:
+                                prepared = future.result()
+                                if len(prepared) != len(group):
+                                    raise RuntimeError(
+                                        "capture preparation returned "
+                                        f"{len(prepared)} groups for {len(group)} leases"
+                                    )
+                            except Exception as exc:
+                                failed(exc)
+                                for record in group:
+                                    w.fail_leased(
+                                        record["tasks"], f"prepare_refs:{exc}"
+                                    )
+                                    records.remove(record)
+                            else:
+                                for record, item in zip(group, prepared):
+                                    record.update(stage="pending", prepared=item)
+
+                        if not accepting:
+                            # An unregistered prepared lease may be waiting for
+                            # consumer credit. Cooperative stop must not depend
+                            # on another ACK arriving before it can retire.
+                            for record in records:
+                                if record["stage"] == "pending":
+                                    record.update(
+                                        stage="cleanup",
+                                        error="producer-stopped",
+                                        cancelled=True,
+                                    )
+
+                        # Credits for unfinished or uncertain server writes stay
+                        # reserved until the exact attempt is physically drained.
+                        if cleaning is None and registering is None:
+                            group = [r for r in records if r["stage"] == "cleanup"]
+                            if group:
+                                cleaning = (
+                                    registration.submit(clean_batch, group),
+                                    group,
+                                )
+
+                        in_flight = channel.in_flight_remote()
+                        current_bytes = resident_bytes()
+                        paused = (
+                            in_flight >= consumer_quantum
+                            and flow_control.should_pause(
+                                in_flight_refs=in_flight,
+                                resident_bytes=current_bytes,
+                            )
+                        )
+                        if (
+                            accepting
+                            and not paused
+                            and submitted < round_budget
+                            and preparing is None
+                        ):
+                            group = []
+                            while (
+                                len(records) < producer_concurrency
+                                and submitted < round_budget
+                            ):
+                                tasks = w.lease_tasks(endpoint_lease)
+                                if not tasks:
                                     break
-                            wait_for_progress(since)
+                                record = dict(
+                                    tasks=tasks,
+                                    start=time.perf_counter(),
+                                    stage="prepare",
+                                    credit=0,
+                                    settled=False,
+                                )
+                                records.append(record)
+                                group.append(record)
+                                submitted += 1
+                            if group:
+                                preparing = (
+                                    preparation.submit(
+                                        source.prepare_refs_batches,
+                                        [r["tasks"] for r in group],
+                                        capture=w.capture,
+                                    ),
+                                    group,
+                                )
+
+                        # Coalesce a ready snapshot within the endpoint's atomic
+                        # begin bound. Excess leases retain their place while
+                        # completed siblings publish and free server capacity.
+                        budget_wait = False
+                        if (
+                            registering is None
+                            and cleaning is None
+                            and time.monotonic() >= next_registration_at
+                        ):
+                            group = []
+                            group_tasks = 0
+                            for record in records:
+                                if record["stage"] != "pending":
+                                    continue
+                                task_count = len(record["tasks"])
+                                if (
+                                    registration_capacity is not None
+                                    and group_tasks + task_count > registration_capacity
+                                ):
+                                    break
+                                if reserve(record):
+                                    group_tasks += task_count
+                                    record["stage"] = "register"
+                                    group.append(record)
+                                else:
+                                    budget_wait = True
+                            if group:
+                                registering = (
+                                    registration.submit(
+                                        source.register_prepared_batches,
+                                        [r["prepared"] for r in group],
+                                    ),
+                                    group,
+                                )
+
+                        if paused or budget_wait or capacity_blocked:
+                            if backpressure_started is None:
+                                backpressure_started = time.monotonic()
+                            if (
+                                peer_wait_timeout_s is not None
+                                and time.monotonic() - backpressure_started
+                                > peer_wait_timeout_s
+                            ):
+                                raise TimeoutError(
+                                    "producer backpressure timed out waiting for consumer progress"
+                                )
                         else:
-                            return
-                    if failure is None:
-                        if stopped():
-                            return
-                        worker_owns_lease = True
+                            backpressure_started = None
+
+                        if not records:
+                            if ingest_closed.is_set() and pool_drained():
+                                return
+                            if not accepting or submitted >= round_budget:
+                                return
+                        waits = list(futures)
+                        waits.extend(
+                            item[0]
+                            for item in (preparing, registering, cleaning)
+                            if item is not None
+                        )
+                        if waits:
+                            concurrent.futures.wait(
+                                waits,
+                                timeout=backpressure_poll_s,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                        else:
+                            sleep(backpressure_poll_s)
+                except BaseException:
+                    abort.set()
+                    # Executor submit can fail before a future is installed.
+                    # Every prelease remains in records, so none can disappear
+                    # between preparation, registration and independent generate.
+                    for item in (preparing, registering, cleaning):
+                        if item is not None:
+                            try:
+                                result = item[0].result()
+                                if item is preparing:
+                                    for record, prepared in zip(item[1], result):
+                                        record["prepared"] = prepared
+                            except BaseException:
+                                pass
+                    cleanup_errors = []
+                    for future, record in futures.items():
                         try:
-                            refs = w.run_leased(
-                                tasks, max_tasks=endpoint_lease, prepared=prepared
-                            )
-                        except Exception as exc:
-                            failure = exc
+                            refs = future.result()
+                        except BaseException:
+                            pass
                         else:
-                            # run_leased settles every prompt. Only missing refs
-                            # still need producer-side retirement after publication.
-                            prepared = source.unreturned_prepared(prepared, refs)
-                            missing_credit = (
-                                prepared["estimated_bytes"]
-                                if prepared and credit
-                                else 0
-                            )
-                            publication_credit = credit - missing_credit
-                            credit = missing_credit
-                            publish_refs(w, refs, start, publication_credit)
-                finally:
-                    try:
-                        if prepared is not None:
-                            source.discard_prepared_batches([prepared])
-                        release(credit)
-                    finally:
-                        if not worker_owns_lease:
-                            reason = (
-                                str(failure)
-                                if failure is not None
-                                else "producer-stopped"
-                            )
-                            w.fail_leased(tasks, reason, unhealthy=failure is not None)
-                if failure is None:
-                    failures = 0
-                else:
-                    failures += 1
-                    if failures >= max_worker_failures:
-                        dead[w.worker_id] = str(failure)
-                        return
+                            for ref in refs:
+                                try:
+                                    abort_feature_ref(
+                                        feature_store,
+                                        ref,
+                                        reason="producer-driver-failed-before-publication",
+                                    )
+                                except BaseException as exc:
+                                    cleanup_errors.append(
+                                        f"{type(exc).__name__}: {exc}"
+                                    )
+                        record["settled"] = not future.cancelled()
+                    for record in records:
+                        cleaned = False
+                        try:
+                            if "prepared" in record:
+                                clean_batch([record])
+                            cleaned = True
+                        except BaseException as exc:
+                            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                        finally:
+                            if not record["settled"]:
+                                w.fail_leased(record["tasks"], "producer-driver-failed")
+                            if cleaned:
+                                release_credit(record)
+                    if cleanup_errors:
+                        logger.error(
+                            "producer exact-attempt cleanup remains pending: %s",
+                            cleanup_errors,
+                        )
+                    raise
 
         last_ingest_log = {"t": None}
 

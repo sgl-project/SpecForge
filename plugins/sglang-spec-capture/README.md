@@ -252,10 +252,11 @@ TP/KV/checkpoint/backend and deterministic semantics. Tokens form complete paren
 hash chains; sample/attempt IDs and loss masks do not enter content keys.
 Passthrough data remains part of the registered request digest.
 
-For negotiated HS capture the producer processes one lease per endpoint at a
-time. A lease may contain multiple prompts up to the endpoint's advertised
-atomic registration limit. Separate endpoints make progress independently;
-`runtime.producer_concurrency` still controls ordinary capture.
+For negotiated HS capture, each endpoint can prepare and register new leases
+while earlier capture calls complete. Ready leases share a registration up to
+the endpoint's atomic limit. Each lease publishes or cleans up independently.
+`runtime.producer_concurrency` bounds the endpoint's active leases, and the
+producer reserves output bytes across endpoints before registration.
 
 Each external attempt has immutable keys
 `store/sample/g1/attempt/server_epoch/reservation_token/feature`. The native

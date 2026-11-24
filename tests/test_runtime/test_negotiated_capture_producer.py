@@ -59,7 +59,7 @@ def wait_for(predicate, timeout=3):
         time.sleep(0.001)
 
 
-class NegotiatedProducerTests(unittest.TestCase):
+class NegotiatedProducerFixture:
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -91,6 +91,8 @@ class NegotiatedProducerTests(unittest.TestCase):
         self.addCleanup(pool.shutdown)
         return future
 
+
+class NegotiatedProducerTests(NegotiatedProducerFixture, unittest.TestCase):
     def test_returned_output_cannot_silently_exceed_reserved_schema(self):
         for item in self.server.capability["schema"]:
             item["dtype"] = "int8"  # Deliberately false server capability.
@@ -434,7 +436,7 @@ class NegotiatedProducerTests(unittest.TestCase):
                 self.assertTrue(release.wait(3))
 
         self.server.gate = gate
-        workers, drive = self.build(n=8)
+        workers, drive = self.build(n=8, concurrency=1)
         future = self.drive_async(drive)
         try:
             self.assertTrue(entered.wait(2))
@@ -484,7 +486,9 @@ class NegotiatedProducerTests(unittest.TestCase):
 
     def test_stop_after_registration_cleans_without_submitting_generate(self):
         stop = threading.Event()
-        workers, drive = self.build(n=4, feature_store_max_resident_bytes=100000)
+        workers, drive = self.build(
+            n=4, concurrency=1, feature_store_max_resident_bytes=100000
+        )
         source = workers[0].feature_source
         register = source.register_prepared_batches
 
@@ -512,7 +516,7 @@ class NegotiatedProducerTests(unittest.TestCase):
 
         source.prepare_refs_batches = short_prepare
         with self.assertRaisesRegex(
-            RuntimeError, "preparation returned 0 groups for one lease"
+            RuntimeError, "preparation returned 3 groups for 4 leases"
         ):
             drive()
         self.assertFalse(self.server.batches)
