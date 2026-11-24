@@ -561,6 +561,37 @@ def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
     )
 
 
+def _cleanup_online_published_refs(store, channel):
+    """Run the existing terminal publication scan with exact-ref authority."""
+    from specforge.runtime.data_plane.feature_store import abort_feature_ref
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
+
+    reader = StreamingRefChannel(channel.path)
+    cleanup = getattr(store, "cleanup_terminal_refs", None)
+    errors = []
+    while True:
+        refs = reader.poll(max_n=1024)
+        if not refs:
+            break
+        if callable(cleanup):
+            try:
+                cleanup(
+                    refs,
+                    consumer_done=channel.consumer_done(),
+                    producer_closed=channel.is_closed(),
+                )
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+        else:
+            for ref in refs:
+                try:
+                    abort_feature_ref(store, ref, reason="online-attempt-finished")
+                except Exception as exc:
+                    errors.append(f"{ref.sample_id}: {type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError("terminal published-ref scan unresolved: " + repr(errors))
+
+
 def _build_online(
     cfg: Config,
     *,
@@ -731,18 +762,7 @@ def _build_online(
                     )
             cleanup_errors = []
             try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
+                _cleanup_online_published_refs(store, channel)
             except Exception as exc:
                 cleanup_errors.append(
                     f"published-ref scan: {type(exc).__name__}: {exc}"

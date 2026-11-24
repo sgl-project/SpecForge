@@ -29,6 +29,7 @@ from specforge.runtime.data_plane import (
     LocalFeatureStore,
     drain_feature_store_removals,
 )
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
 
 logger = logging.getLogger(__name__)
 
@@ -386,8 +387,9 @@ def _publish_refs_with_cleanup(
         cleanup_errors = []
         for ref in transaction.unpublished_refs:
             try:
-                feature_store.abort(
-                    ref.sample_id,
+                abort_feature_ref(
+                    feature_store,
+                    ref,
                     reason="producer-ref-publication-failed",
                 )
             except Exception as cleanup_exc:
@@ -402,6 +404,11 @@ def _publish_refs_with_cleanup(
                 f"{cleanup_errors}"
             ) from publish_exc
         raise
+    finally:
+        relinquish = getattr(feature_store, "relinquish_published", None)
+        if callable(relinquish):
+            for ref in transaction.published_refs:
+                relinquish(ref)
 
 
 def _epoch_online_prompts(
@@ -1158,8 +1165,9 @@ def build_disagg_online_producer(
                     cleanup_errors = []
                     for ref in refs:
                         try:
-                            feature_store.abort(
-                                ref.sample_id,
+                            abort_feature_ref(
+                                feature_store,
+                                ref,
                                 reason="producer-resident-byte-hard-cap",
                             )
                         except Exception as exc:
@@ -1174,11 +1182,17 @@ def build_disagg_online_producer(
                     if cleanup_errors:
                         message += f"; cleanup errors={cleanup_errors}"
                     raise MemoryError(message)
-                _publish_refs_with_cleanup(
-                    channel=channel,
-                    feature_store=feature_store,
-                    refs=refs,
-                )
+                try:
+                    _publish_refs_with_cleanup(
+                        channel=channel,
+                        feature_store=feature_store,
+                        refs=refs,
+                    )
+                except BaseException:
+                    # A possibly visible prefix still owns its original credit.
+                    # Stop peer admissions before releasing the shared lock.
+                    abort.set()
+                    raise
                 if channel.consumed_state_remote()[1] is None:
                     published_sizes.extend(ref_sizes)
                 state["published_bytes"] += sum(ref_sizes)
@@ -1214,8 +1228,9 @@ def build_disagg_online_producer(
                     continue
                 for ref in refs:
                     try:
-                        feature_store.abort(
-                            ref.sample_id,
+                        abort_feature_ref(
+                            feature_store,
+                            ref,
                             reason="producer-driver-failed-before-publication",
                         )
                     except Exception:

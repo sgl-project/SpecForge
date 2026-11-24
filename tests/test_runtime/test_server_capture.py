@@ -426,10 +426,13 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
     def test_eagle3_refs_and_zero_copy_roundtrip(self):
         backend, server, store, adapter = _mk()
-        tasks = [_task(0, 6), _task(1, 9)]
+        tasks = [_task(0, 6), _task(1, 9), _task(2, 5)]
+        tasks[0].metadata["num_tokens"] = 42
+        tasks[1].metadata["num_tokens"] = 0
         refs = adapter.produce_refs(tasks, capture=_eagle3_contract())
-        self.assertEqual(len(refs), 2)
+        self.assertEqual(len(refs), len(tasks))
         for task, ref in zip(tasks, refs):
+            self.assertEqual(ref.num_tokens, len(task.payload["input_ids"]))
             self.assertIsInstance(ref, SampleRef)
             self.assertEqual(ref.sample_id, f"run0:{task.task_id}")
             self.assertEqual(ref.strategy, "eagle3")
