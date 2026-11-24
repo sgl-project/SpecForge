@@ -33,7 +33,12 @@ from typing import Iterator, Optional, Sequence
 
 import click
 
-from specforge.config import Config, load_config
+from specforge.plugins import load_plugins
+
+# Activate platform plugins before importing the CLI configuration and training code.
+load_plugins()
+
+from specforge.config import Config, load_config  # noqa: E402
 
 
 class _WorkerTermination(BaseException):
@@ -232,8 +237,10 @@ def train(
     cfg = load_config(config_path, overrides)
     from specforge.application import bind_run, resolve_run
     from specforge.launch_plan import build_launch_plan, run_commands
+    from specforge.training.model_loading import training_target_config
 
-    resolved = resolve_run(cfg)
+    target_config = training_target_config(cfg)
+    resolved = resolve_run(cfg, target_config=target_config)
     launch = build_launch_plan(
         resolved.config,
         algorithm=resolved.algorithm,
@@ -244,9 +251,15 @@ def train(
     )
     if plan:
         print(launch.render())
+        # The plan renders anywhere; launching it on this host would fail.
         if launch.managed_rdma_error is not None:
-            # The plan renders anywhere; launching it on this host would fail.
             click.echo(f"warning: {launch.managed_rdma_error}", err=True)
+        if launch.server_capture_error is not None:
+            click.echo(
+                f"warning: {launch.server_capture_error}; the capture servers are "
+                "shown without capture flags",
+                err=True,
+            )
         return 0
     if launch.kind == "worker":
         for key, value in launch.worker_env.items():
@@ -266,62 +279,50 @@ def train(
 
 
 @cli.command(short_help="materialize a runtime checkpoint as a model directory")
+@click.option("--converter", type=click.Choice(("sglang",)), default=None)
 @click.option(
-    "--to",
-    "target",
-    type=click.Choice(("hf", "sglang")),
-    required=True,
-    help="Export layout.",
+    "--export-mode",
+    type=click.Choice(("standalone", "native")),
+    default=None,
+    help="Standalone draft (default) or native target merge-back.",
+)
+@click.option(
+    "--copy-target",
+    is_flag=True,
+    help="Copy unchanged native target shards. Required for exports across filesystems; otherwise shards are hard-linked.",
 )
 @click.option("--checkpoint", required=True, metavar="PATH")
-@click.option("--draft-config", required=True, metavar="PATH")
-@click.option("--output-dir", required=True, metavar="PATH")
-@click.option("--vocab-mapping", default=None, metavar="PATH")
 @click.option(
-    "--embedding-source",
+    "--target-model",
     default=None,
     metavar="PATH",
-    help="Target model path supplying a frozen embedding for HF export.",
+    help="Target checkpoint for binding validation or native merge-back.",
 )
-@click.option(
-    "--embedding-key",
-    default="model.embed_tokens.weight",
-    show_default=True,
-)
+@click.option("--output-dir", required=True, metavar="PATH")
 @click.pass_context
 def export(
     ctx: click.Context,
-    target: str,
+    converter: Optional[str],
+    export_mode: Optional[str],
+    copy_target: bool,
     checkpoint: str,
-    draft_config: str,
+    target_model: Optional[str],
     output_dir: str,
-    vocab_mapping: Optional[str],
-    embedding_source: Optional[str],
-    embedding_key: str,
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
-    if target == "hf":
-        from specforge.export.to_hf import export_to_hf
+    from specforge.export.model import check_export_options, export_draft
 
-        export_to_hf(
-            checkpoint,
-            draft_config,
-            output_dir,
-            vocab_mapping_path=vocab_mapping,
-            embedding_source=embedding_source,
-            embedding_key=embedding_key,
-        )
-        return 0
-    if embedding_source is not None:
-        raise click.UsageError("--embedding-source is only valid with --to hf", ctx)
-    from specforge.export.to_sglang import export_to_sglang
-
-    export_to_sglang(
-        checkpoint,
-        draft_config,
-        output_dir,
-        vocab_mapping_path=vocab_mapping,
+    options = dict(
+        export_mode=export_mode,
+        converter=converter,
+        target_model=target_model,
+        copy_target=copy_target,
     )
+    try:
+        check_export_options(**options)
+    except ValueError as error:
+        raise click.UsageError(str(error), ctx) from error
+    export_draft(checkpoint, output_dir, **options)
     return 0
 
 

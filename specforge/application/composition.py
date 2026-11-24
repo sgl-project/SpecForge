@@ -35,8 +35,6 @@ def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
 
     from specforge.application.planning import validate_resolved_run
 
-    if algorithm.providers.resolve_for_config is not None:
-        algorithm = algorithm.providers.resolve_for_config(cfg, algorithm)
     validate_resolved_run(cfg, algorithm)
     return ResolvedRun(config=cfg, algorithm=algorithm)
 
@@ -44,18 +42,18 @@ def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
 def resolve_run(
     cfg: Config,
     registry: AlgorithmRegistry | None = None,
+    *,
+    target_config=None,
 ) -> ResolvedRun:
     """Resolve and validate all algorithm-owned behavior exactly once."""
 
-    if registry is None:
-        from specforge.algorithms.builtin import builtin_algorithm_registry
+    from specforge.training.canonical import resolve_run as resolve_canonical_run
 
-        registry = builtin_algorithm_registry()
-    try:
-        algorithm = registry.resolve(cfg.training.strategy)
-    except KeyError as exc:
-        raise ValueError(str(exc)) from exc
-
+    if registry is not None:
+        raise ValueError(
+            "Register canonical objectives instead of a combined algorithm registry"
+        )
+    cfg, algorithm = resolve_canonical_run(cfg, target_config=target_config)
     return bind_run(cfg, algorithm)
 
 
@@ -72,26 +70,22 @@ def resolve_offline_capture(
     and how those generic states must be persisted for its offline reader.
     """
 
-    resolved = resolve_run(cfg, registry)
     if cfg.mode != "offline":
         raise ValueError("offline capture preparation requires an offline run config")
 
-    if target_config is None:
-        from transformers import AutoConfig
+    from specforge.training.model_loading import training_target_config
 
-        target_config = AutoConfig.from_pretrained(
-            cfg.model.target_model_path,
-            cache_dir=cfg.model.cache_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
+    target_config = (
+        training_target_config(cfg) if target_config is None else target_config
+    )
 
     from specforge.training.model_loading import resolve_draft_config
 
+    target = target_config
+    resolved = resolve_run(cfg, registry, target_config=target)
+
     model_provider = resolved.algorithm.providers.model
-    draft_config = resolve_draft_config(
-        cfg,
-        provider=model_provider.draft_config,
-    )
+    draft_config = resolve_draft_config(resolved.config)
     layers = tuple(
         model_provider.resolve_capture_layers(cfg, draft_config, target_config)
     )
@@ -108,8 +102,7 @@ def resolve_offline_capture(
             f"integers, got {list(layers)!r}"
         )
 
-    text_config = getattr(target_config, "text_config", target_config)
-    target_layers = getattr(text_config, "num_hidden_layers", None)
+    target_layers = target_config.get("num_hidden_layers")
     if isinstance(target_layers, int) and any(
         layer >= target_layers for layer in layers
     ):
@@ -141,7 +134,13 @@ def build_application_run(
 ):
     """Build one executable run from the public config contract."""
 
-    resolved = run if isinstance(run, ResolvedRun) else resolve_run(run, registry)
+    from specforge.training.model_loading import training_target_config
+
+    if isinstance(run, ResolvedRun):
+        resolved = run
+    else:
+        target_config = training_target_config(run)
+        resolved = resolve_run(run, registry, target_config=target_config)
     from specforge.training.assembly import build_training_run
 
     return build_training_run(

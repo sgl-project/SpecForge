@@ -10,6 +10,7 @@ deferred release -> the streamer's customized output -> the tokenizer
 manager's ``meta_info`` -> the SpecForge adapter's result parsing.
 """
 
+import asyncio
 import ctypes
 import importlib.util
 import json
@@ -42,9 +43,13 @@ def _has_extension_points() -> bool:
         ):
             return False
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.managers.scheduler import Scheduler
     except Exception:
         return False
-    return "last_hidden_states" in LogitsProcessorOutput.__dataclass_fields__
+    return (
+        "last_hidden_states" in LogitsProcessorOutput.__dataclass_fields__
+        and hasattr(Scheduler, "defer_response")
+    )
 
 
 class FakeMooncakeStore:
@@ -71,60 +76,24 @@ class FakeMooncakeStore:
         self.objects.pop(key, None)
 
 
-class _Req:
-    """The request fields SGLang's streamer and the plugin read."""
+def _req(rid, prompt_len, spec=None):
+    from array import array
 
-    def __init__(self, rid, prompt_len, spec=None):
-        self.rid = rid
-        self.origin_input_ids = list(range(prompt_len))
-        custom_params = None if spec is None else {"spec_capture": json.dumps(spec)}
-        self.sampling_params = SimpleNamespace(
-            custom_params=custom_params,
-            stream_interval=None,
-            skip_special_tokens=True,
-            spaces_between_special_tokens=True,
-            no_stop_trim=False,
-        )
-        self.defer_output = False
-        self.http_worker_ipc = None
-        self.finished_reason = SimpleNamespace(to_json=lambda: {"type": "length"})
-        self.finished_output = False
-        self.finished_len = None
-        self.beam_group = None
-        self.stream = False
-        self.output_ids = [0]
-        self.output_ids_through_stop = self.output_ids
-        self.send_token_offset = 0
-        self.send_output_token_logprobs_offset = 0
-        self.send_decode_id_offset = 0
-        self.decoded_text = ""
-        self.reasoning_tokens = 0
-        self.cached_tokens = 0
-        self.cached_tokens_device = 0
-        self.cached_tokens_host = 0
-        self.cached_tokens_storage = 0
-        self.retraction_count = 0
-        self.time_stats = None
-        self.return_hidden_states = False
-        self.return_routed_experts = False
-        self.return_indexer_topk = False
-        self.return_sampling_mask = False
-        self.return_logprob = False
-        self.mm_image_tokens = 0
-        self.mm_audio_tokens = 0
-        self.mm_video_tokens = 0
-        self.multimodal_inputs = None
-        self.customized_info = None
-        self.weight_version_events = []
+    from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+    from sglang.srt.sampling.sampling_params import SamplingParams
 
-    def finished(self):
-        return True
-
-    def init_incremental_detokenize(self):
-        return self.output_ids_through_stop, 0
-
-    def check_match_stop_str_prefix(self):
-        return False
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q", range(prompt_len)),
+        sampling_params=SamplingParams(
+            max_new_tokens=0,
+            custom_params=None if spec is None else {"spec_capture": json.dumps(spec)},
+        ),
+    )
+    req.output_ids.append(0)
+    req.finished_reason = FINISH_LENGTH(0)
+    return req
 
 
 def _spec(sample_id):
@@ -160,7 +129,9 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
             ("get_serving", SimpleNamespace(stream_interval=1, weight_version="w")),
             (
                 "get_observability",
-                SimpleNamespace(enable_request_time_stats_logging=False),
+                SimpleNamespace(
+                    enable_request_time_stats_logging=False, enable_metrics=False
+                ),
             ),
         ):
             patcher = mock.patch(
@@ -172,10 +143,13 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
         enter_scope(self, published_topology(ranks={"dp_rank": 0}))
 
     def _scheduler(self, outputs, runtime):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.scheduler_components.output_streamer import (
             SchedulerOutputStreamer,
+        )
+        from sglang.srt.managers.scheduler_components.request_retirer import (
+            RequestRetirer,
         )
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from specforge_sglang_capture.capture import capture_streamer_class
@@ -185,24 +159,29 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
             tree_cache=None,
             server_args=SimpleNamespace(enable_lmcache=False),
             is_generation=True,
+            skip_tokenizer_init=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             disaggregation_mode=DisaggregationMode.NULL,
             enable_hicache_storage=lambda: False,
         )
         scheduler = object.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.output_streamer = streamer
-        scheduler.register_deferred_output_source(runtime.pending)
+        scheduler.request_retirer = object.__new__(RequestRetirer)
+        scheduler.init_deferred_responses()
+        runtime.defer_response = scheduler.defer_response
         streamer.spec_capture_results = runtime.results
         return scheduler
 
     def test_capture_is_published_then_returned_in_meta_info(self):
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        from sglang.srt.managers.io_struct import unwrap_from_pickle
+        from sglang.srt.managers.io_struct import GenerateReqInput, unwrap_from_pickle
         from sglang.srt.managers.scheduler_components.batch_result_processor import (
             SchedulerBatchResultProcessor,
         )
-        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
         from sglang.srt.managers.utils import GenerationBatchResult
+        from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
         from specforge_sglang_capture.capture import CaptureRuntime
         from specforge_sglang_capture.sink import SpecCaptureSink
 
@@ -212,12 +191,17 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
         sink = SpecCaptureSink(aux_layer_ids=[1, 3])
         sink._store, sink._put_config = store, object()
         runtime = CaptureRuntime(
-            sink=sink, is_writer=True, gpu_put=False, max_pending_batches=2
+            sink=sink,
+            is_writer=True,
+            gpu_put=False,
+            max_pending_batches=2,
+            defer_response=mock.Mock(),
         )
+        self.addCleanup(sink._executor.shutdown)
         outputs = []
         scheduler = self._scheduler(outputs, runtime)
 
-        reqs = [_Req("plain", 2), _Req("cap", 3, _spec("cap"))]
+        reqs = [_req("plain", 2), _req("cap", 3, _spec("cap"))]
         batch = SimpleNamespace(reqs=reqs)
         forward_batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_extend=lambda: True),
@@ -246,14 +230,14 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
 
         # Only the plain request streams while the capture is being written.
         self.assertEqual([o.rids for o in outputs], [["plain"]])
-        self.assertTrue(scheduler.has_pending_deferred_outputs())
+        self.assertTrue(scheduler.deferred_responses.has_pending())
 
         deadline = time.monotonic() + 30
         while not outputs[1:] and time.monotonic() < deadline:
-            scheduler.stream_released_deferred_outputs()
+            scheduler.deferred_responses.stream_released()
             time.sleep(0.01)
         self.assertEqual(outputs[1].rids, ["cap"])
-        self.assertFalse(scheduler.has_pending_deferred_outputs())
+        self.assertFalse(scheduler.deferred_responses.has_pending())
 
         # The objects hold the capture request's rows, byte for byte.
         def stored(name, like):
@@ -277,7 +261,13 @@ class TestCapturePluginOnSGLang(unittest.TestCase):
         # The response metadata the producer parses.
         meta_info = {}
         manager = object.__new__(TokenizerManager)
-        state = SimpleNamespace(customized_info_accumulated={})
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=GenerateReqInput(input_ids=[7, 8, 9]),
+            time_stats=APIServerReqTimeStats(),
+        )
         manager.update_request_meta_info(
             meta_info,
             state,

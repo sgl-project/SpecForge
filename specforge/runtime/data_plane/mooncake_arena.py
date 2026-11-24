@@ -78,7 +78,7 @@ class ArenaObjectClient:
             if not controls:
                 raise RuntimeError(
                     f"{server_url} does not advertise spec_capture_control; "
-                    "apply the current SGLang capture patch before NVLink capture"
+                    "install and enable the current SGLang capture plugin before NVLink capture"
                 )
         with self._lock:
             self._server_controls[server_url] = controls

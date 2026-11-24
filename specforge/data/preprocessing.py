@@ -42,6 +42,7 @@ from .parse import (
     GeneralParser,
     GLMParser,
     HarmonyParser,
+    MuseParser,
     ThinkingParser,
 )
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -153,6 +154,8 @@ def preprocess_conversations(
         parser = GLMParser(tokenizer, chat_template)
     elif chat_template.parser_type == "openai-harmony":
         parser = HarmonyParser(tokenizer, chat_template)
+    elif chat_template.parser_type == "muse":
+        parser = MuseParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
     kwargs_list = [{} for _ in range(len(conversations))]

@@ -39,6 +39,7 @@ class DisaggregatedDefaultsTest(unittest.TestCase):
                     deployment["receive_buffers"] = configured
                 cfg = Config.model_validate(
                     {
+                        "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                         "model": {"target_model_path": "target"},
                         "data": {"prompts_path": "prompts.jsonl"},
                         "deployment": {
@@ -52,6 +53,7 @@ class DisaggregatedDefaultsTest(unittest.TestCase):
     def test_legacy_environment_worker_uses_pinned_by_default(self):
         cfg = Config.model_validate(
             {
+                "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                 "model": {"target_model_path": "target"},
                 "data": {"hidden_states_path": "/features"},
             }
@@ -114,6 +116,7 @@ class MooncakeStoreTransportTest(unittest.TestCase):
         self.host = FakeHost(directory.name)
         self.cfg = Config.model_validate(
             {
+                "draft": "specforge/config/draft/presets/llama3-8B-eagle3.yaml",
                 "model": {"target_model_path": "target"},
                 "data": {"hidden_states_path": "/features"},
             }

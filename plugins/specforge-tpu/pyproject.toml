@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specforge-tpu"
+version = "0.1.0"
+description = "SpecForge platform plugin for torch_tpu training"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["specforge"]
+
+[project.entry-points."specforge.plugins"]
+tpu = "specforge_tpu:register"
+
+[tool.setuptools]
+packages = ["specforge_tpu"]

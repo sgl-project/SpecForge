@@ -10,9 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
 from specforge.training.disaggregated import _build_offline
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -40,8 +40,7 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
             model=SimpleNamespace(input_modality="text"),
             training=SimpleNamespace(
                 role="producer",
-                strategy="eagle3",
-                ttt_length=7,
+                objective_options={"ttt_length": 7},
             ),
             data=SimpleNamespace(
                 hidden_states_path="/features",

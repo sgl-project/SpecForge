@@ -3,7 +3,7 @@
   "collectionApi": "https://huggingface.co/api/collections/lmsys/specbundle",
   "title": "SpecBundle",
   "description": "A collection of production-grade draft models for speculative decoding",
-  "updated": "2026-09-04T06:31:50Z",
+  "updated": "2026-11-16T07:31:10Z",
   "models": [
     {
       "id": "lmsys/SGLang-EAGLE3-Llama-3.3-70B-Instruct-SpecForge",
@@ -543,6 +543,42 @@
       "likes": 3,
       "numParameters": 1738783617,
       "lastModified": "2026-07-22T18:34:46.000Z",
+      "gated": false
+    },
+    {
+      "id": "Piggy12/Qwen3.6-27B-DMTP",
+      "name": "Qwen3.6-27B-DMTP",
+      "provider": {
+        "name": "Piggy12",
+        "fullname": "Piggy12",
+        "avatar": null,
+        "type": "user"
+      },
+      "method": "DMTP",
+      "target": "Qwen/Qwen3.6-27B",
+      "dataset": "Huang2020/qwen3.6-27B-reasoning-regen",
+      "downloads": 0,
+      "likes": 1,
+      "numParameters": 1166809600,
+      "lastModified": "2026-11-16T07:21:02.000Z",
+      "gated": false
+    },
+    {
+      "id": "Piggy12/Qwen3.8-next-120b-dmtp",
+      "name": "Qwen3.8-next-120b-dmtp",
+      "provider": {
+        "name": "Piggy12",
+        "fullname": "Piggy12",
+        "avatar": null,
+        "type": "user"
+      },
+      "method": "DMTP",
+      "target": "Qwen/Qwen3.8-Flash-Next",
+      "dataset": null,
+      "downloads": 0,
+      "likes": 1,
+      "numParameters": 616177920,
+      "lastModified": "2026-11-16T07:06:14.000Z",
       "gated": false
     }
   ]

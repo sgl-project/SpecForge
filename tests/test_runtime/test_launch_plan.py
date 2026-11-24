@@ -6,27 +6,31 @@ from __future__ import annotations
 import functools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 from urllib.error import HTTPError
 
 from pydantic import ValidationError
 
-from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.cli import _config_for_role, main
 from specforge.config import Config, apply_overrides
+from specforge.config.draft.codec import encode_config
 from specforge.launch_plan import (
+    _SERVER_CAPTURE_REQUIREMENTS,
     CommandSpec,
     LaunchPlan,
     ReadinessSpec,
     ServiceSpec,
     _http_ready,
+    _managed_preflight,
     _managed_rdma_preflight,
     _spawn_command,
 )
@@ -34,6 +38,8 @@ from specforge.launch_plan import build_launch_plan as _build_launch_plan
 from specforge.launch_plan import run_commands
 from specforge.runtime.data_plane import mooncake_rdma
 from specforge.training.capture_contract import ServerCaptureContract
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_config.draft_fixtures import draft_config
 from tests.test_runtime.test_mooncake_rdma import FakeHost
 from tests.utils import wait_for_processes_to_stop
 
@@ -52,9 +58,30 @@ def _unexpected_rdma_devices(requested, *, defaulted, env):
     raise AssertionError("this plan must not resolve RDMA devices")
 
 
+def _installed_capture(*backends):
+    """Stand in for the capture-interpreter probe: only *backends* resolve."""
+    provided = {
+        name for backend in backends for name in _SERVER_CAPTURE_REQUIREMENTS[backend]
+    }
+
+    def probe(command, modules):
+        return [name for name in modules if name not in provided]
+
+    return probe
+
+
+def _unexpected_capture_probe(command, modules):
+    raise AssertionError("this plan must not probe the capture interpreter")
+
+
 def build_launch_plan(cfg, **kwargs):
-    """Build every test plan with one already-resolved registration."""
+    """Build every test plan with one already-resolved registration.
+
+    Capture interpreters default to SGLang with the plugin, so server_capture=auto
+    resolves to the plugin as it does for existing deployments.
+    """
     kwargs.setdefault("rdma_device_resolver", _fake_rdma_devices)
+    kwargs.setdefault("capture_module_probe", _installed_capture("plugin"))
     return _build_launch_plan(cfg, algorithm=ALGORITHM, **kwargs)
 
 
@@ -81,13 +108,14 @@ def _mooncake_clients(plan):
 
 def _config(*, mode="local_colocated", nproc=1, nnodes=1):
     raw = {
-        "model": {"target_model_path": "target", "draft_model_config": "draft"},
+        "model": {"target_model_path": "target"},
+        "draft": encode_config(draft_config()),
         "data": (
             {"prompts_path": "prompts.jsonl"}
             if mode == "disaggregated"
             else {"hidden_states_path": "features"}
         ),
-        "training": {"strategy": "dflash", "max_steps": 1},
+        "training": {"max_steps": 1},
         "deployment": {
             "mode": mode,
             "trainer": {
@@ -178,7 +206,9 @@ def _managed_plan(root):
                 0,
             ),
             ServiceSpec(
-                CommandSpec("capture-server-0", ("capture",)),
+                CommandSpec(
+                    "capture-server-0", (sys.executable, "-m", "sglang.launch_server")
+                ),
                 ReadinessSpec("http", "http://127.0.0.1:30000/health", 1),
                 os.path.join(log_dir, "capture.log"),
                 1,
@@ -238,6 +268,39 @@ class _FakeProcess:
 
 
 class LaunchPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            mock.patch(
+                "specforge.training.model_loading.training_target_config",
+                return_value=None,
+            )
+        )
+
+    def test_online_producer_plan_checks_dispatch_watermarks(self):
+        for policy in ("round_robin", "cost_balanced"):
+            with self.subTest(policy=policy):
+                raw = _config(mode="disaggregated", nproc=7).model_dump()
+                raw["training"]["accumulation_steps"] = 5
+                raw["runtime"].update(
+                    consumer_dispatch=policy,
+                    in_flight_high_watermark=48,
+                    in_flight_low_watermark=32,
+                )
+                cfg = Config.model_validate(raw)
+                with self.assertRaisesRegex(ValueError, "low watermark 32.*35 samples"):
+                    build_launch_plan(cfg, config_path="run.yaml", env=MOONCAKE_ENV)
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    env={**MOONCAKE_ENV, "DISAGG_IN_FLIGHT_LOW_WATERMARK": "35"},
+                )
+                build_launch_plan(
+                    cfg,
+                    config_path="run.yaml",
+                    env=MOONCAKE_ENV,
+                    requested_role="consumer",
+                )
+
     def test_cuda_receive_buffers_validate_effective_external_protocol(self):
         for configured, override, valid in (
             ("tcp", "rdma", True),
@@ -410,6 +473,7 @@ class LaunchPlanTest(unittest.TestCase):
                     algorithm=ALGORITHM,
                     config_path="run.yaml",
                     env={},
+                    capture_module_probe=_installed_capture("plugin"),
                 )
 
     def test_managed_rdma_without_usable_devices_names_the_opt_out(self):
@@ -968,6 +1032,33 @@ class LaunchPlanTest(unittest.TestCase):
 
         self.assertNotIn("--disable-radix-cache", plan.services[1].command.argv)
 
+    def test_managed_capture_servers_can_use_separate_python(self):
+        cfg = _managed_config(
+            "/fresh/managed-attempt",
+            servers=[
+                {"port": 30000, "cuda_visible_devices": ["0"]},
+                {
+                    "port": 30001,
+                    "cuda_visible_devices": ["1"],
+                    "python_executable": "/capture-venv/bin/python",
+                },
+            ],
+        )
+        plan = _build_managed(cfg.model_dump())
+
+        self.assertEqual(plan.services[1].command.argv[0], sys.executable)
+        self.assertEqual(
+            plan.services[2].command.argv[:3],
+            ("/capture-venv/bin/python", "-m", "sglang.launch_server"),
+        )
+        env = plan.services[2].command.env
+        self.assertIsNone(env["PYTHONPATH"])
+        self.assertIsNone(env["VIRTUAL_ENV"])
+        self.assertTrue(env["PATH"].startswith("/capture-venv/bin" + os.pathsep))
+        self.assertTrue(
+            all(command.argv[0] == sys.executable for command in plan.commands)
+        )
+
     def test_managed_local_gpu_put_override_can_disable_rdma_publication(self):
         servers = [
             {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
@@ -999,22 +1090,262 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(envs["capture-server-1"]["SGLANG_SPEC_CAPTURE_GPU_PUT"], "0")
         self.assertNotIn("SGLANG_SPEC_CAPTURE_GPU_PUT", envs["mooncake"])
 
-    def _managed_plan_for(self, server_capture):
+    def _managed_plan_for(self, server_capture=None, *, servers=None, **kwargs):
         with tempfile.TemporaryDirectory() as root:
-            raw = _managed_config(os.path.join(root, "attempt")).model_dump()
-            raw["deployment"]["disaggregated"]["server_capture"] = server_capture
+            raw = _managed_config(
+                os.path.join(root, "attempt"), servers=servers
+            ).model_dump()
+            if server_capture is not None:
+                raw["deployment"]["disaggregated"]["server_capture"] = server_capture
             cfg = Config.model_validate(raw)
+            kwargs.setdefault("env", {})
             with mock.patch(
                 "specforge.training.capture_contract.resolve_server_capture_contract",
                 return_value=CAPTURE_CONTRACT,
-            ):
-                return build_launch_plan(
+            ) as contract:
+                plan = build_launch_plan(
                     cfg,
                     config_path="run.yaml",
                     worker_prefix=("specforge",),
                     torchrun_prefix=("torchrun",),
-                    env={},
+                    **kwargs,
                 )
+            # Probing for auto reuses the one resolved capture contract.
+            contract.assert_called_once()
+            return plan
+
+    def _capture_preflight(self, plan):
+        """Run the managed preflight up to its capture checks."""
+        with (
+            mock.patch(
+                "specforge.launch_plan.shutil.which",
+                return_value="/usr/bin/mooncake_master",
+            ),
+            mock.patch(
+                "specforge.launch_plan.importlib.util.find_spec",
+                return_value=object(),
+            ),
+            mock.patch("specforge.launch_plan._managed_rdma_preflight"),
+        ):
+            _managed_preflight(replace(plan, managed_ports=(), preflight_checks=()))
+
+    def _assert_capture_flags(self, plan, server_capture):
+        producer = plan.commands[0]
+        captures = [
+            service.command
+            for service in plan.services
+            if service.command.label.startswith("capture-server-")
+        ]
+        self.assertTrue(captures)
+        for capture in captures:
+            if server_capture == "plugin":
+                self.assertIn("--enable-return-aux-hidden-states", capture.argv)
+                self.assertNotIn("--enable-spec-capture", capture.argv)
+                self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
+            else:
+                for flag in (
+                    "--enable-spec-capture",
+                    "--enable-return-aux-hidden-states",
+                    "--speculative-algorithm",
+                ):
+                    self.assertNotIn(flag, capture.argv)
+                self.assertNotIn("SPECFORGE_SPEC_CAPTURE", capture.env)
+        if server_capture is None:
+            self.assertNotIn("DISAGG_SERVER_CAPTURE", producer.env)
+        else:
+            self.assertEqual(producer.env["DISAGG_SERVER_CAPTURE"], server_capture)
+        self.assertNotIn("DISAGG_SERVER_CAPTURE", plan.commands[1].env)
+
+    def test_server_capture_defaults_to_auto(self):
+        cfg = _managed_config("/fresh/attempt")
+        self.assertEqual(cfg.deployment.disaggregated.server_capture, "auto")
+
+    def test_managed_auto_capture_resolves_to_the_installed_backend(self):
+        for installed, expected in ((("plugin",), "plugin"),):
+            with self.subTest(installed=installed):
+                plan = self._managed_plan_for(
+                    capture_module_probe=_installed_capture(*installed)
+                )
+
+                self.assertEqual(plan.server_capture, expected)
+                self.assertTrue(plan.server_capture_detected)
+                self.assertIsNone(plan.server_capture_error)
+                rendered = json.loads(plan.render())
+                self.assertEqual(rendered["server_capture"], expected)
+                self.assertTrue(rendered["server_capture_detected"])
+                self._assert_capture_flags(plan, expected)
+                with mock.patch(
+                    "specforge.launch_plan._missing_capture_modules",
+                    side_effect=AssertionError("planning already probed"),
+                ):
+                    self._capture_preflight(plan)
+
+    def test_managed_auto_capture_probes_every_server_interpreter(self):
+        servers = [
+            {
+                "port": 30000,
+                "cuda_visible_devices": ["0"],
+                "tp_size": 1,
+                "python_executable": "/envs/sglang-a/bin/python",
+            },
+            {
+                "port": 30001,
+                "cuda_visible_devices": ["1"],
+                "tp_size": 1,
+                "python_executable": "/envs/sglang-b/bin/python",
+            },
+        ]
+        probed = []
+
+        def probe(command, modules):
+            probed.append((command.label, command.argv[0], tuple(modules)))
+            return _installed_capture("plugin")(command, modules)
+
+        plan = self._managed_plan_for(servers=servers, capture_module_probe=probe)
+
+        self.assertEqual(plan.server_capture, "plugin")
+        requirements = tuple(
+            name for needed in _SERVER_CAPTURE_REQUIREMENTS.values() for name in needed
+        )
+        self.assertIn(
+            "sglang.srt.managers.deferred_output:ResponseCompletion", requirements
+        )
+        self.assertEqual(
+            probed,
+            [
+                ("capture-server-0", "/envs/sglang-a/bin/python", requirements),
+                ("capture-server-1", "/envs/sglang-b/bin/python", requirements),
+            ],
+        )
+
+    def test_managed_auto_capture_records_unresolved_backends(self):
+        two_servers = [
+            {"port": 30000, "cuda_visible_devices": ["0"], "tp_size": 1},
+            {"port": 30001, "cuda_visible_devices": ["1"], "tp_size": 1},
+        ]
+        plugin_only = _installed_capture("plugin")
+        no_plugin = _installed_capture()
+
+        def mixed(command, modules):
+            probe = plugin_only if command.label == "capture-server-0" else no_plugin
+            return probe(command, modules)
+
+        def without_mooncake(command, modules):
+            return ["mooncake.store", *plugin_only(command, modules)]
+
+        def uninspectable(command, modules):
+            raise RuntimeError("Cannot inspect capture-server-0 Python '/missing'")
+
+        cases = {
+            "mixed servers": (
+                two_servers,
+                mixed,
+                r"found no capture backend for capture-server-1",
+            ),
+            "neither installed": (
+                None,
+                _installed_capture(),
+                "found no capture backend for capture-server-0.*"
+                "specforge-sglang-capture plugin",
+            ),
+            "mooncake missing": (
+                None,
+                without_mooncake,
+                r"specforge-sglang-capture plugin.*missing \['mooncake.store'\]",
+            ),
+            "uninspectable": (None, uninspectable, "Cannot inspect capture-server-0"),
+        }
+        for name, (servers, probe, message) in cases.items():
+            with self.subTest(name):
+                plan = self._managed_plan_for(
+                    servers=servers, capture_module_probe=probe
+                )
+
+                self.assertEqual(plan.server_capture, "auto")
+                self.assertFalse(plan.server_capture_detected)
+                self.assertRegex(plan.server_capture_error, message)
+                rendered = json.loads(plan.render())
+                self.assertEqual(rendered["server_capture"], "auto")
+                self.assertEqual(
+                    rendered["server_capture_error"], plan.server_capture_error
+                )
+                self._assert_capture_flags(plan, None)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._capture_preflight(plan)
+
+    def test_explicit_server_capture_skips_the_probe(self):
+        for backend in ("plugin",):
+            for source in ("config", "env"):
+                with self.subTest(backend=backend, source=source):
+                    plan = self._managed_plan_for(
+                        backend if source == "config" else None,
+                        env=(
+                            {"DISAGG_SERVER_CAPTURE": backend}
+                            if source == "env"
+                            else {}
+                        ),
+                        capture_module_probe=_unexpected_capture_probe,
+                    )
+
+                    self.assertEqual(plan.server_capture, backend)
+                    self.assertFalse(plan.server_capture_detected)
+                    self._assert_capture_flags(plan, backend)
+                    # The preflight still checks an explicit choice.
+                    with mock.patch(
+                        "specforge.launch_plan._missing_capture_modules",
+                        return_value=[],
+                    ) as probe:
+                        self._capture_preflight(plan)
+                    probe.assert_called_once_with(
+                        plan.services[1].command,
+                        _SERVER_CAPTURE_REQUIREMENTS[backend],
+                    )
+
+    def test_explicit_config_server_capture_wins_over_the_env(self):
+        plan = self._managed_plan_for(
+            "plugin",
+            env={"DISAGG_SERVER_CAPTURE": "patch"},
+            capture_module_probe=_unexpected_capture_probe,
+        )
+        self._assert_capture_flags(plan, "plugin")
+
+        plan = self._managed_plan_for(
+            env={"DISAGG_SERVER_CAPTURE": "auto"},
+            capture_module_probe=_installed_capture("plugin"),
+        )
+        self._assert_capture_flags(plan, "plugin")
+
+        with self.assertRaisesRegex(ValueError, "DISAGG_SERVER_CAPTURE must be"):
+            self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "sidecar"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for(env={"DISAGG_SERVER_CAPTURE": "patch"})
+        with self.assertRaises(ValueError):
+            self._managed_plan_for("patch")
+
+    def test_producer_reads_the_exported_server_capture(self):
+        from specforge.training.disaggregated import _server_capture
+
+        auto = _managed_config("/fresh/attempt")
+        raw = auto.model_dump()
+        raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
+        explicit = Config.model_validate(raw)
+        # Legacy configs without deployment.disaggregated use the env contract.
+        legacy = _config()
+        self.assertIsNone(legacy.deployment.disaggregated)
+        for cfg, env, expected in (
+            # Unset: each adapter detects its server from /server_info.
+            (auto, {}, "auto"),
+            (legacy, {}, "auto"),
+            # A managed supervisor exports its resolution to the producer.
+            (auto, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+            (legacy, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+            (explicit, {"DISAGG_SERVER_CAPTURE": "plugin"}, "plugin"),
+        ):
+            with (
+                self.subTest(env=env, expected=expected),
+                mock.patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(_server_capture(cfg), expected)
 
     def test_managed_local_plugin_capture_renders_plugin_flags(self):
         plan = self._managed_plan_for("plugin")
@@ -1037,20 +1368,8 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--chunked-prefill-size") + 1], "-1")
         self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "1")
 
-    def test_managed_local_patch_capture_is_the_default(self):
-        plan = self._managed_plan_for("patch")
-
-        self.assertEqual(plan.server_capture, "patch")
-        capture = plan.services[1].command
-        self.assertIn("--enable-spec-capture", capture.argv)
-        self.assertNotIn("--enable-return-aux-hidden-states", capture.argv)
-        self.assertEqual(capture.env["SPECFORGE_SPEC_CAPTURE"], "0")
-
     def test_managed_capture_backend_overrides_inherited_plugin_switch(self):
-        for backend, inherited, expected in (
-            ("patch", "1", "0"),
-            ("plugin", "0", "1"),
-        ):
+        for backend, inherited, expected in (("plugin", "0", "1"),):
             with (
                 self.subTest(backend=backend),
                 mock.patch.dict(os.environ, {"SPECFORGE_SPEC_CAPTURE": inherited}),
@@ -1138,12 +1457,12 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertEqual(mooncake.readiness.kind, "mooncake")
         for index, service in enumerate(plan.services[1:]):
             argv = service.command.argv
-            self.assertIn("--enable-spec-capture", argv)
+            self.assertIn("--enable-return-aux-hidden-states", argv)
             self.assertIn("--disable-radix-cache", argv)
             self.assertEqual(argv[argv.index("--dtype") + 1], "float32")
             self.assertEqual(argv[argv.index("--download-dir") + 1], "/models/cache")
-            self.assertEqual(argv[argv.index("--spec-capture-method") + 1], "dflash")
-            layer_index = argv.index("--spec-capture-aux-layer-ids")
+            self.assertEqual(argv[argv.index("--speculative-algorithm") + 1], "DFLASH")
+            layer_index = argv.index("--return-aux-hidden-state-layer-ids")
             self.assertEqual(
                 argv[layer_index + 1 : layer_index + 6],
                 ("1", "9", "17", "25", "33"),
@@ -1471,10 +1790,6 @@ class LaunchPlanTest(unittest.TestCase):
 
     def test_passthrough_rejects_aliases_of_the_same_option(self):
         pairs = (
-            (
-                ("--smg-http-sidecar-port", "31000"),
-                ("--grpc-http-sidecar-port", "32000"),
-            ),
             (("--pp-size", "1"), ("--pipeline-parallel-size", "2")),
             (
                 ("--speculative-draft-model-path", "a"),
@@ -1557,7 +1872,7 @@ class LaunchPlanTest(unittest.TestCase):
                             server["extra_args"] = [second]
                         Config.model_validate(raw)
 
-    def test_flag_tables_match_the_pinned_sglang_parser(self):
+    def test_flag_tables_match_the_installed_sglang_parser(self):
         import argparse
 
         from sglang.srt.server_args import ServerArgs
@@ -1935,6 +2250,7 @@ class LaunchPlanTest(unittest.TestCase):
             raw = Config.model_validate(
                 _managed_raw(os.path.join(root, "attempt"))
             ).model_dump(mode="json")
+            raw["deployment"]["disaggregated"]["server_capture"] = "plugin"
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump(raw, stream)
             with (
@@ -1962,6 +2278,41 @@ class LaunchPlanTest(unittest.TestCase):
         error = payload["managed_rdma_error"]
         self.assertIn("no usable RDMA device was found on this host", error)
         warning.assert_called_once_with(f"warning: {error}", err=True)
+
+    def test_cli_plan_warns_when_auto_capture_does_not_resolve(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "run.json")
+            raw = Config.model_validate(
+                _managed_raw(os.path.join(root, "attempt"), protocol="tcp")
+            ).model_dump(mode="json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(raw, stream)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                # A host without the capture server's SGLang, such as a laptop.
+                mock.patch(
+                    "specforge.launch_plan._missing_capture_modules",
+                    side_effect=lambda command, modules: list(modules),
+                ),
+                mock.patch(
+                    "specforge.training.capture_contract."
+                    "resolve_server_capture_contract",
+                    return_value=CAPTURE_CONTRACT,
+                ),
+                mock.patch("specforge.launch_plan.run_commands") as run,
+                mock.patch("builtins.print") as output,
+                mock.patch("click.echo") as warning,
+            ):
+                self.assertEqual(main(["train", "-c", path, "--plan"]), 0)
+        run.assert_not_called()
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload["server_capture"], "auto")
+        error = payload["server_capture_error"]
+        self.assertIn("found no capture backend for capture-server-0", error)
+        warning.assert_called_once_with(
+            f"warning: {error}; the capture servers are shown without capture flags",
+            err=True,
+        )
 
     def test_cli_producer_projection_preserves_canonical_consumer_state(self):
         with tempfile.TemporaryDirectory() as root:
@@ -2241,7 +2592,10 @@ class LaunchPlanTest(unittest.TestCase):
         self.assertIn((capture.pid, signal.SIGTERM), signals)
         self.assertIn((mooncake.pid, signal.SIGTERM), signals)
 
-    def test_managed_preflight_rejects_an_occupied_port_before_spawning(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_an_occupied_port_before_spawning(
+        self, _capture_modules
+    ):
         with tempfile.TemporaryDirectory() as parent:
             root = os.path.join(parent, "attempt")
             port = 30000
@@ -2275,7 +2629,6 @@ class LaunchPlanTest(unittest.TestCase):
         cases = (
             ("plugin", "specforge_sglang_capture", "specforge-sglang-capture plugin"),
             ("plugin", "sglang.srt.managers.deferred_output", "deferred_output"),
-            ("patch", "sglang.srt.spec_capture_sink", "patched SGLang spec capture"),
         )
         for server_capture, missing, message in cases:
             with (
@@ -2296,6 +2649,81 @@ class LaunchPlanTest(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, message),
                 ):
                     run_commands(plan, popen=mock.Mock())
+
+    def test_managed_preflight_checks_the_capture_python_environment(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            python = root / "capture-python"
+            python.symlink_to(sys.executable)
+            packages = root / "packages"
+            for name in (
+                "mooncake/store",
+                "specforge_sglang_capture",
+                "sglang/srt/model_executor/forward_observer",
+                "sglang/srt/managers/deferred_output",
+            ):
+                package = packages / name
+                package.mkdir(parents=True, exist_ok=True)
+                (package / "__init__.py").touch()
+            (packages / "sglang" / "__init__.py").write_text(
+                "import os\n"
+                "assert os.environ['SPECFORGE_SPEC_CAPTURE'] == '0'\n"
+                "assert os.environ['CUDA_VISIBLE_DEVICES'] == ''\n"
+            )
+            deferred_output = packages / "sglang/srt/managers/deferred_output"
+            (deferred_output / "__init__.py").write_text(
+                "class ResponseCompletion:\n    pass\n"
+            )
+            plan = _managed_plan(str(root / "attempt"))
+            mooncake, capture = plan.services
+            capture = replace(
+                capture,
+                command=CommandSpec(
+                    capture.command.label,
+                    (str(python), "-m", "sglang.launch_server"),
+                    {
+                        "PYTHONPATH": str(packages),
+                        "SPECFORGE_SPEC_CAPTURE": "1",
+                        "CUDA_VISIBLE_DEVICES": "0",
+                    },
+                ),
+            )
+            plan = replace(
+                plan,
+                services=(mooncake, capture),
+                managed_ports=(),
+                server_capture="plugin",
+            )
+            with (
+                mock.patch(
+                    "specforge.launch_plan.shutil.which", return_value="mooncake_master"
+                ),
+                mock.patch(
+                    "specforge.launch_plan.importlib.util.find_spec",
+                    return_value=object(),
+                ),
+                mock.patch(
+                    "specforge.launch_plan._module_available",
+                    side_effect=AssertionError("must inspect the capture interpreter"),
+                ),
+            ):
+                _managed_preflight(plan)
+                # The earlier deferred-output revision lacks the completion API.
+                (deferred_output / "__init__.py").write_text(
+                    "class DeferredOutputSource:\n    pass\n"
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "capture-python.*deferred_output:ResponseCompletion"
+                ):
+                    _managed_preflight(plan)
+                shutil.rmtree(deferred_output)
+                with self.assertRaisesRegex(
+                    RuntimeError, "capture-python.*deferred_output"
+                ):
+                    _managed_preflight(plan)
+                python.unlink()
+                with self.assertRaisesRegex(RuntimeError, "python_executable"):
+                    _managed_preflight(plan)
 
     def _rdma_plan(self, root, *, server_env=None, memlock_bytes=None, protocol="rdma"):
         plan = _managed_plan(root)
@@ -2336,7 +2764,8 @@ class LaunchPlanTest(unittest.TestCase):
             finally:
                 popen.assert_not_called()
 
-    def test_managed_preflight_rejects_mooncake_tcp_overrides(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_rejects_mooncake_tcp_overrides(self, _capture_modules):
         with (
             tempfile.TemporaryDirectory() as parent,
             mock.patch(
@@ -2442,7 +2871,10 @@ class LaunchPlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "port 2 is not ACTIVE"):
                     _managed_rdma_preflight(self._rdma_plan(root))
 
-    def test_managed_preflight_requires_memlock_for_rdma_registration(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_requires_memlock_for_rdma_registration(
+        self, _capture_modules
+    ):
         with (
             tempfile.TemporaryDirectory() as parent,
             mock.patch(
@@ -2503,76 +2935,19 @@ class LaunchPlanTest(unittest.TestCase):
             getrlimit.assert_not_called()
 
     def test_managed_plan_defers_the_trainer_liger_import_check(self):
-        with tempfile.TemporaryDirectory() as root:
-            cfg = _managed_config(os.path.join(root, "attempt"))
-            raw = cfg.model_dump()
-            raw["model"]["use_liger_kernel"] = False
-            disabled = Config.model_validate(raw)
-            with (
-                mock.patch(
-                    "specforge.training.capture_contract.resolve_server_capture_contract",
-                    return_value=CAPTURE_CONTRACT,
-                ),
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config"
-                ) as resolve_draft_config,
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
-                disabled_plan = build_launch_plan(
-                    disabled, config_path="run.yaml", env={}
-                )
-                # Planning only records the check; the preflight runs it.
-                resolve_draft_config.assert_not_called()
-                self.assertEqual(1, len(plan.preflight_checks))
-                self.assertEqual(1, len(disabled_plan.preflight_checks))
-                # An explicit false never resolves the draft or imports Liger.
-                disabled_plan.preflight_checks[0]()
-            resolve_draft_config.assert_not_called()
-            load_liger.assert_not_called()
+        with mock.patch(
+            "specforge.training.model_loading.preflight_draft_kernels"
+        ) as resolve:
+            plan = _build_managed(_managed_raw("/unused"))
+            resolve.assert_not_called()
+            self.assertEqual(len(plan.preflight_checks), 1)
+            plan.preflight_checks[0]()
+            resolve.assert_called_once()
 
-            draft_config = mock.Mock(hidden_act="silu")
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="rocm",
-                ),
-                mock.patch.dict(
-                    sys.modules,
-                    {"liger_kernel": None, "liger_kernel.transformers": None},
-                ),
-                self.assertRaisesRegex(
-                    ImportError,
-                    r"resolved to true \(auto: DFlash on ROCm\) but Liger could "
-                    r'not be imported.*pip install --no-deps "liger-kernel>=',
-                ),
-            ):
-                plan.preflight_checks[0]()
-
-            draft_config.hidden_act = "gelu"
-            with (
-                mock.patch(
-                    "specforge.training.model_loading.resolve_draft_config",
-                    return_value=draft_config,
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                    return_value="cuda",
-                ),
-                mock.patch(
-                    "specforge.modeling.draft.dflash_kernels.load_liger_dflash_kernels"
-                ) as load_liger,
-            ):
-                plan.preflight_checks[0]()
-            load_liger.assert_not_called()
-
-    def test_managed_preflight_runs_trainer_checks_before_spawning(self):
+    @mock.patch("specforge.launch_plan._missing_capture_modules", return_value=[])
+    def test_managed_preflight_runs_trainer_checks_before_spawning(
+        self, _capture_modules
+    ):
         with tempfile.TemporaryDirectory() as parent:
             root = os.path.join(parent, "attempt")
             check = mock.Mock(side_effect=ImportError("liger missing"))
@@ -2601,43 +2976,17 @@ class LaunchPlanTest(unittest.TestCase):
             self.assertFalse(os.path.exists(root))
 
     def test_supervisor_runs_trainer_checks_before_spawning_either_role(self):
-        plan = build_launch_plan(
-            _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
-        )
-        self.assertEqual("supervisor", plan.kind)
-        self.assertEqual(1, len(plan.preflight_checks))
-
-        draft_config = mock.Mock(hidden_act="silu")
         popen = mock.Mock()
-        with (
-            mock.patch(
-                "specforge.training.model_loading.resolve_draft_config",
-                return_value=draft_config,
-            ),
-            mock.patch(
-                "specforge.modeling.draft.dflash_kernels.current_liger_platform",
-                return_value="cuda",
-            ),
-            mock.patch.dict(
-                sys.modules,
-                {"liger_kernel": None, "liger_kernel.transformers": None},
-            ),
-            self.assertRaisesRegex(
-                ImportError,
-                r"resolved to true \(auto: DFlash on CUDA\) but Liger could not "
-                r'be imported.*Install it \(pip install "liger-kernel>=',
-            ),
+        with mock.patch(
+            "specforge.training.model_loading.preflight_draft_kernels",
+            side_effect=RuntimeError("liger missing"),
         ):
-            run_commands(plan, popen=popen)
-        popen.assert_not_called()
-
-        # A plan built without a registration has nothing to check.
-        self.assertEqual(
-            (),
-            _build_launch_plan(
+            plan = build_launch_plan(
                 _config(mode="disaggregated"), config_path="run.yaml", env=MOONCAKE_ENV
-            ).preflight_checks,
-        )
+            )
+            with self.assertRaisesRegex(RuntimeError, "liger missing"):
+                run_commands(plan, popen=popen)
+        popen.assert_not_called()
 
     def test_mooncake_readiness_accepts_missing_key_but_rejects_server_errors(self):
         readiness = ReadinessSpec(

@@ -1,0 +1,234 @@
+"""Select a reader by configuration/format; run roots resolve by the run naming."""
+
+import glob
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+from specforge.config.draft import DraftConfig
+from specforge.config.draft.codec.target import validate_target
+from specforge.modeling.draft.hf_config import _METADATA, SpecForgeDraftConfig
+
+from .draft_dir import read_artifact_metadata
+from .tensors import TensorStore
+
+_ADAPTERS = {}
+# The package reads the canonical format only; this script lives outside it.
+_LEGACY_CONVERTER = "scripts/convert_legacy_checkpoint.py"
+
+
+def register_adapter(name, matches, read):
+    """Register config detection and a (config, weights, HF metadata) reader."""
+    if not isinstance(name, str) or not name or name in _ADAPTERS:
+        raise ValueError(f"invalid or duplicate checkpoint adapter: {name}")
+    if not callable(matches) or not callable(read):
+        raise TypeError("adapter detection and reader must be callable")
+    _ADAPTERS[name] = (matches, read)
+
+
+def resolve_run_directory(path: str) -> str:
+    """Resolve one unambiguous resume target to its checkpoint directory.
+
+    A run output directory is convenient in declarative configs, but it
+    must never choose between unrelated runs silently.  Prefer its single
+    complete ``*-latest`` pointer; when symlinks are unavailable, fall back
+    to the highest complete ``<run-id>-stepN`` directory only if all
+    candidates belong to the same run id.
+    """
+    path = str(path)
+    if path.startswith("file://"):
+        path = path[len("file://") :]
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.basename(path) == "training_state.pt":
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"checkpoint state file does not exist: {path}")
+        path = os.path.dirname(path)
+    if os.path.isfile(os.path.join(path, "training_state.pt")):
+        return path
+    if os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path} is not a training_state.pt; name the state file, its "
+            "checkpoint directory or the run root"
+        )
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"checkpoint path does not exist: {path}")
+
+    latest = []
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-latest")):
+        resolved = os.path.realpath(candidate)
+        if os.path.isfile(os.path.join(resolved, "training_state.pt")):
+            latest.append(resolved)
+    latest = sorted(set(latest))
+    if len(latest) == 1:
+        return latest[0]
+    if len(latest) > 1:
+        raise ValueError(
+            f"run root {path} contains multiple complete *-latest runs: "
+            f"{latest}; select one checkpoint explicitly"
+        )
+
+    by_run: dict[str, list[tuple[int, str]]] = {}
+    pattern = re.compile(r"^(.+)-step(\d+)$")
+    for candidate in glob.glob(os.path.join(glob.escape(path), "*-step*")):
+        match = pattern.match(os.path.basename(candidate))
+        if match and os.path.isfile(os.path.join(candidate, "training_state.pt")):
+            by_run.setdefault(match.group(1), []).append(
+                (int(match.group(2)), candidate)
+            )
+    if not by_run:
+        raise FileNotFoundError(f"no complete checkpoint found under {path}")
+    if len(by_run) > 1:
+        raise ValueError(
+            f"run root {path} contains multiple checkpoint runs: "
+            f"{sorted(by_run)}; select one checkpoint explicitly"
+        )
+    candidates = next(iter(by_run.values()))
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _is_run_root(path: Path) -> bool:
+    return any(
+        child.is_dir()
+        and (child.name.endswith("-latest") or re.fullmatch(r".+-step\d+", child.name))
+        for child in path.iterdir()
+    )
+
+
+def resolve_checkpoint_path(source, *, cache_dir=None, config_only=False):
+    """Resolve model directories and training run roots without choosing a run silently."""
+    path = resolve_directory(source, cache_dir=cache_dir, config_only=config_only)
+    # positive evidence only: config-less model dirs and config-only snapshots
+    # hold neither config.json nor weights at their root
+    if (
+        path.is_dir()
+        and not any(
+            (path / name).exists() for name in ("config.json", "training_state.pt")
+        )
+        and _is_run_root(path)
+    ):
+        path = Path(resolve_run_directory(str(path)))
+    return path
+
+
+def resolve_directory(source, *, cache_dir=None, config_only=False):
+    path = Path(str(source).removeprefix("file://")).expanduser()
+    if path.exists():
+        return path
+    if path.is_absolute() or str(source).startswith((".", "~", "file://")):
+        raise FileNotFoundError(path)
+    from huggingface_hub import snapshot_download
+
+    return Path(
+        snapshot_download(
+            str(source),
+            cache_dir=cache_dir,
+            allow_patterns=(
+                ["config.json"]
+                if config_only
+                else ["*.json", "*.safetensors", "*.bin", "training_state.pt"]
+            ),
+        )
+    )
+
+
+def read_json(source):
+    if isinstance(source, dict):
+        return dict(source)
+    return json.loads(Path(source).read_text())
+
+
+def read_target_config(source, *, cache_dir=None):
+    """Read target text metadata without adding Transformers defaults."""
+    return target_configuration(
+        resolve_directory(source, cache_dir=cache_dir, config_only=True)
+    )
+
+
+def target_configuration(directory):
+    config = read_json(Path(directory) / "config.json")
+    text = dict(config.get("text_config", config))
+    if "tie_word_embeddings" not in text and "tie_word_embeddings" in config:
+        text["tie_word_embeddings"] = config["tie_word_embeddings"]
+    # Some targets (LongCat) store their depth as num_layers only.
+    if "num_hidden_layers" not in text and "num_layers" in text:
+        text["num_hidden_layers"] = text["num_layers"]
+    return text
+
+
+@dataclass(frozen=True)
+class DraftCheckpoint:
+    config: DraftConfig
+    weights: dict
+    hf_metadata: dict
+    source: str
+
+
+def _canonical(payload, store, target):
+    shell = SpecForgeDraftConfig.from_dict(payload)
+    if target is not None:
+        validate_target(shell.draft, target)
+    metadata = {k: v for k, v in payload.items() if k in _METADATA}
+    return shell.draft, store.refs(), metadata
+
+
+register_adapter(
+    "canonical", lambda p: p.get("model_type") == "specforge_draft", _canonical
+)
+
+
+def _holds_weights(path):
+    return path.is_file() or any(
+        next(path.glob(pattern), None)
+        for pattern in ("*.safetensors", "*.bin", "training_state.pt")
+    )
+
+
+def read_checkpoint(
+    source,
+    *,
+    target_config=None,
+    adapter=None,
+    cache_dir=None,
+    check_target=True,
+):
+    path = resolve_checkpoint_path(source, cache_dir=cache_dir)
+    directory = path.parent if path.is_file() else path
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        if _holds_weights(path):
+            raise ValueError(
+                f"{directory} holds weights but no config.json, so it is not a "
+                "canonical SpecForge checkpoint; convert a historical checkpoint "
+                f"with {_LEGACY_CONVERTER} (--draft-config supplies its configuration)"
+            )
+        raise ValueError(
+            f"{directory} has no config.json; select a canonical checkpoint directory"
+        )
+    payload = read_json(config_path)
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint config must be an object")
+    artifact = read_artifact_metadata(payload)
+    if artifact and payload.get("model_type") != "specforge_draft":
+        raise ValueError("canonical artifact metadata contradicts its configuration")
+    matches = [name for name, (detect, _) in _ADAPTERS.items() if detect(payload)]
+    if adapter is not None:
+        if adapter not in matches:
+            raise ValueError(f"adapter {adapter!r} does not match checkpoint")
+        matches = [adapter]
+    if not matches:
+        raise ValueError(
+            f"{directory} is not a canonical SpecForge checkpoint: its config.json "
+            f"has model_type {payload.get('model_type')!r}, not 'specforge_draft'; "
+            f"convert a historical checkpoint with {_LEGACY_CONVERTER}"
+        )
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one checkpoint adapter, found {matches}; provide a canonical SpecForge checkpoint or a registered adapter"
+        )
+    store = TensorStore(path)
+    config, weights, metadata = _ADAPTERS[matches[0]][1](
+        payload, store, target_config if check_target else None
+    )
+    return DraftCheckpoint(config, weights, metadata, str(path))

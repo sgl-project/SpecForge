@@ -212,7 +212,15 @@ class FSDPTrainingBackend(TrainingBackend):
         all-gather them before every optimizer window without saving optimizer
         memory, which is the wrong trade-off for the current trainer recipes.
         """
-        modules = []
+        modules = list(getattr(model, "frozen_target_modules", ()))
+        if any(
+            parameter.requires_grad
+            for module in modules
+            for parameter in module.parameters()
+        ):
+            raise ValueError(
+                "frozen_target_modules must contain only frozen parameters"
+            )
         for name in ("lm_head", "embed_tokens"):
             module = getattr(model, name, None)
             if not isinstance(module, nn.Module):
@@ -294,7 +302,8 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
+                        buffer_dtype=torch.float32,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
@@ -464,20 +473,16 @@ class FSDPTrainingBackend(TrainingBackend):
         return {
             "torch": torch.get_rng_state(),
             "device_type": device_type,
-            # Named keys keep old CUDA checkpoints readable and make NPU state
-            # inspectable without understanding a new opaque payload.
             "cuda": accelerator_state if device_type == "cuda" else None,
             "npu": accelerator_state if device_type == "npu" else None,
         }
 
     @staticmethod
     def _set_rng_state(rng: dict) -> None:
+        if "device_type" not in rng:
+            raise ValueError("Checkpoint RNG state does not record device_type")
+        device_type = rng["device_type"]
         torch.set_rng_state(rng["torch"])
-        # ``device_type``/``npu`` are new. Falling back to the legacy ``cuda``
-        # key preserves every checkpoint written before NPU support.
-        device_type = rng.get("device_type")
-        if device_type is None:
-            device_type = "cuda" if rng.get("cuda") is not None else None
         state = rng.get(device_type) if device_type is not None else None
         module = getattr(torch, device_type, None) if device_type is not None else None
         if state is None or module is None or not module.is_available():

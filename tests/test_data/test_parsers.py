@@ -323,6 +323,25 @@ class TestTemplatePreprocessing(unittest.TestCase):
             "openai/gpt-oss-120b", "gpt-oss", messages=self.gpt_oss_messages
         )
 
+    def test_gpt_oss_ignores_extra_dataset_columns(self):
+        # build_eagle3_dataset forwards every extra dataset column (for
+        # example, the status field written by regenerate_train_data.py) to
+        # the parser as a keyword argument.
+        tokenizer = load_tokenizer("openai/gpt-oss-120b", trust_remote_code=True)
+        chat_template = TEMPLATE_REGISTRY.get("gpt-oss")
+        res = preprocess_conversations(
+            tokenizer,
+            self.gpt_oss_messages,
+            chat_template,
+            self.max_length,
+            status=["success"],
+        )
+
+        with open(self._get_ref_path("gpt-oss", "gpt-oss"), "r", encoding="utf-8") as f:
+            ref_data = json.load(f)
+        self.assertListEqual(res["input_ids"][0][0].tolist(), ref_data["input_ids"])
+        self.assertListEqual(res["loss_mask"][0][0].tolist(), ref_data["loss_mask"])
+
     def test_ling_flash_2_0(self):
         self._run_template_test("inclusionAI/Ling-flash-2.0", "ling-flash-2.0")
 

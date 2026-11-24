@@ -15,8 +15,8 @@ usable. A listed device that Mooncake cannot use, or that ``MC_TE_FILTERS``
 excludes, is dropped without a warning. SpecForge's own clients therefore never
 pass Mooncake an empty or unchecked list: they read sysfs, apply the per-device
 checks Mooncake applies on the port and GID index it will open, and raise with
-the reason for every rejected device. The patched SGLang capture server does
-not use this module; it only refuses an empty list.
+the reason for every rejected device. The SGLang capture plugin does not
+import this module; managed launchers check its environment before startup.
 
 Torch-free, so the launch supervisor can import it.
 """

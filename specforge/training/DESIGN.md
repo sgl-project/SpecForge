@@ -21,7 +21,7 @@ CLI; there is no second wrapper-owned training lifecycle.
 
 Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
 counting, interval checkpoints, and durable acknowledgements;
-`TrainerCore` owns one branch-free train step and the accumulation boundary;
+`TrainerCore` owns forward/backward scheduling and the accumulation boundary;
 `DraftTrainStrategy` owns model-specific validation, forward/loss, target
 projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
 backward, optimizer steps, distributed gradient norms, and full training state.
@@ -68,6 +68,13 @@ save, so CLI, builders, and Python callers cannot select a second loader-based
 training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
+DSpine gradient accumulation uses a graph-free CE prepass and
+`StepOutput.replay_loss` to share one detached, globally normalized alignment CE
+across the optimizer window. Replay retains CPU inputs and restores RNG state,
+adding a forward pass without retaining the window's activations. Each replayed
+forward/backward pair uses the backend accumulation context; only the last
+synchronizes DDP gradients. Evaluation and single-micro-batch training skip replay.
+
 Natural end-of-stream is accepted only at an optimizer boundary. If the final
 backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
 gradients or reporting a checkpoint as successful. Queue-mode loaders
@@ -101,6 +108,6 @@ not guarantees of throughput improvement.
 | `TrainerController` | `FeatureDataLoader.__iter__` | compute |
 | `TrainerController` | `TrainerCore.train_step` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
-| `TrainerCore` | `Eagle3TrainStrategy.forward_loss` | compute |
+| `TrainerCore` | `CanonicalTrainStrategy.forward_loss` | compute |
 | `TrainerCore` | `FSDPTrainingBackend.backward` | compute |
 | `TrainerCore` | `FSDPTrainingBackend.step` | compute |

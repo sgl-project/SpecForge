@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline capture is the only local SGLang version boundary."""
+"""Offline capture keeps SGLang internals in the server process."""
 
 import ast
 import os
 import subprocess
 import sys
+import textwrap
 import unittest
 
 _CAPTURE_DIR = os.path.normpath(
@@ -48,11 +49,8 @@ class OfflineSglangBoundaryTest(unittest.TestCase):
         code = (
             "import sys; "
             "import specforge.offline_capture; "
-            "import specforge.offline_capture.sglang_backend; "
             "assert 'torch' not in sys.modules; "
             "assert 'sglang' not in sys.modules; "
-            "assert 'specforge.offline_capture.sglang_backend.capture' "
-            "not in sys.modules"
         )
         subprocess.run(
             [sys.executable, "-c", code],
@@ -62,29 +60,43 @@ class OfflineSglangBoundaryTest(unittest.TestCase):
             text=True,
         )
 
-    def test_backend_package_does_not_eagerly_import_capture(self):
-        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "__init__.py")
-        with open(path, encoding="utf-8") as source:
-            tree = ast.parse(source.read(), filename=path)
-        eager_capture_imports = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom) and node.module == "capture"
-        ]
-        self.assertEqual(eager_capture_imports, [])
+    def test_offline_capture_round_trip_without_sglang(self):
+        # Exercise feature capture, file publication and resume with the real
+        # plugin sink and a fake transport. Any SGLang import must fail even
+        # when the test environment happens to have it installed.
+        code = textwrap.dedent(
+            """
+            import importlib.abc
+            import sys
+            import unittest
+
+            class NoSglang(importlib.abc.MetaPathFinder):
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "sglang" or fullname.startswith("sglang."):
+                        raise ModuleNotFoundError("offline client imported " + fullname)
+
+            sys.meta_path.insert(0, NoSglang())
+            suite = unittest.defaultTestLoader.loadTestsFromName(
+                "tests.test_offline_capture.test_client.OfflineCaptureTest."
+                "test_algorithms_round_trip_and_resume"
+            )
+            result = unittest.TextTestRunner().run(suite)
+            assert result.wasSuccessful()
+            assert not any(n == "sglang" or n.startswith("sglang.") for n in sys.modules)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.path.dirname(os.path.dirname(_CAPTURE_DIR)),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_public_wrapper_has_no_toplevel_sglang_import(self):
-        path = os.path.join(_CAPTURE_DIR, "sglang.py")
+        path = os.path.join(_CAPTURE_DIR, "client.py")
         self.assertEqual(_toplevel_sglang_imports(path), [])
-
-    def test_capture_backend_is_the_single_sglang_boundary(self):
-        path = os.path.join(_CAPTURE_DIR, "sglang_backend", "capture.py")
-        hits = _toplevel_sglang_imports(path)
-        self.assertTrue(
-            hits,
-            "OfflineSGLangCaptureBackend is the version-pinned boundary and should "
-            "own direct SGLang imports",
-        )
 
 
 if __name__ == "__main__":

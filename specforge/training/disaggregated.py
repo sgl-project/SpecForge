@@ -24,8 +24,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
-from specforge.config.schema import resolve_ref_watermarks
-from specforge.runtime.contracts import consumer_dispatch_quantum
+from specforge.config.schema import resolve_dispatch_watermarks
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -219,11 +218,12 @@ def _server_urls(cfg: Config) -> list[str]:
 
 
 def _server_capture(cfg: Config) -> str:
-    """Capture backend of the servers: deployment config, else DISAGG_SERVER_CAPTURE."""
-    deployment = cfg.deployment.disaggregated
-    if deployment is not None:
-        return deployment.server_capture
-    return os.environ.get("DISAGG_SERVER_CAPTURE", "patch")
+    """Capture backend of the servers: explicit deployment config, else
+    DISAGG_SERVER_CAPTURE (a managed supervisor exports its resolution), else
+    ``auto``, which each adapter detects from its server's /server_info."""
+    from specforge.launch_plan import requested_server_capture
+
+    return requested_server_capture(cfg, os.environ)
 
 
 def _consumer_database_path(cfg: Config) -> Optional[str]:
@@ -253,48 +253,6 @@ def _online_prompt_seed(cfg: Config) -> int:
     """Resolve prompt ordering independently while preserving old configs."""
     configured = getattr(cfg.training, "prompt_seed", None)
     return cfg.training.seed if configured is None else configured
-
-
-def _online_flow_window(cfg: Config) -> tuple[int, Optional[int]]:
-    """Resolve and validate producer ref watermarks before prompt preparation.
-
-    The consumer needs one or two complete optimizer windows before dispatch.
-    Validating this contract only after tokenizing/materializing prompts can
-    waste tens of minutes and many GiB for a large online dataset.
-    """
-    from specforge.runtime.control_plane.flow_control import FlowControlLimits
-
-    high, low = resolve_ref_watermarks(
-        cfg.runtime.in_flight_high_watermark, cfg.runtime.in_flight_low_watermark
-    )
-    limits = FlowControlLimits(
-        high_watermark_refs=high,
-        low_watermark_refs=low,
-        max_prompt_lease_per_worker=cfg.runtime.producer_lease,
-    )
-    trainer = cfg.deployment.trainer
-    consumer_quantum = consumer_dispatch_quantum(
-        cfg.runtime.consumer_dispatch,
-        trainer.nnodes
-        * trainer.nproc_per_node
-        * cfg.training.batch_size
-        * cfg.training.accumulation_steps,
-    )
-    if high < consumer_quantum:
-        raise ValueError(
-            "producer in-flight high watermark "
-            f"{high} is smaller than the consumer's dispatch "
-            f"quantum {consumer_quantum}; set "
-            "DISAGG_IN_FLIGHT_HIGH_WATERMARK to at least that value"
-        )
-    if limits.resolved_low_watermark_refs < consumer_quantum:
-        raise ValueError(
-            "producer in-flight low watermark "
-            f"{limits.resolved_low_watermark_refs} is smaller than the "
-            f"consumer's dispatch quantum {consumer_quantum}; "
-            "set DISAGG_IN_FLIGHT_LOW_WATERMARK to at least that value"
-        )
-    return high, low
 
 
 def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
@@ -477,7 +435,7 @@ def _build_offline(
                         cfg.model.input_modality
                     ).build_reader,
                     run_id=cfg.run_id,
-                    ttt_length=cfg.training.ttt_length,
+                    ttt_length=cfg.training.objective_options.get("ttt_length", 7),
                     max_len=cfg.data.max_length,
                     on_ref=tracked_refs.append,
                 )
@@ -552,7 +510,7 @@ def _build_offline(
         optimizer_factory=optimizer_factory(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
-        ttt_length=cfg.training.ttt_length,
+        ttt_length=cfg.training.objective_options.get("ttt_length", 7),
         max_len=cfg.data.max_length,
         batch_size=cfg.training.batch_size,
         accumulation_steps=accumulation_steps,
@@ -565,7 +523,7 @@ def _build_offline(
         logger=logger,
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         max_checkpoints=cfg.training.max_checkpoints,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -649,17 +607,16 @@ def _build_online(
 
         # This check is independent of dataset size. Keep it before tokenizer
         # loading and prompt preparation so an invalid window fails cheaply.
-        in_flight_high_watermark, in_flight_low_watermark = _online_flow_window(cfg)
+        in_flight_high_watermark, in_flight_low_watermark = resolve_dispatch_watermarks(
+            cfg
+        )
         input_adapter = streaming.create_input_adapter(cfg)
         input_tools = _load_input_tools(
             cfg,
             algorithm,
             input_adapter=input_adapter,
         )
-        draft_config = resolve_draft_config(
-            cfg,
-            provider=algorithm.providers.model.draft_config,
-        )
+        draft_config = resolve_draft_config(cfg)
         if input_adapter is None:
             prompts = prepare_prompts(
                 cfg,
@@ -852,12 +809,12 @@ def _build_online(
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
-        resume_from=cfg.training.resume_from,
+        resume_from=cfg.resume_path,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
         async_ack=_consumer_async_ack(cfg),
         consumer_dispatch=cfg.runtime.consumer_dispatch,
-        dispatch_num_anchors=cfg.training.num_anchors,
+        dispatch_num_anchors=cfg.training.objective_options.get("num_anchors", 512),
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

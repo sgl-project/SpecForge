@@ -162,9 +162,9 @@ Rank 0 uses four GPUs for TP4 ModelOpt-FP4 capture; rank 1 defaults to four
 FSDP trainer ranks. Override `TARGET_MODEL_PATH`, `SERVER_GPUS`,
 `TRAINER_GPUS`, or `TRAINER_NPROC` for another allocation. The launcher keeps
 the unified radix tree enabled and does not pass `--disable-radix-cache`.
-SGLang v0.5.18 includes the Inkling support from #31847. Install v0.5.18 in
-both nodes' environment; the wrapper applies SpecForge's checked-in v0.5.18
-capture patch before starting the server.
+Use a compatible SGLang build with Inkling support and install the
+[capture plugin](../../plugins/sglang-spec-capture/README.md) in the capture
+node environment. The wrapper checks the plugin APIs before starting servers.
 
 The Qwen3.8-27B DFlash2 variant runs eight TP1 capture servers on rank 0 and
 an eight-rank trainer on rank 1, with the Mooncake lease, segment sizes and
@@ -185,7 +185,7 @@ the measured throughput on B300 and H200 nodes.
 ## External and managed-local services
 
 Recipes under `online/disaggregated/external` require an already-running
-Mooncake deployment and patched SGLang capture server. Those services are not
+Mooncake deployment and SGLang capture server. Those services are not
 started or stopped by `specforge train`. Put stable, non-secret topology in the
 typed `deployment.disaggregated` section; inject authentication tokens, each
 node's Mooncake hostname, and device visibility through the deployment
