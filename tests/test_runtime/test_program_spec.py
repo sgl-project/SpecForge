@@ -71,6 +71,7 @@ class ProgramSpecTest(unittest.TestCase):
         # A block draft is sharded per decoder layer; EAGLE is one unit.
         self.assertEqual(specs["DFlashDraftModel"].partition.blocks, ("DecoderLayer",))
         self.assertEqual(specs["Eagle3DraftModel"].partition.blocks, ())
+        self.assertEqual(specs["Eagle3DraftModel"].axes, {})
         # In one order on every rank, whatever order the draft holds them in.
         _, peagle = build_runtime("PEagleDraftModel")
         for held in (
@@ -100,6 +101,13 @@ class ProgramSpecTest(unittest.TestCase):
         runtime.registration = None
         with self.assertRaisesRegex(ValueError, "without a registration"):
             program_spec(runtime)
+
+    def test_sequence_parallel_program_declares_part_axis(self):
+        from specforge.training.sequence_parallel import SequenceParallel
+
+        _, runtime = build_runtime("Eagle3DraftModel")
+        runtime.sequence_parallel = SequenceParallel(object(), object(), object())
+        self.assertEqual(program_spec(runtime).axes, {"sequence": "part"})
 
 
 class FrozenModulesTest(unittest.TestCase):

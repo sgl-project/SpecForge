@@ -139,19 +139,26 @@ def train_window(runner, batches, ctx=None):
 
 
 def build_single_rank_distributed(port="29561"):
+    """Make this process a one-rank job once and return its topology.
+
+    When the default group is already up (an earlier call or another test),
+    this returns the one-process topology over that group.
+    """
     import torch.distributed as dist
 
+    from specforge.distributed import Topology, init_distributed
+
     if dist.is_available() and dist.is_initialized():
-        return
+        # Only a one-rank default group matches the one-process topology.
+        assert dist.get_world_size() == 1, "the default group has more than one rank"
+        return Topology(device_type="cuda", world_group=dist.group.WORLD)
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", port)
     torch.cuda.set_device(0)
-    from specforge.distributed import init_distributed
-
-    init_distributed(timeout=10, tp_size=1)
+    return init_distributed(timeout=10, tp_size=1)
 
 
 def init_rank_distributed(
@@ -163,7 +170,7 @@ def init_rank_distributed(
     sp_ring_size=1,
     port="29571",
 ):
-    """Initialize one rank with the canonical target/draft topology.
+    """Initialize one rank with the canonical target/draft topology; return it.
 
     Defaults preserve the world-sized FSDP/DP layout used by the two-rank
     runtime tests. The explicit TP/SP arguments let the numerical parity gate
@@ -178,7 +185,7 @@ def init_rank_distributed(
     torch.cuda.set_device(rank)
     from specforge.distributed import init_distributed
 
-    init_distributed(
+    return init_distributed(
         timeout=60,
         tp_size=tp_size,
         sp_ulysses_size=sp_ulysses_size,
@@ -282,8 +289,16 @@ def build_offline_eagle3_loader(
 
 
 def load_eagle3(
-    config_path, target_dir, vocab_path, *, ttt=3, backend="sdpa", **options
+    config_path,
+    target_dir,
+    vocab_path,
+    *,
+    ttt=3,
+    backend="sdpa",
+    topology=None,
+    **options,
 ):
+    """The tiny EAGLE3 program; USP takes its groups from ``topology``."""
     from specforge.algorithms.objectives import build_objective_model
     from specforge.config.draft.codec import decode_config
     from specforge.modeling import build_draft_model
@@ -301,7 +316,7 @@ def load_eagle3(
     if backend == "usp":
         from specforge.training.sequence_parallel import sequence_parallel_groups
 
-        sequence_parallel = sequence_parallel_groups()
+        sequence_parallel = sequence_parallel_groups(topology)
     model = build_objective_model(
         draft,
         target_head=head.fc,

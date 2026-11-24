@@ -298,12 +298,11 @@ class DataParallelRunner:
         except Exception as error:
             raise RankFailure(f"{type(error).__name__}: {error}") from error
 
-    @staticmethod
-    def _first_rank() -> bool:
+    def _first_rank(self) -> bool:
         """Whether this is the process that writes a checkpoint's shared file."""
-        return not (dist.is_available() and dist.is_initialized()) or (
-            dist.get_rank() == 0
-        )
+        if not (dist.is_available() and dist.is_initialized()):
+            return True
+        return dist.get_rank(group=self.backend.process_group) == 0
 
     def load_resume(self, state: Mapping[str, Any]) -> None:
         self.backend.load_state_dict(state)
@@ -531,8 +530,9 @@ class DataParallelRunner:
             if not math.isfinite(denominator_value) or denominator_value <= 0:
                 raise ValueError("global loss denominator must be finite and positive")
         # new_full fills on the device; new_tensor would be a synchronizing H2D.
+        world_size = self._world_size()
         scale = (
-            denominator.new_full((), self._world_size() * window.accumulation_steps)
+            denominator.new_full((), world_size * window.accumulation_steps)
             / denominator
         )
         self.backend.scale_gradients(scale)
@@ -550,7 +550,7 @@ class DataParallelRunner:
             # would otherwise pull every other one there.
             device=self._device(),
             process_group=self.backend.process_group,
-            reduce=True,
+            reduce=world_size > 1,
             sums=window.sum_totals,
         )
         if grad_norm is not None:

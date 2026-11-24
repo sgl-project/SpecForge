@@ -42,6 +42,11 @@ def program_spec(model) -> ProgramSpec:
                 sorted(getattr(model.draft_model, "_no_split_modules", None) or ())
             )
         ),
+        axes=(
+            {"sequence": "part"}
+            if getattr(model, "sequence_parallel", None) is not None
+            else {}
+        ),
     )
 
 

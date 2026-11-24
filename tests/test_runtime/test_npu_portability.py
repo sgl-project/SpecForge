@@ -21,29 +21,6 @@ class _Mesh:
 
 
 class NPUDistributedTest(unittest.TestCase):
-    _GLOBAL_NAMES = (
-        "_DEVICE_MESH",
-        "_TP_DEVICE_MESH",
-        "_TP_GROUP",
-        "_DP_DEVICE_MESH",
-        "_DP_GROUP",
-        "_DRAFT_DP_GROUP",
-        "_DRAFT_SP_GROUP",
-        "_SP_ULYSSES_GROUP",
-        "_SP_RING_GROUP",
-    )
-
-    def setUp(self):
-        # This suite can run after a CUDA runtime gate in the same interpreter.
-        # Preserve its live groups while the NPU initializer is mocked.
-        self._saved_globals = {
-            name: getattr(sf_dist, name) for name in self._GLOBAL_NAMES
-        }
-
-    def tearDown(self):
-        for name, value in self._saved_globals.items():
-            setattr(sf_dist, name, value)
-
     def test_backend_mapping_is_device_specific(self):
         self.assertEqual(sf_dist._distributed_backend("cuda"), "nccl")
         self.assertEqual(sf_dist._distributed_backend("npu"), "hccl")
@@ -74,6 +51,14 @@ class NPUDistributedTest(unittest.TestCase):
         draft_mesh = _Mesh("draft")
         set_seq_parallel_pg = mock.Mock()
         process_group = SimpleNamespace(ULYSSES_PG="ulysses", RING_PG="ring")
+        # Rank 3 of a (dp 4, tp 2) mesh and of a (draft_dp 8, sp 1) mesh.
+        group_ranks = {
+            None: 3,
+            "target:tp": 1,
+            "target:dp": 1,
+            "draft:draft_dp": 3,
+            "draft:sp": 0,
+        }
 
         with (
             mock.patch.dict(os.environ, {"LOCAL_RANK": "3"}),
@@ -85,25 +70,25 @@ class NPUDistributedTest(unittest.TestCase):
                 side_effect=lambda **kwargs: events.append(("init", kwargs["backend"])),
             ) as init_pg,
             mock.patch.object(sf_dist.dist, "is_initialized", return_value=False),
-            mock.patch.object(sf_dist.dist, "get_rank", return_value=3),
+            mock.patch.object(
+                sf_dist.dist,
+                "get_rank",
+                side_effect=lambda group=None: group_ranks[group],
+            ),
             mock.patch.object(sf_dist.dist, "get_world_size", return_value=8),
+            mock.patch.object(sf_dist.dist, "group", SimpleNamespace(WORLD="world")),
             mock.patch.object(
                 sf_dist.dist.device_mesh,
                 "init_device_mesh",
                 side_effect=(target_mesh, draft_mesh),
             ) as init_mesh,
             mock.patch.object(
-                sf_dist.dist.DeviceMesh,
-                "from_group",
-                side_effect=("tp-mesh", "dp-mesh"),
-            ) as from_group,
-            mock.patch.object(
                 sf_dist,
                 "_load_yunchang_globals",
                 return_value=(process_group, set_seq_parallel_pg),
             ) as load_yunchang,
         ):
-            sf_dist.init_distributed(
+            topology = sf_dist.init_distributed(
                 timeout=7, tp_size=2, sp_ulysses_size=1, sp_ring_size=1
             )
 
@@ -113,65 +98,69 @@ class NPUDistributedTest(unittest.TestCase):
         self.assertEqual(init_mesh.call_args_list[0].args[:2], ("npu", (4, 2)))
         self.assertEqual(init_mesh.call_args_list[1].args[:2], ("npu", (8, 1)))
         self.assertEqual(
-            [call.kwargs["device_type"] for call in from_group.call_args_list],
-            ["npu", "npu"],
+            topology,
+            sf_dist.Topology(
+                rank=3,
+                world_size=8,
+                local_rank=3,
+                tp_size=2,
+                tp_rank=1,
+                dp_rank=1,
+                draft_dp_rank=3,
+                sp_rank=0,
+                device_type="npu",
+            ),
+        )
+        self.assertEqual(topology.world_group, "world")
+        self.assertEqual(
+            (topology.tp_group, topology.dp_group, topology.draft_dp_group),
+            ("target:tp", "target:dp", "draft:draft_dp"),
         )
         # SP sizes of 1 must not touch yunchang: its import probes CUDA and
-        # crashes NPU-only torch builds. The public SP getters must still
-        # return the singleton draft-SP group because PyTorch interprets a
-        # None group as the full WORLD group.
+        # crashes NPU-only torch builds. The SP groups must still be the
+        # singleton draft-SP group because PyTorch interprets a None group as
+        # the full WORLD group.
         load_yunchang.assert_not_called()
         set_seq_parallel_pg.assert_not_called()
-        self.assertEqual(sf_dist.get_draft_sp_group(), "draft:sp")
-        self.assertEqual(sf_dist.get_sp_ulysses_group(), "draft:sp")
-        self.assertEqual(sf_dist.get_sp_ring_group(), "draft:sp")
+        self.assertEqual(topology.draft_sp_group, "draft:sp")
+        self.assertEqual(topology.sp_ulysses_group, "draft:sp")
+        self.assertEqual(topology.sp_ring_group, "draft:sp")
 
 
 class DistributedTeardownTest(unittest.TestCase):
-    def test_destroy_clears_every_cached_group_and_mesh(self):
-        names = NPUDistributedTest._GLOBAL_NAMES
-        saved = {name: getattr(sf_dist, name) for name in names}
-        try:
-            for name in names:
-                setattr(sf_dist, name, object())
-            with (
-                mock.patch.object(sf_dist.dist, "is_initialized", return_value=True),
-                mock.patch.object(sf_dist.dist, "destroy_process_group"),
-            ):
-                sf_dist.destroy_distributed()
-            for name in names:
-                self.assertIsNone(getattr(sf_dist, name), name)
-        finally:
-            for name, value in saved.items():
-                setattr(sf_dist, name, value)
+    def test_destroy_tears_down_every_group_the_topology_holds(self):
+        groups = {
+            name: object()
+            for name in (
+                "world_group",
+                "tp_group",
+                "dp_group",
+                "draft_dp_group",
+                "draft_sp_group",
+                "sp_ulysses_group",
+                "sp_ring_group",
+            )
+        }
+        with mock.patch.object(sf_dist.dist, "destroy_process_group") as destroy:
+            sf_dist.destroy_distributed(sf_dist.Topology(**groups))
+        self.assertEqual(
+            {id(call.args[0]) for call in destroy.call_args_list},
+            {id(group) for group in groups.values()},
+        )
+        self.assertEqual(destroy.call_count, len(groups))
 
     def test_failure_teardown_aborts_each_distinct_process_group(self):
-        names = NPUDistributedTest._GLOBAL_NAMES
-        saved = {name: getattr(sf_dist, name) for name in names}
         subgroup = mock.Mock()
         world = mock.Mock()
-        try:
-            for name in names:
-                setattr(sf_dist, name, None)
-            sf_dist._TP_GROUP = subgroup
-            sf_dist._DP_GROUP = subgroup
-            with (
-                mock.patch.object(sf_dist.dist, "is_initialized", return_value=True),
-                mock.patch.object(
-                    sf_dist.dist,
-                    "group",
-                    SimpleNamespace(WORLD=world),
-                ),
-                mock.patch.object(sf_dist.dist, "destroy_process_group") as destroy,
-            ):
-                sf_dist.destroy_distributed(abort=True)
+        topology = sf_dist.Topology(
+            world_group=world, tp_group=subgroup, dp_group=subgroup
+        )
+        with mock.patch.object(sf_dist.dist, "destroy_process_group") as destroy:
+            sf_dist.destroy_distributed(topology, abort=True)
 
-            subgroup.abort.assert_called_once_with()
-            world.abort.assert_called_once_with()
-            destroy.assert_not_called()
-        finally:
-            for name, value in saved.items():
-                setattr(sf_dist, name, value)
+        subgroup.abort.assert_called_once_with()
+        world.abort.assert_called_once_with()
+        destroy.assert_not_called()
 
 
 class NPURNGTest(unittest.TestCase):

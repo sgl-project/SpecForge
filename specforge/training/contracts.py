@@ -85,6 +85,10 @@ class ProgramSpec:
     #: their denominators between each forward and its backward.
     reduction: Literal["window", "microbatch"] = "window"
     partition: PartitionHints = PartitionHints()
+    #: Model-parallel axes the program communicates on, by counting kind:
+    #: "copy" (same batch, count one rank), "part" (sharded sample, sum shards),
+    #: or "own" (disjoint batches with sharded parameters, sum all).
+    axes: Mapping[str, Literal["copy", "part", "own"]] = field(default_factory=dict)
 
 
 class TrainingProgram(Protocol):

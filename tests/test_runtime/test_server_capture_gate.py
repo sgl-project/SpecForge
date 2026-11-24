@@ -464,7 +464,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(
+        topology = fx.build_single_rank_distributed(
             port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
         )
         torch.manual_seed(0)
@@ -472,7 +472,7 @@ class TestServerCaptureGate(unittest.TestCase):
         vocab_path = fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
         model = fx.load_eagle3(config_path, self.target_dir, vocab_path, ttt=3)
         dm = model.draft_model
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDPTrainingBackend(ParallelConfig.from_topology(topology))
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(
             BF16Optimizer(

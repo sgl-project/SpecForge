@@ -42,7 +42,7 @@ def _direct_offline_loss(model, target_head, batch) -> float:
 @unittest.skipUnless(CUDA, "offline EAGLE3 parity requires CUDA")
 class TestEquivOfflineEagle3(unittest.TestCase):
     def test_feature_files_match_direct_objective_through_trainer_fit(self):
-        fx.build_single_rank_distributed(port="29555")
+        topology = fx.build_single_rank_distributed(port="29555")
         from specforge.launch import build_offline_runtime
 
         previous_deterministic = torch.are_deterministic_algorithms_enabled()
@@ -71,6 +71,7 @@ class TestEquivOfflineEagle3(unittest.TestCase):
 
                 logged = []
                 trainer = build_offline_runtime(
+                    topology=topology,
                     algorithm=ALGORITHM,
                     hidden_states_path=feature_dir,
                     draft_model=model,

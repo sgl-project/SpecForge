@@ -398,7 +398,7 @@ def _raise_flex_recompile_limit():
     dynamo.config.recompile_limit = max(dynamo.config.recompile_limit, 64)
 
 
-def build_bundle(cfg, algorithm):
+def build_bundle(cfg, algorithm, topology):
     import torch
 
     from specforge.algorithms.common.providers import (
@@ -554,7 +554,7 @@ def build_bundle(cfg, algorithm):
     if cfg.training.attention_backend == "usp":
         from .sequence_parallel import sequence_parallel_groups
 
-        sequence_parallel = sequence_parallel_groups()
+        sequence_parallel = sequence_parallel_groups(topology)
     runtime = build_objective_model(
         model,
         **_objective_settings(cfg),

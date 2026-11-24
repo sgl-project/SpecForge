@@ -156,6 +156,8 @@ class DSpineAccumulationTest(unittest.TestCase):
             controller = TrainerController(
                 runner,
                 strategy_name=runner.spec.name,
+                rank=0,
+                world_size=1,
                 accumulation_steps=2,
                 run_id="dspine-evaluation",
                 output_dir=directory,
@@ -233,6 +235,8 @@ class DSpineAccumulationTest(unittest.TestCase):
             controller = TrainerController(
                 runner,
                 strategy_name=runner.spec.name,
+                rank=0,
+                world_size=1,
                 accumulation_steps=2,
                 run_id="dspine-incomplete",
                 output_dir=tmp_path,

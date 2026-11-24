@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
-from typing import Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
 
@@ -37,6 +37,9 @@ from specforge.training.checkpoint import CheckpointManager
 from specforge.training.contracts import ProgramSpec, RankFailure
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +79,9 @@ class Trainer:
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
-        tp_size: int = 1,
-        sp_ulysses_size: int = 1,
-        sp_ring_size: int = 1,
+        topology: Topology,
+        fsdp_sharding: str = "SHARD_GRAD_OP",
+        ddp_bucket_cap_mb: Optional[float] = None,
         dataloader_num_workers: int = 0,
         profiling_options=None,
         fit_context=None,
@@ -248,9 +251,9 @@ class Trainer:
             "accumulation_steps": accumulation_steps,
             "num_epochs": num_epochs,
             "effective_total_steps": effective_total_steps,
-            "tp_size": tp_size,
-            "sp_ulysses_size": sp_ulysses_size,
-            "sp_ring_size": sp_ring_size,
+            "tp_size": topology.tp_size,
+            "sp_ulysses_size": topology.sp_ulysses_size,
+            "sp_ring_size": topology.sp_ring_size,
         }
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
@@ -288,11 +291,8 @@ class Trainer:
                     f"checkpoint {resume_from} was written by strategy "
                     f"{saved_strategy!r}; this run trains {algorithm_name!r}"
                 )
-            import torch.distributed as dist
-
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
             resume_contract = {
-                "world_size": world_size,
+                "world_size": topology.world_size,
                 **persisted_contract,
             }
             saved_options = state.get("canonical_objective_options")
@@ -479,10 +479,10 @@ class Trainer:
             # drop the full draft state before the wrap
             del state, saved_weights
 
-        parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
+        parallel = ParallelConfig.from_topology(
+            topology,
+            sharding_strategy=fsdp_sharding,
+            ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
         backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
         # FSDP-wrap the composite model and build the optimizer over the inner draft
@@ -528,10 +528,10 @@ class Trainer:
         controller_obj = TrainerController(
             runner,
             strategy_name=algorithm_name,
+            rank=topology.rank,
+            world_size=topology.world_size,
             accumulation_steps=accumulation_steps,
-            data_parallel_size=max(
-                1, parallel.world_size // (parallel.tp_size * parallel.sp_size)
-            ),
+            data_parallel_size=topology.data_parallel_size,
             run_id=run_id,
             output_dir=output_dir,
             num_epochs=num_epochs,

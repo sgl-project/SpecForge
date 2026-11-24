@@ -30,11 +30,14 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 
 @dataclass
@@ -154,9 +157,11 @@ def _load_input_tools(
     return _load_text_tokenizer(cfg)
 
 
-def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
+def build_model_bundle(
+    cfg: Config, *, algorithm: AlgorithmRegistration, topology: Topology
+) -> ModelBundle:
     """Build the resolved canonical model, objective and frozen target pieces."""
-    return algorithm.providers.model.build_bundle(cfg, algorithm)
+    return algorithm.providers.model.build_bundle(cfg, algorithm, topology)
 
 
 class _ConfiguredOptimizerFactory:
@@ -465,6 +470,7 @@ def _common_launch_kwargs(
     bundle: ModelBundle,
     algorithm: AlgorithmRegistration,
     *,
+    topology: Topology,
     logger=_logger,
 ) -> Dict[str, Any]:
     t = cfg.training
@@ -490,9 +496,9 @@ def _common_launch_kwargs(
         logger=logger,
         log_interval=t.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        tp_size=t.tp_size,
-        sp_ulysses_size=t.sp_ulysses_size,
-        sp_ring_size=t.sp_ring_size,
+        topology=topology,
+        fsdp_sharding=t.fsdp_sharding,
+        ddp_bucket_cap_mb=t.ddp_bucket_cap_mb,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
@@ -502,19 +508,31 @@ def build_training_run(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    topology: Optional[Topology] = None,
 ) -> TrainingRun:
     """Assemble one validated run from an already-resolved algorithm.
 
     Offline training may run in one process or with a disaggregated feature
     source.  Online training is always disaggregated and captures through
     external SGLang servers; colocated online execution is intentionally absent.
+    ``topology`` is the job's shape; only a producer runs without one.
     """
 
     t = cfg.training
     if t.role != "producer":
-        import torch.distributed as dist
-
-        cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
+        if topology is None:
+            raise ValueError(
+                "training needs the job's topology from init_distributed; "
+                "only a producer runs without one"
+            )
+        cfg.validate_world_size(topology.world_size)
+        configured = (t.tp_size, t.sp_ulysses_size, t.sp_ring_size)
+        built = (topology.tp_size, topology.sp_ulysses_size, topology.sp_ring_size)
+        if built != configured:
+            raise ValueError(
+                f"the topology has (tp, ulysses, ring) = {built} but the run "
+                f"configures {configured}"
+            )
 
     if cfg.mode == "online" and cfg.deployment.mode != "disaggregated":
         raise ValueError(
@@ -531,8 +549,9 @@ def build_training_run(
             return build_disaggregated_run(
                 cfg,
                 algorithm=algorithm,
+                topology=topology,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
-                    run_cfg, algorithm=algorithm
+                    run_cfg, algorithm=algorithm, topology=topology
                 ),
                 preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
@@ -553,7 +572,7 @@ def build_training_run(
     if cfg.mode != "offline":
         raise ValueError("colocated execution supports offline training only")
 
-    bundle = build_model_bundle(cfg, algorithm=algorithm)
+    bundle = build_model_bundle(cfg, algorithm=algorithm, topology=topology)
     from specforge.launch import build_offline_runtime
 
     _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
@@ -574,6 +593,7 @@ def build_training_run(
                 cfg,
                 bundle,
                 algorithm,
+                topology=topology,
                 logger=run_logger,
             ),
         )

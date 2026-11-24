@@ -194,6 +194,8 @@ class TrainerController:
         runner: StepRunner,
         *,
         strategy_name: str,
+        rank: int,
+        world_size: int,
         accumulation_steps: int = 1,
         data_parallel_size: int = 1,
         run_id: str,
@@ -228,6 +230,9 @@ class TrainerController:
         self.runner = runner
         # Recorded in every checkpoint and checked on resume.
         self.strategy_name = strategy_name
+        # This process's place in the job, from its topology.
+        self.rank = rank
+        self.world_size = world_size
         # Micro-batches per optimizer update.
         self.accumulation_steps = max(1, accumulation_steps)
         # Ranks that receive different samples; scales the logged throughput.
@@ -308,9 +313,7 @@ class TrainerController:
             self.max_steps is not None and self.global_step >= self.max_steps
         ):
             return None
-        import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        if self.rank != 0:
             return None
         from tqdm import tqdm
 
@@ -632,16 +635,11 @@ class TrainerController:
         ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
         return Evaluator().run(self.runner, data, ctx)
 
-    @staticmethod
-    def _rank0_decision(flag: bool) -> bool:
+    def _rank0_decision(self, flag: bool) -> bool:
         """Broadcast rank0's verdict for a collective-bearing branch."""
-        if (
-            not torch.distributed.is_available()
-            or not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() == 1
-        ):
+        if self.world_size == 1:
             return bool(flag)
-        box = [bool(flag)] if torch.distributed.get_rank() == 0 else [False]
+        box = [bool(flag)] if self.rank == 0 else [False]
         torch.distributed.broadcast_object_list(box, src=0)
         return bool(box[0])
 
@@ -694,11 +692,7 @@ class TrainerController:
                 "epoch_samples": self._epoch_samples,
                 "strategy": self.strategy_name,
                 "run_id": self.run_id,
-                "world_size": (
-                    torch.distributed.get_world_size()
-                    if torch.distributed.is_initialized()
-                    else 1
-                ),
+                "world_size": self.world_size,
                 **self.checkpoint_extra,
             }
             if "canonical_loss_implementations" in shared:

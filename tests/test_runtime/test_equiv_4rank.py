@@ -36,17 +36,18 @@ def _has_standard_flash_attention() -> bool:
     return True
 
 
-def _build_model(workdir: str, attention_backend: str):
+def _build_model(workdir: str, attention_backend: str, topology):
     return fx.load_eagle3(
         os.path.join(workdir, "draft.json"),
         os.path.join(workdir, "target"),
         os.path.join(workdir, "vm.pt"),
         backend=attention_backend,
+        topology=topology,
     )
 
 
 def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
-    fx.init_rank_distributed(
+    topology = fx.init_rank_distributed(
         rank,
         world_size,
         tp_size=1,
@@ -57,7 +58,6 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     try:
         import torch.distributed as dist
 
-        from specforge.distributed import get_draft_sp_group, get_tp_group
         from specforge.launch import _shard_offline_refs, build_offline_runtime
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
@@ -68,8 +68,8 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         torch.cuda.manual_seed_all(0)
         torch.use_deterministic_algorithms(True, warn_only=True)
 
-        reference_model = _build_model(workdir, "sdpa")
-        usp_model = _build_model(workdir, "usp")
+        reference_model = _build_model(workdir, "sdpa", topology)
+        usp_model = _build_model(workdir, "usp", topology)
         usp_model.load_state_dict(reference_model.state_dict())
         target_head = TargetHead.from_pretrained(
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
@@ -85,6 +85,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         ).read()
         rank_refs = _shard_offline_refs(
             source_refs,
+            topology=topology,
             use_usp_preprocess=True,
             seed=0,
             epoch=0,
@@ -143,9 +144,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             accumulation_steps=2,
             num_epochs=1,
             max_steps=1,
-            tp_size=1,
-            sp_ulysses_size=2,
-            sp_ring_size=1,
+            topology=topology,
             use_usp_preprocess=True,
             seed=0,
             logger=lambda metrics, step: logged.append((step, dict(metrics))),
@@ -155,15 +154,14 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         if len(logged) != 1:
             raise AssertionError(f"rank {rank} expected one logged step, got {logged}")
 
-        topology = trainer.backend.parallel_config
         result = {
             "rank": rank,
             "step": step,
-            "world_size": topology.world_size,
+            "world_size": trainer.backend.parallel_config.world_size,
             "tp_size": topology.tp_size,
             "sp_size": topology.sp_size,
-            "tp_group_size": dist.get_world_size(get_tp_group()),
-            "draft_sp_group_size": dist.get_world_size(get_draft_sp_group()),
+            "tp_group_size": dist.get_world_size(topology.tp_group),
+            "draft_sp_group_size": dist.get_world_size(topology.draft_sp_group),
             "reference_loss": float(expected_loss.item()),
             "usp_loss": float(logged[0][1]["loss"]),
             "grad_norm": float(logged[0][1]["grad_norm"]),
@@ -173,7 +171,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
     finally:
         from specforge.distributed import destroy_distributed
 
-        destroy_distributed()
+        destroy_distributed(topology)
 
 
 @unittest.skipUnless(

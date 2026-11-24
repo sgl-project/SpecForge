@@ -24,7 +24,7 @@ BS_FIXTURE = WORLD * BS  # distinct samples for every rank
 def _worker(rank, world_size, workdir, results_dir):
     from tests.test_runtime import _fixtures as fx
 
-    fx.init_rank_distributed(rank, world_size, port="29581")
+    topology = fx.init_rank_distributed(rank, world_size, port="29581")
 
     from specforge.optimizer import BF16Optimizer
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
@@ -64,7 +64,7 @@ def _worker(rank, world_size, workdir, results_dir):
             m, lr=1e-3, max_grad_norm=0.5, warmup_ratio=0.0, total_steps=10
         )
 
-    pc = ParallelConfig.from_distributed()
+    pc = ParallelConfig.from_topology(topology)
 
     # Path A: no_sync via the runner's accumulation window (reduce once, on the
     # boundary).

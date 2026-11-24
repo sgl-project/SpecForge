@@ -77,9 +77,10 @@ scan does not stop it from reaching through it), a decision taken from
 Every module that breaks a rule today is listed in the test with the reason
 and with each forbidden name it reaches and how many times; one use more or
 one fewer fails. Three are the sequence-parallel axis (the cached rollout,
-ring attention), whose groups share a sequence and never samples. Four are the run
+ring attention), whose groups share a sequence and never samples. Three are the run
 loop's own uses of the process group (`controller.py`, `checkpoint.py`,
-`profiling.py`, `trainer.py`). The design moves the reads to a topology value
+`profiling.py`). `controller.py` and `trainer.py` take ranks and the world size
+from the job's `Topology`; the design moves the remaining reads to that value
 and the error gathers to `runner.agree`; rank 0's two broadcast verdicts
 (whether an evaluation runs, whether a checkpoint is the best) need either a
 way to distribute a decision or every rank computing it, which the contract
