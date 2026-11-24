@@ -272,12 +272,12 @@ def distillation_loss(compute):
 for _name, _compute in {
     "renyi_half": distribution.renyi_half,
     "neg_log_overlap": distribution.neg_log_overlap,
-    "kl": fused_loss.kl_div_loss,
-    "reverse_kl": fused_loss.reverse_kl_div_loss,
-    "js": fused_loss.js_div_loss,
-    "tv": fused_loss.tv_loss,
-    "nla": fused_loss.neg_log_acceptance_loss,
-    "lk": fused_loss.lk_hybrid_loss,
+    "kl": distribution.kl_div_loss,
+    "reverse_kl": distribution.reverse_kl_div_loss,
+    "js": distribution.js_div_loss,
+    "tv": distribution.tv_loss,
+    "nla": distribution.neg_log_acceptance_loss,
+    "lk": distribution.lk_hybrid_loss,
 }.items():
     register_loss(_name, requires=("logits", "labels", "teacher_logits"))(
         distillation_loss(_compute)
