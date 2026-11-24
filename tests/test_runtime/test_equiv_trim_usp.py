@@ -104,7 +104,7 @@ def _write_workdir(workdir):
 def _worker(rank, world_size, port, workdir):
     from tests.test_runtime import _fixtures as fx
 
-    fx.init_rank_distributed(
+    topology = fx.init_rank_distributed(
         rank, world_size, tp_size=1, sp_ulysses_size=1, sp_ring_size=4, port=str(port)
     )
     try:
@@ -126,6 +126,7 @@ def _worker(rank, world_size, port, workdir):
             os.path.join(workdir, "vocab_mapping.pt"),
             backend="usp",
             ttt=TTT,
+            topology=topology,
         )
         model.train()
         algorithm = builtin_algorithm_registry(ttt_length=TTT).resolve("eagle3")
@@ -145,7 +146,11 @@ def _worker(rank, world_size, port, workdir):
                 batch_size=1,
                 collate_fn=provider.build_collator(),
                 per_sample_transform=provider.build_normalizer(
-                    SEQ, ttt_length=TTT, use_usp_preprocess=True
+                    SEQ,
+                    ttt_length=TTT,
+                    use_usp_preprocess=True,
+                    sp_rank=topology.sp_rank,
+                    sp_size=topology.sp_size,
                 ),
                 strategy=algorithm.name,
             )
@@ -179,7 +184,7 @@ def _worker(rank, world_size, port, workdir):
     finally:
         from specforge.distributed import destroy_distributed
 
-        destroy_distributed()
+        destroy_distributed(topology)
 
 
 @unittest.skipUnless(

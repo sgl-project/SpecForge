@@ -1,10 +1,13 @@
 """Sequence-parallel process groups and detached loss statistics."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 
 def reduce_statistics(accepted, count, denominator, *, group):
@@ -47,16 +50,10 @@ class SequenceParallel:
         )
 
 
-def sequence_parallel_groups() -> SequenceParallel:
-    """This process's sequence-parallel groups, as ``init_distributed`` built them."""
-    from specforge.distributed import (
-        get_draft_sp_group,
-        get_sp_ring_group,
-        get_sp_ulysses_group,
-    )
-
+def sequence_parallel_groups(topology: "Topology") -> SequenceParallel:
+    """This process's sequence-parallel groups, as the job's topology holds them."""
     return SequenceParallel(
-        ring_group=get_sp_ring_group(),
-        ulysses_group=get_sp_ulysses_group(),
-        sequence_group=get_draft_sp_group(),
+        ring_group=topology.sp_ring_group,
+        ulysses_group=topology.sp_ulysses_group,
+        sequence_group=topology.draft_sp_group,
     )

@@ -141,7 +141,7 @@ def _train(resolved) -> int:
 
     _bootstrap_single_process_env()
     _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
-    init_distributed(
+    topology = init_distributed(
         timeout=cfg.training.dist_timeout,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -149,17 +149,15 @@ def _train(resolved) -> int:
     )
     failed = True
     try:
-        import torch.distributed as dist
-
-        _validate_world_size(cfg, dist.get_world_size())
+        _validate_world_size(cfg, topology.world_size)
         from specforge.application import build_application_run
 
-        result = build_application_run(resolved).run()
+        result = build_application_run(resolved, topology=topology).run()
         failed = False
         return result
     finally:
         # On failure abort instead of collectively destroying; see destroy_distributed.
-        destroy_distributed(abort=failed)
+        destroy_distributed(topology, abort=failed)
 
 
 def _config_for_role(cfg: Config, role: str) -> Config:

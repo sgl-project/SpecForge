@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
@@ -29,6 +29,9 @@ from specforge.runtime.data_plane import (
     LocalFeatureStore,
     drain_feature_store_removals,
 )
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +70,7 @@ def _assemble_trainer(
     dataset_size: Optional[int] = None,
     checkpoint_extra: Optional[dict] = None,
     max_checkpoints: int = 0,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
+    topology: Topology,
     dataloader_num_workers: int = 0,
     profiling_options=None,
     fit_context=None,
@@ -142,9 +143,7 @@ def _assemble_trainer(
         dataset_size=dataset_size,
         checkpoint_extra=checkpoint_extra,
         max_checkpoints=max_checkpoints,
-        tp_size=tp_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
+        topology=topology,
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
         fit_context=fit_context,
@@ -162,6 +161,7 @@ def _offline_io(
     *,
     ttt_length: int,
     use_usp_preprocess: bool,
+    topology: Topology,
 ):
     """Resolve the algorithm-owned normalizer and collator for one modality."""
     provider = algorithm.providers.offline_for(modality)
@@ -169,18 +169,19 @@ def _offline_io(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        sp_rank=topology.sp_rank,
+        sp_size=topology.sp_size,
     )
 
 
 def _shard_offline_refs(
     refs,
     *,
+    topology: Topology,
     use_usp_preprocess: bool,
     seed=0,
     epoch=0,
     shuffle=True,
-    dp_rank=None,
-    dp_size=None,
 ):
     """Match ``DistributedSampler`` over metadata-only refs for one epoch.
 
@@ -191,19 +192,11 @@ def _shard_offline_refs(
     caller rebuilds this plan with ``seed + epoch`` before applying a resume
     seek, exactly like the legacy ``DistributedSampler.set_epoch`` lifecycle.
     """
-    import torch.distributed as dist
-
     refs = list(refs)
-    if (dp_rank is None) != (dp_size is None):
-        raise ValueError("dp_rank and dp_size must be provided together")
-    if dp_rank is None:
-        if dist.is_available() and dist.is_initialized():
-            from specforge.distributed import get_dp_group, get_draft_dp_group
-
-            group = get_draft_dp_group() if use_usp_preprocess else get_dp_group()
-            dp_rank, dp_size = dist.get_rank(group), dist.get_world_size(group)
-        else:
-            dp_rank, dp_size = 0, 1
+    if use_usp_preprocess:
+        dp_rank, dp_size = topology.draft_dp_rank, topology.draft_dp_size
+    else:
+        dp_rank, dp_size = topology.dp_rank, topology.dp_size
     if dp_size < 1 or not 0 <= dp_rank < dp_size:
         raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
     indices = _distributed_sampler_indices(
@@ -250,6 +243,7 @@ def _make_offline_eval_data_factory(
     max_len: int,
     ttt_length: int,
     use_usp_preprocess: bool,
+    topology: Topology,
     dataloader_num_workers: int,
 ):
     """Build a fresh re-iterable eval loader over the offline feature path."""
@@ -260,6 +254,7 @@ def _make_offline_eval_data_factory(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        topology=topology,
     )
     eval_run_id = f"{run_id}-eval"
     refs = provider.build_reader(
@@ -269,7 +264,7 @@ def _make_offline_eval_data_factory(
         max_len=max_len,
     ).read()
     refs = _shard_offline_refs(
-        refs, use_usp_preprocess=use_usp_preprocess, shuffle=False
+        refs, topology=topology, use_usp_preprocess=use_usp_preprocess, shuffle=False
     )
     store = LocalFeatureStore(eval_run_id)
 
@@ -335,35 +330,20 @@ def _checkpoint_global_step(resume_from: str) -> int:
     return int(state.get("global_step", 0) or 0)
 
 
-def _dp_consumer_layout(
-    dp_rank: Optional[int],
-    dp_size: Optional[int],
-    tp_size: int,
-    sp_ulysses_size: int,
-    sp_ring_size: int,
-) -> Tuple[int, int]:
-    """Resolve the online consumer's (dp_rank, dp_size), defaulting from dist.
+def _dp_consumer_layout(topology: Topology) -> Tuple[int, int]:
+    """The online consumer's (dp_rank, dp_size): its world rank and size.
 
     The DP online consumer shards DATA across ranks (one inbox each), so its DP
     width is the whole trainer world.
     """
-    import torch.distributed as dist
-
-    initialized = dist.is_available() and dist.is_initialized()
-    if dp_size is None:
-        dp_size = dist.get_world_size() if initialized else 1
-    if dp_rank is None:
-        dp_rank = dist.get_rank() if initialized else 0
-    if dp_size > 1 and (tp_size != 1 or sp_ulysses_size != 1 or sp_ring_size != 1):
+    if topology.world_size > 1 and (topology.tp_size != 1 or topology.sp_size != 1):
         raise NotImplementedError(
             "the online disaggregated consumer assigns one inbox to every "
             "trainer rank; nested target TP or draft SP is not supported "
-            f"(tp={tp_size}, sp_ulysses={sp_ulysses_size}, "
-            f"sp_ring={sp_ring_size})"
+            f"(tp={topology.tp_size}, sp_ulysses={topology.sp_ulysses_size}, "
+            f"sp_ring={topology.sp_ring_size})"
         )
-    if not 0 <= dp_rank < dp_size:
-        raise ValueError(f"dp_rank {dp_rank} out of range for dp_size {dp_size}")
-    return dp_rank, dp_size
+    return topology.rank, topology.world_size
 
 
 def _normalize_prompt_epochs(prompt_epochs: int) -> int:
@@ -558,9 +538,7 @@ def build_offline_runtime(
     eval_interval: int = 0,
     eval_hidden_states_path: Optional[str] = None,
     eval_data_factory=None,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
+    topology: Topology,
     use_usp_preprocess: bool = False,
     seed: int = 0,
     logger=None,
@@ -577,7 +555,7 @@ def build_offline_runtime(
     trainable module as ``.draft_model``. Colocated offline refs are fixed and
     re-iterable, so this path does not allocate a training ledger or ref queue.
     """
-    _validate_offline_trainer_tp(tp_size)
+    _validate_offline_trainer_tp(topology.tp_size)
     provider = algorithm.providers.offline_for(modality)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
@@ -585,6 +563,7 @@ def build_offline_runtime(
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        topology=topology,
     )
     controller = DataFlowController(
         run_id,
@@ -598,6 +577,7 @@ def build_offline_runtime(
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
             source_refs,
+            topology=topology,
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
@@ -619,6 +599,7 @@ def build_offline_runtime(
             max_len=max_len,
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
+            topology=topology,
             dataloader_num_workers=dataloader_num_workers,
         )
     return _assemble_trainer(
@@ -651,9 +632,7 @@ def build_offline_runtime(
             "source_dataset_size": len(source_refs),
         },
         max_checkpoints=max_checkpoints,
-        tp_size=tp_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
+        topology=topology,
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
     )
@@ -681,9 +660,7 @@ def build_disagg_offline_runtime(
     eval_interval: int = 0,
     eval_hidden_states_path: Optional[str] = None,
     eval_data_factory=None,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
+    topology: Topology,
     use_usp_preprocess: bool = False,
     seed: int = 0,
     logger=None,
@@ -700,19 +677,21 @@ def build_disagg_offline_runtime(
     ``disagg://`` refs its producer published. Same trainer assembly as the
     colocated offline path, so results match within determinism tolerance.
     """
-    _validate_offline_trainer_tp(tp_size)
+    _validate_offline_trainer_tp(topology.tp_size)
     collate_fn, per_sample_transform = _offline_io(
         algorithm,
         modality,
         max_len,
         ttt_length=ttt_length,
         use_usp_preprocess=use_usp_preprocess,
+        topology=topology,
     )
     source_refs = list(refs)
 
     def refs_for_epoch(epoch):
         return _shard_offline_refs(
             source_refs,
+            topology=topology,
             use_usp_preprocess=use_usp_preprocess,
             seed=seed,
             epoch=epoch,
@@ -738,6 +717,7 @@ def build_disagg_offline_runtime(
             max_len=max_len,
             ttt_length=ttt_length,
             use_usp_preprocess=use_usp_preprocess,
+            topology=topology,
             dataloader_num_workers=dataloader_num_workers,
         )
     return _assemble_trainer(
@@ -770,9 +750,7 @@ def build_disagg_offline_runtime(
             "source_dataset_size": len(source_refs),
         },
         max_checkpoints=max_checkpoints,
-        tp_size=tp_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
+        topology=topology,
         dataloader_num_workers=dataloader_num_workers,
         profiling_options=profiling_options,
     )
@@ -1548,11 +1526,7 @@ def build_disagg_online_consumer(
     log_interval: int = 50,
     strategy_kwargs: Optional[Mapping[str, Any]] = None,
     max_checkpoints: int = 0,
-    tp_size: int = 1,
-    sp_ulysses_size: int = 1,
-    sp_ring_size: int = 1,
-    dp_rank: Optional[int] = None,
-    dp_size: Optional[int] = None,
+    topology: Topology,
     inbox_dir: Optional[str] = None,
     resume_from: Optional[str] = None,
     dataloader_num_workers: int = 0,
@@ -1593,18 +1567,10 @@ def build_disagg_online_consumer(
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
 
     algorithm.providers.server_streaming_for(modality)
-    distributed = dist.is_available() and dist.is_initialized()
-    world = dist.get_world_size() if distributed else 1
-    actual_rank = dist.get_rank() if distributed else 0
+    world = topology.world_size
     preflight_exc = None
     try:
-        dp_rank, dp_size = _dp_consumer_layout(
-            dp_rank,
-            dp_size,
-            tp_size,
-            sp_ulysses_size,
-            sp_ring_size,
-        )
+        dp_rank, dp_size = _dp_consumer_layout(topology)
         if metadata_store is None and metadata_db_path is None:
             raise ValueError(
                 "online consumer needs a metadata_store/metadata_db_path "
@@ -1614,16 +1580,6 @@ def build_disagg_online_consumer(
             raise ValueError(
                 "online consumer feature_store must set retain_on_release=True; "
                 "features are deleted only after an optimizer-boundary durable ack"
-            )
-        if distributed and world != dp_size:
-            raise ValueError(
-                f"online consumer: dp_size={dp_size} but the process group has "
-                f"{world} ranks — every rank must own exactly one inbox"
-            )
-        if distributed and actual_rank != dp_rank:
-            raise ValueError(
-                f"online consumer: dp_rank={dp_rank} but process-group rank is "
-                f"{actual_rank}"
             )
     except BaseException as exc:
         preflight_exc = exc
@@ -1635,7 +1591,7 @@ def build_disagg_online_consumer(
     preflight_error = (
         f"{type(preflight_exc).__name__}: {preflight_exc}" if preflight_exc else None
     )
-    if distributed and world > 1:
+    if world > 1:
         gathered = [None] * world
         dist.all_gather_object(gathered, (preflight_error, async_ack))
         preflight_error = next((error for error, _ in gathered if error), None)
@@ -1643,7 +1599,7 @@ def build_disagg_online_consumer(
         # same decision, so one rank opting out disables async acks for all.
         async_ack = all(enabled for _, enabled in gathered)
     if preflight_error is not None:
-        if not distributed or world == 1:
+        if world == 1:
             raise preflight_exc
         raise RuntimeError(f"online consumer preflight failed: {preflight_error}")
 
@@ -1653,7 +1609,7 @@ def build_disagg_online_consumer(
     # Synchronous acks (DISAGG_ASYNC_ACK=0) keep the default group, so the
     # kill switch also removes the new Gloo connectivity requirement.
     ack_group = None
-    if async_ack and distributed and world > 1:
+    if async_ack and world > 1:
         ack_group = new_durable_ack_process_group()
         if ack_group is None:
             async_ack = False
@@ -1760,7 +1716,7 @@ def build_disagg_online_consumer(
             setup_exc = exc
 
     setup_error = f"{type(setup_exc).__name__}: {setup_exc}" if setup_exc else None
-    if distributed and world > 1:
+    if world > 1:
         payload = [setup_error]
         dist.broadcast_object_list(payload, src=0)
         setup_error = payload[0]
@@ -1769,7 +1725,7 @@ def build_disagg_online_consumer(
             inbox_server.stop()
         if dp_rank == 0 and store is not None and hasattr(store, "close"):
             store.close()
-        if not distributed or world == 1:
+        if world == 1:
             raise setup_exc
         raise RuntimeError(f"online consumer rank-0 setup failed: {setup_error}")
 
@@ -1812,7 +1768,7 @@ def build_disagg_online_consumer(
             drain_consumer_store()
         except BaseException as exc:
             cleanup_error = f"{type(exc).__name__}: {exc}"
-        if distributed and world > 1:
+        if world > 1:
             gathered_errors = [None] * world
             dist.all_gather_object(gathered_errors, cleanup_error)
             failures = [
@@ -1899,9 +1855,7 @@ def build_disagg_online_consumer(
             strategy_kwargs=strategy_kwargs,
             per_sample_transform=None,
             max_checkpoints=max_checkpoints,
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
+            topology=topology,
             resume_from=resume_from,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,

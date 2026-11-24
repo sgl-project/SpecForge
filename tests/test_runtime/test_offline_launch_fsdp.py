@@ -27,7 +27,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29566")
+        topology = fx.build_single_rank_distributed(port="29566")
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -49,6 +49,7 @@ class TestOfflineLaunchFSDP(unittest.TestCase):
             )
 
         trainer = build_offline_runtime(
+            topology=topology,
             algorithm=ALGORITHM,
             hidden_states_path=feat_dir,
             draft_model=eagle3_model,

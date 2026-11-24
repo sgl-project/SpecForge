@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from specforge.algorithms.objectives.base import ObjectiveModel, ObjectiveResult
+from specforge.distributed import Topology
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
 from specforge.training.backend import (
@@ -74,24 +75,28 @@ class TestMetadataStore(unittest.TestCase):
 
 
 class TestParallelConfigHandles(unittest.TestCase):
-    def test_carries_target_and_draft_parallel_state(self):
-        pc = ParallelConfig(tp_size=2, sp_ulysses_size=2, sp_ring_size=2)
+    def test_defaults_to_one_process_on_the_default_group(self):
+        pc = ParallelConfig()
         self.assertIsNone(pc.fsdp_process_group)
         self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
-        self.assertEqual(pc.tp_size, 2)
-        self.assertEqual(pc.sp_size, 4)
+        self.assertEqual(pc.world_size, 1)
 
-    def test_from_distributed_no_dist(self):
-        # Keep this test independent of process groups initialized by earlier
-        # GPU launcher tests in the same unittest process.
-        with mock.patch(
-            "specforge.training.backend.dist.is_initialized", return_value=False
-        ):
-            pc = ParallelConfig.from_distributed(tp_size=2, sp_ulysses_size=2)
+    def test_from_topology_wraps_over_the_world_group(self):
+        world = object()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            pc = ParallelConfig.from_topology(
+                Topology(world_size=4, tp_size=2, sp_ulysses_size=2, world_group=world)
+            )
+        self.assertIs(pc.fsdp_process_group, world)
+        self.assertEqual(pc.world_size, 4)
+        self.assertEqual(pc.sharding_strategy, "SHARD_GRAD_OP")
+
+    def test_from_topology_of_one_process_names_no_group(self):
+        with mock.patch.dict("os.environ", {"FSDP_SHARDING": "NO_SHARD"}):
+            pc = ParallelConfig.from_topology(Topology())
         self.assertIsNone(pc.fsdp_process_group)
         self.assertEqual(pc.world_size, 1)
-        self.assertEqual(pc.tp_size, 2)
-        self.assertEqual(pc.sp_size, 2)
+        self.assertEqual(pc.sharding_strategy, "NO_SHARD")
 
     def test_backend_scales_gradients_before_optimizer_step(self):
         model = nn.Linear(2, 1, bias=False)
@@ -193,6 +198,8 @@ class TestCheckpointRecord(unittest.TestCase):
             ctrl = TrainerController(
                 runner,
                 strategy_name=runner.spec.name,
+                rank=0,
+                world_size=1,
                 run_id="r",
                 output_dir=d,
             )

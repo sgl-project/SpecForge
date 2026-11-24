@@ -24,7 +24,7 @@ from specforge.application import build_application_run
 from specforge.cli import main
 from specforge.config import load_config
 from specforge.config.draft.codec import encode_config
-from specforge.distributed import destroy_distributed
+from specforge.distributed import Topology, destroy_distributed
 from specforge.loading import load_draft
 from specforge.training.checkpoint import CheckpointManager
 from specforge.utils import get_device_type
@@ -159,13 +159,18 @@ def process_group(root):
         dist.destroy_process_group()
 
 
+def current_topology():
+    """The one-rank job of the default group that is up."""
+    return Topology(device_type=get_device_type(), world_group=dist.group.WORLD)
+
+
 def build(config, *overrides):
     """Assemble a run as the ``specforge train`` worker does, in the current group."""
     cfg = load_config(str(config), list(overrides))
     set_seed(cfg.training.seed)
     # The worker exports the recipe's sharding for the trainer backend to read.
     with patch.dict(os.environ, {"FSDP_SHARDING": cfg.training.fsdp_sharding}):
-        return build_application_run(cfg)
+        return build_application_run(cfg, topology=current_topology())
 
 
 def train(config, *overrides):
@@ -371,7 +376,9 @@ class TrainCommandTest(unittest.TestCase):
         if dist.is_initialized():
             self.skipTest("specforge train creates the default process group itself")
         # A worker that fails only aborts its groups; do not leak them to other tests.
-        self.addCleanup(destroy_distributed)
+        self.addCleanup(
+            lambda: dist.is_initialized() and destroy_distributed(current_topology())
+        )
         with TemporaryDirectory() as temp:
             root = Path(temp)
             config = write_run(root, drafts()[0])

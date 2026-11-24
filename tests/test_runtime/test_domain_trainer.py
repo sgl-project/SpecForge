@@ -14,6 +14,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from specforge.distributed import Topology
+
 
 class DomainTrainerWiringTest(unittest.TestCase):
     def _build(
@@ -31,9 +33,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         on_fit_success=None,
         on_fit_failure=None,
         on_fit_finally=None,
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
+        topology=Topology(rank=3, world_size=8),
         store="STORE",
     ):
         import specforge.training.trainer as tr
@@ -54,13 +54,10 @@ class DomainTrainerWiringTest(unittest.TestCase):
 
         class FakeParallel:
             @classmethod
-            def from_distributed(cls, **kw):
+            def from_topology(cls, topology, **kw):
+                cap["parallel_topology"] = topology
                 cap["parallel_kw"] = kw
-                return SimpleNamespace(
-                    world_size=8,
-                    tp_size=kw["tp_size"],
-                    sp_size=kw["sp_ulysses_size"] * kw["sp_ring_size"],
-                )
+                return SimpleNamespace()
 
         class FakeBackend:
             def __init__(self, parallel, *, optimizer_factory):
@@ -149,9 +146,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 on_fit_success=on_fit_success,
                 on_fit_failure=on_fit_failure,
                 on_fit_finally=on_fit_finally,
-                tp_size=tp_size,
-                sp_ulysses_size=sp_ulysses_size,
-                sp_ring_size=sp_ring_size,
+                topology=topology,
             )
         return trainer, cap, dfc_calls, model
 
@@ -219,12 +214,12 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["ctrl_kw"]["strategy_name"], "eagle3")
         self.assertEqual(cap["ctrl_kw"]["accumulation_steps"], 3)
         self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 8)
+        # the run loop's rank and world size are the topology's
+        self.assertEqual((cap["ctrl_kw"]["rank"], cap["ctrl_kw"]["world_size"]), (3, 8))
 
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
-        self.assertEqual(
-            cap["parallel_kw"],
-            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
-        )
+        self.assertEqual(cap["parallel_topology"], Topology(rank=3, world_size=8))
+        self.assertEqual(cap["parallel_kw"], {})
 
         # run identity rides the shared checkpoint payload, validated on resume
         self.assertEqual(
@@ -243,10 +238,18 @@ class DomainTrainerWiringTest(unittest.TestCase):
 
     def test_throughput_scale_counts_only_data_parallel_ranks(self):
         _, cap, _, _ = self._build(
-            {"refs": list(range(6))}, tp_size=2, sp_ulysses_size=2
+            {"refs": list(range(6))},
+            topology=Topology(world_size=8, tp_size=2, sp_ulysses_size=2),
         )
         # 8 ranks in groups of tp 2 x sp 2 receive 2 different sample streams
         self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 2)
+        self.assertEqual(
+            {
+                key: cap["ctrl_kw"]["checkpoint_extra"][key]
+                for key in ("tp_size", "sp_ulysses_size", "sp_ring_size")
+            },
+            {"tp_size": 2, "sp_ulysses_size": 2, "sp_ring_size": 1},
+        )
 
     def test_fixed_refs_reject_partial_accumulation_during_assembly(self):
         try:

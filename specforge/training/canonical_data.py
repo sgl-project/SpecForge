@@ -72,23 +72,27 @@ def build_normalizer(
     loss_mask_filter=None,
     overlap=1,
     use_usp_preprocess=False,
-    **topology,
+    sp_rank=None,
+    sp_size=None,
+    **_options,
 ):
+    """The record normalizer; under USP it keeps this rank's sequence shard.
+
+    ``sp_rank`` and ``sp_size`` are the rank's place in the draft
+    sequence-parallel group, from the job's topology; USP needs both.
+    """
     normalizer = partial(
         normalize_sample, keys=keys, max_len=max_len, loss_mask_filter=loss_mask_filter
     )
     if not use_usp_preprocess:
         return normalizer
-    import torch.distributed as dist
-
-    from specforge.distributed import get_draft_sp_group
-
-    group = get_draft_sp_group()
+    if sp_rank is None or sp_size is None:
+        raise ValueError("USP preprocessing needs sp_rank and sp_size")
     return partial(
         normalize_parallel_sample,
         normalizer=normalizer,
-        rank=dist.get_rank(group),
-        size=dist.get_world_size(group),
+        rank=sp_rank,
+        size=sp_size,
         overlap=overlap,
     )
 

@@ -7,6 +7,7 @@ from unittest import mock
 
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
+from specforge.distributed import Topology
 from specforge.training.assembly import (
     ModelBundle,
     _prepare_prompts,
@@ -87,6 +88,7 @@ class TestEvalAssembly(unittest.TestCase):
             strategy_kwargs={},
         )
         trainer = object()
+        topology = Topology()
         with (
             mock.patch(
                 "specforge.training.assembly.build_model_bundle",
@@ -96,9 +98,10 @@ class TestEvalAssembly(unittest.TestCase):
                 "specforge.launch.build_offline_runtime", return_value=trainer
             ) as build,
         ):
-            run = build_training_run(cfg, algorithm=ALGORITHM)
+            run = build_training_run(cfg, algorithm=ALGORITHM, topology=topology)
 
         self.assertIs(run.trainer, trainer)
+        self.assertIs(build.call_args.kwargs["topology"], topology)
         self.assertEqual(build.call_args.kwargs["eval_interval"], 7)
         self.assertEqual(build.call_args.kwargs["seed"], 19)
         self.assertEqual(
@@ -144,6 +147,7 @@ class TestEvalLaunch(unittest.TestCase):
                 max_len=128,
                 ttt_length=5,
                 use_usp_preprocess=False,
+                topology=Topology(),
                 dataloader_num_workers=3,
             )
 
@@ -200,6 +204,7 @@ class TestEvalLaunch(unittest.TestCase):
                 run_id="run",
                 output_dir="/out",
                 seed=31,
+                topology=Topology(),
             )
 
         self.assertIs(result, trainer)

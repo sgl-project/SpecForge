@@ -435,6 +435,8 @@ def protocol_ledger(
         controller = TrainerController(
             _Observed(runner, ledger, lambda: len(flying)),
             strategy_name="kit",
+            rank=0,
+            world_size=1,
             accumulation_steps=accumulation_steps,
             run_id="kit",
             output_dir=directory,

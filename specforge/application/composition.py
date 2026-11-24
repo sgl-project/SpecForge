@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from specforge.algorithms.common.providers import OfflineCaptureLayout
 from specforge.algorithms.registry import AlgorithmRegistration, AlgorithmRegistry
 from specforge.config import Config
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 
 @dataclass(frozen=True)
@@ -131,8 +134,14 @@ def resolve_offline_capture(
 def build_application_run(
     run: Config | ResolvedRun,
     registry: AlgorithmRegistry | None = None,
+    *,
+    topology: Topology | None = None,
 ):
-    """Build one executable run from the public config contract."""
+    """Build one executable run from the public config contract.
+
+    ``topology`` is the job's shape from ``init_distributed``; only a producer,
+    which trains nothing, runs without one.
+    """
 
     from specforge.training.model_loading import training_target_config
 
@@ -146,6 +155,7 @@ def build_application_run(
     return build_training_run(
         resolved.config,
         algorithm=resolved.algorithm,
+        topology=topology,
     )
 
 

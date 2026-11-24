@@ -12,6 +12,7 @@ import yaml
 
 from specforge.application.composition import resolve_run
 from specforge.config import load_config
+from specforge.distributed import Topology
 from specforge.launch import _shard_offline_refs
 from specforge.training.canonical_data import shard_sequence
 from tests.test_runtime import trajectories
@@ -80,10 +81,13 @@ class TrajectoryTopologiesTest(unittest.TestCase):
             partitions = [
                 _shard_offline_refs(
                     files,
+                    topology=Topology(
+                        world_size=case.world_size,
+                        sp_ulysses_size=cfg.training.sp_ulysses_size,
+                        draft_dp_rank=rank,
+                    ),
                     use_usp_preprocess=True,
                     seed=cfg.training.seed,
-                    dp_rank=rank,
-                    dp_size=2,
                 )
                 for rank in range(2)
             ]

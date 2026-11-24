@@ -16,6 +16,7 @@ from specforge.algorithms.objectives import (
 from specforge.algorithms.objectives.protocols.dflash import DFlashObjective
 from specforge.application.composition import resolve_run
 from specforge.checkpoint.resolve import read_target_config
+from specforge.distributed import Topology
 from specforge.loading import initialize_draft
 from specforge.training.assembly import build_model_bundle
 from specforge.training.capture_contract import resolve_server_capture_contract
@@ -130,7 +131,9 @@ class CanonicalDesignTest(unittest.TestCase):
                 side_effect=AssertionError("HF defaults used"),
             ):
                 run = resolve_run(cfg, target_config=training_target_config(cfg))
-                bundle = build_model_bundle(run.config, algorithm=run.algorithm)
+                bundle = build_model_bundle(
+                    run.config, algorithm=run.algorithm, topology=Topology()
+                )
                 capture = resolve_server_capture_contract(
                     run.config, algorithm=run.algorithm
                 )
@@ -149,7 +152,9 @@ class CanonicalDesignTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValueError, "Frozen parameters require loaded weights"
             ):
-                build_model_bundle(run.config, algorithm=run.algorithm)
+                build_model_bundle(
+                    run.config, algorithm=run.algorithm, topology=Topology()
+                )
             # Binding is a source even though it is absent from state_dict.
             initialize_draft(draft_config(), target=target, require_loaded=("lm_head",))
             original = initialize_draft(draft_config(), target=target)
@@ -199,4 +204,6 @@ class CanonicalDesignTest(unittest.TestCase):
                 ValueError,
                 "Frozen parameters require loaded weights.*candidate_selector",
             ):
-                build_model_bundle(run.config, algorithm=run.algorithm)
+                build_model_bundle(
+                    run.config, algorithm=run.algorithm, topology=Topology()
+                )

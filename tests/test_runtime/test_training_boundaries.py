@@ -130,16 +130,8 @@ EXCEPTED_COLLECTIVES = {
     # the process group, which the design moves to the runner and to a
     # topology value.
     "specforge/training/controller.py": Excepted(
-        "run loop: the progress bar's rank; rank 0's verdict on whether an "
-        "evaluation runs, broadcast; the world size written into a checkpoint",
-        {
-            _T: 1,
-            f"{_T}.broadcast_object_list": 1,
-            f"{_T}.get_rank": 2,
-            f"{_T}.get_world_size": 2,
-            f"{_T}.is_available": 2,
-            f"{_T}.is_initialized": 3,
-        },
+        "run loop: rank 0's verdict on whether an evaluation runs, broadcast",
+        {f"{_T}.broadcast_object_list": 1},
     ),
     "specforge/training/checkpoint.py": Excepted(
         "checkpoint sequence: the gather of write errors, the barrier, rank 0's "
@@ -162,10 +154,6 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.is_available": 1,
             f"{_T}.is_initialized": 1,
         },
-    ),
-    "specforge/training/trainer.py": Excepted(
-        "resume: the world size compared with the checkpoint's",
-        {_T: 1, f"{_T}.get_world_size": 1, f"{_T}.is_initialized": 1},
     ),
 }
 
