@@ -22,8 +22,6 @@ class MoEFFN(nn.Module):
             raise TypeError("MoEFFN requires MoEFFNSpec")
         positive_int("hidden_size", hidden_size)
         self.config = config
-        # A runtime choice, not state: configure_kernels resolves it once at startup.
-        self.experts_kernel = "grouped_mm"
         self.gate = TopKRouter(
             config.router,
             num_experts=config.num_experts,
@@ -59,7 +57,7 @@ class MoEFFN(nn.Module):
         """The stream update in `hidden`'s shape."""
         x = hidden.reshape(-1, hidden.shape[-1])
         _, indices, weights = self.gate(x)
-        out = self.experts(x, indices, weights, kernel=self.experts_kernel)
+        out = self.experts(x, indices, weights)
         if self.shared_expert is not None:
             shared = self.shared_expert(x)
             if self.shared_expert_gate is not None:

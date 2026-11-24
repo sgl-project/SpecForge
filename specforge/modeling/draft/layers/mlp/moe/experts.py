@@ -1,6 +1,4 @@
-"""Routed experts over fused weights with named kernels, and the always-on shared expert."""
-
-from collections.abc import Callable
+"""Routed experts over fused weights via F.grouped_mm, and the always-on shared expert."""
 
 import torch
 import torch.nn.functional as F
@@ -11,23 +9,7 @@ from transformers.activations import ACT2FN
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.mlp import MoEExpertSpec
 
-# Routed-expert kernels over one parameter layout, picked by name once at startup.
-EXPERT_KERNELS: dict[str, Callable[..., Tensor]] = {}
 
-
-def expert_kernel(name: str):
-    """Register the decorated routed-expert kernel under `name`."""
-
-    def register(kernel):
-        if name in EXPERT_KERNELS:
-            raise ValueError(f"experts kernel {name!r} already registered")
-        EXPERT_KERNELS[name] = kernel
-        return kernel
-
-    return register
-
-
-@expert_kernel("grouped_mm")
 def grouped_mm_experts(
     x_sorted: Tensor,
     w_sorted: Tensor,
@@ -44,28 +26,6 @@ def grouped_mm_experts(
     # Weighting before the down GEMM keeps the [S, H] output out of autograd's saved tensors.
     hidden = (act_fn(gate) * up * w_sorted).to(gate_up.dtype)
     return F.grouped_mm(hidden, down_proj.transpose(-1, -2), offs=offsets)
-
-
-@expert_kernel("loop")
-def looped_experts(
-    x_sorted: Tensor,
-    w_sorted: Tensor,
-    counts: Tensor,
-    *,
-    gate_up_proj: Tensor,
-    down_proj: Tensor,
-    act_fn,
-) -> Tensor:
-    """Same contract as grouped_mm_experts with one matmul pair per expert; any device."""
-    outputs, start = [], 0
-    for expert, count in enumerate(counts.tolist()):
-        end = start + count
-        gate_up = x_sorted[start:end] @ gate_up_proj[expert].T
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden = (act_fn(gate) * up * w_sorted[start:end]).to(gate_up.dtype)
-        outputs.append(hidden @ down_proj[expert].T)
-        start = end
-    return torch.cat(outputs)
 
 
 class RoutedExperts(nn.Module):
@@ -117,9 +77,7 @@ class RoutedExperts(nn.Module):
         if shapes != expected:
             raise ValueError(f"expert state {shapes} must be {expected}")
 
-    def forward(
-        self, x: Tensor, indices: Tensor, weights: Tensor, *, kernel: str
-    ) -> Tensor:
+    def forward(self, x: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
         """`x` [T, H], `indices` and `weights` [T, K] -> fp32 [T, H] summed over k."""
         num_tokens, top_k = indices.shape
         expert_ids, order = torch.sort(indices.reshape(-1), stable=True)
@@ -129,11 +87,7 @@ class RoutedExperts(nn.Module):
         )
         x_sorted = x[order // top_k]
         w_sorted = weights.reshape(-1)[order, None]
-        if kernel not in EXPERT_KERNELS:
-            raise ValueError(
-                f"unknown experts kernel {kernel!r}; expected {sorted(EXPERT_KERNELS)}"
-            )
-        out = EXPERT_KERNELS[kernel](
+        out = grouped_mm_experts(
             x_sorted,
             w_sorted,
             counts,
@@ -147,12 +101,12 @@ class RoutedExperts(nn.Module):
         return out.view(num_tokens, top_k, x.shape[-1]).sum(dim=1, dtype=torch.float32)
 
     @torch.no_grad()
-    def probe_kernel(self, kernel: str) -> None:
-        """Run `kernel` on zeros routed to expert 0, so an unusable kernel fails at startup."""
+    def probe(self) -> None:
+        """Run the forward on zeros routed to expert 0, so widths F.grouped_mm rejects fail at startup."""
         x = self.gate_up_proj.new_zeros(16, self.gate_up_proj.shape[-1])
         indices = torch.zeros(16, 1, dtype=torch.long, device=x.device)
         weights = torch.ones(16, 1, dtype=torch.float32, device=x.device)
-        self(x, indices, weights, kernel=kernel)
+        self(x, indices, weights)
 
 
 class SharedExpert(nn.Module):

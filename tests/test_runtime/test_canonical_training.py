@@ -16,7 +16,7 @@ from specforge.config.draft.codec import encode_config
 from specforge.config.draft.layer import LayerSpec
 from specforge.config.draft.mlp import DenseFFNSpec
 from specforge.loading import load_draft
-from specforge.modeling.draft.layers.mlp import EXPERT_KERNELS, MoEFFN
+from specforge.modeling.draft.layers.mlp import MoEFFN
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
 from specforge.training.strategies.base import StepContext
@@ -104,14 +104,13 @@ def moe_draft_config(intermediate_size=16):
     )
 
 
-def moe_run_config(target, draft, kernel):
+def moe_run_config(target, draft):
     return run_config(
         target,
         draft,
         model={
             "target_model_path": str(target),
             "torch_dtype": "float32",
-            "moe_experts_kernel": kernel,
         },
         training={
             "attention_backend": "eager",
@@ -592,12 +591,12 @@ class CanonicalTrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly match"):
                 resolve_run(Config.model_validate(raw))
 
-    def _train_and_resume_moe(self, root, kernel):
+    def _train_and_resume_moe(self, root):
         self._init_group(root)
         target = target_directory(root)
         draft = moe_draft_config()
         write_features(root, draft)
-        cfg = moe_run_config(target, draft, kernel)
+        cfg = moe_run_config(target, draft)
         build_application_run(cfg).run()
         checkpoint = root / "output" / "specforge-run-step1"
         model = load_draft(checkpoint, target=target, dtype=torch.float32)
@@ -615,7 +614,6 @@ class CanonicalTrainingTest(unittest.TestCase):
             final / "training_state.pt", map_location="cpu", weights_only=True
         )
         self.assertEqual(state["global_step"], 2)
-        self.assertEqual(state["canonical_moe_experts_kernel"], kernel)
         trained = state["draft_state_dict"]
         for suffix in ("gate.weight", "experts.gate_up_proj", "experts.down_proj"):
             name = next(key for key in trained if key.endswith(suffix))
@@ -623,15 +621,9 @@ class CanonicalTrainingTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(trained[name]).all(), name)
         bias_key = next(key for key in trained if key.endswith("gate.expert_bias"))
         self.assertEqual(torch.count_nonzero(trained[bias_key]).item(), 0)
-        # The kernel is part of the resume contract, like the Liger choice.
-        other = next(name for name in EXPERT_KERNELS if name != kernel)
-        raw["model"]["moe_experts_kernel"] = other
-        raw["training"]["max_steps"] = 3
-        with self.assertRaisesRegex(ValueError, "canonical_moe_experts_kernel"):
-            build_application_run(Config.model_validate(raw)).run()
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
-    def test_dense_drafts_record_no_expert_kernel_and_resume_with_either_name(self):
+    def test_dense_checkpoints_from_before_the_moe_options_still_resume(self):
         """Dense drafts write the contract pre-MoE runs wrote, so their checkpoints still resume."""
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -657,10 +649,8 @@ class CanonicalTrainingTest(unittest.TestCase):
             state = torch.load(
                 checkpoint / "training_state.pt", map_location="cpu", weights_only=True
             )
-            self.assertNotIn("canonical_moe_experts_kernel", state)
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(checkpoint))
-            raw["model"]["moe_experts_kernel"] = "loop"
             raw["training"]["max_steps"] = 2
             build_application_run(Config.model_validate(raw)).run()
             final = torch.load(
@@ -669,13 +659,11 @@ class CanonicalTrainingTest(unittest.TestCase):
                 weights_only=True,
             )
             self.assertEqual(final["global_step"], 2)
-            self.assertNotIn("canonical_moe_experts_kernel", final)
 
     @unittest.skipUnless(torch.cuda.is_available(), "FSDP integration requires CUDA")
-    def test_moe_draft_trains_saves_and_resumes_with_each_kernel(self):
-        for kernel in sorted(EXPERT_KERNELS):
-            with self.subTest(kernel=kernel), TemporaryDirectory() as temp:
-                self._train_and_resume_moe(Path(temp), kernel)
+    def test_moe_draft_trains_saves_and_resumes(self):
+        with TemporaryDirectory() as temp:
+            self._train_and_resume_moe(Path(temp))
 
     def test_dspine_replay_uses_window_ce_and_restores_rng(self):
         from specforge.algorithms.objectives import build_objective_model

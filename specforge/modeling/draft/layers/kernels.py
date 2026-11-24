@@ -11,7 +11,7 @@ import torch
 
 from .conv.grouped_causal import GroupedCausalConv
 from .mlp.dense import DenseFFN
-from .mlp.moe import EXPERT_KERNELS, MoEFFN, SharedExpert
+from .mlp.moe import MoEFFN, SharedExpert
 from .norm.rms import RMSNorm
 
 
@@ -56,18 +56,18 @@ def fused_conv_unsupported(convolutions):
     return None
 
 
-def configure_kernels(
-    model, *, use_liger=False, use_fused_conv=None, moe_experts_kernel="grouped_mm"
-):
+def configure_kernels(model, *, use_liger=False, use_fused_conv=None):
     """Select the optional kernels of a built draft.
+
+    MoE layers always run F.grouped_mm; every one is probed here, so widths it
+    rejects (not multiples of 8 for bf16/fp16, 4 for fp32) fail at startup
+    rather than fall back.
 
     Args:
         use_liger: Resolved Liger choice; True fails where Liger cannot run.
         use_fused_conv: True requires the Triton grouped convolution and fails
             where it cannot run; None uses it when the draft has grouped
             convolutions that all support it; False keeps the eager one.
-        moe_experts_kernel: The routed-expert kernel, probed on every MoE
-            layer; an unusable choice fails, never falls back.
 
     Returns:
         Whether the grouped convolutions use the Triton kernel.
@@ -91,30 +91,19 @@ def configure_kernels(
             "Triton" if fused_conv else "eager",
             f" (auto: {reason})" if reason and use_fused_conv is None else "",
         )
-    if moe_experts_kernel not in EXPERT_KERNELS:
-        raise ValueError(
-            f"unknown moe_experts_kernel {moe_experts_kernel!r}; "
-            f"expected one of {sorted(EXPERT_KERNELS)}"
-        )
     for module in model.modules():
         if not isinstance(module, MoEFFN):
             continue
         try:
-            module.experts.probe_kernel(moe_experts_kernel)
+            module.experts.probe()
         except RuntimeError as error:
             weight = module.experts.gate_up_proj
-            hint = (
-                ""
-                if moe_experts_kernel == "loop"
-                else "; set model.moe_experts_kernel: loop"
-            )
             raise ValueError(
-                f"moe_experts_kernel {moe_experts_kernel!r} cannot run a MoE layer "
-                f"(hidden_size {weight.shape[-1]}, intermediate_size "
-                f"{module.config.experts.intermediate_size}, {weight.dtype} on "
-                f"{weight.device.type}): {error}{hint}"
+                f"F.grouped_mm cannot run a MoE layer (hidden_size {weight.shape[-1]}, "
+                f"intermediate_size {module.config.experts.intermediate_size}, "
+                f"{weight.dtype} on {weight.device.type}): {error}; hidden_size and "
+                "intermediate_size must be multiples of 8 (bf16/fp16) or 4 (fp32)"
             ) from error
-        module.experts_kernel = moe_experts_kernel
 
     if not use_liger:
         for module in model.modules():

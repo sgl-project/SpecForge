@@ -3,9 +3,8 @@ model:
   target_backend: sglang
   embedding_key: model.embed_tokens.weight
   torch_dtype: bfloat16
-  # Liger RMSNorm; the routed experts keep the kernel chosen below.
+  # Liger RMSNorm; the routed experts run F.grouped_mm.
   use_liger_kernel: true
-  moe_experts_kernel: grouped_mm
   sglang_attention_backend: triton
   sglang_mem_fraction_static: 0.85
   sglang_disable_radix_cache: true
