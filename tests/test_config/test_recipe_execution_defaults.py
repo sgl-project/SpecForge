@@ -82,7 +82,11 @@ def resolved_defaults(cfg, draft):
         "liger": liger_choice(
             cfg.model.use_liger_kernel,
             by_default=requirements.liger_by_default,
-            hidden_act="silu" if activations <= {"silu", "swish"} else "other",
+            hidden_act=(
+                None
+                if not activations
+                else "silu" if activations <= {"silu", "swish"} else "other"
+            ),
             platform="cuda",
         ).enabled,
         # the Triton kernel's rule: a power-of-two group size up to 1024

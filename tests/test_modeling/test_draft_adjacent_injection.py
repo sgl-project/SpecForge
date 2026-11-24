@@ -87,7 +87,7 @@ class AdjacentInjectionTest(unittest.TestCase):
         with torch.no_grad():
             for parameter in module.parameters():
                 parameter.fill_(7)
-        module.reset_draft_parameters()
+        module.reset_draft_parameters(initializer_range=0.02)
         special = [
             module.bias,
             module.predecessor_gate.weight,
@@ -98,7 +98,7 @@ class AdjacentInjectionTest(unittest.TestCase):
             with torch.no_grad():
                 parameter.fill_(7)
             parameter._is_hf_initialized = True
-        module.reset_draft_parameters()
+        module.reset_draft_parameters(initializer_range=0.02)
         for parameter in special:
             torch.testing.assert_close(parameter, torch.full_like(parameter, 7))
 

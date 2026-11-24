@@ -12,7 +12,7 @@ from specforge.config.draft.architecture.domino import GRUHeadSpec
 
 
 class _PrefixGRU(nn.GRU):
-    def reset_draft_parameters(self):
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
         # Match nn.GRU's uniform initialization while respecting HF load flags.
         bound = 1 / math.sqrt(self.hidden_size)
         for parameter in self.parameters():

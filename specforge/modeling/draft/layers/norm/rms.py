@@ -25,12 +25,15 @@ class RMSNorm(nn.Module):
             if config.has_weight
             else None
         )
-        self.reset_draft_parameters()
+        self._reset()
 
-    def reset_draft_parameters(self):
+    def _reset(self) -> None:
         # HF restoration can mark a loaded tensor before initializing missing ones.
         if self.weight is not None:
             init.constant_(self.weight, 1 - self.config.weight_offset)
+
+    def reset_draft_parameters(self, *, initializer_range: float) -> None:
+        self._reset()
 
     def forward(self, hidden: Tensor) -> Tensor:
         if self.liger_norm is not None:

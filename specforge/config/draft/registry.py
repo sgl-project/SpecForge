@@ -28,7 +28,7 @@ from .conv import ConvSpec, GroupedCausalConvSpec
 from .conv.constraints import validate_grouped_causal
 from .layer import KIND_BY_REFERENCE_FIELD
 from .logits import MuPLogitTransformSpec, NoLogitTransformSpec, TargetLogitSpec
-from .mlp import DenseFFNSpec, FFNSpec
+from .mlp import DenseFFNSpec, FFNSpec, MoEFFNSpec
 from .norm import NormSpec, RMSNormSpec
 from .residual import ResidualSpec, StandardResidualSpec
 from .rope import (
@@ -227,6 +227,7 @@ for _kind, _schema in (
     ("attention", MHASpec),
     ("attention", MLASpec),
     ("mlp", DenseFFNSpec),
+    ("mlp", MoEFFNSpec),
     ("norm", RMSNormSpec),
     ("residual", StandardResidualSpec),
     ("rope", DefaultRoPESpec),
