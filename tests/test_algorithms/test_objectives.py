@@ -150,10 +150,10 @@ class ObjectiveTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(blocks.kept_tokens, blocks.keep.repeat_interleave(slots, dim=1))
         )
+        layout = blocks.layer_inputs[0].attention_layout
         self.assertTrue(
             torch.equal(
-                blocks.kept_tokens,
-                blocks.layer_inputs[0].attention_layout.active_queries,
+                blocks.kept_tokens, layout.context_blocks.compute_active_queries()
             )
         )
         self.assertTrue(

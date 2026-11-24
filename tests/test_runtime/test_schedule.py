@@ -5,9 +5,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from specforge.config.schema import resolve_dispatch_watermarks
 from specforge.training.disaggregated import (
     _ONLINE_SCHEDULE_SUFFIX,
-    _online_flow_window,
     _online_schedule_payload,
     _read_online_total_steps,
     _write_control,
@@ -37,18 +37,18 @@ class TestResolveTotalSteps(unittest.TestCase):
 
     def test_online_flow_window_accepts_one_global_optimizer_window(self):
         self.assertEqual(
-            _online_flow_window(self._online_flow_config()),
+            resolve_dispatch_watermarks(self._online_flow_config()),
             (1152, 1024),
         )
 
     def test_online_flow_window_rejects_small_watermarks_before_data_build(self):
         cfg = self._online_flow_config(high=64, low=32)
-        with self.assertRaisesRegex(ValueError, "high watermark 64.*quantum 1024"):
-            _online_flow_window(cfg)
+        with self.assertRaisesRegex(ValueError, "high watermark 64.*1024 samples"):
+            resolve_dispatch_watermarks(cfg)
 
         cfg = self._online_flow_config(high=1152, low=32)
-        with self.assertRaisesRegex(ValueError, "low watermark 32.*quantum 1024"):
-            _online_flow_window(cfg)
+        with self.assertRaisesRegex(ValueError, "low watermark 32.*1024 samples"):
+            resolve_dispatch_watermarks(cfg)
 
     def test_online_flow_window_preserves_high_only_environment_override(self):
         cfg = self._online_flow_config(high=64, low=32)
@@ -57,7 +57,7 @@ class TestResolveTotalSteps(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, environment, clear=False):
             os.environ.pop("DISAGG_IN_FLIGHT_LOW_WATERMARK", None)
-            self.assertEqual(_online_flow_window(cfg), (1024, None))
+            self.assertEqual(resolve_dispatch_watermarks(cfg), (1024, None))
 
     def test_two_window_flow_validates_environment_overrides(self):
         for policy in ("two_window_bucketed", "two_window_joint_balanced"):
@@ -77,11 +77,11 @@ class TestResolveTotalSteps(unittest.TestCase):
                 ):
                     if error:
                         with self.assertRaisesRegex(
-                            ValueError, f"{error} watermark.*quantum 8"
+                            ValueError, f"{error} watermark.*8 samples"
                         ):
-                            _online_flow_window(cfg)
+                            resolve_dispatch_watermarks(cfg)
                     else:
-                        self.assertEqual(_online_flow_window(cfg), (high, low))
+                        self.assertEqual(resolve_dispatch_watermarks(cfg), (high, low))
 
     def test_finite_data_horizon_counts_optimizer_steps(self):
         self.assertEqual(

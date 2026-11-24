@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import types
 import unittest
@@ -9,6 +10,9 @@ from unittest.mock import patch
 
 import torch
 
+from scripts.conversation_validation import (
+    validate_conversation as validate_basic_conversation,
+)
 from scripts.expand_reasoning_conversations import (
     expand_row,
     main,
@@ -489,6 +493,60 @@ class TestExpandGenerationEvents(unittest.TestCase):
 
         self.assertEqual(stripped_input_text, event_input_text)
         self.assertEqual(stripped_loss_text, event_loss_text)
+
+    def test_shared_validator_rejects_non_string_roles(self):
+        for role in ([], {}):
+            with self.subTest(role=role):
+                messages = [{"role": role, "content": "question"}]
+                self.assertEqual(
+                    validate_basic_conversation(messages),
+                    f"message 0 has unsupported role {role!r}",
+                )
+                self.assertEqual(
+                    validate_basic_conversation(messages, error_style="regeneration"),
+                    f"Invalid message role: {role}",
+                )
+
+    def test_cli_continues_after_invalid_role(self):
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "input.jsonl"
+            output = Path(tmpdir) / "events.jsonl"
+            with source.open("w", encoding="utf-8") as stream:
+                for row_id, role in (
+                    ("before", "user"),
+                    ("bad", []),
+                    ("after", "user"),
+                ):
+                    messages = [
+                        {"role": role, "content": "question"},
+                        {
+                            "role": "assistant",
+                            "content": "answer",
+                            "reasoning_content": "r",
+                        },
+                    ]
+                    row = {"id": row_id, "status": "success", "conversations": messages}
+                    print(json.dumps(row), file=stream)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        Path(__file__).resolve().parents[2]
+                        / "scripts/expand_reasoning_conversations.py"
+                    ),
+                    "--input-file-path",
+                    str(source),
+                    "--output-file-path",
+                    str(output),
+                ],
+                check=True,
+            )
+            ids = [json.loads(line)["id"] for line in output.read_text().splitlines()]
+            self.assertEqual(ids, ["before#turn0", "after#turn0"])
+            skipped = json.loads(Path(skipped_path(str(output))).read_text())
+            self.assertEqual(skipped["id"], "bad")
+            self.assertIn("Invalid message role", skipped["error"])
 
 
 if __name__ == "__main__":

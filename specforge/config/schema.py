@@ -80,7 +80,10 @@ _SGLANG_FLAG_ALIASES: Mapping[str, tuple] = {
     "--moe-dp-size": ("--moe-data-parallel-size",),
     "--dcp-replicate-q-proj": ("--no-dcp-replicate-q-proj",),
     "--enable-tp-lm-head-all-to-all": ("--no-enable-tp-lm-head-all-to-all",),
-    "--smg-http-sidecar-port": ("--grpc-http-sidecar-port",),
+    "--enable-flashmla-prefill-token-packing": (
+        "--no-enable-flashmla-prefill-token-packing",
+    ),
+    "--allow-local-media-files": ("--no-allow-local-media-files",),
     "--speculative-draft-model-path": ("--speculative-draft-model",),
     "--hisparse-config": ("--hierarchical-sparse-attention-extra-config",),
     "--experts-shared-outer-loras": ("--no-experts-shared-outer-loras",),
@@ -470,10 +473,13 @@ class ProfilingConfig(StrictConfigModel):
     record_shapes: bool = False
 
 
-def resolve_ref_watermarks(high: int, low: Optional[int]) -> tuple[int, Optional[int]]:
+def resolve_ref_watermarks(
+    high: int, low: Optional[int], *, env: Optional[Mapping[str, str]] = None
+) -> tuple[int, Optional[int]]:
     """Apply producer environment overrides before validating ref watermarks."""
-    high_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
-    low_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
+    env = os.environ if env is None else env
+    high_override = env.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
+    low_override = env.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
     high = int(high_override) if high_override is not None else high
     # The legacy high-only override resumes at the same threshold.
     low = (
@@ -486,6 +492,31 @@ def resolve_ref_watermarks(high: int, low: Optional[int]) -> tuple[int, Optional
         raise ValueError(
             "effective ref watermarks require high >= 1 and 0 <= low <= high"
         )
+    return high, low
+
+
+def resolve_dispatch_watermarks(
+    cfg: Config, *, env: Optional[Mapping[str, str]] = None
+) -> tuple[int, Optional[int]]:
+    """Resolve producer watermarks that can hold a full consumer dispatch."""
+    runtime = cfg.runtime
+    high, low = resolve_ref_watermarks(
+        runtime.in_flight_high_watermark, runtime.in_flight_low_watermark, env=env
+    )
+    trainer = cfg.deployment.trainer
+    window = (
+        trainer.nnodes
+        * trainer.nproc_per_node
+        * cfg.training.batch_size
+        * cfg.training.accumulation_steps
+    )
+    required = consumer_dispatch_quantum(runtime.consumer_dispatch, window)
+    for level, value in (("high", high), ("low", high if low is None else low)):
+        if value < required:
+            raise ValueError(
+                f"{runtime.consumer_dispatch} {level} watermark {value} must cover "
+                f"at least {required} samples per dispatch"
+            )
     return high, low
 
 
@@ -1163,24 +1194,7 @@ class Config(StrictConfigModel):
             "two_window_bucketed",
             "two_window_joint_balanced",
         ):
-            dispatch = self.runtime.consumer_dispatch
-            window = (
-                self.deployment.trainer.nnodes
-                * self.deployment.trainer.nproc_per_node
-                * self.training.batch_size
-                * self.training.accumulation_steps
-            )
-            required = consumer_dispatch_quantum(dispatch, window)
-            high, low = resolve_ref_watermarks(
-                self.runtime.in_flight_high_watermark,
-                self.runtime.in_flight_low_watermark,
-            )
-            for level, value in (("high", high), ("low", high if low is None else low)):
-                if value < required:
-                    raise ValueError(
-                        f"{dispatch} requires a {level} watermark of at least two "
-                        f"global batches (dispatch quantum {required})"
-                    )
+            resolve_dispatch_watermarks(self)
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

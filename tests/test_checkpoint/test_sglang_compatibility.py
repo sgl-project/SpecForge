@@ -578,6 +578,8 @@ class SGLangCompatibilityTest(unittest.TestCase):
                 )
 
     def _check_fused_context(self, served, features):
+        from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+
         # SGLang caches rotary modules globally; do not cast another case's cache.
         for layer in served.layers:
             layer.self_attn.rotary_emb = copy.deepcopy(layer.self_attn.rotary_emb)
@@ -594,15 +596,13 @@ class SGLangCompatibilityTest(unittest.TestCase):
             expected[attn.attn.layer_id] = pair
             buffers[attn.attn.layer_id] = tuple(torch.empty_like(t) for t in pair)
 
-        def read(layer_id):
-            k, v = buffers[layer_id]
-            return SimpleNamespace(key=lambda: k, value=lambda: v)
-
         pool = SimpleNamespace(
-            layer_router=SimpleNamespace(read=read),
+            start_layer=min(buffers),
+            layer_transfer_counter=None,
             get_key_buffer=lambda i: buffers[i][0],
             get_value_buffer=lambda i: buffers[i][1],
         )
+        pool.layer_router = PlainPoolRouter(pool, "full")
         served._fused_kv_write_cache = None
         self.assertIsNotNone(served._fused_kv_write_bundle(pool))
         served.write_target_hidden_kv(

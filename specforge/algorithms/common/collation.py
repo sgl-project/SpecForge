@@ -27,6 +27,7 @@ def pad_and_concatenate_features(
     sequence_axes: Mapping[str, int],
     required_keys: Sequence[str],
     optional_keys: Sequence[str] = (),
+    pad_to_length=None,
 ):
     """Zero-pad configured tensor axes to the longest input sequence.
 
@@ -57,6 +58,10 @@ def pad_and_concatenate_features(
             )
     max_length = max(int(feature["input_ids"].shape[-1]) for feature in features)
 
+    padded_length = max_length if pad_to_length is None else pad_to_length(max_length)
+    if padded_length < max_length:
+        raise ValueError("padding length must cover the longest input sequence")
+
     import torch
 
     batch = {}
@@ -71,9 +76,9 @@ def pad_and_concatenate_features(
                     f"feature {key!r} sequence length {length} exceeds "
                     f"input_ids length {max_length}"
                 )
-            if length < max_length:
+            if length < padded_length:
                 shape = list(tensor.shape)
-                shape[axis] = max_length - length
+                shape[axis] = padded_length - length
                 tensor = torch.cat(
                     [tensor, tensor.new_zeros(shape)],
                     dim=axis,
