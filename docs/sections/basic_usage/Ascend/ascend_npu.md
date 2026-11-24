@@ -157,7 +157,80 @@ Before rerunning, clear stale control state:
 - If the capture producer dies with `ACL_ERROR_RT_CONTEXT_NULL` (107002), the
   installed SpecForge predates the NPU transport bind — upgrade past #722.
 
-### Training DFlash 2 drafts
+### Example 1: Train an EAGLE3.1 draft on three Ascend 910B3 devices
+
+**Prepare the inputs.** The tested environment used CANN/HCCL 9.1.0,
+torch_npu 2.10.0.post6 and SGLang `c757c4bb`. Set `TARGET_MODEL` to the local
+`Qwen/Qwen3-30B-A3B-Instruct-2507` snapshot (`0d7cf239`) and `RUN_BASE` to a
+fresh output directory. Set `DATA` to a directory containing eight pretokenized
+ShareGPT examples in `train.jsonl` (each with `input_ids` and `loss_mask`) and
+the matching `vocab.pt`. The vocabulary map can be built from the tokenized
+dataset with `generate_vocab_mapping_file` in `specforge/data/preprocessing.py`.
+
+**Capture target features.** Start Mooncake as in step 1 above. On two 64 GiB
+910B3 devices (logic IDs 0 and 1), start the TP2 server with layers 1, 23 and 44
+from the EAGLE3.1 preset:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 SPECFORGE_SPEC_CAPTURE=1 \
+MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 MOONCAKE_PROTOCOL=tcp \
+MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata \
+MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=1073741824 SGLANG_SPEC_CAPTURE_GPU_PUT=0 \
+python -m sglang.launch_server --model-path "$TARGET_MODEL" \
+  --device npu --dtype bfloat16 --tp-size 2 --attention-backend ascend \
+  --skip-tokenizer-init --context-length 1024 --max-running-requests 1 \
+  --mem-fraction-static 0.8 --chunked-prefill-size -1 --disable-radix-cache \
+  --disable-cuda-graph --enable-return-aux-hidden-states \
+  --return-hidden-states-mode full --speculative-algorithm EAGLE3 \
+  --return-aux-hidden-state-layer-ids 1 23 44 --host 127.0.0.1 --port 30000
+```
+
+**Train and export.** In another shell with the same paths, run the eight-update
+example from the SpecForge repository root. Device 2 trains the draft with SDPA.
+
+```bash
+set -e
+export ASCEND_RT_VISIBLE_DEVICES=2 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1
+curl --fail http://127.0.0.1:30000/health
+run=qwen30b-910b3-eagle3.1
+out="$RUN_BASE/$run"
+specforge train \
+  -c "examples/configs/online/disaggregated/external/qwen3-30b-a3b-eagle3.1.yaml" \
+  "model.target_model_path=$TARGET_MODEL" "model.vocab_mapping_path=$DATA/vocab.pt" \
+  'data.train_data_path=' "data.prompts_path=$DATA/train.jsonl" data.max_length=512 \
+  data.build_dataset_num_proc=1 data.dataloader_num_workers=0 \
+  training.attention_backend=sdpa deployment.trainer.nproc_per_node=1 \
+  training.num_epochs=1 training.warmup_ratio=0 training.max_steps=8 \
+  training.save_interval=8 training.log_interval=1 tracking.report_to=none \
+  "run_id=$run" "output_dir=$out" "deployment.disaggregated.control_dir=$out/control" \
+  "deployment.disaggregated.consumer_state_dir=$out/consumer-state"
+specforge export --converter sglang --target-model "$TARGET_MODEL" \
+  --checkpoint "$out/$run-step8" --output-dir "$out/sglang-export"
+```
+
+**Verify serving.** Stop the capture server to free devices 0 and 1. From the
+training shell, launch SGLang with the exported draft. EAGLE3.1 uses the
+`EAGLE3` serving algorithm.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 python -m sglang.launch_server \
+  --model-path "$TARGET_MODEL" --device npu --dtype bfloat16 --tp-size 2 \
+  --attention-backend ascend --mem-fraction-static 0.8 --context-length 1024 \
+  --max-running-requests 1 --chunked-prefill-size -1 --disable-radix-cache \
+  --speculative-algorithm EAGLE3 --speculative-draft-model-path "$out/sglang-export" \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --host 127.0.0.1 --port 30000
+```
+
+Once the server is ready, send a request from another shell:
+
+```bash
+curl --fail --json '{"text":"Hello","sampling_params":{"temperature":0,"max_new_tokens":8}}' \
+  http://127.0.0.1:30000/generate
+```
+
+### Example 2: Train a DFlash 2 draft on Ascend
 
 DFlash 2 reuses the DFlash strategy and capture path end to end, so the
 external-server setup above carries over unchanged — including the
@@ -292,3 +365,19 @@ global batch 80/step, ~1.18k optimizer steps, ~1.5h total.
 
 These numbers are a functional reference for the NPU managed-local stack, not
 a tuned performance benchmark.
+
+## Reference results on two Ascend 910B3 devices
+
+A separate EAGLE3.1 run used two devices for capture and four for draft training,
+with 12,288 optimizer updates over 65,536 distinct examples. Serving was measured
+on two 64 GiB 910B3 devices with TP2.
+
+| Concurrency | Target only (tokens/s) | With trained EAGLE3.1 (tokens/s) | Speedup | Output tokens per verification round |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 47.39 | 65.52 | 1.38× | 1.78 |
+| 4 | 133.41 | 174.95 | 1.31× | 1.80 |
+
+The last column divides verified output tokens (including target tokens) by total verification rounds across all requests.
+Each cell represents one timing pass over 16 held-out MT-Bench prompts with
+greedy decoding and up to 256 new tokens. At each concurrency, 7 of 16 draft-assisted
+responses matched the target-only token sequence exactly.
