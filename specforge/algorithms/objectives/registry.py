@@ -50,6 +50,10 @@ class TrainingRequirements:
     supports_sequence_parallel: bool = False
     attention_backends: frozenset[str] = frozenset({"eager", "sdpa", "flex_attention"})
     window_statistic: WindowStatistic | None = None
+    #: Additive statistics returned in ``ObjectiveResult.statistics`` on every
+    #: training forward, summed over the window and all data-parallel ranks and
+    #: delivered to ``apply_statistics`` after the optimizer update succeeds.
+    after_step_statistics: tuple[str, ...] = ()
     host_inputs: Callable | None = (
         None  # (batch tensors, draft config) -> extra tensors
     )
@@ -80,6 +84,23 @@ class TrainingRequirements:
             raise ValueError(f"unknown reduction: {self.reduction!r}")
         if self.draws_per_anchor and not self.samples_anchors:
             raise ValueError("draws_per_anchor needs an objective that samples anchors")
+        if len(set(self.after_step_statistics)) != len(self.after_step_statistics):
+            raise ValueError(
+                f"duplicate after_step_statistics: {self.after_step_statistics!r}"
+            )
+        if any(not isinstance(n, str) or not n for n in self.after_step_statistics):
+            raise ValueError(
+                "after_step_statistics entries must be non-empty strings, got "
+                f"{self.after_step_statistics!r}"
+            )
+        if (
+            self.window_statistic is not None
+            and self.window_statistic.argument_name in self.after_step_statistics
+        ):
+            raise ValueError(
+                f"statistic {self.window_statistic.argument_name!r} cannot be both "
+                "a replay window_statistic and an after_step statistic"
+            )
 
 
 @dataclass(frozen=True)

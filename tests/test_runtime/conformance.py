@@ -188,6 +188,7 @@ class KitProgram(FakeProgram):
         *,
         reduction="window",
         replay=False,
+        after_step=False,
         diagnostics=False,
         dtype=torch.float32,
     ):
@@ -196,7 +197,10 @@ class KitProgram(FakeProgram):
         self.linear = nn.Linear(1, 2, bias=False).to(dtype)
         self.reduction = reduction
         self.replay = replay
+        self.after_step = after_step
         self.diagnostics = diagnostics
+        if after_step:
+            self.register_buffer("expert_bias", torch.zeros(2, dtype=dtype))
         #: ``collect_detailed_metrics`` as each forward received it.
         self.detailed = []
         #: The step and the run's length as each forward received them.
@@ -208,6 +212,7 @@ class KitProgram(FakeProgram):
             name="kit",
             reduction=self.reduction,
             replay_statistics=("scale",) if self.replay else (),
+            after_step_statistics=("expert_counts",) if self.after_step else (),
             evaluation_diagnostics=self.diagnostics,
         )
 
@@ -217,6 +222,14 @@ class KitProgram(FakeProgram):
         count, total = replay_values["scale"]
         # Not their ratio alone: means in place of sums would show.
         return {"scale": count / (total + 1)}
+
+    def apply_statistics(self, values):
+        if not self.after_step:
+            return {}
+        counts = values["expert_counts"]
+        with torch.no_grad():
+            self.expert_bias.add_(0.01 * counts.to(self.expert_bias.dtype))
+        return {"kit/balance": counts.float().mean()}
 
     def forward(
         self,
@@ -244,6 +257,8 @@ class KitProgram(FakeProgram):
         first = first * (1 + 0.25 * step / (total_steps or 1))
         if scale is not None:
             first = first * scale.to(weight.dtype)
+        if self.after_step:
+            second = second + self.expert_bias[0]
         size = x.sum().detach().float()
         result = ObjectiveResult(first + 0.5 * second * second, size)
         result.ratios["acc"] = (size, size + 1)
@@ -251,6 +266,8 @@ class KitProgram(FakeProgram):
             result.ratios["detail"] = (size, size + 3)
         if prepass:
             result.statistics["scale"] = torch.stack((size * (1 + noise[0]), size + 2))
+        elif self.after_step and self.training:
+            result.statistics["expert_counts"] = torch.stack((size, size + 1))
         if self.reduction == "microbatch":
             terms = ((1.0, first, size), (0.5, second * second, size + 1))
             result = replace(
@@ -595,6 +612,9 @@ class RunnerChecks:
 
     def test_replay_statistic(self):
         self.assert_reproduces_the_reference(replay=True)
+
+    def test_after_step_statistic(self):
+        self.assert_reproduces_the_reference(after_step=True)
 
     def test_handle_is_single_use(self):
         program = KitProgram()

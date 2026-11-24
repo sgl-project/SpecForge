@@ -87,6 +87,14 @@ class KitCanFailTest(unittest.TestCase):
         self.assertEqual(self.failures(broken, "test_replay_statistic"), 1)
         self.assertEqual(self.failures(broken, "test_window_reduction"), 0)
 
+    def test_skipped_after_step_statistic_fails_the_after_step_job(self):
+        class SkippedAfterStep(DataParallelRunner):
+            def _apply_after_step_statistics(self, totals):
+                return {}
+
+        self.assertEqual(self.failures(SkippedAfterStep, "test_after_step_statistic"), 1)
+        self.assertEqual(self.failures(SkippedAfterStep, "test_window_reduction"), 0)
+
     def test_lost_resume_state_fails_the_resume_job(self):
         class WithoutMasters(DataParallelRunner):
             def load_resume(self, state):

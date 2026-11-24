@@ -15,7 +15,8 @@ class ObjectiveResult:
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
     sums: dict[str, Tensor] = field(default_factory=dict)
     #: This rank's sums of each statistic the objective needs pooled over a
-    #: window, by name; filled by a prepass only.
+    #: window, by name: replay statistics in a prepass, or declared
+    #: ``after_step_statistics`` in a training forward.
     statistics: dict[str, Tensor] = field(default_factory=dict)
     #: Under the ``microbatch`` reduction, in training: every loss term as
     #: ``(coefficient, numerator, denominator)``, the last two this rank's.
@@ -109,6 +110,7 @@ class ObjectiveModel(nn.Module):
         sequence_parallel: Optional[SequenceParallelGroups] = None,
         anchor_sampling="device",
         anchor_seed=None,
+        after_step_statistics=(),
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -138,6 +140,16 @@ class ObjectiveModel(nn.Module):
             raise ValueError(
                 f"frozen_modules holds modules this model does not: {strangers}"
             )
+        # Additive statistics emitted on training forwards and delivered after
+        # the optimizer update succeeds (e.g. MoE expert counts for bias updates).
+        declared_after_step = (
+            registration.training.after_step_statistics
+            if registration is not None
+            else ()
+        )
+        self.after_step_statistics = tuple(
+            dict.fromkeys((*declared_after_step, *after_step_statistics))
+        )
         # The attention backend the run trains with, and the process groups of
         # its sequence-parallel axis when it has one. A protocol that takes
         # either reads it here; both are fixed for the model's lifetime.
@@ -379,6 +391,24 @@ class ObjectiveModel(nn.Module):
         else:
             value = None
         return {statistic.argument_name: value}
+
+    def apply_statistics(self, values):
+        """Apply pooled after-step statistics once an optimizer update succeeds.
+
+        Delegates to ``self.objective.apply_statistics(self, values)`` when
+        the objective defines one. Issues no collective; every rank computes
+        identical buffer updates before any checkpoint snapshot.
+        """
+        if not values:
+            return {}
+        handler = getattr(self.objective, "apply_statistics", None)
+        if not callable(handler):
+            raise NotImplementedError(
+                f"objective {self.objective_name!r} received after_step statistics "
+                f"{sorted(values)} without an apply_statistics handler"
+            )
+        metrics = handler(self, values)
+        return {} if metrics is None else dict(metrics)
 
     def forward(self, batch, *, step, total_steps, prepass=False, **context):
         """Run the objective on one batch.

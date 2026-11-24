@@ -122,6 +122,46 @@ class ProgramSpecTest(unittest.TestCase):
         # A value: it hashes, as every other declaration does.
         self.assertEqual(hash(spec), hash(program_spec(runtime)))
 
+    def test_after_step_statistics_declaration_and_overlap_refusal(self):
+        from dataclasses import replace
+
+        from specforge.algorithms.objectives.registry import (
+            TrainingRequirements,
+            WindowStatistic,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            ProgramSpec(
+                name="dup",
+                inputs=("x",),
+                replay_statistics=("s",),
+                after_step_statistics=("s",),
+            )
+        with self.assertRaisesRegex(ValueError, "both a replay window_statistic"):
+            TrainingRequirements(
+                window_statistic=WindowStatistic("r", "s"),
+                after_step_statistics=("s",),
+            )
+        _, runtime = build_runtime("DFlashDraftModel")
+        model = ObjectiveModel(
+            runtime.draft_model,
+            runtime.objective,
+            registration=replace(
+                runtime.registration,
+                training=replace(
+                    runtime.registration.training,
+                    after_step_statistics=("proto_stat",),
+                ),
+            ),
+            name=runtime.objective_name,
+            loss_configuration=runtime.loss_configuration,
+            after_step_statistics=("moe_expert_counts", "proto_stat"),
+        )
+        self.assertEqual(
+            program_spec(model).after_step_statistics,
+            ("proto_stat", "moe_expert_counts"),
+        )
+
 
 class FrozenModulesTest(unittest.TestCase):
     def test_modules_are_frozen_where_the_builder_declares_them(self):
