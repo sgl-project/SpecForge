@@ -70,8 +70,10 @@ def validate_target(config: DraftConfig, target: Mapping) -> None:
     if config.target_bindings:
         hidden_size = target.get("hidden_size")
         positive_int("target_config.hidden_size", hidden_size)
-        if hidden_size != config.hidden_size:
-            raise ValueError("bound target hidden_size must match draft hidden_size")
+        if hidden_size != config.spec_config.bound_table_width(config.hidden_size):
+            raise ValueError(
+                "bound target hidden_size must match the draft's bound table width"
+            )
         if bound_vocab_size(target) != config.vocab_size:
             raise ValueError("bound target vocab_size must match draft vocab_size")
     else:

@@ -35,7 +35,8 @@ COMMON_MODULES = ("backbone", "fusion", "embed_tokens", "lm_head")
         "chain_positions",
         "acceptance_chain",
     ),
-    trains=COMMON_MODULES,
+    # width adapters exist only on drafts narrower than the target
+    trains=COMMON_MODULES + ("input_adapter", "output_adapter"),
 )
 @dataclass
 class DFlashObjective:

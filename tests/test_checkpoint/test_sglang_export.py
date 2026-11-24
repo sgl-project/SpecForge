@@ -37,7 +37,7 @@ from specforge.modeling import build_draft_model
 from tests.test_algorithms.test_objectives import configurations
 from tests.test_checkpoint.test_loading import write_target
 from tests.test_checkpoint.test_sglang_boundaries import multi_axis_config
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.draft_fixtures import draft_config, narrow_draft_config
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
 from tests.test_modeling.test_canonical_domino import model_config as domino_config
@@ -130,6 +130,32 @@ class SGLangExportTest(unittest.TestCase):
                         fields["block_size"],
                         config.spec_config.protocol.num_model_slots,
                     )
+
+    def test_narrow_dflash_exports_target_width_and_adapters(self):
+        for config, narrow in ((draft_config(), False), (narrow_draft_config(), True)):
+            with (
+                self.subTest(narrow=narrow),
+                TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                model = build_draft_model(config)
+                save_draft(model, root / "draft")
+                export_to_sglang(root / "draft", root / "serving")
+                fields = json.loads((root / "serving" / "config.json").read_text())
+                weights = load_file(root / "serving" / "model.safetensors")
+                self.assertEqual(fields["hidden_size"], config.hidden_size)
+                if not narrow:
+                    self.assertNotIn("target_hidden_size", fields)
+                    self.assertFalse(any("adapter" in name for name in weights))
+                    continue
+                self.assertEqual(fields["target_hidden_size"], 32)
+                state = model.state_dict()
+                for name, shape in (
+                    ("input_adapter.weight", (16, 32)),
+                    ("output_adapter.weight", (32, 16)),
+                ):
+                    self.assertEqual(tuple(weights[name].shape), shape)
+                    self.assertTrue(torch.equal(weights[name], state[name]), name)
 
     def test_unrepresentable_structures_fail(self):
         base = draft_config()

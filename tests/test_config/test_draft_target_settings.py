@@ -16,6 +16,7 @@ from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_canonical_codec import shorthand
 from tests.test_config.test_draft_dmtp_spec import dmtp_config
 from tests.test_config.test_draft_peagle_spec import peagle_config
+from tests.test_modeling.test_canonical_dspark import model_config as dspark_config
 
 TARGET = {"hidden_size": 32, "vocab_size": 64, "num_hidden_layers": 8}
 
@@ -68,12 +69,23 @@ class TargetSettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
             parse_draft(payload, target_config=TARGET)
 
-    def test_bound_tables_require_the_target_width_to_equal_the_draft_width(self):
-        payload = encode_config(draft_config())
+    def test_bound_tables_require_the_target_width_without_adapters(self):
+        payload = encode_config(dspark_config(bound=True))
         payload["spec_config"]["target_features"]["hidden_size"] = 64
         for reader in (parse_draft, decode_config):
             with self.assertRaisesRegex(ValueError, "target_features.hidden_size"):
                 reader(payload, target_config=None)
+
+    def test_dflash_binds_target_tables_wider_than_the_draft(self):
+        payload = encode_config(draft_config())
+        payload["spec_config"]["target_features"]["hidden_size"] = 64
+        target = {**TARGET, "hidden_size": 64}
+        node = parse_draft(payload, target_config=target)
+        self.assertEqual(node.hidden_size, 32)
+        self.assertEqual(node.spec_config.bound_table_width(node.hidden_size), 64)
+        self.assertEqual(decode_config(encode_config(node), target_config=target), node)
+        with self.assertRaisesRegex(ValueError, "bound target hidden_size"):
+            parse_draft(payload, target_config=TARGET)
 
     def test_registration_requires_an_explicit_target_validator(self):
         @dataclass(frozen=True)

@@ -227,16 +227,16 @@ def common(config, *, eagle=False, native=False):
 
 
 def context(config):
+    spec = config.spec_config
     require(
-        config.spec_config.target_features.hidden_size == config.hidden_size,
-        "DFlash-family target feature width must match draft hidden_size for SGLang",
+        spec.target_features.hidden_size == spec.bound_table_width(config.hidden_size),
+        "DFlash-family target feature width must match the bound table width for SGLang",
     )
     require(
         config.target_bindings == ("embed_tokens", "lm_head"),
         "DFlash-family target_bindings must contain embed_tokens and lm_head",
     )
     result, a, conv = common(config)
-    spec = config.spec_config
     protocol = spec.protocol
     window = result["sliding_window"]
     require(
@@ -272,6 +272,10 @@ def context(config):
 def dflash(config):
     result = context(config)
     result["architectures"] = ["DFlashDraftModel"]
+    width = config.spec_config.target_features.hidden_size
+    if width != config.hidden_size:
+        # serving adds input_adapter/output_adapter when the widths differ
+        result["target_hidden_size"] = width
     return result
 
 

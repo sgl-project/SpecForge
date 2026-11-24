@@ -19,6 +19,10 @@ class DFlashSpec(ArchitectureSpec):
     def validate_target(self, target: Mapping) -> None:
         self.target_features.validate_target(target)
 
+    def bound_table_width(self, hidden_size: int) -> int:
+        # a narrower draft maps to and from the target's tables through adapters
+        return self.target_features.hidden_size
+
     @property
     def protocol(self) -> AnchoredBlockSpec:
         return self.block
