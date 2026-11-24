@@ -20,20 +20,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        "plugins",
-        "sglang-spec-capture",
-    ),
-)
-
-from specforge_sglang_capture import _capture_internal_state  # noqa: E402
-from specforge_sglang_capture import sink  # noqa: E402
+from specforge_sglang_capture import _capture_internal_state, sink
 
 from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
 from specforge.runtime.data_plane.mooncake_arena import (

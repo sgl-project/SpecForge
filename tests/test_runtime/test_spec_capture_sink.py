@@ -10,14 +10,9 @@ import time
 import types
 import unittest
 from contextlib import nullcontext
-from pathlib import Path
 from unittest import mock
 
 import torch
-
-sys.path.insert(
-    0, str(Path(__file__).resolve().parents[2] / "plugins/sglang-spec-capture")
-)
 from specforge_sglang_capture import sink
 
 

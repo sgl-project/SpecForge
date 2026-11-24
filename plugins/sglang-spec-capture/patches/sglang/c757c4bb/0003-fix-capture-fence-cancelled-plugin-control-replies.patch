@@ -1,0 +1,152 @@
+From 3735c9f6de75811b8051960627c934950be7f353 Mon Sep 17 00:00:00 2001
+From: Wilbolu <wilbolu@outlook.com>
+Date: Tue, 10 Nov 2026 02:16:00 +0800
+Subject: [PATCH 3/6] fix(capture): fence cancelled plugin control replies
+
+Keep the existing FIFO communicator task alive until its scheduler reply drains even after the HTTP waiter is cancelled, and reject replies with another control_id. This prevents an abandoned control response from being accepted by a later begin/cleanup call.
+
+Validation: all 19 CPU admission/control contracts pass, including tests that execute the actual tokenizer method body with the actual FanOutCommunicator to force cancellation and a stale-generation reply. AST/diff checks passed. HTTP, real IPC and TP GPU integration remain independently pending.
+---
+ python/sglang/srt/managers/io_struct.py       |  2 +
+ python/sglang/srt/managers/scheduler.py       |  3 +-
+ .../srt/managers/tokenizer_control_mixin.py   | 19 +++++--
+ .../unit/managers/test_prefix_admission.py    | 52 +++++++++++++++++++
+ 4 files changed, 72 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 6efa1b882b..2ba6b8d950 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2671,9 +2671,11 @@ class PluginControlReqInput(BaseReq, kw_only=True):
+ 
+     namespace: str
+     body: Dict[str, Any]
++    control_id: str
+ 
+ 
+ class PluginControlReqOutput(BaseReq, kw_only=True):
++    control_id: str
+     success: bool
+     response: Dict[str, Any]
+     error: str = ""
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 6eebb91087..0e4805dd77 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -6770,10 +6770,11 @@ class Scheduler(
+         response, errors = self.prefix_admission_coordinator.phase(dispatch)
+         if any(error is not None for error in errors):
+             result = PluginControlReqOutput(
+-                success=False, response={}, error=repr(errors)
++                control_id=recv_req.control_id, success=False, response={}, error=repr(errors)
+             )
+         else:
+             result = PluginControlReqOutput(
++                control_id=recv_req.control_id,
+                 success=True,
+                 response=self.prefix_admission_coordinator.broadcast(response),
+             )
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 41b83035b4..f8c3a208b0 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -192,9 +192,22 @@ class TokenizerControlMixin:
+         if not namespace or not isinstance(body, dict):
+             raise ValueError("plugin control requires a namespace and JSON object")
+         self.auto_create_handle_loop()
+-        results = await self.plugin_control_communicator(
+-            PluginControlReqInput(namespace=namespace, body=body)
+-        )
++        control_id = uuid.uuid4().hex
++        pending = asyncio.create_task(self.plugin_control_communicator(
++            PluginControlReqInput(namespace=namespace, body=body, control_id=control_id)
++        ))
++        # Keep the communicator's FIFO lock until its reply is drained even if
++        # the HTTP waiter disappears. A new caller cannot consume its late reply.
++        try:
++            results = await asyncio.shield(pending)
++        except asyncio.CancelledError:
++            def consume_cancelled_call(task):
++                if not task.cancelled():
++                    task.exception()
++            pending.add_done_callback(consume_cancelled_call)
++            raise
++        if any(result.control_id != control_id for result in results):
++            raise ValueError("stale plugin control response")
+         errors = [result.error for result in results if not result.success]
+         if errors:
+             raise ValueError("; ".join(errors))
+diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
+index 6477466dd6..8e8487b7be 100644
+--- a/test/registered/unit/managers/test_prefix_admission.py
++++ b/test/registered/unit/managers/test_prefix_admission.py
+@@ -1,11 +1,14 @@
+ """CPU ownership/collective contracts; these do not certify GPU numerics."""
+ 
++import ast
++import asyncio
+ import concurrent.futures
+ import importlib.util
+ import sys
+ import threading
+ import types
+ import unittest
++import uuid
+ from enum import Enum
+ from pathlib import Path
+ from unittest.mock import patch
+@@ -406,5 +409,54 @@ class PrefixAdmissionTests(unittest.TestCase):
+             self.assertEqual((observer.prepares, observer.polls), (1, 0))
+ 
+ 
++class PluginControlCancellationTests(unittest.IsolatedAsyncioTestCase):
++    def method(self):
++        # Execute the actual tokenizer method and real FanOutCommunicator;
++        # only IPC transport/messages are replaced by in-process callbacks.
++        source = ast.parse((SOURCE.parent / "tokenizer_control_mixin.py").read_text())
++        cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "TokenizerControlMixin")
++        method = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "plugin_control")
++        body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method]
++        namespace = {"asyncio": asyncio, "uuid": uuid, "PluginControlReqInput": types.SimpleNamespace}
++        exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), "actual_tokenizer_plugin_control", "exec"), namespace)
++        spec = importlib.util.spec_from_file_location("actual_fanout", SOURCE.parent / "communicator.py")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return namespace["plugin_control"], module.FanOutCommunicator
++
++    async def test_cancelled_http_waiter_drains_reply_before_next_dispatch(self):
++        method, communicator_type = self.method()
++        sent = []
++        events = [asyncio.Event(), asyncio.Event()]
++        def send(obj):
++            sent.append(obj)
++            events[len(sent) - 1].set()
++        comm = communicator_type(send, 1)
++        tokenizer = types.SimpleNamespace(auto_create_handle_loop=lambda: None, plugin_control_communicator=comm)
++        first = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "old"}))
++        await asyncio.wait_for(events[0].wait(), 1)
++        first.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await first
++        second = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "new"}))
++        await asyncio.sleep(0)
++        self.assertEqual(len(sent), 1)
++        comm.handle_recv(types.SimpleNamespace(control_id=sent[0].control_id, success=True, response={"attempt": "old"}, error=""))
++        await asyncio.wait_for(events[1].wait(), 1)
++        comm.handle_recv(types.SimpleNamespace(control_id=sent[1].control_id, success=True, response={"attempt": "new"}, error=""))
++        self.assertEqual(await asyncio.wait_for(second, 1), {"attempt": "new"})
++
++    async def test_wrong_control_generation_is_rejected(self):
++        method, communicator_type = self.method()
++        event = asyncio.Event()
++        comm = communicator_type(lambda obj: event.set(), 1)
++        tokenizer = types.SimpleNamespace(auto_create_handle_loop=lambda: None, plugin_control_communicator=comm)
++        call = asyncio.create_task(method(tokenizer, "plugin", {}))
++        await asyncio.wait_for(event.wait(), 1)
++        comm.handle_recv(types.SimpleNamespace(control_id="stale", success=True, response={}, error=""))
++        with self.assertRaisesRegex(ValueError, "stale plugin control response"):
++            await asyncio.wait_for(call, 1)
++
++
+ if __name__ == "__main__":
+     unittest.main()

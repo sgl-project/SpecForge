@@ -1,0 +1,49 @@
+From f76f4e58159e184d70726c6d405fdee7ca5b14f1 Mon Sep 17 00:00:00 2001
+From: Wilbolu <wilbolu@outlook.com>
+Date: Tue, 10 Nov 2026 02:17:30 +0800
+Subject: [PATCH 4/6] fix(capture): restore request cache identity on rollback
+
+The plugin prepare phase may select a content-addressed KV namespace. Include extra_key/cache_salt in the native metadata receipt so declined or failed admission restores the original request identity. The CPU reverse-resource contract now checks this mutation; all 19 admission/control cases pass.
+---
+ python/sglang/srt/managers/prefix_admission.py         | 1 +
+ test/registered/unit/managers/test_prefix_admission.py | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/python/sglang/srt/managers/prefix_admission.py b/python/sglang/srt/managers/prefix_admission.py
+index d5bd8de549..d37c2109b7 100644
+--- a/python/sglang/srt/managers/prefix_admission.py
++++ b/python/sglang/srt/managers/prefix_admission.py
+@@ -136,6 +136,7 @@ _REQUEST_FIELDS = (
+     "extend_batch_idx", "cached_tokens", "cached_tokens_device",
+     "cached_tokens_host", "cached_tokens_storage", "_cache_breakdown_computed",
+     "already_computed", "is_retracted",
++    "extra_key", "cache_salt",
+ )
+ _ADDER_FIELDS = (
+     "rem_input_tokens", "rem_chunk_tokens", "rem_dllm_tokens",
+diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
+index 8e8487b7be..6561cf29a4 100644
+--- a/test/registered/unit/managers/test_prefix_admission.py
++++ b/test/registered/unit/managers/test_prefix_admission.py
+@@ -216,6 +216,7 @@ class PrefixAdmissionTests(unittest.TestCase):
+ 
+     def test_reverse_physical_release_and_nested_budget_restore(self):
+         _, _, req, adder = self.make()
++        req.extra_key = "original-attempt-namespace"
+         before = adder.memory_budget.admission_checkpoint()
+         receipt = P.NativeAdmissionReceipt(adder, req)
+         order = []
+@@ -225,11 +226,13 @@ class PrefixAdmissionTests(unittest.TestCase):
+         adder.memory_budget.rem_state_slots = -4
+         adder.can_run_list.append(req)
+         req.kv.component_evicted_seqlens["full"] = 11
++        req.extra_key = "content-namespace-selected-by-plugin"
+         receipt.rollback()
+         self.assertEqual(order, [2, 1])
+         self.assertEqual(vars(adder.memory_budget), before)
+         self.assertEqual(adder.can_run_list, [])
+         self.assertEqual(req.kv.component_evicted_seqlens, {})
++        self.assertEqual(req.extra_key, "original-attempt-namespace")
+ 
+     def test_release_exception_is_not_retried_and_other_resources_are_released(self):
+         _, _, req, adder = self.make()

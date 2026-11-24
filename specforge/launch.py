@@ -843,10 +843,13 @@ def build_disagg_online_producer(
     Workers put() into a cross-node ``feature_store``; committed refs stream to
     the consumer via ``channel``. ``feature_source`` is an injected SGLang
     server-capture transport; a *sequence* of sources fans out to one logical
-    worker per source (the multi-server topology). Each logical worker keeps
+    worker per source (the multi-server topology). Each legacy worker keeps
     ``producer_concurrency`` capture calls in flight and replenishes a slot as
-    soon as that call completes. There is intentionally no in-process
-    target-model path.
+    soon as that call completes. Each negotiated endpoint completes one lease at a time,
+    bounded by its advertised atomic begin capacity. The hard cap must fit a full lease;
+    negotiated output byte reservations include all unfinished server writes
+    in the global feature-store hard cap until publication or exact cleanup.
+    There is intentionally no in-process target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -1088,10 +1091,12 @@ def build_disagg_online_producer(
             "accounted_consumed": channel.consumed_remote(),
             "resident_bytes": 0,
             "published_bytes": 0,
+            "reserved_bytes": 0,
         }
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
+        inactive: dict = {}  # explicitly stopped/draining workers
         # Set once the feeder will ingest nothing more (plan exhausted, stop,
         # or failure); only then may an empty pool end a worker.
         ingest_closed = threading.Event()
@@ -1151,10 +1156,11 @@ def build_disagg_online_producer(
             with publish_lock:
                 return reconcile_consumed_locked()
 
-        def publish_refs(w, refs, run_once_start: float) -> None:
-            if not refs:
-                return
+        def publish_refs(w, refs, run_once_start: float, reservation: int = 0) -> None:
             with publish_lock:
+                if not refs:
+                    state["reserved_bytes"] -= reservation
+                    return
                 current_bytes = reconcile_consumed_locked()
                 ref_sizes = [max(0, int(ref.estimated_bytes or 0)) for ref in refs]
                 projected_bytes = current_bytes + sum(ref_sizes)
@@ -1193,6 +1199,7 @@ def build_disagg_online_producer(
                     # Stop peer admissions before releasing the shared lock.
                     abort.set()
                     raise
+                state["reserved_bytes"] -= reservation
                 if channel.consumed_state_remote()[1] is None:
                     published_sizes.extend(ref_sizes)
                 state["published_bytes"] += sum(ref_sizes)
@@ -1238,7 +1245,7 @@ def build_disagg_online_producer(
                             "failed to abort unpublished ref %s", ref.sample_id
                         )
 
-        def run_worker(w) -> None:
+        def run_worker_legacy(w) -> None:
             failures = 0
             submitted = 0
             accepting = True
@@ -1376,6 +1383,153 @@ def build_disagg_online_producer(
                     abort_unpublished(futures)
                     raise
 
+        def run_worker(w) -> None:
+            source = w.feature_source
+            if getattr(source, "_capture_protocol", None) is None:
+                return run_worker_legacy(w)
+
+            from specforge.inference.capture_protocol import CaptureCapacityDeclined
+
+            # Each endpoint drives one complete lease on its own worker thread.
+            # The lease still batches tasks up to the endpoint's atomic bound.
+            capacity = source.registration_capacity()
+            endpoint_lease = min(worker_lease, capacity) if capacity else worker_lease
+            failures = 0
+
+            def stopped():
+                health = w.health()["state"]
+                if health in ("stopped", "draining"):
+                    inactive[w.worker_id] = health
+                    return True
+                return abort.is_set() or (should_stop is not None and should_stop())
+
+            def wait_for_progress(since):
+                if (
+                    peer_wait_timeout_s is not None
+                    and time.monotonic() - since >= peer_wait_timeout_s
+                ):
+                    raise TimeoutError(
+                        "producer backpressure timed out waiting for consumer progress"
+                    )
+                sleep(backpressure_poll_s)
+
+            def reserve(size):
+                if size is None or feature_store_max_resident_bytes is None:
+                    return 0
+                if size > feature_store_max_resident_bytes:
+                    raise MemoryError(
+                        "producer feature-store hard cap exceeded: "
+                        f"sample reservation={size} > limit={feature_store_max_resident_bytes} bytes"
+                    )
+                with publish_lock:
+                    used = reconcile_consumed_locked() + state["reserved_bytes"]
+                    if used + size > feature_store_max_resident_bytes:
+                        return None
+                    state["reserved_bytes"] += size
+                    return size
+
+            def release(credit):
+                with publish_lock:
+                    state["reserved_bytes"] -= credit
+
+            submitted = 0
+            while submitted < round_budget and not stopped():
+                if ingest_closed.is_set() and pool_drained():
+                    return
+                since = time.monotonic()
+                while True:
+                    in_flight = channel.in_flight_remote()
+                    if in_flight < consumer_quantum or not flow_control.should_pause(
+                        in_flight_refs=in_flight, resident_bytes=resident_bytes()
+                    ):
+                        break
+                    if stopped():
+                        return
+                    wait_for_progress(since)
+                tasks = w.lease_tasks(endpoint_lease)
+                if not tasks:
+                    sleep(backpressure_poll_s)
+                    continue
+                submitted += 1
+                start = time.perf_counter()
+                prepared = None
+                credit = 0
+                worker_owns_lease = False
+                failure = None
+                try:
+                    try:
+                        groups = source.prepare_refs_batches([tasks], capture=w.capture)
+                        if len(groups) != 1:
+                            raise ValueError(
+                                f"capture preparation returned {len(groups)} groups for one lease"
+                            )
+                        prepared = groups[0]
+                    except Exception as exc:
+                        failure = exc
+                    if failure is None:
+                        since = time.monotonic()
+                        while not stopped():
+                            granted = reserve(prepared["estimated_bytes"])
+                            if granted is not None:
+                                credit = granted
+                                try:
+                                    source.register_prepared_batches([prepared])
+                                except CaptureCapacityDeclined:
+                                    # The server explicitly granted no writer. Reuse
+                                    # the original intent, leaving credit for peers.
+                                    release(credit)
+                                    credit = 0
+                                except Exception as exc:
+                                    failure = exc
+                                    break
+                                else:
+                                    break
+                            wait_for_progress(since)
+                        else:
+                            return
+                    if failure is None:
+                        if stopped():
+                            return
+                        worker_owns_lease = True
+                        try:
+                            refs = w.run_leased(
+                                tasks, max_tasks=endpoint_lease, prepared=prepared
+                            )
+                        except Exception as exc:
+                            failure = exc
+                        else:
+                            # run_leased settles every prompt. Only missing refs
+                            # still need producer-side retirement after publication.
+                            prepared = source.unreturned_prepared(prepared, refs)
+                            missing_credit = (
+                                prepared["estimated_bytes"]
+                                if prepared and credit
+                                else 0
+                            )
+                            publication_credit = credit - missing_credit
+                            credit = missing_credit
+                            publish_refs(w, refs, start, publication_credit)
+                finally:
+                    try:
+                        if prepared is not None:
+                            source.discard_prepared_batches([prepared])
+                        release(credit)
+                    finally:
+                        if not worker_owns_lease:
+                            reason = (
+                                str(failure)
+                                if failure is not None
+                                else "producer-stopped"
+                            )
+                            w.fail_leased(tasks, reason, unhealthy=failure is not None)
+                if failure is None:
+                    failures = 0
+                else:
+                    failures += 1
+                    if failures >= max_worker_failures:
+                        dead[w.worker_id] = str(failure)
+                        return
+
         last_ingest_log = {"t": None}
 
         def ingest_prompt_batch(epoch: int, batch_index: int, epoch_prompts) -> None:
@@ -1502,6 +1656,11 @@ def build_disagg_online_producer(
                 raise RuntimeError(
                     f"all rollout workers exited with {len(dead)} dropped "
                     f"as dead and prompts remaining — dead workers: {dead}"
+                )
+            if inactive and not stopped and remaining:
+                raise RuntimeError(
+                    "rollout workers stopped or draining with prompts remaining: "
+                    f"{inactive}"
                 )
             if st["prompts_failed"] and not stopped:
                 raise RuntimeError(

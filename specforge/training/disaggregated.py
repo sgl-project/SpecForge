@@ -690,6 +690,8 @@ def _build_online(
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
                 server_capture=_server_capture(cfg),
+                hs_capture=cfg.deployment.disaggregated.hs_capture,
+                hs_prefix_cache=cfg.deployment.disaggregated.hs_prefix_cache,
             )
             for url in _server_urls(cfg)
         ]

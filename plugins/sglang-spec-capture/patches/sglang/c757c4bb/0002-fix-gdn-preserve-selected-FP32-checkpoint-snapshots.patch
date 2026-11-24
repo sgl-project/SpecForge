@@ -1,0 +1,266 @@
+From d3a3295166bd8cf71d9f20b0f4c1ce28f4ceaab3 Mon Sep 17 00:00:00 2001
+From: Wilbolu <wilbolu@outlook.com>
+Date: Tue, 10 Nov 2026 02:13:26 +0800
+Subject: [PATCH 2/6] fix(gdn): preserve selected FP32 checkpoint snapshots
+
+Source semantics: SGe189be978c1bfb50c463e6fd080a52fd4d111922. Reuse pinned upstream track_state/track_chunk_idx buffers, forwarding them through Triton GDN and all FLA wrapper layers into the existing accumulator snapshot kernel. Ordinary h/output dtype is unchanged. Only the actual CUDA wrapper declares capability; the admission gate rejects lossy pools, ReplaySSM and unsupported GDN prefill graphs.
+
+Validation: four CPU tests execute actual wrapper bodies with leaf doubles and verify selected-buffer identity, unchanged untracked external-backend calls and unsupported/incomplete capability refusal; AST/diff checks passed. Actual hybrid/TP checkpoint and resumed feature/logit/loss/gradient GPU comparison remains pending independent validation.
+---
+ .../sglang/kernels/ops/attention/fla/chunk.py |  26 ++++
+ .../attention/linear/kernels/gdn_triton.py    |  15 ++-
+ .../test_gdn_track_snapshot_contract.py       | 112 ++++++++++++++++++
+ 3 files changed, 152 insertions(+), 1 deletion(-)
+ create mode 100644 test/registered/unit/managers/test_gdn_track_snapshot_contract.py
+
+diff --git a/python/sglang/kernels/ops/attention/fla/chunk.py b/python/sglang/kernels/ops/attention/fla/chunk.py
+index 918d3bcd8d..155ea7c013 100644
+--- a/python/sglang/kernels/ops/attention/fla/chunk.py
++++ b/python/sglang/kernels/ops/attention/fla/chunk.py
+@@ -47,6 +47,8 @@ def chunk_gated_delta_rule_fwd(
+     inplace_update: bool = True,
+     chunk_offsets: torch.LongTensor | None = None,
+     o_chunk_indices: torch.LongTensor | None = None,
++    track_state: Optional[torch.Tensor] = None,
++    track_chunk_idx: Optional[torch.Tensor] = None,
+ ):
+     g = chunk_local_cumsum(
+         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+@@ -62,6 +64,14 @@ def chunk_gated_delta_rule_fwd(
+         chunk_indices=chunk_indices,
+     )
+ 
++    track_args = {}
++    if (track_state is None) != (track_chunk_idx is None):
++        raise ValueError("track_state and track_chunk_idx must be supplied together")
++    if track_state is not None:
++        if is_intel:
++            raise NotImplementedError("the XPU GDN kernel does not support FP32 track snapshots")
++        track_args = {"track_state": track_state, "track_chunk_idx": track_chunk_idx}
++
+     h, v_new = chunk_gated_delta_rule_fwd_h(
+         k=k,
+         w=w,
+@@ -73,6 +83,7 @@ def chunk_gated_delta_rule_fwd(
+         chunk_indices=chunk_indices,
+         inplace_update=inplace_update,
+         chunk_offsets=chunk_offsets,
++        **track_args,
+     )
+     o = chunk_fwd_o(
+         q=q,
+@@ -109,6 +120,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+         inplace_update: bool = True,
+         chunk_indices: Optional[torch.LongTensor] = None,
+         chunk_offsets: Optional[torch.LongTensor] = None,
++        track_state: Optional[torch.Tensor] = None,
++        track_chunk_idx: Optional[torch.Tensor] = None,
+     ):
+         q_orig = q
+         k_orig = k
+@@ -136,6 +149,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+             inplace_update=inplace_update,
+             chunk_offsets=chunk_offsets,
+             o_chunk_indices=o_chunk_indices,
++            track_state=track_state,
++            track_chunk_idx=track_chunk_idx,
+         )
+         return o.to(q.dtype), h
+ 
+@@ -156,6 +171,8 @@ def chunk_gated_delta_rule(
+     inplace_update: bool = True,
+     chunk_indices: Optional[torch.LongTensor] = None,
+     chunk_offsets: Optional[torch.LongTensor] = None,
++    track_state: Optional[torch.Tensor] = None,
++    track_chunk_idx: Optional[torch.Tensor] = None,
+ ):
+     r"""
+     Args:
+@@ -187,6 +204,13 @@ def chunk_gated_delta_rule(
+         inplace_update (Optional[bool]):
+             Whether to write final states back to `initial_state`. Default: `True`.
+ 
++        track_state (Optional[torch.Tensor]):
++            Caller-owned FP32 selected checkpoint buffer, written directly from
++            the recurrent accumulator. Ordinary per-chunk `h` retains its dtype.
++        track_chunk_idx (Optional[torch.Tensor]):
++            Per-sequence chunk index to snapshot; -1 disables that row. Must be
++            supplied together with `track_state`.
++
+     Returns:
+         o (torch.Tensor):
+             Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
+@@ -275,6 +299,8 @@ def chunk_gated_delta_rule(
+         inplace_update,
+         chunk_indices,
+         chunk_offsets,
++        track_state,
++        track_chunk_idx,
+     )
+     if head_first:
+         o = rearrange(o, "b t h ... -> b h t ...")
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+index 433e2704b4..4d1dac50d4 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+@@ -3,7 +3,7 @@ import torch
+ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+     LinearAttnKernelBase,
+ )
+-from sglang.srt.utils import is_cpu, is_npu, is_xpu
++from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
+ 
+ if not is_cpu():
+     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+@@ -42,6 +42,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
+ 
+     supports_packed_decode: bool = not is_cpu() and not is_npu()
+     supports_strided_target_verify_qkv: bool = True
++    # CUDA FLA writes the selected checkpoint directly from FP32 accumulators.
++    # CPU/NPU/XPU wrappers have separate implementations and do not opt in.
++    supports_track_state_snapshot: bool = is_cuda()
+ 
+     def packed_decode(
+         self,
+@@ -190,6 +193,15 @@ class TritonGDNKernel(LinearAttnKernelBase):
+                 "chunk_indices": kwargs["chunk_indices"],
+                 "chunk_offsets": kwargs["chunk_offsets"],
+             }
++        track_state = kwargs.get("track_state")
++        track_chunk_idx = kwargs.get("track_chunk_idx")
++        if (track_state is None) != (track_chunk_idx is None):
++            raise ValueError("track_state and track_chunk_idx must be supplied together")
++        track_args = {}
++        if track_state is not None:
++            if not self.supports_track_state_snapshot:
++                raise NotImplementedError("this GDN backend cannot write exact track snapshots")
++            track_args = {"track_state": track_state, "track_chunk_idx": track_chunk_idx}
+         if is_cpu():
+             if not inplace_update:
+                 raise NotImplementedError(
+@@ -220,6 +232,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
+             **recurrent_state_indices_args,
+             **inplace_update_args,
+             **graph_table_args,
++            **track_args,
+         )
+ 
+     def target_verify(
+diff --git a/test/registered/unit/managers/test_gdn_track_snapshot_contract.py b/test/registered/unit/managers/test_gdn_track_snapshot_contract.py
+new file mode 100644
+index 0000000000..119abfa874
+--- /dev/null
++++ b/test/registered/unit/managers/test_gdn_track_snapshot_contract.py
+@@ -0,0 +1,112 @@
++"""Execute actual GDN wrapper bodies with CPU leaf doubles.
++
++These cases establish argument plumbing and capability refusal only. Real
++FP32 accumulator/checkpoint and resumed feature equivalence require CUDA tests.
++"""
++
++import ast
++import types
++import unittest
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[4]
++
++
++class Tensor:
++    def __init__(self, dtype="bf16", shape=(1, 8, 2, 4)):
++        self.dtype, self.shape = dtype, shape
++
++    def to(self, dtype):
++        if dtype != self.dtype:
++            raise AssertionError("ordinary output dtype changed")
++        return self
++
++
++def wrappers():
++    class Function:
++        @classmethod
++        def apply(cls, *args):
++            return cls.forward(None, *args)
++    torch = types.SimpleNamespace(
++        autograd=types.SimpleNamespace(Function=Function),
++        compiler=types.SimpleNamespace(disable=lambda fn: fn),
++        float32="fp32",
++    )
++    observed = {}
++    def state_kernel(**kwargs):
++        observed.update(kwargs)
++        return Tensor(), Tensor()
++    namespace = {
++        "torch": torch, "input_guard": lambda fn: fn,
++        "autocast_custom_fwd": lambda fn: fn,
++        "chunk_local_cumsum": lambda value, **kwargs: value,
++        "chunk_gated_delta_rule_fwd_intra": lambda **kwargs: (Tensor(), Tensor(), None),
++        "chunk_gated_delta_rule_fwd_h": state_kernel,
++        "chunk_fwd_o": lambda **kwargs: Tensor(),
++        "l2norm_fwd": lambda value: value,
++        "SUPPRESS_LEVEL": 0, "is_intel": False, "CHUNK_SIZE": 64,
++    }
++    source = ast.parse((ROOT / "python/sglang/kernels/ops/attention/fla/chunk.py").read_text())
++    body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
++    body += [node for node in source.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
++    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), "actual_fla_wrappers", "exec"), namespace)
++    return namespace, observed
++
++
++def gdn_kernel_class(chunk):
++    source = ast.parse((ROOT / "python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py").read_text())
++    original = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "TritonGDNKernel")
++    extend = next(node for node in original.body if isinstance(node, ast.FunctionDef) and node.name == "extend")
++    body = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
++    body.append(ast.ClassDef(name="ActualKernel", bases=[], keywords=[], body=[extend], decorator_list=[]))
++    namespace = {"is_cpu": lambda: False, "is_npu": lambda: False, "chunk_gated_delta_rule": chunk}
++    exec(compile(ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])), "actual_gdn_extend", "exec"), namespace)
++    cls = namespace["ActualKernel"]
++    cls.supports_track_state_snapshot = True
++    return cls
++
++
++class SnapshotWrapperTests(unittest.TestCase):
++    def invoke(self, fn, **kwargs):
++        return fn(q=Tensor(), k=Tensor(), v=Tensor(), g=Tensor(),
++                  beta=Tensor(shape=(1, 8, 2)), initial_state=Tensor("fp32"), **kwargs)
++
++    def test_actual_fla_wrappers_forward_selected_fp32_buffer_without_cast(self):
++        namespace, observed = wrappers()
++        snapshot, indices = Tensor("fp32"), object()
++        self.invoke(namespace["chunk_gated_delta_rule"], track_state=snapshot, track_chunk_idx=indices)
++        self.assertIs(observed["track_state"], snapshot)
++        self.assertIs(observed["track_chunk_idx"], indices)
++        self.assertEqual(observed["k"].dtype, "bf16")
++
++    def test_untracked_fla_call_keeps_external_backend_signature(self):
++        namespace, observed = wrappers()
++        self.invoke(namespace["chunk_gated_delta_rule"])
++        self.assertNotIn("track_state", observed)
++        self.assertNotIn("track_chunk_idx", observed)
++
++    def test_actual_gdn_extend_forwards_to_entire_fla_chain(self):
++        namespace, observed = wrappers()
++        kernel = gdn_kernel_class(namespace["chunk_gated_delta_rule"])()
++        snapshot, indices = Tensor("fp32"), object()
++        kernel.extend(Tensor(), Tensor(), Tensor(), Tensor(), Tensor(shape=(1, 8, 2)),
++                      ssm_states=Tensor("fp32"), cache_indices=None, query_start_loc=None,
++                      track_state=snapshot, track_chunk_idx=indices)
++        self.assertIs(observed["track_state"], snapshot)
++        self.assertIs(observed["track_chunk_idx"], indices)
++
++    def test_actual_gdn_extend_rejects_unsupported_or_incomplete_snapshot(self):
++        namespace, _ = wrappers()
++        kernel = gdn_kernel_class(namespace["chunk_gated_delta_rule"])()
++        args = (Tensor(), Tensor(), Tensor(), Tensor(), Tensor())
++        common = dict(ssm_states=Tensor("fp32"), cache_indices=None, query_start_loc=None)
++        with self.assertRaises(ValueError):
++            kernel.extend(*args, **common, track_state=Tensor("fp32"))
++        kernel.supports_track_state_snapshot = False
++        with self.assertRaises(NotImplementedError):
++            kernel.extend(*args, **common, track_state=Tensor("fp32"), track_chunk_idx=object())
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,119 @@
+From 9c65ee3e7443257016fdf6a4a2cffa633bf11d9e Mon Sep 17 00:00:00 2001
+From: Wilbolu <wilbolu@outlook.com>
+Date: Tue, 10 Nov 2026 02:28:51 +0800
+Subject: [PATCH 5/6] fix(capture): propagate terminal lifecycle cleanup
+ failures
+
+---
+ .../sglang/srt/managers/prefix_admission.py   |  5 +++
+ python/sglang/srt/managers/scheduler.py       | 30 +++++++-------
+ .../unit/managers/test_prefix_admission.py    | 39 +++++++++++++++++++
+ 3 files changed, 60 insertions(+), 14 deletions(-)
+
+diff --git a/python/sglang/srt/managers/prefix_admission.py b/python/sglang/srt/managers/prefix_admission.py
+index d37c2109b7..aa68c4956c 100644
+--- a/python/sglang/srt/managers/prefix_admission.py
++++ b/python/sglang/srt/managers/prefix_admission.py
+@@ -340,6 +340,11 @@ class PrefixAdmissionCoordinator:
+                 # itself cannot enter a collective; the next all-rank safe
+                 # point gathers and raises local failures before new work.
+                 self.lifecycle_errors.append(f"{event} {identity!r}: {exc!r}")
++        if event == "shutdown" and self.lifecycle_errors:
++            # Terminal teardown has no later all-rank poll. Preserve its local
++            # failure as a process error, without entering a collective while
++            # peer schedulers may already be exiting.
++            raise RuntimeError(f"prefix shutdown failed: {self.lifecycle_errors!r}")
+ 
+     def _validate_native_scope(self, req, adder):
+         s = self.scheduler
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 0e4805dd77..80bad067d0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -6983,20 +6983,22 @@ def run_scheduler_process(
+                 pass
+     finally:
+         if scheduler is not None:
+-            scheduler.prefix_admission_coordinator.lifecycle(None, "shutdown", None)
+-            # FPM has a background ZMQ publisher thread that needs explicit
+-            # teardown to flush queued metrics and close the socket cleanly.
+-            scheduler.metrics_reporter._shutdown_fpm()
+-            # Stop the async D2H copy worker thread if any.
+-            if scheduler.async_d2h_worker is not None:
+-                scheduler.async_d2h_worker.shutdown()
+-                scheduler.async_d2h_worker = None
+-            # Graceful path only: on the exception path the GPU may be wedged
+-            # and the synchronize() in destroy() could itself hang.
+-            if scheduler.gracefully_exit:
+-                scheduler.release_host_resources()
+-                # Last: anything above may still need a working communicator.
+-                abort_distributed_environment()
++            try:
++                scheduler.prefix_admission_coordinator.lifecycle(None, "shutdown", None)
++            finally:
++                # FPM has a background ZMQ publisher thread that needs explicit
++                # teardown to flush queued metrics and close the socket cleanly.
++                scheduler.metrics_reporter._shutdown_fpm()
++                # Stop the async D2H copy worker thread if any.
++                if scheduler.async_d2h_worker is not None:
++                    scheduler.async_d2h_worker.shutdown()
++                    scheduler.async_d2h_worker = None
++                # Graceful path only: on the exception path the GPU may be wedged
++                # and the synchronize() in destroy() could itself hang.
++                if scheduler.gracefully_exit:
++                    scheduler.release_host_resources()
++                    # Last: anything above may still need a working communicator.
++                    abort_distributed_environment()
+ 
+ 
+ def _make_abort_req(
+diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
+index 6561cf29a4..7202ad06a1 100644
+--- a/test/registered/unit/managers/test_prefix_admission.py
++++ b/test/registered/unit/managers/test_prefix_admission.py
+@@ -214,6 +214,45 @@ class PrefixAdmissionTests(unittest.TestCase):
+         s, parallel = scheduler(observer)
+         return Coordinator(s, parallel), observer, Request(), Adder(mode)
+ 
++    def test_terminal_shutdown_reports_current_and_previously_deferred_errors(self):
++        for previous in (False, True):
++            with self.subTest(previous=previous):
++                c, observer, _, _ = self.make()
++                def fail(*args):
++                    raise RuntimeError("native drain unproven")
++                observer.lifecycle = fail
++                if previous:
++                    c.lifecycle(None, "cancel", ("epoch", "rid", "attempt", 1))
++                    observer.lifecycle = lambda *args: None
++                with self.assertRaisesRegex(RuntimeError, "prefix shutdown failed.*native drain unproven"):
++                    c.lifecycle(None, "shutdown")
++                self.assertEqual(len(c.lifecycle_errors), 1)
++                self.assertEqual(c.round, 0)  # Terminal cleanup must stay rank-local.
++
++    def test_scheduler_native_cleanup_runs_when_plugin_shutdown_fails(self):
++        # Execute the actual finalizer AST, retaining its try/finally nesting.
++        # The fixture records native teardown; no GPU process is started.
++        tree = ast.parse((SOURCE.parent / "scheduler.py").read_text())
++        call_name = "prefix_admission_coordinator"
++        finalizer = next(node.finalbody for node in ast.walk(tree)
++                         if isinstance(node, ast.Try) and node.finalbody and
++                         any(isinstance(child, ast.Attribute) and child.attr == call_name
++                             for statement in node.finalbody for child in ast.walk(statement)))
++        events = []
++        def fail(*args):
++            events.append("plugin")
++            raise RuntimeError("unproven drain")
++        s = types.SimpleNamespace(prefix_admission_coordinator=types.SimpleNamespace(lifecycle=fail),
++            metrics_reporter=types.SimpleNamespace(_shutdown_fpm=lambda: events.append("metrics")),
++            async_d2h_worker=types.SimpleNamespace(shutdown=lambda: events.append("d2h")),
++            gracefully_exit=True, release_host_resources=lambda: events.append("host"))
++        namespace = {"scheduler": s, "abort_distributed_environment": lambda: events.append("distributed")}
++        code = compile(ast.fix_missing_locations(ast.Module(body=finalizer, type_ignores=[])), "actual_scheduler_finalizer", "exec")
++        with self.assertRaisesRegex(RuntimeError, "unproven drain"):
++            exec(code, namespace)
++        self.assertEqual(events, ["plugin", "metrics", "d2h", "host", "distributed"])
++        self.assertIsNone(s.async_d2h_worker)
++
+     def test_reverse_physical_release_and_nested_budget_restore(self):
+         _, _, req, adder = self.make()
+         req.extra_key = "original-attempt-namespace"

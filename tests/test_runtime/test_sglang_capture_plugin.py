@@ -19,21 +19,9 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
+import specforge_sglang_capture
 import torch
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        "plugins",
-        "sglang-spec-capture",
-    ),
-)
-
-import specforge_sglang_capture  # noqa: E402
-from specforge_sglang_capture import capture  # noqa: E402
+from specforge_sglang_capture import capture
 
 
 def _spec(sample_id, features=("aux", "last_hidden")):
