@@ -16,6 +16,7 @@ import types
 import unittest
 import weakref
 from concurrent.futures import Future
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
 
@@ -33,7 +34,7 @@ sys.path.insert(
 )
 
 import specforge_sglang_capture  # noqa: E402
-from specforge_sglang_capture import capture  # noqa: E402
+from specforge_sglang_capture import capture, prefix_cache  # noqa: E402
 
 
 def _spec(sample_id, features=("aux", "last_hidden")):
@@ -53,8 +54,12 @@ def _req(rid, prompt_len, spec=None, *, finished=True):
     return SimpleNamespace(
         rid=rid,
         origin_input_ids=list(range(prompt_len)),
-        sampling_params=SimpleNamespace(custom_params=custom_params),
+        sampling_params=SimpleNamespace(custom_params=custom_params, max_new_tokens=0),
         finished=lambda: finished,
+        extra_key="capture-run",
+        input_embeds=None,
+        multimodal_inputs=None,
+        lora_id=None,
     )
 
 
@@ -88,13 +93,27 @@ class FakeSink:
         return future
 
 
-def _runtime(*, is_writer=True, gpu_put=False, max_pending=2):
+def _runtime(
+    *,
+    is_writer=True,
+    gpu_put=False,
+    max_pending=2,
+    prefix_cache_bytes=0,
+    prefix_page_size=1,
+):
     return capture.CaptureRuntime(
         sink=FakeSink(),
         is_writer=is_writer,
         gpu_put=gpu_put,
         max_pending_batches=max_pending,
         defer_response=mock.Mock(),
+        prefix_cache=(
+            prefix_cache.HiddenPrefixCache(
+                prefix_cache_bytes, prefix_page_size, is_writer=is_writer
+            )
+            if prefix_cache_bytes
+            else None
+        ),
     )
 
 
@@ -142,6 +161,87 @@ class TestCollectItems(unittest.TestCase):
 
 
 class TestObserver(unittest.TestCase):
+    def test_prefix_hit_recovers_all_rows_and_isolated_miss_returns_no_tensors(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=2)
+        first = _req("first", 4, dict(_spec("first"), reuse_prefix=True))
+        original = _logits_output(4)
+        runtime.observer.after_forward(
+            SimpleNamespace(reqs=[first]),
+            _forward_batch([4]),
+            original,
+            can_run_graph=False,
+        )
+        cache = runtime.prefix_cache
+        self.assertFalse(cache.slots)
+        cache.insert([10], first._spec_capture_pending_hidden)
+        followup = _req("followup", 4, dict(_spec("followup"), reuse_prefix=True))
+        followup._spec_capture_kv_page_heads = [10]
+        other = _req("other", 4, dict(_spec("other"), reuse_prefix=True))
+        other.extra_key = "other-run"
+        other._spec_capture_kv_page_heads = [20]
+        cold = _req("cold", 3, _spec("cold"))
+        suffix = _logits_output(7)
+        expected_aux = torch.cat(
+            (
+                original.hidden_states[:2],
+                suffix.hidden_states[:2],
+                suffix.hidden_states[4:],
+            )
+        )
+        expected_last = torch.cat(
+            (
+                original.last_hidden_states[:2],
+                suffix.last_hidden_states[:2],
+                suffix.last_hidden_states[4:],
+            )
+        )
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[followup, other, cold]),
+            _forward_batch([2, 2, 3], [2, 2, 0]),
+            suffix,
+            can_run_graph=True,
+        )
+        # A subsequent graph replay can overwrite the suffix buffers.
+        suffix.hidden_states.zero_()
+        suffix.last_hidden_states.zero_()
+        torch.testing.assert_close(device.aux, expected_aux)
+        torch.testing.assert_close(device.last_hidden, expected_last)
+        self.assertEqual(device.items[0].length, 4)
+        self.assertEqual(device.items[2].start, 4)
+        error = capture.error_result(device.items[1].spec, device.items[1].error)
+        self.assertEqual(error["error_code"], "prefix_cache_miss")
+        cache.release(torch.tensor([10, 11]))
+        self.assertFalse(cache.slots)
+        self.assertIsNone(cache.read(followup, 2))
+
+    def test_prefix_miss_keeps_following_cold_rows(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=2)
+        miss = _req("miss", 4, dict(_spec("miss"), reuse_prefix=True))
+        cold = _req("cold", 3, _spec("cold"))
+        out = _logits_output(5)
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[miss, cold]),
+            _forward_batch([2, 3], [2, 0]),
+            out,
+            can_run_graph=False,
+        )
+        self.assertEqual(device.items[0].error, capture.PREFIX_CACHE_MISS)
+        self.assertEqual(device.items[1].start, 0)
+        torch.testing.assert_close(device.aux, out.hidden_states[2:])
+        torch.testing.assert_close(device.last_hidden, out.last_hidden_states[2:])
+
+    def test_full_capture_at_one_page_needs_no_hidden_admission(self):
+        runtime = _runtime(prefix_cache_bytes=4096, prefix_page_size=4)
+        req = _req("short", 4, dict(_spec("short"), reuse_prefix=True))
+        out = _logits_output(4)
+        device = runtime.observer.after_forward(
+            SimpleNamespace(reqs=[req]), _forward_batch([4]), out, can_run_graph=False
+        )
+        self.assertIs(device.aux, out.hidden_states)
+        self.assertIs(device.last_hidden, out.last_hidden_states)
+        self.assertFalse(runtime.prefix_cache.slots)
+        self.assertFalse(hasattr(req, "_spec_capture_pending_hidden"))
+
     def test_non_writer_ranks_and_decode_batches_capture_nothing(self):
         batch = SimpleNamespace(reqs=[_req("a", 2, _spec("a"))])
         out = _logits_output(2)
@@ -411,16 +511,105 @@ class TestStreamer(unittest.TestCase):
         )
 
 
+@dataclass
+class _MatchParams:
+    key: tuple
+    req: object
+
+
+class TestRadixPrefixCache(unittest.TestCase):
+    def test_radix_match_shortens_an_uncovered_kv_hit_before_forward(self):
+        hidden = prefix_cache.HiddenPrefixCache(4096, 2, is_writer=False)
+        hidden.slots = {10: 0}
+        tree = SimpleNamespace(
+            _spec_capture_hidden=hidden,
+            path_device_indices=lambda node: torch.tensor([10, 11, 20, 21][:node]),
+        )
+        req = _req("match", 5, dict(_spec("match"), reuse_prefix=True))
+
+        def native_match(tree, params):
+            length = len(params.key)
+            return SimpleNamespace(device_prefix_len=length, last_device_node=length)
+
+        params = _MatchParams((1, 2, 3, 4), req)
+        result = prefix_cache.match_prefix(native_match, tree, params)
+        self.assertEqual(result.device_prefix_len, 2)
+        self.assertEqual(req._spec_capture_kv_page_heads, [10])
+        hidden.release(torch.tensor([10, 11]))
+        self.assertEqual(
+            prefix_cache.match_prefix(native_match, tree, params).device_prefix_len, 0
+        )
+
+    def test_hidden_budget_requests_kv_eviction_before_publishing_more_pages(self):
+        hidden = prefix_cache.HiddenPrefixCache(128, 2, is_writer=False)
+        old_req = _req("old", 5, dict(_spec("old"), reuse_prefix=True))
+        logits = _logits_output(5)
+        tensors = (logits.hidden_states, logits.last_hidden_states)
+        hidden.stage(old_req, 0, 5, tensors, copy=False)
+        hidden.insert([10, 20], old_req._spec_capture_pending_hidden)
+        req = _req("new", 7, dict(_spec("new"), reuse_prefix=True))
+        req.kv = SimpleNamespace(cache_protected_len=0, req_pool_idx=0)
+        logits = _logits_output(7)
+        hidden.stage(
+            req, 0, 7, (logits.hidden_states, logits.last_hidden_states), copy=False
+        )
+        evicted = []
+
+        def evict(params, *, allocation_reclaim_satisfied):
+            evicted.append(params.num_tokens)
+            # The first victim is a KV-only page, and another request pins page 20.
+            hidden.release(torch.tensor([90, 91]))
+            self.assertFalse(allocation_reclaim_satisfied())
+            hidden.release(torch.tensor([10, 11]))
+            self.assertFalse(allocation_reclaim_satisfied())
+
+        tree = SimpleNamespace(
+            _spec_capture_hidden=hidden,
+            evict_for_alloc=evict,
+            full_evictable_size=lambda: 4,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor([[30, 31, 40, 41, 50, 51, 60]])
+            ),
+        )
+
+        def publish(tree, req, *, up_to):
+            self.assertEqual(up_to, 2)
+            req.kv.cache_protected_len = up_to
+
+        base_cache = types.ModuleType("sglang.srt.mem_cache.base_prefix_cache")
+        base_cache.EvictParams = SimpleNamespace
+        with mock.patch.dict(sys.modules, {base_cache.__name__: base_cache}):
+            prefix_cache.checkpoint(publish, tree, req, up_to=7)
+        self.assertEqual(evicted, [4])
+        self.assertEqual(set(hidden.slots), {20, 30})
+        self.assertIsNone(req._spec_capture_pending_hidden)
+
+
+class _UnifiedRadixCache:
+    page_size = logical_page_size = 256
+    cache_controller = linker = uocr_doc_reuse = None
+    disable = False
+    tree_core = SimpleNamespace(is_eagle=False)
+
+    def supports_mamba(self):
+        return False
+
+
 def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
     disaggregation = types.ModuleType("sglang.srt.disaggregation.utils")
     disaggregation.DisaggregationMode = SimpleNamespace(NULL="null")
     runtime_context = types.ModuleType("sglang.srt.runtime_context")
     runtime_context.get_exec = lambda: SimpleNamespace(features=features)
-    runtime_context.get_parallel = lambda: SimpleNamespace(attn_tp_rank=attn_tp_rank)
+    runtime_context.get_parallel = lambda: SimpleNamespace(
+        attn_tp_rank=attn_tp_rank, pp_size=1
+    )
     runtime_context.get_schedule = lambda: SimpleNamespace(
         chunked_prefill_size=chunked_prefill_size
     )
+    radix = types.ModuleType("sglang.srt.mem_cache.unified_radix_cache")
+    radix.UnifiedRadixCache = _UnifiedRadixCache
     return {
+        radix.__name__: radix,
         "sglang.srt.disaggregation.utils": disaggregation,
         "sglang.srt.runtime_context": runtime_context,
     }
@@ -428,6 +617,9 @@ def _fake_sglang_modules(features, *, chunked_prefill_size=-1, attn_tp_rank=0):
 
 class _ModelRunner:
     forward_observer = None
+    model_config = SimpleNamespace(hidden_size=8)
+    max_total_num_tokens = 4096
+    dtype = torch.bfloat16
 
 
 def _scheduler():
@@ -436,6 +628,7 @@ def _scheduler():
         output_streamer=SimpleNamespace(),
         defer_response=mock.Mock(),
         disaggregation_mode="null",
+        tree_cache=_UnifiedRadixCache(),
     )
     return scheduler
 
@@ -460,6 +653,26 @@ class TestInstall(unittest.TestCase):
             mock.patch.dict(os.environ, env or {"MOONCAKE_PROTOCOL": "tcp"}),
         ):
             return scheduler, capture.install(scheduler)
+
+    def test_advertises_only_usable_radix_capacity(self):
+        env = {"MOONCAKE_PROTOCOL": "tcp"}
+        env["SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES"] = str(2 * 256 * 3 * 8 * 2)
+        scheduler, runtime = self._install(env=env)
+        self.assertEqual(runtime.prefix_cache.page_size, 256)
+        self.assertIs(runtime.prefix_cache, scheduler.tree_cache._spec_capture_hidden)
+        result = SimpleNamespace(internal_state={})
+        specforge_sglang_capture._capture_internal_state(result, scheduler)
+        self.assertEqual(result.internal_state["spec_capture_prefix_page_size"], 256)
+        self.assertEqual(
+            result.internal_state["spec_capture_prefix_capacity_tokens"], 512
+        )
+
+        env["SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES"] = "4096"
+        scheduler, runtime = self._install(env=env)
+        self.assertIsNone(runtime.prefix_cache)
+        result = SimpleNamespace(internal_state={})
+        specforge_sglang_capture._capture_internal_state(result, scheduler)
+        self.assertNotIn("spec_capture_prefix_page_size", result.internal_state)
 
     def test_wires_observer_completions_and_results(self):
         scheduler, runtime = self._install()
@@ -608,7 +821,9 @@ class TestRegister(unittest.TestCase):
     def _fake_hook_registry(self):
         registered = []
         module = types.ModuleType("sglang.srt.plugins.hook_registry")
-        module.HookType = SimpleNamespace(AFTER="after")
+        module.HookType = SimpleNamespace(
+            AFTER="after", BEFORE="before", AROUND="around"
+        )
         module.HookRegistry = SimpleNamespace(
             register=lambda target, hook, hook_type: registered.append(
                 (target, hook_type)
@@ -644,6 +859,11 @@ class TestRegister(unittest.TestCase):
                     "sglang.srt.managers.scheduler.Scheduler.get_internal_state",
                     "after",
                 ),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.match_prefix", "around"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.checkpoint_into_tree", "around"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}._apply_cache_action", "before"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}._reset_full", "before"),
+                (f"{prefix_cache._UNIFIED_RADIX_CACHE}.on_release", "before"),
             ],
         )
 

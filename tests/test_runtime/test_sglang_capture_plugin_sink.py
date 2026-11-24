@@ -329,7 +329,10 @@ class SpecCaptureSinkTest(unittest.TestCase):
         self.sink.aux_layer_ids = [2, 5, 8]
         scheduler = SimpleNamespace(
             _specforge_capture_runtime=SimpleNamespace(
-                is_writer=True, sink=self.sink, capture_method="eagle3"
+                is_writer=True,
+                sink=self.sink,
+                capture_method="eagle3",
+                prefix_capacity_tokens=0,
             )
         )
         client = ArenaObjectClient(local_hostname="127.0.0.1")

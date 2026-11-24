@@ -180,6 +180,7 @@ the capture server.
 | `deployment.disaggregated.store_id` | `null` | Feature-store namespace; defaults to `run_id`. |
 | `deployment.disaggregated.server_urls` | `[]` | External SGLang capture endpoints (running the capture plugin). One rollout worker is created per entry. Do not set with `managed_local`. |
 | `deployment.disaggregated.server_capture` | `auto` | SGLang capture uses the `specforge-sglang-capture` plugin; allowed values are `auto` and `plugin`. `auto` honors `DISAGG_SERVER_CAPTURE=plugin`, otherwise managed-local planning checks each server interpreter for the plugin and its required SGLang APIs. External capture detects `spec_capture_backend: plugin` in `/server_info`. Missing support fails with installation instructions; source-patch servers are unsupported. See [plugin setup](../../plugins/sglang-spec-capture/README.md). |
+| `deployment.disaggregated.server_capture_prefix_cache` | `auto` | Prefix reuse for online text capture. `auto` enables reuse on compatible endpoints with at least 5% estimated token reuse. `true` enables reuse on compatible endpoints. `false` forces full prefill. Configure the hidden cache budget with `SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` on the capture server. |
 | `deployment.disaggregated.mooncake_metadata_server` | `null` | External Mooncake metadata URL. |
 | `deployment.disaggregated.mooncake_master_server_addr` | `null` | External Mooncake RPC `host:port`. |
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |

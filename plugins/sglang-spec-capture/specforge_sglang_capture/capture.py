@@ -45,6 +45,7 @@ from concurrent.futures import wait as wait_futures
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
+from specforge_sglang_capture.prefix_cache import HiddenPrefixCache
 from specforge_sglang_capture.sink import (
     ARTIFACT_AUX,
     ARTIFACT_LAST_HIDDEN,
@@ -61,6 +62,8 @@ logger = logging.getLogger(__name__)
 SPEC_CAPTURE_KEY = "spec_capture"
 #: Bound on scheduler batches whose rows the sink still holds.
 MAX_PENDING_BATCHES_ENV = "SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES"
+PREFIX_CACHE_BYTES_ENV = "SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES"
+PREFIX_CACHE_MISS = "capture prefix hidden states are unavailable"
 
 _UNPARSED = object()
 
@@ -74,6 +77,7 @@ class CaptureItem:
     start: int
     length: int
     error: Optional[str] = None
+    prefix_len: int = 0
 
 
 def request_spec(req) -> Optional[Dict[str, Any]]:
@@ -97,7 +101,23 @@ def request_spec(req) -> Optional[Dict[str, Any]]:
 
 
 def error_result(spec: Dict[str, Any], error: str) -> Dict[str, Any]:
-    return {"sample_id": str(spec.get("sample_id")), "error": error}
+    result = {"sample_id": str(spec.get("sample_id")), "error": error}
+    if error == PREFIX_CACHE_MISS:
+        result["error_code"] = "prefix_cache_miss"
+    return result
+
+
+def prefix_eligible(req, spec):
+    return (
+        spec.get("reuse_prefix") is True
+        and req.extra_key
+        and req.sampling_params.max_new_tokens == 0
+        and req.input_embeds is None
+        and req.multimodal_inputs is None
+        and req.lora_id is None
+        and getattr(req, "positional_embed_overrides", None) is None
+        and getattr(req, "session", None) is None
+    )
 
 
 def collect_capture_items(
@@ -107,8 +127,8 @@ def collect_capture_items(
 ) -> Tuple[List[CaptureItem], int]:
     """Locate capture requests' rows; return the items and the total row count.
 
-    A capture must cover the whole prompt in this forward: a cached prefix or a
-    chunked prefill would leave rows out.
+    The prefill must cover the entire suffix. Only explicitly opted-in text
+    requests can supply the missing prefix from the hidden-state cache.
     """
     items: List[CaptureItem] = []
     offset = 0
@@ -117,17 +137,17 @@ def collect_capture_items(
         if spec is not None:
             error = spec.get("_parse_error")
             prompt_len = len(req.origin_input_ids)
-            if error is None and prefix_len:
+            if error is None and prefix_len and not prefix_eligible(req, spec):
                 error = (
                     f"{prefix_len} prompt tokens were served from the prefix "
                     "cache; spec capture needs a full prefill"
                 )
-            elif error is None and length != prompt_len:
+            elif error is None and length + prefix_len != prompt_len:
                 error = (
                     f"the prefill covered {length} of {prompt_len} prompt tokens; "
                     "launch the server with --chunked-prefill-size -1"
                 )
-            items.append(CaptureItem(req.rid, spec, offset, length, error))
+            items.append(CaptureItem(req.rid, spec, offset, length, error, prefix_len))
         offset += length
     return items, offset
 
@@ -144,7 +164,10 @@ class CaptureObserver:
         self.runtime = runtime
 
     def after_forward(self, batch, forward_batch, logits_output, *, can_run_graph):
-        if not self.runtime.is_writer or not forward_batch.forward_mode.is_extend():
+        cache = self.runtime.prefix_cache
+        if not forward_batch.forward_mode.is_extend() or (
+            not self.runtime.is_writer and cache is None
+        ):
             return None
         items, num_rows = collect_capture_items(
             batch.reqs,
@@ -185,8 +208,69 @@ class CaptureObserver:
                         ),
                     )
             checked.append(item)
+        if cache is not None and aux is not None and last_hidden is not None:
+            req_by_id = {req.rid: req for req in batch.reqs}
+            for item in checked:
+                req = req_by_id[item.rid]
+                if item.error is None and prefix_eligible(req, item.spec):
+                    span = slice(item.start, item.start + item.length)
+                    cache.stage(
+                        req,
+                        item.prefix_len,
+                        item.prefix_len + item.length,
+                        (aux[span], last_hidden[span]),
+                        copy=can_run_graph,
+                    )
+        if not self.runtime.is_writer:
+            return None
+        if any(item.prefix_len and item.error is None for item in checked):
+            return self._restore_prefixes(
+                batch.reqs, checked, aux, last_hidden, copy=can_run_graph
+            )
         return CaptureDeviceOutput.from_rows(
             self.runtime, checked, aux, last_hidden, copy=can_run_graph
+        )
+
+    def _restore_prefixes(self, reqs, items, aux, last_hidden, *, copy):
+        cache = self.runtime.prefix_cache
+        req_by_id = {req.rid: req for req in reqs}
+        can_restore = cache is not None and aux is not None and last_hidden is not None
+        parts = []
+        rebased = []
+        hits = False
+        cursor = 0
+        for i, item in enumerate(items):
+            if item.error is not None:
+                rebased.append(item)
+                continue
+            if item.prefix_len:
+                prefix = (
+                    cache.read(req_by_id[item.rid], item.prefix_len)
+                    if can_restore
+                    else None
+                )
+                if prefix is None:
+                    item = dataclasses.replace(item, error=PREFIX_CACHE_MISS)
+                    items[i] = item
+                    rebased.append(item)
+                    continue
+                parts.append(prefix)
+                hits = True
+            if can_restore:
+                span = slice(item.start, item.start + item.length)
+                parts.append((aux[span], last_hidden[span]))
+            length = item.prefix_len + item.length
+            rebased.append(dataclasses.replace(item, start=cursor, length=length))
+            cursor += length
+        if not hits:
+            return CaptureDeviceOutput.from_rows(
+                self.runtime, items, aux, last_hidden, copy=copy
+            )
+
+        # The concatenations allocate fresh storage, including for graph outputs.
+        aux_parts, last_parts = zip(*parts, strict=True)
+        return CaptureDeviceOutput(
+            self.runtime, rebased, torch.cat(aux_parts), torch.cat(last_parts)
         )
 
 
@@ -424,15 +508,61 @@ class CaptureRuntime:
         gpu_put: bool,
         max_pending_batches: int,
         defer_response: Callable[[Any, CaptureCompletion], None],
+        prefix_cache: HiddenPrefixCache | None = None,
+        prefix_capacity_tokens: int = 0,
     ) -> None:
         self.sink = sink
         self.is_writer = is_writer
         self.gpu_put = gpu_put
         self.defer_response = defer_response
+        self.prefix_cache = prefix_cache
+        self.prefix_capacity_tokens = prefix_capacity_tokens
         # rid -> result dict, read by the streamer when the request streams.
         self.results: Dict[str, Dict[str, Any]] = {}
         self.pending = PendingCaptures(self, max_pending_batches)
         self.observer = CaptureObserver(self)
+
+
+def _configure_prefix_cache(tree, model_runner, features, budget, is_writer):
+    if not budget:
+        return None, 0
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.runtime_context import get_parallel
+
+    if (
+        type(tree) is not UnifiedRadixCache
+        or tree.disable
+        or tree.cache_controller is not None
+        or tree.linker is not None
+        or tree.logical_page_size != tree.page_size
+        or tree.supports_mamba()
+        or tree.tree_core.is_eagle
+        or tree.uocr_doc_reuse is not None
+        or get_parallel().pp_size != 1
+    ):
+        logger.info("SpecForge prefix reuse is unavailable on this radix cache")
+        return None, 0
+
+    layers = features.return_aux_hidden_state_layer_ids
+    if not layers:
+        return None, 0
+    bytes_per_token = (
+        model_runner.model_config.hidden_size
+        * (len(layers) + 1)
+        * model_runner.dtype.itemsize
+    )
+    hidden = HiddenPrefixCache(
+        budget,
+        tree.page_size,
+        is_writer=is_writer,
+        max_tokens=model_runner.max_total_num_tokens,
+    )
+    pages = hidden.capacity(tree.page_size * bytes_per_token)
+    if not pages:
+        return None, 0
+
+    tree._spec_capture_hidden = hidden
+    return hidden, pages * tree.page_size
 
 
 def install(scheduler) -> CaptureRuntime:
@@ -476,12 +606,21 @@ def install(scheduler) -> CaptureRuntime:
         # size now rather than failing every capture batch.
         arena_bytes()
 
+    prefix_cache_bytes = int(os.environ.get(PREFIX_CACHE_BYTES_ENV, "0"))
+    if prefix_cache_bytes < 0:
+        raise ValueError(f"{PREFIX_CACHE_BYTES_ENV} must be nonnegative")
+    is_writer = get_parallel().attn_tp_rank == 0
+    prefix_cache, prefix_capacity = _configure_prefix_cache(
+        scheduler.tree_cache, model_runner, features, prefix_cache_bytes, is_writer
+    )
     runtime = CaptureRuntime(
         sink=SpecCaptureSink(features.return_aux_hidden_state_layer_ids),
-        is_writer=get_parallel().attn_tp_rank == 0,
+        is_writer=is_writer,
         gpu_put=gpu_put_enabled(),
         max_pending_batches=int(os.environ.get(MAX_PENDING_BATCHES_ENV, "2")),
         defer_response=scheduler.defer_response,
+        prefix_cache=prefix_cache,
+        prefix_capacity_tokens=prefix_capacity,
     )
     method = features.aux_hidden_state_capture
     runtime.capture_method = str(getattr(method, "name", method)).lower()

@@ -649,6 +649,21 @@ def _build_online(
             passthrough=layout.passthrough,
             attention_mask_feature=layout.attention_mask_feature,
         )
+        deployment = cfg.deployment.disaggregated
+        server_urls = _server_urls(cfg)
+        prompt_seed = _online_prompt_seed(cfg)
+        prefix_mode = deployment.server_capture_prefix_cache if deployment else "auto"
+        prefix_flags = [False] * len(server_urls)
+        if prefix_mode is True and input_adapter is None:
+            from specforge.inference.prefix_cache import supported_prefix_cache_modes
+
+            prefix_flags = supported_prefix_cache_modes(server_urls)
+        elif prefix_mode == "auto" and input_adapter is None:
+            from specforge.inference.prefix_cache import auto_prefix_cache_modes
+
+            prefix_flags = auto_prefix_cache_modes(
+                prompts, server_urls, lease=cfg.runtime.producer_lease, seed=prompt_seed
+            )
         adapters = [
             SGLangServerCaptureAdapter(
                 url,
@@ -659,8 +674,9 @@ def _build_online(
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
                 server_capture=_server_capture(cfg),
+                prefix_cache=prefix_enabled,
             )
-            for url in _server_urls(cfg)
+            for url, prefix_enabled in zip(server_urls, prefix_flags, strict=True)
         ]
         target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
@@ -680,7 +696,7 @@ def _build_online(
             target_repr=target_repr,
             aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=_online_prompt_seed(cfg),
+            prompt_seed=prompt_seed,
             lease=cfg.runtime.producer_lease,
             in_flight_high_watermark=in_flight_high_watermark,
             in_flight_low_watermark=in_flight_low_watermark,

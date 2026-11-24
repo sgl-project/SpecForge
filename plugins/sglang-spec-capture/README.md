@@ -140,6 +140,35 @@ The response's `meta_info["spec_capture"]` holds `[result]`, where `result` is
 or `{sample_id, error}`. Objects are stored at
 `{store_id}/{sample_id}/g{gen}/{name}`.
 
+## Prefix reuse
+
+For a fixed text target,
+`deployment.disaggregated.server_capture_prefix_cache` defaults to `auto`.
+Set it to `true` to enable reuse on supported servers or `false` to force
+full prefill. Give each capture writer a positive
+`SGLANG_SPEC_CAPTURE_PREFIX_CACHE_BYTES` budget and reserve that device memory
+below `--mem-fraction-static`. The budget must hold at least one radix page of
+aux and last hidden states. Each producer adapter uses its own radix namespace.
+
+`auto` samples up to 512 prepared prompts in deterministic random order. It
+approximates lease assignment across endpoints and estimates reusable full
+pages in a history capped at 64K tokens and the advertised hidden capacity per
+scheduler. It enables endpoints with at least 5% estimated reuse.
+
+The plugin coordinates admission with SGLang's on-device unified radix cache.
+It keeps hidden rows outside the radix tree, indexed by the KV page slots
+published by the cache. When the hidden pool needs space, SGLang's eviction
+policy selects KV pages and the plugin releases the corresponding hidden
+slots. Evicting KV for allocator pressure and resetting the tree also release
+their hidden slots. A capture request uses only the longest prefix available
+in both caches, determined before prefill. The store receives full-length
+tensors, and an unexpected missing hidden prefix still triggers one cold retry.
+
+Servers without a supported on-device unified cache or enough budget use full
+prefill. Host/external KV tiers, recurrent-state caches, pipeline parallelism,
+and multimodal or custom-input captures use the full-prefill path. Lease
+retries also use full prefill.
+
 ## Multi-node NVLink
 
 On GB200/GB300 NVL72 systems, `MOONCAKE_PROTOCOL=nvlink` moves captures from

@@ -867,6 +867,8 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: backend: managed_local probes each capture server's interpreter while
     #: planning; the producer reads an external server's ``/server_info``.
     server_capture: Literal["auto", "plugin"] = "auto"
+    #: Estimate radix-prefix reuse from prepared text prompts by default.
+    server_capture_prefix_cache: bool | Literal["auto"] = "auto"
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
