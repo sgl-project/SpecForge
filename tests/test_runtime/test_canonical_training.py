@@ -274,11 +274,7 @@ class CanonicalTrainingTest(unittest.TestCase):
     def test_all_architectures_resolve_and_assemble(self):
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))
-            configs = configurations()[:-2] + [
-                eagle_config(target_width=32),
-                peagle_config(target_width=32),
-            ]
-            for draft in configs:
+            for draft in configurations(eagle_target_width=32):
                 with self.subTest(architecture=draft.architecture):
                     cfg = run_config(target, draft, initialization={})
                     resolved = resolve_run(cfg)

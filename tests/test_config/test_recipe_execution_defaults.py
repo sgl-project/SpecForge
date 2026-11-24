@@ -5,8 +5,9 @@ last commit whose recipes ran the legacy training wrappers. For every recipe it
 holds what a CUDA trainer resolved there: whether the loss used the fused
 kernels, the loss chunk (in flattened row x block units), chunk checkpointing,
 Liger, the Triton grouped convolution and the feature-loader workers. The
-canonical route has to resolve the same values. A deliberate change updates the
-fixture in the same commit and says why.
+canonical route has to resolve the same values. Recipes added after the migration
+record their canonical defaults. A deliberate change updates the fixture in the
+same commit and says why.
 """
 
 import json

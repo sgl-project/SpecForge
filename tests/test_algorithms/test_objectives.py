@@ -24,7 +24,7 @@ from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_conf
 from tests.test_modeling.test_canonical_peagle import model_config as peagle_config
 
 
-def configurations():
+def configurations(*, eagle_target_width=48):
     return [
         draft_config(target_bindings=(), target_logit_transform=None),
         dflash2_config(),
@@ -33,12 +33,14 @@ def configurations():
         dspine_config(),
         dmtp_config(),
         mtp_config(target_bindings=(), target_logit_transform=None),
-        eagle_config(),
+        eagle_config(target_width=eagle_target_width),
         replace(
-            eagle_config(normalize=True, norm_output=True),
+            eagle_config(
+                normalize=True, norm_output=True, target_width=eagle_target_width
+            ),
             architecture="ParallelReconsiderationDraftModel",
         ),
-        peagle_config(),
+        peagle_config(target_width=eagle_target_width),
     ]
 
 
