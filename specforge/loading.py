@@ -59,16 +59,29 @@ def read_draft(
     )
 
 
-def _dtype(requested, checkpoint):
+def _fixed_state(config, backend):
+    """State entries whose dtype their module fixes whatever dtype the draft is built with, as the modules declare them."""
+    preview = build_draft_model(
+        config, device="meta", dtype=torch.float32, backend=backend
+    )
+    return {
+        f"{prefix}.{name}" if prefix else name
+        for prefix, module in preview.named_modules()
+        for name in getattr(module, "fixed_dtype_buffers", ())
+    }
+
+
+def _dtype(requested, checkpoint, backend):
     if requested is not None:
         if not isinstance(requested, torch.dtype) or not requested.is_floating_point:
             raise ValueError("dtype must be a floating-point torch.dtype")
         return requested
-    # The checkpoint's one floating dtype; a MoE router's expert_bias is fp32 whatever it is.
+    # The checkpoint's one floating dtype, past the entries their modules fix.
+    fixed = _fixed_state(checkpoint.config, backend)
     types = {
         ref.info.dtype
         for name, ref in checkpoint.weights.items()
-        if not name.endswith(".expert_bias")
+        if name not in fixed
         and isinstance(ref.info.dtype, torch.dtype)
         and ref.info.dtype.is_floating_point
     }
@@ -120,7 +133,7 @@ def load_draft(
         raise ValueError(
             "supplied draft does not match checkpoint structure; use weights_from for a new structure"
         )
-    dtype = _dtype(dtype, checkpoint)
+    dtype = _dtype(dtype, checkpoint, backend)
     preview = build_draft_model(
         checkpoint.config, device="meta", dtype=dtype, backend=backend
     )

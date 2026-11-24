@@ -21,6 +21,7 @@ from specforge.loading import load_draft
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.layers.mlp import MoEFFN
+from specforge.modeling.draft.layers.mlp.moe import Router
 from specforge.modeling.draft.models import DSparkDraftModel
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_dspark_spec import dspark_spec
@@ -234,6 +235,8 @@ class CanonicalDSparkTest(unittest.TestCase):
 
     def test_moe_load_infers_the_dtype_past_the_fixed_fp32_expert_bias(self):
         """dtype omitted: the checkpoint's one dtype, the fp32 expert_bias aside; mixed weights need it explicit."""
+        # The router declares the buffer; the loader reads the declaration, not a name.
+        self.assertEqual(Router.fixed_dtype_buffers, ("expert_bias",))
         model = build_draft_model(moe_model_config(), dtype=torch.bfloat16)
         with TemporaryDirectory() as path:
             model.save_pretrained(path)

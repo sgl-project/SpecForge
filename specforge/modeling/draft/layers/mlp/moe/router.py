@@ -12,6 +12,10 @@ from specforge.config.draft.mlp import MoERouterSpec
 class Router(nn.Module):
     """Router contract: `forward`, and the fp32 `expert_bias` that shifts the top-k choice."""
 
+    # Buffers whose dtype this module fixes whatever dtype the draft is built with;
+    # the loader leaves them out when it infers a checkpoint's dtype.
+    fixed_dtype_buffers: tuple[str, ...] = ("expert_bias",)
+
     def __init__(
         self, config: MoERouterSpec, *, num_experts: int, top_k: int, device=None
     ):
