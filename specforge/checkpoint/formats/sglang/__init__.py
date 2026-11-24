@@ -1,6 +1,6 @@
 """One-way conversions to the explicitly pinned SGLang checkpoint format."""
 
-SGLANG_COMMIT = "48eaefbd1e8038175162b6071e800b85d425c96b"
+SGLANG_COMMIT = "c19e9c7d19a873498c4fee1d789596c1a2b6e6f0"
 CONVERTER_VERSION = 1
 # HF container/dtype probes do not select draft computation in this format.
 NON_COMPUTATIONAL_READS = frozenset(

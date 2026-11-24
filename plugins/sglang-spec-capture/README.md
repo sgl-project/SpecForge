@@ -25,7 +25,7 @@ This version requires SGLang's [aux-capture changes in PR #43449](https://github
 and the completion-based `defer_response` revision of
 [PR #43450](https://github.com/sgl-project/sglang/pull/43450), or a branch containing
 both. Install SGLang manually at commit
-`48eaefbd1e8038175162b6071e800b85d425c96b` on the `release/v1.0.0` branch; the released
+`c19e9c7d19a873498c4fee1d789596c1a2b6e6f0` on the `release/v1.0.0` branch; the released
 0.5.23 wheel still lacks the forward observer, completion and auxiliary-capture
 APIs required here.
 
@@ -70,7 +70,7 @@ uv pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
 uv pip install wheel setuptools setuptools-rust setuptools-scm
 uv pip install --no-build-isolation --prerelease=allow -e .
 uv pip install --no-build-isolation --prerelease=allow \
-  "sglang @ git+https://github.com/sgl-project/sglang.git@48eaefbd1e8038175162b6071e800b85d425c96b#subdirectory=python"
+  "sglang @ git+https://github.com/sgl-project/sglang.git@c19e9c7d19a873498c4fee1d789596c1a2b6e6f0#subdirectory=python"
 uv pip install --no-deps plugins/sglang-spec-capture
 uv pip install mooncake-transfer-engine-cuda13
 ```
