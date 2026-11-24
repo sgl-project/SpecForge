@@ -46,7 +46,7 @@ from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import STATE_FILE, CheckpointManager
 from specforge.training.controller import TrainerController, _AsyncAckRunner
 from specforge.training.runner import DataParallelRunner
-from tests.test_runtime._fixtures import FakeProgram, fake_spec
+from tests.test_runtime._fixtures import FakeProgram, fake_spec, reference_runtime
 
 WORLD_SIZE = 2
 ACK_THREAD = "specforge-durable-ack"
@@ -470,6 +470,7 @@ def _build_consumer(
             channel=channel,
             draft_model=object(),
             optimizer_factory=object(),
+            runtime=reference_runtime(),
             run_id="run0",
             output_dir=os.path.join(work, "output"),
             collate_fn=lambda features: {},

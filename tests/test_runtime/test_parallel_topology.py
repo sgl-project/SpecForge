@@ -11,6 +11,7 @@ from specforge.launch import (
     build_offline_runtime,
 )
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime._fixtures import reference_runtime
 
 
 class ParallelTopologyTest(unittest.TestCase):
@@ -122,6 +123,7 @@ class ParallelTopologyTest(unittest.TestCase):
                 draft_model=object(),
                 target_head=None,
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run",
                 output_dir="/unused",
                 topology=Topology(world_size=2, tp_size=2),
@@ -137,6 +139,7 @@ class ParallelTopologyTest(unittest.TestCase):
                 draft_model=object(),
                 target_head=None,
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run",
                 output_dir="/unused",
                 topology=Topology(world_size=2, tp_size=2),

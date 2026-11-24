@@ -134,6 +134,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
             draft_model=usp_model,
             target_head=target_head,
             optimizer_factory=optimizer_factory,
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="usp-parity",
             output_dir=os.path.join(workdir, "output"),
             ttt_length=3,

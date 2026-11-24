@@ -75,6 +75,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
                 warmup_ratio=0.0,
                 total_steps=1,
             ),
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="dspark-e2e",
             output_dir=os.path.join(workdir, "out"),
             batch_size=1,

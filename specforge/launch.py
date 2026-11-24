@@ -32,7 +32,11 @@ from specforge.runtime.data_plane import (
 
 if TYPE_CHECKING:
     from specforge.distributed import Topology
-    from specforge.training.contracts import OptimizerSpec, SchedulerSpec
+    from specforge.training.contracts import (
+        OptimizerSpec,
+        SchedulerSpec,
+        TrainingRuntime,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,7 @@ def _assemble_trainer(
     optimizer_spec: Optional[OptimizerSpec] = None,
     scheduler_spec: Optional[SchedulerSpec] = None,
     max_grad_norm: Optional[float] = None,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     batch_size: int,
@@ -130,6 +135,7 @@ def _assemble_trainer(
         optimizer_spec=optimizer_spec,
         scheduler_spec=scheduler_spec,
         max_grad_norm=max_grad_norm,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -539,6 +545,7 @@ def build_offline_runtime(
     optimizer_spec: Optional[OptimizerSpec] = None,
     scheduler_spec: Optional[SchedulerSpec] = None,
     max_grad_norm: Optional[float] = None,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
@@ -628,6 +635,7 @@ def build_offline_runtime(
         optimizer_spec=optimizer_spec,
         scheduler_spec=scheduler_spec,
         max_grad_norm=max_grad_norm,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -671,6 +679,7 @@ def build_disagg_offline_runtime(
     optimizer_spec: Optional[OptimizerSpec] = None,
     scheduler_spec: Optional[SchedulerSpec] = None,
     max_grad_norm: Optional[float] = None,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     ttt_length: int = 7,
@@ -756,6 +765,7 @@ def build_disagg_offline_runtime(
         optimizer_spec=optimizer_spec,
         scheduler_spec=scheduler_spec,
         max_grad_norm=max_grad_norm,
+        runtime=runtime,
         run_id=run_id,
         output_dir=output_dir,
         batch_size=batch_size,
@@ -1542,6 +1552,7 @@ def build_disagg_online_consumer(
     optimizer_spec: Optional[OptimizerSpec] = None,
     scheduler_spec: Optional[SchedulerSpec] = None,
     max_grad_norm: Optional[float] = None,
+    runtime: TrainingRuntime,
     run_id: str,
     output_dir: str,
     target_head=None,
@@ -1878,6 +1889,7 @@ def build_disagg_online_consumer(
             optimizer_spec=optimizer_spec,
             scheduler_spec=scheduler_spec,
             max_grad_norm=max_grad_norm,
+            runtime=runtime,
             run_id=run_id,
             output_dir=output_dir,
             batch_size=batch_size,

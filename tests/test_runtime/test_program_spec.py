@@ -19,6 +19,7 @@ from specforge.training.contracts import PartitionHints, ProgramSpec
 from specforge.training.program import program_spec
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import configurations
+from tests.test_runtime._fixtures import reference_runtime
 from tests.test_runtime.test_canonical_end_to_end import (
     build,
     drafts,
@@ -189,9 +190,13 @@ class FrozenModulesTest(unittest.TestCase):
             pass
 
         model = nn.Sequential(Block(2, 2), nn.Linear(2, 2), nn.Embedding(4, 2))
+        model.to(torch.bfloat16)
         table = model[2]
         table.requires_grad_(False)
-        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="SHARD_GRAD_OP"))
+        spec = reference_runtime(torch.bfloat16).precision
+        backend = FSDPTrainingBackend(
+            ParallelConfig(sharding_strategy="SHARD_GRAD_OP"), precision=spec
+        )
         with patch(
             "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
         ) as wrapper:
@@ -204,9 +209,12 @@ class FrozenModulesTest(unittest.TestCase):
         )
         self.assertEqual(backend.ignored_frozen_modules, (table,))
         self.assertEqual(backend.auto_wrap_block_classes, {Block})
+        # The run's precision is what the wrapper computes and reduces in.
+        precision = arguments["mixed_precision"]
+        self.assertEqual(precision.param_dtype, spec.compute_dtype)
+        self.assertEqual(precision.reduce_dtype, spec.gradient_dtype)
         # The program receives its inputs as placed, as under DDP: the wrapper
         # casts parameters, never the program's tensors.
-        precision = arguments["mixed_precision"]
         self.assertFalse(precision.cast_root_forward_inputs)
         self.assertFalse(precision.cast_forward_inputs)
         # Without declarations: nothing ignored, one root unit.
@@ -214,7 +222,7 @@ class FrozenModulesTest(unittest.TestCase):
             "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
         ) as wrapper:
             FSDPTrainingBackend(
-                ParallelConfig(sharding_strategy="SHARD_GRAD_OP")
+                ParallelConfig(sharding_strategy="SHARD_GRAD_OP"), precision=spec
             ).prepare_model(model)
         self.assertNotIn("ignored_modules", wrapper.call_args.kwargs)
         self.assertNotIn("auto_wrap_policy", wrapper.call_args.kwargs)

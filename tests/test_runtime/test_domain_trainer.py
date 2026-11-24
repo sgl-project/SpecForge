@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from specforge.distributed import Topology
+from tests.test_runtime._fixtures import reference_runtime
 
 
 class DomainTrainerWiringTest(unittest.TestCase):
@@ -35,6 +36,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         on_fit_finally=None,
         topology=Topology(rank=3, world_size=8),
         store="STORE",
+        runtime=None,
     ):
         import specforge.training.trainer as tr
         from specforge.training.contracts import PartitionHints, ProgramSpec
@@ -74,12 +76,14 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 optimizer_spec=None,
                 scheduler_spec=None,
                 max_grad_norm=None,
+                precision=None,
             ):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
                 cap["optimizer_spec"] = optimizer_spec
                 cap["scheduler_spec"] = scheduler_spec
                 cap["max_grad_norm"] = max_grad_norm
+                cap["precision"] = precision
 
             def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
                 cap["prepare_model"] = (model, optimizer_target, frozen_modules, blocks)
@@ -132,6 +136,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         model = SimpleNamespace(draft_model="DRAFT", frozen_modules=("TABLE",))
         dfc = FakeDataflowController()
 
+        runtime = reference_runtime() if runtime is None else runtime
         with mock.patch.multiple(
             tr,
             FeatureDataLoader=FakeLoader,
@@ -148,6 +153,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 model=model,
                 program_spec=spec,
                 optimizer_factory="OPT",
+                runtime=runtime,
                 run_id="run",
                 output_dir="/out",
                 batch_size=2,
@@ -254,8 +260,21 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "tp_size": 1,
                 "sp_ulysses_size": 1,
                 "sp_ring_size": 1,
+                "runtime": "fsdp",
+                "precision": reference_runtime().precision.to_record(),
+                "fsdp_sharding": "SHARD_GRAD_OP",
             },
         )
+        self.assertEqual(cap["precision"], reference_runtime().precision)
+
+    def test_unknown_runtime_is_refused_before_wrapping(self):
+        from dataclasses import replace
+
+        unknown = replace(reference_runtime(), name="unknown_rt")
+        with self.assertRaisesRegex(
+            ValueError, "unknown training runtime 'unknown_rt'"
+        ):
+            self._build({"refs": list(range(6))}, runtime=unknown)
 
     def test_throughput_scale_counts_only_data_parallel_ranks(self):
         _, cap, _, _ = self._build(

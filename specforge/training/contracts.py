@@ -93,6 +93,127 @@ class SchedulerSpec:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
+#: Runtimes ``training.runtime`` names, and how each holds the trainable draft.
+RUNTIMES = ("fsdp", "fsdp2")
+
+
+@dataclass(frozen=True)
+class PrecisionSpec:
+    """How the trainable draft's numbers are stored, computed, reduced and written.
+
+    Resolved once for a run (``resolve``) and handed to the trainer. The
+    runtime refuses a combination it cannot hold, and checks the trainable
+    parameters are stored as declared and the optimizer keeps the declared
+    masters. Under ``fsdp`` the separate fp32 master copy is
+    ``BF16Optimizer``'s, and the artifact is written in the parameter dtype.
+    Frozen modules (bound target tables, the teacher head) keep the dtype they
+    were built in and are not described here.
+    """
+
+    #: What the trainable parameters are stored in.
+    parameter_dtype: torch.dtype
+    #: What the runtime gives the parameters in for forward and backward. A
+    #: module may cast further inside (Domino's GRU runs fp16 on Ascend).
+    compute_dtype: torch.dtype
+    #: What gradients accumulate in across micro-batches and are reduced in
+    #: across ranks.
+    gradient_dtype: torch.dtype
+    #: The optimizer's own copy of the parameters, when it keeps one; None
+    #: when the parameters themselves are the masters.
+    master_dtype: Optional[torch.dtype]
+    #: What checkpoints and exports write the draft's weights in.
+    artifact_dtype: torch.dtype
+    #: What floating-point buffers are cast to while wrapped; None leaves
+    #: buffers in the dtype they were built in (DDP / unwrapped).
+    buffer_dtype: Optional[torch.dtype] = None
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        runtime: str,
+        model_dtype: torch.dtype,
+        sharding_strategy: Optional[str] = None,
+    ) -> "PrecisionSpec":
+        """The precision a runtime trains a draft built in ``model_dtype`` with.
+
+        ``fsdp`` (DDP / FSDP1): parameters, compute, gradients and the artifact
+        in ``model_dtype``; ``BF16Optimizer`` keeps fp32 masters; FSDP1 casts
+        floating buffers to fp32 while DDP (``NO_SHARD``) leaves them as built.
+        ``fsdp2``: fp32 parameters that are the masters, compute in
+        ``model_dtype``, fp32 gradients and floating buffers, artifact in
+        ``model_dtype``.
+        """
+        if not model_dtype.is_floating_point:
+            raise ValueError(f"model dtype must be floating point, not {model_dtype}")
+        if runtime == "fsdp":
+            return cls(
+                parameter_dtype=model_dtype,
+                compute_dtype=model_dtype,
+                gradient_dtype=model_dtype,
+                master_dtype=torch.float32,
+                artifact_dtype=model_dtype,
+                buffer_dtype=(
+                    None if sharding_strategy == "NO_SHARD" else torch.float32
+                ),
+            )
+        if runtime == "fsdp2":
+            return cls(
+                parameter_dtype=torch.float32,
+                compute_dtype=model_dtype,
+                gradient_dtype=torch.float32,
+                master_dtype=None,
+                artifact_dtype=model_dtype,
+                buffer_dtype=torch.float32,
+            )
+        raise ValueError(f"unknown runtime {runtime!r}; expected one of {RUNTIMES}")
+
+    def to_record(self) -> Dict[str, Optional[str]]:
+        """Plain string representation recorded in checkpoints for resume checks."""
+        return {
+            "parameter_dtype": str(self.parameter_dtype),
+            "compute_dtype": str(self.compute_dtype),
+            "gradient_dtype": str(self.gradient_dtype),
+            "master_dtype": (
+                None if self.master_dtype is None else str(self.master_dtype)
+            ),
+            "artifact_dtype": str(self.artifact_dtype),
+            "buffer_dtype": (
+                None if self.buffer_dtype is None else str(self.buffer_dtype)
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class TrainingRuntime:
+    """The data-parallel runtime that trains the draft, and its precision.
+
+    Resolved once for a run and handed to the trainer, which builds that
+    runtime; the runtime honours the precision or refuses it.
+    """
+
+    #: One of ``RUNTIMES``.
+    name: str
+    precision: PrecisionSpec
+
+    @classmethod
+    def resolve(
+        cls,
+        name: str,
+        *,
+        model_dtype: torch.dtype,
+        sharding_strategy: Optional[str] = None,
+    ) -> "TrainingRuntime":
+        return cls(
+            name,
+            PrecisionSpec.resolve(
+                runtime=name,
+                model_dtype=model_dtype,
+                sharding_strategy=sharding_strategy,
+            ),
+        )
+
+
 @dataclass(frozen=True)
 class PartitionHints:
     """What a runner that shards parameters has to keep together."""

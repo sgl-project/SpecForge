@@ -32,6 +32,7 @@ from specforge.training.disaggregated import (
 )
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -119,6 +120,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         build_model_bundle=lambda _cfg: bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=None,
                         preflight_model_bundle=preflight,
                     )
@@ -197,6 +199,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         build_model_bundle=mock.Mock(),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=None,
                         preflight_model_bundle=preflight,
                     )
@@ -353,6 +356,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                             build_model_bundle=mock.Mock(),
                             prepare_prompts=mock.Mock(),
                             optimizer_factory=mock.Mock(),
+                            training_runtime=lambda _cfg: reference_runtime(),
                             logger=mock.Mock(),
                         )
 
@@ -406,6 +410,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         build_model_bundle=build_model_bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=mock.Mock(),
                         preflight_model_bundle=preflight,
                     )
@@ -508,6 +513,7 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
+                    training_runtime=lambda _cfg: reference_runtime(),
                     logger=mock.Mock(),
                 )
         self.assertFalse(os.path.exists(channel + ".failed"))
