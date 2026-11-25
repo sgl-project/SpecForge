@@ -171,10 +171,16 @@ def _training_runtime(cfg: Config) -> TrainingRuntime:
 
     from specforge.training.contracts import TrainingRuntime
 
+    gradient_dtype = (
+        getattr(torch, cfg.training.gradient_dtype)
+        if cfg.training.gradient_dtype is not None
+        else None
+    )
     return TrainingRuntime.resolve(
         cfg.training.runtime,
         model_dtype=getattr(torch, cfg.model.torch_dtype),
         sharding_strategy=cfg.training.fsdp_sharding,
+        gradient_dtype=gradient_dtype,
     )
 
 

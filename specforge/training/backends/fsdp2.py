@@ -52,10 +52,13 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
     averaged over the ranks (FSDP2's default), and a runtime-owned step that
     clips, validates scalars in one host read, steps, clears and schedules.
 
-    Limit (torch 2.14): a parameter that receives no gradient on an earlier
-    micro-batch of a window but one on its last fails FSDP2's reduce-scatter,
-    which then holds that gradient in the compute dtype beside the others'
-    fp32 accumulators ("FSDP reduce-scatter expects uniform gradient dtype").
+    Limit (torch 2.14, with ``gradient_dtype=fp32``): a parameter that receives
+    no gradient on an earlier micro-batch of a window but one on its last fails
+    FSDP2's reduce-scatter, which then holds that gradient in the compute dtype
+    beside the others' fp32 accumulators ("FSDP reduce-scatter expects uniform
+    gradient dtype"). Opting into ``gradient_dtype=compute_dtype`` avoids this
+    by accumulating and reducing uniformly in the compute dtype (with sharded
+    grads still cast to the fp32 masters after reduction).
     """
 
     name = "fsdp2"
@@ -74,8 +77,8 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         """
         Raises:
             ValueError: An unknown sharding strategy, or a precision this runtime
-                does not hold: fp32 parameters as masters, fp32 gradients and
-                fp32 floating buffers.
+                does not hold: fp32 parameters as masters, fp32 or compute-dtype
+                gradients and fp32 floating buffers.
         """
         if parallel.sharding_strategy not in _RESHARD_AFTER_FORWARD:
             raise ValueError(
@@ -98,13 +101,14 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
     def _validate_precision(self, precision: PrecisionSpec) -> None:
         if not (
             precision.parameter_dtype == torch.float32
-            and precision.gradient_dtype == torch.float32
+            and precision.gradient_dtype in (torch.float32, precision.compute_dtype)
             and precision.master_dtype is None
             and precision.buffer_dtype == torch.float32
         ):
             raise ValueError(
-                "the fsdp2 runtime holds fp32 parameters as the masters, fp32 "
-                f"gradients and fp32 floating buffers; {precision} asks otherwise"
+                "the fsdp2 runtime holds fp32 parameters as the masters, fp32 or "
+                "compute-dtype gradients and fp32 floating buffers; "
+                f"{precision} asks otherwise"
             )
 
     @property
@@ -158,15 +162,13 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         mesh = self._mesh(next(model.parameters()).device)
         policy = MixedPrecisionPolicy(
             param_dtype=self.compute_dtype,
-            reduce_dtype=torch.float32,
+            reduce_dtype=self.precision.gradient_dtype,
             cast_forward_inputs=False,
         )
-        options = dict(
+        reshard = _RESHARD_AFTER_FORWARD[self.parallel_config.sharding_strategy]
+        common_options = dict(
             mesh=mesh,
             mp_policy=policy,
-            reshard_after_forward=_RESHARD_AFTER_FORWARD[
-                self.parallel_config.sharding_strategy
-            ],
             # Every unit, not only the root: a frozen table inside a block is
             # otherwise taken by that block's unit before the root sees it.
             ignored_params={p for module in frozen for p in module.parameters()},
@@ -176,10 +178,17 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             for module in model.modules()
             if type(module).__name__ in blocks
         }
-        for module in list(model.modules()):
-            if type(module) in block_classes:
-                fully_shard(module, **options)
-        fully_shard(model, **options)
+        # Wrap blocks bottom-up so nested _no_split_modules claim inner blocks
+        # before their enclosing modules, and keep root reshard_after_forward=False
+        # so FULL_SHARD does not immediately re-gather the root group for backward.
+        block_modules = [
+            module
+            for module in model.modules()
+            if module is not model and type(module) in block_classes
+        ]
+        for module in reversed(block_modules):
+            fully_shard(module, reshard_after_forward=reshard, **common_options)
+        fully_shard(model, reshard_after_forward=False, **common_options)
         if self.parallel_config.sharding_strategy == "NO_SHARD":
             _broadcast_replicas(model, mesh.get_group("replicate"))
         self.module = model
@@ -238,13 +247,23 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None:
         """Backward one micro-batch; the gradient collective runs at the boundary.
 
-        Between boundaries FSDP2 keeps the unsharded gradient in fp32 and the
-        parameters gathered after backward, so a window reduces once; under
-        ``SHARD_GRAD_OP`` and ``NO_SHARD`` it also gathers once.
+        Between boundaries FSDP2 skips the gradient collective so a window
+        reduces once. ``SHARD_GRAD_OP`` and ``NO_SHARD`` keep parameters
+        gathered across micro-batches, whereas ``FULL_SHARD`` reshards after
+        each backward to preserve its lower parameter-memory peak. Sync and
+        reshard flags are restored in ``finally``.
         """
-        self.module.set_requires_gradient_sync(is_boundary)
-        self.module.set_reshard_after_backward(is_boundary)
-        loss.backward()
+        if is_boundary:
+            loss.backward()
+            return
+        reshard = _RESHARD_AFTER_FORWARD[self.parallel_config.sharding_strategy]
+        self.module.set_requires_gradient_sync(False)
+        self.module.set_reshard_after_backward(reshard)
+        try:
+            loss.backward()
+        finally:
+            self.module.set_requires_gradient_sync(True)
+            self.module.set_reshard_after_backward(True)
 
     def accumulation_context(self, *, is_boundary: bool = True):
         return contextlib.nullcontext()

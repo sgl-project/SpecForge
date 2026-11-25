@@ -1078,8 +1078,15 @@ class TrainingConfig(StrictConfigModel):
     #: accumulates and reduces gradients in it, and keeps fp32 masters in the
     #: optimizer. ``fsdp2`` stores the trainable draft in fp32 (the masters),
     #: computes in ``model.torch_dtype``, and accumulates and reduces gradients in
-    #: fp32, driving registry-built optimizers directly.
+    #: fp32 by default (or ``model.torch_dtype`` via ``training.gradient_dtype``),
+    #: driving registry-built optimizers directly.
     runtime: Literal["fsdp", "fsdp2"] = "fsdp"
+    #: Optional gradient accumulation and reduction dtype override. ``None``
+    #: follows the runtime default (``model.torch_dtype`` for ``fsdp``,
+    #: ``float32`` for ``fsdp2``). Under ``fsdp2``, setting this to
+    #: ``model.torch_dtype`` (e.g. ``bfloat16``) avoids 2x unsharded fp32
+    #: gradient buffers across micro-batches and gives FSDP1 parity.
+    gradient_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
     optimizer: str = Field(default="adamw", min_length=1)
     optimizer_options: dict = Field(default_factory=dict)
@@ -1256,6 +1263,26 @@ class Config(StrictConfigModel):
                 "profiling.enabled applies to trainer roles, not a capture-only "
                 "producer"
             )
+        if self.training.gradient_dtype is not None:
+            if (
+                self.training.runtime == "fsdp"
+                and self.training.gradient_dtype != self.model.torch_dtype
+            ):
+                raise ValueError(
+                    "training.runtime=fsdp accumulates and reduces gradients in "
+                    f"model.torch_dtype ({self.model.torch_dtype}); got "
+                    f"training.gradient_dtype={self.training.gradient_dtype}"
+                )
+            if (
+                self.training.runtime == "fsdp2"
+                and self.training.gradient_dtype
+                not in ("float32", self.model.torch_dtype)
+            ):
+                raise ValueError(
+                    "training.runtime=fsdp2 supports training.gradient_dtype in "
+                    f"('float32', {self.model.torch_dtype!r}); got "
+                    f"{self.training.gradient_dtype!r}"
+                )
         if self.data.eval_data_path:
             raise ValueError(
                 "data.eval_data_path is unsupported; online evaluation is not "

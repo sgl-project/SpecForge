@@ -526,6 +526,74 @@ class FSDP2PrecisionAndConfigTest(unittest.TestCase):
                 }
             )
 
+    def test_config_and_backend_gradient_dtype_opt_in(self):
+        from specforge.training.assembly import _training_runtime
+
+        base = {
+            "model": {"target_model_path": "target", "torch_dtype": "bfloat16"},
+            "data": {"hidden_states_path": "features"},
+            "draft": "specforge/config/draft/presets/qwen3-8b-dflash.yaml",
+        }
+        cfg = Config.model_validate(
+            {**base, "training": {"runtime": "fsdp2", "gradient_dtype": "bfloat16"}}
+        )
+        runtime = _training_runtime(cfg)
+        self.assertEqual(runtime.precision.gradient_dtype, torch.bfloat16)
+        self.assertEqual(runtime.precision.parameter_dtype, torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "training.gradient_dtype"):
+            Config.model_validate(
+                {**base, "training": {"runtime": "fsdp2", "gradient_dtype": "float16"}}
+            )
+        with self.assertRaisesRegex(ValueError, "model.torch_dtype"):
+            Config.model_validate(
+                {**base, "training": {"runtime": "fsdp", "gradient_dtype": "float32"}}
+            )
+        with self.assertRaisesRegex(ValueError, "fp32 or compute-dtype gradients"):
+            FSDP2TrainingBackend(
+                ParallelConfig(),
+                precision=replace(_FSDP2_BF16, gradient_dtype=torch.float16),
+            )
+
+    def test_backward_reshard_strategy_and_finally_restore(self):
+        for strategy, expected_reshard in (
+            ("FULL_SHARD", True),
+            ("SHARD_GRAD_OP", False),
+            ("NO_SHARD", False),
+        ):
+            with self.subTest(sharding_strategy=strategy):
+                backend = FSDP2TrainingBackend(
+                    ParallelConfig(sharding_strategy=strategy),
+                    precision=_FSDP2_BF16,
+                )
+                calls = []
+
+                class _FakeModule:
+                    def set_requires_gradient_sync(self, flag: bool) -> None:
+                        calls.append(("sync", flag))
+
+                    def set_reshard_after_backward(self, flag: bool) -> None:
+                        calls.append(("reshard", flag))
+
+                class _FailingLoss:
+                    def backward(self) -> None:
+                        calls.append(("backward", None))
+                        raise RuntimeError("boom")
+
+                backend.module = _FakeModule()
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    backend.backward(_FailingLoss(), is_boundary=False)
+                self.assertEqual(
+                    calls,
+                    [
+                        ("sync", False),
+                        ("reshard", expected_reshard),
+                        ("backward", None),
+                        ("sync", True),
+                        ("reshard", True),
+                    ],
+                )
+
 
 class _MixedShapeModel(nn.Module):
     def __init__(self):
@@ -813,6 +881,160 @@ class FSDP2EquivalentUpdateTest(unittest.TestCase):
                             .max()
                         )
                         self.assertLessEqual(float(diff), atol, name)
+
+
+class _InnerBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class _OuterBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = _InnerBlock()
+        self.out = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.out(self.inner(x))
+
+
+class _NestedProgram(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.root_proj = nn.Linear(4, 4, bias=False)
+        self.outer = _OuterBlock()
+
+    def forward(self, x):
+        return self.outer(self.root_proj(x))
+
+
+class _ConditionalBranchModel(nn.Module):
+    """Parameter ``branch_b`` receives no grad on micro-batch 0 and one on 1."""
+
+    def __init__(self):
+        super().__init__()
+        self.branch_a = nn.Linear(4, 4, bias=False)
+        self.branch_b = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x, *, use_b: bool):
+        out = self.branch_a(x)
+        if use_b:
+            out = out + self.branch_b(x)
+        return out
+
+
+def _nested_and_bf16_grad_worker(rank, world, store_path, out_dir):
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        # 1. Nested _no_split_modules under FULL_SHARD: bottom-up wrap succeeds,
+        # blocks reshard after forward, root keeps reshard_after_forward=False,
+        # and A=2 accumulation runs cleanly.
+        torch.manual_seed(0)
+        nested = _NestedProgram().to(torch.bfloat16)
+        backend = FSDP2TrainingBackend(
+            ParallelConfig(
+                sharding_strategy="FULL_SHARD",
+                fsdp_process_group=dist.group.WORLD,
+            ),
+            optimizer_spec=_opt_spec(lr=1e-2),
+            scheduler_spec=_sched_spec(),
+            max_grad_norm=1.0,
+            precision=_FSDP2_BF16,
+        )
+        backend.prepare_model(
+            nested,
+            blocks=("_OuterBlock", "_InnerBlock"),
+        )
+        x0 = torch.randn(2, 4, dtype=torch.bfloat16)
+        x1 = torch.randn(2, 4, dtype=torch.bfloat16)
+        backend.backward(nested(x0).float().pow(2).mean(), is_boundary=False)
+        backend.backward(nested(x1).float().pow(2).mean(), is_boundary=True)
+        norm_full = backend.step()
+
+        root_state = fully_shard.state(nested)
+        outer_state = fully_shard.state(nested.outer)
+        inner_state = fully_shard.state(nested.outer.inner)
+        root_reshards = any(
+            g.post_forward_mesh_info is not None for g in root_state._fsdp_param_groups
+        )
+        outer_reshards = all(
+            g.post_forward_mesh_info is not None for g in outer_state._fsdp_param_groups
+        )
+        inner_reshards = all(
+            g.post_forward_mesh_info is not None for g in inner_state._fsdp_param_groups
+        )
+
+        # 2. gradient_dtype=bf16 opt-in avoids torch 2.14 uniform-dtype assert
+        # when a parameter receives grad only on the boundary micro-batch, and
+        # still delivers fp32 grads to the fp32 DTensor masters.
+        torch.manual_seed(1)
+        cond = _ConditionalBranchModel().to(torch.bfloat16)
+        bf16_grad_precision = PrecisionSpec.resolve(
+            runtime="fsdp2",
+            model_dtype=torch.bfloat16,
+            gradient_dtype=torch.bfloat16,
+        )
+        cond_backend = FSDP2TrainingBackend(
+            ParallelConfig(
+                sharding_strategy="FULL_SHARD",
+                fsdp_process_group=dist.group.WORLD,
+            ),
+            optimizer_spec=_opt_spec(lr=1e-2),
+            scheduler_spec=_sched_spec(),
+            max_grad_norm=1.0,
+            precision=bf16_grad_precision,
+        )
+        cond_backend.prepare_model(cond)
+        cond_backend.backward(
+            cond(x0, use_b=False).float().pow(2).mean(), is_boundary=False
+        )
+        cond_backend.backward(
+            cond(x1, use_b=True).float().pow(2).mean(), is_boundary=True
+        )
+        grad_dtypes = sorted(
+            {str(p.grad.dtype) for p in cond.parameters() if p.grad is not None}
+        )
+        norm_bf16 = cond_backend.step()
+
+        torch.save(
+            {
+                "norm_full_finite": bool(torch.isfinite(norm_full)),
+                "root_reshards": root_reshards,
+                "outer_reshards": outer_reshards,
+                "inner_reshards": inner_reshards,
+                "grad_dtypes": grad_dtypes,
+                "norm_bf16_finite": bool(torch.isfinite(norm_bf16)),
+            },
+            os.path.join(out_dir, f"nested_{rank}.pt"),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@unittest.skipUnless(_GLOO, "needs gloo")
+class FSDP2NestedBlocksAndBF16GradTest(unittest.TestCase):
+    def test_nested_blocks_full_shard_and_bf16_gradient_dtype_opt_in(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            mp.spawn(_nested_and_bf16_grad_worker, args=(2, store, d), nprocs=2)
+            for rank in range(2):
+                report = torch.load(
+                    os.path.join(d, f"nested_{rank}.pt"), weights_only=False
+                )
+                self.assertTrue(report["norm_full_finite"])
+                self.assertFalse(report["root_reshards"])
+                self.assertTrue(report["outer_reshards"])
+                self.assertTrue(report["inner_reshards"])
+                self.assertEqual(report["grad_dtypes"], ["torch.float32"])
+                self.assertTrue(report["norm_bf16_finite"])
 
 
 if __name__ == "__main__":
