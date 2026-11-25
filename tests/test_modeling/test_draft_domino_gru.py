@@ -22,6 +22,41 @@ class DFlashDraftModel(DraftPreTrainedModel):
 
 
 class DominoGRUTest(unittest.TestCase):
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.backends.cudnn.is_available(),
+        "requires cuDNN",
+    )
+    def test_gru_preserves_flat_parameter_views(self):
+        gru = DominoGRUHead(
+            GRUHeadSpec(hidden_size=3, projection_size=2),
+            hidden_size=4,
+            vocab_size=7,
+            device="cuda",
+        ).prefix_gru
+        params = dict(gru.named_parameters())
+        flat = torch.cat(
+            [p.detach().flatten() for p in params.values()]
+        ).requires_grad_()
+        views = {
+            name: chunk.view_as(p)
+            for (name, p), chunk in zip(
+                params.items(), flat.split([p.numel() for p in params.values()])
+            )
+        }
+        inputs = torch.randn(2, 5, 4, device="cuda")
+        expected, _ = gru(inputs)
+        actual, _ = torch.func.functional_call(gru, views, (inputs,))
+        for view in views.values():
+            self.assertEqual(
+                view.untyped_storage().data_ptr(), flat.untyped_storage().data_ptr()
+            )
+        torch.testing.assert_close(actual, expected)
+        expected_grads = torch.autograd.grad(expected.sum(), tuple(params.values()))
+        (grad,) = torch.autograd.grad(actual.sum(), flat)
+        torch.testing.assert_close(
+            grad, torch.cat([g.flatten() for g in expected_grads])
+        )
+
     def test_aligned_head_matches_explicit_gru_for_both_label_conventions(self):
         cases = [("cpu", torch.float32), ("cpu", torch.bfloat16)]
         if torch.cuda.is_available():

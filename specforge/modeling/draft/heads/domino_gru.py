@@ -12,6 +12,12 @@ from specforge.config.draft.architecture.domino import GRUHeadSpec
 
 
 class _PrefixGRU(nn.GRU):
+    def flatten_parameters(self):
+        # FSDP lends the GRU tensor views into its flat parameter during forward.
+        # cuDNN weight packing would rebind those views to a different storage.
+        if all(isinstance(weight, nn.Parameter) for weight in self._flat_weights):
+            super().flatten_parameters()
+
     def reset_draft_parameters(self):
         # Match nn.GRU's uniform initialization while respecting HF load flags.
         bound = 1 / math.sqrt(self.hidden_size)
