@@ -195,7 +195,11 @@ def resolve_run(cfg, *, target_config=None):
             mode=FeatureMode.OFFLINE,
             modality="text",
             required_tensors=frozenset(keys),
-            optional_tensors=frozenset({"attention_mask"}),
+            optional_tensors=frozenset(
+                {"attention_mask", "position_ids"}
+                if family == "eagle3"
+                else {"attention_mask"}
+            ),
             allowed_target_representations=representations,
             default_target_representation=target_repr,
             storage=storage,
@@ -222,6 +226,10 @@ def resolve_run(cfg, *, target_config=None):
             keys=keys,
             loss_mask_filter=requirements.loss_mask_filter,
             overlap=getattr(resolved.objective, "ttt_length", 1),
+            require_right_padding=(
+                family == "eagle3"
+                and cfg.training.attention_backend in ("fa", "flex_attention")
+            ),
         ),
         build_collator=partial(canonical_data.build_collator, keys=keys),
         capture_layout=layout,

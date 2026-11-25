@@ -1,5 +1,29 @@
 # Benchmarking for Speculative Decoding
 
+## Ascend offline context-parallel training
+
+To measure training on captured EAGLE3 features, configure an offline
+recipe with enough examples for at least one warmup update followed by
+measured updates. For example, use a four-rank `usp` recipe with
+`sp_ulysses_size=2`, `sp_ring_size=2`, and a fresh directory for measurements:
+
+```bash
+export SPECFORGE_DEVICE=npu ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
+torchrun --standalone --nproc-per-node=4 -m benchmarks.bench_ascend_usp \
+  --config "$CONFIG" --output "$MEASUREMENTS" --warmup-updates 1
+python -m benchmarks.bench_ascend_usp --summarize --output "$MEASUREMENTS"
+```
+
+Compare the same offline records, weights, objective, sequence length and
+effective batch. For four logical sequences per optimizer update, use
+batch size 1 and configured accumulation 4 for SP=1 (`sdpa`), 2 for SP=2,
+and 1 for SP=4. The benchmark records the synchronized forward, loss,
+backward and optimizer work inside each trainer step. It excludes disk
+reads, logging, checkpoint I/O and the warmup updates from throughput.
+The numerator counts nonpadding input tokens once across all sequence shards.
+Memory is the maximum across ranks and all steps of the PyTorch NPU
+allocator's peak allocated and reserved bytes, reported separately in GiB.
+
 ## Overview
 
 We provided a unified script to test the performance of the Speculative Decoding with EAGLE3 algorithm on multiple datasets. You can follow the steps below to run the benchmarks.

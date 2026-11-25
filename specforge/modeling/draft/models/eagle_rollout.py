@@ -218,6 +218,21 @@ class EagleCachedStep:
         return hidden, key, value
 
     def _flash(self, query, key, value, keys, values, padding, depth):
+        if self.backend == "usp" and query.device.type == "npu":
+            from specforge.modeling.draft.layers.attention.backends.ascend_usp import (
+                ascend_usp_attention,
+            )
+
+            return ascend_usp_attention(
+                query,
+                key,
+                value,
+                keys,
+                values,
+                ulysses_group=self.ulysses_group,
+                ring_group=self.ring_group,
+            )
+
         from specforge.modeling.draft.layers.attention.backends.cached_flash import (
             _FlashCachedMergeFunc,
             _raise_standard_flash_attn_unavailable,

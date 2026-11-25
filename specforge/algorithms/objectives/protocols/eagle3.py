@@ -94,7 +94,11 @@ class Eagle3Objective:
             else None
         )
         anchor = torch.arange(length, device=ids.device)
-        initial = model.fusion(batch["hidden_states"])[:, :length]
+        denominator = batch.get("shard_loss_denominator") if parallel else None
+        if denominator is None:
+            # Manually sharded batches from earlier callers carry owned width only.
+            denominator = torch.tensor(float(ids.shape[0] * length), device=ids.device)
+        initial = model.fusion(batch["hidden_states"][:, :length])
         hidden, prefix, positions = initial, None, []
         for depth in range(self.ttt_length):
             original = (anchor + depth + 1).expand(ids.shape[0], -1)
@@ -153,9 +157,7 @@ class Eagle3Objective:
                 draft_to_target=model.vocabulary.d2t,
                 requires=frozenset({"teacher_logits"}),
                 default_loss=self.default_loss,
-                denominator=torch.tensor(
-                    float(ids.shape[0] * length), device=ids.device
-                ),
+                denominator=denominator,
                 # every depth also counts toward the pooled ``acc``
                 accuracy_name=f"acc_{depth}",
                 reduce_statistics=getattr(runtime, "reduce_sequence_statistics", None),
@@ -202,7 +204,15 @@ def depth_acceptance(runtime, deferred):
     for depth, build in enumerate(deferred):
         predictions = build()
         measured = measure_predictions(runtime, predictions, expected_acceptance)
-        rate = measured["accepted"] / measured["supervised"].clamp_min(1e-8)
+        accepted_sum, count = measured["accepted"], measured["supervised"]
+        if (
+            getattr(runtime, "attention_backend", None) == "usp"
+            and predictions.reduce_statistics is not None
+        ):
+            accepted_sum, count, _ = predictions.reduce_statistics(
+                accepted_sum, count, None
+            )
+        rate = accepted_sum / count.clamp_min(1e-8)
         pair = (rate * predictions.denominator, predictions.denominator)
         ratios[f"acceptance_rate_{depth}"] = ratios[f"expected_acceptance_{depth}"] = (
             pair

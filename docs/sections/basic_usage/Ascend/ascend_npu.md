@@ -67,11 +67,51 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 
 ### Attention backends on Ascend
 
-Use `sdpa` for the **trainer**. Sequence parallelism (`sp_ulysses_size` /
-`sp_ring_size` > 1, the `usp` backend) requires `yunchang`, whose import probes
-the CUDA device and crashes NPU-only torch builds, so USP is CUDA-only for now.
-SpecForge imports `yunchang` lazily only when SP sizes exceed 1, so the default
-SP=1 path never touches it.
+Use `sdpa` for single-device attention. For offline EAGLE3 and EAGLE3.1
+training, `usp` can split one sequence across several NPUs. The Ascend path
+uses HCCL for Ulysses all-to-all and Ring send/receive, and
+`torch_npu.npu_fusion_attention` for local attention blocks. It requires
+the matching CANN and torch_npu installation. It runs independently of
+Yunchang and CUDA FlashAttention.
+
+For example, set `TARGET`, `FEATURES` and `VOCAB_MAP` to the target
+snapshot, offline EAGLE3 capture directory and matching draft vocabulary
+map. Run from the repository root with four allocated chip logic IDs:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 SPECFORGE_DEVICE=npu \
+specforge train -c examples/configs/offline/colocated/qwen3-8b-eagle3.yaml \
+  "model.target_model_path=$TARGET" "model.vocab_mapping_path=$VOCAB_MAP" \
+  "data.hidden_states_path=$FEATURES" data.max_length=16384 \
+  training.attention_backend=usp training.batch_size=1 \
+  training.sp_ulysses_size=2 training.sp_ring_size=2 \
+  deployment.trainer.nproc_per_node=4
+```
+
+The product of the two SP sizes is the number of devices per sequence.
+Ulysses exchanges contiguous position ranges for query-head partitions.
+The query head count must be divisible by the Ulysses size. Ring peers
+circulate the causal prefix K/V while computing attention on the current
+block. Later EAGLE rollout branches attend to the same anchor and their
+K/V stays local to the corresponding position. Each shard retains the
+lookahead needed to align the next tokens and teacher features across its
+right boundary.
+
+Use a single unpacked, right-padded sequence per microbatch, full causal
+attention and zero attention dropout. The trainer multiplies the configured
+accumulation steps by the SP size for USP. Account for that factor when
+comparing global batches with SDPA. This path covers the EAGLE3 objective;
+DFlash and DSpark retain their existing trainer backends.
+
+On 64 GiB 910B3 devices with CANN 9.1.0 and torch_npu 2.10.0.post6,
+the Qwen3-30B-A3B-Instruct-2507 EAGLE3.1 draft completed optimizer updates
+on an unpadded 65,536-token offline capture in BF16. With three rollout
+depths, loss projection chunks of 512 positions and four logical sequences
+per update, peak allocated memory was 25.48 GiB per device for Ulysses 2
+and 15.30 GiB for Ulysses 2 × Ring 2. Single-device SDPA ran out of memory
+on that capture. See the
+[training benchmark instructions](https://github.com/sgl-project/SpecForge/blob/main/benchmarks/README.md#ascend-offline-context-parallel-training)
+for the timing and allocator definitions.
 
 For the **capture server**, the recipes set `model.sglang_attention_backend:
 ascend`. If a config leaves it at the flashinfer default, the launcher falls
@@ -330,8 +370,9 @@ the [Disaggregated training](../disaggregated_training.md) guide.
 - **Empty `ASCEND_RT_VISIBLE_DEVICES` is invalid** — the Ascend driver rejects
   it. SpecForge unsets the variable instead of emptying it; do not export
   `ASCEND_RT_VISIBLE_DEVICES=` by hand.
-- **USP is CUDA-only for now** — `yunchang` probes CUDA at import. Keep
-  `sp_ulysses_size` / `sp_ring_size` at 1 and use the `sdpa` trainer backend.
+- **Selecting an SP topology** — for offline EAGLE3, set the trainer
+  backend to `usp` and set the Ulysses and Ring sizes to match the allocated
+  devices. Keep both at 1 for `sdpa`.
 - **Ascend Mooncake rejects wildcard buffer registration** — the trainer side
   forces `local_buffer_size=0` automatically (SpecForge roles are pure
   zero-copy clients), and the capture plugin mounts its feature segment

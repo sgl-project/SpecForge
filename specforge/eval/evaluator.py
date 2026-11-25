@@ -55,11 +55,7 @@ class Evaluator:
                 out = forward_fn(batch)
                 m = out.metrics
                 # .mean() normalizes a shape-[1] loss to the 0-dim slot.
-                loss = (
-                    out.loss.detach().double().mean()
-                    if isinstance(out.loss, torch.Tensor)
-                    else torch.tensor(float(out.loss), dtype=torch.float64)
-                )
+                loss = self._metric64(out.loss).mean()
                 if sums is None:
                     sums = torch.zeros(7, dtype=torch.float64, device=loss.device)
                 tokens = self._token_count(batch, m, device=sums.device)
@@ -96,14 +92,7 @@ class Evaluator:
                     sums[2] += self._sum64(accuracy_numerator, sums.device)
                     sums[3] += self._sum64(accuracy_denominator, sums.device)
                 elif "accuracy" in m:
-                    acc = m["accuracy"]
-                    acc = (
-                        acc.detach().double().mean().to(sums.device)
-                        if isinstance(acc, torch.Tensor)
-                        else torch.tensor(
-                            float(acc), dtype=torch.float64, device=sums.device
-                        )
-                    )
+                    acc = self._metric64(m["accuracy"]).mean().to(sums.device)
                     denom = m.get("accuracy_denom")
                     w = self._sum64(denom, sums.device) if denom is not None else tokens
                     sums[2] += acc * w
@@ -116,20 +105,18 @@ class Evaluator:
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         if world_size > 1:
             device = self._comm_device()
-            sums = (
-                sums if sums is not None else torch.zeros(7, dtype=torch.float64)
-            ).to(device)
-            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+            if sums is None:
+                sums = torch.zeros(7, dtype=torch.float64, device="cpu")
+            sums = self._distributed_sum(sums, device)
             local_len = pp.size(1) if pp is not None else 0
             pp_len = torch.tensor([local_len], dtype=torch.int64, device=device)
             dist.all_reduce(pp_len, op=dist.ReduceOp.MAX)
             global_len = int(pp_len.item())
             if global_len > 0:
-                buf = torch.zeros(4, global_len, dtype=torch.float64, device=device)
+                buf = sums.new_zeros((4, global_len))
                 if pp is not None:
-                    buf[:, : pp.size(1)] = pp.to(device)
-                dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-                pp = buf
+                    buf[:, : pp.size(1)] = pp.to(buf.device)
+                pp = self._distributed_sum(buf, device)
 
         if sums is None or sums[4].item() == 0.0:
             # Zero batches globally: report nothing — fabricated zero metrics
@@ -165,12 +152,39 @@ class Evaluator:
         }
 
     @staticmethod
+    def _metric64(value: Any) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            return torch.as_tensor(value, dtype=torch.float64, device="cpu")
+        value = value.detach()
+        # Ascend 910B silently downcasts double arithmetic to float32.
+        if value.device.type == "npu":
+            value = value.cpu()
+        return value.double()
+
+    @staticmethod
     def _stack(values: Iterable[Any]) -> torch.Tensor:
-        return torch.stack([torch.as_tensor(v).detach().double() for v in values])
+        return torch.stack([Evaluator._metric64(v) for v in values])
+
+    @staticmethod
+    def _distributed_sum(value: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if device.type != "npu":
+            value = value.to(device)
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            return value
+
+        # HCCL cannot reduce float64. Gather the small metric buffers as bytes
+        # and sum their original float64 values on the host.
+        packed = value.contiguous().view(torch.uint8).flatten().to(device)
+        world_size = dist.get_world_size()
+        gathered = packed.new_empty(world_size * packed.numel())
+        dist.all_gather_into_tensor(gathered, packed)
+        return (
+            gathered.cpu().view(torch.float64).reshape(world_size, *value.shape).sum(0)
+        )
 
     @staticmethod
     def _sum64(value: Any, device: torch.device) -> torch.Tensor:
-        return torch.as_tensor(value).detach().double().sum().to(device)
+        return Evaluator._metric64(value).sum().to(device)
 
     @staticmethod
     def _comm_device() -> torch.device:
@@ -204,19 +218,13 @@ class Evaluator:
     def _token_count(
         batch: TrainBatch, metrics: Dict[str, Any], device
     ) -> torch.Tensor:
-        """This batch's token weight as a 0-dim float64 tensor (no host sync):
-        the strategy's loss denoms, else the loss mask, else 1."""
+        """The strategy's loss denoms, else the loss mask, else 1."""
         denoms = metrics.get("metric_loss_denoms")
         if denoms:
-            return (
-                torch.stack([torch.as_tensor(d).detach().float() for d in denoms])
-                .sum()
-                .double()
-                .to(device)
-            )
+            return Evaluator._stack(denoms).sum().to(device)
         loss_mask = batch.tensors.get("loss_mask")
         if isinstance(loss_mask, torch.Tensor):
-            return loss_mask.sum().double().to(device)
+            return Evaluator._metric64(loss_mask.sum()).to(device)
         return torch.ones((), dtype=torch.float64, device=device)
 
 
