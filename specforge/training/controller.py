@@ -260,148 +260,6 @@ def _reduce_ratio_metrics(
     return output
 
 
-_EAGLE3_STRUCTURED_METRIC_KEYS = frozenset(
-    {
-        "acces",
-        "acceptance_rates",
-        "plosses",
-        "acc_corrects",
-        "acc_denoms",
-        "metric_losses",
-        "metric_loss_denoms",
-    }
-)
-
-
-def _metric_vector(values: Any, *, device: torch.device, name: str) -> torch.Tensor:
-    """Normalize one per-TTT metric sequence without losing its positions."""
-    if isinstance(values, torch.Tensor):
-        vector = values.detach().flatten()
-    elif isinstance(values, (list, tuple)):
-        vector = torch.stack(
-            [torch.as_tensor(value).detach().reshape(()) for value in values]
-        )
-    else:
-        raise TypeError(f"{name} must be a tensor or sequence, got {type(values)!r}")
-    if vector.numel() == 0:
-        raise ValueError(f"{name} must contain at least one TTT position")
-    return vector.to(device=device, dtype=torch.float32)
-
-
-def _reduce_eagle3_metrics(
-    raw: Dict[str, Any],
-    *,
-    device: torch.device,
-    process_group: Any,
-    ploss_decay: float,
-    reduce: bool,
-    objective_metric_name: Optional[str] = None,
-) -> Optional[Dict[str, torch.Tensor]]:
-    """Reduce EAGLE3's per-position training telemetry as numerators/counts.
-
-    Accuracy and p-loss are ratios, so averaging rank-local ratios biases the
-    result whenever ranks carry different token counts.  Pack every numerator
-    and denominator into one collective and form ratios only after the global
-    SUM.  Acceptance rate has no separate count in the model contract; weight
-    it by the corresponding p-loss token count, matching the evaluator's
-    batch-size-invariant convention.
-    """
-    required = {
-        "acc_corrects",
-        "acc_denoms",
-        "metric_losses",
-        "metric_loss_denoms",
-    }
-    if not required.issubset(raw):
-        return None
-
-    corrects = _metric_vector(raw["acc_corrects"], device=device, name="acc_corrects")
-    acc_denoms = _metric_vector(raw["acc_denoms"], device=device, name="acc_denoms")
-    losses = _metric_vector(raw["metric_losses"], device=device, name="metric_losses")
-    loss_denoms = _metric_vector(
-        raw["metric_loss_denoms"], device=device, name="metric_loss_denoms"
-    )
-    length = corrects.numel()
-    vectors = {
-        "acc_denoms": acc_denoms,
-        "metric_losses": losses,
-        "metric_loss_denoms": loss_denoms,
-    }
-    acceptance_rates = None
-    if "acceptance_rates" in raw:
-        acceptance_rates = _metric_vector(
-            raw["acceptance_rates"], device=device, name="acceptance_rates"
-        )
-        vectors["acceptance_rates"] = acceptance_rates
-    mismatched = {
-        name: value.numel()
-        for name, value in vectors.items()
-        if value.numel() != length
-    }
-    if mismatched:
-        raise ValueError(
-            "EAGLE3 structured metric lengths must match acc_corrects "
-            f"({length}); got {mismatched}"
-        )
-
-    # Rows: accuracy numerator/denominator, p-loss numerator/denominator,
-    # acceptance numerator/denominator.  The last two rows stay zero when the
-    # strategy does not expose acceptance telemetry.
-    packed = torch.stack(
-        (
-            corrects,
-            acc_denoms,
-            losses * loss_denoms,
-            loss_denoms,
-            (
-                acceptance_rates * loss_denoms
-                if acceptance_rates is not None
-                else torch.zeros_like(loss_denoms)
-            ),
-            (
-                loss_denoms
-                if acceptance_rates is not None
-                else torch.zeros_like(loss_denoms)
-            ),
-        )
-    )
-
-    import torch.distributed as dist
-
-    if reduce and dist.is_available() and dist.is_initialized():
-        world = dist.get_world_size(process_group)
-        if world > 1:
-            dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=process_group)
-
-    reduced_acc = packed[0] / packed[1].clamp_min(1e-6)
-    reduced_ploss = packed[2] / packed[3].clamp_min(1e-6)
-    result: Dict[str, torch.Tensor] = {}
-    for index in range(length):
-        result[f"acc_{index}"] = reduced_acc[index]
-        result[f"ploss_{index}"] = reduced_ploss[index]
-        if objective_metric_name is not None:
-            result[f"{objective_metric_name}_{index}"] = reduced_ploss[index]
-
-    result["acc"] = packed[0].sum().div(packed[1].sum().clamp_min(1e-6))
-    weights = torch.tensor(
-        [ploss_decay**index for index in range(length)],
-        dtype=reduced_ploss.dtype,
-        device=reduced_ploss.device,
-    )
-    result["loss"] = (reduced_ploss * weights).sum()
-    if objective_metric_name is not None:
-        result[objective_metric_name] = result["loss"]
-
-    if acceptance_rates is not None:
-        reduced_acceptance = packed[4] / packed[5].clamp_min(1e-6)
-        for index in range(length):
-            result[f"acceptance_rate_{index}"] = reduced_acceptance[index]
-            result[f"expected_acceptance_{index}"] = reduced_acceptance[index]
-        result["acceptance_rate"] = reduced_acceptance.mean()
-        result["expected_acceptance"] = result["acceptance_rate"]
-    return result
-
-
 class TrainerCore:
     """One step: forward/loss (strategy) -> backward (backend) -> optimizer boundary."""
 
@@ -571,9 +429,6 @@ class TrainerCore:
         ratio_metrics: Optional[Dict[str, Any]] = None,
         sum_metrics: Optional[Dict[str, Any]] = None,
     ) -> StepResult:
-        # EAGLE3 carries per-TTT numerators and denominators.  Preserve those
-        # positions and reduce counts before ratios; scalarizing its lists here
-        # would both collapse the TTT structure and log one rank's local data.
         metric_device = (
             out.loss.device
             if isinstance(out.loss, torch.Tensor)
@@ -581,35 +436,15 @@ class TrainerCore:
         )
         parallel_config = getattr(self.backend, "parallel_config", None)
         process_group = getattr(parallel_config, "fsdp_process_group", None)
-        eagle3_model = getattr(self.strategy, "eagle3_model", None)
-        if eagle3_model is not None and not hasattr(eagle3_model, "lk_loss_type"):
-            eagle3_model = getattr(eagle3_model, "module", eagle3_model)
-        objective_metric_name = (
-            "lk_loss"
-            if eagle3_model is not None
-            and getattr(eagle3_model, "lk_loss_type", None) is not None
-            else "kl_loss"
-        )
-        structured = _reduce_eagle3_metrics(
-            out.metrics,
-            device=metric_device,
-            process_group=process_group,
-            ploss_decay=float(getattr(self.strategy, "ploss_decay", 1.0)),
-            reduce=stepped,
-            objective_metric_name=objective_metric_name,
-        )
-        # Structured EAGLE3 metrics are already globally reduced.  Remaining
+        # Ratios and sums are reduced as counts in one collective. Remaining
         # scalar diagnostics are DP-averaged in a single collective at optimizer
         # boundaries; non-boundary results stay rank-local.
-        metrics: Dict[str, Any] = dict(structured or {})
-        metrics.update(
-            _reduce_ratio_metrics(
-                out.ratio_metrics if ratio_metrics is None else ratio_metrics,
-                device=metric_device,
-                process_group=process_group,
-                reduce=stepped,
-                sums=out.sum_metrics if sum_metrics is None else sum_metrics,
-            )
+        metrics: Dict[str, Any] = _reduce_ratio_metrics(
+            out.ratio_metrics if ratio_metrics is None else ratio_metrics,
+            device=metric_device,
+            process_group=process_group,
+            reduce=stepped,
+            sums=out.sum_metrics if sum_metrics is None else sum_metrics,
         )
         scalar_metrics: Dict[str, Any] = {}
         if "loss" not in metrics:
@@ -624,11 +459,7 @@ class TrainerCore:
         # the generic trainer their algorithm-specific names. Keep host schedule
         # scalars (for example Domino's lambda_base) on the host unless a real
         # multi-rank DP reduction requires moving them to the loss device.
-        reserved_metric_keys = _EAGLE3_STRUCTURED_METRIC_KEYS | {
-            "accuracy",
-            "accuracy_denom",
-            "loss",
-        }
+        reserved_metric_keys = {"accuracy", "accuracy_denom", "loss"}
         for key, value in out.metrics.items():
             if key in reserved_metric_keys:
                 continue
