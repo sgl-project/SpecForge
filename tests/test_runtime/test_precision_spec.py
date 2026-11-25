@@ -69,6 +69,40 @@ class PrecisionSpecTest(unittest.TestCase):
                         ),
                     )
 
+    def test_fsdp2_allows_compute_dtype_gradient_opt_in_and_refuses_others(self):
+        for dtype in MODEL_DTYPES:
+            with self.subTest(dtype=dtype):
+                spec = PrecisionSpec.resolve(
+                    runtime="fsdp2", model_dtype=dtype, gradient_dtype=dtype
+                )
+                self.assertEqual(spec.gradient_dtype, dtype)
+                self.assertEqual(spec.parameter_dtype, torch.float32)
+                self.assertEqual(spec.compute_dtype, dtype)
+                rt = TrainingRuntime.resolve(
+                    "fsdp2", model_dtype=dtype, gradient_dtype=dtype
+                )
+                self.assertEqual(rt.precision, spec)
+        with self.assertRaisesRegex(ValueError, "fp32 or compute-dtype"):
+            PrecisionSpec.resolve(
+                runtime="fsdp2",
+                model_dtype=torch.bfloat16,
+                gradient_dtype=torch.float16,
+            )
+        with self.assertRaisesRegex(ValueError, "accumulates and reduces gradients in"):
+            PrecisionSpec.resolve(
+                runtime="fsdp",
+                model_dtype=torch.bfloat16,
+                gradient_dtype=torch.float32,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "gradient dtype must be floating point"
+        ):
+            PrecisionSpec.resolve(
+                runtime="fsdp2",
+                model_dtype=torch.bfloat16,
+                gradient_dtype=torch.int64,
+            )
+
     def test_unknown_runtime_and_integer_model_dtype_are_refused(self):
         with self.assertRaisesRegex(ValueError, "unknown runtime 'ddp'"):
             PrecisionSpec.resolve(runtime="ddp", model_dtype=torch.bfloat16)

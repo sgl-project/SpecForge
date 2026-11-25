@@ -134,6 +134,7 @@ class PrecisionSpec:
         runtime: str,
         model_dtype: torch.dtype,
         sharding_strategy: Optional[str] = None,
+        gradient_dtype: Optional[torch.dtype] = None,
     ) -> "PrecisionSpec":
         """The precision a runtime trains a draft built in ``model_dtype`` with.
 
@@ -141,16 +142,29 @@ class PrecisionSpec:
         in ``model_dtype``; ``BF16Optimizer`` keeps fp32 masters; FSDP1 casts
         floating buffers to fp32 while DDP (``NO_SHARD``) leaves them as built.
         ``fsdp2``: fp32 parameters that are the masters, compute in
-        ``model_dtype``, fp32 gradients and floating buffers, artifact in
-        ``model_dtype``.
+        ``model_dtype``, fp32 gradients by default (or ``model_dtype`` when
+        explicitly requested via ``gradient_dtype``), fp32 floating buffers,
+        artifact in ``model_dtype``.
         """
         if not model_dtype.is_floating_point:
             raise ValueError(f"model dtype must be floating point, not {model_dtype}")
+        if gradient_dtype is not None and not gradient_dtype.is_floating_point:
+            raise ValueError(
+                f"gradient dtype must be floating point, not {gradient_dtype}"
+            )
         if runtime == "fsdp":
+            resolved_gradient_dtype = (
+                model_dtype if gradient_dtype is None else gradient_dtype
+            )
+            if resolved_gradient_dtype != model_dtype:
+                raise ValueError(
+                    "the fsdp runtime accumulates and reduces gradients in "
+                    f"{model_dtype}; got gradient_dtype={resolved_gradient_dtype}"
+                )
             return cls(
                 parameter_dtype=model_dtype,
                 compute_dtype=model_dtype,
-                gradient_dtype=model_dtype,
+                gradient_dtype=resolved_gradient_dtype,
                 master_dtype=torch.float32,
                 artifact_dtype=model_dtype,
                 buffer_dtype=(
@@ -158,10 +172,19 @@ class PrecisionSpec:
                 ),
             )
         if runtime == "fsdp2":
+            resolved_gradient_dtype = (
+                torch.float32 if gradient_dtype is None else gradient_dtype
+            )
+            if resolved_gradient_dtype not in (torch.float32, model_dtype):
+                raise ValueError(
+                    "the fsdp2 runtime supports fp32 or compute-dtype "
+                    f"({model_dtype}) gradients; got gradient_dtype="
+                    f"{resolved_gradient_dtype}"
+                )
             return cls(
                 parameter_dtype=torch.float32,
                 compute_dtype=model_dtype,
-                gradient_dtype=torch.float32,
+                gradient_dtype=resolved_gradient_dtype,
                 master_dtype=None,
                 artifact_dtype=model_dtype,
                 buffer_dtype=torch.float32,
@@ -203,6 +226,7 @@ class TrainingRuntime:
         *,
         model_dtype: torch.dtype,
         sharding_strategy: Optional[str] = None,
+        gradient_dtype: Optional[torch.dtype] = None,
     ) -> "TrainingRuntime":
         return cls(
             name,
@@ -210,6 +234,7 @@ class TrainingRuntime:
                 runtime=name,
                 model_dtype=model_dtype,
                 sharding_strategy=sharding_strategy,
+                gradient_dtype=gradient_dtype,
             ),
         )
 
