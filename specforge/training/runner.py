@@ -278,8 +278,6 @@ class DataParallelRunner:
         another mode than the module that wraps it, and an objective reads the
         draft's own flag to choose its normalization.
         """
-        if self._evaluating:
-            raise RuntimeError("a training call inside an evaluation pass")
         module = self.strategy.trainable_module()
         if self._mode_unset or not module.training:
             module.train()
@@ -308,7 +306,7 @@ class DataParallelRunner:
             return self.strategy.forward_loss(batch, ctx)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
-        self._refuse_after_failure()
+        self._check_training_call()
         if self._micro or self._pending is not None:
             raise RuntimeError("a prepass belongs before the window's gradient pass")
         self._hold_window_length(ctx, opening=not self._prepass_rng)
@@ -329,7 +327,7 @@ class DataParallelRunner:
     def forward_backward(
         self, batch: TrainBatch, ctx: StepContext, *, is_boundary: bool
     ) -> Optional[PendingStep]:
-        self._refuse_after_failure()
+        self._check_training_call()
         if self._pending is not None:
             raise RuntimeError(
                 "the previous window's optimizer step has not been applied"
@@ -510,12 +508,14 @@ class DataParallelRunner:
                 scalars[key] = float(value)
         return scalars
 
-    def _refuse_after_failure(self) -> None:
+    def _check_training_call(self) -> None:
         if self._broken is not None:
             raise RuntimeError(
                 "this runner cannot continue: a micro-batch raised inside its "
                 f"forward or backward ({self._broken})"
             )
+        if self._evaluating:
+            raise RuntimeError("a training call inside an evaluation pass")
 
     def _hold_window_length(self, ctx: StepContext, *, opening: bool) -> None:
         """Keep the length the window's first call gave it, prepass or backward."""

@@ -254,6 +254,8 @@ class RunnerModeTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "inside an evaluation pass"):
                 runner.forward_backward(batch(1), StepContext(), is_boundary=True)
 
+        run_window(runner, [batch(2)], StepContext())
+
     def test_training_calls_put_the_whole_model_in_training_mode(self):
         class Strategy(_EvaluatedStrategy):
             """A training-mode module around a draft that was left in evaluation mode."""
