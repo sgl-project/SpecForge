@@ -24,11 +24,7 @@ from specforge.modeling.draft.eagle4 import (
     candidate_logits,
     cutoff_retrieval_loss,
 )
-from specforge.modeling.draft.eagle4_moe import (
-    Eagle4MoE,
-    relu2,
-    resolve_act_fn,
-)
+from specforge.modeling.draft.eagle4_moe import Eagle4MoE, relu2, resolve_act_fn
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
@@ -60,6 +56,8 @@ def _config(**overrides) -> LlamaConfig:
         hidden_act="silu",
         initializer_range=0.02,
     )
+    if overrides.get("efficient_lm_head_config") is not None:
+        config.eagle4_training_stage = overrides.get("eagle4_training_stage", "stage2")
     config.draft_vocab_size = overrides.get("draft_vocab_size", config.vocab_size)
     config.architectures = [EAGLE4_ARCH]
     for key, value in overrides.items():
@@ -371,6 +369,7 @@ class Eagle4MoETest(unittest.TestCase):
         self.assertEqual((2, 4, 8), tuple(out.shape))
         self.assertTrue(torch.isfinite(out).all())
 
+
 class Eagle4DenseHeadTest(unittest.TestCase):
     def test_dense_export_roundtrip_preserves_identity_mapping(self):
         model = LlamaForCausalLMEagle4(_config(), attention_backend="sdpa")
@@ -446,7 +445,9 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
         )
         indices = approx.topk(3, dim=-1).indices
         dense = torch.nn.functional.linear(hidden, model.lm_head.weight)
-        torch.testing.assert_close(logits.gather(-1, indices), dense.gather(-1, indices))
+        torch.testing.assert_close(
+            logits.gather(-1, indices), dense.gather(-1, indices)
+        )
         fill = torch.finfo(logits.dtype).min
         blocked = torch.ones_like(logits, dtype=torch.bool).scatter_(-1, indices, False)
         self.assertTrue(torch.all(logits[blocked] == fill))
@@ -465,7 +466,9 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
             model.efficient_lm_head.weight,
         )
         indices = approx.topk(3, dim=-1).indices
-        torch.testing.assert_close(logits.gather(-1, indices), dense.gather(-1, indices))
+        torch.testing.assert_close(
+            logits.gather(-1, indices), dense.gather(-1, indices)
+        )
         fill = torch.finfo(logits.dtype).min
         blocked = torch.ones_like(logits, dtype=torch.bool).scatter_(-1, indices, False)
         self.assertTrue(torch.all(logits[blocked] == fill))
@@ -491,14 +494,14 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
-            with open(os.path.join(directory, "config.json"), encoding="utf-8") as handle:
+            with open(
+                os.path.join(directory, "config.json"), encoding="utf-8"
+            ) as handle:
                 payload = json.load(handle)
             self.assertEqual([EAGLE4_ARCH], payload["architectures"])
             self.assertEqual("low_rank", payload["efficient_lm_head_config"]["type"])
             self.assertEqual(4, payload["efficient_lm_head_config"]["rank"])
-            reloaded = AutoDraftModel.from_pretrained(
-                directory, local_files_only=True
-            )
+            reloaded = AutoDraftModel.from_pretrained(directory, local_files_only=True)
             self.assertIsInstance(reloaded, LlamaForCausalLMEagle4)
             torch.testing.assert_close(
                 reloaded.efficient_lm_head.weight,
@@ -511,9 +514,7 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
         with torch.no_grad():
             model.lm_head.weight.zero_()
             model.lm_head.weight[3].fill_(1.0)
-            model.efficient_lm_head_down_proj.weight.copy_(
-                torch.eye(4, 8)[:4]
-            )
+            model.efficient_lm_head_down_proj.weight.copy_(torch.eye(4, 8)[:4])
             model.efficient_lm_head.weight.zero_()
             model.efficient_lm_head.weight[3, 0] = 10.0
         hidden = torch.zeros(1, 2, 8)
@@ -551,9 +552,7 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
         dense = torch.zeros(1, vocab)
         dense[0, 0] = 4.0
         dense[0, 1] = 3.0
-        ranking = torch.tensor(
-            [2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11, 12, 13, 14, 15, 1]
-        )
+        ranking = torch.tensor([2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11, 12, 13, 14, 15, 1])
         values = torch.arange(vocab, 0, -1, dtype=torch.float32)
         scores = torch.zeros(1, vocab, requires_grad=True)
         with torch.no_grad():
@@ -709,15 +708,16 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
                     ),
                 )
 
-            report = SimpleNamespace(
-                missing_keys={"efficient_lm_head.weight"}
-            )
-            with mock.patch(
-                "specforge.algorithms.model_providers._warm_start",
-                return_value=report,
-            ), mock.patch(
-                "specforge.algorithms.model_providers._device",
-                return_value=torch.device("cpu"),
+            report = SimpleNamespace(missing_keys={"efficient_lm_head.weight"})
+            with (
+                mock.patch(
+                    "specforge.algorithms.model_providers._warm_start",
+                    return_value=report,
+                ),
+                mock.patch(
+                    "specforge.algorithms.model_providers._device",
+                    return_value=torch.device("cpu"),
+                ),
             ):
                 model = build_eagle4_draft(_cfg(""), config)
                 self.assertTrue(bool(model.t2d.all().item()))
@@ -733,7 +733,9 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
                     },
                     trainable,
                 )
-                with self.assertRaisesRegex(ValueError, "omit model.vocab_mapping_path"):
+                with self.assertRaisesRegex(
+                    ValueError, "omit model.vocab_mapping_path"
+                ):
                     build_eagle4_draft(_cfg(shrinking), config)
 
 
@@ -815,7 +817,6 @@ class Eagle4DenseTTTHookTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(torch.isfinite(model.lm_head.weight.grad).all())
         self.assertTrue(torch.isfinite(model.midlayer.eh_proj.weight.grad).all())
-
 
 
 if __name__ == "__main__":

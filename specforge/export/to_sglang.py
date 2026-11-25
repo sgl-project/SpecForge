@@ -28,10 +28,12 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+from specforge.export.eagle4 import add_eagle4_svd_factors
 
 #: per-architecture trainer-key -> serving-key renames ({} = identity).
 WEIGHT_MAPS: Dict[str, Dict[str, str]] = {
     "LlamaForCausalLMEagle3": {},
+    "LlamaForCausalLMEagle4": {},
 }
 
 #: keys the sglang EAGLE3 spec-decoder loader requires in a draft checkpoint.
@@ -61,6 +63,7 @@ def export_to_sglang(
     *,
     vocab_mapping_path: Optional[str] = None,
     weight_map: Optional[Dict[str, str]] = None,
+    svd_device: str = "cpu",
 ) -> str:
     """Write an sglang-loadable draft directory; returns ``output_dir``.
 
@@ -69,9 +72,9 @@ def export_to_sglang(
     checkpoint predates them.
     """
     state = resolve_training_state(checkpoint_path)
-    if state.get("strategy") != "eagle3":
+    if state.get("strategy") not in ("eagle3", "eagle4"):
         raise ValueError(
-            "the specialized SGLang exporter currently supports EAGLE3 "
+            "the specialized SGLang exporter currently supports EAGLE3/EAGLE4 "
             f"checkpoints only, got strategy={state.get('strategy')!r}; use "
             "--to hf for DFlash-family and P-EAGLE draft model directories"
         )
@@ -92,6 +95,7 @@ def export_to_sglang(
             and not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
+    full = add_eagle4_svd_factors(model.config, full, device=svd_device)
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
     apply_legacy_rope_scaling(output_dir)
     return output_dir
@@ -102,6 +106,7 @@ def main(argv=None) -> int:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--draft-config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--svd-device", default="cpu")
     parser.add_argument("--vocab-mapping", default=None)
     args = parser.parse_args(argv)
     out = export_to_sglang(
@@ -109,6 +114,7 @@ def main(argv=None) -> int:
         args.draft_config,
         args.output_dir,
         vocab_mapping_path=args.vocab_mapping,
+        svd_device=args.svd_device,
     )
     print(f"exported sglang draft to {out}")
     return 0

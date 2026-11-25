@@ -53,5 +53,10 @@
   "use_cache": true,
   "use_rope": false,
   "use_sliding_window": true,
-  "vocab_size": 151936
+  "vocab_size": 151936,
+  "efficient_lm_head_config": {
+    "type": "low_rank",
+    "rank": 128,
+    "num_candidates": 128
+  }
 }

@@ -122,11 +122,7 @@ def iter_feature_batches(
 
 
 def _efficient_missing_keys(model: Any) -> set[str]:
-    return {
-        name
-        for name in model.state_dict()
-        if name.startswith("efficient_lm_head")
-    }
+    return {name for name in model.state_dict() if name.startswith("efficient_lm_head")}
 
 
 def load_dense_draft(
@@ -147,11 +143,10 @@ def load_dense_draft(
     from specforge.utils import get_local_device
 
     draft_config = load_draft_config_source(draft_config_path, cache_dir=cache_dir)
-    if getattr(draft_config, "efficient_lm_head_config", None):
-        raise ValueError(
-            "dense eval expects a stage-1 config without efficient_lm_head_config; "
-            f"got {draft_config.efficient_lm_head_config!r}"
-        )
+    from specforge.modeling.draft.eagle4_structure import candidate_training_enabled
+
+    if candidate_training_enabled(draft_config):
+        raise ValueError("dense eval expects a stage-1 config")
     model = AutoDraftModel.from_config(
         draft_config, attention_backend=attention_backend, torch_dtype=dtype
     )
@@ -159,10 +154,12 @@ def load_dense_draft(
         model,
         checkpoint,
         draft_config=draft_config,
-        strategy="eagle3",
+        strategy="eagle4",
         allow_missing_embedding=True,
     )
-    model.load_embedding(target_model_path, embedding_key=embedding_key, cache_dir=cache_dir)
+    model.load_embedding(
+        target_model_path, embedding_key=embedding_key, cache_dir=cache_dir
+    )
     model.freeze_embedding()
     return model.to(device=get_local_device(), dtype=dtype).eval()
 
@@ -179,6 +176,7 @@ def load_svd_draft(
     from specforge.utils import get_local_device
 
     config = copy.deepcopy(dense_model.config)
+    config.eagle4_training_stage = "stage2"
     config.efficient_lm_head_config = {
         "type": "low_rank",
         "rank": rank,
@@ -256,6 +254,7 @@ def load_trained_draft(
     """Load a stage-2 checkpoint, including its trained low-rank factors."""
 
     from specforge.modeling.auto import AutoDraftModel
+    from specforge.modeling.draft.eagle4_structure import candidate_training_enabled
     from specforge.training.model_loading import (
         load_draft_config_source,
         warm_start_draft_model,
@@ -263,11 +262,8 @@ def load_trained_draft(
     from specforge.utils import get_local_device
 
     draft_config = load_draft_config_source(draft_config_path, cache_dir=cache_dir)
-    if not getattr(draft_config, "efficient_lm_head_config", None):
-        raise ValueError(
-            "trained-head eval expects efficient_lm_head_config; "
-            f"got {getattr(draft_config, 'efficient_lm_head_config', None)!r}"
-        )
+    if not candidate_training_enabled(draft_config):
+        raise ValueError("trained-head eval expects eagle4_training_stage='stage2'")
     model = AutoDraftModel.from_config(
         draft_config, attention_backend=attention_backend, torch_dtype=dtype
     )
@@ -275,8 +271,6 @@ def load_trained_draft(
         model,
         checkpoint,
         draft_config=draft_config,
-        # Stage-2 checkpoints record cfg.training.strategy ("eagle4"), not the
-        # Eagle3TrainStrategy.name ("eagle3") used by the dense stage-1 export.
         strategy="eagle4",
         allow_missing_embedding=True,
         allowed_unexpected_keys={"t2d", "d2t"},
@@ -289,7 +283,9 @@ def load_trained_draft(
             "trained-head checkpoint is missing low-rank factors "
             f"{missing_head}; refusing to SVD-initialize them"
         )
-    model.load_embedding(target_model_path, embedding_key=embedding_key, cache_dir=cache_dir)
+    model.load_embedding(
+        target_model_path, embedding_key=embedding_key, cache_dir=cache_dir
+    )
     model.freeze_embedding()
     return model.to(device=get_local_device(), dtype=dtype).eval()
 

@@ -30,16 +30,20 @@ from specforge.algorithms.eagle3.data import (
     NORMALIZER_ID,
     build_offline_collator,
     build_offline_normalizer,
-    build_offline_reader as build_eagle3_offline_reader,
-    build_server_collator,
 )
+from specforge.algorithms.eagle3.data import (
+    build_offline_reader as build_eagle3_offline_reader,
+)
+from specforge.algorithms.eagle3.data import build_server_collator
 from specforge.algorithms.eagle3.providers import (
     allowed_missing_checkpoint_keys,
     build_training_model,
     resolve_capture_layers,
-    resume_contract as eagle3_resume_contract,
-    step_options,
 )
+from specforge.algorithms.eagle3.providers import (
+    resume_contract as eagle3_resume_contract,
+)
+from specforge.algorithms.eagle3.providers import step_options
 
 ALGORITHM_NAME = "eagle4"
 DRAFT_ARCHITECTURE = "LlamaForCausalLMEagle4"
@@ -75,11 +79,7 @@ def resume_contract(config, draft_model, training_model):
 
     inner = eagle3_resume_contract(config, draft_model, training_model)
     return {
-        (
-            f"eagle4_{key[len('eagle3_'):]}"
-            if key.startswith("eagle3_")
-            else key
-        ): value
+        (f"eagle4_{key[len('eagle3_'):]}" if key.startswith("eagle3_") else key): value
         for key, value in inner.items()
     }
 

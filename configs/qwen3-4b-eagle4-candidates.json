@@ -8,7 +8,11 @@
   "bos_token_id": 151643,
   "draft_vocab_size": 151936,
   "eagle_config": {
-    "eagle_aux_hidden_state_layer_ids": [1, 17, 32]
+    "eagle_aux_hidden_state_layer_ids": [
+      1,
+      17,
+      32
+    ]
   },
   "efficient_lm_head_config": {
     "type": "low_rank",
@@ -58,5 +62,6 @@
   "use_cache": true,
   "use_rope": false,
   "use_sliding_window": true,
-  "vocab_size": 151936
+  "vocab_size": 151936,
+  "eagle4_training_stage": "stage2"
 }

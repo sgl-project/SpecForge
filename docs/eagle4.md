@@ -1,8 +1,9 @@
 # EAGLE-4 training
 
-Stage 1 trains a dense, full-vocabulary draft head. Candidate-factor training and
-SVD conversion are described separately below for the stage-2 branch. For stage 1, do not set
-`efficient_lm_head_config` or `model.vocab_mapping_path`: the draft creates its
+Stage 1 trains a dense, full-vocabulary draft head and remains the default.
+`efficient_lm_head_config` alone describes stage-1 SVD export and does not change
+the training objective. Set `eagle4_training_stage: stage2` in the draft JSON to
+train candidate factors. Omit `model.vocab_mapping_path`; the draft creates its
 full-vocabulary identity buffers directly.
 
 The Qwen3-4B architecture is defined in `configs/qwen3-4b-eagle4.json`: one draft
@@ -34,6 +35,79 @@ specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4.yaml
 The offline example captures 256 training samples and runs 20 optimizer steps.
 Runtime attention kernels are selected by the installed capture backend;
 these recipes do not force a hardware-specific kernel.
+
+## Config-driven SVD export
+
+The Qwen3-4B config uses `efficient_lm_head_config` with `type: low_rank`,
+`rank: 128`, and `num_candidates: 128`. Runtime training checkpoints contain the
+trained dense weights and optimizer state, without low-rank factor tensors.
+
+```bash
+specforge export --to sglang \
+  --checkpoint ./outputs/qwen3-4b-eagle4-offline \
+  --draft-config configs/qwen3-4b-eagle4.json \
+  --output-dir ./outputs/qwen3-4b-eagle4-svd \
+  --svd-device cuda
+```
+
+Export computes an unweighted FP32 SVD of the trained dense head `W`. For
+`W = U S Vh`, it writes `B = U[:, :rank] S[:rank]` and `A = Vh[:rank]`, stored in
+`W`'s dtype. These are `efficient_lm_head.weight` and
+`efficient_lm_head_down_proj.weight`. Retrieval uses `B A h` to select candidates;
+the original, unchanged dense head rescores their rows. Omitting the head config
+produces a dense export. The SVD device defaults to CPU; `cuda` uses an allocated
+GPU and avoids the potentially expensive CPU decomposition.
+
+`--to hf` also derives SVD factors when configured and includes the target
+embedding (supply `--embedding-source` if the checkpoint excludes it). These
+factor-bearing exports are inference artifacts. Resume dense training from its
+runtime checkpoint, not the inference export. Export never modifies that source
+checkpoint or adds factors to its optimizer.
+
+`configs/qwen3.8-27b-eagle4.json` reproduces the published
+[EAGLE-Corp config](https://huggingface.co/EAGLE-Corp/Qwen3.8-27B-EAGLE4/blob/f58a5985223040552ad404fba98f0dd27f5f676a/config.json).
+The offline recipe is
+`examples/configs/offline/colocated/qwen3.8-27b-eagle4.yaml`. It requires the matching
+`Qwen/Qwen3.8-27B` target, tokenizer, capture layers, and embedding key. It is not interchangeable with
+Qwen3-4B: it uses different hidden/vocabulary sizes, RoPE, a dense MLP, and a 4,096-token window.
+
+## Recorded serving smoke tests
+
+The existing stage-1 checkpoint and its rank-128 SVD conversion were tested with
+SGLang and static EAGLE-Harness scheduling: BF16, one GPU, TP=1, concurrency=1,
+eager execution, three draft steps, top-k=1, and four draft tokens. Decoding was
+greedy with thinking disabled and a 256-token output limit. All 33 prompts were
+warmed up before timing.
+
+Dense serving completed 33/33 requests at 88.03 output tokens/s and 1.862 tokens
+per verification round. SVD serving completed 33/33 at 86.17 tokens/s and 1.839
+per round. Acceptance includes the bonus token. These are integration smoke tests,
+not optimized throughput measurements or checks of exact target-only equivalence.
+
+
+## Training-to-serving pipeline validation
+
+A fresh Qwen3-4B smoke run exercised feature capture, 20 optimizer steps of dense
+stage-1 training, config-driven rank-128 SVD export, and SGLang serving. The run
+used the offline recipe with 32 captured samples, sequence length 512, batch size
+1, TTT length 7, and learning rate 1e-4. Runtime checkpoints contained no retrieval
+factors; the export preserved every non-embedding trained tensor exactly and added
+factors of shapes `[151936, 128]` and `[128, 2560]`.
+
+With the serving settings above and a 64-token output limit, the fresh export
+completed 33/33 requests at 49.23 output tokens/s and 1.072 tokens per verification
+round (including the bonus token). This validates the pipeline; 20 training steps
+do not establish model quality. These results are separate from the trained
+checkpoint measurements above.
+
+The matching Qwen3.8-27B pipeline also completed 20 optimizer steps and exported
+factors of shapes `[248320, 128]` and `[128, 5120]`, with the same dense-weight
+preservation checks. Serving completed 8/8 generic prompts at 21.25 output tokens/s
+and 1.039 tokens per verification round, using the same serving settings and
+64-token output limit. Its prompt set differs from the 4B test.
+
+Both smoke runs had finite losses and gradients. Four truncated batches per run
+contained no supervised tokens; 16 of the 20 optimizer steps had nonzero loss.
 
 ## Stage-2 candidate training
 
@@ -124,10 +198,12 @@ candidate-only dense scoring is the inference path.
 ### Configuration and running
 
 On this branch, `training.strategy: eagle4` together with
-`efficient_lm_head_config` in the draft JSON selects candidate-factor training.
+`eagle4_training_stage: stage2` and `efficient_lm_head_config` in the draft JSON
+selects candidate-factor training.
 For example:
 
 ```json
+"eagle4_training_stage": "stage2",
 "efficient_lm_head_config": {
   "type": "low_rank",
   "rank": 128,
@@ -186,3 +262,12 @@ For serving exported checkpoints, the version-pinned
 [EAGLE-Harness compatibility patch](../patches/eagle-harness/3e20798/README.md)
 documents dense and low-rank head support, runtime requirements, and application
 and source-hash verification instructions.
+
+## Stage-1 and stage-2 export compatibility
+
+Legacy stage-1 draft configs remain dense, including those with export head
+metadata. Both `specforge export --to hf` and `--to sglang` support EAGLE4.
+For stage 1, export derives FP32 SVD factors from the trained dense head when
+`efficient_lm_head_config` is present, retaining the dense weights. For stage 2,
+export preserves the two learned factors and does not recompute SVD. Keep the
+stage-2 draft JSON with the stage-2 checkpoint when exporting or warm-starting.

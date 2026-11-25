@@ -8,8 +8,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Export a DataFlow training checkpoint to an HF-format draft directory.
 
-The output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
-finetune from it). EAGLE-family embeddings may be absent by design — training
+Dense output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
+finetune from it). EAGLE-4 exports with efficient_lm_head_config instead add
+SVD factors for inference; resume dense training from the runtime checkpoint.
+EAGLE-family embeddings may be absent by design — training
 reloads frozen embeddings from the target — while DFlash-family drafts do not
 own an embedding at all.
 """
@@ -24,6 +26,7 @@ from specforge.export.checkpoint_io import (
     materialize_draft,
     resolve_training_state,
 )
+from specforge.export.eagle4 import add_eagle4_svd_factors
 from specforge.modeling.target.checkpoint import load_checkpoint_tensors
 
 
@@ -35,11 +38,13 @@ def export_to_hf(
     vocab_mapping_path: Optional[str] = None,
     embedding_source: Optional[str] = None,
     embedding_key: str = "model.embed_tokens.weight",
+    svd_device: str = "cpu",
 ) -> str:
     """Write the checkpoint's draft as an HF directory; returns ``output_dir``.
 
-    The exported directory is SELF-CONTAINED (reloads via ``from_pretrained``
-    with no missing keys). Draft checkpoints deliberately exclude the frozen
+    The exported directory includes the real embedding. EAGLE-4 head metadata
+    additionally derives inference-only SVD factors; its dense runtime checkpoint
+    remains the training-resume artifact. Draft checkpoints exclude the frozen
     embedding, so it must come from somewhere real: pass ``embedding_source``
     (the target model path/dir — the embedding is deterministic from it) unless
     the checkpoint itself carries ``embed_tokens.weight``. A randomly
@@ -84,6 +89,7 @@ def export_to_hf(
             if not (vocab_mapping_path and key in {"t2d", "d2t"})
         }
     )
+    full_state = add_eagle4_svd_factors(model.config, full_state, device=svd_device)
     model.save_pretrained(output_dir, state_dict=full_state)
     apply_legacy_rope_scaling(output_dir)
     return output_dir
@@ -101,6 +107,7 @@ def main(argv=None) -> int:
         help="target model path/dir supplying the frozen embedding "
         "(required unless the checkpoint carries embed_tokens.weight)",
     )
+    parser.add_argument("--svd-device", default="cpu")
     parser.add_argument("--embedding-key", default="model.embed_tokens.weight")
     args = parser.parse_args(argv)
     out = export_to_hf(
@@ -110,6 +117,7 @@ def main(argv=None) -> int:
         vocab_mapping_path=args.vocab_mapping,
         embedding_source=args.embedding_source,
         embedding_key=args.embedding_key,
+        svd_device=args.svd_device,
     )
     print(f"exported HF draft to {out}")
     return 0

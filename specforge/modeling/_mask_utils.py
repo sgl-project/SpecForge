@@ -42,7 +42,9 @@ def _make_causal_mask(
         key = torch.arange(tgt_len + past_key_values_length, device=device)
         distance = query[:, None] - key[None, :]
         allowed = (distance >= 0) & (distance < window)
-        mask = torch.full(allowed.shape, torch.finfo(dtype).min, dtype=dtype, device=device)
+        mask = torch.full(
+            allowed.shape, torch.finfo(dtype).min, dtype=dtype, device=device
+        )
         mask.masked_fill_(allowed, 0)
         return mask[None, None].expand(bsz, 1, tgt_len, key.numel())
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
