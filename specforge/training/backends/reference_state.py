@@ -73,6 +73,7 @@ def read_reference_state(
     blocks: Sequence[str],
     group=None,
     keep: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
+    state_indices: Optional[Sequence[int]] = None,
 ) -> ReferenceState:
     """This rank's saved ``BF16Optimizer`` state, read whole, kept in part.
 
@@ -96,6 +97,10 @@ def read_reference_state(
         keep: ``keep(index, full)``: what this rank keeps of ``full``, the
             whole master or moment of trainable parameter ``index``, on the
             host. Whole when omitted. One parameter is whole at a time.
+        state_indices: For each trainable parameter ``index`` in
+            ``named_parameters()`` order, its key in
+            ``saved["optimizer_state_dict"]["state"]`` (which uses flattened
+            ``param_groups`` order). Defaults to ``range(len(shapes))``.
 
     Raises:
         ValueError: The saved state does not fit the parameters, or the
@@ -108,10 +113,16 @@ def read_reference_state(
             f"saved optimizer has {len(masters)} masters for {len(shapes)} "
             "trainable parameters"
         )
+    index_map = range(len(masters)) if state_indices is None else state_indices
+    if len(index_map) != len(masters):
+        raise ValueError(
+            f"state_indices has {len(index_map)} entries for {len(masters)} "
+            "trainable parameters"
+        )
     optimizer = saved["optimizer_state_dict"]
     states = [
-        _checked_state(optimizer["state"].get(index, {}), index)
-        for index in range(len(masters))
+        _checked_state(optimizer["state"].get(state_index, {}), index)
+        for index, state_index in enumerate(index_map)
     ]
     whole = _all_agree(all(m.shape == s for m, s in zip(masters, shapes)), group)
     spans = (

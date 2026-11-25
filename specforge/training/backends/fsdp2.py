@@ -18,7 +18,11 @@ import torch.distributed as dist
 from torch import nn
 
 from specforge.optimizer import FSDP2_OPTIMIZER_FORMAT_KEY, local_tensor
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import (
+    FSDPTrainingBackend,
+    ParallelConfig,
+    _optimizer_params,
+)
 from specforge.training.contracts import (
     OptimizerSpec,
     PrecisionSpec,
@@ -382,6 +386,33 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
                 "resuming from the fsdp runtime's optimizer state requires "
                 "retain_reference_layout=True in prepare_model"
             )
+        # Align named_parameters() order (used by BF16Optimizer.fp32_params and
+        # FSDP1 layout replay) with flattened param_groups order (used by
+        # optimizer_state_dict["state"] and _load_torch_optimizer_state_dict).
+        by_id = {id(p): i for i, p in enumerate(self._trainable)}
+        if self.optimizer is not None:
+            opt_params = _optimizer_params(self.optimizer)
+            if len(opt_params) != len(self._trainable) or any(
+                id(p) not in by_id for p in opt_params
+            ):
+                raise ValueError(
+                    "optimizer parameters do not match trainable draft parameters"
+                )
+            opt_to_named = [by_id[id(p)] for p in opt_params]
+            saved_groups = saved.get("optimizer_state_dict", {}).get("param_groups")
+            if saved_groups is not None:
+                saved_sizes = [len(g["params"]) for g in saved_groups]
+                current_sizes = [len(g["params"]) for g in self.optimizer.param_groups]
+                if saved_sizes != current_sizes:
+                    raise ValueError(
+                        f"checkpoint param_groups sizes {saved_sizes} do not match "
+                        f"current optimizer param_groups {current_sizes}"
+                    )
+        else:
+            opt_to_named = list(range(len(self._trainable)))
+        named_to_opt = {ni: oi for oi, ni in enumerate(opt_to_named)}
+        state_indices = [named_to_opt[i] for i in range(len(self._trainable))]
+
         group = self.parallel_config.fsdp_process_group or dist.group.WORLD
         replay_group = None
         if dist.is_initialized():
@@ -400,6 +431,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
                 shapes=[p.shape for p in self._trainable],
                 group=group,
                 keep=lambda index, full: _local_part(full, self._trainable[index]),
+                state_indices=state_indices,
                 **self._reference_layout,
             )
         finally:
@@ -408,13 +440,17 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         return {
             "optimizer_state_dict": {
                 # A parameter the reference never stepped starts afresh.
-                "state": {index: dict(s) for index, s in enumerate(state.states) if s},
+                "state": {
+                    oi: dict(state.states[ni])
+                    for oi, ni in enumerate(opt_to_named)
+                    if state.states[ni]
+                },
                 "param_groups": state.param_groups,
             },
             "scheduler_state_dict": state.scheduler_state_dict,
             "lr_scheduler_type": state.lr_scheduler_type,
             "max_grad_norm": state.max_grad_norm,
-            "fp32_params": list(state.masters),
+            "fp32_params": [state.masters[ni] for ni in opt_to_named],
             self.FORMAT_KEY: True,
         }
 

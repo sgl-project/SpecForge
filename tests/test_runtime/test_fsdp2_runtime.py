@@ -219,13 +219,13 @@ def _on_host_fsdp1():
     return mock.patch.object(FullyShardedDataParallel, "__init__", on_host)
 
 
-def _reference_backend(sharding):
+def _reference_backend(sharding, *, opt_spec=None):
     return FSDPTrainingBackend(
         ParallelConfig(sharding_strategy=sharding, fsdp_process_group=dist.group.WORLD),
         precision=PrecisionSpec.resolve(
             runtime="fsdp", model_dtype=torch.bfloat16, sharding_strategy=sharding
         ),
-        optimizer_spec=_opt_spec(),
+        optimizer_spec=opt_spec or _opt_spec(),
         scheduler_spec=_sched_spec(),
         max_grad_norm=1.0,
     )
@@ -285,7 +285,7 @@ def _written(backend, shapes):
     return {"whole": whole, "some_rank_holds_no_slice": holds_nothing}
 
 
-def _reference_worker(rank, world, store_path, out_dir, sharding):
+def _reference_worker(rank, world, store_path, out_dir, sharding, policy="default"):
     """Train with the reference runtime and write its optimizer state."""
     dist.init_process_group(
         "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
@@ -294,7 +294,11 @@ def _reference_worker(rank, world, store_path, out_dir, sharding):
         torch.manual_seed(0)
         program = _program()
         shapes = [p.shape for p in program.draft_model.parameters() if p.requires_grad]
-        backend = _reference_backend(sharding)
+        opt_spec = _opt_spec(
+            weight_decay=0.05 if policy == "no_decay_1d" else 0.0,
+            param_group_policy=policy,
+        )
+        backend = _reference_backend(sharding, opt_spec=opt_spec)
         spec = program_spec(program)
         with _on_host_fsdp1():
             wrapped = backend.prepare_model(
@@ -310,6 +314,9 @@ def _reference_worker(rank, world, store_path, out_dir, sharding):
             {
                 "saved": backend.optimizer.state_dict(),
                 "written": _written(backend, shapes),
+                "group_wds": [
+                    g["weight_decay"] for g in backend.optimizer.optimizer.param_groups
+                ],
             },
             os.path.join(out_dir, f"reference{rank}.pt"),
         )
@@ -317,7 +324,9 @@ def _reference_worker(rank, world, store_path, out_dir, sharding):
         dist.destroy_process_group()
 
 
-def _read_reference_worker(rank, world, store_path, out_dir, sharding):
+def _read_reference_worker(
+    rank, world, store_path, out_dir, sharding, policy="default"
+):
     dist.init_process_group(
         "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
     )
@@ -331,8 +340,15 @@ def _read_reference_worker(rank, world, store_path, out_dir, sharding):
         written = torch.load(
             os.path.join(out_dir, "reference0.pt"), weights_only=False
         )["written"]
+        opt_spec = _opt_spec(
+            weight_decay=0.05 if policy == "no_decay_1d" else 0.0,
+            param_group_policy=policy,
+        )
         runner, backend = _runner(
-            program, "SHARD_GRAD_OP", retain_reference_layout=True
+            program,
+            "SHARD_GRAD_OP",
+            opt_spec=opt_spec,
+            retain_reference_layout=True,
         )
         retained_before_load = backend._reference_layout is not None
         backend.load_state_dict({"optimizer": reference["saved"]})
@@ -343,6 +359,10 @@ def _read_reference_worker(rank, world, store_path, out_dir, sharding):
             "retained_before_load": retained_before_load,
             "cleared_after_load": cleared_after_load,
             "mismatches": _mismatches(backend, trainable, written["whole"]),
+            "ref_group_wds": reference["group_wds"],
+            "resumed_group_wds": [
+                g["weight_decay"] for g in backend.optimizer.param_groups
+            ],
         }
         batches = _batches(program, 2, seed=7 + rank)
         report["loss"] = train_window(runner, batches).loss
@@ -466,22 +486,39 @@ class FSDP2RuntimeTest(unittest.TestCase):
 
     def test_reads_the_reference_runtimes_optimizer_state_exactly(self):
         for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):
-            with self.subTest(sharding=sharding), tempfile.TemporaryDirectory() as d:
-                self._run(_reference_worker, d, sharding)
-                self._run(_read_reference_worker, d, sharding)
-                for rank in range(2):
-                    read = torch.load(
-                        os.path.join(d, f"read{rank}.pt"), weights_only=False
+            for policy in ("default", "no_decay_1d"):
+                with (
+                    self.subTest(sharding=sharding, policy=policy),
+                    tempfile.TemporaryDirectory() as d,
+                ):
+                    store_ref = os.path.join(d, f"store-ref-{policy}")
+                    store_read = os.path.join(d, f"store-read-{policy}")
+                    mp.spawn(
+                        _reference_worker,
+                        args=(2, store_ref, d, sharding, policy),
+                        nprocs=2,
                     )
-                    self.assertTrue(read["retained_before_load"])
-                    self.assertTrue(read["cleared_after_load"])
-                    self.assertEqual(read["mismatches"], [])
-                    self.assertTrue(torch.isfinite(torch.tensor(read["loss"])))
-                # Under FSDP1 some rank holds no slice of some parameter, and
-                # so no optimizer state for it.
-                self.assertEqual(
-                    read["some_rank_holds_no_slice"], sharding == "SHARD_GRAD_OP"
-                )
+                    mp.spawn(
+                        _read_reference_worker,
+                        args=(2, store_read, d, sharding, policy),
+                        nprocs=2,
+                    )
+                    for rank in range(2):
+                        read = torch.load(
+                            os.path.join(d, f"read{rank}.pt"), weights_only=False
+                        )
+                        self.assertTrue(read["retained_before_load"])
+                        self.assertTrue(read["cleared_after_load"])
+                        self.assertEqual(read["mismatches"], [])
+                        self.assertTrue(torch.isfinite(torch.tensor(read["loss"])))
+                        if policy == "no_decay_1d":
+                            self.assertEqual(read["ref_group_wds"], [0.05, 0.0])
+                            self.assertEqual(read["resumed_group_wds"], [0.05, 0.0])
+                    # Under FSDP1 some rank holds no slice of some parameter, and
+                    # so no optimizer state for it.
+                    self.assertEqual(
+                        read["some_rank_holds_no_slice"], sharding == "SHARD_GRAD_OP"
+                    )
 
     def test_ranks_agree_on_a_layout_one_rank_cannot_tell(self):
         with tempfile.TemporaryDirectory() as d:
