@@ -88,6 +88,21 @@ def prepare_anchor_capacity(batch, config):
     return {"anchor_capacity": torch.empty(count, dtype=torch.bool)}
 
 
+def full_block_candidates(supervised, block_size):
+    """The released MMFlash recipe only samples starts that fit a full block."""
+    length = supervised.shape[1]
+    return supervised[:, : max(length - block_size + 1, 1)] & (length >= block_size)
+
+
+def prepare_full_block_capacity(batch, config):
+    if batch["loss_mask"].device.type != "cpu":
+        return {}
+    size = config.spec_config.protocol.num_model_slots
+    valid = full_block_candidates(valid_tokens(batch), size)
+    count = max(int(valid.sum(-1).max()) - 1, 0)
+    return {"full_block_capacity": torch.empty(count, dtype=torch.bool)}
+
+
 def sample_anchors(valid, num_anchors, available=None):
     """Sample sorted valid anchors, retaining masked padding for uneven rows."""
     available = int(valid.sum(-1).max()) if available is None else available
@@ -109,6 +124,7 @@ def prepare_blocks(
     input_offset=0,
     context_offset=0,
     prefix=False,
+    full_block_anchors=False,
 ):
     """Sample adjacent supervised anchors and isolate each independent draft block.
 
@@ -121,12 +137,20 @@ def prepare_blocks(
     supervised = valid_tokens(batch)
     if "lengths" in batch and batch["lengths"].numel() > ids.shape[0]:
         raise ValueError("block objectives require unpacked sequences")
-    valid = supervised[:, :-1] & supervised[:, 1:]
-    capacity = batch.get("anchor_capacity")
-    anchors, keep = sample_anchors(
-        valid, num_anchors, None if capacity is None else capacity.numel()
-    )
     spec, size = config.spec_config, config.spec_config.protocol.num_model_slots
+    if full_block_anchors:
+        valid = full_block_candidates(supervised, size)
+        capacity = batch.get("full_block_capacity")
+        available = (
+            int(valid.sum(-1).max()) - 1 if capacity is None else capacity.numel()
+        )
+        if available < 1:
+            raise ValueError("full-block sampling needs at least two eligible anchors")
+    else:
+        valid = supervised[:, :-1] & supervised[:, 1:]
+        capacity = batch.get("anchor_capacity")
+        available = None if capacity is None else capacity.numel()
+    anchors, keep = sample_anchors(valid, num_anchors, available)
     slots = torch.arange(size, device=ids.device)
     positions = anchors[..., None] + input_offset + slots
     label_positions = anchors[..., None] + label_offset + slots

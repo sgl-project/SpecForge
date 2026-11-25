@@ -47,6 +47,8 @@ class TrainingRequirements:
     #: Whether evaluation runs the objective's diagnostics, for an objective
     #: whose evaluation reports them.
     evaluation_diagnostics: bool = False
+    #: Modalities handled by this objective when consuming precomputed records.
+    offline_modalities: tuple[str, ...] = ("text",)
 
 
 @dataclass(frozen=True)
@@ -158,14 +160,19 @@ def _training_options(factory, options, training):
 def objective_record(name, options, *, training=None):
     """Options that fix the training trajectory: what a resume compares.
 
-    An objective lists the options that only select what is logged in
-    ``logging_options``; they are left out, for a saved record as well.
+    Logging-only options and compatible checkpoint defaults are left out of
+    new and saved records.
     """
     factory = _PROTOCOLS[name].factory
     if training is not None:
         options = _training_options(factory, options, training)
     logged = getattr(factory, "logging_options", ())
-    return {key: value for key, value in options.items() if key not in logged}
+    defaults = getattr(factory, "checkpoint_option_defaults", {})
+    return {
+        key: value
+        for key, value in options.items()
+        if key not in logged and (key not in defaults or value != defaults[key])
+    }
 
 
 def resolve_objective(

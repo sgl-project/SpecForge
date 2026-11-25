@@ -126,6 +126,15 @@
    "loss_checkpoint": true,
    "loss_chunk": 256
   },
+  "offline/colocated/qwen3.5-4b-mmflash-a100.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 0,
+   "fused_conv": false,
+   "fused_loss": false,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
   "offline/colocated/qwen3.5-4b-native-mtp.yaml": {
    "attention_backend": "sdpa",
    "dataloader_workers": 4,

@@ -154,6 +154,7 @@ the capture server.
 | --- | --- |
 | EAGLE3 | `training.objective_options.ttt_length` (`7`); choose `soft_ce` or an LK formula under `loss.terms.token`. |
 | DFlash / DFlash2 / Domino | `training.objective_options.num_anchors` (`512`); configure CE/LK under `loss.terms`, and exponential/D-PACE weighting under `training.weighting`. Selector warmup/ramp and Domino schedules are `objective_options` too. |
+| MMFlash | Set `training.objective: mmflash` and `model.input_modality: multimodal` for scored offline DFlash features. Its objective options are `num_anchors` (`512`), `smoothing` (`0.5`), and `visual_alpha` (`1.0`). [Single-card recipe](../mmflash/README.md) |
 | DSpark | `loss.terms.token` defaults to CE/L1 weights 0.1/0.9; `loss.terms.confidence.coefficient` defaults to 1. Sampling stays in `objective_options.num_anchors`. |
 | P-EAGLE | `training.objective_options.num_depths` (`8`), `down_sample_ratio` (`0.8`) and `down_sample_ratio_min` (`0.2`); `norm_before_residual` is part of the draft configuration. |
 | MTP | `training.loss.execution.chunk_size` controls projection/loss chunks; `0` disables splitting. |

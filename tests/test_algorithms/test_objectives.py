@@ -127,7 +127,7 @@ class ObjectiveTest(unittest.TestCase):
                     self.assertTrue(
                         all(t.grad is None for t in batch.values() if t.requires_grad)
                     )
-        self.assertEqual(len(objective_registrations()), 9)
+        self.assertEqual(len(objective_registrations()), 10)
 
     def test_block_alignment_and_empty_supervision(self):
         config = dmtp_config()

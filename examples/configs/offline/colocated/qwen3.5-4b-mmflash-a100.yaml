@@ -1,0 +1,42 @@
+# Single-card MMFlash smoke. Prepare the shared feature cache with
+# scripts/score_visual_kl.py. See examples/mmflash/README.md.
+model:
+  target_model_path: cache/mmflash/target
+  input_modality: multimodal
+  embedding_key: model.language_model.embed_tokens.weight
+  torch_dtype: bfloat16
+  use_liger_kernel: false
+draft: specforge/config/draft/presets/qwen3.5-4b-dflash.yaml
+data:
+  hidden_states_path: cache/mmflash/features
+  dataloader_num_workers: 0
+  max_length: 1024
+  chat_template: qwen3.5
+training:
+  objective: mmflash
+  objective_options:
+    num_anchors: 32
+  loss:
+    fused: false
+  num_epochs: 2
+  max_steps: 64
+  batch_size: 1
+  accumulation_steps: 1
+  fsdp_sharding: NO_SHARD
+  learning_rate: 0.0006
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: sdpa
+  log_interval: 1
+  save_interval: 64
+  max_checkpoints: 1
+  seed: 42
+tracking:
+  report_to: none
+run_id: mmflash
+output_dir: outputs/mmflash-smoke/mmflash
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1
