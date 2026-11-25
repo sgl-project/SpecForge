@@ -86,6 +86,7 @@ def _fake_seam():
             }
 
     class Backend(TrainingBackend):
+        process_group = None
         name = "fake"
 
         def __init__(self, model):
@@ -1119,15 +1120,18 @@ class TestFitReentry(unittest.TestCase):
     """fit() at/after max_steps and re-entry after a mid-epoch return (CPU fakes)."""
 
     def _controller(self, seen, max_steps, out_dir, **kw):
-        from specforge.training.controller import TrainerController, TrainerCore
+        from specforge.training.controller import TrainerController
+        from specforge.training.runner import DataParallelRunner
 
         num_epochs = kw.pop("num_epochs", 1)
         Composite, Strategy, Backend = _fake_seam()
         model = Composite()
         backend = Backend(model)
-        core = TrainerCore(Strategy(model, seen), backend, accumulation_steps=1)
+        strategy = Strategy(model, seen)
         ctrl = TrainerController(
-            core,
+            DataParallelRunner(strategy, backend),
+            strategy=strategy,
+            backend=backend,
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
@@ -1291,7 +1295,8 @@ class TestCheckpointResume(unittest.TestCase):
         from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.controller import TrainerController, TrainerCore
+        from specforge.training.controller import TrainerController
+        from specforge.training.runner import DataParallelRunner
         from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, N = 3, 2, 6
@@ -1328,9 +1333,14 @@ class TestCheckpointResume(unittest.TestCase):
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
         strategy = build_strategy(model, target_head=head)
-        core = TrainerCore(strategy, backend)
         ctrl = TrainerController(
-            core, run_id="r", output_dir=out_dir, max_steps=3, num_epochs=2
+            DataParallelRunner(strategy, backend),
+            strategy=strategy,
+            backend=backend,
+            run_id="r",
+            output_dir=out_dir,
+            max_steps=3,
+            num_epochs=2,
         )
         step = ctrl.fit(loader)
         self.assertEqual(step, 3)
@@ -1409,7 +1419,8 @@ class TestCheckpointResume(unittest.TestCase):
 
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.controller import TrainerController, TrainerCore
+        from specforge.training.controller import TrainerController
+        from specforge.training.runner import DataParallelRunner
         from tests.test_runtime._fixtures import build_strategy
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
@@ -1443,14 +1454,16 @@ class TestCheckpointResume(unittest.TestCase):
                     total_steps=100,
                 )
             )
-            core = TrainerCore(build_strategy(model, target_head=head), backend)
-            return model, backend, core
+            strategy = build_strategy(model, target_head=head)
+            return model, backend, strategy
 
         # Reference: one uninterrupted run of TOTAL steps (loss + lr per step).
         losses_ref, lrs_ref = [], []
-        _, backend_r, core_r = build_run()
+        _, backend_r, strategy_r = build_run()
         ctrl_r = TrainerController(
-            core_r,
+            DataParallelRunner(strategy_r, backend_r),
+            strategy=strategy_r,
+            backend=backend_r,
             run_id="ref",
             output_dir=os.path.join(workdir, "ref"),
             max_steps=TOTAL,
@@ -1467,9 +1480,11 @@ class TestCheckpointResume(unittest.TestCase):
         # Interrupted phase 1: CUT steps, then save.
         out_a = os.path.join(workdir, "rez")
         losses_a = []
-        model_a, backend_a, core_a = build_run()
+        model_a, backend_a, strategy_a = build_run()
         ctrl_a = TrainerController(
-            core_a,
+            DataParallelRunner(strategy_a, backend_a),
+            strategy=strategy_a,
+            backend=backend_a,
             run_id="rez",
             output_dir=out_a,
             max_steps=CUT,
@@ -1503,7 +1518,7 @@ class TestCheckpointResume(unittest.TestCase):
         # checkpoint and must be rebuilt identically (as a real resume rebuilds
         # it from the same target); training RNG is restored from the checkpoint.
         torch.manual_seed(0)
-        model_b, backend_b, core_b = build_run()
+        model_b, backend_b, strategy_b = build_run()
         model_b.draft_model.load_state_dict(state["draft_state_dict"], strict=False)
         backend_b.load_state_dict(state["backend"])
 
@@ -1532,7 +1547,9 @@ class TestCheckpointResume(unittest.TestCase):
 
         losses_b = []
         ctrl_b = TrainerController(
-            core_b,
+            DataParallelRunner(strategy_b, backend_b),
+            strategy=strategy_b,
+            backend=backend_b,
             run_id="rez",
             output_dir=out_a,
             max_steps=TOTAL,

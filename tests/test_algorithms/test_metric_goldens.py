@@ -23,7 +23,9 @@ from specforge.algorithms.objectives.losses import PositionWeighting
 from specforge.modeling import build_draft_model
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
-from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.controller import TrainerController
+from specforge.training.frame import run_window
+from specforge.training.runner import DataParallelRunner
 from specforge.training.strategies.base import StepContext
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_algorithms.test_objective_goldens import block_runtime
@@ -100,6 +102,7 @@ ROLLOUT_DEPTHS = 3
 class NullBackend(TrainingBackend):
     """Runs the trainer's metric reduction without gradients or an optimizer."""
 
+    process_group = None
     name = "null"
 
     def prepare_model(self, model):
@@ -127,7 +130,8 @@ def logged_metrics(strategy, tensors, *, detailed=True):
     ctx = StepContext(
         global_step=STEP, total_steps=TOTAL_STEPS, collect_detailed_metrics=detailed
     )
-    return TrainerCore(strategy, NullBackend()).train_step(batch, ctx).metrics
+    runner = DataParallelRunner(strategy, NullBackend())
+    return run_window(runner, [batch], ctx).materialize()
 
 
 def evaluated_metrics(strategy, batches):
@@ -136,9 +140,12 @@ def evaluated_metrics(strategy, batches):
         TrainBatch(sample_ids=["a", "b"], strategy=strategy.name, tensors=tensors)
         for tensors in batches
     ]
+    backend = NullBackend()
     with TemporaryDirectory() as output_dir:
         controller = TrainerController(
-            TrainerCore(strategy, NullBackend()),
+            DataParallelRunner(strategy, backend),
+            strategy=strategy,
+            backend=backend,
             run_id="metrics",
             output_dir=output_dir,
             total_steps=TOTAL_STEPS,

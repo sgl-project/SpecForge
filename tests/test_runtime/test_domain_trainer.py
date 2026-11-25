@@ -56,7 +56,11 @@ class DomainTrainerWiringTest(unittest.TestCase):
             @classmethod
             def from_distributed(cls, **kw):
                 cap["parallel_kw"] = kw
-                return "PARALLEL"
+                return SimpleNamespace(
+                    world_size=8,
+                    tp_size=kw["tp_size"],
+                    sp_size=kw["sp_ulysses_size"] * kw["sp_ring_size"],
+                )
 
         class FakeBackend:
             def __init__(self, parallel, *, optimizer_factory):
@@ -67,13 +71,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["prepare_model"] = (model, optimizer_target)
                 return "WRAPPED"
 
-        class FakeCore:
-            def __init__(self, strategy, backend, *, accumulation_steps):
-                cap["core"] = (strategy, backend, accumulation_steps)
+        class FakeRunner:
+            def __init__(self, strategy, backend):
+                cap["runner"] = (strategy, backend)
 
         class FakeController:
-            def __init__(self, core, **kw):
-                cap["ctrl_core"] = core
+            def __init__(self, runner, **kw):
+                cap["ctrl_runner"] = runner
                 cap["ctrl_kw"] = kw
                 self.global_step = 0
                 self.micro_step = 0
@@ -112,10 +116,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
             name="eagle3",
             providers=SimpleNamespace(
                 step=SimpleNamespace(
-                    build=lambda wrapped, *, target_head: (
-                        "STRAT",
-                        wrapped,
-                        target_head,
+                    build=lambda wrapped, *, target_head: SimpleNamespace(
+                        built_from=("STRAT", wrapped, target_head)
                     )
                 )
             ),
@@ -128,7 +130,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             FeatureDataLoader=FakeLoader,
             ParallelConfig=FakeParallel,
             FSDPTrainingBackend=FakeBackend,
-            TrainerCore=FakeCore,
+            DataParallelRunner=FakeRunner,
             TrainerController=FakeController,
         ):
             trainer = tr.Trainer(
@@ -214,8 +216,16 @@ class DomainTrainerWiringTest(unittest.TestCase):
 
         # optimizer built over the inner draft AFTER FSDP wrap
         self.assertEqual(cap["prepare_model"], (model, "DRAFT"))
-        self.assertEqual(cap["core"][0], ("STRAT", "WRAPPED", "HEAD"))
-        self.assertEqual(cap["core"][2], 3)  # accumulation_steps threaded
+        strategy, backend = cap["runner"]
+        self.assertEqual(strategy.built_from, ("STRAT", "WRAPPED", "HEAD"))
+        self.assertIs(backend, trainer.backend)
+
+        # the run loop drives that runner over the same strategy and backend
+        self.assertIs(cap["ctrl_runner"], trainer.runner)
+        self.assertIs(cap["ctrl_kw"]["strategy"], strategy)
+        self.assertIs(cap["ctrl_kw"]["backend"], backend)
+        self.assertEqual(cap["ctrl_kw"]["accumulation_steps"], 3)
+        self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 8)
 
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
         self.assertEqual(
@@ -237,6 +247,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "sp_ring_size": 1,
             },
         )
+
+    def test_throughput_scale_counts_only_data_parallel_ranks(self):
+        _, cap, _, _ = self._build(
+            {"refs": list(range(6))}, tp_size=2, sp_ulysses_size=2
+        )
+        # 8 ranks in groups of tp 2 x sp 2 receive 2 different sample streams
+        self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 2)
 
     def test_fixed_refs_reject_partial_accumulation_during_assembly(self):
         try:

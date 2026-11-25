@@ -40,7 +40,7 @@ class BF16Optimizer:
     clipping and configurable warmup scheduling."""
 
     #: ``step(loss_denominator=...)`` validates the caller's global loss
-    #: denominator in the same host read as the grad norm (see TrainerCore).
+    #: denominator in the same host read as the grad norm (see the step runner).
     checks_loss_denominator = True
 
     def __init__(

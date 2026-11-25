@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,22 +37,24 @@ class StepOutput:
     # Additive telemetry (for example reached/accepted counts), summed across
     # the optimizer window and data-parallel ranks, never averaged.
     sum_metrics: Dict[str, Any] = field(default_factory=dict)
-    # Replay a graph-free prepass once the window's local ratio totals are known.
-    replay_loss: Optional[
-        Callable[[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], StepOutput]
-    ] = None
+    # This rank's sums of each replay statistic the strategy declares, by name.
+    statistics: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class StepContext:
     """Training-schedule state passed into ``forward_loss``.
 
-    ``collect_detailed_metrics`` gates expensive diagnostics to log steps."""
+    ``collect_detailed_metrics`` gates expensive diagnostics to log steps.
+    ``replay_values`` holds each replay statistic's sums over the optimizer
+    window and the data-parallel ranks, by name; it is empty except while the
+    window is replayed for gradients."""
 
     global_step: int = 0
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
     accumulation_steps: int = 1
+    replay_values: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
 
 class DraftTrainStrategy(abc.ABC):
@@ -60,6 +62,8 @@ class DraftTrainStrategy(abc.ABC):
     required_features: set
     #: Whether an evaluation pass collects the detailed metrics as well.
     evaluation_diagnostics: bool = False
+    #: Names of the statistics pooled over a window before its gradient pass.
+    replay_statistics: Tuple[str, ...] = ()
 
     @abc.abstractmethod
     def trainable_module(self) -> nn.Module:
@@ -77,6 +81,13 @@ class DraftTrainStrategy(abc.ABC):
     def forward_loss(
         self, batch: TrainBatch, ctx: Optional["StepContext"] = None
     ) -> StepOutput: ...
+
+    def prepass(self, batch: TrainBatch, ctx: "StepContext") -> StepOutput:
+        """Collect ``replay_statistics`` with every statistic's value at zero.
+
+        The caller disables gradients and owns the RNG.
+        """
+        raise NotImplementedError(f"{self.name} declares no replay statistic")
 
     def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Select the keys this strategy persists as draft weights."""

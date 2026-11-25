@@ -64,7 +64,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
             total_steps=2,
         )
 
-        strategy = trainer.core.strategy
+        strategy = trainer.runner.strategy
         self.assertIsInstance(strategy, CanonicalTrainStrategy)
         module = strategy.trainable_module()
         self.assertIsInstance(strategy.model, FSDP)

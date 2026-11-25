@@ -21,8 +21,10 @@ from specforge.training.backend import (
     ParallelConfig,
     TrainingBackend,
 )
-from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.controller import TrainerController
+from specforge.training.runner import DataParallelRunner
 from specforge.training.strategies.canonical import CanonicalTrainStrategy
+from tests.test_runtime._fixtures import train_window
 
 
 def _ref(i):
@@ -120,6 +122,7 @@ class TestParallelConfigHandles(unittest.TestCase):
 
 
 class _FakeBackend(TrainingBackend):
+    process_group = None
     name = "fake"
 
     def __init__(self, model):
@@ -186,10 +189,10 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
     def test_canonical_strategy_uses_shared_trainer_lifecycle(self):
         model = _FakeDFlashModel()
         backend = _FakeBackend(model)
-        core = TrainerCore(strategy_for(model), backend)
+        runner = DataParallelRunner(strategy_for(model), backend)
         batch = TrainBatch(["s0"], "dflash", {"hidden_states": torch.randn(1, 4, 8)})
-        report = core.train_step(batch)
-        self.assertTrue(report.optimizer_stepped)
+        metrics = train_window(runner, [batch])
+        self.assertIsNotNone(metrics.grad_norm)
         self.assertEqual(backend.steps, 1)
         self.assertIsNotNone(model.w.grad)
 
@@ -206,9 +209,14 @@ class TestCheckpointRecord(unittest.TestCase):
         strat = strategy_for(model)
         backend = _FakeBackend(model)
         backend.prepare_model(model)
-        core = TrainerCore(strat, backend)
         with tempfile.TemporaryDirectory() as d:
-            ctrl = TrainerController(core, run_id="r", output_dir=d)
+            ctrl = TrainerController(
+                DataParallelRunner(strat, backend),
+                strategy=strat,
+                backend=backend,
+                run_id="r",
+                output_dir=d,
+            )
             ckpt = ctrl.save_checkpoint(10)
         # weight-version/publish/serving-gate deferred to M7: just a checkpoint record
         self.assertTrue(ckpt.checkpoint_uri.startswith("file://"))

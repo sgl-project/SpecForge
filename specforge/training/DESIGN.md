@@ -19,12 +19,21 @@ terminal done/failed signal and always stops the rank-0 ref distributor. Direct
 Python builder callers therefore receive the same cleanup guarantees as the
 CLI; there is no second wrapper-owned training lifecycle.
 
-Below that boundary, `TrainerController` owns the epoch loop, optimizer-step
-counting, interval checkpoints, and durable acknowledgements;
-`TrainerCore` owns forward/backward scheduling and the accumulation boundary;
-`DraftTrainStrategy` owns model-specific validation, forward/loss, target
-projection, and checkpoint filtering; `FSDPTrainingBackend` owns wrapping,
-backward, optimizer steps, distributed gradient norms, and full training state.
+Below that boundary, `TrainerController` is the run loop: it owns the epochs,
+the optimizer windows it cuts from the training stream, optimizer-step
+counting, interval checkpoints, and durable acknowledgements. The step frame
+(`frame.run_window`) walks one window and decides only the order in which the
+runner sees its micro-batches. `DataParallelRunner` executes each micro-batch
+and applies the update: it issues the step's collectives across samples (the
+loss denominator, the window's metrics, the replay statistics), normalizes the
+gradients and owns the RNG. One collective of a step is still issued elsewhere:
+an objective with the `global_microbatch` reduction (DSpark) reduces each
+term's denominator itself, inside the forward
+(`algorithms.objectives.base.microbatch_mean`). `DraftTrainStrategy` owns model-specific
+validation, forward/loss, target projection, and checkpoint filtering;
+`FSDPTrainingBackend` owns wrapping, backward, optimizer steps, distributed
+gradient norms, and full training state. What the frame and a runner exchange
+is declared in `contracts.py` (`StepRunner`, `PendingStep`, `StepMetrics`).
 Checkpoint rotation and the latest pointer live in
 `specforge.training.checkpoint`. Resume restores each rank's optimizer/RNG
 state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
@@ -36,48 +45,59 @@ flowchart TD
   classDef compute fill:#e6f6ea,stroke:#3bb061,color:#0b4a22;
   classDef control fill:#e8f0fe,stroke:#3b6fd6,color:#0b2e6b;
 
-  PUB[Trainer fit public lifecycle] -->|private loader| FIT[TrainerController epoch loop]
+  PUB[Trainer fit public lifecycle] -->|private loader| FIT[TrainerController run loop]
   PUB -->|final unsaved step| CKPT[save_checkpoint collective]
-  FIT -->|for batch in loader| TS[TrainerCore train_step]
+  FIT -->|one window of batches| FR[frame run_window]
   FIT -->|append sample_ids| PA[pending_ack accumulator]
-  TS -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
-  TS -->|backward| BK[FSDPTrainingBackend]
-  TS -->|step at accum boundary| BK
-  TS -->|StepResult optimizer_stepped| FIT
-  FIT -->|on boundary global_step plus 1| BND[boundary actions]
+  FR -->|forward_backward per micro-batch| RN[DataParallelRunner]
+  FR -->|apply_step at the boundary| RN
+  RN -->|forward_loss| ST[DraftTrainStrategy projection plus loss]
+  RN -->|backward and optimizer step| BK[FSDPTrainingBackend]
+  FR -->|StepMetrics| FIT
+  FIT -->|global_step plus 1| BND[boundary actions]
   BND -->|ack_fn ids step| ACK[ack_train_refs durable]
   BND -->|save_interval| CKPT
   CKPT -->|checkpoint_state_filter| ST
   CKPT -->|state_dict FULL| BK
 
-  class PUB,FIT,TS,ST,BK,BND,PA,CKPT compute;
+  class PUB,FIT,FR,RN,ST,BK,BND,PA,CKPT compute;
   class ACK control;
 ```
 
 The training plane is the only tensor-carrying side besides the data plane; it
-consumes `TrainBatch.tensors`. `TrainerCore.train_step` divides the loss by
-`accumulation_steps`, uses `no_sync()` only for non-boundary micro-batches, and
-returns `optimizer_stepped` as the single authoritative boundary signal.
+consumes `TrainBatch.tensors`. One optimizer update consumes one window: at
+most `accumulation_steps` micro-batches, cut from the stream across epoch
+boundaries and handed to the runner one at a time, so no window is held in
+memory. `DataParallelRunner.forward_backward` divides each loss numerator by
+`accumulation_steps` and uses `no_sync()` only for non-boundary micro-batches;
+its boundary call returns the `PendingStep` that `apply_step` consumes, so an
+update cannot be applied twice or without its backward. The update's objective
+is `sum(numerator) / sum(denominator)` over the window and the ranks.
 For DDP, the backend accumulation context encloses both forward and backward;
 wrapping backward alone does not disable DDP gradient synchronization. FSDP
 retains its backward-only deferral.
-`TrainerController` increments `global_step` only at that boundary, commits the
-pending sample acknowledgements, emits metrics, and performs configured
-interval saves. The outer `Trainer` owns topology cleanup and the guarded final
+`TrainerController` increments `global_step` only when a window's update has
+been applied, commits the pending sample acknowledgements, emits metrics, and
+performs configured interval saves. The outer `Trainer` owns topology cleanup and the guarded final
 save, so CLI, builders, and Python callers cannot select a second loader-based
 training entry. All saves delegate to `CheckpointManager`; the shared draft
 state is written by rank 0 while every rank writes its own optimizer/RNG state.
 
-DSpine gradient accumulation uses a graph-free CE prepass and
-`StepOutput.replay_loss` to share one detached, globally normalized alignment CE
-across the optimizer window. Replay retains CPU inputs and restores RNG state,
-adding a forward pass without retaining the window's activations. Each replayed
+DSpine declares a replay statistic: its alignment CE is normalized over the
+whole optimizer window and every rank. For such a window the frame first calls
+`runner.prepass` for each micro-batch (training mode, no gradients) and keeps a
+host copy of its inputs, pools the statistic's sums once with
+`runner.reduce_sum`, then calls `forward_backward` for each kept micro-batch
+with the pooled sums in `StepContext.replay_values`. The runner restores, for
+each replayed forward, the RNG state its prepass started from. Replay adds a
+forward pass without retaining the window's activations. Each replayed
 forward/backward pair uses the backend accumulation context; only the last
-synchronizes DDP gradients. Evaluation and single-micro-batch training skip replay.
+synchronizes DDP gradients. Evaluation does not replay.
 
-Natural end-of-stream is accepted only at an optimizer boundary. If the final
-backward is inside FSDP `no_sync`, `fit` fails instead of stepping unreduced
-gradients or reporting a checkpoint as successful. Queue-mode loaders
+Natural end-of-stream is accepted only at an optimizer boundary. If the stream
+ends inside a window the frame raises `IncompleteWindow` and `fit` fails
+instead of stepping unreduced gradients or reporting a checkpoint as
+successful. Queue-mode loaders
 terminally settle and clean a short `drop_last` batch without emitting it;
 fixed offline refs keep normal `drop_last` semantics.
 
@@ -106,8 +126,9 @@ not guarantees of throughput improvement.
 | From | Endpoint | Plane |
 |---|---|---|
 | `TrainerController` | `FeatureDataLoader.__iter__` | compute |
-| `TrainerController` | `TrainerCore.train_step` | compute |
+| `TrainerController` | `frame.run_window` | compute |
+| `frame.run_window` | `DataParallelRunner.forward_backward` / `apply_step` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
-| `TrainerCore` | `CanonicalTrainStrategy.forward_loss` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.backward` | compute |
-| `TrainerCore` | `FSDPTrainingBackend.step` | compute |
+| `DataParallelRunner` | `CanonicalTrainStrategy.forward_loss` | compute |
+| `DataParallelRunner` | `FSDPTrainingBackend.backward` | compute |
+| `DataParallelRunner` | `FSDPTrainingBackend.step` | compute |
