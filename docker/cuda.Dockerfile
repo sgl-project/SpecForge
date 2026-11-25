@@ -6,7 +6,8 @@
 # ones in pyproject.toml, so its virtual environment (/opt/sglang) is reused
 # as is. No released image carries the SGLang revision the capture plugin needs,
 # so the image's SGLang checkout moves to that revision and is rebuilt in place.
-# SpecForge, the capture plugin and Mooncake install next to it.
+# SpecForge is cloned from GitHub and installs next to it with the capture plugin
+# and Mooncake.
 #
 #   docker build -f docker/cuda.Dockerfile -t specforge:cuda .
 #   docker run --rm -it --gpus all --ipc=host specforge:cuda
@@ -47,29 +48,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
  && uv pip install "flashinfer-jit-cache==${flashinfer}" \
       --index-url ${FLASHINFER_INDEX_URL}/${FLASHINFER_CUDA}
 
+# SpecForge is cloned rather than copied from the build context, so the image
+# holds a git checkout and the build needs no local files. SPECFORGE_REF takes a
+# branch, tag or commit. Docker caches this layer by its text, so a branch stays
+# at the commit it had when the layer was built until a --no-cache build.
+ARG SPECFORGE_REPO=https://github.com/sgl-project/SpecForge.git
+ARG SPECFORGE_REF=main
+RUN git clone ${SPECFORGE_REPO} /sgl-workspace/SpecForge \
+ && git -C /sgl-workspace/SpecForge checkout ${SPECFORGE_REF}
+
 WORKDIR /sgl-workspace/SpecForge
 
-# Dependencies come from pyproject.toml alone, so source edits reuse this layer.
-COPY pyproject.toml ./
+# SpecForge is editable too: `git pull` in the container, or a checkout mounted
+# over this directory, takes effect without a rebuild. The final command fails
+# the build if the installs replaced the CUDA Torch, the capture plugin cannot
+# find its SGLang APIs, or the cloned SpecForge pins a different SGLang revision
+# than the one built above. Mooncake is only located: importing it needs the
+# driver's libcuda, absent during a build.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --prerelease=allow -r pyproject.toml mooncake-transfer-engine-cuda13
-
-COPY version.txt README.md LICENSE MANIFEST.in ./
-COPY specforge ./specforge
-COPY plugins/sglang-spec-capture ./plugins/sglang-spec-capture
-COPY examples ./examples
-COPY scripts ./scripts
-COPY benchmarks ./benchmarks
-# SpecForge is editable too: a checkout mounted over this directory takes effect
-# without a rebuild. The final command fails the build if the installs replaced
-# the CUDA Torch or the capture plugin cannot find its SGLang APIs. Mooncake is
-# only located: importing it needs the driver's libcuda, absent during a build.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-deps --no-build-isolation -e . \
+    uv pip install --no-build-isolation --prerelease=allow -e . \
+      mooncake-transfer-engine-cuda13 \
  && uv pip install --no-deps --no-build-isolation ./plugins/sglang-spec-capture \
  && python -c "import importlib.util, torch, specforge.cli, specforge_sglang_capture; \
 from sglang.srt.model_executor.forward_observer import ForwardObserver; \
 from sglang.srt.managers.deferred_output import ResponseCompletion; \
+from specforge.checkpoint.formats.sglang import SGLANG_COMMIT; \
+assert SGLANG_COMMIT == '${SGLANG_COMMIT}', SGLANG_COMMIT; \
 assert importlib.util.find_spec('mooncake.store'); \
 assert torch.version.cuda, torch.__version__"
 

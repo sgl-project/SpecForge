@@ -66,8 +66,9 @@ whose RMSNorm/SwiGLU kernels DFlash drafts use by default on CUDA and ROCm
 [`docker/cuda.Dockerfile`](https://github.com/sgl-project/SpecForge/blob/main/docker/cuda.Dockerfile)
 packages the source installation above as a CUDA 13 image. It starts from the
 SGLang release image with the same Torch and Transformers pins, moves that
-image's SGLang to the pinned revision, and installs SpecForge, the capture
-plugin and Mooncake into the image's virtual environment at `/opt/sglang`:
+image's SGLang to the pinned revision, then clones SpecForge and installs it
+with the capture plugin and Mooncake into the image's virtual environment at
+`/opt/sglang`:
 
 ```bash
 docker build -f docker/cuda.Dockerfile -t specforge:cuda .
@@ -76,9 +77,13 @@ docker run --rm -it --gpus all --ipc=host \
   specforge:cuda
 ```
 
-The checkout lives in `/sgl-workspace/SpecForge` and is installed in editable
-mode, so mounting a local checkout over that path picks up source changes
-without a rebuild.
+The image clones the `main` branch; pass `--build-arg SPECFORGE_REF=<branch, tag
+or commit>` (and `SPECFORGE_REPO` for a fork) to build another revision. Docker
+caches the clone, so add `--no-cache` to pick up new commits on a branch.
+
+The clone lives in `/sgl-workspace/SpecForge` and is installed in editable
+mode, so `git pull` there, or a local checkout mounted over that path, takes
+effect without a rebuild.
 
 ### AMD ROCm
 
