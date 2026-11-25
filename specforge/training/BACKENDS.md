@@ -421,11 +421,15 @@ LR schedule adds one entry in `optim/`. Neither touches `RunLoop`, `StepExecutor
 Why FSDP2 first instead of torchtitan (which itself runs PyTorch FSDP2, `torch.compile` and
 `torchao` underneath):
 
-- **Accuracy**: FSDP1 with `no_sync()` accumulates unsharded gradients in `compute_dtype` (`bf16`)
-  and casts to `reduce_dtype` only on the synced micro-batch. FSDP2 upcasts each micro-batch's
-  gradient to `fp32` and accumulates and reduces in `fp32` (`MixedPrecisionPolicy(param_dtype=compute,
-  reduce_dtype=fp32, cast_forward_inputs=False)`). On 32 `bf16`-computed micro-batches, FSDP2
-  matches the exact `fp64` gradient sum to `1e-6`, where `bf16` accumulation drifts by >100×.
+- **Accuracy (with `bf16` grad opt-in)**: FSDP1 with `no_sync()` accumulates unsharded gradients in
+  `compute_dtype` (`bf16`) and casts to `reduce_dtype` only on the synced micro-batch. FSDP2 defaults
+  to upcasting each micro-batch's gradient to `fp32` and accumulating/reducing in `fp32`
+  (`MixedPrecisionPolicy(param_dtype=compute, reduce_dtype=precision.gradient_dtype,
+  cast_forward_inputs=False)`). On 32 `bf16`-computed micro-batches, FSDP2 matches the exact `fp64`
+  gradient sum to `1e-6`, where `bf16` accumulation drifts by >100×. For `A > 1` runs where 2×
+  unsharded `fp32` grad memory or reduce-scatter bandwidth matters (or for FSDP1 parity), setting
+  `training.gradient_dtype` to `model.torch_dtype` (e.g. `bfloat16`) accumulates and reduces
+  uniformly in `bf16` while still casting reduced sharded gradients onto the `fp32` DTensor masters.
 - **Efficiency & zero external impedance mismatch**: FSDP2 operates directly on canonical
   `nn.Module` drafts on `torch==2.14.1` in ~250 lines (versus ~1,000+ lines of adapter glue for
   torchtitan's `Module` protocol, version pins and bypassed `forward_backward`). For small drafts,
@@ -441,16 +445,21 @@ What is implemented in `#1242–#1245`:
 
 - `specforge/training/backends/fsdp2.py::FSDP2TrainingBackend` (`#1244`): upcasts trainable draft
   parameters to `fp32` (preserving tied weights), leaves `program.frozen` unsharded in its built
-  dtype, applies `fully_shard` per declared block and at root, disables gradient sync and
-  post-backward resharding on non-boundary micro-batches, drives registry-built optimizers directly
-  (`#1242`), and exports canonical draft weights in `PrecisionSpec.artifact_dtype`.
+  dtype, applies `fully_shard` bottom-up per declared block (supporting nested `_no_split_modules`)
+  and with `reshard_after_forward=False` at root (avoiding redundant pre-backward root re-gathers
+  under `FULL_SHARD`), uses `reduce_dtype=precision.gradient_dtype` (default `fp32`, opt-in
+  `compute_dtype`), disables gradient sync on non-boundary micro-batches while tying post-backward
+  resharding to `fsdp_sharding` (`False` for `SHARD_GRAD_OP`/`NO_SHARD`, `True` for `FULL_SHARD`,
+  restoring both flags in `finally`), drives registry-built optimizers directly (`#1242`), and
+  exports canonical draft weights in `PrecisionSpec.artifact_dtype`.
 - `specforge/training/backends/reference_state.py` (`#1245`): converts DDP and FSDP1
   `BF16Optimizer` checkpoints (replaying FSDP1 `FlatParameter._shard_param_infos` lazily on CPU one
-  parameter at a time) into FSDP2 `DTensor` shards so existing runs switch to `fsdp2` seamlessly on
-  resume.
-- Known torch 2.14 limit: a parameter that receives no gradient on micro-batches `1..A-1` and
-  receives one on micro-batch `A` triggers FSDP2's uniform-gradient-dtype reduce-scatter error;
-  conditional/MoE drafts must guard unused experts or stay on `fsdp` until handled.
+  parameter at a time, aligning `named_parameters()` and multi-group `param_groups` order) into
+  FSDP2 `DTensor` shards so existing runs switch to `fsdp2` seamlessly on resume.
+- Known torch 2.14 limit (under `gradient_dtype=fp32`): a parameter that receives no gradient on
+  micro-batches `1..A-1` and receives one on micro-batch `A` triggers FSDP2's uniform-gradient-dtype
+  reduce-scatter error; conditional/MoE drafts can guard unused experts, opt into
+  `training.gradient_dtype: bfloat16`, or stay on `fsdp` until handled.
 - Current refusals: `fsdp2` refuses `optimizer_cpu_offload=True` (no separate master copy) and
   `attention_backend=usp` until GPU USP regression coverage lands.
 
