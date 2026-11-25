@@ -251,6 +251,12 @@ class FSDPTrainingBackend(TrainingBackend):
             for parameter in module.parameters()
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
+        # Record pre-sharding parameter ranks by object identity before FSDP1
+        # flattens shards to 1-D (and inserts ``_fsdp_wrapped_module`` into names).
+        pre_wrap_target = optimizer_target if optimizer_target is not None else model
+        orig_ndims = {
+            id(p): p.ndim for p in pre_wrap_target.parameters() if p.requires_grad
+        }
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -328,12 +334,17 @@ class FSDPTrainingBackend(TrainingBackend):
             self.ignored_frozen_modules = ignored_frozen_modules
         target = optimizer_target if optimizer_target is not None else self.module
         if self._optimizer_spec is not None:
-            self._build_configured_optimizer(target)
+            self._build_configured_optimizer(target, param_ndims=orig_ndims)
         elif self._optimizer_factory is not None:
             self.set_optimizer(self._optimizer_factory(target))
         return self.module
 
-    def _build_configured_optimizer(self, target: nn.Module) -> None:
+    def _build_configured_optimizer(
+        self,
+        target: nn.Module,
+        *,
+        param_ndims: Optional[Mapping[int, int]] = None,
+    ) -> None:
         from specforge.optimizer import BF16Optimizer
 
         if self._scheduler_spec is None:
@@ -346,6 +357,7 @@ class FSDPTrainingBackend(TrainingBackend):
                 optimizer_spec=self._optimizer_spec,
                 scheduler_spec=self._scheduler_spec,
                 max_grad_norm=self._max_grad_norm,
+                param_ndims=param_ndims,
             )
         )
 

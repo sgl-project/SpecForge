@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 import torch.distributed as dist
@@ -154,13 +165,41 @@ def _default_param_groups(
     return [{"params": [param for _, param in named_params]}]
 
 
+def _accepts_param_ndims(policy: Callable[..., Any]) -> bool:
+    params = inspect.signature(policy).parameters
+    return "param_ndims" in params or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
+def _fsdp1_param_ndims(module: nn.Module) -> Dict[int, int]:
+    """Recover pre-flattening parameter ranks from any FSDP1 units in ``module``."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    ndims: Dict[int, int] = {}
+    for unit in module.modules():
+        if isinstance(unit, FSDP) and unit._handle is not None:
+            flat = unit._handle.flat_param
+            for param, shape in zip(flat._params, flat._shapes):
+                ndims[id(param)] = len(shape)
+    return ndims
+
+
 def _no_decay_1d_param_groups(
-    named_params: Sequence[Tuple[str, nn.Parameter]], spec: OptimizerSpec
+    named_params: Sequence[Tuple[str, nn.Parameter]],
+    spec: OptimizerSpec,
+    *,
+    param_ndims: Optional[Mapping[int, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Apply ``weight_decay`` only to >=2-D non-bias tensors."""
     decay, no_decay = [], []
     for name, param in named_params:
-        if param.ndim >= 2 and not name.endswith(".bias") and name != "bias":
+        ndim = (
+            param_ndims.get(id(param), param.ndim)
+            if param_ndims is not None
+            else param.ndim
+        )
+        if ndim >= 2 and not name.endswith(".bias") and name != "bias":
             decay.append(param)
         else:
             no_decay.append(param)
@@ -203,9 +242,16 @@ def registered_param_group_policies() -> Tuple[str, ...]:
 
 
 def build_param_groups(
-    named_params: Iterable[Tuple[str, nn.Parameter]], spec: OptimizerSpec
+    named_params: Iterable[Tuple[str, nn.Parameter]],
+    spec: OptimizerSpec,
+    *,
+    param_ndims: Optional[Mapping[int, int]] = None,
 ) -> List[Dict[str, Any]]:
-    """Group trainable ``(name, parameter)`` pairs using ``spec.param_group_policy``."""
+    """Group trainable ``(name, parameter)`` pairs using ``spec.param_group_policy``.
+
+    ``param_ndims`` maps ``id(param)`` to the parameter's pre-sharding rank
+    when a wrapper such as FSDP1 has flattened shards to 1-D.
+    """
     policy = _PARAM_GROUP_POLICIES.get(spec.param_group_policy)
     if policy is None:
         raise ValueError(
@@ -213,6 +259,8 @@ def build_param_groups(
             f"expected one of {sorted(_PARAM_GROUP_POLICIES)}"
         )
     trainable = [(name, p) for name, p in named_params if p.requires_grad]
+    if param_ndims is not None and _accepts_param_ndims(policy):
+        return policy(trainable, spec, param_ndims=param_ndims)
     return policy(trainable, spec)
 
 
@@ -269,7 +317,10 @@ def registered_optimizers() -> Tuple[str, ...]:
 
 
 def build_optimizer(
-    target: nn.Module | Iterable[Tuple[str, nn.Parameter]], spec: OptimizerSpec
+    target: nn.Module | Iterable[Tuple[str, nn.Parameter]],
+    spec: OptimizerSpec,
+    *,
+    param_ndims: Optional[Mapping[int, int]] = None,
 ) -> torch.optim.Optimizer:
     """Build an optimizer from the shared registry over ``target``."""
     builder = _OPTIMIZERS.get(spec.kind)
@@ -280,7 +331,7 @@ def build_optimizer(
     named_params = (
         target.named_parameters() if isinstance(target, nn.Module) else target
     )
-    param_groups = build_param_groups(named_params, spec)
+    param_groups = build_param_groups(named_params, spec, param_ndims=param_ndims)
     return builder(param_groups, spec)
 
 
@@ -315,6 +366,7 @@ class BF16Optimizer:
         *,
         optimizer_spec: Optional[OptimizerSpec] = None,
         scheduler_spec: Optional[SchedulerSpec] = None,
+        param_ndims: Optional[Mapping[int, int]] = None,
     ):
         opt_spec = (
             optimizer_spec
@@ -355,12 +407,25 @@ class BF16Optimizer:
         named_masters = [
             (name, mp) for (name, _), mp in zip(named_trainable, self.fp32_params)
         ]
+        resolved_ndims = _fsdp1_param_ndims(model)
+        if param_ndims is not None:
+            resolved_ndims.update(param_ndims)
+        master_ndims = (
+            {
+                id(mp): resolved_ndims.get(id(p), p.ndim)
+                for p, mp in zip(self.model_params, self.fp32_params)
+            }
+            if resolved_ndims
+            else None
+        )
         self._adamw_fused = (
             True
             if self.fp32_params and all(mp.is_cuda for mp in self.fp32_params)
             else None
         )
-        self.optimizer = build_optimizer(named_masters, opt_spec)
+        self.optimizer = build_optimizer(
+            named_masters, opt_spec, param_ndims=master_ndims
+        )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
         self._reduce_grad_norm_across_ranks = True

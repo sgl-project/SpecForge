@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 
 from specforge.algorithms.objectives.base import ObjectiveResult
@@ -431,6 +435,118 @@ class CanonicalRegistryValidationTest(unittest.TestCase):
                 cfg = Config.model_validate({**base, "training": {field: value}})
                 with self.assertRaisesRegex(ValueError, pattern):
                     resolve_run(cfg, target_config=target_cfg)
+
+
+class _Block(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 4, bias=True)
+        self.norm = nn.LayerNorm(4)
+
+
+class _DraftWithBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_proj = nn.Linear(4, 4, bias=True)
+        self.block = _Block()
+
+
+class _RootProgram(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.draft_model = _DraftWithBlock()
+
+
+def _fsdp1_no_decay_worker(rank, world, store_path, out_dir):
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    original_init = FullyShardedDataParallel.__init__
+
+    def _cpu_fsdp_init(self, module, *args, **kwargs):
+        kwargs.setdefault("device_id", torch.device("cpu"))
+        original_init(self, module, *args, **kwargs)
+
+    try:
+        torch.manual_seed(0)
+        program = _RootProgram().to(torch.bfloat16)
+        backend = FSDPTrainingBackend(
+            ParallelConfig(
+                world_size=world,
+                sharding_strategy="SHARD_GRAD_OP",
+                param_dtype=torch.bfloat16,
+                fsdp_process_group=dist.group.WORLD,
+            ),
+            optimizer_spec=OptimizerSpec(
+                kind="adamw",
+                lr=1e-3,
+                weight_decay=0.05,
+                param_group_policy="no_decay_1d",
+            ),
+            scheduler_spec=SchedulerSpec(kind="constant", total_steps=4),
+            max_grad_norm=1.0,
+        )
+        with mock.patch.object(FullyShardedDataParallel, "__init__", _cpu_fsdp_init):
+            backend.prepare_model(
+                program,
+                optimizer_target=program.draft_model,
+                blocks=("_Block",),
+            )
+        opt = backend.optimizer
+        by_master = {
+            id(mp): name
+            for (name, _), mp in zip(
+                [
+                    (n, p)
+                    for n, p in program.draft_model.named_parameters()
+                    if p.requires_grad
+                ],
+                opt.fp32_params,
+            )
+        }
+        groups = [
+            (g["weight_decay"], [by_master[id(p)] for p in g["params"]])
+            for g in opt.optimizer.param_groups
+        ]
+        torch.save(
+            {
+                "all_shards_1d": all(p.ndim == 1 for p in opt.model_params),
+                "groups": groups,
+            },
+            os.path.join(out_dir, f"fsdp1_wd_{rank}.pt"),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+class FSDP1NoDecay1DTest(unittest.TestCase):
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "needs gloo")
+    def test_fsdp1_preserves_pre_sharding_ndims_for_no_decay_1d(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            mp.spawn(_fsdp1_no_decay_worker, args=(2, store, d), nprocs=2)
+            for rank in range(2):
+                report = torch.load(
+                    os.path.join(d, f"fsdp1_wd_{rank}.pt"), weights_only=False
+                )
+                # Confirms FSDP1 genuinely flattened every shard to 1-D.
+                self.assertTrue(report["all_shards_1d"])
+                groups = report["groups"]
+                self.assertEqual([wd for wd, _ in groups], [0.05, 0.0])
+                decay_names, no_decay_names = groups[0][1], groups[1][1]
+                # Both root-level and auto-wrapped block 2-D weights get decay.
+                self.assertEqual(len(decay_names), 2)
+                self.assertTrue(
+                    any(n.endswith("root_proj.weight") for n in decay_names)
+                )
+                self.assertTrue(any(n.endswith("linear.weight") for n in decay_names))
+                # All biases and 1-D LayerNorm params get weight_decay=0.0.
+                self.assertEqual(len(no_decay_names), 4)
+                self.assertTrue(
+                    all(n.endswith(".bias") or ".norm." in n for n in no_decay_names)
+                )
 
 
 if __name__ == "__main__":
