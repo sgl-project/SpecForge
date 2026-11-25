@@ -1374,15 +1374,26 @@ class TestFitReentry(unittest.TestCase):
 
 @unittest.skipUnless(CUDA, "checkpoint resume requires CUDA")
 class TestCheckpointResume(unittest.TestCase):
-    def test_checkpoint_resume(self):
-        torch.manual_seed(0)
+    @classmethod
+    def setUpClass(cls):
+        if torch.distributed.is_initialized():
+            return
+
+        from specforge.distributed import destroy_distributed
         from tests.test_runtime import _fixtures as fx
 
+        env = mock.patch.dict(os.environ)
+        env.start()
+        cls.addClassCleanup(env.stop)
+        cls.addClassCleanup(destroy_distributed)
         fx.build_single_rank_distributed(port="29563")
 
+    def test_checkpoint_resume(self):
+        torch.manual_seed(0)
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController
+        from tests.test_runtime import _fixtures as fx
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -1496,13 +1507,10 @@ class TestCheckpointResume(unittest.TestCase):
             )
 
     def test_resume_loss_curve_continuity(self):
-        from tests.test_runtime import _fixtures as fx
-
-        fx.build_single_rank_distributed(port="29564")
-
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController
+        from tests.test_runtime import _fixtures as fx
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
@@ -1520,9 +1528,13 @@ class TestCheckpointResume(unittest.TestCase):
                 max_len=512,
             )
 
+        self.addCleanup(
+            torch.set_deterministic_debug_mode, torch.get_deterministic_debug_mode()
+        )
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
         def build_run():
             torch.manual_seed(0)
-            torch.use_deterministic_algorithms(True, warn_only=True)
             model, _ = fx.build_eagle3(workdir, ttt=TTT)
             backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
             backend.prepare_model(model, wrap=False)
