@@ -94,6 +94,17 @@ forward pass without retaining the window's activations. Each replayed
 forward/backward pair uses the backend accumulation context; only the last
 synchronizes DDP gradients. Evaluation does not replay.
 
+Evaluation goes through the same runner. `Evaluator.run` opens one
+`runner.evaluation()` pass on every rank (evaluation mode from entry to exit,
+the mode it found restored afterwards), calls `runner.evaluate` for each batch
+without gradients, and pools the pass once at the end through
+`runner.reduce_sum` and `runner.reduce_max`, on a schedule that is the same on
+every rank. `evaluate` reduces nothing across samples, so a rank may hold fewer
+evaluation batches than another, or none, unless the forward itself
+communicates (a sharded wrapper, or sequence-parallel attention). An objective that normalizes each rank's micro-batch over
+all ranks in training (DSpark) is normalized on its own rank in evaluation; the
+evaluator pools numerators and denominators of the whole pass instead.
+
 Natural end-of-stream is accepted only at an optimizer boundary. If the stream
 ends inside a window the frame raises `IncompleteWindow` and `fit` fails
 instead of stepping unreduced gradients or reporting a checkpoint as
@@ -128,6 +139,8 @@ not guarantees of throughput improvement.
 | `TrainerController` | `FeatureDataLoader.__iter__` | compute |
 | `TrainerController` | `frame.run_window` | compute |
 | `frame.run_window` | `DataParallelRunner.forward_backward` / `apply_step` | compute |
+| `TrainerController` | `Evaluator.run` | compute |
+| `Evaluator` | `DataParallelRunner.evaluate` / `reduce_sum` / `reduce_max` | compute |
 | `TrainerController` | `DataFlowController.ack_train_refs` | control |
 | `DataParallelRunner` | `CanonicalTrainStrategy.forward_loss` | compute |
 | `DataParallelRunner` | `FSDPTrainingBackend.backward` | compute |

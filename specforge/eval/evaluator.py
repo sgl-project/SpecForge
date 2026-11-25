@@ -8,20 +8,22 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Batch-size-invariant eval aggregation: per-position correct/denom counts are
 summed over the whole eval set (all batches, all DP ranks) BEFORE any ratio or
-geometric sum. The evaluator's own collective schedule is decided globally, so
-empty or scalar-only shards issue the same reductions as their peers; when
-``forward_fn`` is itself collective (FSDP), every rank must additionally
-iterate the same number of eval batches."""
+geometric sum. The pass is pooled once, through the step runner, on a schedule
+that is the same on every rank, so empty or scalar-only shards issue the same
+reductions as their peers; when the runner's forward is itself collective
+(FSDP), every rank must additionally iterate the same number of eval batches."""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
 import torch
-import torch.distributed as dist
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import StepOutput
+
+if TYPE_CHECKING:
+    from specforge.training.contracts import StepRunner
+    from specforge.training.strategies.base import StepContext
 
 
 class Evaluator:
@@ -34,10 +36,15 @@ class Evaluator:
 
     def run(
         self,
-        forward_fn: Callable[[TrainBatch], StepOutput],
+        runner: "StepRunner",
         batches: Optional[Iterable[TrainBatch]],
+        ctx: "StepContext",
     ) -> Dict[str, Any]:
         """Run the pass; returns ``{}`` if zero batches were processed globally.
+
+        Each batch is evaluated by ``runner.evaluate`` inside one
+        ``runner.evaluation()`` pass, which is then pooled across ranks by
+        ``runner.reduce_sum`` and ``runner.reduce_max``.
 
         Additive loss and accuracy terms are used directly when the strategy
         provides them. Scalar fallbacks use ``metrics['accuracy_denom']`` when
@@ -50,9 +57,10 @@ class Evaluator:
         # [loss*w, w, scalar_acc*denom, scalar_denom, n_batches, ar_w, pl_w]
         sums = None
 
-        with torch.no_grad():
+        # Entered on every rank, with or without batches of its own.
+        with runner.evaluation(), torch.no_grad():
             for batch in batches if batches is not None else ():
-                out = forward_fn(batch)
+                out = runner.evaluate(batch, ctx)
                 m = out.metrics
                 # .mean() normalizes a shape-[1] loss to the 0-dim slot.
                 loss = (
@@ -113,25 +121,20 @@ class Evaluator:
         # sums, (2) MAX the per-position length — a global decision, so an
         # empty shard still participates — (3) SUM one padded count buffer iff
         # any rank has per-position data.
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        if world_size > 1:
-            device = self._comm_device()
-            sums = (
-                sums if sums is not None else torch.zeros(7, dtype=torch.float64)
-            ).to(device)
-            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
-            local_len = pp.size(1) if pp is not None else 0
-            pp_len = torch.tensor([local_len], dtype=torch.int64, device=device)
-            dist.all_reduce(pp_len, op=dist.ReduceOp.MAX)
-            global_len = int(pp_len.item())
-            if global_len > 0:
-                buf = torch.zeros(4, global_len, dtype=torch.float64, device=device)
-                if pp is not None:
-                    buf[:, : pp.size(1)] = pp.to(device)
-                dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-                pp = buf
+        sums = runner.reduce_sum(
+            sums if sums is not None else torch.zeros(7, dtype=torch.float64)
+        )
+        local_len = pp.size(1) if pp is not None else 0
+        global_len = int(
+            runner.reduce_max(torch.tensor([local_len], dtype=torch.int64)).item()
+        )
+        if global_len > 0:
+            buf = torch.zeros(4, global_len, dtype=torch.float64, device=sums.device)
+            if pp is not None:
+                buf[:, : pp.size(1)] = pp.to(sums.device)
+            pp = runner.reduce_sum(buf)
 
-        if sums is None or sums[4].item() == 0.0:
+        if sums[4].item() == 0.0:
             # Zero batches globally: report nothing — fabricated zero metrics
             # would poison best-checkpoint tracking.
             return {}
@@ -171,24 +174,6 @@ class Evaluator:
     @staticmethod
     def _sum64(value: Any, device: torch.device) -> torch.Tensor:
         return torch.as_tensor(value).detach().double().sum().to(device)
-
-    @staticmethod
-    def _comm_device() -> torch.device:
-        """Return the bound device required by the active collective backend."""
-        backend = str(dist.get_backend()).lower()
-        if "nccl" in backend:
-            return torch.device("cuda", torch.cuda.current_device())
-        if "hccl" in backend:
-            from specforge.utils import get_local_device
-
-            device = get_local_device()
-            if device.type != "npu":
-                raise RuntimeError(
-                    "HCCL evaluation requires SPECFORGE_DEVICE=npu and a bound "
-                    f"NPU device, got {device}"
-                )
-            return device
-        return torch.device("cpu")
 
     @staticmethod
     def _simulated_acc_len(per_position_acc: List[float]) -> float:

@@ -384,8 +384,6 @@ class TrainerController:
                 self.max_steps,
             )
             return self.global_step
-        module = self.strategy.trainable_module()
-        module.train()
         # Rank0-broadcast once: rank-local assembly must not let ranks enter or
         # skip the evaluator's collectives independently.
         eval_enabled = self._rank0_decision(
@@ -494,7 +492,6 @@ class TrainerController:
             eval_metrics: Optional[Dict[str, Any]] = None
             if eval_enabled and self.global_step % self.eval_interval == 0:
                 eval_metrics = self.evaluate_configured()
-                module.train()
                 if eval_metrics:
                     if self.logger:
                         self.logger(eval_metrics, self.global_step)
@@ -618,7 +615,6 @@ class TrainerController:
         with data as entered:
             return self.evaluate(data if entered is None else entered)
 
-    @torch.no_grad()
     def evaluate(self, data: Optional[Iterable[TrainBatch]]) -> Dict[str, Any]:
         """Full-pass eval via :class:`Evaluator`.
 
@@ -629,24 +625,10 @@ class TrainerController:
         from specforge.eval import Evaluator
 
         self._flush_durable_ack()
-        module = self.strategy.trainable_module()
-        was_training = module.training
-        module.eval()
         # Use the train path's live context so schedule-dependent losses (for
         # example Domino's lambda_base) are not evaluated as if at step zero.
-        # The evaluator reads loss and accuracy: skip the diagnostics unless
-        # the strategy's evaluation reports them.
-        ctx = StepContext(
-            global_step=self.global_step,
-            total_steps=self.total_steps,
-            collect_detailed_metrics=self.strategy.evaluation_diagnostics,
-        )
-        try:
-            return Evaluator().run(
-                lambda batch: self.strategy.forward_loss(batch, ctx), data
-            )
-        finally:
-            module.train(was_training)
+        ctx = StepContext(global_step=self.global_step, total_steps=self.total_steps)
+        return Evaluator().run(self.runner, data, ctx)
 
     @staticmethod
     def _rank0_decision(flag: bool) -> bool:
