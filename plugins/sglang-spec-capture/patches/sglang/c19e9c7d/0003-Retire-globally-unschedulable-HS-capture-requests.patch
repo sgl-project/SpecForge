@@ -1,0 +1,97 @@
+From d1e5107d3443030ac2a2228d9f0df1ba742aed46 Mon Sep 17 00:00:00 2001
+From: SpecForge HS migration <specforge-hs-migration@localhost>
+Date: Wed, 25 Nov 2026 11:11:46 +0800
+Subject: [PATCH 3/3] Retire globally unschedulable HS capture requests
+
+---
+ .../sglang/srt/managers/prefix_admission.py   |  3 +++
+ python/sglang/srt/managers/scheduler.py       |  6 ++++-
+ .../unit/managers/test_prefix_admission.py    | 23 +++++++++++++++++++
+ 3 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/managers/prefix_admission.py b/python/sglang/srt/managers/prefix_admission.py
+index dc7ab36801..0bfd1f63a0 100644
+--- a/python/sglang/srt/managers/prefix_admission.py
++++ b/python/sglang/srt/managers/prefix_admission.py
+@@ -586,6 +586,9 @@ class PrefixAdmissionCoordinator:
+                             if len({v[4] for v in votes}) == 1
+                             else AddReqResult.OTHER
+                         )
++                    if any(v[4] == "UNSCHEDULABLE" for v in votes):
++                        reason = "native_admission_unschedulable"
++                        return AddReqResult.UNSCHEDULABLE
+                     reason = "native_admission_declined"
+             except Exception as exc:
+                 reason = str(exc)
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 7d4ced2509..a979ae6c7f 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -534,6 +534,7 @@ class Scheduler(
+     rust_server: Optional[RustServer] = None
+     # The alignment a truncated prefill chunk is cut to; None leaves it free.
+     truncation_align_size: Optional[int] = None
++    prefix_admission_observer = None
+
+     # Class-level default so on_idle's stall gate works even if a fork
+     # overrides init_load_publisher (which would otherwise not set it).
+@@ -556,7 +557,6 @@ class Scheduler(
+         # with minimal glue. Move substantial component-specific logic into
+         # dedicated methods instead of adding inline blocks here.
+         self.init_startup_timing_begin()
+-        self.prefix_admission_observer = None
+         self.prefix_admission_coordinator = PrefixAdmissionCoordinator(self, parallel=get_parallel())
+         self.is_initializing = True
+         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+@@ -3989,6 +3989,10 @@ class Scheduler(
+         self.request_retirer.abort(req, reason=reason, finished_reason=reason.to_json())
+
+     def _abort_unavailable(self, req: Req, *, message: str) -> None:
++        if self.prefix_admission_observer is not None:
++            self.prefix_admission_coordinator.lifecycle(
++                req, "cancel", getattr(req, "_prefix_admission_identity", None)
++            )
+         self.request_retirer.abort(
+             req,
+             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
+diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
+index 49a01fbf98..9f19937964 100644
+--- a/test/registered/unit/managers/test_prefix_admission.py
++++ b/test/registered/unit/managers/test_prefix_admission.py
+@@ -28,6 +28,7 @@ class Result(Enum):
+     CONTINUE = 1
+     OTHER = 2
+     NO_TOKEN = 3
++    UNSCHEDULABLE = 4
+
+
+ class Budget:
+@@ -458,6 +459,28 @@ class PrefixAdmissionTests(unittest.TestCase):
+             results = [future.result(timeout=8) for future in futures]
+         return replicas, results
+
++    def test_tp_terminal_decline_rolls_back_every_rank_without_retry(self):
++        def run(rank, coordinator, observer, req, adder):
++            original = adder.add_one_req
++            if rank == 1:
++
++                def fail_to_admit(*args):
++                    original(*args)
++                    adder.can_run_list.clear()
++                    return Result.UNSCHEDULABLE
++
++                adder.add_one_req = fail_to_admit
++            return coordinator.admit(req, adder, False, None)
++
++        replicas, verdicts = self.run_two(run)
++        self.assertEqual(verdicts, [Result.UNSCHEDULABLE] * 2)
++        for _, observer, req, adder in replicas:
++            self.assertEqual(observer.prepares, 1)
++            self.assertEqual(observer.rollbacks, 1)
++            self.assertFalse(
++                observer.reservations or adder.can_run_list or req.resources
++            )
++
+     def test_tp_match_disagreement_rolls_back_every_rank(self):
+         def run(rank, c, observer, req, adder):
+             req.match_len += rank

@@ -1,7 +1,7 @@
 From 8d1a7ce54612c9a9b4efd84ad8aa5d8309f4b43c Mon Sep 17 00:00:00 2001
 From: SpecForge HS migration <specforge-hs-migration@localhost>
 Date: Wed, 25 Nov 2026 11:01:44 +0800
-Subject: [PATCH 2/2] Preserve selected FP32 GDN checkpoint snapshots
+Subject: [PATCH 2/3] Preserve selected FP32 GDN checkpoint snapshots
 
 ---
  .../sglang/kernels/ops/attention/fla/chunk.py |  24 +++

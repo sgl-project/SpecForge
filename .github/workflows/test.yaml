@@ -222,10 +222,10 @@ jobs:
           git -C "$checkout" fetch --no-tags --depth=1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT"
           git -C "$checkout" checkout --quiet --detach FETCH_HEAD
           test "$(git -C "$checkout" rev-parse HEAD)" = "$SGLANG_COMMIT"
-          patches=("$PWD"/plugins/sglang-spec-capture/patches/sglang/c19e9c7d/000[1-2]-*.patch)
-          test "${#patches[@]}" -eq 2
+          patches=("$PWD"/plugins/sglang-spec-capture/patches/sglang/c19e9c7d/000[1-3]-*.patch)
+          test "${#patches[@]}" -eq 3
           git -C "$checkout" -c user.name="SpecForge CI" -c user.email="ci@specforge.invalid" am "${patches[@]}"
-          test "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = db88e5c7c39274cb2bbf0a0c4ac43e2619cc1e2b
+          test "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = 7b4777b7a9081e8767b1794df1b56cda1db84a58
           # The stock environments have already been cached and tested. Use
           # the normal source installation in the isolated capture interpreter.
           stock_version=$(sf-capture/bin/python -c 'from importlib.metadata import version; print(version("sglang"))')
