@@ -6,6 +6,7 @@ from .base import (
     AttentionPreparationScope,
     AttentionResult,
     PreparedAttention,
+    PreparedLayout,
 )
 from .dense import EagerAttentionBackend, SDPAAttentionBackend
 from .eager import eager_attention
@@ -35,6 +36,7 @@ __all__ = [
     "AttentionPreparationScope",
     "AttentionResult",
     "PreparedAttention",
+    "PreparedLayout",
     "EagerAttentionBackend",
     "SDPAAttentionBackend",
     "FlexAttentionBackend",

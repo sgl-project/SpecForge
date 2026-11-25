@@ -150,14 +150,35 @@ training:
       checkpoint: true
 ```
 
-Named `attention_configs` define GQA, MHA or MLA, including `is_causal` and
-`sliding_window` on each node. `layer_configs` composes attention and FFN nodes;
+Named `attention_configs` define GQA, MHA, MLA or KDA, including `is_causal` and
+`sliding_window` on each softmax node. `layer_configs` composes attention and FFN nodes;
 `layer_types` selects the named layer for each position. Architecture settings
 live in `spec_config`. A checkpoint stores the expanded canonical configuration.
 There are no target-derived defaults or structural overrides in the run config.
 
 See [draft training](/draft_training.md) for objectives, kernel options,
 sequence parallelism and checkpoint initialization.
+
+#### KDA layers
+
+A `type: kda` node is Kimi Delta Attention: a gated delta-rule recurrence
+instead of a K/V lookup, with the field names of Kimi's `linear_attn_config`
+(`num_heads`, `head_dim`, `short_conv_kernel_size`, `gate_lower_bound`) plus
+`full_rank_output_gate`. A block starts from the KDA state after the target
+context rows its softmax layers attend to, and its short convolutions continue
+from the last of those rows. KDA has no rotary subspace (`rope_parameters: null`).
+It works with the block architectures (DFlash, DFlash2, DSpark, Domino, DMTP);
+EAGLE3, P-EAGLE, MTP and DSpine reject it while the draft config is validated.
+Mix it with softmax layers through `layer_types`, as in
+`specforge/config/draft/presets/qwen3.8-27b-dflash2-kda.yaml`
+(`[kda, kda, gqa, kda, kda]`).
+
+On CUDA, KDA runs FLA's `chunk_kda`; install the `kda` extra
+(`pip install '.[kda]'`, which pins `fla-core==0.5.1`). A missing FLA fails at the
+first forward rather than falling back. CPU tensors use the reference recurrence.
+Each forward plans the context scan once on the host (one device-to-host copy)
+and every KDA layer reuses the plan. The visible context of an active block must
+not contain padding.
 
 ### DFlash2
 

@@ -256,6 +256,6 @@ selects the convolution and path-selector implementation. The resolved target lo
 unary logits in both SpecForge's local generation path and the matching serving
 contract.
 
-Training supports the shared DFlash-family `gqa`, `mha`, and `mla` attention
-modes. Export checks whether the pinned SGLang format can express the selected
+Training supports the shared DFlash-family `gqa`, `mha`, `mla` and `kda`
+attention kinds. Export checks whether the pinned SGLang format can express the selected
 components; unsupported settings fail before writing an artifact.

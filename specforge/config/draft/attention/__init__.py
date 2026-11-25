@@ -2,6 +2,7 @@
 
 from .base import AttentionSpec
 from .gqa import GQASpec, MHASpec
+from .kda import KDASpec
 from .mla import MLASpec
 
-__all__ = ["AttentionSpec", "GQASpec", "MHASpec", "MLASpec"]
+__all__ = ["AttentionSpec", "GQASpec", "KDASpec", "MHASpec", "MLASpec"]

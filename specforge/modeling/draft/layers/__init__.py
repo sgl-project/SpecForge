@@ -1,6 +1,6 @@
 """Node-configured building blocks shared by draft architectures."""
 
-from .attention import GQAAttention, MLAAttention
+from .attention import GQAAttention, KDAAttention, MLAAttention
 from .conv import GroupedCausalConv
 from .decoder import DecoderLayer
 from .logits import MuPLogitTransform, NoLogitTransform, TargetLogitTransform
@@ -14,6 +14,7 @@ __all__ = [
     "DecoderLayer",
     "GQAAttention",
     "GroupedCausalConv",
+    "KDAAttention",
     "MLAAttention",
     "MuPLogitTransform",
     "NoLogitTransform",
