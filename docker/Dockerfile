@@ -7,10 +7,10 @@
 # as is. No released image carries the SGLang revision the capture plugin needs,
 # so the image's SGLang checkout moves to that revision and is rebuilt in place.
 # SpecForge is cloned from GitHub and installs next to it with the capture plugin
-# and Mooncake.
+# and Mooncake. The tag below names the base image's SGLang release and CUDA build.
 #
-#   docker build -f docker/cuda.Dockerfile -t specforge:cuda .
-#   docker run --rm -it --gpus all --ipc=host specforge:cuda
+#   docker build -f docker/Dockerfile -t specforge:sgl0.5.23-cu130 .
+#   docker run --rm -it --gpus all --ipc=host specforge:sgl0.5.23-cu130
 #
 ARG BASE_IMAGE=lmsysorg/sglang:v0.5.23-cu130
 FROM ${BASE_IMAGE}
