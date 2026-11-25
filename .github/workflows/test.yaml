@@ -210,7 +210,7 @@ jobs:
           uv pip install --no-deps ./plugins/specforge-tpu
           python -m unittest discover -s plugins/specforge-tpu/tests -v
 
-      - name: Run six-patch SGLang HS TP contract
+      - name: Run patched SGLang HS CPU contracts
         timeout-minutes: 40
         shell: bash
         env:
@@ -222,10 +222,10 @@ jobs:
           git -C "$checkout" fetch --no-tags --depth=1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT"
           git -C "$checkout" checkout --quiet --detach FETCH_HEAD
           test "$(git -C "$checkout" rev-parse HEAD)" = "$SGLANG_COMMIT"
-          patches=("$PWD"/plugins/sglang-spec-capture/patches/sglang/c757c4bb/000[1-6]-*.patch)
-          test "${#patches[@]}" -eq 6
+          patches=("$PWD"/plugins/sglang-spec-capture/patches/sglang/c19e9c7d/000[1-2]-*.patch)
+          test "${#patches[@]}" -eq 2
           git -C "$checkout" -c user.name="SpecForge CI" -c user.email="ci@specforge.invalid" am "${patches[@]}"
-          test "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = 1e2bd88315469e2d3f522b171613c4d9032491a5
+          test "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = db88e5c7c39274cb2bbf0a0c4ac43e2619cc1e2b
           # The stock environments have already been cached and tested. Use
           # the normal source installation in the isolated capture interpreter.
           stock_version=$(sf-capture/bin/python -c 'from importlib.metadata import version; print(version("sglang"))')
@@ -245,6 +245,9 @@ jobs:
           assert prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1
           PYTHON
           sf-capture/bin/python -m unittest tests.test_runtime.hs_tp_protocol -v
+          tests="$checkout/test/registered/unit/managers"
+          sf-capture/bin/python -m unittest discover -s "$tests" -p 'test_prefix_admission*.py' -v
+          sf-capture/bin/python "$tests/test_gdn_track_snapshot_contract.py" -v
 
       - name: Save cache
         run: |

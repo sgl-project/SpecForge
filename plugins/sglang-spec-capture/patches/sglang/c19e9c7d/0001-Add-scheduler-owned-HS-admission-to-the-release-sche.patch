@@ -1,46 +1,47 @@
-From bc9b971712136f6a798f45ee7ea68c4a926a6518 Mon Sep 17 00:00:00 2001
+From b822304af9c63d3ea6514ae700a2412a2324fd99 Mon Sep 17 00:00:00 2001
 From: Wilbolu <wilbolu@outlook.com>
 Date: Tue, 10 Nov 2026 02:10:37 +0800
-Subject: [PATCH 1/6] feat(capture): add scheduler-owned prefix admission
- transactions
+Subject: [PATCH 1/2] Add scheduler-owned HS admission to the release scheduler
 
-Pinned base: c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0. HS semantic source: e189be978c1bfb50c463e6fd080a52fd4d111922. Protocol v1 delays plan freeze until actual batch allocation and TP decisions complete; native receipts cover exact locks, COW, rows, token pages, state/tracking slots and nested budgets. Generic plugin control is dispatched on scheduler threads.
-
-Validation: 17 pure CPU fault/collective contract cases and AST/diff checks passed. This is an integration checkpoint; actual scheduler, device allocator, numerical, hybrid and TP GPU acceptance are pending. GDN snapshot capability remains disabled until the follow-up precision patch.
+Migrate the prior admission transaction plus cancelled-control drain, request identity rollback, slotted request state and shutdown propagation to c19e9c7d. Use the native indexed request lists, retire path, KV budget, row state, batched tracking allocation and deferred responses.
 ---
- python/sglang/srt/managers/io_struct.py       |  13 +
- .../sglang/srt/managers/prefix_admission.py   | 589 ++++++++++++++++++
- python/sglang/srt/managers/schedule_batch.py  |   9 +
- python/sglang/srt/managers/schedule_policy.py |  18 +-
- python/sglang/srt/managers/scheduler.py       | 451 +++++++++-----
- .../srt/managers/tokenizer_control_mixin.py   |  19 +
+ python/sglang/srt/managers/io_struct.py       |  15 +
+ .../sglang/srt/managers/prefix_admission.py   | 744 ++++++++++++++++++
+ python/sglang/srt/managers/schedule_batch.py  |   3 +
+ python/sglang/srt/managers/schedule_policy.py |  45 +-
+ python/sglang/srt/managers/scheduler.py       | 566 ++++++++-----
+ .../srt/managers/tokenizer_control_mixin.py   |  32 +
  python/sglang/srt/mem_cache/allocation.py     |  11 +-
- python/sglang/srt/mem_cache/kv/requests.py    |  17 +-
- .../sglang/srt/mem_cache/kv/state_storage.py  |  43 +-
+ python/sglang/srt/mem_cache/kv/requests.py    |  16 +-
+ .../sglang/srt/mem_cache/kv/state_storage.py  |   8 +
  python/sglang/srt/mem_cache/memory_pool.py    |  17 +-
- python/sglang/srt/mem_cache/prefill_budget.py |  25 +
- .../unified_cache/components/mamba.py         |  23 +-
- .../unit/managers/test_prefix_admission.py    | 410 ++++++++++++
- 13 files changed, 1473 insertions(+), 172 deletions(-)
+ python/sglang/srt/mem_cache/prefill_budget.py |  17 +
+ .../unified_cache/components/mamba.py         |  28 +-
+ .../unit/managers/test_prefix_admission.py    | 640 +++++++++++++++
+ .../test_prefix_admission_actual_req.py       | 253 ++++++
+ 14 files changed, 2174 insertions(+), 221 deletions(-)
  create mode 100644 python/sglang/srt/managers/prefix_admission.py
  create mode 100644 test/registered/unit/managers/test_prefix_admission.py
+ create mode 100644 test/registered/unit/managers/test_prefix_admission_actual_req.py
 
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 5b38a395b1..6efa1b882b 100644
+index 43a026b39f..73c0d459f9 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -2666,6 +2666,19 @@ class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
-     success: bool
- 
- 
+@@ -2848,6 +2848,21 @@ class BlockReqInput(BaseReq, kw_only=True):
+     req_type: BlockReqType
+
+
 +class PluginControlReqInput(BaseReq, kw_only=True):
 +    """Ordered control dispatch to a scheduler-owned plugin."""
 +
 +    namespace: str
 +    body: Dict[str, Any]
++    control_id: str
 +
 +
 +class PluginControlReqOutput(BaseReq, kw_only=True):
++    control_id: str
 +    success: bool
 +    response: Dict[str, Any]
 +    error: str = ""
@@ -51,10 +52,10 @@ index 5b38a395b1..6efa1b882b 100644
      # JSON request body (guarded to be a dict at the /dumper endpoint).
 diff --git a/python/sglang/srt/managers/prefix_admission.py b/python/sglang/srt/managers/prefix_admission.py
 new file mode 100644
-index 0000000000..d5bd8de549
+index 0000000000..dc7ab36801
 --- /dev/null
 +++ b/python/sglang/srt/managers/prefix_admission.py
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,744 @@
 +"""Scheduler-owned, opt-in prefix admission transactions.
 +
 +The plugin owns its leases and output reservations.  The engine owns request
@@ -65,11 +66,13 @@ index 0000000000..d5bd8de549
 +
 +from __future__ import annotations
 +
-+from dataclasses import dataclass
++import logging
++from dataclasses import dataclass, fields, is_dataclass
 +from typing import Any, Callable, Protocol
 +
 +CAPTURE_ADMISSION_PROTOCOL = 1
 +ExecutionIdentity = tuple[str, str, str, int]
++logger = logging.getLogger(__name__)
 +
 +
 +def capture_checkpoint_capability(model_runner) -> dict:
@@ -82,25 +85,45 @@ index 0000000000..d5bd8de549
 +    linear = getattr(backend, "linear_attn_backend", None)
 +    recurrent = getattr(model_runner.req_to_token_pool, "holds_state_slots", False)
 +    if linear is None and not recurrent:
-+        return {"supported": True, "kind": "full_attention", "backend": type(backend).__name__}
++        return {
++            "supported": True,
++            "kind": "full_attention",
++            "backend": type(backend).__name__,
++        }
 +    result = {"supported": False, "kind": "hybrid", "backend": type(linear).__name__}
 +    if linear is None or type(linear).__name__ != "GDNAttnBackend":
-+        return dict(result, reason="only the selected CUDA Triton GDN path is supported")
++        return dict(
++            result, reason="only the selected CUDA Triton GDN path is supported"
++        )
 +    pool = linear.state_pool.mamba_cache
 +    kernel = linear.kernel_dispatcher.extend_kernel
-+    result.update(ssm_dtype=str(pool.temporal.dtype), selected_kernel=type(kernel).__name__)
++    result.update(
++        ssm_dtype=str(pool.temporal.dtype), selected_kernel=type(kernel).__name__
++    )
 +    if str(model_runner.device).split(":")[0] != "cuda":
 +        return dict(result, reason="exact GDN snapshot requires CUDA")
 +    if str(pool.temporal.dtype) != "torch.float32":
 +        return dict(result, reason="recurrent state pool must be FP32")
 +    graph_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
 +    if graph_runner is not None and type(graph_runner).__name__ != "EagerRunner":
-+        return dict(result, reason="GDN prefill graph snapshots are not supported by this protocol")
-+    if type(kernel).__name__ != "TritonGDNKernel" or not kernel.supports_track_state_snapshot:
-+        return dict(result, reason="selected prefill kernel does not supply FP32 track snapshots")
++        return dict(
++            result,
++            reason="GDN prefill graph snapshots are not supported by this protocol",
++        )
++    if (
++        type(kernel).__name__ != "TritonGDNKernel"
++        or not kernel.supports_track_state_snapshot
++    ):
++        return dict(
++            result,
++            reason="selected prefill kernel does not supply FP32 track snapshots",
++        )
 +    if getattr(model_runner.req_to_token_pool, "mamba_ckpt_pool", None) is not None:
 +        return dict(result, reason="compressed Mamba checkpoints are unsupported")
-+    if any(getattr(pool, name, None) is not None for name in ("replayssm_d", "replayssm_rawv")):
++    if any(
++        getattr(pool, name, None) is not None
++        for name in ("replayssm_d", "replayssm_rawv")
++    ):
 +        return dict(result, reason="ReplaySSM checkpoints are unsupported")
 +    return dict(result, supported=True, kind="gdn_fp32_track_snapshot")
 +
@@ -110,14 +133,24 @@ index 0000000000..d5bd8de549
 +    from sglang.srt.runtime_context import get_exec
 +
 +    execution = get_exec()
-+    if not execution.deterministic.enable_deterministic_inference or not is_batch_invariant_mode_enabled():
++    if (
++        not execution.deterministic.enable_deterministic_inference
++        or not is_batch_invariant_mode_enabled()
++    ):
 +        raise ValueError("HS reuse requires deterministic batch-invariant execution")
 +    mamba = execution.mamba
-+    if any(getattr(mamba, name, False) for name in (
-+        "enable_int8_mamba_checkpoint", "enable_mamba_cache_stochastic_rounding",
-+        "enable_linear_replayssm", "enable_linear_replayssm_spec",
-+    )):
-+        raise ValueError("HS reuse does not support lossy or replay recurrent checkpoints")
++    if any(
++        getattr(mamba, name, False)
++        for name in (
++            "enable_int8_mamba_checkpoint",
++            "enable_mamba_cache_stochastic_rounding",
++            "enable_linear_replayssm",
++            "enable_linear_replayssm_spec",
++        )
++    ):
++        raise ValueError(
++            "HS reuse does not support lossy or replay recurrent checkpoints"
++        )
 +    capability = capture_checkpoint_capability(scheduler.tp_worker.model_runner)
 +    if not capability["supported"]:
 +        raise ValueError("HS checkpoint capability refused: " + repr(capability))
@@ -184,22 +217,50 @@ index 0000000000..d5bd8de549
 +
 +
 +_REQUEST_FIELDS = (
-+    "prefix_len", "last_node", "last_host_node", "best_match_node",
-+    "host_hit_length", "swa_host_hit_length", "mamba_host_hit_length",
-+    "mamba_branching_seqlen", "swa_branching_seqlen",
-+    "num_matched_prefix_tokens", "host_loaded_length", "extend_end", "lock",
-+    "logprob_start_len", "_prefix_admission_identity",
++    "prefix_len",
++    "last_node",
++    "last_host_node",
++    "best_match_node",
++    "host_hit_length",
++    "swa_host_hit_length",
++    "mamba_host_hit_length",
++    "mamba_branching_seqlen",
++    "swa_branching_seqlen",
++    "num_matched_prefix_tokens",
++    "host_loaded_length",
++    "extend_end",
++    "lock",
++    "logprob_start_len",
++    "_prefix_admission_identity",
 +    "_prefix_admission_lifecycle",
-+    "extend_batch_idx", "cached_tokens", "cached_tokens_device",
-+    "cached_tokens_host", "cached_tokens_storage", "_cache_breakdown_computed",
-+    "already_computed", "is_retracted",
++    "extend_batch_idx",
++    "cached_tokens",
++    "cached_tokens_device",
++    "cached_tokens_host",
++    "cached_tokens_storage",
++    "_cache_breakdown_computed",
++    "already_computed",
++    "is_retracted",
++    "retracted_stain",
++    "extra_key",
++    "cache_salt",
++    "matched_window_host_hit_lengths",
 +)
 +_ADDER_FIELDS = (
-+    "rem_input_tokens", "rem_chunk_tokens", "rem_dllm_tokens",
-+    "new_chunked_req", "log_hit_tokens", "reprocessed_log_hit_tokens",
-+    "log_device_hit_tokens", "log_host_hit_tokens", "log_storage_hit_tokens",
-+    "log_input_tokens", "log_replay_tokens", "reprocessed_log_input_tokens",
-+    "kv_shard_block_bound_pages", "kv_shard_chunk_pages",
++    "rem_input_tokens",
++    "rem_chunk_tokens",
++    "rem_dllm_tokens",
++    "new_chunked_req",
++    "log_hit_tokens",
++    "reprocessed_log_hit_tokens",
++    "log_device_hit_tokens",
++    "log_host_hit_tokens",
++    "log_storage_hit_tokens",
++    "log_input_tokens",
++    "log_replay_tokens",
++    "reprocessed_log_input_tokens",
++    "kv_shard_block_bound_pages",
++    "kv_shard_chunk_pages",
 +)
 +_MISSING = object()
 +
@@ -230,11 +291,21 @@ index 0000000000..d5bd8de549
 +            raise RuntimeError("nested prefix admission transaction")
 +        self.adder, self.req = adder, req
 +        self.request_before = _snapshot(req, _REQUEST_FIELDS)
-+        self.kv_before = {
-+            name: value.copy() if isinstance(value, (dict, list)) else value
-+            for name, value in vars(req.kv).items()
-+        }
-+        self.fill_len_before = len(req.full_untruncated_fill_ids)
++        # ReqKvInfo is a slotted dataclass on this pin. Keep tensor/allocator
++        # handles by identity and copy only mutable metadata containers.
++        kv_names = (
++            (field.name for field in fields(req.kv))
++            if is_dataclass(req.kv)
++            else vars(req.kv).keys()
++        )
++        self.kv_before = {}
++        for name in kv_names:
++            value = getattr(req.kv, name)
++            self.kv_before[name] = (
++                value.copy() if isinstance(value, (dict, list)) else value
++            )
++        self.fill_ids_before = req.full_untruncated_fill_ids
++        self.fill_len_before = len(self.fill_ids_before)
 +        self.adder_before = _snapshot(adder, _ADDER_FIELDS)
 +        self.lists_before = {
 +            name: list(getattr(adder, name))
@@ -295,20 +366,30 @@ index 0000000000..d5bd8de549
 +                item.run()
 +            except Exception as exc:
 +                self.rollback_errors.append(f"{item.description}: {exc!r}")
++
 +        # Restore metadata even when a physical release failed. The coordinator
 +        # gathers that failure and terminates instead of attempting reclamation.
 +        def restore_lists():
 +            for name, before in self.lists_before.items():
 +                getattr(self.adder, name)[:] = before
++
 +        def restore_kv():
-+            vars(self.req.kv).clear()
-+            vars(self.req.kv).update(self.kv_before)
++            for name, value in self.kv_before.items():
++                setattr(self.req.kv, name, value)
++
 +        def restore_ids():
-+            del self.req.full_untruncated_fill_ids[self.fill_len_before:]
++            del self.fill_ids_before[self.fill_len_before :]
++            self.req.full_untruncated_fill_ids = self.fill_ids_before
++
 +        restores = (
 +            ("adder metadata", lambda: _restore(self.adder, self.adder_before)),
 +            ("adder membership", restore_lists),
-+            ("nested budget", lambda: self.adder.memory_budget.restore_admission_checkpoint(self.budget_before)),
++            (
++                "nested budget",
++                lambda: self.adder.memory_budget.restore_admission_checkpoint(
++                    self.budget_before
++                ),
++            ),
 +            ("request metadata", lambda: _restore(self.req, self.request_before)),
 +            ("request KV metadata", restore_kv),
 +            ("request fill ids", restore_ids),
@@ -367,6 +448,9 @@ index 0000000000..d5bd8de549
 +        try:
 +            value = call()
 +        except Exception as exc:
++            logger.warning(
++                "Prefix admission local phase failed: %s", exc, exc_info=True
++            )
 +            error = f"{type(exc).__name__}: {exc}"
 +        return value, self.gather(error)
 +
@@ -375,9 +459,15 @@ index 0000000000..d5bd8de549
 +        if any(x is not None for x in errors):
 +            raise RuntimeError(f"TP prefix {phase} failed: {errors!r}")
 +
++    def check_order(self, reqs):
++        orders = self.gather(tuple(req.rid for req in reqs))
++        if any(order != orders[0] for order in orders[1:]):
++            raise RuntimeError("TP prefix waiting request order differs")
++
 +    def poll(self):
 +        observer = self.scheduler.prefix_admission_observer
 +        if observer is not None:
++
 +            def poll_local():
 +                if self.lifecycle_errors:
 +                    raise RuntimeError(repr(self.lifecycle_errors))
@@ -396,6 +486,11 @@ index 0000000000..d5bd8de549
 +                # itself cannot enter a collective; the next all-rank safe
 +                # point gathers and raises local failures before new work.
 +                self.lifecycle_errors.append(f"{event} {identity!r}: {exc!r}")
++        if event == "shutdown" and self.lifecycle_errors:
++            # Terminal teardown has no later all-rank poll. Preserve its local
++            # failure as a process error, without entering a collective while
++            # peer schedulers may already be exiting.
++            raise RuntimeError(f"prefix shutdown failed: {self.lifecycle_errors!r}")
 +
 +    def _validate_native_scope(self, req, adder):
 +        s = self.scheduler
@@ -412,7 +507,7 @@ index 0000000000..d5bd8de549
 +            s.dllm_config is not None,
 +            getattr(s, "enable_lora", False),
 +            getattr(s, "enable_hisparse", False),
-+            getattr(s, "uocr_doc_hooks", None) is not None,
++            getattr(s, "uocr_runtime", None) is not None,
 +            getattr(s, "is_mixed_chunk", False),
 +            self.parallel.pp_size != 1,
 +            self.parallel.attn_cp_size != 1,
@@ -421,11 +516,14 @@ index 0000000000..d5bd8de549
 +            getattr(req, "beam_group", None) is not None,
 +        )
 +        if any(forbidden):
-+            raise ValueError("prefix admission v1 requires nonchunked device-only prefill")
++            raise ValueError(
++                "prefix admission v1 requires nonchunked device-only prefill"
++            )
 +
 +    def admit(self, req, adder, has_chunked_req, truncation_align_size):
 +        """Return None for an ordinary request, otherwise native AddReqResult."""
 +        from sglang.srt.managers.schedule_policy import AddReqResult
++        from sglang.srt.mem_cache.capacity import shares_memory
 +
 +        s, observer = self.scheduler, self.scheduler.prefix_admission_observer
 +        for attempt in range(2):
@@ -440,8 +538,12 @@ index 0000000000..d5bd8de549
 +
 +                def prepare():
 +                    value = observer.prepare(s, req)
-+                    if value is not None and not isinstance(value, PrefixAdmissionProposal):
-+                        raise TypeError("prepare must return PrefixAdmissionProposal or None")
++                    if value is not None and not isinstance(
++                        value, PrefixAdmissionProposal
++                    ):
++                        raise TypeError(
++                            "prepare must return PrefixAdmissionProposal or None"
++                        )
 +                    return value
 +
 +                proposal, errors = self.phase(prepare)
@@ -452,59 +554,96 @@ index 0000000000..d5bd8de549
 +                    _, errors = self.phase(receipt.rollback)
 +                    self.check(errors, "ordinary request restoration")
 +                    committed = True
-+                    return AddReqResult.OTHER if getattr(
-+                        adder, "_prefix_pending_admissions", None
-+                    ) else None
++                    return (
++                        AddReqResult.OTHER
++                        if getattr(adder, "_prefix_pending_admissions", None)
++                        else None
++                    )
 +                if not all(selected):
 +                    raise RuntimeError("TP prefix protocol request membership differs")
-+                if adder.can_run_list and not getattr(adder, "_prefix_pending_admissions", None):
++                if adder.can_run_list and not getattr(
++                    adder, "_prefix_pending_admissions", None
++                ):
 +                    reason = "different_prefill_protocol"
 +                    return AddReqResult.OTHER
 +                _, errors = self.phase(lambda: self._validate_native_scope(req, adder))
 +                self.check(errors, "scope")
 +                identities = self.gather(proposal.identity)
 +                if len(set(identities)) != 1:
-+                    raise RuntimeError(f"TP prefix execution identities differ: {identities!r}")
++                    raise RuntimeError(
++                        f"TP prefix execution identities differ: {identities!r}"
++                    )
 +                cap = self.broadcast(proposal.max_prefix_len)
-+                proposal = PrefixAdmissionProposal(cap, proposal.identity, proposal.opaque)
++                proposal = PrefixAdmissionProposal(
++                    cap, proposal.identity, proposal.opaque
++                )
 +                req._prefix_admission_identity = proposal.identity
 +                req._prefix_admission_lifecycle = self.lifecycle
 +                _, errors = self.phase(
-+                    lambda: req.init_next_round_input(s.tree_cache, max_prefix_len=cap)
++                    lambda: req.init_next_round_input(
++                        s.tree_cache,
++                        max_prefix_len=cap,
++                        defer_cow_slot=shares_memory(s.token_to_kv_pool_allocator),
++                    )
 +                )
 +                self.check(errors, "native match")
 +                lengths = self.gather(req.prefix_len)
 +                if len(set(lengths)) != 1 or not 0 <= lengths[0] <= cap:
 +                    raise RuntimeError(f"TP prefix legal lengths differ: {lengths!r}")
 +                lawful_l = lengths[0]
++                defer, errors = self.phase(lambda: adder.should_defer(req))
++                self.check(errors, "native deferral check")
++                if any(self.gather(defer)):
++                    reason = "native_admission_deferred"
++                    return AddReqResult.OTHER
 +                if any(self.gather(req.needs_host_load_back())):
-+                    raise ValueError("prefix admission v1 does not support host load-back")
-+                _, errors = self.phase(lambda: observer.after_match(s, req, proposal, lawful_l))
++                    raise ValueError(
++                        "prefix admission v1 does not support host load-back"
++                    )
++                _, errors = self.phase(
++                    lambda: observer.after_match(s, req, proposal, lawful_l)
++                )
 +                self.check(errors, "after_match")
-+                accepted, errors = self.phase(lambda: observer.reserve(s, req, proposal, lawful_l))
++                accepted, errors = self.phase(
++                    lambda: observer.reserve(s, req, proposal, lawful_l)
++                )
 +                self.check(errors, "reserve")
 +                if not all(self.gather(accepted is True)):
 +                    budget_declined = True
 +                    reason = "capture_budget_declined"
 +                else:
 +                    result, errors = self.phase(
-+                        lambda: adder.add_one_req(req, has_chunked_req, truncation_align_size)
++                        lambda: adder.add_one_req(
++                            req, has_chunked_req, truncation_align_size
++                        )
 +                    )
 +                    self.check(errors, "native admission")
-+                    votes = self.gather((
-+                        any(item is req for item in adder.can_run_list),
-+                        req.prefix_len, len(req.full_untruncated_fill_ids),
-+                        proposal.identity, result.name,
-+                    ))
++                    votes = self.gather(
++                        (
++                            any(item is req for item in adder.can_run_list),
++                            req.prefix_len,
++                            len(req.full_untruncated_fill_ids),
++                            proposal.identity,
++                            result.name,
++                        )
++                    )
 +                    if any(v[1:4] != votes[0][1:4] for v in votes):
-+                        raise RuntimeError(f"TP prefix admitted plans differ: {votes!r}")
++                        raise RuntimeError(
++                            f"TP prefix admitted plans differ: {votes!r}"
++                        )
 +                    if all(v[0] for v in votes):
 +                        if not hasattr(adder, "_prefix_pending_admissions"):
 +                            adder._prefix_pending_admissions = []
-+                        adder._prefix_pending_admissions.append((receipt, proposal, lawful_l))
++                        adder._prefix_pending_admissions.append(
++                            (receipt, proposal, lawful_l)
++                        )
 +                        committed = True
 +                        # The verdict controls the next request, not membership.
-+                        return result if len({v[4] for v in votes}) == 1 else AddReqResult.OTHER
++                        return (
++                            result
++                            if len({v[4] for v in votes}) == 1
++                            else AddReqResult.OTHER
++                        )
 +                    reason = "native_admission_declined"
 +            except Exception as exc:
 +                reason = str(exc)
@@ -524,7 +663,9 @@ index 0000000000..d5bd8de549
 +                    # A rank-local cleanup error cannot let its siblings retry.
 +                    all_cleanup_errors = self.gather(cleanup_errors)
 +                    if any(all_cleanup_errors):
-+                        raise AdmissionRollbackError(f"TP prefix rollback failed: {all_cleanup_errors!r}")
++                        raise AdmissionRollbackError(
++                            f"TP prefix rollback failed: {all_cleanup_errors!r}"
++                        )
 +            if budget_declined and attempt == 0:
 +                self.poll()
 +                continue
@@ -580,7 +721,9 @@ index 0000000000..d5bd8de549
 +
 +    def rollback_pending(self, adder, reason):
 +        errors = []
-+        for receipt, proposal, _ in reversed(getattr(adder, "_prefix_pending_admissions", [])):
++        for receipt, proposal, _ in reversed(
++            getattr(adder, "_prefix_pending_admissions", [])
++        ):
 +            try:
 +                receipt.rollback()
 +            except Exception as exc:
@@ -597,24 +740,35 @@ index 0000000000..d5bd8de549
 +        adder._prefix_pending_admissions = []
 +
 +
-+def record_batch_token_allocation(batch, storage, token_ids):
-+    """Receipt for newly allocated pages, excluding a borrowed prefix tail."""
-+    receipts = [getattr(req, "_prefix_native_admission_receipt", None) for req in batch.reqs]
++def batch_admission_receipt(reqs):
++    receipts = [getattr(req, "_prefix_native_admission_receipt", None) for req in reqs]
 +    if not any(receipts):
 +        return None
 +    if not all(receipts):
-+        raise RuntimeError("transactional and ordinary prefills cannot share allocations")
++        raise RuntimeError(
++            "transactional and ordinary prefills cannot share allocations"
++        )
++    return receipts[0]
++
++
++def record_batch_token_allocation(batch, storage, token_ids):
++    """Receipt for newly allocated pages, excluding a borrowed prefix tail."""
++    receipt = batch_admission_receipt(batch.reqs)
++    if receipt is None:
++        return None
 +    page_size = batch.token_to_kv_pool_allocator.page_size
 +    segments, offset = [], 0
 +    for prefix_len, extend_len in zip(batch.prefix_lens, batch.extend_lens):
 +        borrowed = min(extend_len, (-prefix_len) % page_size)
 +        if borrowed < extend_len:
-+            segments.append(token_ids[offset + borrowed:offset + extend_len])
++            segments.append(token_ids[offset + borrowed : offset + extend_len])
 +        offset += extend_len
++
 +    def release():
 +        for segment in segments:
 +            storage.free_tokens(segment)
-+    return receipts[0].record("batch token KV pages", release)
++
++    return receipt.record("batch token KV pages", release)
 +
 +
 +def record_request_rows(table, rows, receipt):
@@ -627,9 +781,11 @@ index 0000000000..d5bd8de549
 +    for row in rows:
 +        if row in registry:
 +            raise RuntimeError("request row already has an admission owner")
++
 +        def release(row=row):
 +            registry.pop(row, None)
 +            table._free_rows_without_admission([row])
++
 +        registry[row] = receipt.record(
 +            "request row", release, on_commit=lambda row=row: registry.pop(row, None)
 +        )
@@ -645,72 +801,108 @@ index 0000000000..d5bd8de549
 +        else:
 +            release.run()
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index c474f89526..e4d280fe0a 100644
+index 1ce1cbd27a..39255107fb 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -1849,6 +1849,8 @@ class Req(ReqDllmMixin):
-         self,
-         tree_cache: Optional[BasePrefixCache] = None,
+@@ -1141,6 +1141,7 @@ class Req(ReqDllmMixin):
          cow_mamba: Optional[bool] = None,
-+        *,
+         *,
+         defer_cow_slot: bool = False,
 +        max_prefix_len: Optional[int] = None,
      ):
          if self.is_dllm():
              self._init_fill_ids_for_dllm()
-@@ -1877,6 +1879,10 @@ class Req(ReqDllmMixin):
+@@ -1169,6 +1170,8 @@ class Req(ReqDllmMixin):
          # avoiding an O(context) copy per prefill-batch build.
          token_ids_to_match = self.full_untruncated_fill_ids
          key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 +        if max_prefix_len is not None:
-+            if type(max_prefix_len) is not int or max_prefix_len < 0:
-+                raise ValueError("max_prefix_len must be a nonnegative raw-token count")
-+            key_limit = min(key_limit, max_prefix_len)
- 
++            key_limit = min(max(key_limit, 0), max_prefix_len)
+
          # Disable prefix caching when embed overrides are present: same token IDs
          # with different override vectors must not share cached KV values.
-@@ -2204,6 +2210,9 @@ class Req(ReqDllmMixin):
-             return
- 
-     def reset_for_retract(self):
-+        from sglang.srt.managers.prefix_admission import notify_prefix_lifecycle
-+
-+        notify_prefix_lifecycle(self, "retract")
-         # Increment retraction count before resetting other state. We should not reset this
-         # since we are tracking the total number of retractions for each request.
-         self.retraction_count += 1
 diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
-index 0ad51683d0..f2575c3215 100644
+index e1fd1892a4..ac78bb019a 100644
 --- a/python/sglang/srt/managers/schedule_policy.py
 +++ b/python/sglang/srt/managers/schedule_policy.py
-@@ -208,6 +208,7 @@ class SchedulePolicy:
+@@ -240,13 +240,17 @@ class SchedulePolicy:
          running_batch: Optional[ScheduleBatch] = None,
          processed_tokens: int = 0,
-         bootstrap_queue: List[Req] = [],
+         bootstrap_queue: Iterable[Req] = (),
 +        prefix_match_max_len: Optional[int] = None,
-     ) -> None:
-         policy = self._determine_active_policy(waiting_queue)
- 
-@@ -219,7 +220,7 @@ class SchedulePolicy:
+     ) -> List[Req]:
+         """The waiting requests in the order the policy admits them."""
+         waiting_queue = list(waiting)
+-        if self._bounded_active or (
+-            len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+-            and self._bounded_lpm_enabled
+-            and self.policy == CacheAwarePolicy.LPM
++        if prefix_match_max_len is None and (
++            self._bounded_active
++            or (
++                len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
++                and self._bounded_lpm_enabled
++                and self.policy == CacheAwarePolicy.LPM
++            )
+         ):
+             was_active = self._bounded_active
+             if was_active:
+@@ -288,14 +292,19 @@ class SchedulePolicy:
+                 and get_disagg().disaggregation_mode != "decode"
+             ):
+                 for r in tail:
+-                    r.init_next_round_input(self.tree_cache)
+-            self._touch_waiting_prefixes(
+-                CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
+-            )
++                    r.init_next_round_input(
++                        self.tree_cache,
++                        cow_mamba=False if prefix_match_max_len is not None else None,
++                        max_prefix_len=prefix_match_max_len,
++                    )
++            if prefix_match_max_len is None:
++                self._touch_waiting_prefixes(
++                    CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
++                )
+             if not self._bounded_members:
+                 return waiting_queue
+             deprioritized = self._compute_prefix_matches(
+-                self._bounded_members, CacheAwarePolicy.LPM
++                self._bounded_members, CacheAwarePolicy.LPM, prefix_match_max_len
+             )
+             self._sort_by_longest_prefix(self._bounded_members, deprioritized)
+             next_ids = {id(r) for r in self._bounded_next_members}
+@@ -315,7 +324,7 @@ class SchedulePolicy:
              and get_disagg().disaggregation_mode != "decode"
          ):
              for r in waiting_queue:
 -                match_kv_cache(r, self.tree_cache)
 +                match_kv_cache(r, self.tree_cache, max_prefix_len=prefix_match_max_len)
- 
+
          if self.policy == CacheAgnosticPolicy.FCFS:
              if self.enable_priority_scheduling:
-@@ -228,7 +229,7 @@ class SchedulePolicy:
+@@ -324,7 +333,7 @@ class SchedulePolicy:
                  )
          elif isinstance(policy, CacheAwarePolicy):
              temporary_deprioritized = self._compute_prefix_matches(
 -                waiting_queue, policy
-+                waiting_queue, policy, prefix_match_max_len=prefix_match_max_len
++                waiting_queue, policy, prefix_match_max_len
              )
              if policy == CacheAwarePolicy.LPM:
                  SchedulePolicy._sort_by_longest_prefix(
-@@ -346,7 +347,8 @@ class SchedulePolicy:
+@@ -368,7 +377,8 @@ class SchedulePolicy:
+             else:
+                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+
+-        self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
++        if prefix_match_max_len is None:
++            self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
+         return waiting_queue
+
+     def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
+@@ -538,7 +548,8 @@ class SchedulePolicy:
                  raise ValueError(f"Unknown schedule_policy: {policy=}")
- 
+
      def _compute_prefix_matches(
 -        self, waiting_queue: List[Req], policy: CacheAwarePolicy
 +        self, waiting_queue: List[Req], policy: CacheAwarePolicy,
@@ -718,18 +910,16 @@ index 0ad51683d0..f2575c3215 100644
      ) -> Set[int]:
          temporary_deprioritized: Set[int] = set()
          self.waiting_queue_radix_tree.reset()
-@@ -355,7 +357,9 @@ class SchedulePolicy:
+@@ -548,7 +559,7 @@ class SchedulePolicy:
+         candidates = []
+         for r in waiting_queue:
              prefix_ids = r.origin_input_ids + r.output_ids
-             extra_key = r.extra_key
-             cache_salt = r.cache_salt
--            match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
-+            match_result = match_kv_cache(
-+                r, self.tree_cache, prefix_ids, max_prefix_len=prefix_match_max_len
-+            )
- 
-             # NOTE(sang): This logic is for in-batch prefix caching;
-             # If there are more than 1 request that have small matching prefix from
-@@ -1678,7 +1682,11 @@ class PrefillAdder:
+-            match_kv_cache(r, self.tree_cache, prefix_ids)
++            match_kv_cache(r, self.tree_cache, prefix_ids, max_prefix_len=prefix_match_max_len)
+             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
+                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
+@@ -2222,7 +2233,11 @@ class PrefillAdder:
      ) -> None:
          assert req.prefix_len == admission.prefix_len
          req.extend_end = admission.prefix_len + admission.extend_len
@@ -743,31 +933,21 @@ index 0ad51683d0..f2575c3215 100644
          if admission.is_chunked:
              self.new_chunked_req = req
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 770ca11586..6eebb91087 100644
+index f3de591871..7d4ced2509 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -57,6 +57,12 @@ import torch
- import torch.distributed
- from torch.distributed import barrier
- 
-+from sglang.srt.managers.prefix_admission import (
-+    PrefixAdmissionCoordinator,
-+    PrefixAdmissionRejected,
-+    notify_prefix_lifecycle,
-+)
-+
- if TYPE_CHECKING:
-     from torch.cuda import Stream as CudaStream
- 
-@@ -137,6 +143,7 @@ from sglang.srt.managers.io_struct import (
+@@ -153,7 +153,10 @@ from sglang.srt.managers.io_struct import (
+     AttachHiCacheStorageReqOutput,
      BatchTokenizedEmbeddingReqInput,
      BatchTokenizedGenerateReqInput,
++    PluginControlReqInput,
++    PluginControlReqOutput,
      BeginWeightUpdateReqInput,
 +    BeginWeightUpdateReqOutput,
      CheckWeightsReqInput,
      ClearHiCacheReqInput,
      ClearHiCacheReqOutput,
-@@ -149,6 +156,7 @@ from sglang.srt.managers.io_struct import (
+@@ -167,6 +170,7 @@ from sglang.srt.managers.io_struct import (
      DumperControlReqInput,
      DumperControlReqOutput,
      EndWeightUpdateReqInput,
@@ -775,16 +955,15 @@ index 770ca11586..6eebb91087 100644
      ExpertDistributionReq,
      ExpertDistributionReqOutput,
      ExpertDistributionReqType,
-@@ -158,6 +166,8 @@ from sglang.srt.managers.io_struct import (
-     GetHiCacheL3LayoutReq,
-     GetHiCacheL3LayoutReqOutput,
-     GetInternalStateReq,
-+    PluginControlReqInput,
-+    PluginControlReqOutput,
-     GetWeightsByNameReqInput,
-     HealthCheckOutput,
-     InitWeightsSendGroupForRemoteInstanceReqInput,
-@@ -194,9 +204,13 @@ from sglang.srt.managers.io_struct import (
+@@ -192,6 +196,7 @@ from sglang.srt.managers.io_struct import (
+     PauseGenerationReqInput,
+     PdRoleSwitchReqInput,
+     PluginWeightUpdateReqInput,
++    PluginWeightUpdateReqOutput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
+@@ -214,9 +219,13 @@ from sglang.srt.managers.io_struct import (
      UnloadLoRAAdapterReqInput,
      UnloadLoRAAdapterReqOutput,
      UpdateWeightFromDiskReqInput,
@@ -798,30 +977,32 @@ index 770ca11586..6eebb91087 100644
      UpdateWeightVersionReqInput,
      UpdateWeightVersionReqOutput,
      sock_send,
-@@ -495,6 +509,7 @@ class Scheduler(
-     uocr_doc_hooks: Optional[UocrDocHooks] = None
-     async_shm_materializer: Optional[AsyncShmMaterializer] = None
-     deferred_overlap_release: Optional[DeferredOverlapRelease] = None
-+    prefix_admission_observer = None
- 
-     def __init__(
-         self,
-@@ -506,6 +521,7 @@ class Scheduler(
+@@ -239,6 +248,12 @@ from sglang.srt.managers.prefill_delayer import (
+     PrefillDelayerSinglePassExecutor,
+     RecentPrefillBatchSizeTracker,
+ )
++from sglang.srt.managers.prefix_admission import (
++    PrefixAdmissionCoordinator,
++    PrefixAdmissionRejected,
++    notify_prefix_lifecycle,
++)
++
+ from sglang.srt.managers.req_types import (
+     FINISH_ABORT,
+     MultimodalInputs,
+@@ -541,6 +556,8 @@ class Scheduler(
          # with minimal glue. Move substantial component-specific logic into
          # dedicated methods instead of adding inline blocks here.
          self.init_startup_timing_begin()
-+        self.init_prefix_admission()
++        self.prefix_admission_observer = None
++        self.prefix_admission_coordinator = PrefixAdmissionCoordinator(self, parallel=get_parallel())
          self.is_initializing = True
          # init_soft_watchdog starts a daemon thread that reads these on its first tick.
          self.forward_ct: int = 0
-@@ -791,6 +807,17 @@ class Scheduler(
+@@ -815,6 +832,13 @@ class Scheduler(
          self.is_initializing = False
          self.init_startup_timing_summary()
- 
-+    def init_prefix_admission(self) -> None:
-+        self.prefix_admission_observer = None
-+        self.prefix_admission_coordinator = PrefixAdmissionCoordinator(self, parallel=get_parallel())
-+
+
 +    def prefix_admission_broadcast(self, value):
 +        """Owner-thread TP helper for plugin epochs and server-issued tokens."""
 +        return self.prefix_admission_coordinator.broadcast(value)
@@ -831,8 +1012,8 @@ index 770ca11586..6eebb91087 100644
 +
      def init_startup_timing_begin(self) -> None:
          self.scheduler_startup_begin = time.perf_counter()
- 
-@@ -1978,6 +2005,7 @@ class Scheduler(
+
+@@ -2070,6 +2094,7 @@ class Scheduler(
                  (ConfigureLoggingReq, self.configure_logging),
                  (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                  (DumperControlReqInput, self.handle_dumper_control),
@@ -840,113 +1021,156 @@ index 770ca11586..6eebb91087 100644
                  (AddExternalCorpusReqInput, self.add_external_corpus),
                  (
                      RemoveExternalCorpusReqInput,
-@@ -2288,6 +2316,7 @@ class Scheduler(
+@@ -2360,6 +2385,7 @@ class Scheduler(
              # Count successful receive/broadcast time as active; empty polls stay idle.
              self.metrics_reporter.record_scheduler_active(recv_start_ns)
          self.process_input_requests(recv_reqs)
 +        self.prefix_admission_coordinator.poll()
-         return recv_reqs
- 
+         return received_reqs
+
      @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
-@@ -2320,7 +2349,9 @@ class Scheduler(
+@@ -2392,7 +2418,9 @@ class Scheduler(
                  self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
                  continue
- 
+
 -            output = self._request_dispatcher(recv_req)
 +            output = self._guard_prefix_weight_update(recv_req)
 +            if output is None:
 +                output = self._request_dispatcher(recv_req)
+             if output is None:
+                 output = self._rust_control_ack(recv_req)
              if output is not None:
-                 if self.rust_server is None and isinstance(output, RpcReqOutput):
-                     if self.ipc_channels.recv_from_rpc is not None:
-@@ -3780,6 +3811,7 @@ class Scheduler(
- 
-     def _release_aborted_request(self, req: Req) -> None:
-         """Drop the cache-side state an aborted request left behind."""
-+        notify_prefix_lifecycle(req, "cancel")
-         req.release_mm_inputs_on_abort()
-         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-         if req.session is not None and req.session.streaming:
-@@ -4369,6 +4401,14 @@ class Scheduler(
+@@ -3955,6 +3983,11 @@ class Scheduler(
+             return False
+         return True
+
++    def _reject_prefix_admission(self, req: Req, exc: PrefixAdmissionRejected) -> None:
++        logger.warning("Prefix admission rejected rid=%s: %s", req.rid, exc, exc_info=True)
++        reason = FINISH_ABORT(str(exc), HTTPStatus.BAD_REQUEST)
++        self.request_retirer.abort(req, reason=reason, finished_reason=reason.to_json())
++
+     def _abort_unavailable(self, req: Req, *, message: str) -> None:
+         self.request_retirer.abort(
+             req,
+@@ -4574,6 +4607,13 @@ class Scheduler(
              # request clears the flag elsewhere, so admission would stay shut.
              running_batch.batch_is_full = False
- 
-+        if self.prefix_admission_observer is not None:
-+            queues = self.prefix_admission_gather(tuple(req.rid for req in self.waiting_queue))
-+            if any(queue != queues[0] for queue in queues[1:]):
-+                raise RuntimeError("TP prefix waiting request membership differs")
-+            running_batch.batch_is_full = any(
-+                self.prefix_admission_gather(running_batch.batch_is_full)
-+            )
+
++        coordinator = (
++            self.prefix_admission_coordinator if self.prefix_admission_observer is not None else None
++        )
++        if coordinator is not None:
++            coordinator.check_order(self.waiting_queue)
++            running_batch.batch_is_full = any(coordinator.gather(running_batch.batch_is_full))
 +
          if (
              running_batch.batch_is_full or len(self.waiting_queue) == 0
          ) and self.chunked_req is None:
-@@ -4402,25 +4442,38 @@ class Scheduler(
+@@ -4581,7 +4621,7 @@ class Scheduler(
+
+         running_bs = len(running_batch.reqs)
+         # Skipped during a chunked prefill: that pass must proceed regardless.
+-        if (
++        delay_prefill = (
+             self.min_free_slots_delayer is not None
+             and self.chunked_req is None
+             and self.min_free_slots_delayer.should_delay(
+@@ -4590,7 +4630,10 @@ class Scheduler(
+                     running_bs, running_batch=running_batch
+                 ),
+             )
+-        ):
++        )
++        if coordinator is not None:
++            delay_prefill = any(coordinator.gather(delay_prefill))
++        if delay_prefill:
+             return None, running_batch
+
+         num_allocatable_reqs = self.get_num_allocatable_reqs(
+@@ -4604,11 +4647,14 @@ class Scheduler(
+                     running_bs, running_batch=running_batch
+                 )
+
++        no_rows = num_allocatable_reqs <= 0
++        if coordinator is not None:
++            no_rows = any(coordinator.gather(no_rows))
          # A chunked request skips this check: it keeps its req_to_token row across
          # chunks, and under PP it (or a dllm request) may finish in another
          # microbatch, so holding it back here would leak its memory.
-+        no_rows = self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
-+        if self.prefix_admission_observer is not None:
-+            no_rows = any(self.prefix_admission_gather(no_rows))
          if (
--            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
+-            num_allocatable_reqs <= 0
 +            no_rows
              and self.chunked_req is None
              and not self.enable_priority_preemption
          ):
-             running_batch.batch_is_full = True
-             return None, running_batch
- 
--        # Get priority queue
--        self.policy.calc_priority(
--            self.waiting_queue,
--            running_batch,
--            processed_tokens=self.processed_tokens_counter,
--            bootstrap_queue=(
--                self.disagg_prefill_bootstrap_queue.queue
--                if self.disagg_prefill_bootstrap_queue is not None
--                else []
--            ),
+@@ -4619,18 +4665,26 @@ class Scheduler(
+         self._ack_waiting_health_checks()
+         # Get priority queue
+         self.policy.poll_storage_prefetches(self.waiting_queue)
+-        self.waiting_queue.reorder(
+-            self.policy.calc_priority(
+-                self.waiting_queue,
+-                running_batch,
+-                processed_tokens=self.processed_tokens_counter,
+-                bootstrap_queue=(
+-                    self.disagg_prefill_bootstrap_queue.queue
+-                    if self.disagg_prefill_bootstrap_queue is not None
+-                    else []
+-                ),
++        def prioritize():
++            self.waiting_queue.reorder(
++                self.policy.calc_priority(
++                    self.waiting_queue,
++                    running_batch,
++                    processed_tokens=self.processed_tokens_counter,
++                    bootstrap_queue=(
++                        self.disagg_prefill_bootstrap_queue.queue
++                        if self.disagg_prefill_bootstrap_queue is not None
++                        else []
++                    ),
++                    prefix_match_max_len=0 if coordinator is not None else None,
++                )
+             )
 -        )
-+        # Policy probes cannot exceed an unleased HS prefix.
-+        def rank_priority():
-+            self.policy.calc_priority(
-+                self.waiting_queue,
-+                running_batch,
-+                processed_tokens=self.processed_tokens_counter,
-+                bootstrap_queue=(
-+                    self.disagg_prefill_bootstrap_queue.queue
-+                    if self.disagg_prefill_bootstrap_queue is not None
-+                    else []
-+                ),
-+                prefix_match_max_len=0 if self.prefix_admission_observer is not None else None,
-+            )
-+        if self.prefix_admission_observer is not None:
-+            _, errors = self.prefix_admission_coordinator.phase(rank_priority)
-+            self.prefix_admission_coordinator.check(errors, "policy probe")
-+            queues = self.prefix_admission_gather(tuple(req.rid for req in self.waiting_queue))
-+            if any(queue != queues[0] for queue in queues[1:]):
-+                raise RuntimeError("TP prefix waiting request order differs")
++        if coordinator is not None:
++            _, errors = coordinator.phase(prioritize)
++            coordinator.check(errors, "policy probe")
++            coordinator.check_order(self.waiting_queue)
 +        else:
-+            rank_priority()
- 
++            prioritize()
+
          if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
              # If we are testing retraction and the running batch size exceeds
-@@ -4499,129 +4552,166 @@ class Scheduler(
-                 )
- 
+@@ -4717,160 +4771,199 @@ class Scheduler(
+
          mamba_allocator = self.token_to_kv_pool_allocator.state_slots
--        if mamba_allocator is not None:
+         if mamba_allocator is not None:
 -            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
 -        buffer_pipeline = self.tree_cache.buffer_pipeline
+-        # A parked chunk found no budget in this pass: admit no one ahead of it,
+-        # so no batch carries a chunked request it does not run.
+-        chunk_parked = (
+-            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+-        )
+-        # Requests no memory will ever come back for; aborted after the loop.
+-        unschedulable: List[Req] = []
 -        # Get requests from the waiting queue to a new prefill batch
--        for req in self.waiting_queue:
+-        bounded_active = self.policy._bounded_active
+-        candidates = (
+-            self.policy.admission_candidates(self.waiting_queue)
+-            if bounded_active
+-            else self.waiting_queue
+-        )
+-        for req in candidates:
+-            if bounded_active and not self.policy.allows_admission(req):
+-                break
 -            # A spent pass budget admits no one, even before the first
 -            # candidate: the resumed chunk or mixed decode rows can spend it.
--            if adder.budget_state() == AddReqResult.OTHER:
+-            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
 -                break
 -            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
 -                continue
 -
 -            # A forward batch runs one pooling mode, so setwise readout requests
@@ -956,6 +1180,8 @@ index 770ca11586..6eebb91087 100644
 -                (req.token_indices_to_pool is not None)
 -                != (adder.can_run_list[0].token_indices_to_pool is not None)
 -            ):
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
 -                continue
 -
 -            running_bs = len(running_batch.reqs)
@@ -968,6 +1194,7 @@ index 770ca11586..6eebb91087 100644
 -                candidate_beam_width,
 -                running_batch=running_batch,
 -                num_held_rows=num_held_rows,
+-                admitted_reqs=adder.can_run_list,
 -            ):
 -                running_batch.batch_is_full = True
 -
@@ -975,42 +1202,57 @@ index 770ca11586..6eebb91087 100644
 -                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
 -                    req
 -                ):
-+        try:
-+            if mamba_allocator is not None:
-+                if self.prefix_admission_observer is not None:
-+                    _, errors = self.prefix_admission_coordinator.phase(
-+                        lambda: mamba_allocator.alloc_group_begin(len(self.waiting_queue))
-+                    )
-+                    self.prefix_admission_coordinator.check(errors, "allocation group begin")
-+                else:
-+                    mamba_allocator.alloc_group_begin(len(self.waiting_queue))
-+            buffer_pipeline = self.tree_cache.buffer_pipeline
-+            # Get requests from the waiting queue to a new prefill batch
-+            for req in tuple(self.waiting_queue):
-+                # A spent pass budget admits no one, even before the first
-+                # candidate: the resumed chunk or mixed decode rows can spend it.
-+                exhausted = adder.budget_state() == AddReqResult.OTHER
-+                if self.prefix_admission_observer is not None:
-+                    exhausted = any(self.prefix_admission_gather(exhausted))
-+                if exhausted:
-                     break
-+                if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
-+                    continue
- 
--            if self.enable_hicache_storage or self.enable_lmcache:
+-                    break
+-
+-            if (
+-                self.enable_hicache_storage
+-                or self.enable_lmcache
+-                or self.enable_unified_cache_external_linker
+-            ):
 -                prefetch_done = self.tree_cache.check_prefetch_progress(
 -                    req.cache_request_handle
--                )
++            if coordinator is None:
++                mamba_allocator.alloc_group_begin(len(self.waiting_queue))
++            else:
++                _, errors = coordinator.phase(
++                    lambda: mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+                 )
 -                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
 -                if not prefetch_done:
 -                    # skip staging requests that are ongoing prefetch
-+                # A forward batch runs one pooling mode, so setwise readout requests
-+                # (token_indices_to_pool) cannot share a batch with last-token ones.
-+                # Admit only the first request's mode; the other stays queued.
-+                if adder.can_run_list and (
-+                    (req.token_indices_to_pool is not None)
-+                    != (adder.can_run_list[0].token_indices_to_pool is not None)
-+                ):
++                coordinator.check(errors, "state allocation group begin")
++        try:
++            buffer_pipeline = self.tree_cache.buffer_pipeline
++            # A parked chunk found no budget in this pass: admit no one ahead of it,
++            # so no batch carries a chunked request it does not run.
++            chunk_parked = (
++                self.chunked_req is not None and self.chunked_req not in adder.can_run_list
++            )
++            # Requests no memory will ever come back for; aborted after the loop.
++            unschedulable: List[Req] = []
++            # Get requests from the waiting queue to a new prefill batch
++            bounded_active = self.policy._bounded_active
++            candidates = (
++                self.policy.admission_candidates(self.waiting_queue)
++                if bounded_active
++                else self.waiting_queue
++            )
++            if coordinator is not None:
++                candidates = tuple(candidates)
++                coordinator.check_order(candidates)
++            for req in candidates:
++                if bounded_active and not self.policy.allows_admission(req):
++                    break
++                # A spent pass budget admits no one, even before the first
++                # candidate: the resumed chunk or mixed decode rows can spend it.
++                exhausted = chunk_parked or adder.budget_state() == AddReqResult.OTHER
++                if coordinator is not None:
++                    exhausted = any(coordinator.gather(exhausted))
++                if exhausted:
++                    break
++                if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                     if bounded_active:
+                         self.policy.mark_admission_skipped(req)
                      continue
 -                # Pop the L3-loaded span. Unified cache exposes its absolute
 -                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -1024,69 +1266,86 @@ index 770ca11586..6eebb91087 100644
 -                    # marks the staged span below once it is surfaced.
 -                    req.host_hit_is_storage = False
 -
--            req.init_next_round_input(self.tree_cache)
--            if (
--                self.uocr_doc_hooks is not None
--                and self.uocr_doc_hooks.defer_new_document(
--                    req=req,
--                    adder=adder,
--                    nothing_running=running_batch.is_empty() and not adder.can_run_list,
-+
-+                running_bs = len(running_batch.reqs)
-+                candidate_beam_width = (
-+                    req.beam_group.beam_width if req.beam_group is not None else None
-                 )
--            ):
+-            # On a shared memory the match takes no state slot: admission prices
+-            # it, and the slot is bound with the row. A request this pass leaves
+-            # queued drops the copy its match staged.
+-            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
+-            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+-            if adder.should_defer(req):
+-                if defer_cow_slot:
+-                    self._drop_unadmitted_match(req)
 -                break
 -            if self.enable_hicache_storage and (
 -                self._prefetch_after_device_hit_loss(req)
 -            ):
+-                if defer_cow_slot:
+-                    self._drop_unadmitted_match(req)
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
 -                continue
 -            if self.enable_hicache_storage and buffer_pipeline is not None:
 -                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
 -                req.time_stats.observe_storage_staging_ready(staging_ready)
 -                if not staging_ready:
--                    continue
+-                    if defer_cow_slot:
+-                        self._drop_unadmitted_match(req)
++
++                # A forward batch runs one pooling mode, so setwise readout requests
++                # (token_indices_to_pool) cannot share a batch with last-token ones.
++                # Admit only the first request's mode; the other stays queued.
++                if adder.can_run_list and (
++                    (req.token_indices_to_pool is not None)
++                    != (adder.can_run_list[0].token_indices_to_pool is not None)
++                ):
+                     if bounded_active:
+                         self.policy.mark_admission_skipped(req)
+                     continue
 -            res = adder.add_one_req(
 -                req,
 -                has_chunked_req=(self.chunked_req is not None),
 -                truncation_align_size=self.truncation_align_size,
 -            )
+
+-            if self.enable_lora:
+-                running_loras.add(req.lora_id)
++                running_bs = len(running_batch.reqs)
++                candidate_beam_width = (
++                    req.beam_group.beam_width if req.beam_group is not None else None
++                )
 +                num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
 +                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
 +                    running_bs,
 +                    candidate_beam_width,
 +                    running_batch=running_batch,
 +                    num_held_rows=num_held_rows,
++                    admitted_reqs=adder.can_run_list,
 +                ):
 +                    running_batch.batch_is_full = True
- 
--            if self.enable_lora:
--                running_loras.add(req.lora_id)
-+                if self.prefix_admission_observer is not None:
-+                    running_batch.batch_is_full = any(
-+                        self.prefix_admission_gather(running_batch.batch_is_full)
-+                    )
-+                if running_batch.batch_is_full:
-+                    if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-+                        req
-+                    ):
-+                        break
- 
+
 -            if res != AddReqResult.CONTINUE:
 -                if res == AddReqResult.NO_TOKEN:
--                    # Set batch_is_full after making sure there are requests that can be served
--                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
--                        not running_batch.is_empty()
-+                if self.enable_hicache_storage or self.enable_lmcache:
+-                    running_batch.batch_is_full = adder.batch_is_full_after_rejection(
++                if coordinator is not None:
++                    running_batch.batch_is_full = any(coordinator.gather(running_batch.batch_is_full))
++                if running_batch.batch_is_full:
++                    if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                         req
++                    ):
++                        break
++
++                if (
++                    self.enable_hicache_storage
++                    or self.enable_lmcache
++                    or self.enable_unified_cache_external_linker
++                ):
 +                    prefetch_done = self.tree_cache.check_prefetch_progress(
 +                        req.cache_request_handle
-                     )
--                    # Retained document windows are not tree-evictable; free
--                    # them here or a full pool of them stalls admission.
++                    )
 +                    req.time_stats.observe_storage_prefetch_ready(prefetch_done)
 +                    if not prefetch_done:
 +                        # skip staging requests that are ongoing prefetch
++                        if bounded_active:
++                            self.policy.mark_admission_skipped(req)
 +                        continue
 +                    # Pop the L3-loaded span. Unified cache exposes its absolute
 +                    # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -1100,119 +1359,171 @@ index 770ca11586..6eebb91087 100644
 +                        # marks the staged span below once it is surfaced.
 +                        req.host_hit_is_storage = False
 +
-+                prefix_result = None
-+                if self.prefix_admission_observer is not None:
++                res = None
++                if coordinator is not None:
 +                    try:
-+                        prefix_result = self.prefix_admission_coordinator.admit(
-+                            req, adder, self.chunked_req is not None, self.truncation_align_size
++                        res = coordinator.admit(
++                            req,
++                            adder,
++                            self.chunked_req is not None,
++                            self.truncation_align_size,
 +                        )
 +                    except PrefixAdmissionRejected as exc:
-+                        req.finish_outside_step(FINISH_ABORT(str(exc), status_code=400))
-+                        self._release_aborted_request(req)
-+                        self.waiting_queue.remove(req)
-+                        self.send_abort_output(_make_abort_req(req), req)
++                        self._reject_prefix_admission(req, exc)
 +                        continue
-+                if prefix_result is None:
-+                    req.init_next_round_input(self.tree_cache)
-                     if (
-                         self.uocr_doc_hooks is not None
--                        and self.uocr_doc_hooks.on_no_token(
-+                        and self.uocr_doc_hooks.defer_new_document(
-                             req=req,
-                             adder=adder,
--                            nothing_running=running_batch.is_empty(),
-+                            nothing_running=running_batch.is_empty() and not adder.can_run_list,
-                         )
-                     ):
--                        running_batch.batch_is_full = False
++                ordinary = res is None
++                if ordinary:
++                    # On a shared memory the match takes no state slot: admission prices
++                    # it, and the slot is bound with the row. A request this pass leaves
++                    # queued drops the copy its match staged.
++                    defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
++                    req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
++                    if adder.should_defer(req):
++                        if defer_cow_slot:
++                            self._drop_unadmitted_match(req)
++                        break
++                    if self.enable_hicache_storage and (
++                        self._prefetch_after_device_hit_loss(req)
++                    ):
++                        if defer_cow_slot:
++                            self._drop_unadmitted_match(req)
++                        if bounded_active:
++                            self.policy.mark_admission_skipped(req)
++                        continue
++                    if self.enable_hicache_storage and buffer_pipeline is not None:
++                        staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
++                        req.time_stats.observe_storage_staging_ready(staging_ready)
++                        if not staging_ready:
++                            if defer_cow_slot:
++                                self._drop_unadmitted_match(req)
++                            if bounded_active:
++                                self.policy.mark_admission_skipped(req)
++                            continue
++                    res = adder.add_one_req(
++                        req,
++                        has_chunked_req=(self.chunked_req is not None),
++                        truncation_align_size=self.truncation_align_size,
+                     )
 -                # revert matched mamba idx to avoid memory leak, if req is not added.
 -                # Only free if the slot was freshly allocated in this batch (not
 -                # pre-existing from a session). Session-held slots have their own
 -                # lifecycle and freeing them here causes double-free.
 -                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
 -                if not added:
--                    # init_next_round_input() may stage deferred Mamba COW/clear
--                    # metadata before add_one_req() rejects the request.
--                    req.kv.mamba_cow_src_index = None
--                    req.kv.mamba_needs_clear = False
--                    if req.kv.holds_mamba and not getattr(req, "session", None):
--                        kv_storage_of(
--                            self.req_to_token_pool, self.token_to_kv_pool_allocator
--                        ).release_state_slot(req)
+-                    self._drop_unadmitted_match(req)
+-                if res == AddReqResult.UNSCHEDULABLE and not added:
+-                    # Nothing holding memory will give it back: waiting would
+-                    # keep the request queued forever.
+-                    unschedulable.append(req)
+-                    continue
 -                break
-+                        break
-+                    if self.enable_hicache_storage and self._prefetch_after_device_hit_loss(req):
-+                        continue
-+                    if self.enable_hicache_storage and buffer_pipeline is not None:
-+                        staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
-+                        req.time_stats.observe_storage_staging_ready(staging_ready)
-+                        if not staging_ready:
-+                            continue
-+                    res = adder.add_one_req(
-+                        req,
-+                        has_chunked_req=(self.chunked_req is not None),
-+                        truncation_align_size=self.truncation_align_size,
-+                    )
-+                else:
-+                    res = prefix_result
- 
--        if mamba_allocator is not None:
--            mamba_allocator.alloc_group_end()
+
+-        for req in unschedulable:
+-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-                # As a queued abort: the sender goes before the KV it reads.
+-                self.release_prefill_sender(req, abort_sender=True)
+-            self._abort_unavailable(
+-                req,
+-                message=(
+-                    "The request cannot be scheduled: it fits the KV memory "
+-                    "pool only once memory held elsewhere is freed, and "
+-                    "nothing that holds memory will free it."
+-                ),
+-            )
 +                if self.enable_lora:
 +                    running_loras.add(req.lora_id)
-+
+
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_end()
 +                if res != AddReqResult.CONTINUE:
 +                    if res == AddReqResult.NO_TOKEN:
-+                        # Set batch_is_full after making sure there are requests that can be served
-+                        running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-+                            not running_batch.is_empty()
++                        running_batch.batch_is_full = adder.batch_is_full_after_rejection(
++                            req
 +                        )
-+                        # Retained document windows are not tree-evictable; free
-+                        # them here or a full pool of them stalls admission.
-+                        if (
-+                            self.uocr_doc_hooks is not None
-+                            and self.uocr_doc_hooks.on_no_token(
-+                                req=req,
-+                                adder=adder,
-+                                nothing_running=running_batch.is_empty(),
-+                            )
-+                        ):
-+                            running_batch.batch_is_full = False
 +                    # revert matched mamba idx to avoid memory leak, if req is not added.
 +                    # Only free if the slot was freshly allocated in this batch (not
 +                    # pre-existing from a session). Session-held slots have their own
 +                    # lifecycle and freeing them here causes double-free.
 +                    added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-+                    if not added and prefix_result is None:
-+                        # init_next_round_input() may stage deferred Mamba COW/clear
-+                        # metadata before add_one_req() rejects the request.
-+                        req.kv.mamba_cow_src_index = None
-+                        req.kv.mamba_needs_clear = False
-+                        if req.kv.holds_mamba and not getattr(req, "session", None):
-+                            kv_storage_of(
-+                                self.req_to_token_pool, self.token_to_kv_pool_allocator
-+                            ).release_state_slot(req)
++                    if not added and ordinary:
++                        self._drop_unadmitted_match(req)
++                    if res == AddReqResult.UNSCHEDULABLE and not added:
++                        # Nothing holding memory will give it back: waiting would
++                        # keep the request queued forever.
++                        unschedulable.append(req)
++                        continue
 +                    break
++
++            for req in unschedulable:
++                if self.disaggregation_mode == DisaggregationMode.PREFILL:
++                    # As a queued abort: the sender goes before the KV it reads.
++                    self.release_prefill_sender(req, abort_sender=True)
++                self._abort_unavailable(
++                    req,
++                    message=(
++                        "The request cannot be scheduled: it fits the KV memory "
++                        "pool only once memory held elsewhere is freed, and "
++                        "nothing that holds memory will free it."
++                    ),
++                )
 +        except Exception:
-+            if self.prefix_admission_observer is not None:
-+                self.prefix_admission_coordinator.rollback_pending(adder, "prefill pass failed")
++            if coordinator is not None and getattr(adder, "_prefix_pending_admissions", None):
++                coordinator.rollback_pending(adder, "prefill pass failed")
 +            raise
 +        finally:
 +            if mamba_allocator is not None:
-+                if self.prefix_admission_observer is not None:
-+                    _, errors = self.prefix_admission_coordinator.phase(mamba_allocator.alloc_group_end)
-+                    if any(error is not None for error in errors):
-+                        self.prefix_admission_coordinator.rollback_pending(adder, "allocation group cleanup failed")
-+                    self.prefix_admission_coordinator.check(errors, "allocation group end")
-+                else:
++                if coordinator is None:
 +                    mamba_allocator.alloc_group_end()
-         self.running_reqs.leave(adder.preempt_list)
- 
++                else:
++                    _, errors = coordinator.phase(mamba_allocator.alloc_group_end)
++                    if any(error is not None for error in errors):
++                        coordinator.rollback_pending(adder, "state allocation group cleanup failed")
++                    coordinator.check(errors, "state allocation group end")
+
          # Update waiting queue
-@@ -4653,30 +4743,33 @@ class Scheduler(
- 
+         can_run_list: List[Req] = adder.can_run_list
+@@ -4886,6 +4979,37 @@ class Scheduler(
+             return None, running_batch
+
+         can_run_set = set(can_run_list)
++        batch_chunked_req = adder.new_chunked_req or self.chunked_req
++
++        def create_batch():
++            # Create a new batch
++            new_batch = ScheduleBatch.init_new(
++                can_run_list,
++                self.req_to_token_pool,
++                self.token_to_kv_pool_allocator,
++                self.tree_cache,
++                self.model_config,
++                self.enable_overlap,
++                self.spec_algorithm,
++                chunked_req=batch_chunked_req,
++            )
++
++            # A parked chunked request runs no chunk in this batch.
++            new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
++                batch_chunked_req in can_run_set
++            )
++            new_batch.hisparse_coordinator = self.hisparse_coordinator
++
++            if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
++                # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
++                new_batch.hicache_consumer_index = (
++                    self.tree_cache.ready_to_load_host_cache()
++                )
++            return new_batch
++
++        transactional = coordinator is not None and getattr(adder, "_prefix_pending_admissions", None)
++        if transactional:
++            new_batch = coordinator.build_batch(adder, create_batch)
+         retries = self.tree_cache.storage_prefetch_retries
+         if self.enable_hicache_storage and retries is not None:
+             for req in can_run_list:
+@@ -4913,31 +5037,10 @@ class Scheduler(
+
          set_time_batch(can_run_list, "set_forward_entry_time")
- 
+
 -        # Create a new batch
 -        new_batch = ScheduleBatch.init_new(
 -            can_run_list,
@@ -1225,93 +1536,72 @@ index 770ca11586..6eebb91087 100644
 -            chunked_req=self.chunked_req,
 -        )
 -
--        new_batch.contains_last_prefill_chunk = (
--            self.chunked_req is None or len(can_run_list) != 1
+-        # A parked chunked request runs no chunk in this batch.
+-        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+-            self.chunked_req in can_run_set
 -        )
 -        new_batch.hisparse_coordinator = self.hisparse_coordinator
-+        def create_batch():
-+            # Create a new batch
-+            new_batch = ScheduleBatch.init_new(
-+                can_run_list,
-+                self.req_to_token_pool,
-+                self.token_to_kv_pool_allocator,
-+                self.tree_cache,
-+                self.model_config,
-+                self.enable_overlap,
-+                self.spec_algorithm,
-+                chunked_req=self.chunked_req,
-+            )
- 
+-
 -        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
 -            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
 -            new_batch.hicache_consumer_index = (
 -                self.tree_cache.ready_to_load_host_cache()
-+            new_batch.contains_last_prefill_chunk = (
-+                self.chunked_req is None or len(can_run_list) != 1
-             )
-+            new_batch.hisparse_coordinator = self.hisparse_coordinator
-+
-+            if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
-+                # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-+                new_batch.hicache_consumer_index = (
-+                    self.tree_cache.ready_to_load_host_cache()
-+                )
-+
-+            return new_batch
- 
+-            )
+
 -        new_batch.prepare_for_extend()
-+        new_batch = self.prefix_admission_coordinator.build_batch(adder, create_batch)
- 
++        if not transactional:
++            new_batch = create_batch()
++            new_batch.prepare_for_extend()
+
          if self.tp_worker.model_runner.prefill_aware_swa:
              for req in can_run_list:
-@@ -5483,6 +5576,13 @@ class Scheduler(
+@@ -5876,6 +5979,14 @@ class Scheduler(
+             self.batch_result_processor.process_batch_result_prebuilt(batch)
          elif batch.forward_mode.is_idle():
              self.batch_result_processor.process_batch_result_idle(batch, result)
-         # Running requests finish only in a step's processing.
-+        for req in batch.reqs:
-+            identity = getattr(req, "_prefix_admission_identity", None)
-+            if req.finished() and identity is not None and (
-+                getattr(req, "_prefix_finished_identity", None) != identity
-+            ):
-+                notify_prefix_lifecycle(req, "finish")
-+                req._prefix_finished_identity = identity
-         self.running_reqs.leave_finished()
- 
++        if self.prefix_admission_observer is not None:
++            for req in batch.reqs:
++                identity = getattr(req, "_prefix_admission_identity", None)
++                if req.finished() and identity is not None and (
++                    getattr(req, "_prefix_finished_identity", None) != identity
++                ):
++                    notify_prefix_lifecycle(req, "finish")
++                    req._prefix_finished_identity = identity
+         self._on_step_processed(batch, result)
+
          # Submit this batch's queued host backups before the next scheduler step.
-@@ -5710,7 +5810,10 @@ class Scheduler(
+@@ -6087,7 +6198,9 @@ class Scheduler(
              self.load_inquirer.get_loads, force=True, snapshot=snapshot
          )
- 
--        if self.has_pending_deferred_outputs():
-+        observer_pending = self.prefix_admission_observer is not None and getattr(
-+            self.prefix_admission_observer, "has_pending_work", lambda: True
-+        )()
-+        if self.has_pending_deferred_outputs() or observer_pending:
+
+-        if self.deferred_responses.has_pending():
++        observer = self.prefix_admission_observer
++        observer_pending = observer is not None and observer.has_pending_work()
++        if self.deferred_responses.has_pending() or observer_pending:
              # Held responses are released by polling, not by a socket event:
              # keep polling, and yield the GIL to the completion's worker.
              time.sleep(0)
-@@ -6085,6 +6188,17 @@ class Scheduler(
-         return inflight_batches
- 
+@@ -6549,6 +6662,16 @@ class Scheduler(
+                 self._pending_chunked_abort_req = chunked_req
+
      def abort_request(self, recv_req: AbortReq):
 +        if self.prefix_admission_observer is not None:
-+            active = {
-+                *self.collect_inflight_reqs(), *self.waiting_queue,
-+                *(req for req, _ in (self._deferred_responses or {}).values()),
-+                *([self.chunked_req] if self.chunked_req is not None else []),
-+            }
++            active = self.collect_inflight_reqs()
++            for request_list in self.request_lists().values():
++                active.update(request_list)
 +            for req in sorted(active, key=lambda item: item.rid):
-+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
++                if recv_req.matches(req.rid):
++                    # Queued requests may own a registration before admission.
 +                    self.prefix_admission_coordinator.lifecycle(
 +                        req, "cancel", getattr(req, "_prefix_admission_identity", None)
 +                    )
-         if self._deferred_responses:
-             self._abort_deferred_responses(recv_req)
-         if (chunked_req := self.chunked_req) is not None:
-@@ -6617,6 +6731,54 @@ class Scheduler(
-             logging.getLogger().setLevel(recv_req.log_level.upper())
-         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
- 
+         # Abort requests still waiting for encoder embeddings (EPD language-only)
+         if self.mm_receiver is not None:
+             self.mm_receiver.abort_waiting_requests(recv_req)
+@@ -6977,6 +7100,56 @@ class Scheduler(
+         if self.rust_server is None:
+             self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+
 +    def _guard_prefix_weight_update(self, recv_req):
 +        observer = self.prefix_admission_observer
 +        if observer is None:
@@ -1323,6 +1613,7 @@ index 770ca11586..6eebb91087 100644
 +            UpdateWeightsFromIPCReqInput: UpdateWeightsFromIPCReqOutput,
 +            BeginWeightUpdateReqInput: BeginWeightUpdateReqOutput,
 +            EndWeightUpdateReqInput: EndWeightUpdateReqOutput,
++            PluginWeightUpdateReqInput: PluginWeightUpdateReqOutput,
 +            RpcReqInput: RpcReqOutput,
 +        }
 +        response_type = response_types.get(type(recv_req))
@@ -1351,31 +1642,62 @@ index 770ca11586..6eebb91087 100644
 +        response, errors = self.prefix_admission_coordinator.phase(dispatch)
 +        if any(error is not None for error in errors):
 +            result = PluginControlReqOutput(
-+                success=False, response={}, error=repr(errors)
++                control_id=recv_req.control_id, success=False, response={}, error=repr(errors)
 +            )
 +        else:
 +            result = PluginControlReqOutput(
++                control_id=recv_req.control_id,
 +                success=True,
 +                response=self.prefix_admission_coordinator.broadcast(response),
 +            )
-+        self.ipc_channels.send_to_tokenizer.send_output(result, recv_req)
++        return result
 +
      def handle_dumper_control(self, recv_req: DumperControlReqInput):
          from sglang.srt.debug_utils.dumper import dumper
- 
-@@ -6820,6 +6982,7 @@ def run_scheduler_process(
+
+@@ -7183,20 +7356,23 @@ def run_scheduler_process(
                  pass
      finally:
          if scheduler is not None:
-+            scheduler.prefix_admission_coordinator.lifecycle(None, "shutdown", None)
-             # FPM has a background ZMQ publisher thread that needs explicit
-             # teardown to flush queued metrics and close the socket cleanly.
-             scheduler.metrics_reporter._shutdown_fpm()
+-            # FPM has a background ZMQ publisher thread that needs explicit
+-            # teardown to flush queued metrics and close the socket cleanly.
+-            scheduler.metrics_reporter._shutdown_fpm()
+-            # Stop the async D2H copy worker thread if any.
+-            if scheduler.async_d2h_worker is not None:
+-                scheduler.async_d2h_worker.shutdown()
+-                scheduler.async_d2h_worker = None
+-            # Graceful path only: on the exception path the GPU may be wedged
+-            # and the synchronize() in destroy() could itself hang.
+-            if scheduler.gracefully_exit:
+-                scheduler.release_host_resources()
+-                close_custom_all_reduce()
+-                # Last: anything above may still need a working communicator.
+-                abort_distributed_environment()
++            try:
++                scheduler.prefix_admission_coordinator.lifecycle(None, "shutdown", None)
++            finally:
++                # FPM has a background ZMQ publisher thread that needs explicit
++                # teardown to flush queued metrics and close the socket cleanly.
++                scheduler.metrics_reporter._shutdown_fpm()
++                # Stop the async D2H copy worker thread if any.
++                if scheduler.async_d2h_worker is not None:
++                    scheduler.async_d2h_worker.shutdown()
++                    scheduler.async_d2h_worker = None
++                # Graceful path only: on the exception path the GPU may be wedged
++                # and the synchronize() in destroy() could itself hang.
++                if scheduler.gracefully_exit:
++                    scheduler.release_host_resources()
++                    close_custom_all_reduce()
++                    # Last: anything above may still need a working communicator.
++                    abort_distributed_environment()
+
+     # SubprocessWatchdog treats exit code 0 as a clean shutdown, so a crash must not exit 0.
+     if hit_exception:
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index 15f4b44374..41b83035b4 100644
+index c9f1e07550..fead3a32dc 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -56,6 +56,8 @@ from sglang.srt.managers.io_struct import (
+@@ -57,6 +57,8 @@ from sglang.srt.managers.io_struct import (
      LoadLoRAAdapterReqOutput,
      LoRAUpdateOutput,
      OpenSessionReqInput,
@@ -1383,27 +1705,40 @@ index 15f4b44374..41b83035b4 100644
 +    PluginControlReqOutput,
      PdRoleSwitchReqInput,
      PdRoleSwitchReqOutput,
-     ProfileReq,
-@@ -144,6 +146,7 @@ _COMMUNICATOR_SPECS = [
-     ("end_weight_update", EndWeightUpdateReqOutput),
+     PluginWeightUpdateReqInput,
+@@ -148,6 +150,7 @@ _COMMUNICATOR_SPECS = [
+     ("plugin_weight_update", PluginWeightUpdateReqOutput),
      ("update_lora_adapter", LoRAUpdateOutput),
      ("dumper_control", DumperControlReqOutput),
 +    ("plugin_control", PluginControlReqOutput),
      ("scale_elastic_ep", ScaleElasticEPReqOutput),
  ]
- 
-@@ -184,6 +187,22 @@ class TokenizerControlMixin:
+
+@@ -188,6 +191,35 @@ class TokenizerControlMixin:
      FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
      """
- 
+
 +    async def plugin_control(self: TokenizerManager, namespace: str, body: dict) -> dict:
 +        """Forward control only; plugin state belongs to scheduler threads."""
 +        if not namespace or not isinstance(body, dict):
 +            raise ValueError("plugin control requires a namespace and JSON object")
 +        self.auto_create_handle_loop()
-+        results = await self.plugin_control_communicator(
-+            PluginControlReqInput(namespace=namespace, body=body)
-+        )
++        control_id = uuid.uuid4().hex
++        pending = asyncio.create_task(self.plugin_control_communicator(
++            PluginControlReqInput(namespace=namespace, body=body, control_id=control_id)
++        ))
++        # Keep the communicator's FIFO lock until its reply is drained even if
++        # the HTTP waiter disappears. A new caller cannot consume its late reply.
++        try:
++            results = await asyncio.shield(pending)
++        except asyncio.CancelledError:
++            def consume_cancelled_call(task):
++                if not task.cancelled():
++                    task.exception()
++            pending.add_done_callback(consume_cancelled_call)
++            raise
++        if any(result.control_id != control_id for result in results):
++            raise ValueError("stale plugin control response")
 +        errors = [result.error for result in results if not result.success]
 +        if errors:
 +            raise ValueError("; ".join(errors))
@@ -1416,13 +1751,13 @@ index 15f4b44374..41b83035b4 100644
          dispatch_pairs = []
          for spec in _COMMUNICATOR_SPECS:
 diff --git a/python/sglang/srt/mem_cache/allocation.py b/python/sglang/srt/mem_cache/allocation.py
-index 796db4395c..225e323636 100644
+index 3d63cf607b..3c2a41aa15 100644
 --- a/python/sglang/srt/mem_cache/allocation.py
 +++ b/python/sglang/srt/mem_cache/allocation.py
-@@ -456,6 +456,12 @@ def alloc_for_extend(
+@@ -483,6 +483,12 @@ def alloc_for_extend(
              batch=batch,
          )
- 
+
 +    # The receipt starts before any row write or auxiliary allocation. Its page
 +    # segments exclude a prefix page the tree already owns.
 +    from sglang.srt.managers.prefix_admission import record_batch_token_allocation
@@ -1432,7 +1767,7 @@ index 796db4395c..225e323636 100644
      # Write to req_to_token_pool
      if is_cp_sharded_padded():
          # Rollback owns physical rows; the request table and caller need cache ids.
-@@ -515,7 +521,10 @@ def alloc_for_extend(
+@@ -542,7 +548,10 @@ def alloc_for_extend(
      except Exception:
          if is_cp_sharded_padded():
              out_cache_loc = physical_out_cache_loc
@@ -1442,176 +1777,111 @@ index 796db4395c..225e323636 100644
 +        else:
 +            storage.free_tokens(out_cache_loc)
          raise
- 
+
      # DSV4-NPU hook: no-op on non-DSV4 paths.
 diff --git a/python/sglang/srt/mem_cache/kv/requests.py b/python/sglang/srt/mem_cache/kv/requests.py
-index 33d89bdeab..984b615e03 100644
+index d26b8ed235..518869cbd3 100644
 --- a/python/sglang/srt/mem_cache/kv/requests.py
 +++ b/python/sglang/srt/mem_cache/kv/requests.py
-@@ -22,6 +22,7 @@ import msgspec
+@@ -26,6 +26,7 @@ import msgspec
  import torch
- 
+
  from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-+from sglang.srt.managers.prefix_admission import free_request_rows, record_request_rows
++from sglang.srt.managers.prefix_admission import batch_admission_receipt, free_request_rows, record_request_rows
+ from sglang.srt.utils.device import async_h2d
  from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
- 
- if TYPE_CHECKING:
-@@ -115,7 +116,12 @@ class RequestTable:
+
+@@ -217,7 +218,11 @@ class RequestTable:
          assert all(r.kv.kv_allocated_len > 0 for r in reusing), (
              "a reused row must carry allocated KV"
          )
 -        rows = self.alloc_rows(len(reqs) - len(reusing))
-+        receipt = next((getattr(req, "_prefix_native_admission_receipt", None)
-+                        for req in reqs if getattr(req, "_prefix_native_admission_receipt", None) is not None), None)
-+        rows = (
-+            self.alloc_rows(len(reqs) - len(reusing), admission_receipt=receipt)
-+            if receipt is not None else self.alloc_rows(len(reqs) - len(reusing))
-+        )
++        receipt = batch_admission_receipt(reqs)
++        if receipt is None:
++            rows = self.alloc_rows(len(reqs) - len(reusing))
++        else:
++            rows = self.alloc_rows(len(reqs) - len(reusing), admission_receipt=receipt)
          if rows is None:
              return None
          fresh = iter(rows)
-@@ -124,7 +130,7 @@ class RequestTable:
-                 r.kv.req_pool_idx = next(fresh)
+@@ -227,7 +232,7 @@ class RequestTable:
          return [r.kv.req_pool_idx for r in reqs]
- 
--    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
-+    def alloc_rows(self, need_size: int, admission_receipt=None) -> Optional[List[int]]:
-         """Take rows from the tail of the free list, with no request bound."""
-         if need_size > len(self.free_slots):
-             return None
-@@ -132,10 +138,17 @@ class RequestTable:
-             return []
-         rows = self.free_slots[-need_size:]
+
+     def alloc_rows(
+-        self, need_size: int, *, state: RowState = RowState.ACTIVE
++        self, need_size: int, *, state: RowState = RowState.ACTIVE, admission_receipt=None
+     ) -> Optional[List[int]]:
+         """Take rows from the tail of the free list into ``state``, with no
+         request bound."""
+@@ -244,12 +249,19 @@ class RequestTable:
          del self.free_slots[-need_size:]
+         for row in rows:
+             self._move(row, (RowState.FREE,), state)
 +        record_request_rows(self, rows, admission_receipt)
          self.req_generation[rows] += 1
          return rows
- 
+
      def free_rows(self, rows: List[int]) -> None:
+         """Give rows back, from any state but FREE: a second release of a row
+         fails here instead of handing it out twice."""
 +        if getattr(self, "_prefix_admission_row_releases", None):
 +            free_request_rows(self, rows)
 +        else:
 +            self._free_rows_without_admission(rows)
 +
 +    def _free_rows_without_admission(self, rows: List[int]) -> None:
-         self.free_slots.extend(rows)
- 
-     def free(self, req: Req) -> None:
+         for row in rows:
+             self._move(row, _HOLDING, RowState.FREE)
+         if self._row_units is not None and rows:
 diff --git a/python/sglang/srt/mem_cache/kv/state_storage.py b/python/sglang/srt/mem_cache/kv/state_storage.py
-index 4f65cd7ea2..00343bb2ed 100644
+index 14578bbd26..f03d585b97 100644
 --- a/python/sglang/srt/mem_cache/kv/state_storage.py
 +++ b/python/sglang/srt/mem_cache/kv/state_storage.py
-@@ -116,8 +116,8 @@ class StateStorage:
-         mamba_indices: list[torch.Tensor] = []
-         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
-         # What this call hands out, given back if a later request finds no slot.
--        given_state: list[Req] = []
--        given_tracking: list[Req] = []
-+        given_state = []
-+        given_tracking = []
-         for req in reqs:
-             if req.kv.holds_mamba:  # for radix cache / continuing chunked
-                 pass
-@@ -128,8 +128,13 @@ class StateStorage:
-                     raise StateSlotsExhausted(
-                         f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
-                     )
-+                receipt = getattr(req, "_prefix_native_admission_receipt", None)
-+                release = (
-+                    receipt.record("request state slot", lambda mid=mid: self.slots.free(mid))
-+                    if receipt is not None else None
-+                )
-                 req.kv.mamba_pool_idx = mid[0]
--                given_state.append(req)
-+                given_state.append((req, release))
-                 req.kv.mamba_needs_clear = True
-                 # A zero write_pos empties the ReplaySSM ring;
-                 # decode then reads only the checkpoint written by prefill.
-@@ -138,13 +143,14 @@ class StateStorage:
-             mamba_indices.append(req.kv.mamba_pool_idx)
-             if table.enable_mamba_extra_buffer:
-                 if req.kv.mamba_ping_pong_track_buffer is None:
--                    if not self.alloc_ping_pong_buffer(table, req):
-+                    tracking_releases = []
-+                    if not self.alloc_ping_pong_buffer(table, req, release_receipts=tracking_releases):
-                         self._give_back(given_state, given_tracking)
-                         raise StateSlotsExhausted(
-                             "Not enough space for mamba ping pong idx, "
-                             "try to increase --mamba-full-memory-ratio."
-                         )
--                    given_tracking.append(req)
-+                    given_tracking.append((req, tracking_releases[0] if tracking_releases else None))
-                 mamba_ping_pong_track_buffers.append(
-                     req.kv.mamba_ping_pong_track_buffer
+@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional
+
+ import torch
+
++from sglang.srt.managers.prefix_admission import batch_admission_receipt
++
+ from sglang.srt.mem_cache.kv.decl import STATE_PART
+ from sglang.srt.utils.device import async_h2d
+
+@@ -159,6 +161,9 @@ class StateStorage:
+                     f"{self.pool.size=}, {self.slots.available_size()=}, "
+                     f"{len(needing)=}, {len(untracked)=}, {per_request=}"
                  )
-@@ -165,7 +171,7 @@ class StateStorage:
-                 ping_pong_tensor
-             )
- 
--    def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
-+    def alloc_ping_pong_buffer(self, table, req: Req, *, release_receipts=None) -> bool:
-         """Return False if slots are exhausted. Lazy mode starts with one slot
-         and a -1 sentinel for the second; normal mode allocates all slots.
-         """
-@@ -173,6 +179,11 @@ class StateStorage:
-         slots = self.slots.alloc(n)
++            receipt = batch_admission_receipt(reqs)
++            if receipt is not None:
++                receipt.record("batch state and tracking slots", lambda: self.slots.free(slots))
+             mids = slots[: len(needing)]
+             for req, mid in zip(needing, mids):
+                 req.kv.mamba_pool_idx = mid
+@@ -224,6 +229,9 @@ class StateStorage:
+         slots = self.slots.alloc(table.mamba_initial_tracking_slots)
          if slots is None:
              return False
 +        receipt = getattr(req, "_prefix_native_admission_receipt", None)
 +        if receipt is not None:
-+            release = receipt.record("request tracking slots", lambda: self.slots.free(slots))
-+            if release_receipts is not None:
-+                release_receipts.append(release)
-         buf = torch.full(
-             (table.mamba_ping_pong_track_buffer_size,),
-             -1,
-@@ -193,17 +204,23 @@ class StateStorage:
-         )
++            receipt.record("request tracking slots", lambda: self.slots.free(slots))
+         self._hand_out_tracking(table, [req], slots)
          return True
- 
--    def _give_back(self, given_state: List[Req], given_tracking: List[Req]) -> None:
-+    def _give_back(self, given_state, given_tracking) -> None:
-         """Undo a failed `acquire`: the state and tracking slots it handed out."""
--        for req in given_state:
--            self.slots.free(req.kv.mamba_pool_idx.unsqueeze(0))
-+        for req, release in given_state:
-+            if release is not None:
-+                release.run()
-+            else:
-+                self.slots.free(req.kv.mamba_pool_idx.unsqueeze(0))
-             req.kv.mamba_pool_idx = None
-             req.kv.mamba_needs_clear = False
--        for req in given_tracking:
-+        for req, release in given_tracking:
-             buf = req.kv.mamba_ping_pong_track_buffer
--            for position, empty in enumerate(req.kv.mamba_ping_pong_empty):
--                if not empty:
--                    self.slots.free(buf[position : position + 1])
-+            if release is not None:
-+                release.run()
-+            else:
-+                for position, empty in enumerate(req.kv.mamba_ping_pong_empty):
-+                    if not empty:
-+                        self.slots.free(buf[position : position + 1])
-             req.kv.mamba_ping_pong_track_buffer = None
-             req.kv.mamba_ping_pong_empty = None
-             req.kv.mamba_next_track_idx = None
+
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index eb2354e085..5af7bf16f3 100644
+index d79235ff45..57ba7dd234 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
- 
+
  import numpy as np
  import torch
 +from sglang.srt.managers.prefix_admission import free_request_rows, record_request_rows
  import triton
  import triton.language as tl
- 
-@@ -435,7 +436,12 @@ class ReqToTokenPool:
+
+@@ -440,7 +441,12 @@ class ReqToTokenPool:
              "a reused row must carry allocated KV"
          )
- 
+
 -        select_index = self.alloc_rows(len(reqs) - len(reusing))
 +        receipt = next((getattr(req, "_prefix_native_admission_receipt", None)
 +                        for req in reqs if getattr(req, "_prefix_native_admission_receipt", None) is not None), None)
@@ -1622,16 +1892,16 @@ index eb2354e085..5af7bf16f3 100644
          if select_index is None:
              return None
          offset = 0
-@@ -445,7 +451,7 @@ class ReqToTokenPool:
+@@ -450,7 +456,7 @@ class ReqToTokenPool:
                  offset += 1
          return [r.kv.req_pool_idx for r in reqs]
- 
+
 -    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
 +    def alloc_rows(self, need_size: int, admission_receipt=None) -> Optional[List[int]]:
          """Take need_size rows and bump their generation, with no Req bound to
          them. alloc() layers Req binding on top; beam member rows have no Req."""
          if need_size > len(self.free_slots):
-@@ -457,12 +463,19 @@ class ReqToTokenPool:
+@@ -462,12 +468,19 @@ class ReqToTokenPool:
          # O(len(free_slots)).
          select_index = self.free_slots[-need_size:]
          del self.free_slots[-need_size:]
@@ -1640,7 +1910,7 @@ index eb2354e085..5af7bf16f3 100644
          if self._on_alloc_rows is not None:
              self._on_alloc_rows(select_index)
          return select_index
- 
+
      def free_rows(self, indices: List[int]) -> None:
 +        if getattr(self, "_prefix_admission_row_releases", None):
 +            free_request_rows(self, indices)
@@ -1652,73 +1922,57 @@ index eb2354e085..5af7bf16f3 100644
          # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
          if self._aux_cache is not None:
 diff --git a/python/sglang/srt/mem_cache/prefill_budget.py b/python/sglang/srt/mem_cache/prefill_budget.py
-index 6165fe2ebf..5d6e4fcf9d 100644
+index 47cccf23e2..43aa056d80 100644
 --- a/python/sglang/srt/mem_cache/prefill_budget.py
 +++ b/python/sglang/srt/mem_cache/prefill_budget.py
-@@ -19,6 +19,7 @@ Selection checks do not mutate cache state. Shared-pool load preparation
- realizes the selected reservation before a host transfer pins device rows.
- """
- 
-+from dataclasses import dataclass
- from typing import Optional
- 
- from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
-@@ -67,6 +68,14 @@ def estimate_swa_kv_tokens(
-     return reserved
- 
- 
-+@dataclass(frozen=True)
-+class PrefillAdmissionCheckpoint:
-+    total_offset: int
-+    current_offset: int
-+    swa_offset: int
-+    rem_state_slots: Optional[int]
-+
-+
- class PrefillBudget:
-     """Fixed token pool. Offsets include pending allocations and decode headroom."""
- 
-@@ -87,6 +96,22 @@ class PrefillBudget:
+@@ -121,6 +121,23 @@ class PrefillBudget:
          self.current_offset = num_mixed_decode_tokens
          self.swa_offset = 0
- 
-+    def admission_checkpoint(self) -> PrefillAdmissionCheckpoint:
-+        """Mark every reservation counter, including nested chain state slots."""
-+        return PrefillAdmissionCheckpoint(
-+            self.total_offset,
-+            self.current_offset,
-+            self.swa_offset,
-+            getattr(self, "rem_state_slots", None),
+
++    def admission_checkpoint(self) -> dict:
++        names = (
++            "total_offset", "current_offset", "swa_offset",
++            "pending_state_slots", "pending_request_rows",
++            "window_offsets", "window_current_offsets", "unschedulable",
 +        )
++        mark = {}
++        for name in names:
++            if hasattr(self, name):
++                value = getattr(self, name)
++                mark[name] = value.copy() if isinstance(value, dict) else value
++        return mark
 +
-+    def restore_admission_checkpoint(self, mark: PrefillAdmissionCheckpoint) -> None:
-+        self.total_offset = mark.total_offset
-+        self.current_offset = mark.current_offset
-+        self.swa_offset = mark.swa_offset
-+        if hasattr(self, "rem_state_slots"):
-+            self.rem_state_slots = mark.rem_state_slots
++    def restore_admission_checkpoint(self, mark: dict) -> None:
++        for name, value in mark.items():
++            setattr(self, name, value)
 +
      def ceil_paged_tokens(self, tokens: int) -> int:
          return -(-tokens // self.page_size) * self.page_size
- 
+
 diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
-index 940ac2077c..b34d232c8c 100644
+index ba4aaa4c06..08b7e03b0e 100644
 --- a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
 +++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
-@@ -218,17 +218,30 @@ class MambaComponent(TreeComponent):
-         assert req is not None
-         if not req.kv.holds_mamba:
+@@ -247,17 +247,33 @@ class MambaComponent(TreeComponent):
+         # staged copy still runs, as it does into a slot taken here.
+         if not req.kv.holds_mamba and not params.defer_cow_slot:
              storage, sub_pool = self._state()
+-            dst_index = storage.take_state_slots(sub_pool, 1)
 +            receipt = getattr(req, "_prefix_native_admission_receipt", None)
-             dst_index = storage.take_state_slots(sub_pool, 1)
-+            if dst_index is not None and receipt is not None:
-+                receipt.record_state_slots(storage, sub_pool, dst_index)
++
++            def take_slot():
++                slots = storage.take_state_slots(sub_pool, 1)
++                if slots is not None and receipt is not None:
++                    receipt.record_state_slots(storage, sub_pool, slots)
++                return slots
++
++            dst_index = take_slot()
              if dst_index is None:
                  # Pin the window via inc/dec_lock_ref so evict's SWA release
                  # stops at this request's window boundary instead of walking to
                  # root and over-decrementing locks held by other requests.
 -                lock_result = self.cache.inc_lock_ref(result.best_match_node)
--                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+-                self.cache.evict_for_alloc(KVDemand(state_slots=1))
 -                dst_index = storage.take_state_slots(sub_pool, 1)
 -                self.cache.dec_lock_ref(
 -                    result.best_match_node, lock_result.to_dec_params()
@@ -1729,10 +1983,8 @@ index 940ac2077c..b34d232c8c 100644
 +                    else None
                  )
 +                try:
-+                    self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
-+                    dst_index = storage.take_state_slots(sub_pool, 1)
-+                    if dst_index is not None and receipt is not None:
-+                        receipt.record_state_slots(storage, sub_pool, dst_index)
++                    self.cache.evict_for_alloc(KVDemand(state_slots=1))
++                    dst_index = take_slot()
 +                finally:
 +                    if lock_release is not None:
 +                        lock_release.run()
@@ -1743,24 +1995,30 @@ index 940ac2077c..b34d232c8c 100644
          req.kv.mamba_cow_src_index = src_index
 diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
 new file mode 100644
-index 0000000000..6477466dd6
+index 0000000000..49a01fbf98
 --- /dev/null
 +++ b/test/registered/unit/managers/test_prefix_admission.py
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,640 @@
 +"""CPU ownership/collective contracts; these do not certify GPU numerics."""
 +
++import ast
++import asyncio
 +import concurrent.futures
 +import importlib.util
 +import sys
 +import threading
 +import types
 +import unittest
++import uuid
 +from enum import Enum
 +from pathlib import Path
 +from unittest.mock import patch
 +
 +
-+SOURCE = Path(__file__).resolve().parents[4] / "python/sglang/srt/managers/prefix_admission.py"
++SOURCE = (
++    Path(__file__).resolve().parents[4]
++    / "python/sglang/srt/managers/prefix_admission.py"
++)
 +SPEC = importlib.util.spec_from_file_location("prefix_admission_contract", SOURCE)
 +P = importlib.util.module_from_spec(SPEC)
 +sys.modules[SPEC.name] = P
@@ -1791,8 +2049,11 @@ index 0000000000..6477466dd6
 +    def __init__(self, rid="r", match_len=2):
 +        self.rid = rid
 +        self.kv = types.SimpleNamespace(
-+            holds_kv=False, mamba_pool_idx=None, req_pool_idx=None,
-+            cache_protected_len=0, component_evicted_seqlens={},
++            holds_kv=False,
++            mamba_pool_idx=None,
++            req_pool_idx=None,
++            cache_protected_len=0,
++            component_evicted_seqlens={},
 +        )
 +        self.session = self.lock = self.extend_end = None
 +        self.prefix_len = 0
@@ -1805,9 +2066,11 @@ index 0000000000..6477466dd6
 +        if name in self.resources:
 +            raise AssertionError("resource allocated twice")
 +        self.resources.add(name)
-+        self._prefix_native_admission_receipt.record(name, lambda: self.resources.remove(name))
++        self._prefix_native_admission_receipt.record(
++            name, lambda: self.resources.remove(name)
++        )
 +
-+    def init_next_round_input(self, cache, *, max_prefix_len):
++    def init_next_round_input(self, cache, *, max_prefix_len, defer_cow_slot=False):
 +        self.full_untruncated_fill_ids[:] = self.origin_input_ids
 +        self.prefix_len = min(max_prefix_len, self.match_len)
 +        if self.kv.mamba_pool_idx is None:
@@ -1827,6 +2090,9 @@ index 0000000000..6477466dd6
 +        self.new_chunked_req = None
 +        self.memory_budget = Budget()
 +        self.mode = mode
++
++    def should_defer(self, req):
++        return False
 +
 +    def add_one_req(self, req, *args):
 +        req.extend_end = len(req.origin_input_ids)
@@ -1852,7 +2118,9 @@ index 0000000000..6477466dd6
 +
 +    def prepare(self, s, req):
 +        self.prepares += 1
-+        return P.PrefixAdmissionProposal(6 if self.rank == 0 else 0, ("server", req.rid, "attempt", 0))
++        return P.PrefixAdmissionProposal(
++            6 if self.rank == 0 else 0, ("server", req.rid, "attempt", 0)
++        )
 +
 +    def after_match(self, *args):
 +        pass
@@ -1898,23 +2166,35 @@ index 0000000000..6477466dd6
 +            if self.fail:
 +                raise RuntimeError("partial physical allocation")
 +            if self.fail_finalizer:
++
 +                def fail():
 +                    raise RuntimeError("commit finalizer failed")
-+                req._prefix_native_admission_receipt.record("finalizer", lambda: None, on_commit=fail)
++
++                req._prefix_native_admission_receipt.record(
++                    "finalizer", lambda: None, on_commit=fail
++                )
 +
 +
 +def scheduler(observer, tp=1):
 +    s = types.SimpleNamespace(
-+        prefix_admission_observer=observer, tree_cache=object(),
-+        enable_hierarchical_cache=False, enable_hicache_storage=False,
-+        enable_lmcache=False, enable_priority_preemption=False, dllm_config=None,
++        prefix_admission_observer=observer,
++        tree_cache=object(),
++        token_to_kv_pool_allocator=object(),
++        enable_hierarchical_cache=False,
++        enable_hicache_storage=False,
++        enable_lmcache=False,
++        enable_priority_preemption=False,
++        dllm_config=None,
 +    )
-+    parallel = types.SimpleNamespace(tp_size=tp, pp_size=1, attn_cp_size=1, dcp_size=1, attn_dp_size=1)
++    parallel = types.SimpleNamespace(
++        tp_size=tp, pp_size=1, attn_cp_size=1, dcp_size=1, attn_dp_size=1
++    )
 +    return s, parallel
 +
 +
 +class CollectiveGroup:
 +    """Deterministic two-rank rendezvous; a missing phase fails the test."""
++
 +    def __init__(self):
 +        self.barrier = threading.Barrier(2, timeout=3)
 +        self.values = {}
@@ -1947,9 +2227,17 @@ index 0000000000..6477466dd6
 +
 +class PrefixAdmissionTests(unittest.TestCase):
 +    def setUp(self):
-+        self.patch = patch.dict(sys.modules, {
-+            "sglang.srt.managers.schedule_policy": types.SimpleNamespace(AddReqResult=Result)
-+        })
++        self.patch = patch.dict(
++            sys.modules,
++            {
++                "sglang.srt.managers.schedule_policy": types.SimpleNamespace(
++                    AddReqResult=Result
++                ),
++                "sglang.srt.mem_cache.capacity": types.SimpleNamespace(
++                    shares_memory=lambda _: False
++                ),
++            },
++        )
 +        self.patch.start()
 +
 +    def tearDown(self):
@@ -1960,8 +2248,78 @@ index 0000000000..6477466dd6
 +        s, parallel = scheduler(observer)
 +        return Coordinator(s, parallel), observer, Request(), Adder(mode)
 +
++    def test_terminal_shutdown_reports_current_and_previously_deferred_errors(self):
++        for previous in (False, True):
++            with self.subTest(previous=previous):
++                c, observer, _, _ = self.make()
++
++                def fail(*args):
++                    raise RuntimeError("native drain unproven")
++
++                observer.lifecycle = fail
++                if previous:
++                    c.lifecycle(None, "cancel", ("epoch", "rid", "attempt", 1))
++                    observer.lifecycle = lambda *args: None
++                with self.assertRaisesRegex(
++                    RuntimeError, "prefix shutdown failed.*native drain unproven"
++                ):
++                    c.lifecycle(None, "shutdown")
++                self.assertEqual(len(c.lifecycle_errors), 1)
++                self.assertEqual(c.round, 0)  # Terminal cleanup must stay rank-local.
++
++    def test_scheduler_native_cleanup_runs_when_plugin_shutdown_fails(self):
++        # Execute the actual finalizer AST, retaining its try/finally nesting.
++        # The fixture records native teardown; no GPU process is started.
++        tree = ast.parse((SOURCE.parent / "scheduler.py").read_text())
++        call_name = "prefix_admission_coordinator"
++        finalizer = next(
++            node.finalbody
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Try)
++            and node.finalbody
++            and any(
++                isinstance(child, ast.Attribute) and child.attr == call_name
++                for statement in node.finalbody
++                for child in ast.walk(statement)
++            )
++        )
++        events = []
++
++        def fail(*args):
++            events.append("plugin")
++            raise RuntimeError("unproven drain")
++
++        s = types.SimpleNamespace(
++            prefix_admission_coordinator=types.SimpleNamespace(lifecycle=fail),
++            metrics_reporter=types.SimpleNamespace(
++                _shutdown_fpm=lambda: events.append("metrics")
++            ),
++            async_d2h_worker=types.SimpleNamespace(
++                shutdown=lambda: events.append("d2h")
++            ),
++            gracefully_exit=True,
++            release_host_resources=lambda: events.append("host"),
++        )
++        namespace = {
++            "scheduler": s,
++            "close_custom_all_reduce": lambda: events.append("all_reduce"),
++            "abort_distributed_environment": lambda: events.append("distributed"),
++        }
++        code = compile(
++            ast.fix_missing_locations(ast.Module(body=finalizer, type_ignores=[])),
++            "actual_scheduler_finalizer",
++            "exec",
++        )
++        with self.assertRaisesRegex(RuntimeError, "unproven drain"):
++            exec(code, namespace)
++        self.assertEqual(
++            events, ["plugin", "metrics", "d2h", "host", "all_reduce", "distributed"]
++        )
++        self.assertIsNone(s.async_d2h_worker)
++
 +    def test_reverse_physical_release_and_nested_budget_restore(self):
 +        _, _, req, adder = self.make()
++        req.extra_key = "original-attempt-namespace"
 +        before = adder.memory_budget.admission_checkpoint()
 +        receipt = P.NativeAdmissionReceipt(adder, req)
 +        order = []
@@ -1971,20 +2329,24 @@ index 0000000000..6477466dd6
 +        adder.memory_budget.rem_state_slots = -4
 +        adder.can_run_list.append(req)
 +        req.kv.component_evicted_seqlens["full"] = 11
++        req.extra_key = "content-namespace-selected-by-plugin"
 +        receipt.rollback()
 +        self.assertEqual(order, [2, 1])
 +        self.assertEqual(vars(adder.memory_budget), before)
 +        self.assertEqual(adder.can_run_list, [])
 +        self.assertEqual(req.kv.component_evicted_seqlens, {})
++        self.assertEqual(req.extra_key, "original-attempt-namespace")
 +
 +    def test_release_exception_is_not_retried_and_other_resources_are_released(self):
 +        _, _, req, adder = self.make()
 +        receipt = P.NativeAdmissionReceipt(adder, req)
 +        calls = []
 +        receipt.record("safe", lambda: calls.append("safe"))
++
 +        def uncertain():
 +            calls.append("uncertain")
 +            raise RuntimeError("failed after physical release")
++
 +        receipt.record("uncertain", uncertain)
 +        for _ in range(2):
 +            with self.assertRaises(P.AdmissionRollbackError):
@@ -2006,8 +2368,10 @@ index 0000000000..6477466dd6
 +        _, _, req, adder = self.make()
 +        receipt = P.NativeAdmissionReceipt(adder, req)
 +        req.acquire("tokens")
++
 +        def fail():
 +            raise RuntimeError("detach failed")
++
 +        receipt.record("detach", lambda: None, on_commit=fail)
 +        with self.assertRaisesRegex(RuntimeError, "detach failed"):
 +            receipt.commit()
@@ -2054,8 +2418,10 @@ index 0000000000..6477466dd6
 +    def test_batch_construction_failure_rolls_back_staged_match(self):
 +        c, observer, req, adder = self.make()
 +        c.admit(req, adder, False, None)
++
 +        def fail_factory():
 +            raise RuntimeError("batch init failed")
++
 +        with self.assertRaisesRegex(RuntimeError, "batch construction"):
 +            c.build_batch(adder, fail_factory)
 +        self.assertEqual(req.resources, set())
@@ -2064,7 +2430,9 @@ index 0000000000..6477466dd6
 +    def test_temporary_pressure_permits_only_one_fully_rolled_back_retry(self):
 +        c, observer, req, adder = self.make(Observer(accepted=False))
 +        self.assertEqual(c.admit(req, adder, False, None), Result.OTHER)
-+        self.assertEqual((observer.prepares, observer.polls, observer.rollbacks), (2, 1, 2))
++        self.assertEqual(
++            (observer.prepares, observer.polls, observer.rollbacks), (2, 1, 2)
++        )
 +        self.assertEqual(req.resources, set())
 +
 +    def test_preexisting_recurrent_state_is_preserved(self):
@@ -2080,9 +2448,14 @@ index 0000000000..6477466dd6
 +        for rank in range(2):
 +            observer = Observer(rank=rank)
 +            s, parallel = scheduler(observer, tp=2)
-+            replicas.append((Coordinator(s, parallel, group, rank), observer, Request(), Adder()))
++            replicas.append(
++                (Coordinator(s, parallel, group, rank), observer, Request(), Adder())
++            )
 +        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-+            futures = [executor.submit(operation, rank, *replica) for rank, replica in enumerate(replicas)]
++            futures = [
++                executor.submit(operation, rank, *replica)
++                for rank, replica in enumerate(replicas)
++            ]
 +            results = [future.result(timeout=8) for future in futures]
 +        return replicas, results
 +
@@ -2091,6 +2464,7 @@ index 0000000000..6477466dd6
 +            req.match_len += rank
 +            with self.assertRaises(P.PrefixAdmissionRejected):
 +                c.admit(req, adder, False, None)
++
 +        replicas, _ = self.run_two(run)
 +        for c, observer, req, adder in replicas:
 +            self.assertEqual(req.resources, set())
@@ -2102,6 +2476,7 @@ index 0000000000..6477466dd6
 +            observer.fail_poll = rank == 0
 +            with self.assertRaisesRegex(RuntimeError, "poll failed"):
 +                c.admit(req, adder, False, None)
++
 +        replicas, _ = self.run_two(run)
 +        for c, observer, req, adder in replicas:
 +            self.assertEqual((observer.prepares, observer.polls), (1, 1))
@@ -2113,6 +2488,7 @@ index 0000000000..6477466dd6
 +            c.admit(req, adder, False, None)
 +            with self.assertRaisesRegex(RuntimeError, "native commit preparation"):
 +                c.build_batch(adder, lambda: Batch([req], fail_finalizer=rank == 0))
++
 +        replicas, _ = self.run_two(run)
 +        for c, observer, req, adder in replicas:
 +            self.assertEqual(req.resources, set())
@@ -2125,6 +2501,7 @@ index 0000000000..6477466dd6
 +            c.admit(req, adder, False, None)
 +            with self.assertRaisesRegex(RuntimeError, "prefix commit failed"):
 +                c.build_batch(adder, lambda: Batch([req]))
++
 +        replicas, _ = self.run_two(run)
 +        for c, observer, req, adder in replicas:
 +            self.assertEqual(req.resources, set())
@@ -2134,25 +2511,389 @@ index 0000000000..6477466dd6
 +        def run(rank, c, observer, req, adder):
 +            observer.prepare = lambda *args: None
 +            if rank == 0:
++
 +                def fail(mark):
 +                    raise RuntimeError("nested budget restore failed")
++
 +                adder.memory_budget.restore_admission_checkpoint = fail
 +            with self.assertRaises(P.AdmissionRollbackError):
 +                c.admit(req, adder, False, None)
++
 +        self.run_two(run)
 +
 +    def test_tp_rank_local_rollback_error_forbids_reclaim_retry(self):
 +        def run(rank, c, observer, req, adder):
 +            observer.accepted = False
 +            if rank == 0:
++
 +                def fail(*args):
 +                    raise RuntimeError("plugin rollback failed")
++
 +                observer.rollback = fail
 +            with self.assertRaises(P.AdmissionRollbackError):
 +                c.admit(req, adder, False, None)
++
 +        replicas, _ = self.run_two(run)
 +        for c, observer, req, adder in replicas:
 +            self.assertEqual((observer.prepares, observer.polls), (1, 0))
++
++
++class PluginControlCancellationTests(unittest.IsolatedAsyncioTestCase):
++    def method(self):
++        # Execute the actual tokenizer method and real FanOutCommunicator;
++        # only IPC transport/messages are replaced by in-process callbacks.
++        source = ast.parse((SOURCE.parent / "tokenizer_control_mixin.py").read_text())
++        cls = next(
++            node
++            for node in source.body
++            if isinstance(node, ast.ClassDef) and node.name == "TokenizerControlMixin"
++        )
++        method = next(
++            node
++            for node in cls.body
++            if isinstance(node, ast.AsyncFunctionDef) and node.name == "plugin_control"
++        )
++        body = [
++            ast.ImportFrom(
++                module="__future__", names=[ast.alias(name="annotations")], level=0
++            ),
++            method,
++        ]
++        namespace = {
++            "asyncio": asyncio,
++            "uuid": uuid,
++            "PluginControlReqInput": types.SimpleNamespace,
++        }
++        exec(
++            compile(
++                ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
++                "actual_tokenizer_plugin_control",
++                "exec",
++            ),
++            namespace,
++        )
++        spec = importlib.util.spec_from_file_location(
++            "actual_fanout", SOURCE.parent / "communicator.py"
++        )
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return namespace["plugin_control"], module.FanOutCommunicator
++
++    async def test_cancelled_http_waiter_drains_reply_before_next_dispatch(self):
++        method, communicator_type = self.method()
++        sent = []
++        events = [asyncio.Event(), asyncio.Event()]
++
++        def send(obj):
++            sent.append(obj)
++            events[len(sent) - 1].set()
++
++        comm = communicator_type(send, 1)
++        tokenizer = types.SimpleNamespace(
++            auto_create_handle_loop=lambda: None, plugin_control_communicator=comm
++        )
++        first = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "old"}))
++        await asyncio.wait_for(events[0].wait(), 1)
++        first.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await first
++        second = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "new"}))
++        await asyncio.sleep(0)
++        self.assertEqual(len(sent), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id=sent[0].control_id,
++                success=True,
++                response={"attempt": "old"},
++                error="",
++            )
++        )
++        await asyncio.wait_for(events[1].wait(), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id=sent[1].control_id,
++                success=True,
++                response={"attempt": "new"},
++                error="",
++            )
++        )
++        self.assertEqual(await asyncio.wait_for(second, 1), {"attempt": "new"})
++
++    async def test_wrong_control_generation_is_rejected(self):
++        method, communicator_type = self.method()
++        event = asyncio.Event()
++        comm = communicator_type(lambda obj: event.set(), 1)
++        tokenizer = types.SimpleNamespace(
++            auto_create_handle_loop=lambda: None, plugin_control_communicator=comm
++        )
++        call = asyncio.create_task(method(tokenizer, "plugin", {}))
++        await asyncio.wait_for(event.wait(), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id="stale", success=True, response={}, error=""
++            )
++        )
++        with self.assertRaisesRegex(ValueError, "stale plugin control response"):
++            await asyncio.wait_for(call, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/managers/test_prefix_admission_actual_req.py b/test/registered/unit/managers/test_prefix_admission_actual_req.py
+new file mode 100644
+index 0000000000..865cd6e77a
+--- /dev/null
++++ b/test/registered/unit/managers/test_prefix_admission_actual_req.py
+@@ -0,0 +1,253 @@
++"""Actual pinned Req/ReqKvInfo/budget CPU interface regression.
++
++Source method bodies and dataclass decorators are executed unchanged. Clock,
++mode enum and IPC leaves are small doubles; no model, CUDA or venv is loaded.
++This establishes the CPU boundary, not real scheduler/GPU acceptance.
++"""
++
++import ast
++import copy
++import dataclasses
++import importlib.util
++import logging
++import sys
++import types
++import unittest
++from array import array
++from http import HTTPStatus
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[4]
++SOURCE = ROOT / "python/sglang/srt"
++spec = importlib.util.spec_from_file_location(
++    "actual_req_prefix_admission", SOURCE / "managers/prefix_admission.py"
++)
++P = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = P
++spec.loader.exec_module(P)
++
++
++def extract(relative, names, namespace, methods=None):
++    source = ast.parse((SOURCE / relative).read_text())
++    selected = [
++        node
++        for node in source.body
++        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
++    ]
++    if methods:
++        for cls in selected:
++            if isinstance(cls, ast.ClassDef) and cls.name in methods:
++                cls.body = [
++                    node
++                    for node in cls.body
++                    if isinstance(node, ast.FunctionDef)
++                    and node.name in methods[cls.name]
++                ]
++    body = [
++        ast.ImportFrom(
++            module="__future__", names=[ast.alias(name="annotations")], level=0
++        ),
++        *selected,
++    ]
++    exec(
++        compile(
++            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
++            str(SOURCE / relative),
++            "exec",
++        ),
++        namespace,
++    )
++
++
++class ClockLeaf:
++    def __init__(self, **kwargs):
++        pass
++
++    def set_metrics_collector(self, value):
++        pass
++
++    def set_scheduler_recv_time(self):
++        pass
++
++
++def actual_namespace():
++    module = types.ModuleType("pinned_actual_req_methods")
++    sys.modules[module.__name__] = module
++    namespace = vars(module)
++    namespace.update(
++        dataclasses=dataclasses,
++        dataclass=dataclasses.dataclass,
++        array=array,
++        copy=copy,
++        HTTPStatus=HTTPStatus,
++        SchedulerReqTimeStats=ClockLeaf,
++        CaptureHiddenMode=types.SimpleNamespace(NULL=0, FULL=1, LAST=2),
++        FAKE_BOOTSTRAP_HOST="fake",
++        is_cp_sharded_padded=lambda: False,
++    )
++    extract("mem_cache/base_prefix_cache.py", {"CacheRequestHandle"}, namespace)
++    extract(
++        "dllm/mixin/req.py",
++        {"ReqDllmMixin"},
++        namespace,
++        {"ReqDllmMixin": {"init_diffusion_llm", "is_dllm", "reset_dllm_progress"}},
++    )
++    extract(
++        "managers/req_types.py",
++        {"get_return_hidden_states_mode", "BaseFinishReason", "FINISH_ABORT"},
++        namespace,
++    )
++    extract(
++        "managers/schedule_batch.py",
++        {
++            "ReqKvInfo",
++            "ReqLogprob",
++            "Req",
++            "BaseFinishReason",
++            "FINISH_ABORT",
++        },
++        namespace,
++        {
++            "Req": {
++                "__init__",
++                "refresh_fill_ids",
++                "init_next_round_input",
++                "_compute_max_prefix_len",
++                "needs_host_load_back",
++                "auxiliary_swa_host_hit_length",
++                "finish_outside_step",
++            }
++        },
++    )
++    extract(
++        "mem_cache/prefill_budget.py",
++        {"PrefillAdmissionCheckpoint", "PrefillBudget"},
++        namespace,
++    )
++    return namespace
++
++
++class ActualReqContracts(unittest.TestCase):
++    def setUp(self):
++        self.ns = actual_namespace()
++        self.req = self.ns["Req"](
++            "actual-req",
++            None,
++            array("q", [11, 22, 33, 44]),
++            types.SimpleNamespace(max_new_tokens=0, custom_params={}),
++            return_hidden_states=True,
++        )
++        self.budget = self.ns["PrefillBudget"](types.SimpleNamespace(page_size=1), None)
++        self.adder = types.SimpleNamespace(
++            memory_budget=self.budget,
++            can_run_list=[],
++            preempt_list=[],
++            rem_input_tokens=100,
++            rem_chunk_tokens=None,
++        )
++
++    def test_actual_slotted_req_kv_receipt_restores_metadata_and_resource_identity(
++        self,
++    ):
++        self.assertFalse(hasattr(self.req.kv, "__dict__"))
++        with self.assertRaises(TypeError):
++            vars(self.req.kv)  # The exact failed operation from the first smoke.
++        existing_tensor_handle = object()
++        self.req.kv.mamba_pool_idx = existing_tensor_handle
++        self.req.kv.window_evicted_seqlens["full"] = 7
++        self.req.kv.mamba_ping_pong_empty = [True, False]
++        before = self.budget.admission_checkpoint()
++        mark = P.NativeAdmissionReceipt(self.adder, self.req)
++        self.assertIs(mark.kv_before["mamba_pool_idx"], existing_tensor_handle)
++        self.assertIsNot(
++            mark.kv_before["window_evicted_seqlens"], self.req.kv.window_evicted_seqlens
++        )
++        self.req.kv.mamba_pool_idx = object()
++        self.req.kv.window_evicted_seqlens["full"] = 9
++        self.req.kv.mamba_ping_pong_empty[0] = False
++        self.budget.reserve(4, 2)
++        self.req.init_next_round_input(None, max_prefix_len=0)
++        mark.rollback()
++        self.assertIs(self.req.kv.mamba_pool_idx, existing_tensor_handle)
++        self.assertEqual(self.req.kv.window_evicted_seqlens, {"full": 7})
++        self.assertEqual(self.req.kv.mamba_ping_pong_empty, [True, False])
++        self.assertEqual(self.budget.admission_checkpoint(), before)
++        self.assertEqual(list(self.req.origin_input_ids), [11, 22, 33, 44])
++        self.assertEqual(list(self.req.full_untruncated_fill_ids), [])
++
++    def test_actual_req_can_prepare_commit_without_kv_dict(self):
++        mark = P.NativeAdmissionReceipt(self.adder, self.req)
++        self.req.init_next_round_input(None, max_prefix_len=0)
++        mark.prepare_commit()
++        mark.commit()
++        self.assertEqual(list(self.req.full_untruncated_fill_ids), [11, 22, 33, 44])
++        self.assertIsNone(self.req._prefix_native_admission_receipt)
++
++    def test_local_phase_logs_original_native_trace_before_tp_string_vote(self):
++        coordinator = P.PrefixAdmissionCoordinator(
++            types.SimpleNamespace(), parallel=types.SimpleNamespace(tp_size=1)
++        )
++        with self.assertLogs(P.__name__, level="WARNING") as logs:
++            _, errors = coordinator.phase(lambda: vars(self.req.kv))
++        self.assertIn("TypeError", errors[0])
++        self.assertIsNotNone(logs.records[0].exc_info)
++        self.assertIn("vars(self.req.kv)", "\n".join(logs.output))
++
++    def test_actual_scheduler_rejection_preserves_phase_status_and_trace(self):
++        namespace = self.ns
++        namespace.update(
++            logger=logging.getLogger("actual_prefix_rejection"),
++            AbortReq=types.SimpleNamespace,
++            PrefixAdmissionRejected=P.PrefixAdmissionRejected,
++            compute_weight_version_spans=lambda *args, **kwargs: [],
++            get_serving=lambda: types.SimpleNamespace(weight_version="default"),
++        )
++        for name in (
++            "SchedulerDisaggregationDecodeMixin",
++            "SchedulerDisaggregationPrefillMixin",
++            "SchedulerPPMixin",
++            "SchedulerDllmMixin",
++            "SchedulerMlxOverlapMixin",
++        ):
++            namespace[name] = type(name, (), {})
++        namespace["resolve_forward_inputs"] = None
++        extract(
++            "managers/scheduler.py",
++            {"Scheduler"},
++            namespace,
++            {"Scheduler": {"_reject_prefix_admission"}},
++        )
++        scheduler = namespace["Scheduler"]()
++        scheduler.waiting_queue = [self.req]
++        released, sent = [], []
++
++        def abort(req, *, reason, finished_reason):
++            self.assertIs(req, self.req)
++            scheduler.waiting_queue.remove(req)
++            released.append(req)
++            req.finished_reason = reason
++            sent.append(types.SimpleNamespace(finished_reason=finished_reason))
++
++        scheduler.request_retirer = types.SimpleNamespace(abort=abort)
++        with self.assertLogs("actual_prefix_rejection", level="WARNING") as logs:
++            try:
++                raise TypeError("vars() argument must have __dict__ attribute")
++            except TypeError as native:
++                try:
++                    raise P.PrefixAdmissionRejected(
++                        "TP prefix native receipt failed: TypeError: " + str(native)
++                    ) from native
++                except P.PrefixAdmissionRejected as exc:
++                    scheduler._reject_prefix_admission(self.req, exc)
++        self.assertEqual(released, [self.req])
++        self.assertEqual(scheduler.waiting_queue, [])
++        self.assertEqual(sent[0].finished_reason, self.req.finished_reason.to_json())
++        self.assertEqual(sent[0].finished_reason["status_code"], 400)
++        self.assertIn("native receipt failed", sent[0].finished_reason["message"])
++        self.assertIn("__dict__", "\n".join(logs.output))
++        self.assertIsNotNone(logs.records[0].exc_info)
 +
 +
 +if __name__ == "__main__":

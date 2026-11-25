@@ -2,7 +2,7 @@
 
 The rendezvous enforces collective operation order and exchanges real Python
 payloads between two scheduler-owner threads. Run this contract in the Python
-environment with the six-patch SGLang companion installed.
+environment with the SGLang companion installed.
 """
 
 import copy

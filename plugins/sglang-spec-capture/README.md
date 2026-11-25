@@ -186,8 +186,8 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 ## Opt-in HS capture protocol v1
 
 Ordinary capture uses the official SGLang pin in [Install](#install). A Teacher
-with `SPECFORGE_HS_CAPTURE=1` also requires the [six SGLang companion
-patches](patches/sglang/c757c4bb/), including when `SPECFORGE_HS_CACHE=0`.
+with `SPECFORGE_HS_CAPTURE=1` also requires the [two SGLang companion
+patches](patches/sglang/c19e9c7d/), including when `SPECFORGE_HS_CACHE=0`.
 The series adds scheduler-owned prefix admission, exact GDN checkpoints,
 cancellation-safe control replies, and rollback and shutdown handling.
 At startup the plugin checks `managers.prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1`.
@@ -202,17 +202,17 @@ the series in order and install the patched source.
     set -eu
     plugin_dir="$(pwd -P)/plugins/sglang-spec-capture"
     cd /absolute/path/to/sglang
-    test "$(git rev-parse HEAD)" = "c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0"
+    test "$(git rev-parse HEAD)" = "c19e9c7d19a873498c4fee1d789596c1a2b6e6f0"
     test -z "$(git status --porcelain)"
-    git am "$plugin_dir"/patches/sglang/c757c4bb/000[1-6]-*.patch
-    test "$(git rev-parse 'HEAD^{tree}')" = "1e2bd88315469e2d3f522b171613c4d9032491a5"
+    git am "$plugin_dir"/patches/sglang/c19e9c7d/000[1-2]-*.patch
+    test "$(git rev-parse 'HEAD^{tree}')" = "db88e5c7c39274cb2bbf0a0c4ac43e2619cc1e2b"
     uv pip install --no-build-isolation --prerelease=allow -e ./python
     uv pip install --no-deps -e "$plugin_dir"
 )
 ```
 
 The expected source tree is from the validated SGLang commit
-`d3dd55e5c8ba260939da7740b8038d483adab412`. Replaying the series with `git am`
+`8d1a7ce54612c9a9b4efd84ad8aa5d8309f4b43c`. Replaying the series with `git am`
 can produce different commit IDs with the same source tree.
 
 Enable `SPECFORGE_HS_CAPTURE=1` to negotiate server-issued attempt reservations
