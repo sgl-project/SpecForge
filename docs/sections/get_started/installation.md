@@ -63,6 +63,23 @@ the same `specforge train` entry. On Linux it also installs `liger-kernel`,
 whose RMSNorm/SwiGLU kernels DFlash drafts use by default on CUDA and ROCm
 (`model.use_liger_kernel`).
 
+[`docker/cuda.Dockerfile`](https://github.com/sgl-project/SpecForge/blob/main/docker/cuda.Dockerfile)
+packages the source installation above as a CUDA 13 image. It starts from the
+SGLang release image with the same Torch and Transformers pins, moves that
+image's SGLang to the pinned revision, and installs SpecForge, the capture
+plugin and Mooncake into the image's virtual environment at `/opt/sglang`:
+
+```bash
+docker build -f docker/cuda.Dockerfile -t specforge:cuda .
+docker run --rm -it --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  specforge:cuda
+```
+
+The checkout lives in `/sgl-workspace/SpecForge` and is installed in editable
+mode, so mounting a local checkout over that path picks up source changes
+without a rebuild.
+
 ### AMD ROCm
 
 On ROCm, install SpecForge into an environment that already provides a ROCm
