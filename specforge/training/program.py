@@ -38,11 +38,7 @@ def program_spec(model) -> ProgramSpec:
         partition=PartitionHints(
             blocks=tuple(sorted(model.draft_model._no_split_modules))
         ),
-        axes=(
-            {"sequence": "part"}
-            if getattr(model, "sequence_parallel", None) is not None
-            else {}
-        ),
+        axes={"sequence": "part"} if model.sequence_parallel is not None else {},
     )
 
 

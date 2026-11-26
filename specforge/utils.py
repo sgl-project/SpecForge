@@ -194,7 +194,7 @@ def print_args_with_dots(args):
 
 
 def print_on_rank0(message):
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+    if dist.get_rank() == 0:
         logger.info(message)
 
 
