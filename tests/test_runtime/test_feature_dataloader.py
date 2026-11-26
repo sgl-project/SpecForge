@@ -14,6 +14,7 @@ from unittest import mock
 import torch
 
 from specforge.data.preprocessing import process_offline_eagle3_sample
+from specforge.runtime.contracts import TrainBatch
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
@@ -214,6 +215,31 @@ class TestFeatureDataLoader(unittest.TestCase):
             # all refs acked
             self.assertEqual(q.in_flight(), 0)
             self.assertEqual(q.depth(), 0)
+
+    def test_npu_prefetch_hands_off_work_and_allocator_lifetime(self):
+        device = mock.Mock(type="npu", index=0)
+        tensor = mock.Mock(device=device)
+        batch = TrainBatch(
+            sample_ids=["sample"], strategy="eagle3", tensors={"x": tensor}
+        )
+        loader = FeatureDataLoader(mock.Mock(), refs=[mock.Mock()])
+        npu = mock.Mock()
+        worker_stream = mock.Mock()
+        consumer_stream = mock.Mock()
+        event = npu.Event.return_value
+        npu.current_stream.side_effect = [worker_stream, consumer_stream]
+
+        with (
+            mock.patch.object(torch, "npu", npu, create=True),
+            mock.patch.object(loader, "_timed_make_batch", return_value=batch),
+        ):
+            prepared = loader._prepare_batch([mock.Mock()])
+            self.assertEqual(list(prepared.ready), [device])
+            event.record.assert_called_once_with(worker_stream)
+            self.assertIs(prepared.consume(), batch)
+
+        consumer_stream.wait_event.assert_called_once_with(event)
+        tensor.record_stream.assert_called_once_with(consumer_stream)
 
     @unittest.skipUnless(torch.cuda.is_available(), "pinned memory requires CUDA")
     def test_pin_memory_pins_collated_cpu_tensors(self):

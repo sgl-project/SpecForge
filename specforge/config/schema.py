@@ -885,9 +885,14 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: a fresh host tensor per feature (registered and unregistered around each
     #: read, then copied to the device on the training stream); ``pinned`` keeps
     #: a bounded pool of page-locked, once-registered host buffers and copies to
-    #: the device on a side stream; ``cuda`` keeps the pool on the trainer device
-    #: for device reads (Mooncake 0.3.x stages these through its client buffer).
+    #: the device on a side stream when enabled for the trainer device; ``cuda``
+    #: keeps the pool on the trainer device for device reads (Mooncake 0.3.x
+    #: stages these through its client buffer).
     receive_buffers: Literal["pageable", "pinned", "cuda"] = "pinned"
+    #: Opt in to NPU H2D in loader workers for pinned receives. Off keeps the
+    #: prefetched batches on host because receive_pool_bytes excludes the device
+    #: output copies. CUDA pinned delivery remains enabled as before.
+    npu_loader_h2d: bool = False
     #: Retained receive-pool budget per rank; excludes output copies and overflow.
     receive_pool_bytes: int = Field(default=8 << 30, gt=0)
     idle_timeout_s: Optional[float] = Field(default=None, gt=0)

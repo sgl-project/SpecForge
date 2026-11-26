@@ -612,6 +612,31 @@ class LaunchPlanTest(unittest.TestCase):
                 for command in plan.commands:
                     self.assertEqual(command.env["DISAGG_RECEIVE_BUFFERS"], expected)
 
+    def test_disaggregated_npu_loader_h2d_is_opt_in(self):
+        for configured, expected in ((None, "0"), (False, "0"), (True, "1")):
+            with self.subTest(configured=configured):
+                cfg = _config(mode="disaggregated")
+                if configured is not None:
+                    cfg = apply_overrides(
+                        cfg,
+                        [
+                            "deployment.disaggregated.npu_loader_h2d="
+                            + str(configured).lower()
+                        ],
+                    )
+                plan = build_launch_plan(cfg, config_path="run.yaml", env=MOONCAKE_ENV)
+                for command in plan.commands:
+                    self.assertEqual(command.env["DISAGG_NPU_LOADER_H2D"], expected)
+
+        cfg = _config(mode="disaggregated")
+        plan = build_launch_plan(
+            cfg,
+            config_path="run.yaml",
+            env={**MOONCAKE_ENV, "DISAGG_NPU_LOADER_H2D": "1"},
+        )
+        for command in plan.commands:
+            self.assertEqual(command.env["DISAGG_NPU_LOADER_H2D"], "1")
+
     def test_local_multi_rank_self_launches_torchrun(self):
         plan = build_launch_plan(
             _config(nproc=4),

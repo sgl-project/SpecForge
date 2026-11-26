@@ -235,6 +235,7 @@ class ConfigSchemaTest(unittest.TestCase):
         payload["deployment"]["disaggregated"]["receive_buffers"] = "pinned"
         cfg = Config.model_validate(payload)
         self.assertEqual(cfg.deployment.disaggregated.receive_buffers, "pinned")
+        self.assertFalse(cfg.deployment.disaggregated.npu_loader_h2d)
         self.assertEqual(cfg.deployment.disaggregated.receive_pool_bytes, 8 << 30)
 
     def test_fsdp_sharding_is_typed(self):

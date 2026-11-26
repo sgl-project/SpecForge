@@ -187,7 +187,8 @@ the capture server.
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection; an exported `MOONCAKE_RDMA_DEVICES` overrides it. Under `rdma`, a producer or trainer checks every listed device, and unset selects the usable HCAs of its node; external capture servers must list theirs in `MOONCAKE_RDMA_DEVICES`. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. For `receive_buffers: cuda`, size for the largest concurrently fetched tensors; an 8k-token Qwen3.8-27B feature can exceed this default. Use e.g. `2147483648` and increase with fetch concurrency. |
-| `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
+| `deployment.disaggregated.receive_buffers` | `pinned` | Consumer receive buffers for feature reads: `pinned` (pooled page-locked host buffers, side-stream device copy when enabled), `pageable` (fresh host tensor per feature), or `cuda` (pooled device buffers; Mooncake 0.3.x stages RDMA reads through its client buffer). |
+| `deployment.disaggregated.npu_loader_h2d` | `false` | Opt in to NPU H2D in loader workers for pinned receives. Off keeps prefetched batches on host. The receive-pool budget does not include device output copies. `DISAGG_NPU_LOADER_H2D` overrides this setting. |
 | `deployment.disaggregated.receive_pool_bytes` | `8589934592` | Retained receive-pool budget per rank (`pinned`/`cuda`), excluding output copies and concurrent overflow. Failed-transfer buffers remain quarantined for the store lifetime. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |
 | `deployment.disaggregated.peer_wait_timeout_s` | `null` | Optional positive producer/consumer peer-completion timeout. Unset is unbounded; expiration fails the attempt. |
@@ -230,6 +231,11 @@ the capture server.
 | `deployment.disaggregated.managed_local.capture_servers[].extra_args` | `[]` | SGLang CLI tokens for this server only, appended after `model.sglang_extra_args` under the same rules. A flag may appear once per command line, so set a per-server flag here and not in the global list. |
 | `deployment.disaggregated.managed_local.capture_servers[].env` | `{}` | Extra environment for this server process, for example the capture plugin's `SGLANG_SPEC_CAPTURE_TIMING` or `SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES`. Keys the launcher sets are rejected: `MOONCAKE_*`, `DISAGG_*`, device-visibility variables, `SGLANG_SPEC_CAPTURE_GPU_PUT` (use `gpu_put`) and `FLASHINFER_DISABLE_VERSION_CHECK`. |
 | `deployment.disaggregated.managed_local.capture_servers[].probe_timeout_s` | `5` | Positive, finite HTTP health-probe timeout, capped by the remaining startup timeout. SGLang's generation-based `/health` waits at least one second; allow headroom instead of setting this to one second. |
+
+On NPU, `receive_buffers: pinned` keeps prefetched batches on host by default.
+Set `deployment.disaggregated.npu_loader_h2d: true` to enable loader-side H2D.
+The receive-pool budget excludes device outputs and collate temporaries; size
+`data.dataloader_num_workers` accordingly.
 
 ### `runtime`: streaming backpressure
 
