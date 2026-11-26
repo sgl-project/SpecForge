@@ -172,18 +172,19 @@ class Trainer:
         # The step options are recorded for resume. They used to construct
         # the step; each still has to describe the program that trains.
         options = dict(strategy_kwargs or {})
-        unknown = sorted(set(options) - {"name", "objective", "required_features"})
+        expected = {
+            "name": algorithm_name,
+            "objective": program_spec.name,
+            "required_features": set(program_spec.inputs),
+        }
+        unknown = sorted(set(options) - set(expected))
         if unknown:
             raise ValueError(
                 f"step options {unknown} configure nothing: the step reads what "
                 "its program declares"
             )
         for option, value in options.items():
-            described = {
-                "name": lambda: algorithm_name,
-                "objective": lambda: program_spec.name,
-                "required_features": lambda: set(program_spec.inputs),
-            }[option]()
+            described = expected[option]
             if (set(value) if option == "required_features" else value) != described:
                 raise ValueError(
                     f"step option {option}={value!r} does not describe this run, "

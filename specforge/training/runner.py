@@ -501,7 +501,7 @@ class DataParallelRunner:
         # is reduced on its own, in its own dtype and shape: a packed
         # reduction rounds in one dtype and may sum the ranks of each element
         # in another order. It is never differentiated.
-        pooled = [
+        pooled_denominators = [
             self.reduce_sum(denominator.detach().clone())
             for _, _, denominator in result.terms
         ]
@@ -509,11 +509,13 @@ class DataParallelRunner:
         loss = sum(
             coefficient
             * (world_size * numerator / denominator.where(denominator > 0, 1))
-            for (coefficient, numerator, _), denominator in zip(result.terms, pooled)
+            for (coefficient, numerator, _), denominator in zip(
+                result.terms, pooled_denominators
+            )
         )
         # The window counts its micro-batches with this one, in a dtype that
         # holds the count whatever the terms' is.
-        return loss, torch.ones((), device=pooled[0].device)
+        return loss, torch.ones((), device=pooled_denominators[0].device)
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:

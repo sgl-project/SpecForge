@@ -73,6 +73,10 @@ def _fake_seam():
             pre = "draft_model."
             return {k[len(pre) :]: v for k, v in state.items() if k.startswith(pre)}
 
+        def kernel_record(self):
+            selection = getattr(self, "loss_implementations", None)
+            return {} if selection is None else dict(selection.names)
+
     class Backend(TrainingBackend):
         process_group = None
         name = "fake"
@@ -272,6 +276,19 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             state = CheckpointManager.read_resume_state(checkpoint)
             self.assertEqual(
                 state["canonical_loss_implementations"], {"0:0": "token_ce"}
+            )
+            # Even if checkpoint_extra holds a separate stale mapping, saving
+            # writes the exact CheckpointState.kernels snapshot agreed across ranks.
+            trainer._controller.checkpoint_extra["canonical_loss_implementations"] = {
+                "0:0": "stale_kernel"
+            }
+            trainer._controller.save_checkpoint(step=2)
+            state_from_snapshot = CheckpointManager.read_resume_state(
+                os.path.realpath(os.path.join(out, "rz-latest"))
+            )
+            self.assertEqual(
+                state_from_snapshot["canonical_loss_implementations"],
+                {"0:0": "token_ce"},
             )
             model = Composite()
             model.loss_implementations = ExecutionSelection()
@@ -1672,6 +1689,244 @@ class TestCheckpointResume(unittest.TestCase):
             backend_r.optimizer.get_learning_rate(),
             places=12,
         )
+
+
+def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
+    """Compare an uninterrupted step against restarting from a sharded checkpoint."""
+    import torch.distributed as dist
+    import torch.nn as nn
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    from specforge.algorithms.objectives.base import ObjectiveResult
+    from specforge.runtime.contracts import TrainBatch
+    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.checkpoint import CheckpointManager
+    from specforge.training.controller import TrainerController
+    from specforge.training.runner import DataParallelRunner
+    from tests.test_runtime._fixtures import FakeProgram, fake_spec
+
+    class Draft(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+            self.out = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.out(torch.relu(self.proj(x)))
+
+    class Composite(FakeProgram):
+        def __init__(self):
+            super().__init__()
+            self.draft_model = Draft()
+
+        def forward(
+            self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+        ):
+            x = tensors["x"]
+            # Use RNG so rank-local RNG restoration is also verified.
+            noise = torch.randn_like(x) * 0.01
+            out = self.draft_model(x + noise)
+            return ObjectiveResult((out * out).mean(), torch.ones((), device=x.device))
+
+        def draft_state(self, state):
+            prefix = "draft_model."
+            return {
+                k[len(prefix) :]: v
+                for k, v in state.items()
+                if k.startswith(prefix)
+            }
+
+    if use_cuda:
+        torch.cuda.set_device(rank)
+        device = torch.device("cuda", rank)
+        pg_backend = "nccl"
+    else:
+        torch.set_num_threads(1)
+        device = torch.device("cpu")
+        pg_backend = "gloo"
+
+    dist.init_process_group(
+        pg_backend,
+        init_method=f"file://{workdir}/rendezvous",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        orig_fsdp = FSDP
+
+        def cpu_fsdp(module, *args, **kwargs):
+            kwargs.setdefault("device_id", torch.device("cpu"))
+            return orig_fsdp(module, *args, **kwargs)
+
+        patch_ctx = (
+            contextlib.nullcontext()
+            if use_cuda
+            else mock.patch("torch.distributed.fsdp.FullyShardedDataParallel", cpu_fsdp)
+        )
+
+        # Two deterministic rank-distinct batches: step 1 before save, step 2 after.
+        step1_batch = TrainBatch(
+            sample_ids=[f"s1-r{rank}"],
+            strategy="sharded-resume",
+            tensors={
+                "x": torch.linspace(
+                    0.1 * (rank + 1), 1.0 + 0.1 * rank, 16, device=device
+                ).reshape(2, 8)
+            },
+        )
+        step2_batch = TrainBatch(
+            sample_ids=[f"s2-r{rank}"],
+            strategy="sharded-resume",
+            tensors={
+                "x": torch.linspace(
+                    -0.5 - 0.1 * rank, 0.7 + 0.2 * rank, 16, device=device
+                ).reshape(2, 8)
+            },
+        )
+
+        def build_run(out_dir, *, start_step=0, max_steps=2, draft_weights=None):
+            torch.manual_seed(1234)
+            model = Composite().to(device)
+            if draft_weights is not None:
+                model.draft_model.load_state_dict(draft_weights, strict=True)
+            pc = ParallelConfig(
+                world_size=2,
+                sharding_strategy="SHARD_GRAD_OP",
+                param_dtype=torch.float32,
+                fsdp_process_group=dist.group.WORLD,
+            )
+
+            class _ZeroingAdamW(torch.optim.AdamW):
+                def step(self, closure=None):
+                    out = super().step(closure=closure)
+                    self.zero_grad(set_to_none=True)
+                    return out
+
+            backend = FSDPTrainingBackend(
+                pc,
+                optimizer_factory=lambda target: _ZeroingAdamW(
+                    target.parameters(), lr=1e-2
+                ),
+            )
+            with patch_ctx:
+                wrapped = backend.prepare_model(
+                    model, optimizer_target=model.draft_model
+                )
+            runner = DataParallelRunner(
+                wrapped, backend, fake_spec("x", name="sharded-resume")
+            )
+            ctrl = TrainerController(
+                runner,
+                strategy_name="sharded-resume",
+                run_id="fsdp-resume",
+                output_dir=out_dir,
+                max_steps=max_steps,
+                start_step=start_step,
+                checkpoint_manager=CheckpointManager(out_dir, "fsdp-resume"),
+            )
+            return runner, backend, ctrl
+
+        def snapshot_optimizer(opt):
+            state = opt.state_dict()["state"]
+            return {
+                k: {
+                    name: val.detach().cpu().clone() if torch.is_tensor(val) else val
+                    for name, val in entry.items()
+                }
+                for k, entry in state.items()
+            }
+
+        # 1) Uninterrupted two-step reference.
+        ref_runner, ref_backend, ref_ctrl = build_run(
+            os.path.join(workdir, "ref"), max_steps=2
+        )
+        torch.manual_seed(100 + rank)
+        ref_ctrl.fit([step1_batch, step2_batch])
+        ref_state = ref_runner.checkpoint_state()
+        ref_opt = snapshot_optimizer(ref_backend.optimizer)
+
+        # 2) Interrupted run: step 1 -> save checkpoint -> restart -> step 2.
+        ckpt_out = os.path.join(workdir, "ckpt")
+        _, _, a_ctrl = build_run(ckpt_out, max_steps=1)
+        torch.manual_seed(100 + rank)
+        a_ctrl.fit([step1_batch])
+        ck = a_ctrl.save_checkpoint(1)
+        dist.barrier()
+
+        ckpt_dir = ck.checkpoint_uri[len("file://") :]
+        shared = torch.load(
+            os.path.join(ckpt_dir, "training_state.pt"),
+            map_location="cpu",
+            weights_only=False,
+        )
+        assert "replicated_optimizer_state" not in shared
+        assert os.path.exists(os.path.join(ckpt_dir, f"training_state_rank{rank}.pt"))
+
+        resume = CheckpointManager.read_resume_state(ck.checkpoint_uri)
+        assert resume["backend"]["optimizer"] is not None
+
+        b_runner, b_backend, b_ctrl = build_run(
+            os.path.join(workdir, "resumed"),
+            start_step=1,
+            max_steps=2,
+            draft_weights=resume["draft_state_dict"],
+        )
+        b_runner.load_resume(resume["backend"])
+        b_runner.agree(None)
+        b_ctrl.fit([step2_batch])
+        b_state = b_runner.checkpoint_state()
+        b_opt = snapshot_optimizer(b_backend.optimizer)
+
+        # Compare full gathered draft weights on rank 0.
+        if rank == 0:
+            assert set(b_state.draft) == set(ref_state.draft)
+            for name, ref_tensor in ref_state.draft.items():
+                if not torch.equal(b_state.draft[name].cpu(), ref_tensor.cpu()):
+                    raise AssertionError(f"draft weight mismatch on {name}")
+
+        # Compare each rank's sharded optimizer state tensors.
+        assert set(b_opt) == set(ref_opt) and len(b_opt) > 0
+        for param_id, ref_entry in ref_opt.items():
+            b_entry = b_opt[param_id]
+            assert set(b_entry) == set(ref_entry)
+            for key, ref_val in ref_entry.items():
+                if torch.is_tensor(ref_val):
+                    if not torch.equal(b_entry[key], ref_val):
+                        raise AssertionError(
+                            f"rank {rank} optimizer shard mismatch on {param_id}.{key}"
+                        )
+                else:
+                    assert b_entry[key] == ref_val
+    finally:
+        dist.destroy_process_group()
+
+
+class TestTwoRankFSDPShardedResume(unittest.TestCase):
+    def test_two_rank_fsdp_sharded_resume_matches_uninterrupted(self):
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as workdir:
+            mp.spawn(
+                _two_rank_fsdp_resume_worker,
+                args=(workdir, False),
+                nprocs=2,
+                join=True,
+            )
+
+    @unittest.skipUnless(
+        CUDA and torch.cuda.device_count() >= 2,
+        "two-GPU FSDP sharded resume requires >=2 CUDA devices",
+    )
+    def test_two_gpu_fsdp_sharded_resume_matches_uninterrupted(self):
+        import torch.multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as workdir:
+            mp.spawn(
+                _two_rank_fsdp_resume_worker,
+                args=(workdir, True),
+                nprocs=2,
+                join=True,
+            )
 
 
 if __name__ == "__main__":

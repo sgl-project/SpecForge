@@ -26,6 +26,12 @@ class ObjectiveResult:
 
     @property
     def loss(self):
+        """Return this rank's local loss.
+
+        Under ``microbatch`` reduction, the step runner computes the backward
+        loss from :attr:`terms` using globally pooled denominators, so reading
+        this property on one rank reports only that rank's local value.
+        """
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
