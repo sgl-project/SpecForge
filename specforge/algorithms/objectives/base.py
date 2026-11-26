@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol
 
 import torch
 from torch import Tensor, nn
@@ -33,6 +34,26 @@ class ObjectiveResult:
         this property on one rank reports only that rank's local value.
         """
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
+
+
+class SequenceParallelGroups(Protocol):
+    """The sequence-parallel axis an objective model is built with.
+
+    Ranks of one group share a sequence, not samples. The training side builds
+    the value; a protocol reads these members and nothing else of it.
+    """
+
+    #: Group of the ring-attention exchange.
+    ring_group: Any
+    #: Group of the Ulysses all-to-all.
+    ulysses_group: Any
+
+    @property
+    def size(self) -> int:
+        """Number of ranks one sequence is split over."""
+
+    def reduce_statistics(self, accepted, count, denominator):
+        """Sum detached loss statistics over the ranks of one sequence."""
 
 
 def validate_anchor_sampling(name, training, anchor_sampling, anchor_seed):
@@ -85,7 +106,7 @@ class ObjectiveModel(nn.Module):
         execution=None,
         frozen_modules=(),
         attention_backend=None,
-        sequence_parallel=None,
+        sequence_parallel: Optional[SequenceParallelGroups] = None,
         anchor_sampling="device",
         anchor_seed=None,
     ):
@@ -105,7 +126,18 @@ class ObjectiveModel(nn.Module):
         self.frozen_parameters = tuple(frozen_parameters)
         # Frozen modules a runner neither shards nor optimizes: target tables
         # used only inside the loss, as whoever built this model declared them.
-        self.frozen = tuple(dict.fromkeys(frozen_modules))
+        # Each once: the teacher may be the draft's own bound head.
+        self.frozen_modules = tuple(dict.fromkeys(frozen_modules))
+        own = {id(module) for module in self.modules()}
+        strangers = [
+            type(module).__name__
+            for module in self.frozen_modules
+            if id(module) not in own
+        ]
+        if strangers:
+            raise ValueError(
+                f"frozen_modules holds modules this model does not: {strangers}"
+            )
         # The attention backend the run trains with, and the process groups of
         # its sequence-parallel axis when it has one. A protocol that takes
         # either reads it here; both are fixed for the model's lifetime.

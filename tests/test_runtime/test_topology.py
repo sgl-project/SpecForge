@@ -55,10 +55,6 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(topology.dp_size, 8)
         self.assertEqual(topology.draft_dp_size, 4)
         self.assertEqual(topology.data_parallel_size, 2)
-        # More model-parallel ranks than the world still has one sample stream.
-        self.assertEqual(
-            Topology(world_size=2, tp_size=2, sp_ulysses_size=2).data_parallel_size, 1
-        )
 
     def test_layout_records_the_sizes(self):
         self.assertEqual(

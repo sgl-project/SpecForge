@@ -918,6 +918,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         Program, _ = _fake_seam()
 
         class Draft(nn.Module):
+            _no_split_modules = []
+
             def __init__(self):
                 super().__init__()
                 self.w = nn.Parameter(torch.zeros(1))
@@ -925,11 +927,12 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 self.embed_tokens.requires_grad_(False)
 
         class Composite(Program):
-            # the builder reads the program's declarations from these two
+            # the builder reads the program's declarations from these
             objective_name = "eagle3"
             registration = SimpleNamespace(
                 inputs=("x",), training=TrainingRequirements()
             )
+            sequence_parallel = None
 
             def __init__(self):
                 super().__init__(Draft())

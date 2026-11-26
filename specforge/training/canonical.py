@@ -106,6 +106,9 @@ def resolve_run(cfg, *, target_config=None):
         OfflineStorageContract,
     )
     from specforge.algorithms.objectives import resolve_objective
+    from specforge.algorithms.objectives.registry import (
+        refuse_dpace_over_sequence_shards,
+    )
     from specforge.config.draft.codec import encode_config
 
     from . import canonical_data
@@ -157,20 +160,13 @@ def resolve_run(cfg, *, target_config=None):
     family = entry.runtime_name or objective
     if cfg.training.tp_size != 1:
         raise ValueError("canonical objectives require trainer TP size one")
-    sequence_parallel = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size > 1
-    if sequence_parallel and (
+    sp_size = cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
+    if sp_size > 1 and (
         not requirements.supports_sequence_parallel
         or cfg.training.attention_backend != "usp"
     ):
         raise ValueError("sequence parallelism requires an objective supporting USP")
-    if sequence_parallel:
-        from specforge.losses.position_weights import DPACE_LOSS_TYPES
-
-        if resolved.weighting.kind in DPACE_LOSS_TYPES:
-            raise ValueError(
-                "D-PACE weighting is not supported with sequence parallelism: "
-                "chain weights are normalized within each sequence shard"
-            )
+    refuse_dpace_over_sequence_shards(resolved.weighting, sp_size=sp_size)
     # Retain the established strategy name for data/rendezvous identifiers.
     options = asdict(resolved.objective)
     if cfg.training.weighting is not None:

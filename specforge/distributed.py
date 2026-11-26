@@ -15,7 +15,7 @@ class Topology:
 
     :func:`init_distributed` builds it once, reading each rank once, and its
     consumers receive it explicitly. ``Topology()`` is one process with no
-    groups: what a test or a capture producer has.
+    groups, which is what a test builds; a capture producer has no topology.
     """
 
     rank: int = 0
@@ -54,7 +54,7 @@ class Topology:
     @property
     def data_parallel_size(self) -> int:
         """Ranks that receive different samples."""
-        return max(1, self.world_size // (self.tp_size * self.sp_size))
+        return self.world_size // (self.tp_size * self.sp_size)
 
     def layout(self) -> dict:
         """The sizes that describe the job, for records."""

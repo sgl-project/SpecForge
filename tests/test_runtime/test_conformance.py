@@ -142,21 +142,48 @@ class KitCanFailTest(unittest.TestCase):
 
         self.assertEqual(self.failures(EvaluatedPrepass, "test_replay_statistic"), 1)
 
-    def test_dropped_schedule_or_detail_flag_fails_the_window_job(self):
-        class StepZero(DataParallelRunner):
-            def _forward(self, batch, ctx, **arguments):
-                return super()._forward(
-                    batch, dataclasses.replace(ctx, global_step=0), **arguments
+    def test_dropped_or_fixed_context_field_fails_the_window_job(self):
+        def with_context(**fixed):
+            class Fixed(DataParallelRunner):
+                def _forward(self, batch, ctx, **arguments):
+                    ctx = dataclasses.replace(ctx, **fixed)
+                    return super()._forward(batch, ctx, **arguments)
+
+            return Fixed
+
+        for fixed in (
+            {"global_step": 0},
+            {"total_steps": None},
+            # Never asked for, and asked for on every update.
+            {"collect_detailed_metrics": False},
+            {"collect_detailed_metrics": True},
+        ):
+            with self.subTest(fixed=fixed):
+                self.assertEqual(
+                    self.failures(with_context(**fixed), "test_window_reduction"), 1
                 )
 
-        class NoDetail(DataParallelRunner):
-            def _forward(self, batch, ctx, **arguments):
-                ctx = dataclasses.replace(ctx, collect_detailed_metrics=False)
-                return super()._forward(batch, ctx, **arguments)
+    def test_runner_with_a_resume_layout_of_its_own_passes_every_job(self):
+        """The optimizer state is the runner's: only its own resume reads it."""
 
-        for broken in (StepZero, NoDetail):
-            with self.subTest(runner=broken.__name__):
-                self.assertEqual(self.failures(broken, "test_window_reduction"), 1)
+        class OwnLayout(DataParallelRunner):
+            def checkpoint_state(self):
+                state = super().checkpoint_state()
+                rank = {**state.rank, "optimizer": {"mine": state.rank["optimizer"]}}
+                return dataclasses.replace(state, rank=rank)
+
+            def load_resume(self, state):
+                super().load_resume({**state, "optimizer": state["optimizer"]["mine"]})
+
+        for job in (
+            "test_window_reduction",
+            "test_window_reduction_in_bfloat16",
+            "test_microbatch_reduction",
+            "test_replay_statistic",
+            "test_resume_continues_the_same_trajectory",
+        ):
+            with self.subTest(job=job):
+                self.assertEqual(self.failures(OwnLayout, job), 0)
 
     def test_checkpoint_that_does_not_wait_for_commits_fails_the_protocol(self):
         class Probe(ProtocolChecks, unittest.TestCase):
