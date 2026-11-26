@@ -583,7 +583,13 @@ class ObjectiveContractTest(unittest.TestCase):
     def test_window_statistic_cannot_take_a_keyword_of_the_forward(self):
         from specforge.algorithms.objectives.registry import WindowStatistic
 
-        for name in ("prepass", "step", "total_steps", "batch"):
+        for name in (
+            "prepass",
+            "step",
+            "total_steps",
+            "batch",
+            "collect_detailed_metrics",
+        ):
             with self.subTest(argument=name):
                 with self.assertRaisesRegex(ValueError, "takes that keyword itself"):
                     WindowStatistic(ratio_name="ce", argument_name=name)
