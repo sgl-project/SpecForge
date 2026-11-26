@@ -304,7 +304,7 @@ def _reference_worker(rank, world, store_path, out_dir, sharding, policy="defaul
             wrapped = backend.prepare_model(
                 program,
                 optimizer_target=program.draft_model,
-                frozen=program.frozen,
+                frozen_modules=program.frozen_modules,
                 blocks=spec.partition.blocks,
             )
         runner = DataParallelRunner(wrapped, backend, spec)
@@ -920,7 +920,8 @@ class FSDP2PrecisionAndConfigTest(unittest.TestCase):
                         raise RuntimeError(err)
 
             model = SimpleNamespace(
-                draft_model=nn.Linear(1, 1, bias=False).to(torch.bfloat16), frozen=()
+                draft_model=nn.Linear(1, 1, bias=False).to(torch.bfloat16),
+                frozen_modules=(),
             )
             declared = SimpleNamespace(
                 name="eagle3",

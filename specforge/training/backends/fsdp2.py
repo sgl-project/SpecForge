@@ -174,7 +174,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             self._reference_layout = dict(
                 structure=empty_structure(model),
                 trainable=names[id(target)],
-                frozen=tuple(names[id(module)] for module in frozen),
+                frozen=tuple(names[id(module)] for module in frozen_modules),
                 blocks=tuple(blocks),
             )
         else:
