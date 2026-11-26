@@ -12,7 +12,6 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -38,7 +37,7 @@ from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
-from tests.test_runtime._fixtures import train_window
+from tests.test_runtime._fixtures import gloo_single_rank, spawn_gloo, train_window
 from tests.test_runtime.conformance import (
     KitProgram,
     ProtocolChecks,
@@ -96,10 +95,8 @@ def _runner(program, sharding, *, opt_spec=None, sched_spec=None, max_grad_norm=
     return DataParallelRunner(wrapped, backend, spec), backend
 
 
-def _worker(rank, world, store_path, out_dir, sharding):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
-    )
+def _worker(rank, world, out_dir, sharding):
+    del world
     backend = None
     try:
         torch.manual_seed(0)
@@ -147,17 +144,14 @@ def _worker(rank, world, store_path, out_dir, sharding):
             for name, value in program.draft_model.named_parameters()
             if value.requires_grad
         }
-        torch.save(report, os.path.join(out_dir, f"report{rank}.pt"))
+        return report
     finally:
         if backend is not None:
             backend.close()
-        dist.destroy_process_group()
 
 
-def _resume_worker(rank, world, store_path, out_dir, sharding):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
-    )
+def _resume_worker(rank, world, out_dir, sharding):
+    del world
     backend = None
     try:
         torch.manual_seed(0)
@@ -177,24 +171,19 @@ def _resume_worker(rank, world, store_path, out_dir, sharding):
             for name, value in program.draft_model.named_parameters()
             if value.requires_grad
         }
-        torch.save(report, os.path.join(out_dir, f"resumed{rank}.pt"))
+        return report
     finally:
         if backend is not None:
             backend.close()
-        dist.destroy_process_group()
 
 
 @unittest.skipUnless(_GLOO, "needs gloo")
 class FSDP2RuntimeTest(unittest.TestCase):
-    def _run(self, worker, directory, sharding, world=2):
-        store = os.path.join(directory, f"store-{worker.__name__}")
-        mp.spawn(worker, args=(world, store, directory, sharding), nprocs=world)
-
     def test_two_ranks_train_resume_and_write_the_draft_in_its_dtype(self):
         for sharding in ("SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"):
             with self.subTest(sharding=sharding), tempfile.TemporaryDirectory() as d:
-                self._run(_worker, d, sharding)
-                report = torch.load(os.path.join(d, "report0.pt"), weights_only=False)
+                reports = spawn_gloo(_worker, sharding, workdir=d)
+                report = reports[0]
                 # Drives PyTorch AdamW directly — no separate FP32Optimizer wrapper.
                 self.assertEqual(report["optimizer_type"], "AdamW")
                 # The trainable draft is fp32; bound target tables stay as built,
@@ -206,14 +195,8 @@ class FSDP2RuntimeTest(unittest.TestCase):
                 self.assertEqual(report["model_dtypes"], ["torch.bfloat16"])
                 self.assertTrue(all(torch.isfinite(torch.tensor(report["losses"]))))
                 # A resumed run continues bit for bit.
-                self._run(_resume_worker, d, sharding)
-                for rank in range(2):
-                    kept = torch.load(
-                        os.path.join(d, f"report{rank}.pt"), weights_only=False
-                    )
-                    resumed = torch.load(
-                        os.path.join(d, f"resumed{rank}.pt"), weights_only=False
-                    )
+                resumed_reports = spawn_gloo(_resume_worker, sharding, workdir=d)
+                for kept, resumed in zip(reports, resumed_reports):
                     self.assertTrue(torch.equal(resumed["rng_draw"], kept["rng_draw"]))
                     self.assertEqual(resumed["next_loss"], kept["next_loss"])
                     for name, value in kept["next_weights"].items():
@@ -279,10 +262,8 @@ def _full(program):
     }
 
 
-def _toy_worker(rank, world, store_path, out_dir, sharding):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
-    )
+def _toy_worker(rank, world, out_dir, sharding):
+    del world, out_dir
     backend = None
     resumed = None
     try:
@@ -329,26 +310,20 @@ def _toy_worker(rank, world, store_path, out_dir, sharding):
                 except ValueError as error:
                     report["part_refused"] = str(error)
             dist.destroy_process_group(part)
-        torch.save(report, os.path.join(out_dir, f"toy{rank}.pt"))
+        return report
     finally:
         if resumed is not None:
             resumed.close()
         if backend is not None:
             backend.close()
-        dist.destroy_process_group()
 
 
 @unittest.skipUnless(_GLOO, "needs gloo")
 class FSDP2LayoutTest(unittest.TestCase):
     def test_uneven_shards_resume_frozen_blocks_and_aligned_replicas(self):
         for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):
-            with self.subTest(sharding=sharding), tempfile.TemporaryDirectory() as d:
-                store = os.path.join(d, "store")
-                mp.spawn(_toy_worker, args=(2, store, d, sharding), nprocs=2)
-                reports = [
-                    torch.load(os.path.join(d, f"toy{rank}.pt"), weights_only=False)
-                    for rank in range(2)
-                ]
+            with self.subTest(sharding=sharding):
+                reports = spawn_gloo(_toy_worker, sharding)
                 for report in reports:
                     self.assertTrue(report["table_is_plain"])
                     self.assertEqual(report["replicated"], sharding == "NO_SHARD")
@@ -411,51 +386,42 @@ class AccumulationPrecisionTest(unittest.TestCase):
     """Micro-batch gradients accumulate in fp32, not in the compute dtype."""
 
     def test_window_gradient_is_the_fp32_sum_of_the_bf16_gradients(self):
-        with tempfile.TemporaryDirectory() as directory:
-            dist.init_process_group(
-                "gloo",
-                init_method=f"file://{os.path.join(directory, 'store')}",
-                rank=0,
-                world_size=1,
+        with gloo_single_rank():
+            torch.manual_seed(0)
+            reference = _Toy().to(torch.bfloat16)
+            program = _Toy().to(torch.bfloat16)
+            program.load_state_dict(reference.state_dict())
+            backend = FSDP2TrainingBackend(
+                ParallelConfig(
+                    sharding_strategy="SHARD_GRAD_OP",
+                    fsdp_process_group=dist.group.WORLD,
+                ),
+                precision=_FSDP2_BF16,
             )
-            try:
-                torch.manual_seed(0)
-                reference = _Toy().to(torch.bfloat16)
-                program = _Toy().to(torch.bfloat16)
-                program.load_state_dict(reference.state_dict())
-                backend = FSDP2TrainingBackend(
-                    ParallelConfig(
-                        sharding_strategy="SHARD_GRAD_OP",
-                        fsdp_process_group=dist.group.WORLD,
-                    ),
-                    precision=_FSDP2_BF16,
+            backend.prepare_model(program)
+            micro_batches = [
+                torch.randn(8, 64, dtype=torch.bfloat16) * (1 + 3 * index)
+                for index in range(32)
+            ]
+            exact = torch.zeros(64, 64, dtype=torch.float64)
+            in_bf16 = torch.zeros(64, 64, dtype=torch.bfloat16)
+            for index, x in enumerate(micro_batches):
+                # The reference computes each gradient in bf16, as the
+                # runtime does, then sums exactly and in bf16.
+                reference.zero_grad()
+                reference(x).float().pow(2).mean().backward()
+                exact += reference.layer.weight.grad.double()
+                in_bf16 += reference.layer.weight.grad
+                backend.backward(
+                    program(x).float().pow(2).mean(),
+                    is_boundary=index == len(micro_batches) - 1,
                 )
-                backend.prepare_model(program)
-                micro_batches = [
-                    torch.randn(8, 64, dtype=torch.bfloat16) * (1 + 3 * index)
-                    for index in range(32)
-                ]
-                exact = torch.zeros(64, 64, dtype=torch.float64)
-                in_bf16 = torch.zeros(64, 64, dtype=torch.bfloat16)
-                for index, x in enumerate(micro_batches):
-                    # The reference computes each gradient in bf16, as the
-                    # runtime does, then sums exactly and in bf16.
-                    reference.zero_grad()
-                    reference(x).float().pow(2).mean().backward()
-                    exact += reference.layer.weight.grad.double()
-                    in_bf16 += reference.layer.weight.grad
-                    backend.backward(
-                        program(x).float().pow(2).mean(),
-                        is_boundary=index == len(micro_batches) - 1,
-                    )
-                grad = program.layer.weight.grad.full_tensor()
-                self.assertEqual(grad.dtype, torch.float32)
-                fp32_error = (grad.double() - exact).abs().max() / exact.abs().max()
-                bf16_error = (in_bf16.double() - exact).abs().max() / exact.abs().max()
-                self.assertLess(float(fp32_error), 1e-6)
-                self.assertGreater(float(bf16_error), 100 * float(fp32_error))
-            finally:
-                dist.destroy_process_group()
+            grad = program.layer.weight.grad.full_tensor()
+            self.assertEqual(grad.dtype, torch.float32)
+            fp32_error = (grad.double() - exact).abs().max() / exact.abs().max()
+            bf16_error = (in_bf16.double() - exact).abs().max() / exact.abs().max()
+            self.assertLess(float(fp32_error), 1e-6)
+            self.assertGreater(float(bf16_error), 100 * float(fp32_error))
 
 
 class FSDP2PrecisionAndConfigTest(unittest.TestCase):
@@ -629,10 +595,8 @@ class _MatrixAwareOptimizer(torch.optim.Optimizer):
         return None
 
 
-def _registry_worker(rank, world, store_path, out_dir):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
-    )
+def _registry_worker(rank, world, out_dir):
+    del world, out_dir
     backend = None
     backend_b = None
     muon_backend = None
@@ -717,44 +681,32 @@ def _registry_worker(rank, world, store_path, out_dir):
             _toy_step(muon_model, muon_backend, x)
             observed_shapes = list(muon_backend.optimizer.observed_shapes)
 
-        torch.save(
-            {
-                "group_wds": [
-                    g["weight_decay"] for g in backend.optimizer.param_groups
-                ],
-                "lrs_a": lrs_a,
-                "lrs_b": lrs_b,
-                "weights_match": all(
-                    torch.equal(pa.full_tensor(), pb.full_tensor())
-                    for pa, pb in zip(model.parameters(), model_b.parameters())
-                ),
-                "observed_shapes": observed_shapes,
-            },
-            os.path.join(out_dir, f"reg{rank}.pt"),
-        )
+        return {
+            "group_wds": [g["weight_decay"] for g in backend.optimizer.param_groups],
+            "lrs_a": lrs_a,
+            "lrs_b": lrs_b,
+            "weights_match": all(
+                torch.equal(pa.full_tensor(), pb.full_tensor())
+                for pa, pb in zip(model.parameters(), model_b.parameters())
+            ),
+            "observed_shapes": observed_shapes,
+        }
     finally:
         for b in (muon_backend, backend_b, backend):
             if b is not None:
                 b.close()
-        dist.destroy_process_group()
 
 
 @unittest.skipUnless(_GLOO, "needs gloo")
 class FSDP2RegistryIntegrationTest(unittest.TestCase):
     def test_wsd_no_decay_and_custom_matrix_optimizer_on_sharded_fsdp2(self):
-        with tempfile.TemporaryDirectory() as d:
-            store = os.path.join(d, "store")
-            mp.spawn(_registry_worker, args=(2, store, d), nprocs=2)
-            for rank in range(2):
-                report = torch.load(
-                    os.path.join(d, f"reg{rank}.pt"), weights_only=False
-                )
-                self.assertEqual(report["group_wds"], [0.05, 0.0])
-                self.assertEqual(report["lrs_a"], report["lrs_b"])
-                self.assertLess(report["lrs_a"][-1], report["lrs_a"][0])
-                self.assertTrue(report["weights_match"])
-                # proj.weight arrives as a 2-D DTensor with full global shape (6, 4).
-                self.assertIn((True, (6, 4), 2), report["observed_shapes"])
+        for report in spawn_gloo(_registry_worker):
+            self.assertEqual(report["group_wds"], [0.05, 0.0])
+            self.assertEqual(report["lrs_a"], report["lrs_b"])
+            self.assertLess(report["lrs_a"][-1], report["lrs_a"][0])
+            self.assertTrue(report["weights_match"])
+            # proj.weight arrives as a 2-D DTensor with full global shape (6, 4).
+            self.assertIn((True, (6, 4), 2), report["observed_shapes"])
 
 
 @unittest.skipUnless(_GLOO, "needs gloo")
@@ -763,19 +715,12 @@ class FSDP2ProtocolTest(ProtocolChecks, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._dir = tempfile.TemporaryDirectory()
-        dist.init_process_group(
-            "gloo",
-            init_method=f"file://{os.path.join(cls._dir.name, 'store')}",
-            rank=0,
-            world_size=1,
-        )
+        cls._gloo = gloo_single_rank()
+        cls._gloo.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        cls._dir.cleanup()
+        cls._gloo.__exit__(None, None, None)
 
     @staticmethod
     def make_runner(program, spec):
@@ -805,19 +750,12 @@ class FSDP2EquivalentUpdateTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._dir = tempfile.TemporaryDirectory()
-        dist.init_process_group(
-            "gloo",
-            init_method=f"file://{os.path.join(cls._dir.name, 'store')}",
-            rank=0,
-            world_size=1,
-        )
+        cls._gloo = gloo_single_rank()
+        cls._gloo.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        cls._dir.cleanup()
+        cls._gloo.__exit__(None, None, None)
 
     def test_window_and_microbatch_first_update_match_reference(self):
         for reduction in ("window", "microbatch"):
@@ -929,114 +867,98 @@ class _ConditionalBranchModel(nn.Module):
         return out
 
 
-def _nested_and_bf16_grad_worker(rank, world, store_path, out_dir):
+def _nested_and_bf16_grad_worker(rank, world, out_dir):
+    del rank, world, out_dir
     from torch.distributed.fsdp import fully_shard
 
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    # 1. Nested _no_split_modules under FULL_SHARD: bottom-up wrap succeeds,
+    # blocks reshard after forward, root keeps reshard_after_forward=False,
+    # and A=2 accumulation runs cleanly.
+    torch.manual_seed(0)
+    nested = _NestedProgram().to(torch.bfloat16)
+    backend = FSDP2TrainingBackend(
+        ParallelConfig(
+            sharding_strategy="FULL_SHARD",
+            fsdp_process_group=dist.group.WORLD,
+        ),
+        optimizer_spec=_opt_spec(lr=1e-2),
+        scheduler_spec=_sched_spec(),
+        max_grad_norm=1.0,
+        precision=_FSDP2_BF16,
     )
-    try:
-        # 1. Nested _no_split_modules under FULL_SHARD: bottom-up wrap succeeds,
-        # blocks reshard after forward, root keeps reshard_after_forward=False,
-        # and A=2 accumulation runs cleanly.
-        torch.manual_seed(0)
-        nested = _NestedProgram().to(torch.bfloat16)
-        backend = FSDP2TrainingBackend(
-            ParallelConfig(
-                sharding_strategy="FULL_SHARD",
-                fsdp_process_group=dist.group.WORLD,
-            ),
-            optimizer_spec=_opt_spec(lr=1e-2),
-            scheduler_spec=_sched_spec(),
-            max_grad_norm=1.0,
-            precision=_FSDP2_BF16,
-        )
-        backend.prepare_model(
-            nested,
-            blocks=("_OuterBlock", "_InnerBlock"),
-        )
-        x0 = torch.randn(2, 4, dtype=torch.bfloat16)
-        x1 = torch.randn(2, 4, dtype=torch.bfloat16)
-        backend.backward(nested(x0).float().pow(2).mean(), is_boundary=False)
-        backend.backward(nested(x1).float().pow(2).mean(), is_boundary=True)
-        norm_full = backend.step()
+    backend.prepare_model(
+        nested,
+        blocks=("_OuterBlock", "_InnerBlock"),
+    )
+    x0 = torch.randn(2, 4, dtype=torch.bfloat16)
+    x1 = torch.randn(2, 4, dtype=torch.bfloat16)
+    backend.backward(nested(x0).float().pow(2).mean(), is_boundary=False)
+    backend.backward(nested(x1).float().pow(2).mean(), is_boundary=True)
+    norm_full = backend.step()
 
-        root_state = fully_shard.state(nested)
-        outer_state = fully_shard.state(nested.outer)
-        inner_state = fully_shard.state(nested.outer.inner)
-        root_reshards = any(
-            g.post_forward_mesh_info is not None for g in root_state._fsdp_param_groups
-        )
-        outer_reshards = all(
-            g.post_forward_mesh_info is not None for g in outer_state._fsdp_param_groups
-        )
-        inner_reshards = all(
-            g.post_forward_mesh_info is not None for g in inner_state._fsdp_param_groups
-        )
+    root_state = fully_shard.state(nested)
+    outer_state = fully_shard.state(nested.outer)
+    inner_state = fully_shard.state(nested.outer.inner)
+    root_reshards = any(
+        g.post_forward_mesh_info is not None for g in root_state._fsdp_param_groups
+    )
+    outer_reshards = all(
+        g.post_forward_mesh_info is not None for g in outer_state._fsdp_param_groups
+    )
+    inner_reshards = all(
+        g.post_forward_mesh_info is not None for g in inner_state._fsdp_param_groups
+    )
 
-        # 2. gradient_dtype=bf16 opt-in avoids torch 2.14 uniform-dtype assert
-        # when a parameter receives grad only on the boundary micro-batch, and
-        # still delivers fp32 grads to the fp32 DTensor masters.
-        torch.manual_seed(1)
-        cond = _ConditionalBranchModel().to(torch.bfloat16)
-        bf16_grad_precision = PrecisionSpec.resolve(
-            runtime="fsdp2",
-            model_dtype=torch.bfloat16,
-            gradient_dtype=torch.bfloat16,
-        )
-        cond_backend = FSDP2TrainingBackend(
-            ParallelConfig(
-                sharding_strategy="FULL_SHARD",
-                fsdp_process_group=dist.group.WORLD,
-            ),
-            optimizer_spec=_opt_spec(lr=1e-2),
-            scheduler_spec=_sched_spec(),
-            max_grad_norm=1.0,
-            precision=bf16_grad_precision,
-        )
-        cond_backend.prepare_model(cond)
-        cond_backend.backward(
-            cond(x0, use_b=False).float().pow(2).mean(), is_boundary=False
-        )
-        cond_backend.backward(
-            cond(x1, use_b=True).float().pow(2).mean(), is_boundary=True
-        )
-        grad_dtypes = sorted(
-            {str(p.grad.dtype) for p in cond.parameters() if p.grad is not None}
-        )
-        norm_bf16 = cond_backend.step()
+    # 2. gradient_dtype=bf16 opt-in avoids torch 2.14 uniform-dtype assert
+    # when a parameter receives grad only on the boundary micro-batch, and
+    # still delivers fp32 grads to the fp32 DTensor masters.
+    torch.manual_seed(1)
+    cond = _ConditionalBranchModel().to(torch.bfloat16)
+    bf16_grad_precision = PrecisionSpec.resolve(
+        runtime="fsdp2",
+        model_dtype=torch.bfloat16,
+        gradient_dtype=torch.bfloat16,
+    )
+    cond_backend = FSDP2TrainingBackend(
+        ParallelConfig(
+            sharding_strategy="FULL_SHARD",
+            fsdp_process_group=dist.group.WORLD,
+        ),
+        optimizer_spec=_opt_spec(lr=1e-2),
+        scheduler_spec=_sched_spec(),
+        max_grad_norm=1.0,
+        precision=bf16_grad_precision,
+    )
+    cond_backend.prepare_model(cond)
+    cond_backend.backward(
+        cond(x0, use_b=False).float().pow(2).mean(), is_boundary=False
+    )
+    cond_backend.backward(cond(x1, use_b=True).float().pow(2).mean(), is_boundary=True)
+    grad_dtypes = sorted(
+        {str(p.grad.dtype) for p in cond.parameters() if p.grad is not None}
+    )
+    norm_bf16 = cond_backend.step()
 
-        torch.save(
-            {
-                "norm_full_finite": bool(torch.isfinite(norm_full)),
-                "root_reshards": root_reshards,
-                "outer_reshards": outer_reshards,
-                "inner_reshards": inner_reshards,
-                "grad_dtypes": grad_dtypes,
-                "norm_bf16_finite": bool(torch.isfinite(norm_bf16)),
-            },
-            os.path.join(out_dir, f"nested_{rank}.pt"),
-        )
-    finally:
-        dist.destroy_process_group()
+    return {
+        "norm_full_finite": bool(torch.isfinite(norm_full)),
+        "root_reshards": root_reshards,
+        "outer_reshards": outer_reshards,
+        "inner_reshards": inner_reshards,
+        "grad_dtypes": grad_dtypes,
+        "norm_bf16_finite": bool(torch.isfinite(norm_bf16)),
+    }
 
 
 @unittest.skipUnless(_GLOO, "needs gloo")
 class FSDP2NestedBlocksAndBF16GradTest(unittest.TestCase):
     def test_nested_blocks_full_shard_and_bf16_gradient_dtype_opt_in(self):
-        with tempfile.TemporaryDirectory() as d:
-            store = os.path.join(d, "store")
-            mp.spawn(_nested_and_bf16_grad_worker, args=(2, store, d), nprocs=2)
-            for rank in range(2):
-                report = torch.load(
-                    os.path.join(d, f"nested_{rank}.pt"), weights_only=False
-                )
-                self.assertTrue(report["norm_full_finite"])
-                self.assertFalse(report["root_reshards"])
-                self.assertTrue(report["outer_reshards"])
-                self.assertTrue(report["inner_reshards"])
-                self.assertEqual(report["grad_dtypes"], ["torch.float32"])
-                self.assertTrue(report["norm_bf16_finite"])
+        for report in spawn_gloo(_nested_and_bf16_grad_worker):
+            self.assertTrue(report["norm_full_finite"])
+            self.assertFalse(report["root_reshards"])
+            self.assertTrue(report["outer_reshards"])
+            self.assertTrue(report["inner_reshards"])
+            self.assertEqual(report["grad_dtypes"], ["torch.float32"])
+            self.assertTrue(report["norm_bf16_finite"])
 
     def test_unknown_blocks_fails_before_fp32_mutation_or_mesh_creation(self):
         model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
