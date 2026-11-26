@@ -362,8 +362,8 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
             window_size=(-1, -1),
             alibi_slopes=None,
             deterministic=False,
+            return_fp32_dq=True,
         )
-        dq = dq.float()
         dcache_k[:, 0] = dk0.float()
         dcache_v[:, 0] = dv0.float()
 
