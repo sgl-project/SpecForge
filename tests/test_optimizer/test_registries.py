@@ -93,7 +93,7 @@ class OptimizerRegistryTest(unittest.TestCase):
     def test_custom_optimizer_and_policy_registration(self):
         seen_names = []
 
-        def custom_policy(named_params, spec):
+        def custom_policy(named_params, spec, *, param_ndims):
             seen_names.extend(name for name, _ in named_params)
             return [{"params": [p for _, p in named_params], "lr": spec.lr}]
 

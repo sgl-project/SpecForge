@@ -245,10 +245,8 @@ class Trainer:
                 num_epochs=num_epochs,
             )
 
-        if optimizer_factory is not None and optimizer_spec is not None:
-            raise ValueError(
-                "pass either optimizer_factory or optimizer_spec, not both"
-            )
+        if (optimizer_factory is None) == (optimizer_spec is None):
+            raise ValueError("pass exactly one of optimizer_factory or optimizer_spec")
         if optimizer_spec is not None:
             if scheduler_spec is None:
                 raise ValueError("optimizer_spec requires scheduler_spec")
@@ -269,17 +267,11 @@ class Trainer:
                     "optimizer/controller schedule mismatch: "
                     f"{scheduler_spec.total_steps} != {effective_total_steps}"
                 )
-        else:
-            configure_schedule = getattr(
-                optimizer_factory, "configure_total_steps", None
+        elif scheduler_spec is not None or max_grad_norm is not None:
+            raise ValueError(
+                "scheduler_spec and max_grad_norm come with optimizer_spec; an "
+                "optimizer_factory builds its own schedule and clipping"
             )
-            if effective_total_steps is None and configure_schedule is not None:
-                raise ValueError(
-                    "a configured optimizer on a streaming source requires total_steps "
-                    "or max_steps"
-                )
-            if configure_schedule is not None:
-                configure_schedule(effective_total_steps)
 
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
@@ -524,16 +516,13 @@ class Trainer:
             sharding_strategy=fsdp_sharding,
             ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
-        backend_kwargs: dict[str, object] = {}
-        if optimizer_factory is not None:
-            backend_kwargs["optimizer_factory"] = optimizer_factory
-        if optimizer_spec is not None:
-            backend_kwargs["optimizer_spec"] = optimizer_spec
-        if scheduler_spec is not None:
-            backend_kwargs["scheduler_spec"] = scheduler_spec
-        if max_grad_norm is not None:
-            backend_kwargs["max_grad_norm"] = max_grad_norm
-        backend = FSDPTrainingBackend(parallel, **backend_kwargs)
+        backend = FSDPTrainingBackend(
+            parallel,
+            optimizer_factory=optimizer_factory,
+            optimizer_spec=optimizer_spec,
+            scheduler_spec=scheduler_spec,
+            max_grad_norm=max_grad_norm,
+        )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).

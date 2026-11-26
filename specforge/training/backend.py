@@ -224,15 +224,10 @@ class FSDPTrainingBackend(TrainingBackend):
         return self.parallel_config.fsdp_process_group
 
     def learning_rate(self) -> Any:
-        if self.optimizer is None:
-            return None
         get_learning_rate = getattr(self.optimizer, "get_learning_rate", None)
         if callable(get_learning_rate):
             return get_learning_rate()
-        if (
-            isinstance(self.optimizer, torch.optim.Optimizer)
-            and self.optimizer.param_groups
-        ):
+        if isinstance(self.optimizer, torch.optim.Optimizer):
             return self.optimizer.param_groups[0]["lr"]
         return None
 

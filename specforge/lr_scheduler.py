@@ -267,10 +267,7 @@ class FunctionalLRScheduler(_LRScheduler):
     def load_state_dict(self, state_dict):
         self.last_epoch = int(state_dict["last_epoch"])
         self.base_lrs = list(state_dict["base_lrs"])
-        last_lr = state_dict.get("_last_lr")
-        if last_lr is None:
-            last_lr = self.get_lr()
-        self._last_lr = list(last_lr)
+        self._last_lr = list(state_dict["_last_lr"])
         for group, lr in zip(self.optimizer.param_groups, self._last_lr):
             group["lr"] = lr
 

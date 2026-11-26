@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import math
 from typing import (
@@ -88,7 +87,7 @@ def validate_step_scalars(
     max_grad_norm: float,
     loss_denominator: Optional[torch.Tensor] = None,
     extra_scalars: Sequence[torch.Tensor] = (),
-    on_error: Optional[Callable[[], None]] = None,
+    on_error: Callable[[], None],
 ) -> List[float]:
     """Validate global grad norm and optional loss denominator in one host read.
 
@@ -109,12 +108,10 @@ def validate_step_scalars(
     if loss_denominator is not None:
         denominator = host_values[-1]
         if not math.isfinite(denominator) or denominator <= 0:
-            if on_error is not None:
-                on_error()
+            on_error()
             raise ValueError("global loss denominator must be finite and positive")
     if not math.isfinite(host_values[0]):
-        if on_error is not None:
-            on_error()
+        on_error()
         raise FloatingPointError(
             "refusing optimizer step with non-finite global grad norm "
             f"(max_grad_norm={max_grad_norm})"
@@ -159,17 +156,13 @@ def restore_optimizer_kernel_state(
 
 
 def _default_param_groups(
-    named_params: Sequence[Tuple[str, nn.Parameter]], spec: OptimizerSpec
+    named_params: Sequence[Tuple[str, nn.Parameter]],
+    spec: OptimizerSpec,
+    *,
+    param_ndims: Optional[Mapping[int, int]] = None,
 ) -> List[Dict[str, Any]]:
-    del spec
+    del spec, param_ndims
     return [{"params": [param for _, param in named_params]}]
-
-
-def _accepts_param_ndims(policy: Callable[..., Any]) -> bool:
-    params = inspect.signature(policy).parameters
-    return "param_ndims" in params or any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
 
 
 def _fsdp1_param_ndims(module: nn.Module) -> Dict[int, int]:
@@ -208,13 +201,10 @@ def _no_decay_1d_param_groups(
         groups.append({"params": decay, "weight_decay": spec.weight_decay})
     if no_decay:
         groups.append({"params": no_decay, "weight_decay": 0.0})
-    return groups or [{"params": []}]
+    return groups
 
 
-_PARAM_GROUP_POLICIES: Dict[
-    str,
-    Callable[[Sequence[Tuple[str, nn.Parameter]], OptimizerSpec], List[Dict[str, Any]]],
-] = {
+_PARAM_GROUP_POLICIES: Dict[str, Callable[..., List[Dict[str, Any]]]] = {
     "default": _default_param_groups,
     "no_decay_1d": _no_decay_1d_param_groups,
 }
@@ -222,13 +212,16 @@ _PARAM_GROUP_POLICIES: Dict[
 
 def register_param_group_policy(
     name: str,
-    policy: Callable[
-        [Sequence[Tuple[str, nn.Parameter]], OptimizerSpec], List[Dict[str, Any]]
-    ],
+    policy: Callable[..., List[Dict[str, Any]]],
     *,
     override: bool = False,
 ) -> None:
-    """Register a parameter-grouping policy under ``name``."""
+    """Register a parameter-grouping policy under ``name``.
+
+    A policy is called as ``policy(named_params, spec, *, param_ndims)``.
+    ``param_ndims`` maps ``id(param)`` to the parameter's rank before a
+    sharding wrapper flattened it, or is None when nothing was flattened.
+    """
     if not name:
         raise ValueError("param_group_policy name must be non-empty")
     if name in _PARAM_GROUP_POLICIES and not override:
@@ -259,9 +252,9 @@ def build_param_groups(
             f"expected one of {sorted(_PARAM_GROUP_POLICIES)}"
         )
     trainable = [(name, p) for name, p in named_params if p.requires_grad]
-    if param_ndims is not None and _accepts_param_ndims(policy):
-        return policy(trainable, spec, param_ndims=param_ndims)
-    return policy(trainable, spec)
+    if not trainable:
+        raise ValueError("the optimizer's target has no trainable parameter")
+    return policy(trainable, spec, param_ndims=param_ndims)
 
 
 # ---------------------------------------------------------------------------
