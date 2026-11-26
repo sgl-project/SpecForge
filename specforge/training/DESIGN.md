@@ -80,15 +80,14 @@ Every module that breaks a rule today is listed in the test with the reason
 and with each forbidden name it reaches. A name that communicates or reads
 the process-global topology is listed with how many times; one use more or
 one fewer fails. A type, a constant or a query of the process's own rank or
-of a group's size is listed by name only. Five are a model-parallel axis
-(sequence parallelism: the rollout, ring attention; tensor parallelism: three
-layers), whose groups share a sequence or a tensor and never samples. Four are
-the run loop's own uses of the process group (`controller.py`,
-`checkpoint.py`, `profiling.py`, `trainer.py`). The design moves the reads to
-a topology value and the error gathers to `runner.agree`; rank 0's two
-broadcast verdicts (whether an evaluation runs, whether a checkpoint is the
-best) need either a way to distribute a decision or every rank computing it,
-which the contract does not have yet.
+of a group's size is listed by name only. Two are the sequence-parallel axis
+(the rollout, ring attention), whose groups share a sequence and never
+samples. Four are the run loop's own uses of the process group
+(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`). The design
+moves the reads to a topology value and the error gathers to `runner.agree`;
+rank 0's two broadcast verdicts (whether an evaluation runs, whether a
+checkpoint is the best) need either a way to distribute a decision or every
+rank computing it, which the contract does not have yet.
 
 ### Conformance
 

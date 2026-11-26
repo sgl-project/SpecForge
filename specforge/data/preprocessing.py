@@ -20,8 +20,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
-import io
 import json
 import os
 import re
@@ -30,12 +28,10 @@ from collections import Counter
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from ..distributed import get_draft_sp_group, get_sp_ring_group
 from .loss_mask import has_consecutive_supervised_tokens
 from .parse import (
     DeepSeekV4Parser,
@@ -382,218 +378,6 @@ def build_eagle3_dataset(
 
     dataset.set_format(type="torch")
     return dataset
-
-
-# ==============================
-# Offline Eagle3 Dataset
-# ==============================
-# modified from https://github.com/NickL77/BaldEagle/blob/master/train/modules/data/data.py
-def list_local_files(path, suffixes=None):
-    if suffixes is None:
-        suffixes = [".ckpt", ".ckpt.gz"]
-    datapaths = []
-    for root, directories, files in os.walk(path):
-        for file in files:
-            file_path = os.path.join(root, file)
-            datapaths.append(file_path)
-    if suffixes:
-        datapaths = [
-            f_name
-            for f_name in datapaths
-            if any(f_name.endswith(suffix) for suffix in suffixes)
-        ]
-    datapaths.sort()  # Sort to ensure deterministic order across ranks
-    return datapaths
-
-
-class OfflineEagle3Dataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        datapath,
-        transform=None,
-        max_len=2048,
-        ttt_length=1,
-        use_usp_preprocess=False,
-    ):
-        """
-        Args:
-            datapath: List of file paths.
-            transform: Optional transform to apply.
-            max_len: Maximum sequence length to load.
-            ttt_length: TTT overlap length used in USP preprocessing.
-            use_usp_preprocess: Whether to shard all sequences with USP overlap in preprocessing.
-        """
-        self.datapaths = datapath
-        self.transform = transform
-        self._epoch = 0
-        self.max_len = max_len
-        self.ttt_length = ttt_length
-        self.use_usp_preprocess = use_usp_preprocess
-        if use_usp_preprocess:
-            sp_group = get_draft_sp_group()
-            self.sp_rank = torch.distributed.get_rank(sp_group)
-            self.sp_size = torch.distributed.get_world_size(sp_group)
-            ring_group = get_sp_ring_group()
-            self.ring_rank = torch.distributed.get_rank(ring_group)
-            self.sp_ring_size = torch.distributed.get_world_size(ring_group)
-
-    @staticmethod
-    def process_data(data, max_len, transform=None):
-        new_data = {}
-        # Squeeze due to our data generation script adding a batch dimension
-        hidden_state = data["aux_hidden_state"].squeeze(0)[:max_len][None, :]
-        target = data["hidden_state"].squeeze(0)[:max_len][None, :]
-
-        input_ids = data["input_ids"][:max_len][None, :]
-        loss_mask = data["loss_mask"][:max_len][None, :]
-        loss_mask[0, -1] = 0
-
-        new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
-        new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
-        new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
-        if transform:
-            new_data = transform(new_data)
-        return new_data
-
-    @staticmethod
-    def process_data_usp(
-        data,
-        max_len,
-        ttt_length=1,
-        transform=None,
-        sp_rank=0,
-        sp_size=1,
-        ring_rank=0,
-        sp_ring_size=1,
-    ):
-        """
-        USP preprocess: shard all sequences by sp_rank and add TTT overlap.
-        Each local sequence length = ceil(max_len / sp_size) + ttt_length.
-        """
-        new_data = {}
-
-        input_ids = data["input_ids"]
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-
-        global_len = min(max_len, input_ids.shape[1])
-        chunk_size = (global_len + sp_size - 1) // sp_size
-        start = sp_rank * chunk_size
-        local_len = chunk_size + ttt_length
-
-        end = min(start + local_len, global_len)
-
-        def _slice_and_pad(tensor):
-            if tensor.ndim == 1:
-                tensor = tensor.unsqueeze(0)
-            tensor = tensor[:, :global_len]
-            sliced = tensor[:, start : min(end, tensor.shape[1])]
-            valid_len = sliced.shape[1]
-            if valid_len < local_len:
-                pad_len = local_len - valid_len
-                if tensor.ndim == 2:
-                    sliced = F.pad(sliced, (0, pad_len))
-                else:
-                    sliced = F.pad(sliced, (0, 0, 0, pad_len))
-            return sliced.contiguous(), valid_len
-
-        if "aux_hidden_state" not in data or data["aux_hidden_state"] is None:
-            raise KeyError("aux_hidden_state is required for OfflineEagle3Dataset")
-        new_data["hidden_state"], _ = _slice_and_pad(data["aux_hidden_state"])
-        new_data["target"], _ = _slice_and_pad(data["hidden_state"])
-
-        new_data["input_ids"], valid_len = _slice_and_pad(input_ids)
-
-        full_loss_mask = data["loss_mask"]
-        if full_loss_mask.ndim == 1:
-            full_loss_mask = full_loss_mask.unsqueeze(0)
-
-        full_loss_mask = full_loss_mask[:, :global_len].clone()
-        if full_loss_mask.numel() > 0:
-            full_loss_mask[0, -1] = 0
-        new_data["loss_mask"], _ = _slice_and_pad(full_loss_mask)
-
-        local_len = new_data["input_ids"].shape[1]
-        attention_mask = torch.zeros((1, local_len), dtype=torch.long)
-        attention_mask[:, :valid_len] = 1
-        new_data["attention_mask"] = attention_mask
-
-        # RoPE runs on local Q/K before Ulysses all-to-all. Each rank needs
-        # the global positions of its own chunk, excluding rollout overlap.
-        # Preserve both Ring-block and Ulysses-peer offsets.
-        sp_ulysses_size = max(1, sp_size // sp_ring_size)
-        usp_chunk_size = max(local_len - ttt_length, 0)
-        ring_chunk = usp_chunk_size * sp_ulysses_size
-        ulysses_rank = sp_rank % sp_ulysses_size
-        ring_start = ring_rank * ring_chunk + ulysses_rank * usp_chunk_size
-        new_data["position_ids"] = torch.arange(
-            ring_start, ring_start + usp_chunk_size, dtype=torch.long
-        ).unsqueeze(0)
-
-        if transform:
-            new_data = transform(new_data)
-
-        return new_data
-
-    def __len__(self):
-        return len(self.datapaths)
-
-    def _open_file(self, index):
-        """
-        Opens the file with memory mapping.
-        This operation is virtually instant and consumes negligible RAM
-        because no data is actually read from disk yet.
-        """
-        data_path = self.datapaths[index]
-        if data_path.endswith(".gz"):
-            with gzip.open(data_path, "rb") as f:
-                return torch.load(io.BytesIO(f.read()), weights_only=False)
-        return torch.load(data_path, weights_only=False, mmap=True)
-
-    def __getitem__(self, index):
-        try:
-            data = self._open_file(index)
-        except Exception as e:
-            print(f"ERROR Failed to load {self.datapaths[index]} with error {e}")
-            data = self._open_file(0)
-
-        # 2. Read only specific bytes from disk
-        if self.use_usp_preprocess:
-            return self.process_data_usp(
-                data,
-                self.max_len,
-                ttt_length=self.ttt_length,
-                transform=self.transform,
-                sp_rank=self.sp_rank,
-                sp_size=self.sp_size,
-                ring_rank=self.ring_rank,
-                sp_ring_size=self.sp_ring_size,
-            )
-        return self.process_data(
-            data,
-            self.max_len,
-            self.transform,
-        )
-
-    def set_epoch(self, epoch):
-        self._epoch = epoch
-
-
-def build_offline_eagle3_dataset(
-    hidden_states_path: str,
-    max_len: int = 2048,
-    ttt_length: int = 1,
-    use_usp_preprocess: bool = False,
-) -> torch.utils.data.Dataset:
-
-    return OfflineEagle3Dataset(
-        list_local_files(hidden_states_path),
-        max_len=max_len,
-        ttt_length=ttt_length,
-        use_usp_preprocess=use_usp_preprocess,
-    )
 
 
 # ==============================

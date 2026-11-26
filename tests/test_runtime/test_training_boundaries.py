@@ -100,7 +100,6 @@ class Rule:
 
 
 _T = "torch.distributed"
-_S = "specforge.distributed"
 
 #: Names under ``torch.distributed`` that issue no communication: types,
 #: constants, and queries of the process's own rank and of a group's size.
@@ -129,11 +128,11 @@ def _counted(name: str) -> bool:
 
 
 #: Modules that reach a process group today. The counts include what a helper
-#: of the package brings: every use of ``shard_tensor`` counts as the group
-#: reads in its body.
+#: of the package brings: every use of a helper counts as the group reads in
+#: its body.
 EXCEPTED_COLLECTIVES = {
-    # A model-parallel axis: ranks of one group share a sequence or a tensor,
-    # never samples.
+    # The sequence-parallel axis: ranks of one group share a sequence, never
+    # samples.
     "specforge/modeling/draft/models/eagle_rollout.py": Excepted(
         "sequence-parallel axis: asks whether the rollout's ring group has more "
         "than one rank",
@@ -154,34 +153,6 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.get_rank",
             f"{_T}.get_world_size",
         ),
-    ),
-    "specforge/layers/embedding.py": Excepted(
-        "tensor-parallel axis: an embedding sharded over the group, summed back",
-        {
-            f"{_T}.all_reduce": 1,
-            f"{_S}.get_tp_group": 2,
-            f"{_S}.shard_tensor": 2,
-        },
-        reads=(
-            _T,
-            f"{_T}.ReduceOp.SUM",
-            f"{_T}.get_rank",
-            f"{_T}.get_world_size",
-        ),
-    ),
-    "specforge/layers/linear.py": Excepted(
-        "tensor-parallel axis: linear layers sharded over the group",
-        {f"{_S}.get_tp_group": 3, f"{_S}.shard_tensor": 14},
-        reads=(_T, f"{_T}.get_rank", f"{_T}.get_world_size"),
-    ),
-    "specforge/layers/lm_head.py": Excepted(
-        "tensor-parallel axis: a head sharded over the group, gathered back",
-        {
-            f"{_T}.all_gather": 1,
-            f"{_S}.get_tp_group": 2,
-            f"{_S}.shard_tensor": 3,
-        },
-        reads=(_T, f"{_T}.get_rank", f"{_T}.get_world_size"),
     ),
     # Not a model-parallel axis: the run loop's and its helpers' own uses of
     # the process group, which the design moves to the runner and to a
@@ -656,7 +627,6 @@ class TrainingBoundaryTest(unittest.TestCase):
             self.assertTrue(_counted(f"torch.distributed.{name}"), name)
         # Topology read from the process counts too, through its helpers.
         self.assertTrue(_counted("specforge.distributed.get_tp_group"))
-        self.assertTrue(_counted("specforge.distributed.shard_tensor"))
         for name in ("get_rank", "is_initialized", "ProcessGroup", "ReduceOp.SUM"):
             self.assertFalse(_counted(f"torch.distributed.{name}"), name)
         self.assertFalse(_counted("torch.distributed"))
