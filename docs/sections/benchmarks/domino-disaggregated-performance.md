@@ -177,4 +177,4 @@ Production runs expose the typed `profiling` configuration (`enabled`,
 `start_step`, `num_steps`, and `record_shapes`) for bounded PyTorch traces on
 trainer ranks. The component timers used to collect this benchmark were
 temporary measurement instrumentation and are not runtime environment APIs.
-`FSDP_SHARDING=NO_SHARD` remains available for controlled sharding comparisons.
+`training.fsdp_sharding=NO_SHARD` remains available for controlled sharding comparisons.
