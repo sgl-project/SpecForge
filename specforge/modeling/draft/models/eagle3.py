@@ -74,17 +74,17 @@ class Eagle3DraftModel(DraftPreTrainedModel):
 
         Args:
             backend: Configured attention backend name. "fa" and "usp" select
-                the cached Flash/USP kernels; any other name selects that dense
-                backend for the merged cache.
+                the cached Flash/USP kernels; any other name selects the
+                requested backend for the merged cache.
         """
         from ..layers.attention.gqa import GQAAttention
-        from .eagle_rollout import EagleRollout, FullEagleRollout
+        from .eagle_rollout import EagleRollout
 
         attention = self.backbone.layers[0].self_attn
         if not isinstance(attention, GQAAttention):
             if backend in ("fa", "usp"):
                 raise ValueError("cached Flash/USP requires GQA/MHA")
-            return FullEagleRollout(self)
+            raise ValueError("EAGLE3 rollout requires GQA/MHA attention")
         if backend in ("fa", "usp") and (
             not attention.config.is_causal
             or attention.config.sliding_window is not None
