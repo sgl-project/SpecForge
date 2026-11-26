@@ -697,6 +697,9 @@ class TrainerController:
                 ),
                 **self.checkpoint_extra,
             }
+            if "canonical_loss_implementations" in shared:
+                # Write the exact kernel snapshot that was agreed across ranks above.
+                shared["canonical_loss_implementations"] = dict(state.kernels)
             if state.replicated is not None:
                 # Saved once in the shared payload; the rank files still keep
                 # each rank's own state.
