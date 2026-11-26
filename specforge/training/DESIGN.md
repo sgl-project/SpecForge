@@ -114,12 +114,16 @@ which the contract does not have yet.
   in flight; a complete run does not raise.
 - `RunnerChecks`: one job per declaration in one process, compared with the
   reference runner bit for bit: every update's metrics, gradient norm,
-  learning rate and weights, and the exported draft, the optimizer state and
-  the generator at the end. The program's loss reads the step and the noise
-  it draws, its replay statistic depends on the mode and the generator of the
-  prepass, and one job runs in bfloat16, where the optimizer's fp32 masters
-  hold more than the weights. Plus the single-use handle, a refused batch,
-  evaluation, and resume in bfloat16 through two further updates.
+  learning rate and weights, and the exported draft and the generator at the
+  end. The optimizer state is not compared across runners: what a runner
+  resumes from is its own to lay out, and the resume job holds it to the
+  runner's own uninterrupted run. The program's loss reads the step, the
+  run's length and the noise it draws, detailed metrics are asked for on
+  every second update, its replay statistic depends on the mode and the
+  generator of the prepass, and one job runs in bfloat16, where the
+  optimizer's fp32 masters hold more than the weights. Plus the single-use
+  handle, a refused batch, evaluation, and resume in bfloat16 through two
+  further updates.
 
 A new runner adds two test classes that set `make_runner`; those hold it in
 one process, on the host. Not in the kit: a recorded case with sequence
