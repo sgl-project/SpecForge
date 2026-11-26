@@ -44,6 +44,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Sequence
 
@@ -58,6 +59,23 @@ _FAILED_SUFFIX = ".failed"
 _CONSUMER_DONE_SUFFIX = ".consumer_done"
 _CONSUMER_FAILED_SUFFIX = ".consumer_failed"
 _CONSUMER_QUANTUM_SUFFIX = ".consumer_quantum"
+
+
+def atomic_write_text(path: str, content: str, *, fsync: bool = True) -> None:
+    """Atomically write ``content`` to ``path``, unlinking the temp file on error."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp.{uuid.uuid4().hex}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            if fsync:
+                stream.flush()
+                os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 @dataclass
@@ -289,12 +307,7 @@ class StreamingRefChannel:
         return value
 
     def _write_sidecar(self, suffix: str, value: str) -> None:
-        tmp = f"{self.path}{suffix}.tmp.{os.getpid()}"
-        with open(tmp, "w", encoding="utf-8") as stream:
-            stream.write(value)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, self.path + suffix)
+        atomic_write_text(self.path + suffix, value, fsync=True)
 
     def _read_sidecar(self, suffix: str) -> Optional[str]:
         try:
@@ -343,6 +356,9 @@ class StreamingRefChannel:
         for attempt in range(3):
             out: List[SampleRef] = []
             next_offset = self._read_offset
+            # Check closure before reading so a closed channel is guaranteed
+            # to contain every byte written prior to close().
+            closed = os.path.exists(self.path + _CLOSED_SUFFIX)
             try:
                 with open(self.path, "rb") as stream:
                     if attempt and hasattr(os, "posix_fadvise"):
@@ -359,8 +375,12 @@ class StreamingRefChannel:
                     end_offset = stream.seek(0, os.SEEK_END)
                     stream.seek(self._read_offset)
                     chunk = stream.read(max(0, end_offset - self._read_offset))
-                for line in chunk.split(b"\n")[:-1]:
+                parts = chunk.split(b"\n")
+                trailing = parts.pop()
+                truncated_by_limit = False
+                for line in parts:
                     if max_n is not None and len(out) >= max_n:
+                        truncated_by_limit = True
                         break
                     if line.strip():
                         raw = json.loads(line.decode("utf-8"))
@@ -374,6 +394,20 @@ class StreamingRefChannel:
 
                         out.append(ref)
                     next_offset += len(line) + 1
+                if closed and not truncated_by_limit and trailing:
+                    try:
+                        trailing.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(
+                            f"StreamingRefChannel {self.path}: closed channel ended "
+                            f"with incomplete UTF-8 ({len(trailing)} bytes) at "
+                            f"byte offset {next_offset}"
+                        ) from exc
+                    raise ValueError(
+                        f"StreamingRefChannel {self.path}: closed channel ended with "
+                        f"an incomplete trailing record ({len(trailing)} bytes) at "
+                        f"byte offset {next_offset}"
+                    )
             except FileNotFoundError:
                 return []
             except (json.JSONDecodeError, UnicodeDecodeError) as error:
@@ -398,13 +432,10 @@ class StreamingRefChannel:
     def _store_consumed(self, count: int, num_bytes: Optional[int]) -> None:
         # Caller holds _consumed_lock. Publish count and bytes together so a
         # producer cannot observe half an acknowledgement, including on resume.
-        tmp = f"{self.path}{_CONSUMED_SUFFIX}.tmp.{os.getpid()}.{threading.get_ident()}"
-        with open(tmp, "w") as stream:
-            json.dump(
-                count if num_bytes is None else {"count": count, "bytes": num_bytes},
-                stream,
-            )
-        os.replace(tmp, self.path + _CONSUMED_SUFFIX)
+        payload = json.dumps(
+            count if num_bytes is None else {"count": count, "bytes": num_bytes}
+        )
+        atomic_write_text(self.path + _CONSUMED_SUFFIX, payload, fsync=False)
         self._consumed, self._consumed_bytes = count, num_bytes
 
     def mark_consumed(self, n: int, *, num_bytes: Optional[int] = None) -> None:
@@ -636,4 +667,9 @@ class StreamingRefQueue:
             return [ref.sample_id for ref in self._inflight]
 
 
-__all__ = ["RefPublishTransaction", "StreamingRefChannel", "StreamingRefQueue"]
+__all__ = [
+    "RefPublishTransaction",
+    "StreamingRefChannel",
+    "StreamingRefQueue",
+    "atomic_write_text",
+]

@@ -303,6 +303,75 @@ class ArenaObjectClientTest(unittest.TestCase):
         self.adapter.produce_refs([_task(1, 5)], capture=_eagle3_contract())
         self.assertEqual(self.info_requests, ["http://server:30000/server_info"])
 
+    def test_close_closes_and_clears_control_connections(self):
+        (ref,) = self._refs(4)
+        self.store.abort(ref.sample_id, reason="done")
+        connections = list(self.client._connections.values())
+        self.assertEqual(len(connections), 1)
+        self.assertNotEqual(connections[0].fileno(), -1)
+
+        self.assertEqual(self.client.close(), 0)
+        self.assertEqual(self.client._connections, {})
+        self.assertEqual(connections[0].fileno(), -1)
+        # Idempotent second close
+        self.assertEqual(self.client.close(), 0)
+
+    def test_remove_after_close_does_not_reopen_control_socket(self):
+        (ref,) = self._refs(4)
+        self.assertEqual(self.client.close(), 0)
+        key = f"run0/{ref.sample_id}/g1/hidden_state"
+        self.assertEqual(self.client.remove(key), -1)
+        self.assertEqual(self.client._connections, {})
+
+    def test_aborted_nvlink_read_defers_arena_free_and_leaves_no_stale_routes(self):
+        (ref,) = self._refs(5)
+        feature_name = next(iter(ref.feature_specs))
+        in_read = threading.Event()
+        release_read = threading.Event()
+
+        def blocking_read(session, ptr, address, nbytes):
+            in_read.set()
+            release_read.wait(timeout=5.0)
+            ctypes.memmove(ptr, address, nbytes)
+            return 0
+
+        errors = []
+
+        def reader():
+            try:
+                self.store.get(ref, names=[feature_name])
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(
+            self.engine, "transfer_sync_read", side_effect=blocking_read
+        ):
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            self.assertTrue(in_read.wait(timeout=2.0))
+            self.store.abort(ref.sample_id, reason="aborted-during-read")
+            # Physical free is deferred while the read is still using the arena span.
+            key = f"run0/{ref.sample_id}/g1/{feature_name}"
+            self.assertIn(key, self.arena.objects)
+            release_read.set()
+            thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], KeyError)
+        # Once the read exits, deferred reclamation frees the server arena and routing entries.
+        for name in ref.feature_specs:
+            self.assertTrue(self.arena.wait_freed(f"run0/{ref.sample_id}/g1/{name}"))
+        self.assertEqual(self.arena.objects, {})
+        self.assertEqual(self.client._objects, {})
+        self.assertEqual(self.client._object_controls, {})
+
+        # A subsequent get() after abort must not repopulate arena routing entries.
+        with self.assertRaises(KeyError):
+            self.store.get(ref)
+        self.assertEqual(self.client._objects, {})
+        self.assertEqual(self.client._object_controls, {})
+
 
 class ArenaStoreFactoryTest(unittest.TestCase):
     def _cfg(self, receive_buffers):

@@ -656,6 +656,62 @@ class TestStreamingRefChannel(unittest.TestCase):
         self.assertEqual(queue.in_flight_ids(), [])
         self.assertEqual([ref.sample_id for ref in queue.get(1)], ["s0"])
 
+    def test_write_sidecar_uses_unique_temp_filenames_for_same_pid(self):
+        channel = StreamingRefChannel(self.path)
+        sources = []
+        real_replace = os.replace
+
+        def record_replace(src, dst):
+            sources.append(src)
+            return real_replace(src, dst)
+
+        with mock.patch(
+            "specforge.runtime.data_plane.streaming_ref_channel.os.replace",
+            side_effect=record_replace,
+        ):
+            channel.mark_consumer_failed("rank 1 failed")
+            channel.mark_consumer_failed("rank 2 failed")
+
+        self.assertEqual(len(sources), 2)
+        self.assertNotEqual(sources[0], sources[1])
+
+    def test_closed_channel_rejects_trailing_incomplete_record(self):
+        for case, payload in (
+            ("mid_utf8", "样本".encode("utf-8")[:2]),
+            ("partial_jsonl", b'{"sample_id": "s0"'),
+        ):
+            with self.subTest(case=case):
+                path = os.path.join(self.dir, f"truncated-{case}.jsonl")
+                producer = StreamingRefChannel(path)
+                with open(path, "wb") as stream:
+                    stream.write(payload)
+                producer.close()
+                queue = StreamingRefQueue(StreamingRefChannel(path), poll_s=0.0)
+                with self.assertRaises(ValueError):
+                    queue.get(1)
+
+    def test_failed_sidecar_write_unlinks_temp_file(self):
+        channel = StreamingRefChannel(self.path)
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.replace",
+                side_effect=OSError("disk full"),
+            ),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            channel.mark_consumer_failed("boom")
+        self.assertEqual(os.listdir(self.dir), [])
+
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.streaming_ref_channel.os.replace",
+                side_effect=OSError("consumed disk full"),
+            ),
+            self.assertRaisesRegex(OSError, "consumed disk full"),
+        ):
+            channel.mark_consumed(1)
+        self.assertEqual(os.listdir(self.dir), [])
+
 
 if __name__ == "__main__":
     unittest.main()

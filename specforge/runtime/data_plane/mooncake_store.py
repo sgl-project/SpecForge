@@ -64,6 +64,7 @@ import threading
 import time
 import uuid
 import weakref
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -569,6 +570,7 @@ class MooncakeFeatureStore(FeatureStore):
         *,
         store_id: Optional[str] = None,
         store: Optional[Any] = None,
+        close_store: bool = False,
         setup_kwargs: Optional[Dict[str, Any]] = None,
         auth: Optional[AuthPolicy] = None,
         credential: Optional[str] = None,
@@ -588,7 +590,14 @@ class MooncakeFeatureStore(FeatureStore):
         self.auth.check(credential)  # attach-time gate (B9)
         self.store_id = store_id or uuid.uuid4().hex[:8]
         self._owns_store = store is None
+        self._close_store = bool(close_store) or self._owns_store
+        self._closing = False
         self._closed = False
+        self._closed_event = threading.Event()
+        self._external_attempts_closed = False
+        self._inflight_ops = 0
+        self._inflight_external_attempts = 0
+        self._inflight_reads: Dict[Tuple[str, int], int] = {}
         if store is None:
             kw = dict(_MOONCAKE_SETUP_DEFAULTS)
             kw.update(setup_kwargs or {})
@@ -686,6 +695,7 @@ class MooncakeFeatureStore(FeatureStore):
         # shared index would own this in the online multi-node follow-up.
         self._freed: set = set()
         self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
         self._counter = 0
         self._gen_counter = 0
         self._stats = {"force_freed": 0, "force_freed_bytes": 0}
@@ -748,46 +758,75 @@ class MooncakeFeatureStore(FeatureStore):
         )
         return torch.device("cuda", index)
 
+    @contextmanager
+    def _admit_op(self):
+        """Coordinate RPC admission with close() so teardown waits for active ops."""
+        with self._cond:
+            if self._closing or self._closed:
+                raise RuntimeError("Mooncake feature store is closed")
+            self._inflight_ops += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._inflight_ops -= 1
+                if self._inflight_ops == 0:
+                    self._cond.notify_all()
+
     def close(self) -> None:
         """Release receive memory after loaders and removal drains have stopped.
 
-        An injected/shared backend is never closed here. Its failed-transfer
-        buffers stay quarantined because its owner may still be using transport.
+        An injected/shared backend is closed only when ``close_store=True`` is
+        requested explicitly. Failed-transfer buffers stay quarantined unless
+        the store owns and stops the native transport.
         """
-        if self._closed:
-            return
+        with self._cond:
+            if self._closed:
+                return
+            self._closing = True
+            self._external_attempts_closed = True
+            self._closed_event.set()
+            while self._inflight_ops > 0:
+                self._cond.wait()
         if self._receive_pool is not None:
             self._receive_pool.close()
-        if self._owns_store:
+        if self._close_store:
             rc = self._store.close()
             if rc is not None and int(rc) != 0:
                 raise RuntimeError(f"Mooncake transport close failed ({rc})")
+        if self._owns_store:
             if self._receive_pool is not None:
                 self._receive_pool.close(transport_stopped=True)
-            self._quarantined_buffers.clear()
-            self._quarantined_bytes = 0
-        self._closed = True
+            with self._quarantine_lock:
+                self._quarantined_buffers.clear()
+                self._quarantined_bytes = 0
+        with self._cond:
+            self._closed = True
 
     def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
         """Retry transient reads into fresh storage; return caller-owned tensors."""
-        if self._closed:
-            raise RuntimeError("Mooncake feature store is closed")
         attempts = len(_GET_RETRY_DELAYS_S) + 1
         for attempt in range(attempts):
-            try:
-                return self._fetch_tensor_once(key, spec, device)
-            except _MooncakeGetError as exc:
-                if exc.status not in _RETRYABLE_GET_STATUSES or attempt + 1 == attempts:
-                    raise
-                delay = _GET_RETRY_DELAYS_S[attempt]
-                logger.warning(
-                    "%s; retry %d/%d in %.0fs",
-                    exc,
-                    attempt + 1,
-                    len(_GET_RETRY_DELAYS_S),
-                    delay,
-                )
-                time.sleep(delay)
+            with self._admit_op():
+                try:
+                    return self._fetch_tensor_once(key, spec, device)
+                except _MooncakeGetError as exc:
+                    if (
+                        exc.status not in _RETRYABLE_GET_STATUSES
+                        or attempt + 1 == attempts
+                    ):
+                        raise
+                    retry_exc = exc
+            delay = _GET_RETRY_DELAYS_S[attempt]
+            logger.warning(
+                "%s; retry %d/%d in %.0fs",
+                retry_exc,
+                attempt + 1,
+                len(_GET_RETRY_DELAYS_S),
+                delay,
+            )
+            if self._closed_event.wait(delay):
+                raise RuntimeError("Mooncake feature store is closed")
         raise AssertionError("unreachable Mooncake fetch retry state")
 
     def _fetch_tensor_once(self, key: str, spec, device) -> torch.Tensor:
@@ -907,89 +946,92 @@ class MooncakeFeatureStore(FeatureStore):
         sample_id: str,
         metadata: Dict[str, Any],
     ) -> SampleRef:
-        self.auth.check(self._credential)
-        if not tensors:
-            raise ValueError("put requires at least one tensor")
-        staged = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
-        specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
-        nbytes = sum(_nbytes(t) for t in staged.values())
-        with self._lock:
-            if (
-                self.max_resident_bytes is not None
-                and sum(self._sample_bytes.values()) + nbytes > self.max_resident_bytes
-            ):
-                raise MemoryError(
-                    f"MooncakeFeatureStore {self.store_id} over budget "
-                    f"({self.max_resident_bytes} bytes): consumer is behind"
-                )
-            self._gen_counter += 1
-            gen = self._gen_counter
-            prior_gen = self._generation.get(sample_id)
-            prior_names = self._sample_names.get(sample_id, [])
-        # One object per tensor, DMA'd straight from its storage. The shared put
-        # config requests hard pinning when the Mooncake client supports it.
-        # staged keeps the source tensors alive across the synchronous puts.
-        attempted_names: List[str] = []
-        try:
-            for name, t in staged.items():
-                # A failed RPC may still have published its key.
-                attempted_names.append(name)
-                self._store_put_tensor(self._tkey(sample_id, gen, name), t)
-        except BaseException:
+        with self._admit_op():
+            self.auth.check(self._credential)
+            if not tensors:
+                raise ValueError("put requires at least one tensor")
+            staged = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
+            specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
+            nbytes = sum(_nbytes(t) for t in staged.values())
             with self._lock:
-                attempt = (sample_id, gen)
-                self._partial_put_pending[attempt] = (attempted_names, 0)
-                try:
-                    self._try_partial_put_free_locked(attempt)
-                except Exception:
-                    # Preserve both the original put error and cleanup ownership.
-                    logger.exception(
-                        "Failed to roll back partial Mooncake put %s", attempt
+                if (
+                    self.max_resident_bytes is not None
+                    and sum(self._sample_bytes.values()) + nbytes
+                    > self.max_resident_bytes
+                ):
+                    raise MemoryError(
+                        f"MooncakeFeatureStore {self.store_id} over budget "
+                        f"({self.max_resident_bytes} bytes): consumer is behind"
                     )
-            raise
-        # Overwrite-safe: drop the prior generation's tensor keys so a stale
-        # ref's keys are gone (its get() then raises -> no use-after-free).
-        if prior_gen is not None and prior_gen != gen:
-            leaked = [
-                name
-                for name in prior_names
-                if not self._store_remove(self._tkey(sample_id, prior_gen, name))
-            ]
-            if leaked:
-                logger.warning(
-                    "MooncakeFeatureStore re-put of %s gen %s: removing prior "
-                    "generation %s tensors %s failed; scheduling retry via gc()",
-                    sample_id,
-                    gen,
-                    prior_gen,
-                    leaked,
-                )
+                self._gen_counter += 1
+                gen = self._gen_counter
+            # One object per tensor, DMA'd straight from its storage. The shared put
+            # config requests hard pinning when the Mooncake client supports it.
+            # staged keeps the source tensors alive across the synchronous puts.
+            attempted_names: List[str] = []
+            try:
+                for name, t in staged.items():
+                    # A failed RPC may still have published its key.
+                    attempted_names.append(name)
+                    self._store_put_tensor(self._tkey(sample_id, gen, name), t)
+            except BaseException:
                 with self._lock:
-                    self._partial_put_pending[(sample_id, prior_gen)] = (leaked, 0)
-        with self._lock:
-            self._generation[sample_id] = gen
-            self._put_time[sample_id] = self._clock()
-            self._sample_bytes[sample_id] = nbytes
-            self._sample_names[sample_id] = list(staged)
-        return SampleRef(
-            sample_id=sample_id,
-            run_id=str(metadata.get("run_id", "unknown")),
-            source_task_id=metadata.get("source_task_id"),
-            feature_store_uri=f"mooncake://{self.store_id}/{sample_id}",
-            feature_keys={k: f"{sample_id}/{k}" for k in staged},
-            feature_specs=specs,
-            strategy=metadata.get("strategy", "eagle3"),
-            schema_version=int(metadata.get("schema_version", SCHEMA_VERSION)),
-            target_model_version=str(metadata.get("target_model_version", "unknown")),
-            draft_weight_version=metadata.get("draft_weight_version"),
-            tokenizer_version=str(metadata.get("tokenizer_version", "unknown")),
-            num_tokens=int(metadata.get("num_tokens", 0)),
-            estimated_bytes=nbytes,
-            metadata={
-                **{k: v for k, v in metadata.items() if k != "num_tokens"},
-                "generation": gen,  # travels with the ref for the staleness guard
-            },
-        )
+                    attempt = (sample_id, gen)
+                    self._partial_put_pending[attempt] = (attempted_names, 0)
+                    try:
+                        self._try_partial_put_free_locked(attempt)
+                    except Exception:
+                        # Preserve both the original put error and cleanup ownership.
+                        logger.exception(
+                            "Failed to roll back partial Mooncake put %s", attempt
+                        )
+                raise
+            # Atomically retire the superseded generation under _lock before
+            # installing the new one so stale refs cannot pass get() even when
+            # physical removal is deferred by a read lease or in-flight read.
+            with self._lock:
+                current_gen = self._generation.get(sample_id)
+                current_names = list(self._sample_names.get(sample_id, []))
+                if current_gen is not None and current_gen != gen:
+                    self._freed.add((sample_id, current_gen))
+                    self._release_pending.pop(sample_id, None)
+                self._generation[sample_id] = gen
+                self._put_time[sample_id] = self._clock()
+                self._sample_bytes[sample_id] = nbytes
+                self._sample_names[sample_id] = list(staged)
+                if current_gen is not None and current_gen != gen and current_names:
+                    attempt = (sample_id, current_gen)
+                    self._partial_put_pending[attempt] = (current_names, 0)
+                    if not self._try_partial_put_free_locked(attempt):
+                        logger.warning(
+                            "MooncakeFeatureStore re-put of %s gen %s: removing prior "
+                            "generation %s tensors %s deferred/failed; scheduling retry via gc()",
+                            sample_id,
+                            gen,
+                            current_gen,
+                            self._partial_put_pending[attempt][0],
+                        )
+            return SampleRef(
+                sample_id=sample_id,
+                run_id=str(metadata.get("run_id", "unknown")),
+                source_task_id=metadata.get("source_task_id"),
+                feature_store_uri=f"mooncake://{self.store_id}/{sample_id}",
+                feature_keys={k: f"{sample_id}/{k}" for k in staged},
+                feature_specs=specs,
+                strategy=metadata.get("strategy", "eagle3"),
+                schema_version=int(metadata.get("schema_version", SCHEMA_VERSION)),
+                target_model_version=str(
+                    metadata.get("target_model_version", "unknown")
+                ),
+                draft_weight_version=metadata.get("draft_weight_version"),
+                tokenizer_version=str(metadata.get("tokenizer_version", "unknown")),
+                num_tokens=int(metadata.get("num_tokens", 0)),
+                estimated_bytes=nbytes,
+                metadata={
+                    **{k: v for k, v in metadata.items() if k != "num_tokens"},
+                    "generation": gen,  # travels with the ref for the staleness guard
+                },
+            )
 
     def adopt(self, sample_ref: SampleRef) -> None:
         """Register an externally-produced sample for lifecycle management.
@@ -1008,6 +1050,9 @@ class MooncakeFeatureStore(FeatureStore):
         self._locate(sample_ref)
         with self._lock:
             gen = int(gen)
+            prev_gen = self._generation.get(sample_ref.sample_id)
+            if prev_gen is not None and prev_gen != gen:
+                self._freed.add((sample_ref.sample_id, prev_gen))
             self._generation[sample_ref.sample_id] = gen
             self._sample_names[sample_ref.sample_id] = list(
                 sample_ref.feature_keys.keys()
@@ -1017,6 +1062,14 @@ class MooncakeFeatureStore(FeatureStore):
             )
             self._put_time[sample_ref.sample_id] = self._clock()
             self._external_provisional.pop((sample_ref.sample_id, gen), None)
+
+    def stop_external_attempts(self, *, wait: bool = False) -> None:
+        """Stop admitting new external captures and optionally wait for discovery."""
+        with self._cond:
+            self._external_attempts_closed = True
+            if wait:
+                while self._inflight_external_attempts > 0:
+                    self._cond.wait()
 
     def track_external_attempt(
         self,
@@ -1030,19 +1083,33 @@ class MooncakeFeatureStore(FeatureStore):
         names = list(dict.fromkeys(str(name) for name in feature_names))
         if not names:
             raise ValueError("external capture attempt must name at least one feature")
-        with self._lock:
-            track = getattr(self._store, "track_capture_attempt", None)
-            if track is not None:
-                if server_url is None:
-                    raise ValueError("arena capture attempts require a server_url")
-                track(
-                    [
-                        self._tkey(str(sample_id), int(generation), name)
-                        for name in names
-                    ],
-                    server_url,
+        sid = str(sample_id)
+        gen = int(generation)
+        track = getattr(self._store, "track_capture_attempt", None)
+        if track is not None and server_url is None:
+            raise ValueError("arena capture attempts require a server_url")
+        with self._cond:
+            if self._closing or self._closed or self._external_attempts_closed:
+                raise RuntimeError(
+                    "Mooncake feature store is closed to new external capture attempts"
                 )
-            self._external_provisional[(str(sample_id), int(generation))] = names
+            self._inflight_external_attempts += 1
+            self._inflight_ops += 1
+        try:
+            if track is not None:
+                # /server_info HTTP discovery can block up to 30s; run outside _lock.
+                track([self._tkey(sid, gen, name) for name in names], server_url)
+            with self._cond:
+                if self._closing or self._closed or self._external_attempts_closed:
+                    raise RuntimeError(
+                        "Mooncake feature store closed during external capture discovery"
+                    )
+                self._external_provisional[(sid, gen)] = names
+        finally:
+            with self._cond:
+                self._inflight_external_attempts -= 1
+                self._inflight_ops -= 1
+                self._cond.notify_all()
 
     def discard_external_attempts(
         self, *, reason: str = "unadopted-external-capture"
@@ -1055,55 +1122,77 @@ class MooncakeFeatureStore(FeatureStore):
         shutdown path. Physical-remove failures remain visible to
         :meth:`drain_pending_removals`.
         """
-        with self._lock:
+        with self._cond:
+            while self._inflight_external_attempts > 0:
+                self._cond.wait()
+            if not self._external_provisional:
+                return 0
+            if self._closing or self._closed:
+                raise RuntimeError("Mooncake feature store is closed")
+            self._inflight_ops += 1
             attempts = list(self._external_provisional.items())
-
-        errors: Dict[str, str] = {}
-        discarded = 0
-        for (sample_id, generation), names in attempts:
-            with self._lock:
-                attempt_key = (sample_id, generation)
-                # A response can be adopted after the snapshot but before this
-                # attempt is visited. adopt() removes the provisional entry
-                # under the same lock, so never delete that now-live sample.
-                if attempt_key not in self._external_provisional:
-                    continue
-                current = self._generation.get(sample_id)
-                if current is not None:
-                    if current != generation:
-                        errors[sample_id] = (
-                            f"cannot discard provisional sample {sample_id!r} "
-                            f"generation {generation}: adopted generation is {current}"
-                        )
+        try:
+            errors: Dict[str, str] = {}
+            discarded = 0
+            for (sample_id, generation), names in attempts:
+                with self._lock:
+                    attempt_key = (sample_id, generation)
+                    # A response can be adopted after the snapshot but before this
+                    # attempt is visited. adopt() removes the provisional entry
+                    # under the same lock, so never delete that now-live sample.
+                    if attempt_key not in self._external_provisional:
                         continue
-                else:
-                    self._generation[sample_id] = generation
-                    self._sample_names[sample_id] = names
-                    self._sample_bytes[sample_id] = 0
-                    self._put_time[sample_id] = self._clock()
-                try:
-                    # RLock keeps adopt() from racing between the ownership
-                    # check above and this removal attempt. abort() reacquires
-                    # the same lock and either frees the keys or records them
-                    # in _release_pending for lifecycle drain.
-                    self.abort(sample_id, reason=reason)
-                except BaseException as exc:
-                    # Preserve both explicit provisional ownership and a
-                    # retryable removal entry.  Terminal drain can now reclaim
-                    # the keys even when a Mooncake metadata probe itself
-                    # failed, rather than losing every remaining snapshot item.
-                    self._release_pending.setdefault(sample_id, 0)
-                    errors[sample_id] = f"{type(exc).__name__}: {exc}"
-                    continue
-                self._external_provisional.pop(attempt_key, None)
-                discarded += 1
-        if errors:
-            raise RuntimeError(
-                "could not discard all provisional external captures: " f"{errors}"
-            )
-        return discarded
+                    current = self._generation.get(sample_id)
+                    if current is not None:
+                        if current != generation:
+                            errors[sample_id] = (
+                                f"cannot discard provisional sample {sample_id!r} "
+                                f"generation {generation}: adopted generation is {current}"
+                            )
+                            continue
+                    else:
+                        self._generation[sample_id] = generation
+                        self._sample_names[sample_id] = names
+                        self._sample_bytes[sample_id] = 0
+                        self._put_time[sample_id] = self._clock()
+                    try:
+                        # RLock keeps adopt() from racing between the ownership
+                        # check above and this removal attempt. abort() reacquires
+                        # the same lock and either frees the keys or records them
+                        # in _release_pending for lifecycle drain.
+                        self.abort(sample_id, reason=reason)
+                    except BaseException as exc:
+                        # Preserve both explicit provisional ownership and a
+                        # retryable removal entry.  Terminal drain can now reclaim
+                        # the keys even when a Mooncake metadata probe itself
+                        # failed, rather than losing every remaining snapshot item.
+                        self._release_pending.setdefault(sample_id, 0)
+                        errors[sample_id] = f"{type(exc).__name__}: {exc}"
+                        continue
+                    self._external_provisional.pop(attempt_key, None)
+                    discarded += 1
+            if errors:
+                raise RuntimeError(
+                    "could not discard all provisional external captures: " f"{errors}"
+                )
+            return discarded
+        finally:
+            with self._cond:
+                self._inflight_ops -= 1
+                if self._inflight_ops == 0:
+                    self._cond.notify_all()
 
     # -- read --------------------------------------------------------------
+    def _check_not_freed_locked(self, sid: str, gen: int) -> None:
+        cur = self._generation.get(sid)
+        if (sid, gen) in self._freed or (cur is not None and cur != gen):
+            # logically freed or superseded here; the remote bytes may still
+            # linger under Mooncake's read-lease, but this ref must not resolve (B5)
+            raise KeyError(
+                f"sample {sid} generation {gen} was released/aborted or superseded; "
+                "refusing use-after-free"
+            )
+
     def get(
         self,
         sample_ref: SampleRef,
@@ -1114,39 +1203,72 @@ class MooncakeFeatureStore(FeatureStore):
         self.auth.check(self._credential)
         sid = sample_ref.sample_id
         ref_gen = sample_ref.metadata.get("generation")
-        with self._lock:
-            if ref_gen is not None and (sid, int(ref_gen)) in self._freed:
-                # logically freed here; the remote bytes may still linger under
-                # Mooncake's read-lease, but this ref must not resolve (B5)
-                raise KeyError(
-                    f"sample {sid} generation {ref_gen} was released/aborted; "
-                    f"refusing use-after-free"
+        if ref_gen is None:
+            raise KeyError(f"sample {sid} ref carries no generation; cannot locate")
+        gen = int(ref_gen)
+        read_key = (sid, gen)
+        with self._cond:
+            if self._closing or self._closed:
+                raise RuntimeError("Mooncake feature store is closed")
+            self._check_not_freed_locked(sid, gen)
+            # Reserve this generation before _locate() so concurrent abort/re-put/gc
+            # defers physical reclamation until this read exits.
+            self._inflight_reads[read_key] = self._inflight_reads.get(read_key, 0) + 1
+            self._inflight_ops += 1
+        try:
+            wanted = names or list(sample_ref.feature_keys.keys())
+            self._locate(sample_ref)
+            out = self._get_tensors(sample_ref, gen, wanted, device)
+            # Pooled reads already placed every feature (integer features on the
+            # host); pageable reads land on the host and move here.
+            if self._receive_pool is None and str(device) != "cpu":
+                target = torch.device(device)
+                out = {
+                    k: (v if v.device == target else v.to(target))
+                    for k, v in out.items()
+                }
+            with self._cond:
+                self._check_not_freed_locked(sid, gen)
+                self._counter += 1
+                # Consumer-side cache: a process that only get()s a sample (never
+                # put() it) still needs gen + feature names so its release()/abort()
+                # can free the per-tensor keys. setdefault keeps the producer's own
+                # entries authoritative when producer and consumer are one instance.
+                self._generation.setdefault(sid, gen)
+                self._sample_names.setdefault(sid, list(sample_ref.feature_keys.keys()))
+                handle = FeatureHandle(
+                    sample_id=sid,
+                    generation=gen,
+                    lease_token=f"{sid}:{self._counter}",
                 )
-        wanted = names or list(sample_ref.feature_keys.keys())
-        self._locate(sample_ref)
-        out, gen = self._get_tensors(sample_ref, wanted, device)
-        # Pooled reads already placed every feature (integer features on the
-        # host); pageable reads land on the host and move here.
-        if self._receive_pool is None and str(device) != "cpu":
-            target = torch.device(device)
-            out = {
-                k: (v if v.device == target else v.to(target)) for k, v in out.items()
-            }
-        with self._lock:
-            self._counter += 1
-            # Consumer-side cache: a process that only get()s a sample (never
-            # put() it) still needs gen + feature names so its release()/abort()
-            # can free the per-tensor keys. setdefault keeps the producer's own
-            # entries authoritative when producer and consumer are one instance.
-            self._generation.setdefault(sid, gen)
-            self._sample_names.setdefault(sid, list(sample_ref.feature_keys.keys()))
-            handle = FeatureHandle(
-                sample_id=sid,
-                generation=gen,
-                lease_token=f"{sid}:{self._counter}",
-            )
-            self._active_leases[handle.lease_token] = handle
-        return out, handle
+                self._active_leases[handle.lease_token] = handle
+            return out, handle
+        finally:
+            with self._cond:
+                remaining = self._inflight_reads.get(read_key, 1) - 1
+                if remaining <= 0:
+                    self._inflight_reads.pop(read_key, None)
+                else:
+                    self._inflight_reads[read_key] = remaining
+                if remaining <= 0 and not self._closed:
+                    try:
+                        if (
+                            sid in self._release_pending
+                            and self._generation.get(sid) == gen
+                            and not self._still_leased_locked(sid, gen)
+                            and self._try_physical_free(sid)
+                        ):
+                            self._free_bookkeeping_locked(sid)
+                        if read_key in self._partial_put_pending:
+                            self._try_partial_put_free_locked(read_key)
+                    except Exception:
+                        logger.exception(
+                            "Deferred Mooncake free after read exit failed for %s",
+                            read_key,
+                        )
+                self._inflight_ops -= 1
+                if self._inflight_ops == 0:
+                    self._cond.notify_all()
 
     def _locate(self, sample_ref: SampleRef) -> None:
         """Pass server-owned object locations to backends that need them.
@@ -1167,14 +1289,10 @@ class MooncakeFeatureStore(FeatureStore):
         )
 
     def _get_tensors(
-        self, ref: SampleRef, wanted: List[str], device="cpu"
-    ) -> Tuple[Dict[str, torch.Tensor], int]:
+        self, ref: SampleRef, gen: int, wanted: List[str], device="cpu"
+    ) -> Dict[str, torch.Tensor]:
         """Read each feature straight into a spec-allocated tensor."""
         sid = ref.sample_id
-        gen = ref.metadata.get("generation")
-        if gen is None:
-            raise KeyError(f"sample {sid} ref carries no generation; cannot locate")
-        gen = int(gen)
         out: Dict[str, torch.Tensor] = {}
         for n in wanted:
             spec = ref.feature_specs.get(n)
@@ -1189,13 +1307,15 @@ class MooncakeFeatureStore(FeatureStore):
                 )
             # fresh alloc (or a pooled slot copied out) -> clone-on-fetch for free (B5)
             out[n] = self._fetch_tensor(key, spec, device)
-        return out, gen
+        return out
 
     # -- lifetime ----------------------------------------------------------
     def _try_partial_put_free_locked(
         self, attempt: Tuple[str, int], *, force: bool = False
     ) -> bool:
         """Remove keys from an unpublished generation, retaining failed keys."""
+        if self._inflight_reads.get(attempt, 0) > 0:
+            return False
         names, attempts = self._partial_put_pending[attempt]
         sample_id, generation = attempt
         remaining = [
@@ -1230,6 +1350,8 @@ class MooncakeFeatureStore(FeatureStore):
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
+        if self._inflight_reads.get((sample_id, gen), 0) > 0:
+            return False
         ok = True
         for name in self._sample_names.get(sample_id, []):
             key = self._tkey(sample_id, gen, name)
@@ -1283,6 +1405,9 @@ class MooncakeFeatureStore(FeatureStore):
             gen = self._generation.get(sample_id)
             if gen is not None:
                 self._freed.add((sample_id, gen))  # immediate logical free
+            for sid, inflight_gen in self._inflight_reads:
+                if sid == sample_id:
+                    self._freed.add((sid, inflight_gen))
             if self._try_physical_free(sample_id):
                 self._free_bookkeeping_locked(sample_id)
             else:
@@ -1536,6 +1661,9 @@ class MooncakeFeatureStore(FeatureStore):
                     and not self._still_leased_locked(sid, self._generation.get(sid))
                 ]
                 for sid in stale:
+                    gen = self._generation.get(sid)
+                    if gen is not None:
+                        self._freed.add((sid, gen))
                     if self._try_physical_free(sid, confirm_absent_on_failure=False):
                         freed_bytes += self._free_bookkeeping_locked(sid)
                         freed += 1

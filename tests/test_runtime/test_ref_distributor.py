@@ -984,6 +984,55 @@ class TestRefDistributor(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             dist.run()
 
+    def test_stop_raises_when_worker_thread_does_not_exit(self):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _BlockedSource:
+            path = os.path.join(self.dir, "blocked.jsonl")
+
+            def poll(self):
+                entered.set()
+                release.wait(timeout=5.0)
+                return []
+
+            def is_closed(self):
+                return False
+
+            def failure(self):
+                return None
+
+            def restore_consumed(self, count, num_bytes):
+                pass
+
+            def mark_consumed(self, n, *, num_bytes=None):
+                pass
+
+        controller = DataFlowController("run0")
+        dist = RefDistributor(
+            _BlockedSource(),
+            controller,
+            os.path.join(self.dir, "blocked-inboxes"),
+            dp_size=1,
+            feature_store=mock.Mock(),
+            refs_per_rank_step=1,
+            dispatch_policy="round_robin",
+            num_anchors=1,
+            block_size=1,
+            poll_s=0.01,
+        ).start()
+        try:
+            self.assertTrue(entered.wait(timeout=2.0))
+            with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                dist.stop(join_timeout_s=0.05)
+            self.assertTrue(dist.is_alive())
+        finally:
+            release.set()
+            dist.stop(join_timeout_s=2.0)
+        self.assertFalse(dist.is_alive())
+
 
 class TestDPAckController(unittest.TestCase):
     def setUp(self):

@@ -12,6 +12,8 @@ import ctypes
 import gc
 import importlib.util
 import os
+import threading
+import time
 import unittest
 import weakref
 from inspect import signature
@@ -272,14 +274,12 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         fs = MooncakeFeatureStore(store=fake, store_id="run0")
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
 
-        with mock.patch(
-            "specforge.runtime.data_plane.mooncake_store.time.sleep"
-        ) as sleep:
+        with mock.patch.object(fs._closed_event, "wait", return_value=False) as wait:
             out, _ = fs.get(ref, names=["hidden_state"])
 
         self.assertIn("hidden_state", out)
         self.assertEqual(fake.get_calls, 3)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 4.0])
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [2.0, 4.0])
         health = fs.health()
         self.assertEqual(health["quarantined_buffers"], 2)
         self.assertGreater(health["quarantined_bytes"], 0)
@@ -290,15 +290,13 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
 
         with (
-            mock.patch(
-                "specforge.runtime.data_plane.mooncake_store.time.sleep"
-            ) as sleep,
+            mock.patch.object(fs._closed_event, "wait", return_value=False) as wait,
             self.assertRaisesRegex(KeyError, "status -704"),
         ):
             fs.get(ref, names=["hidden_state"])
 
         self.assertEqual(fake.get_calls, 1)
-        sleep.assert_not_called()
+        wait.assert_not_called()
         self.assertEqual(fs.health()["quarantined_buffers"], 1)
 
     def test_get_quarantines_final_failed_attempt(self):
@@ -307,16 +305,14 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
 
         with (
-            mock.patch(
-                "specforge.runtime.data_plane.mooncake_store.time.sleep"
-            ) as sleep,
+            mock.patch.object(fs._closed_event, "wait", return_value=False) as wait,
             self.assertRaisesRegex(KeyError, "status -800"),
         ):
             fs.get(ref, names=["hidden_state"])
 
         self.assertEqual(fake.get_calls, 4)
         self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list], [2.0, 4.0, 8.0]
+            [call.args[0] for call in wait.call_args_list], [2.0, 4.0, 8.0]
         )
         self.assertEqual(fs.health()["quarantined_buffers"], 4)
 
@@ -752,7 +748,7 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         )
         ref = producer.put(_tensors(), sample_id="s0", metadata=_meta())
         fake.fail_next = 1
-        with mock.patch("specforge.runtime.data_plane.mooncake_store.time.sleep"):
+        with mock.patch.object(consumer._closed_event, "wait", return_value=False):
             got, handle = consumer.get(ref)
         self.assertTrue(torch.equal(got["hidden_state"], _tensors()["hidden_state"]))
         consumer.release(handle)
@@ -934,8 +930,8 @@ class TestMooncakeFeatureStore(unittest.TestCase):
                         )
 
                     with mock.patch.object(fake, "get_into", side_effect=fail_once):
-                        with mock.patch(
-                            "specforge.runtime.data_plane.mooncake_store.time.sleep"
+                        with mock.patch.object(
+                            consumer._closed_event, "wait", return_value=False
                         ):
                             tensors, _ = consumer.get(ref)
                     self.assertNotEqual(pointers[0], pointers[1])
@@ -953,13 +949,13 @@ class TestMooncakeFeatureStore(unittest.TestCase):
                     with mock.patch.object(
                         fake, "get_into", return_value=status
                     ) as get:
-                        with mock.patch(
-                            "specforge.runtime.data_plane.mooncake_store.time.sleep"
-                        ) as sleep:
+                        with mock.patch.object(
+                            consumer._closed_event, "wait", return_value=False
+                        ) as wait:
                             with self.assertRaises(KeyError):
                                 consumer.get(ref)
                     self.assertEqual(get.call_count, 1)
-                    sleep.assert_not_called()
+                    wait.assert_not_called()
 
     def test_unknown_receive_buffer_kind_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "receive_buffers"):
@@ -1207,6 +1203,325 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertTrue(_phys_resident(fake))  # bytes physically linger
         with self.assertRaises(KeyError):
             fs.get(ref)  # logically aborted -> KeyError (no use-after-free)
+
+    def test_track_external_attempt_does_not_hold_store_lock_during_backend_call(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _SlowTrackStore(_FakeMooncakeStore):
+            def track_capture_attempt(self, keys, server_url):
+                entered.set()
+                release.wait(timeout=2.0)
+
+        fs = MooncakeFeatureStore(store=_SlowTrackStore(), store_id="run0")
+        worker = threading.Thread(
+            target=fs.track_external_attempt,
+            args=("s0",),
+            kwargs={
+                "generation": 1,
+                "feature_names": ["hidden_state"],
+                "server_url": "http://capture:30000",
+            },
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(timeout=2.0))
+        health_done = threading.Event()
+
+        def probe_health():
+            fs.health()
+            health_done.set()
+
+        probe = threading.Thread(target=probe_health, daemon=True)
+        probe.start()
+        try:
+            self.assertTrue(
+                health_done.wait(timeout=2.0),
+                "track_external_attempt held _lock during backend track_capture_attempt",
+            )
+        finally:
+            release.set()
+            worker.join(timeout=2.0)
+            probe.join(timeout=2.0)
+        self.assertEqual(fs.health()["provisional_external"], 1)
+
+    def test_get_refuses_sample_aborted_during_in_flight_fetch(self):
+        fake = _FakeMooncakeStore()
+        fake.lease_defer = True
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        original_get_into = fake.get_into
+        aborted = False
+
+        def abort_mid_fetch(key, ptr, size):
+            nonlocal aborted
+            rc = original_get_into(key, ptr, size)
+            if not aborted:
+                aborted = True
+                fs.abort("s0")
+            return rc
+
+        with mock.patch.object(fake, "get_into", side_effect=abort_mid_fetch):
+            with self.assertRaisesRegex(KeyError, "released/aborted"):
+                fs.get(ref, names=["hidden_state"])
+
+        health = fs.health()
+        self.assertEqual(health["resident_samples"], 0)
+        self.assertEqual(health["active_leases"], 0)
+
+    def test_close_interrupts_retry_sleep_immediately(self):
+        fake = _ScriptedGetStore([-800, -800, -800, -800])
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        errors = []
+        in_wait = threading.Event()
+        real_wait = fs._closed_event.wait
+
+        def track_wait(timeout=None):
+            in_wait.set()
+            return real_wait(timeout)
+
+        def fetch():
+            try:
+                fs.get(ref, names=["hidden_state"])
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(fs._closed_event, "wait", side_effect=track_wait):
+            worker = threading.Thread(target=fetch, daemon=True)
+            worker.start()
+            self.assertTrue(in_wait.wait(timeout=2.0))
+            started = time.monotonic()
+            fs.close()
+            worker.join(timeout=2.0)
+            elapsed = time.monotonic() - started
+
+        self.assertFalse(
+            worker.is_alive(),
+            f"retry thread stayed blocked after close() ({elapsed:.2f}s)",
+        )
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(fake.get_calls, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertIn("closed", str(errors[0]))
+
+    def test_reput_under_lease_defer_retires_superseded_generation(self):
+        fake = _FakeMooncakeStore()
+        fake.lease_defer = True
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref1 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        ref2 = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        # Old keys still exist in the backend due to lease_defer, yet get(ref1) fails.
+        self.assertIn("run0/s0/g1/hidden_state", fake._d)
+        with self.assertRaises(KeyError):
+            fs.get(ref1)
+        out, handle = fs.get(ref2)
+        self.assertIn("hidden_state", out)
+        fs.release(handle)
+
+    def test_age_gc_retires_generation_for_inflight_get(self):
+        now = {"t": 0.0}
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        class _BlockingGetStore(_FakeMooncakeStore):
+            def get_into(self, key, ptr, size):
+                entered.set()
+                proceed.wait(timeout=5.0)
+                return super().get_into(key, ptr, size)
+
+        fake = _BlockingGetStore()
+        fs = MooncakeFeatureStore(
+            store=fake, store_id="run0", max_hold_age_s=10.0, clock=lambda: now["t"]
+        )
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        errors = []
+
+        def reader():
+            try:
+                fs.get(ref, names=["hidden_state"])
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=2.0))
+        now["t"] = 20.0
+        fs.gc()
+        # Physical free is deferred while the read is active.
+        self.assertIn("run0/s0/g1/hidden_state", fake._d)
+        proceed.set()
+        thread.join(timeout=2.0)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], KeyError)
+        self.assertEqual(fs.health()["active_leases"], 0)
+        self.assertEqual(fake._d, {})
+
+    def test_stop_external_attempts_and_close_wait_for_inflight_discovery(self):
+        for action in ("stop_external_attempts", "close"):
+            with self.subTest(action=action):
+                in_discovery = threading.Event()
+                release_discovery = threading.Event()
+
+                class _DiscoveryStore(_FakeMooncakeStore):
+                    def __init__(self):
+                        super().__init__()
+                        self.closed_after_discovery = False
+                        self.discovery_done = False
+
+                    def track_capture_attempt(self, keys, server_url):
+                        in_discovery.set()
+                        release_discovery.wait(timeout=5.0)
+                        self.discovery_done = True
+
+                    def close(self):
+                        self.closed_after_discovery = self.discovery_done
+                        return 0
+
+                fake = _DiscoveryStore()
+                fs = MooncakeFeatureStore(store=fake, store_id="run0", close_store=True)
+                worker_errors = []
+
+                def discover():
+                    try:
+                        fs.track_external_attempt(
+                            "s0",
+                            generation=1,
+                            feature_names=["hidden_state"],
+                            server_url="http://capture:30000",
+                        )
+                    except BaseException as exc:
+                        worker_errors.append(exc)
+
+                worker = threading.Thread(target=discover, daemon=True)
+                worker.start()
+                self.assertTrue(in_discovery.wait(timeout=2.0))
+
+                waiter_waiting = threading.Event()
+                waiter_done = threading.Event()
+                saw_discovery_done = {}
+                real_cond_wait = fs._cond.wait
+
+                def track_cond_wait(*args, **kwargs):
+                    waiter_waiting.set()
+                    return real_cond_wait(*args, **kwargs)
+
+                def run_waiter():
+                    if action == "stop_external_attempts":
+                        fs.stop_external_attempts(wait=True)
+                    else:
+                        fs.close()
+                    saw_discovery_done["value"] = fake.discovery_done
+                    waiter_done.set()
+
+                with mock.patch.object(fs._cond, "wait", side_effect=track_cond_wait):
+                    waiter = threading.Thread(target=run_waiter, daemon=True)
+                    waiter.start()
+                    self.assertTrue(waiter_waiting.wait(timeout=2.0))
+                    self.assertFalse(waiter_done.is_set())
+                    with self.assertRaisesRegex(RuntimeError, "closed"):
+                        fs.track_external_attempt(
+                            "s-late",
+                            generation=1,
+                            feature_names=["hidden_state"],
+                            server_url="http://capture:30000",
+                        )
+                    release_discovery.set()
+                    worker.join(timeout=2.0)
+                    waiter.join(timeout=2.0)
+
+                self.assertTrue(waiter_done.is_set())
+                self.assertTrue(saw_discovery_done["value"])
+                if action == "close":
+                    self.assertTrue(fake.closed_after_discovery)
+                self.assertEqual(len(worker_errors), 1)
+                self.assertIsInstance(worker_errors[0], RuntimeError)
+                self.assertEqual(fs.health()["provisional_external"], 0)
+
+    def test_close_waits_for_inflight_get_and_blocks_post_timeout_retry(self):
+        in_get = threading.Event()
+        release_get = threading.Event()
+
+        class _RacingRetryStore(_ScriptedGetStore):
+            def __init__(self):
+                super().__init__([-800, -800])
+                self.close_saw_active = False
+                self.close_calls = 0
+                self.active = False
+
+            def get_into(self, key, ptr, size):
+                self.active = True
+                in_get.set()
+                release_get.wait(timeout=5.0)
+                try:
+                    return super().get_into(key, ptr, size)
+                finally:
+                    self.active = False
+
+            def close(self):
+                self.close_calls += 1
+                self.close_saw_active = self.active
+                return 0
+
+        fake = _RacingRetryStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", close_store=True)
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        errors = []
+        closer_waiting = threading.Event()
+        real_cond_wait = fs._cond.wait
+
+        def track_cond_wait(*args, **kwargs):
+            closer_waiting.set()
+            return real_cond_wait(*args, **kwargs)
+
+        def fetch():
+            try:
+                fs.get(ref, names=["hidden_state"])
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            mock.patch.object(fs._closed_event, "wait", return_value=False),
+            mock.patch.object(fs._cond, "wait", side_effect=track_cond_wait),
+        ):
+            worker = threading.Thread(target=fetch, daemon=True)
+            worker.start()
+            self.assertTrue(in_get.wait(timeout=2.0))
+
+            closer = threading.Thread(target=fs.close, daemon=True)
+            closer.start()
+            self.assertTrue(closer_waiting.wait(timeout=2.0))
+            self.assertEqual(fake.close_calls, 0)
+
+            release_get.set()
+            worker.join(timeout=2.0)
+            closer.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(fake.close_calls, 1)
+        self.assertFalse(fake.close_saw_active)
+        self.assertEqual(fake.get_calls, 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+
+    def test_close_store_closes_injected_backend_while_keeping_quarantine(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(
+            store=backend, close_store=True, receive_buffers="pinned"
+        )
+        pool = store._receive_pool
+        slot, pooled = pool.acquire(128, "cpu")
+        storage = weakref.ref(slot.storage)
+        pool.release(slot, pooled, quarantine=True)
+        del slot
+        with mock.patch.object(backend, "close", create=True, return_value=0) as close:
+            store.close()
+            close.assert_called_once_with()
+        gc.collect()
+        self.assertIsNotNone(storage())
 
 
 class TestMooncakeFeatureStoreWireContract(unittest.TestCase):

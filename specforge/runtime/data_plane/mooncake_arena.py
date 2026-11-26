@@ -56,6 +56,7 @@ class ArenaObjectClient:
         self._server_controls: Dict[str, Set[str]] = {}
         self._controls: Set[str] = set()
         self._connections: Dict[str, socket.socket] = {}
+        self._closed = False
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
 
@@ -163,6 +164,15 @@ class ArenaObjectClient:
         return 0
 
     def close(self) -> int:
+        with self._send_lock:
+            self._closed = True
+            connections = list(self._connections.values())
+            self._connections.clear()
+        for connection in connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
         return 0
 
     # -- transports ------------------------------------------------------------
@@ -194,6 +204,8 @@ class ArenaObjectClient:
     def _send_free(self, control: str, keys: List[str]) -> None:
         line = (json.dumps(keys) + "\n").encode()
         with self._send_lock:
+            if self._closed:
+                raise OSError("ArenaObjectClient is closed")
             connection = self._connections.get(control)
             if connection is None:
                 host, port = control.rsplit(":", 1)
