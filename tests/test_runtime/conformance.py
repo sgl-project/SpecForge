@@ -19,7 +19,8 @@ that consumed them and in order, an incomplete window is never committed, and
 commits are flushed before a checkpoint.
 
 ``RunnerChecks`` holds a runner to the reference runner's updates in one
-process, bit for bit, for each declaration.
+process, bit for bit, for each declaration. The state a runner resumes from
+is its own: it is held to the runner's own uninterrupted run.
 
 The recorded cases train the runner that ``specforge train`` assembles, which
 is the reference: no configuration key selects another. A candidate is
@@ -175,10 +176,11 @@ class KitProgram(FakeProgram):
     With ``replay`` it turns the window's pooled sums into its forward's
     argument itself, by a function that is not their ratio alone, and its
     prepass reports sums that depend on the noise it drew in training mode.
-    Its forward draws from the generator and reads the step, and reports one
-    ratio only when detailed metrics are asked for: a runner that restores
-    the wrong RNG state, runs a prepass in another mode, or drops the
-    schedule or the flag, shows in the update or in what it reports.
+    Its forward draws from the generator, reads the step and the run's
+    length, and reports one ratio only when detailed metrics are asked for: a
+    runner that restores the wrong RNG state, runs a prepass in another mode,
+    or drops or fixes the schedule or the flag, shows in the update or in what
+    it reports.
     """
 
     def __init__(
@@ -197,6 +199,8 @@ class KitProgram(FakeProgram):
         self.diagnostics = diagnostics
         #: ``collect_detailed_metrics`` as each forward received it.
         self.detailed = []
+        #: The step and the run's length as each forward received them.
+        self.schedule = []
 
     def spec(self):
         return fake_spec(
@@ -219,12 +223,14 @@ class KitProgram(FakeProgram):
         tensors,
         *,
         step=0,
+        total_steps=None,
         collect_detailed_metrics=True,
         prepass=False,
         scale=None,
         **context,
     ):
         self.detailed.append(collect_detailed_metrics)
+        self.schedule.append((step, total_steps))
         weight = self.linear.weight
         x = tensors["x"].to(weight.dtype)
         noise = (
@@ -233,7 +239,9 @@ class KitProgram(FakeProgram):
             else torch.zeros(2, device=weight.device)
         )
         first, second = (self.linear(x) * (1 + noise).to(weight.dtype)).unbind()
-        first = first * (1 + 0.25 * step)
+        # As a schedule would: by the step, as a share of the run when its
+        # length is known.
+        first = first * (1 + 0.25 * step / (total_steps or 1))
         if scale is not None:
             first = first * scale.to(weight.dtype)
         size = x.sum().detach().float()
@@ -477,12 +485,25 @@ class ProtocolChecks:
                 self.assertEqual(protocol_violations(ledger), [])
 
 
+def _context(step, window):
+    """The context of a job's update: every field differs from its default.
+
+    Detailed metrics are asked for on every second update, as a run logs, and
+    the run has a length.
+    """
+    return StepContext(
+        global_step=step,
+        total_steps=4,
+        collect_detailed_metrics=step % 2 == 0,
+        accumulation_steps=len(window),
+    )
+
+
 def _train(runner, program, windows, *, first_step=0):
     """Run ``windows``; return what every update reported and what the run left."""
     trajectory = []
     for step, window in enumerate(windows, start=first_step):
-        ctx = StepContext(global_step=step, accumulation_steps=len(window))
-        metrics = run_window(runner, iter(window), ctx)
+        metrics = run_window(runner, iter(window), _context(step, window))
         trajectory.append(
             {
                 "metrics": dict(metrics.materialize()),
@@ -507,9 +528,17 @@ def _train(runner, program, windows, *, first_step=0):
         },
         "optimizer": copy.deepcopy(optimizer),
         "generator": torch.get_rng_state(),
-        # Whether each forward was asked for the detailed metrics.
+        # What each forward was told: whether to report the detailed
+        # metrics, and where in the run it is.
         "detailed": list(program.detailed),
+        "schedule": list(program.schedule),
     }
+
+
+#: What a runner owes any other: the updates it reports, the draft it exports,
+#: the generator it leaves and what it tells the program. The state it resumes
+#: from (``CheckpointState.rank`` / ``replicated``) is its own to lay out.
+_REPRODUCED = ("updates", "draft", "generator", "detailed", "schedule")
 
 
 class RunnerChecks:
@@ -517,9 +546,12 @@ class RunnerChecks:
 
     Mix into a ``unittest.TestCase`` and set ``make_runner``. One job per
     declaration; each compares every update's metrics, gradient norm,
-    learning rate and weights, and the draft, optimizer and generator state at
-    the end, with the reference runner's, bit for bit. Both runners are built
-    on the host: an accelerator has a generator of its own.
+    learning rate and weights, and the draft and generator state at the end,
+    with the reference runner's, bit for bit. The optimizer state is not
+    compared across runners: a runner keeps what it resumes from in a layout
+    of its own, and the resume job holds that to its own uninterrupted run.
+    Both runners are built on the host: an accelerator has a generator of its
+    own.
     """
 
     make_runner = staticmethod(reference_runner)
@@ -540,7 +572,13 @@ class RunnerChecks:
     def assert_reproduces_the_reference(self, **declarations):
         expected = self.trained(reference_runner, KitProgram(**declarations))
         actual = self.trained(self.make_runner, KitProgram(**declarations))
-        self.assertEqual(differences(actual, expected), [])
+        self.assertEqual(
+            differences(
+                {name: actual[name] for name in _REPRODUCED},
+                {name: expected[name] for name in _REPRODUCED},
+            ),
+            [],
+        )
         # The job is not vacuous: the weights moved, and differently each update.
         first, second = (update["weights"] for update in expected["updates"][:2])
         self.assertFalse(torch.equal(first, second))
@@ -611,11 +649,7 @@ class RunnerChecks:
         first, second = KitProgram(dtype=dtype), KitProgram(dtype=dtype)
         runner = self.make_runner(first, first.spec())
         torch.manual_seed(5)
-        run_window(
-            runner,
-            iter(self.windows[0]),
-            StepContext(global_step=0, accumulation_steps=2),
-        )
+        run_window(runner, iter(self.windows[0]), _context(0, self.windows[0]))
         state = runner.checkpoint_state()
         # The draft as exported: its keys, dtype and bits are the uninterrupted
         # run's after the same update.

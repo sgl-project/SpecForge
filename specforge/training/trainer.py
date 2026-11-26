@@ -357,10 +357,7 @@ class Trainer:
                     )
             # Checkpoints written before anchor_sampling existed drew anchors
             # on the device.
-            if (
-                "canonical_anchor_sampling" in resume_contract
-                and "canonical_anchor_sampling" not in state
-            ):
+            if "canonical_anchor_sampling" not in state:
                 state = {**state, "canonical_anchor_sampling": "device"}
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
@@ -543,7 +540,7 @@ class Trainer:
         wrapped = backend.prepare_model(
             model,
             optimizer_target=model.draft_model,
-            frozen=model.frozen,
+            frozen_modules=model.frozen_modules,
             blocks=program_spec.partition.blocks,
         )
         runner = DataParallelRunner(wrapped, backend, program_spec)

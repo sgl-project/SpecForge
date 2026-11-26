@@ -806,7 +806,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     wrapped = backend.prepare_model(
                         runtime,
                         optimizer_target=runtime.draft_model,
-                        frozen=runtime.frozen,
+                        frozen_modules=runtime.frozen_modules,
                         blocks=spec.partition.blocks,
                     )
                 features = []

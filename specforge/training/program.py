@@ -32,21 +32,13 @@ def program_spec(model) -> ProgramSpec:
         replay_statistics=() if statistic is None else (statistic.argument_name,),
         evaluation_diagnostics=registration.training.evaluation_diagnostics,
         reduction=registration.training.reduction,
-        # A draft class names its transformer block; a draft without one
-        # (EAGLE) is a single unit.
-        # A draft that names no block (EAGLE, or a module that is not a
-        # canonical draft class) is one unit. Sorted: a draft class may hold
-        # the names in a set, whose order differs between the ranks' processes.
+        # A draft class names its transformer blocks; one that names none
+        # (EAGLE) is a single unit. Sorted: a draft class may hold the names in
+        # a set, whose order differs between the ranks' processes.
         partition=PartitionHints(
-            blocks=tuple(
-                sorted(getattr(model.draft_model, "_no_split_modules", None) or ())
-            )
+            blocks=tuple(sorted(model.draft_model._no_split_modules))
         ),
-        axes=(
-            {"sequence": "part"}
-            if getattr(model, "sequence_parallel", None) is not None
-            else {}
-        ),
+        axes=(("sequence", "part"),) if model.sequence_parallel is not None else (),
     )
 
 

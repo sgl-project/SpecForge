@@ -3,9 +3,11 @@
 The parts (program, step frame, run loop, step runner) meet through
 ``specforge/training/contracts.py``. Each rule below names the modules it
 covers and what they may not reach. A module that breaks a rule today is
-listed with the reason and with every forbidden name it reaches and how many
+listed with the reason and with every forbidden name it reaches. What
+communicates or reads the process-global topology is listed with how many
 times: one use more or one use less fails, so an exception neither grows nor
-outlives its code.
+outlives its code. A type, a constant or a query of the process's own rank is
+listed by name only.
 
 The scan follows names. It does not see which process group a collective runs
 on, what a method called on a value does, or anything reached through a name
@@ -42,7 +44,6 @@ FRAME = (
 )
 RUN_LOOP = (
     "specforge/training/controller.py",
-    "specforge/eval/evaluator.py",
     "specforge/eval/**/*.py",
 )
 #: What the run loop calls around a step; only the first rule covers these:
@@ -60,19 +61,26 @@ RUNNER = (
 
 #: The contracts the parts are meant to share, whatever a rule forbids.
 SHARED_CONTRACTS = ("specforge.training.contracts", "specforge.runtime.contracts")
-#: A package whose own names (its value types) are shared and whose
-#: submodules (codecs, validators, the registry) are not.
-SHARED_VALUE_TYPES = "specforge.config.draft"
+#: The value types of the draft configuration, shared by the name their
+#: package exports them under. Nothing else of the package is shared: not its
+#: codecs, validators or registry, nor a name its ``__init__`` re-exports.
+SHARED_VALUE_TYPES = ("specforge.config.draft.DraftConfig",)
 
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
 
 
 @dataclass(frozen=True)
 class Excepted:
-    """A module that breaks a rule today: why, and each use of what it reaches."""
+    """A module that breaks a rule today: why, and what it reaches."""
 
     reason: str
-    reaches: dict[str, int]
+    #: Each forbidden name it reaches that communicates or reads the
+    #: process-global topology, with how many times.
+    reaches: dict[str, int] = field(default_factory=dict)
+    #: The other forbidden names it reaches (see ``QUERIES``), not counted.
+    reads: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,35 +101,58 @@ class Rule:
 
 _T = "torch.distributed"
 
+#: Names under ``torch.distributed`` that issue no communication: types,
+#: constants, and queries of the process's own rank and of a group's size.
+#: An exception names the ones its module reaches and does not count them.
+QUERIES = tuple(
+    f"{_T}.{name}"
+    for name in (
+        "ProcessGroup",
+        "ReduceOp",
+        "get_global_rank",
+        "get_rank",
+        "get_world_size",
+        "is_available",
+        "is_initialized",
+    )
+)
+
+
+def _counted(name: str) -> bool:
+    """Whether an exception lists how many times its module reaches ``name``.
+
+    Everything is counted but the import of a distributed module and the
+    names under ``QUERIES``.
+    """
+    return name not in DISTRIBUTED and not any(_under(name, query) for query in QUERIES)
+
+
 #: Modules that reach a process group today. The counts include what a helper
 #: of the package brings: every use of a helper counts as the group reads in
 #: its body.
 EXCEPTED_COLLECTIVES = {
-    # A model-parallel axis: ranks of one group share a sequence or a tensor,
-    # never samples.
-    "specforge/modeling/draft/layers/attention/backends/cached_flash.py": Excepted(
-        "sequence-parallel axis: names the type of the ring group it hands to "
-        "ring attention",
-        {_T: 1, f"{_T}.ProcessGroup": 1},
-    ),
+    # The sequence-parallel axis: ranks of one group share a sequence, never
+    # samples.
     "specforge/modeling/draft/models/eagle_rollout.py": Excepted(
         "sequence-parallel axis: asks whether the rollout's ring group has more "
         "than one rank",
-        {_T: 1, f"{_T}.get_world_size": 1},
+        reads=(_T, f"{_T}.get_world_size"),
     ),
     "specforge/layers/ring/utils.py": Excepted(
         "sequence-parallel axis: ring attention's exchange between neighbours",
         {
-            _T: 1,
             f"{_T}.P2POp": 2,
-            f"{_T}.ProcessGroup": 1,
             f"{_T}.batch_isend_irecv": 1,
-            f"{_T}.get_global_rank": 2,
-            f"{_T}.get_rank": 1,
-            f"{_T}.get_world_size": 1,
             f"{_T}.irecv": 1,
             f"{_T}.isend": 1,
         },
+        reads=(
+            _T,
+            f"{_T}.ProcessGroup",
+            f"{_T}.get_global_rank",
+            f"{_T}.get_rank",
+            f"{_T}.get_world_size",
+        ),
     ),
     # Not a model-parallel axis: the run loop's and its helpers' own uses of
     # the process group, which the design moves to the runner and to a
@@ -137,20 +168,22 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.all_gather_object": 2,
             f"{_T}.barrier": 1,
             f"{_T}.broadcast_object_list": 1,
-            f"{_T}.get_rank": 3,
-            f"{_T}.get_world_size": 3,
-            f"{_T}.is_available": 1,
-            f"{_T}.is_initialized": 6,
         },
+        reads=(
+            f"{_T}.get_rank",
+            f"{_T}.get_world_size",
+            f"{_T}.is_available",
+            f"{_T}.is_initialized",
+        ),
     ),
     "specforge/training/profiling.py": Excepted(
         "profiler: the rank in its output's name",
-        {
-            _T: 1,
-            f"{_T}.get_rank": 1,
-            f"{_T}.is_available": 1,
-            f"{_T}.is_initialized": 1,
-        },
+        reads=(
+            _T,
+            f"{_T}.get_rank",
+            f"{_T}.is_available",
+            f"{_T}.is_initialized",
+        ),
     ),
 }
 
@@ -219,14 +252,52 @@ def _chain(node: ast.AST) -> tuple[ast.AST, list[str]]:
     return node, attributes[::-1]
 
 
+def _outside(scope: ast.AST) -> list[ast.AST]:
+    """The parts of a nested scope that the scope around it evaluates.
+
+    A comprehension's first iterable; a function's decorators, defaults and
+    annotations; a class's decorators, bases and keywords.
+    """
+    if isinstance(scope, _COMPREHENSIONS):
+        return [scope.generators[0].iter]
+    if isinstance(scope, ast.ClassDef):
+        return [*scope.decorator_list, *scope.bases, *scope.keywords]
+    if not isinstance(scope, _FUNCTIONS):
+        return []
+    arguments = scope.args
+    parameters = (
+        *arguments.posonlyargs,
+        *arguments.args,
+        *arguments.kwonlyargs,
+        arguments.vararg,
+        arguments.kwarg,
+    )
+    parts = [
+        *arguments.defaults,
+        *arguments.kw_defaults,
+        *(parameter and parameter.annotation for parameter in parameters),
+    ]
+    if not isinstance(scope, ast.Lambda):
+        parts += [*scope.decorator_list, scope.returns]
+    return [part for part in parts if part is not None]
+
+
 def _own(scope: ast.AST) -> list[ast.AST]:
-    """Nodes of one scope: nested functions and classes are named, not entered."""
+    """Nodes of one scope.
+
+    A nested function, class or comprehension is named and not entered, except
+    for the parts of it that this scope evaluates.
+    """
+    elsewhere = {id(node) for node in _outside(scope)}
     found, pending = [], list(ast.iter_child_nodes(scope))
     while pending:
         node = pending.pop()
+        if id(node) in elsewhere:
+            continue
         found.append(node)
-        if not isinstance(node, _SCOPES):
-            pending.extend(ast.iter_child_nodes(node))
+        pending.extend(
+            _outside(node) if isinstance(node, _SCOPES) else ast.iter_child_nodes(node)
+        )
     return found
 
 
@@ -383,11 +454,13 @@ class _Scan:
             if name is not None:
                 uses[name] += 1
         self.names.update(uses)
+        # A class body's names are not in scope for what is nested in it.
+        enclosing = outer if isinstance(scope, ast.ClassDef) else aliases
         for node in live:
             if not isinstance(node, _SCOPES):
                 continue
             before = Counter(self.names)
-            self._scope(node, aliases)
+            self._scope(node, enclosing)
             if top_level and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions[node.name] = self.names - before
         return imports
@@ -402,8 +475,10 @@ def reached(source: str, package: str) -> Counter[str]:
     (``import torch as t; t.distributed.barrier()``); a literal
     ``importlib.import_module`` or ``__import__``. Names are resolved in the
     scope they are used in: a function's own import, parameter or assignment
-    hides the module's. The branch of a ``typing.TYPE_CHECKING`` test that
-    never executes does not count.
+    hides the module's, a comprehension's variable hides it inside the
+    comprehension only, and a class body's names hide nothing in its methods.
+    The branch of a ``typing.TYPE_CHECKING`` test that never executes does
+    not count.
     """
     return _Scan(package).module(ast.parse(source)).names
 
@@ -466,16 +541,8 @@ def brought_along(name: str, sources: dict[str, _Source]) -> set[str]:
     return seen
 
 
-def _shared(name: str, sources: dict[str, _Source]) -> bool:
-    if any(_under(name, contract) for contract in SHARED_CONTRACTS):
-        return True
-    # A name of the package itself, not one of a module inside it.
-    return _under(name, SHARED_VALUE_TYPES) and (
-        name == SHARED_VALUE_TYPES
-        or (
-            name.count(".") == SHARED_VALUE_TYPES.count(".") + 1 and name not in sources
-        )
-    )
+def _shared(name: str) -> bool:
+    return any(_under(name, shared) for shared in SHARED_CONTRACTS + SHARED_VALUE_TYPES)
 
 
 def forbidden_uses(
@@ -484,7 +551,7 @@ def forbidden_uses(
     """Of a module's uses, those that reach a forbidden name, by that name."""
     hits: Counter[str] = Counter()
     for name, count in uses.items():
-        if _shared(name, sources):
+        if _shared(name):
             continue
         for brought in brought_along(name, sources):
             if any(_under(brought, prefix) for prefix in forbidden):
@@ -532,9 +599,31 @@ class TrainingBoundaryTest(unittest.TestCase):
             found = violations(rule)
             for path, excepted in rule.excepted.items():
                 with self.subTest(rule=rule.name, path=path):
+                    hits = found.get(path, {})
                     self.assertEqual(
-                        found.get(path, {}), dict(sorted(excepted.reaches.items()))
+                        {name: uses for name, uses in hits.items() if _counted(name)},
+                        dict(sorted(excepted.reaches.items())),
                     )
+                    # Named, and each still reached: a name more or less fails.
+                    self.assertEqual(
+                        [name for name in hits if not _counted(name)],
+                        sorted(excepted.reads),
+                    )
+
+    def test_only_what_issues_no_communication_goes_uncounted(self):
+        for name in ("barrier", "all_reduce", "all_gather_object", "isend", "P2POp"):
+            self.assertTrue(_counted(f"torch.distributed.{name}"), name)
+        # Anything else of the package's own distributed module counts too.
+        self.assertTrue(_counted("specforge.distributed.init_distributed"))
+        for name in ("get_rank", "is_initialized", "ProcessGroup", "ReduceOp.SUM"):
+            self.assertFalse(_counted(f"torch.distributed.{name}"), name)
+        self.assertFalse(_counted("torch.distributed"))
+
+    def test_every_shared_value_type_is_a_name_its_package_exports(self):
+        """A renamed or removed type would otherwise leave a name shared for nothing."""
+        for name in SHARED_VALUE_TYPES:
+            package, _, symbol = name.rpartition(".")
+            self.assertIn(symbol, _sources()[package].imported, name)
 
     def test_no_covered_module_star_imports_from_the_package(self):
         """A star import brings names the scan cannot attribute."""
@@ -600,6 +689,71 @@ class ReachedTest(unittest.TestCase):
         # And a name that was never imported is not a module.
         never = "def f(torch):\n    return torch.distributed\n"
         self.assertEqual(reached(never, "p"), {})
+
+    def test_comprehension_variable_hides_a_name_inside_the_comprehension_only(self):
+        source = (
+            "import torch.distributed as dist\n"
+            "def f(items):\n"
+            "    x = [dist for dist in items]\n"
+            "    dist.barrier()\n"
+        )
+        self.assertEqual(
+            reached(source, "p"),
+            {"torch.distributed": 1, "torch.distributed.barrier": 1},
+        )
+        # Inside, the variable is not the import, in any kind of comprehension.
+        for inside in (
+            "[dist.barrier() for dist in items]",
+            "{dist.barrier() for dist in items}",
+            "{dist: dist.barrier() for dist in items}",
+            "any(dist.barrier() for dist in items)",
+        ):
+            with self.subTest(inside=inside):
+                names = reached(f"import torch.distributed as dist\n{inside}\n", "p")
+                self.assertEqual(names, {"torch.distributed": 1})
+        # The first iterable is evaluated outside the comprehension; a later
+        # one inside it.
+        first = "import torch.distributed as dist\n[d for dist in dist.groups()]\n"
+        self.assertEqual(reached(first, "p")["torch.distributed.groups"], 1)
+        later = (
+            "import torch.distributed as dist\n"
+            "[d for dist in items for d in dist.groups()]\n"
+        )
+        self.assertNotIn("torch.distributed.groups", reached(later, "p"))
+
+    def test_what_the_enclosing_scope_evaluates_is_resolved_there(self):
+        for source, name in (
+            # A default, a decorator and an annotation of a function that
+            # rebinds the name; the bases of a class that does.
+            ("def f(x=dist.get_rank()):\n    dist = 1\n", "get_rank"),
+            ("@dist.wrap\ndef f(dist):\n    return dist\n", "wrap"),
+            ("def f(g: dist.ProcessGroup, dist=None): ...\n", "ProcessGroup"),
+            ("f = lambda dist=dist.get_rank(): dist\n", "get_rank"),
+            ("class A(dist.Base):\n    dist = None\n", "Base"),
+        ):
+            with self.subTest(source=source):
+                names = reached(f"import torch.distributed as dist\n{source}", "p")
+                self.assertEqual(
+                    names, {"torch.distributed": 1, f"torch.distributed.{name}": 1}
+                )
+
+    def test_class_body_hides_nothing_in_its_methods(self):
+        source = (
+            "import torch.distributed as dist\n"
+            "class A:\n"
+            "    dist = None\n"
+            "    def f(self):\n"
+            "        dist.barrier()\n"
+        )
+        self.assertEqual(reached(source, "p")["torch.distributed.barrier"], 1)
+        # Nor does a class's own import reach into them.
+        source = (
+            "class A:\n"
+            "    import torch.distributed as dist\n"
+            "    def f(self):\n"
+            "        dist.barrier()\n"
+        )
+        self.assertEqual(reached(source, "p"), {"torch.distributed": 1})
 
     def test_only_whole_chains_count(self):
         source = (
@@ -757,13 +911,40 @@ class BroughtAlongTest(unittest.TestCase):
             {"torch.distributed.barrier": 3},
         )
 
-    def test_shared_package_shares_its_own_names_and_not_its_modules(self):
-        sources = _sources()
-        self.assertTrue(_shared("specforge.config.draft.DraftConfig", sources))
-        self.assertTrue(_shared("specforge.training.contracts.StepContext", sources))
-        self.assertFalse(_shared("specforge.config.draft.registry", sources))
-        self.assertFalse(
-            _shared("specforge.config.draft.codec.v1.decode_config", sources)
+    def test_shared_names_are_the_contracts_and_the_listed_value_types(self):
+        self.assertTrue(_shared("specforge.config.draft.DraftConfig"))
+        self.assertTrue(_shared("specforge.training.contracts.StepContext"))
+        self.assertFalse(_shared("specforge.config.draft"))
+        self.assertFalse(_shared("specforge.config.draft.registry"))
+        self.assertFalse(_shared("specforge.config.draft.codec.v1.decode_config"))
+
+    def test_name_reexported_by_the_shared_package_is_followed_to_its_origin(self):
+        """Exporting a registry helper next to the value types shares nothing."""
+        sources = {
+            "specforge.config.draft": _Source(
+                {
+                    "DraftConfig": "specforge.config.draft.model.DraftConfig",
+                    "register": "specforge.config.draft.registry.register",
+                },
+                {},
+            ),
+            "specforge.config.draft.registry": _Source({}, {"register": Counter()}),
+        }
+        uses = reached(
+            "from specforge.config.draft import DraftConfig, register\nregister()\n",
+            "specforge.training",
+        )
+        self.assertEqual(
+            forbidden_uses(uses, ("specforge.config.draft.registry",), sources),
+            {"specforge.config.draft.registry.register": 2},
+        )
+        # Under a rule that forbids the whole package, only the value type passes.
+        self.assertEqual(
+            sorted(forbidden_uses(uses, ("specforge",), sources)),
+            [
+                "specforge.config.draft.register",
+                "specforge.config.draft.registry.register",
+            ],
         )
 
 

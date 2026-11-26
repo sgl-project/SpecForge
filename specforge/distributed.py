@@ -15,7 +15,7 @@ class Topology:
 
     :func:`init_distributed` builds it once, reading each rank once, and its
     consumers receive it explicitly. ``Topology()`` is one process with no
-    groups: what a test or a capture producer has.
+    groups, which is what a test builds; a capture producer has no topology.
     """
 
     rank: int = 0
@@ -39,6 +39,26 @@ class Topology:
     sp_ulysses_group: Any = field(default=None, compare=False, repr=False)
     sp_ring_group: Any = field(default=None, compare=False, repr=False)
 
+    def __post_init__(self):
+        sizes = {
+            "world_size": self.world_size,
+            "tp_size": self.tp_size,
+            "sp_ulysses_size": self.sp_ulysses_size,
+            "sp_ring_size": self.sp_ring_size,
+        }
+        below_one = sorted(name for name, size in sizes.items() if size < 1)
+        if below_one:
+            raise ValueError(f"topology sizes must be positive: {below_one}")
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError(
+                f"rank {self.rank} is not a rank of a world of {self.world_size}"
+            )
+        if self.world_size % (self.tp_size * self.sp_size):
+            raise ValueError(
+                f"a world of {self.world_size} is not divided by tp_size "
+                f"{self.tp_size} x sp_size {self.sp_size}"
+            )
+
     @property
     def sp_size(self) -> int:
         return self.sp_ulysses_size * self.sp_ring_size
@@ -54,7 +74,7 @@ class Topology:
     @property
     def data_parallel_size(self) -> int:
         """Ranks that receive different samples."""
-        return max(1, self.world_size // (self.tp_size * self.sp_size))
+        return self.world_size // (self.tp_size * self.sp_size)
 
     def layout(self) -> dict:
         """The sizes that describe the job, for records."""
