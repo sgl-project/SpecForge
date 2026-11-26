@@ -73,7 +73,7 @@ class TestCliConfigBuild(unittest.TestCase):
         self.assertEqual(trainer.output_dir, run_config["output_dir"])
         self.assertEqual(trainer.batch_size, 2)
         self.assertEqual(trainer.accumulation_steps, 1)
-        self.assertEqual(trainer.runner.strategy.name, "eagle3")
+        self.assertEqual(trainer.runner.spec.name, "eagle3")
 
         # and it actually trains to the configured step cap
         step = run.run()

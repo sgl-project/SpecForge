@@ -22,19 +22,19 @@ import torch
 from specforge.training.contracts import (
     IncompleteWindow,
     PendingStep,
+    StepContext,
     StepMetrics,
     StepRunner,
 )
 
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
-    from specforge.training.strategies.base import StepContext
 
 
 def run_window(
     runner: StepRunner,
     window: Iterable["TrainBatch"],
-    ctx: "StepContext",
+    ctx: StepContext,
 ) -> StepMetrics:
     """Consume one optimizer window and apply its update.
 
@@ -71,7 +71,7 @@ def run_window(
 
 
 def _bounded(
-    window: Iterable["TrainBatch"], ctx: "StepContext"
+    window: Iterable["TrainBatch"], ctx: StepContext
 ) -> Iterator[Tuple[int, "TrainBatch"]]:
     """Number the window's micro-batches from one; refuse one too many."""
     for received, batch in enumerate(window, start=1):
@@ -86,7 +86,7 @@ def _bounded(
 def _run_replayed_window(
     runner: StepRunner,
     window: Iterable["TrainBatch"],
-    ctx: "StepContext",
+    ctx: StepContext,
 ) -> StepMetrics:
     """Pool the window's statistics in a prepass, then replay it for gradients."""
     names = tuple(runner.replay_statistics)
@@ -127,7 +127,7 @@ def _run_replayed_window(
 
 
 def _at_boundary(
-    pending: Optional[PendingStep], received: int, ctx: "StepContext"
+    pending: Optional[PendingStep], received: int, ctx: StepContext
 ) -> Optional[PendingStep]:
     """A runner returns a step at the window's boundary and nowhere else."""
     if (pending is not None) != (received == ctx.accumulation_steps):
@@ -138,7 +138,7 @@ def _at_boundary(
     return pending
 
 
-def _incomplete(received: int, ctx: "StepContext") -> IncompleteWindow:
+def _incomplete(received: int, ctx: StepContext) -> IncompleteWindow:
     return IncompleteWindow(
         "training stream ended with incomplete gradient accumulation: "
         f"received {received} of {ctx.accumulation_steps} "

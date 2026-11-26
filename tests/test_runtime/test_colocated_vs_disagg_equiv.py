@@ -32,8 +32,7 @@ def _optimizer_factory(module):
 
 
 def _draft_state(trainer):
-    state = trainer.backend.state_dict()["model"]
-    return trainer.runner.strategy.checkpoint_state_filter(state)
+    return trainer.runner.checkpoint_state().draft
 
 
 @unittest.skipUnless(CUDA, "colocated/disaggregated parity requires CUDA")

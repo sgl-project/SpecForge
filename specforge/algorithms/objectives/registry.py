@@ -20,6 +20,21 @@ class WindowStatistic:
     ratio_name: str
     argument_name: str
 
+    def __post_init__(self):
+        # The objective model's forward and the step runner pass these keywords
+        # explicitly alongside ``**replay``.
+        if self.argument_name in (
+            "batch",
+            "step",
+            "total_steps",
+            "prepass",
+            "collect_detailed_metrics",
+        ):
+            raise ValueError(
+                f"a window statistic cannot be passed as {self.argument_name!r}: "
+                "the objective model's forward takes that keyword itself"
+            )
+
 
 @dataclass(frozen=True)
 class TrainingRequirements:

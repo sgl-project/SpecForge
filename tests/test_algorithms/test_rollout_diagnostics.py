@@ -10,9 +10,8 @@ import torch
 
 from specforge.algorithms.objectives.losses import PositionWeighting
 from specforge.runtime.contracts import TrainBatch
+from specforge.training.contracts import StepContext
 from specforge.training.frame import run_window
-from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext
 from tests.test_algorithms.test_block_diagnostics import rng_states
 from tests.test_algorithms.test_metric_goldens import (
     ROLLOUT_CASES,
@@ -23,8 +22,8 @@ from tests.test_algorithms.test_metric_goldens import (
     RolloutCase,
     evaluation_batches,
     prepared_rollout,
-    rollout_strategy,
 )
+from tests.test_runtime._fixtures import build_runner
 
 
 def run(runtime, tensors, *, detailed=True):
@@ -40,14 +39,14 @@ def ratio(result, name):
     return (numerator / denominator).item()
 
 
-def step_metrics(strategy, batches, *, accumulation):
+def step_metrics(runtime, batches, *, accumulation):
     """What each optimizer step reports over windows of ``accumulation`` batches."""
-    runner = DataParallelRunner(strategy, NullBackend())
+    runner = build_runner(runtime, NullBackend())
     ctx = StepContext(
         global_step=STEP, total_steps=TOTAL_STEPS, accumulation_steps=accumulation
     )
     stream = (
-        TrainBatch(sample_ids=["a"], strategy=strategy.name, tensors=tensors)
+        TrainBatch(sample_ids=["a"], strategy=runner.spec.name, tensors=tensors)
         for tensors in batches
     )
     torch.manual_seed(11)
@@ -182,10 +181,9 @@ class RolloutDiagnosticsTest(unittest.TestCase):
         for case in ROLLOUT_CASES:
             with self.subTest(case=case.name):
                 runtime, tensors = prepared_rollout(case)
-                strategy = rollout_strategy(case, runtime, tensors)
                 batches = evaluation_batches(tensors)
-                separate = step_metrics(strategy, batches, accumulation=1)
-                (combined,) = step_metrics(strategy, batches, accumulation=2)
+                separate = step_metrics(runtime, batches, accumulation=1)
+                (combined,) = step_metrics(runtime, batches, accumulation=2)
                 if case.kind == "eagle3":
                     weights = [batch["input_ids"].numel() for batch in batches]
                     names = [

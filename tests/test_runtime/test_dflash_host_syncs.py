@@ -17,10 +17,15 @@ from unittest import mock
 import torch
 from torch import nn
 
+from specforge.algorithms.objectives.base import ObjectiveModel, ObjectiveResult
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import StepContext, StepOutput
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
-from tests.test_runtime._fixtures import build_strategy, train_window
+from specforge.training.contracts import StepContext
+from tests.test_runtime._fixtures import (
+    FakeProgram,
+    fake_spec,
+    forward_program,
+    train_window,
+)
 
 CUDA = torch.cuda.is_available()
 _CTX = StepContext(global_step=5, total_steps=100, collect_detailed_metrics=False)
@@ -83,8 +88,8 @@ def _batch(loss_mask_device):
     )
 
 
-def _micro_step(strategy, batch):
-    strategy.forward_loss(batch, _CTX).loss.backward()
+def _micro_step(model, batch):
+    forward_program(model, batch, _CTX).loss.backward()
 
 
 class _CountSyncs:
@@ -110,26 +115,30 @@ class _CountSyncs:
         )
 
 
-class _RecordingModel(nn.Module):
-    """Captures what a DFlash-family strategy hands its model."""
+class _RecordingModel(ObjectiveModel):
+    """Captures the batch a DFlash-family objective model is handed."""
 
     def __init__(self):
-        super().__init__()
-        self.draft_model = nn.Linear(4, 4)
         from types import SimpleNamespace
 
         from specforge.algorithms.objectives.inputs import prepare_anchor_capacity
         from specforge.algorithms.objectives.registry import TrainingRequirements
 
-        self.draft_model.config = SimpleNamespace(draft=None)
-        self.registration = SimpleNamespace(
-            training=TrainingRequirements(host_inputs=prepare_anchor_capacity)
+        draft = nn.Linear(4, 4)
+        draft.config = SimpleNamespace(draft=None)
+        super().__init__(
+            draft,
+            objective=None,
+            registration=SimpleNamespace(
+                inputs=("input_ids", "loss_mask", "hidden_states"),
+                training=TrainingRequirements(host_inputs=prepare_anchor_capacity),
+            ),
+            name="dflash",
+            loss_configuration=None,
         )
         self.kwargs = None
 
     def forward(self, batch, **kwargs):
-        from specforge.algorithms.objectives.base import ObjectiveResult
-
         self.kwargs = batch
         loss = self.draft_model(batch["hidden_states"]).sum()
         return ObjectiveResult(loss, loss.new_ones(()))
@@ -144,10 +153,7 @@ class TestHostAnchorSizing(unittest.TestCase):
             hidden_states=torch.randn(2, 6, 4, device=device),
         )
         model = _RecordingModel().to(device)
-        strategy = CanonicalTrainStrategy(
-            model, name="dflash", objective="dflash", required_features=tensors.keys()
-        )
-        strategy.forward_loss(TrainBatch(["a", "b"], "dflash", tensors), _CTX)
+        forward_program(model, TrainBatch(["a", "b"], "dflash", tensors), _CTX)
         self.assertEqual(model.kwargs["anchor_capacity"].numel(), 3)
         self.assertEqual(model.kwargs["loss_mask"].device.type, device)
 
@@ -157,26 +163,26 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
     def test_micro_step_is_sync_free_with_host_loss_mask(self):
         for backend, sliding in (("sdpa", False), ("flex_attention", True)):
             with self.subTest(backend=backend, sliding=sliding):
-                strategy = build_strategy(_tiny_dflash2(backend, sliding=sliding))
+                model = _tiny_dflash2(backend, sliding=sliding)
                 for _ in range(2):  # compile / allocator warm-up
-                    _micro_step(strategy, _batch("cpu"))
+                    _micro_step(model, _batch("cpu"))
                 batch = _batch("cpu")
                 torch.cuda.synchronize()
                 torch.cuda.set_sync_debug_mode("error")
                 try:
-                    _micro_step(strategy, batch)
+                    _micro_step(model, batch)
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
 
     def test_device_loss_mask_still_falls_back_to_a_detected_sync(self):
-        strategy = build_strategy(_tiny_dflash2("sdpa", sliding=False))
-        _micro_step(strategy, _batch("cpu"))
+        model = _tiny_dflash2("sdpa", sliding=False)
+        _micro_step(model, _batch("cpu"))
         batch = _batch("cuda")
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
             with self.assertRaisesRegex(RuntimeError, "synchronizing"):
-                strategy.forward_loss(batch, _CTX)
+                forward_program(model, batch, _CTX)
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
@@ -230,37 +236,40 @@ class TestDFlashMicroStepSyncs(unittest.TestCase):
                 atol=0,
             )
 
-        strategy = build_strategy(_tiny_dflash2("sdpa", sliding=False))
-        _micro_step(strategy, _batch("cpu"))
+        model = _tiny_dflash2("sdpa", sliding=False)
+        _micro_step(model, _batch("cpu"))
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            _micro_step(strategy, batch)
+            _micro_step(model, batch)
         finally:
             torch.cuda.set_sync_debug_mode("default")
 
 
-class _WeightedStrategy:
-    """Scalar-loss strategy with ``loss_terms`` and a host schedule metric."""
+class _WeightedProgram(FakeProgram):
+    """Loss terms with their own denominator and a host schedule value.
 
-    name = "weighted"
-    replay_statistics = ()
+    The schedule value is reported as a ratio over the loss denominator, so it
+    is formed on the device.
+    """
 
-    def __init__(self, model, denominator):
-        self.model = model
+    def __init__(self, denominator):
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8))
         self.denominator = denominator
 
-    def trainable_module(self):
-        return self.model
-
-    def forward_loss(self, batch, ctx=None):
-        numerator = self.model(batch.tensors["x"]).float().square().sum()
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ):
+        numerator = self.layers(tensors["x"]).float().square().sum()
         denominator = torch.full_like(numerator, self.denominator).detach()
-        return StepOutput(
-            loss=numerator / denominator,
-            metrics={"lambda_base": 0.25},
-            ratio_metrics={"acc": (numerator.detach(), denominator)},
-            loss_terms=(numerator, denominator),
+        return ObjectiveResult(
+            numerator,
+            denominator,
+            ratios={
+                "acc": (numerator.detach(), denominator),
+                "lambda_base": (0.25 * denominator, denominator),
+            },
         )
 
 
@@ -270,18 +279,15 @@ def _boundary_runner(*, denominator=4.0):
     from specforge.training.runner import DataParallelRunner
 
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(16, 32), nn.GELU(), nn.Linear(32, 8)).to(
-        "cuda", torch.bfloat16
-    )
+    program = _WeightedProgram(denominator).to("cuda", torch.bfloat16)
     backend = FSDPTrainingBackend(
         ParallelConfig(),
         optimizer_factory=lambda module: BF16Optimizer(
             module, lr=1e-3, max_grad_norm=0.05, total_steps=10, warmup_ratio=0.0
         ),
     )
-    backend.prepare_model(model, wrap=False)
-    strategy = _WeightedStrategy(model, denominator)
-    return DataParallelRunner(strategy, backend)
+    backend.prepare_model(program, wrap=False)
+    return DataParallelRunner(program, backend, fake_spec("x", name="weighted"))
 
 
 def _x_batch():
@@ -315,7 +321,7 @@ class TestOptimizerBoundarySyncs(unittest.TestCase):
         self.assertTrue(runner.backend.checks_loss_denominator)
         self.assertEqual(self._boundary_syncs(runner), (0, 1))
 
-    def test_dp_boundary_reduces_host_scalars_without_extra_syncs(self):
+    def test_dp_boundary_reduces_device_metrics_without_extra_syncs(self):
         runner = _boundary_runner()
         with (
             mock.patch("torch.distributed.is_available", return_value=True),

@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from copy import deepcopy
-from dataclasses import replace
 from datetime import timedelta
 
 import torch
@@ -9,25 +8,25 @@ import torch.distributed as dist
 import torch.multiprocessing as multiprocessing
 from torch import nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.contracts import StepContext
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext, StepOutput
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 
-class _Strategy:
-    replay_statistics = ()
+class _Program(FakeProgram):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 2, bias=False)
 
-    def __init__(self, model):
-        self.model = model
-
-    def trainable_module(self):
-        return self.model
-
-    def forward_loss(self, batch, ctx=None):
-        return StepOutput(
-            loss=self.model(batch.tensors["input"]).square().mean(), metrics={}
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ):
+        return ObjectiveResult(
+            self.linear(tensors["input"]).square().mean(), torch.ones(())
         )
 
 
@@ -37,13 +36,14 @@ class _Optimizer(torch.optim.SGD):
         self.zero_grad(set_to_none=True)
 
 
-class _ReplayStrategy(_Strategy):
-    replay_statistics = ("count",)
+class _ReplayProgram(_Program):
+    """Declares the ``count`` statistic; a prepass reports one per micro-batch."""
 
-    def prepass(self, batch, ctx):
-        return replace(
-            self.forward_loss(batch, ctx), statistics={"count": torch.ones(1)}
-        )
+    def forward(self, tensors, *, prepass=False, replay_values=None, **context):
+        result = super().forward(tensors, **context)
+        if prepass:
+            result.statistics["count"] = torch.ones(1)
+        return result
 
 
 def _count_allreduce(state, bucket):
@@ -73,17 +73,17 @@ def _worker(rank, directory, replay):
     )
     try:
         torch.manual_seed(77)
-        model = nn.Linear(4, 2, bias=False)
-        reference = deepcopy(model)
+        program = _ReplayProgram() if replay else _Program()
+        reference = deepcopy(program.linear)
         backend = FSDPTrainingBackend(
             ParallelConfig(world_size=2, sharding_strategy="NO_SHARD"),
             optimizer_factory=lambda target: _Optimizer(target.parameters(), lr=0.01),
         )
-        wrapped = backend.prepare_model(model)
+        wrapped = backend.prepare_model(program)
         state = {"calls": 0}
         wrapped.register_comm_hook(state, _count_allreduce)
-        strategy = _ReplayStrategy(wrapped) if replay else _Strategy(wrapped)
-        runner = DataParallelRunner(strategy, backend)
+        spec = fake_spec("input", replay_statistics=("count",) if replay else ())
+        runner = DataParallelRunner(wrapped, backend, spec)
         ctx = StepContext(accumulation_steps=2)
         reference_optimizer = _Optimizer(reference.parameters(), lr=0.01)
         check = unittest.TestCase()
@@ -122,7 +122,7 @@ def _worker(rank, directory, replay):
             reference(inputs).square().mean().backward()
             reference_optimizer.step()
             torch.testing.assert_close(
-                model.weight, reference.weight, rtol=0, atol=1e-6
+                program.linear.weight, reference.weight, rtol=0, atol=1e-6
             )
     finally:
         dist.destroy_process_group()

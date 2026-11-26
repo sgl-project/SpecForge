@@ -13,7 +13,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-from specforge.algorithms.objectives.implementations.registry import ExecutionSelection
+from specforge.algorithms.objectives.base import ObjectiveModel, ObjectiveResult
 from specforge.runtime.contracts import SampleRef, TrainBatch
 from specforge.runtime.control_plane import DataFlowController, InMemoryMetadataStore
 from specforge.training.backend import (
@@ -22,9 +22,7 @@ from specforge.training.backend import (
     TrainingBackend,
 )
 from specforge.training.controller import TrainerController
-from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
-from tests.test_runtime._fixtures import train_window
+from tests.test_runtime._fixtures import build_runner, forward_program, train_window
 
 
 def _ref(i):
@@ -156,40 +154,39 @@ class _FakeBackend(TrainingBackend):
         pass
 
 
-class _FakeDFlashModel(nn.Module):
+class _FakeDFlashModel(ObjectiveModel):
+    """An objective model declared as DFlash, with a one-parameter draft."""
+
     def __init__(self):
-        super().__init__()
-        # the strategy compares kernel selections across ranks before a checkpoint
-        self.loss_implementations = ExecutionSelection()
         from specforge.algorithms.objectives.registry import TrainingRequirements
 
-        self.draft_model = nn.Module()
-        self.draft_model.register_parameter("w", nn.Parameter(torch.ones(1)))
-        self.draft_model.config = SimpleNamespace(draft=None)
-        self.registration = SimpleNamespace(training=TrainingRequirements())
+        draft = nn.Module()
+        draft.register_parameter("w", nn.Parameter(torch.ones(1)))
+        draft.config = SimpleNamespace(draft=None)
+        super().__init__(
+            draft,
+            objective=None,
+            registration=SimpleNamespace(
+                inputs=("hidden_states",), training=TrainingRequirements()
+            ),
+            name="dflash",
+            loss_configuration=None,
+        )
 
     @property
     def w(self):
         return self.draft_model.w
 
     def forward(self, batch, **context):
-        from specforge.algorithms.objectives.base import ObjectiveResult
-
         loss = (self.w * batch["hidden_states"].float().sum()).abs()
         return ObjectiveResult(loss, loss.new_ones(()))
 
 
-def strategy_for(model):
-    return CanonicalTrainStrategy(
-        model, name="dflash", objective="dflash", required_features={"hidden_states"}
-    )
-
-
 class TestDFlashSharesLifecycle(unittest.TestCase):
-    def test_canonical_strategy_uses_shared_trainer_lifecycle(self):
+    def test_objective_model_uses_shared_trainer_lifecycle(self):
         model = _FakeDFlashModel()
         backend = _FakeBackend(model)
-        runner = DataParallelRunner(strategy_for(model), backend)
+        runner = build_runner(model, backend)
         batch = TrainBatch(["s0"], "dflash", {"hidden_states": torch.randn(1, 4, 8)})
         metrics = train_window(runner, [batch])
         self.assertIsNotNone(metrics.grad_norm)
@@ -198,21 +195,19 @@ class TestDFlashSharesLifecycle(unittest.TestCase):
 
     def test_missing_required_feature_fails(self):
         with self.assertRaises(ValueError):
-            strategy_for(_FakeDFlashModel()).forward_loss(
-                TrainBatch(["s0"], "dflash", {})
-            )
+            forward_program(_FakeDFlashModel(), TrainBatch(["s0"], "dflash", {}))
 
 
 class TestCheckpointRecord(unittest.TestCase):
     def test_save_checkpoint_returns_plain_record(self):
         model = _FakeDFlashModel()
-        strat = strategy_for(model)
         backend = _FakeBackend(model)
         backend.prepare_model(model)
+        runner = build_runner(model, backend)
         with tempfile.TemporaryDirectory() as d:
             ctrl = TrainerController(
-                DataParallelRunner(strat, backend),
-                strategy_name=strat.name,
+                runner,
+                strategy_name=runner.spec.name,
                 run_id="r",
                 output_dir=d,
             )

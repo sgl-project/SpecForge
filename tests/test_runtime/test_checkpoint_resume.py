@@ -44,49 +44,37 @@ def _x_collate(features):
 
 
 def _fake_seam():
-    """CPU fakes over the real seam ABCs (imported lazily: specforge is heavy)."""
+    """A CPU program and a backend for it (imported lazily: specforge is heavy)."""
     import torch.nn as nn
 
+    from specforge.algorithms.objectives.base import ObjectiveResult
     from specforge.training.backend import TrainingBackend
-    from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
+    from tests.test_runtime._fixtures import FakeProgram
 
     class Draft(nn.Module):
         def __init__(self):
             super().__init__()
             self.w = nn.Parameter(torch.zeros(1))
 
-    class Composite(nn.Module):
+    class Composite(FakeProgram):
         # mirrors ObjectiveModel's shape: the checkpointed unit is .draft_model
-        def __init__(self):
+        def __init__(self, draft=None):
             super().__init__()
-            self.draft_model = Draft()
+            self.draft_model = Draft() if draft is None else draft
 
-    class Strategy(DraftTrainStrategy):
-        name = "eagle3"  # matches the offline refs' strategy tag
-        required_features = {"x"}
+        def forward(
+            self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+        ):
+            w = self.draft_model.w
+            loss = ((w - tensors["x"].float().mean()) ** 2).sum()
+            return ObjectiveResult(loss, torch.ones(()))
 
-        def __init__(self, model, seen=None):
-            self.model = model
-            self.seen = [] if seen is None else seen
-
-        def trainable_module(self):
-            return self.model
-
-        def forward_loss(self, batch, ctx=None):
-            self.validate_batch(batch)
-            self.seen.extend(batch.sample_ids)
-            w = self.model.draft_model.w
-            loss = ((w - batch.tensors["x"].float().mean()) ** 2).sum()
-            return StepOutput(loss=loss, metrics={})
-
-        def checkpoint_state_filter(self, state_dict):
+        def draft_state(self, state):
             pre = "draft_model."
-            return {
-                k[len(pre) :]: v for k, v in state_dict.items() if k.startswith(pre)
-            }
+            return {k[len(pre) :]: v for k, v in state.items() if k.startswith(pre)}
 
-        def kernels(self):
-            selection = getattr(self.model, "loss_implementations", None)
+        def kernel_record(self):
+            selection = getattr(self, "loss_implementations", None)
             return {} if selection is None else dict(selection.names)
 
     class Backend(TrainingBackend):
@@ -103,6 +91,12 @@ def _fake_seam():
         def backward(self, loss, *, is_boundary=True):
             loss.backward()
 
+        def scale_gradients(self, factor):
+            with torch.no_grad():
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(factor)
+
         def step(self):
             self.steps += 1
             with torch.no_grad():
@@ -118,7 +112,26 @@ def _fake_seam():
         def load_state_dict(self, state):
             pass
 
-    return Composite, Strategy, Backend
+    return Composite, Backend
+
+
+def _spec():
+    """What the fake program declares; named after the offline refs' strategy tag."""
+    from tests.test_runtime._fixtures import fake_spec
+
+    return fake_spec("x", name="eagle3")
+
+
+def _recording_runner(seen):
+    """A runner class that appends to ``seen`` the sample ids of each batch it forwards."""
+    from specforge.training.runner import DataParallelRunner
+
+    class Runner(DataParallelRunner):
+        def _forward(self, batch, ctx, **replay):
+            seen.extend(batch.sample_ids)
+            return super()._forward(batch, ctx, **replay)
+
+    return Runner
 
 
 @contextlib.contextmanager
@@ -183,21 +196,23 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
         from specforge.training.trainer import Trainer
 
-        Composite, Strategy, _ = _fake_seam()
+        Composite, _ = _fake_seam()
         seen = [] if seen is None else seen
         model = Composite() if model is None else model
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
-        with _no_fsdp_wrap():
+        with (
+            _no_fsdp_wrap(),
+            mock.patch(
+                "specforge.training.trainer.DataParallelRunner", _recording_runner(seen)
+            ),
+        ):
             trainer = Trainer(
                 algorithm_name=spec_name,
-                make_step_strategy=lambda wrapped, *, target_head: Strategy(
-                    wrapped, seen
-                ),
                 controller=DataFlowController(run_id),
                 store=LocalFeatureStore("st"),
                 ref_source={"refs": refs},
                 model=model,
-                target_head=None,
+                program_spec=_spec(),
                 optimizer_factory=lambda m: BF16Optimizer(
                     m,
                     lr=0.05,
@@ -229,7 +244,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         )
         from specforge.training.checkpoint import CheckpointManager
 
-        Composite, _, _ = _fake_seam()
+        Composite, _ = _fake_seam()
         with tempfile.TemporaryDirectory() as workdir:
             features = _write_feature_files(os.path.join(workdir, "features"), n=4)
             out = os.path.join(workdir, "out")
@@ -388,7 +403,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         )
         from specforge.training.checkpoint import CheckpointManager
 
-        Composite, _, _ = _fake_seam()
+        Composite, _ = _fake_seam()
 
         def model_with(execution):
             model = Composite()
@@ -700,6 +715,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             checkpoint_key_fingerprint,
         )
 
+        Program, _ = _fake_seam()
+
         class Draft(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -708,10 +725,9 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 self.embed_tokens = nn.Embedding(4, 1)
                 self.embed_tokens.requires_grad_(False)
 
-        class Composite(nn.Module):
+        class Composite(Program):
             def __init__(self):
-                super().__init__()
-                self.draft_model = Draft()
+                super().__init__(Draft())
 
         workdir = tempfile.mkdtemp(prefix="trainer_resume_keys_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
@@ -895,7 +911,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.data_plane.feature_store import LocalFeatureStore
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 
-        _, BaseStrategy, _ = _fake_seam()
+        Program, _ = _fake_seam()
 
         class Draft(nn.Module):
             def __init__(self):
@@ -904,38 +920,34 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 self.embed_tokens = nn.Embedding(4, 1)
                 self.embed_tokens.requires_grad_(False)
 
-        class Composite(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.draft_model = Draft()
+        class Composite(Program):
+            # the builder reads the program's declarations from these two
+            objective_name = "eagle3"
+            registration = SimpleNamespace(
+                inputs=("x",),
+                training=SimpleNamespace(
+                    window_statistic=None, evaluation_diagnostics=False
+                ),
+            )
 
-        class EagleStrategy(BaseStrategy):
-            def checkpoint_state_filter(self, state_dict):
-                state = super().checkpoint_state_filter(state_dict)
+            def __init__(self):
+                super().__init__(Draft())
+
+            def draft_state(self, state):
+                state = super().draft_state(state)
                 return {
                     key: value for key, value in state.items() if "embed" not in key
                 }
 
-        step = SimpleNamespace(
-            build=lambda wrapped, *, target_head=None, **_options: EagleStrategy(
-                wrapped
-            ),
-            allowed_missing_checkpoint_keys=lambda _cfg, draft, _model: {
-                key for key in draft.state_dict() if "embed" in key
-            },
-        )
-        algorithm = SimpleNamespace(
-            name="eagle3",
-            providers=SimpleNamespace(step=step),
-        )
+        algorithm = SimpleNamespace(name="eagle3")
         workdir = tempfile.mkdtemp(prefix="direct_builder_eagle_resume_")
         feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=4)
         refs = OfflineManifestReader(feat_dir, run_id="data").read()
 
-        def runtime(model, *, objective_scale=1.0):
+        def runtime(model, *, options=None):
             allowed_missing = {"embed_tokens.weight"}
             return StepRuntimeConfig(
-                options={"objective_scale": objective_scale},
+                options={"name": "eagle3"} if options is None else options,
                 resume_contract={
                     OMITTED_STATE_FINGERPRINT_CONTRACT_KEY: (
                         checkpoint_key_fingerprint(
@@ -981,7 +993,6 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     store=LocalFeatureStore("direct-store"),
                     ref_source={"refs": refs},
                     model=model,
-                    target_head=None,
                     optimizer_factory=lambda module: BF16Optimizer(
                         module,
                         lr=0.05,
@@ -1050,11 +1061,49 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 output_dir=output_dir,
                 max_steps=2,
                 resume_from=checkpoint,
+                # Other options than the checkpoint recorded, that describe
+                # the same run.
                 strategy_runtime=runtime(
                     unchanged_model,
-                    objective_scale=2.0,
+                    options={"name": "eagle3", "objective": "eagle3"},
                 ),
             )
+        # An option is recorded for resume, so one that describes nothing of
+        # the program is refused before anything trains.
+        for options, message in (
+            ({"objective_scale": 2.0}, r"\['objective_scale'\] configure nothing"),
+            ({"name": "eagle3-other"}, "whose name is 'eagle3'"),
+            ({"objective": "dflash"}, "whose objective is 'eagle3'"),
+            (
+                {"required_features": ("x", "teacher")},
+                r"whose required_features is \{'x'\}",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                assemble(
+                    Composite(),
+                    output_dir=os.path.join(workdir, "refused"),
+                    max_steps=1,
+                    strategy_runtime=StepRuntimeConfig(
+                        options=options,
+                        resume_contract={},
+                        allowed_missing_checkpoint_keys=frozenset(),
+                    ),
+                )
+        described = StepRuntimeConfig(
+            options={"objective": "eagle3", "required_features": ("x",)},
+            resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        assemble(
+            Composite(),
+            output_dir=os.path.join(workdir, "described"),
+            max_steps=1,
+            strategy_runtime=described,
+        )
 
         changed_model = Composite()
         with torch.no_grad():
@@ -1179,16 +1228,15 @@ class TestFitReentry(unittest.TestCase):
 
     def _controller(self, seen, max_steps, out_dir, **kw):
         from specforge.training.controller import TrainerController
-        from specforge.training.runner import DataParallelRunner
 
         num_epochs = kw.pop("num_epochs", 1)
-        Composite, Strategy, Backend = _fake_seam()
+        Composite, Backend = _fake_seam()
         model = Composite()
         backend = Backend(model)
-        strategy = Strategy(model, seen)
+        spec = _spec()
         ctrl = TrainerController(
-            DataParallelRunner(strategy, backend),
-            strategy_name=strategy.name,
+            _recording_runner(seen)(model, backend, spec),
+            strategy_name=spec.name,
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
@@ -1343,18 +1391,26 @@ class TestFitReentry(unittest.TestCase):
 
 @unittest.skipUnless(CUDA, "checkpoint resume requires CUDA")
 class TestCheckpointResume(unittest.TestCase):
-    def test_checkpoint_resume(self):
-        torch.manual_seed(0)
+    @classmethod
+    def setUpClass(cls):
+        if torch.distributed.is_initialized():
+            return
+
+        from specforge.distributed import destroy_distributed
         from tests.test_runtime import _fixtures as fx
 
+        env = mock.patch.dict(os.environ)
+        env.start()
+        cls.addClassCleanup(env.stop)
+        cls.addClassCleanup(destroy_distributed)
         fx.build_single_rank_distributed(port="29563")
 
-        from specforge.modeling.target.target_head import TargetHead
+    def test_checkpoint_resume(self):
+        torch.manual_seed(0)
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController
-        from specforge.training.runner import DataParallelRunner
-        from tests.test_runtime._fixtures import build_strategy
+        from tests.test_runtime import _fixtures as fx
 
         TTT, BS, N = 3, 2, 6
         workdir = tempfile.mkdtemp(prefix="ckpt_resume_")
@@ -1369,7 +1425,6 @@ class TestCheckpointResume(unittest.TestCase):
                 cfg, target_dir, vocab_path, ttt=TTT, backend="flex_attention"
             )
 
-        head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
         loader = fx.build_offline_eagle3_loader(
             feat_dir,
             batch_size=BS,
@@ -1389,10 +1444,10 @@ class TestCheckpointResume(unittest.TestCase):
         backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
-        strategy = build_strategy(model, target_head=head)
+        runner = fx.build_runner(model, backend)
         ctrl = TrainerController(
-            DataParallelRunner(strategy, backend),
-            strategy_name=strategy.name,
+            runner,
+            strategy_name=runner.spec.name,
             run_id="r",
             output_dir=out_dir,
             max_steps=3,
@@ -1469,15 +1524,10 @@ class TestCheckpointResume(unittest.TestCase):
             )
 
     def test_resume_loss_curve_continuity(self):
-        from tests.test_runtime import _fixtures as fx
-
-        fx.build_single_rank_distributed(port="29564")
-
         from specforge.optimizer import BF16Optimizer
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.controller import TrainerController
-        from specforge.training.runner import DataParallelRunner
-        from tests.test_runtime._fixtures import build_strategy
+        from tests.test_runtime import _fixtures as fx
 
         TTT, BS, TOTAL, CUT = 3, 2, 6, 3
         workdir = tempfile.mkdtemp(prefix="ckpt_continuity_")
@@ -1495,10 +1545,14 @@ class TestCheckpointResume(unittest.TestCase):
                 max_len=512,
             )
 
+        self.addCleanup(
+            torch.set_deterministic_debug_mode, torch.get_deterministic_debug_mode()
+        )
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
         def build_run():
             torch.manual_seed(0)
-            torch.use_deterministic_algorithms(True, warn_only=True)
-            model, head = fx.build_eagle3(workdir, ttt=TTT)
+            model, _ = fx.build_eagle3(workdir, ttt=TTT)
             backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
             backend.prepare_model(model, wrap=False)
             backend.set_optimizer(
@@ -1510,15 +1564,14 @@ class TestCheckpointResume(unittest.TestCase):
                     total_steps=100,
                 )
             )
-            strategy = build_strategy(model, target_head=head)
-            return model, backend, strategy
+            return model, backend, fx.build_runner(model, backend)
 
         # Reference: one uninterrupted run of TOTAL steps (loss + lr per step).
         losses_ref, lrs_ref = [], []
-        _, backend_r, strategy_r = build_run()
+        _, backend_r, runner_r = build_run()
         ctrl_r = TrainerController(
-            DataParallelRunner(strategy_r, backend_r),
-            strategy_name=strategy_r.name,
+            runner_r,
+            strategy_name=runner_r.spec.name,
             run_id="ref",
             output_dir=os.path.join(workdir, "ref"),
             max_steps=TOTAL,
@@ -1535,10 +1588,10 @@ class TestCheckpointResume(unittest.TestCase):
         # Interrupted phase 1: CUT steps, then save.
         out_a = os.path.join(workdir, "rez")
         losses_a = []
-        model_a, backend_a, strategy_a = build_run()
+        model_a, backend_a, runner_a = build_run()
         ctrl_a = TrainerController(
-            DataParallelRunner(strategy_a, backend_a),
-            strategy_name=strategy_a.name,
+            runner_a,
+            strategy_name=runner_a.spec.name,
             run_id="rez",
             output_dir=out_a,
             max_steps=CUT,
@@ -1572,7 +1625,7 @@ class TestCheckpointResume(unittest.TestCase):
         # checkpoint and must be rebuilt identically (as a real resume rebuilds
         # it from the same target); training RNG is restored from the checkpoint.
         torch.manual_seed(0)
-        model_b, backend_b, strategy_b = build_run()
+        model_b, backend_b, runner_b = build_run()
         model_b.draft_model.load_state_dict(state["draft_state_dict"], strict=False)
         backend_b.load_state_dict(state["backend"])
 
@@ -1601,8 +1654,8 @@ class TestCheckpointResume(unittest.TestCase):
 
         losses_b = []
         ctrl_b = TrainerController(
-            DataParallelRunner(strategy_b, backend_b),
-            strategy_name=strategy_b.name,
+            runner_b,
+            strategy_name=runner_b.spec.name,
             run_id="rez",
             output_dir=out_a,
             max_steps=TOTAL,
@@ -1646,12 +1699,13 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
     import torch.nn as nn
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+    from specforge.algorithms.objectives.base import ObjectiveResult
     from specforge.runtime.contracts import TrainBatch
     from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
     from specforge.training.checkpoint import CheckpointManager
     from specforge.training.controller import TrainerController
     from specforge.training.runner import DataParallelRunner
-    from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
+    from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
     class Draft(nn.Module):
         def __init__(self):
@@ -1662,37 +1716,24 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
         def forward(self, x):
             return self.out(torch.relu(self.proj(x)))
 
-    class Composite(nn.Module):
+    class Composite(FakeProgram):
         def __init__(self):
             super().__init__()
             self.draft_model = Draft()
 
-        def forward(self, x):
-            return self.draft_model(x)
-
-    class Strategy(DraftTrainStrategy):
-        name = "sharded-resume"
-        required_features = {"x"}
-
-        def __init__(self, model):
-            self.model = model
-
-        def trainable_module(self):
-            return self.model
-
-        def forward_loss(self, batch, ctx=None):
-            x = batch.tensors["x"]
+        def forward(
+            self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+        ):
+            x = tensors["x"]
             # Use RNG so rank-local RNG restoration is also verified.
             noise = torch.randn_like(x) * 0.01
-            out = self.model(x + noise)
-            return StepOutput(loss=(out * out).mean(), metrics={})
+            out = self.draft_model(x + noise)
+            return ObjectiveResult((out * out).mean(), torch.ones((), device=x.device))
 
-        def checkpoint_state_filter(self, state_dict):
+        def draft_state(self, state):
             prefix = "draft_model."
             return {
-                k[len(prefix) :]: v
-                for k, v in state_dict.items()
-                if k.startswith(prefix)
+                k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)
             }
 
     if use_cuda:
@@ -1771,7 +1812,9 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
                 wrapped = backend.prepare_model(
                     model, optimizer_target=model.draft_model
                 )
-            runner = DataParallelRunner(Strategy(wrapped), backend)
+            runner = DataParallelRunner(
+                wrapped, backend, fake_spec("x", name="sharded-resume")
+            )
             ctrl = TrainerController(
                 runner,
                 strategy_name="sharded-resume",

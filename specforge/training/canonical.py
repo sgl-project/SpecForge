@@ -75,12 +75,6 @@ def minimum_loss_tokens(cfg, draft, *, count):
     return count
 
 
-def build_step(wrapped_model, *, target_head=None, **options):
-    from specforge.training.strategies.canonical import CanonicalTrainStrategy
-
-    return CanonicalTrainStrategy(wrapped_model, **options)
-
-
 def _objective_settings(cfg):
     return dict(
         name=cfg.training.objective,
@@ -101,7 +95,6 @@ def resolve_run(cfg, *, target_config=None):
         OfflineDataProvider,
         ServerCaptureLayout,
         ServerStreamingProvider,
-        StepProvider,
         make_registration,
     )
     from specforge.algorithms.contracts import (
@@ -279,14 +272,9 @@ def resolve_run(cfg, *, target_config=None):
             minimum_loss_tokens, count=requirements.minimum_loss_tokens
         ),
     )
-    step = StepProvider(
-        build=build_step,
-        uses_external_target_head=False,
-    )
     providers = AlgorithmProviders(
         algorithm_name=family,
         model=provider,
-        step=step,
         offline=(offline,),
         server_streaming=streaming,
         vocab_mapping_modes=spec.feature_modes if vocab else frozenset(),

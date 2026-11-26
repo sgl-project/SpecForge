@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.runtime.contracts import FeatureSpec, SampleRef, TrainBatch
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import (
@@ -44,36 +45,29 @@ from specforge.training.backend import TrainingBackend
 from specforge.training.checkpoint import STATE_FILE, CheckpointManager
 from specforge.training.controller import TrainerController, _AsyncAckRunner
 from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import DraftTrainStrategy, StepOutput
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 WORLD_SIZE = 2
 ACK_THREAD = "specforge-durable-ack"
 _GLOO_AVAILABLE = dist.is_available() and dist.is_gloo_available()
 
 
-class _TinyModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.w = nn.Parameter(torch.ones(1))
-
-
-class _Strategy(DraftTrainStrategy):
-    name = "fake"
-    required_features = {"x"}
+class _Program(FakeProgram):
+    """Calls ``on_forward`` with the completed step count on each training forward."""
 
     def __init__(self, on_forward=None):
-        self.model = _TinyModel()
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(1))
         self.on_forward = on_forward
 
-    def trainable_module(self):
-        return self.model
-
-    def forward_loss(self, batch: TrainBatch, ctx=None) -> StepOutput:
-        self.validate_batch(batch)
-        if self.on_forward is not None and self.model.training:
-            self.on_forward(batch, ctx)
-        loss = (self.model.w * batch.tensors["x"].sum()).abs()
-        return StepOutput(loss=loss, metrics={"accuracy": torch.tensor(0.5)})
+    def forward(
+        self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+    ) -> ObjectiveResult:
+        if self.on_forward is not None and self.training:
+            self.on_forward(step)
+        loss = (self.w * tensors["x"].sum()).abs()
+        one = torch.ones(())
+        return ObjectiveResult(loss, one, ratios={"accuracy": (torch.tensor(0.5), one)})
 
 
 class _Backend(TrainingBackend):
@@ -149,11 +143,12 @@ def _ref(sample_id: str) -> SampleRef:
 
 
 def _controller(output_dir, *, on_forward=None, on_step=None, **kwargs):
-    strategy = _Strategy(on_forward)
-    backend = _Backend(strategy.model, on_step)
+    program = _Program(on_forward)
+    backend = _Backend(program, on_step)
+    spec = fake_spec("x", name="fake")
     return TrainerController(
-        DataParallelRunner(strategy, backend),
-        strategy_name=strategy.name,
+        DataParallelRunner(program, backend, spec),
+        strategy_name=spec.name,
         run_id="run0",
         output_dir=output_dir,
         **kwargs,
@@ -182,7 +177,7 @@ class TestAsyncDurableAck(unittest.TestCase):
         return ack_fn
 
     def test_ack_overlaps_next_step_in_optimizer_step_order(self):
-        # ctx.global_step is the last COMPLETED step while step N computes.
+        # A forward is given the last COMPLETED step while step N computes.
         computing = {step: threading.Event() for step in range(1, 5)}
         calls = []
 
@@ -193,7 +188,7 @@ class TestAsyncDurableAck(unittest.TestCase):
 
         ctrl = _controller(
             self.work,
-            on_forward=lambda _batch, ctx: computing[ctx.global_step + 1].set(),
+            on_forward=lambda step: computing[step + 1].set(),
             max_steps=4,
             ack_fn=ack_fn,
             async_ack=True,
@@ -325,8 +320,8 @@ class TestAsyncDurableAck(unittest.TestCase):
             ack_finished.set()
             raise ValueError("ack also failed")
 
-        def on_forward(_batch, ctx):
-            if ctx.global_step == 1:
+        def on_forward(step):
+            if step == 1:
                 raise RuntimeError("forward failed on step 2")
 
         ctrl = _controller(
@@ -351,7 +346,7 @@ class TestAsyncDurableAck(unittest.TestCase):
             logged = []
             ctrl = _controller(
                 self.work,
-                on_forward=lambda _batch, _ctx: time.sleep(0.1),
+                on_forward=lambda _step: time.sleep(0.1),
                 max_steps=4,
                 log_interval=4,
                 logger=lambda metrics, _step: logged.append(dict(metrics)),
@@ -590,8 +585,8 @@ def _crash_mid_ack_worker(work: str) -> None:
     dfc.commit_samples("producer", [_ref(f"s{i}") for i in range(1, 5)])
     step4_computing = threading.Event()
 
-    def on_forward(_batch, ctx):
-        if ctx.global_step == 3:
+    def on_forward(step):
+        if step == 3:
             step4_computing.set()
 
     def ack_fn(ids, step):

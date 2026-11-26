@@ -186,7 +186,7 @@ class ConvertCanonicalCheckpointTest(unittest.TestCase):
                         ExecutionSelection,
                     )
 
-                    composite, _, _ = resume_tests._fake_seam()
+                    composite, _ = resume_tests._fake_seam()
                     model = composite()
                     model.loss_implementations = ExecutionSelection()
                     resumed, _, _ = harness._make_trainer(

@@ -7,7 +7,7 @@ import torch
 
 from specforge.modeling.draft.layers.kernels import configure_kernels
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.strategies.base import StepContext
+from specforge.training.contracts import StepContext
 from tests.test_modeling.dspine_fixtures import training_inputs, training_model
 from tests.test_modeling.test_dspine_accumulation import training_runner
 from tests.test_runtime._fixtures import train_window

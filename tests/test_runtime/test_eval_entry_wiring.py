@@ -112,10 +112,7 @@ class TestEvalLaunch(unittest.TestCase):
         provider = types.SimpleNamespace(build_reader=reader)
         return types.SimpleNamespace(
             name="eagle3",
-            providers=types.SimpleNamespace(
-                offline_for=lambda _modality: provider,
-                step=types.SimpleNamespace(uses_external_target_head=True),
-            ),
+            providers=types.SimpleNamespace(offline_for=lambda _modality: provider),
         )
 
     def test_offline_eval_factory_reuses_io_contract_and_keeps_partial_batch(self):

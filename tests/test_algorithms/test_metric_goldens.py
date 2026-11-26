@@ -23,11 +23,9 @@ from specforge.algorithms.objectives.losses import PositionWeighting
 from specforge.modeling import build_draft_model
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
+from specforge.training.contracts import StepContext
 from specforge.training.controller import TrainerController
 from specforge.training.frame import run_window
-from specforge.training.runner import DataParallelRunner
-from specforge.training.strategies.base import StepContext
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_algorithms.test_objective_goldens import block_runtime
 from tests.test_algorithms.test_objectives import (
     eagle_config,
@@ -35,6 +33,7 @@ from tests.test_algorithms.test_objectives import (
     training_batch,
 )
 from tests.test_modeling.test_canonical_eagle3 import install_mapping
+from tests.test_runtime._fixtures import build_runner
 
 GOLDENS = Path(__file__).resolve().parents[1] / "fixtures/metric_goldens.json"
 # The target tables stay at their initial values while the draft is fitted.
@@ -124,27 +123,29 @@ class NullBackend(TrainingBackend):
         pass
 
 
-def logged_metrics(strategy, tensors, *, detailed=True):
+def logged_metrics(runtime, tensors, *, detailed=True):
     """The metrics one optimizer step hands to the tracker."""
-    batch = TrainBatch(sample_ids=["a", "b"], strategy=strategy.name, tensors=tensors)
+    runner = build_runner(runtime, NullBackend())
+    batch = TrainBatch(
+        sample_ids=["a", "b"], strategy=runner.spec.name, tensors=tensors
+    )
     ctx = StepContext(
         global_step=STEP, total_steps=TOTAL_STEPS, collect_detailed_metrics=detailed
     )
-    runner = DataParallelRunner(strategy, NullBackend())
     return run_window(runner, [batch], ctx).materialize()
 
 
-def evaluated_metrics(strategy, batches):
+def evaluated_metrics(runtime, batches):
     """The metrics the trainer's evaluation pass reports for these batches."""
+    runner = build_runner(runtime, NullBackend())
     data = [
-        TrainBatch(sample_ids=["a", "b"], strategy=strategy.name, tensors=tensors)
+        TrainBatch(sample_ids=["a", "b"], strategy=runner.spec.name, tensors=tensors)
         for tensors in batches
     ]
-    backend = NullBackend()
     with TemporaryDirectory() as output_dir:
         controller = TrainerController(
-            DataParallelRunner(strategy, backend),
-            strategy_name=strategy.name,
+            runner,
+            strategy_name=runner.spec.name,
             run_id="metrics",
             output_dir=output_dir,
             total_steps=TOTAL_STEPS,
@@ -247,17 +248,14 @@ def prepared(case, runtime):
 
 
 def canonical_metrics(case, runtime, tensors, *, detailed=True):
-    """What a step of the canonical strategy reports for a prepared runtime."""
+    """What a step of the runner reports for a prepared runtime."""
     if not case.lk_lambda:
         # Three of ten blocks per chunk, so merging chunks is covered too.
         # LK-lambda reads the whole prediction set and stays unsplit.
         runtime.execution = replace(runtime.execution, chunk_size=3)
-    strategy = CanonicalTrainStrategy(
-        runtime, name=case.kind, objective=case.kind, required_features=tuple(tensors)
-    )
     torch.manual_seed(11)
     with patch.dict("os.environ", {"SPECFORGE_DFLASH2_FUSED_CONV": "0"}):
-        return logged_metrics(strategy, tensors, detailed=detailed)
+        return logged_metrics(runtime, tensors, detailed=detailed)
 
 
 def block_metrics(case, *, detailed=True):
@@ -336,20 +334,13 @@ def evaluation_batches(tensors):
     return [tensors, {name: value[:1, :9] for name, value in tensors.items()}]
 
 
-def rollout_strategy(case, runtime, tensors):
-    return CanonicalTrainStrategy(
-        runtime, name=case.kind, objective=case.kind, required_features=tuple(tensors)
-    )
-
-
 def rollout_metrics(case, *, detailed=True, evaluation=False):
-    """What the canonical strategy reports for a rollout case."""
+    """What the runner reports for a rollout case."""
     runtime, tensors = prepared_rollout(case)
-    strategy = rollout_strategy(case, runtime, tensors)
     torch.manual_seed(11)
     if evaluation:
-        return evaluated_metrics(strategy, evaluation_batches(tensors))
-    return logged_metrics(strategy, tensors, detailed=detailed)
+        return evaluated_metrics(runtime, evaluation_batches(tensors))
+    return logged_metrics(runtime, tensors, detailed=detailed)
 
 
 def flattened(metrics):

@@ -1,4 +1,4 @@
-"""Small model-assembly utilities shared by training strategies."""
+"""Small model-assembly utilities shared by the training builders."""
 
 from __future__ import annotations
 

@@ -6,7 +6,6 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,7 +15,6 @@ from specforge.config import Config, apply_overrides
 from specforge.config.draft.codec import encode_config
 from specforge.training.canonical import capture_layers
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_runtime.test_canonical_training import (
     draft_config,
@@ -37,41 +35,42 @@ class CanonicalReviewTest(unittest.TestCase):
             case.doCleanups()
 
     def test_depth_metrics_and_runtime_eval_mode(self):
-        from specforge.algorithms.objectives import objective_registrations
+        from specforge.algorithms.objectives.base import ObjectiveResult
         from specforge.eval import Evaluator
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.contracts import StepContext
         from specforge.training.runner import DataParallelRunner
-        from specforge.training.strategies.base import StepContext
+        from tests.test_runtime._fixtures import FakeProgram, fake_spec
         from tests.test_runtime.test_evaluator_aggregation import _batch
 
-        runtime = torch.nn.Module()
-        runtime.registration = objective_registrations()["eagle3"]
-        runtime.draft_model = torch.nn.Linear(1, 1)
-        runtime.draft_model.config = SimpleNamespace(draft=None)
-        ratios = {
-            "acc_1": (torch.tensor(1.0), torch.tensor(2.0)),
-            "acc_0": (torch.tensor(3.0), torch.tensor(4.0)),
-        }
-        result = SimpleNamespace(
-            loss=torch.tensor(1.0),
-            ratios=ratios,
-            sums={},
-            numerator=torch.tensor(1.0),
-            denominator=torch.tensor(1.0),
-        )
-        strategy = CanonicalTrainStrategy(
-            runtime, name="eagle3", objective="eagle3", required_features=()
-        )
-        runner = DataParallelRunner(strategy, FSDPTrainingBackend(ParallelConfig()))
         modes = []
 
-        def forward(*args, **kwargs):
-            modes.append((runtime.training, runtime.draft_model.training))
-            return result
+        class Program(FakeProgram):
+            """Reports two depths, the deeper one first, and the modes it ran in."""
 
+            def __init__(self):
+                super().__init__()
+                self.draft_model = torch.nn.Linear(1, 1)
+
+            def forward(
+                self, tensors, *, step, total_steps, collect_detailed_metrics, **replay
+            ):
+                modes.append((self.training, self.draft_model.training))
+                return ObjectiveResult(
+                    torch.tensor(1.0),
+                    torch.tensor(1.0),
+                    ratios={
+                        "acc_1": (torch.tensor(1.0), torch.tensor(2.0)),
+                        "acc_0": (torch.tensor(3.0), torch.tensor(4.0)),
+                    },
+                )
+
+        runtime = Program()
+        runner = DataParallelRunner(
+            runtime, FSDPTrainingBackend(ParallelConfig()), fake_spec(name="eagle3")
+        )
         self.assertTrue(runtime.training)
-        with patch.object(runtime, "forward", side_effect=forward):
-            metrics = Evaluator().run(runner, [_batch()], StepContext())
+        metrics = Evaluator().run(runner, [_batch()], StepContext())
         self.assertAlmostEqual(metrics["eval/avg_acc"], 0.75)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 1.125)
         # Evaluated in evaluation mode, and left as it was found.

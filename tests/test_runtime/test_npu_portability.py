@@ -226,13 +226,15 @@ class NPUReductionTest(unittest.TestCase):
     def test_host_values_are_reduced_on_the_models_device(self):
         """An empty evaluation shard builds its sums on the host; HCCL needs the NPU."""
         from specforge.training.runner import DataParallelRunner
+        from tests.test_runtime._fixtures import fake_spec
 
         device = SimpleNamespace(type="npu")
-        module = SimpleNamespace(
+        program = SimpleNamespace(
             parameters=lambda: iter([SimpleNamespace(device=device)])
         )
-        strategy = SimpleNamespace(trainable_module=lambda: module)
-        runner = DataParallelRunner(strategy, SimpleNamespace(process_group=None))
+        runner = DataParallelRunner(
+            program, SimpleNamespace(process_group=None), fake_spec()
+        )
         values = mock.Mock()
         with (
             mock.patch("torch.distributed.is_available", return_value=True),

@@ -580,6 +580,37 @@ class ObjectiveContractTest(unittest.TestCase):
         _, mtp = build_runtime("MTPDraftModel")
         self.assertEqual(mtp.weighting, PositionWeighting())
 
+    def test_window_statistic_cannot_take_a_keyword_of_the_forward(self):
+        from specforge.algorithms.objectives.registry import WindowStatistic
+
+        for name in (
+            "prepass",
+            "step",
+            "total_steps",
+            "batch",
+            "collect_detailed_metrics",
+        ):
+            with self.subTest(argument=name):
+                with self.assertRaisesRegex(ValueError, "takes that keyword itself"):
+                    WindowStatistic(ratio_name="ce", argument_name=name)
+        WindowStatistic(ratio_name="ce", argument_name="alignment_ce")
+
+    def test_statistic_argument_is_given_in_every_call(self):
+        """Zero in a prepass, the pooled ratio in a replay, None otherwise."""
+        _, dspine = build_runtime("DSpineDraftModel")
+        self.assertEqual(dspine.replay_arguments({}), {"alignment_ce": None})
+        prepass = dspine.replay_arguments({}, prepass=True)["alignment_ce"]
+        self.assertEqual((prepass.item(), prepass.requires_grad), (0.0, False))
+        sums = {"alignment_ce": torch.tensor([768.0, 257.0])}
+        replay = dspine.replay_arguments(sums)["alignment_ce"]
+        self.assertEqual(replay.item(), (torch.tensor(768.0) / 257).item())
+        empty = {"alignment_ce": torch.tensor([3.0, 0.0])}
+        self.assertEqual(dspine.replay_arguments(empty)["alignment_ce"].item(), 3.0)
+        # An objective without a statistic takes no such argument.
+        _, dflash = build_runtime("DFlashDraftModel")
+        self.assertEqual(dflash.replay_arguments({}), {})
+        self.assertEqual(dflash.replay_arguments({}, prepass=True), {})
+
     def test_dspark_returns_a_per_microbatch_mean(self):
         """Microbatches are averaged as means, like main, not pooled by token."""
         config, runtime = build_runtime("DSparkDraftModel")

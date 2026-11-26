@@ -6,32 +6,133 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""What the run loop, the step frame and a step runner exchange.
+"""What the run loop, the step frame, a step runner and a program exchange.
 
 The frame (:mod:`specforge.training.frame`) walks one optimizer window and a
-runner executes each micro-batch of it. Everything that crosses between them
-is declared here, so a second runner needs nothing from the first.
+runner executes each micro-batch of it on a program. Everything that crosses
+between them is declared here, so a second runner needs nothing from the
+first, and a runner needs no name of an objective or an architecture.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     ContextManager,
     Dict,
+    Iterator,
     Mapping,
     Optional,
     Protocol,
     Sequence,
+    Tuple,
 )
 
 import torch
 
 if TYPE_CHECKING:
+    from specforge.algorithms.objectives.base import ObjectiveResult
     from specforge.runtime.contracts import TrainBatch
-    from specforge.training.strategies.base import StepContext, StepOutput
+
+
+@dataclass(frozen=True)
+class StepContext:
+    """Schedule state for one optimizer window; values only.
+
+    ``collect_detailed_metrics`` gates expensive diagnostics to log steps.
+    ``replay_values`` holds each replay statistic's sums over the optimizer
+    window and the data-parallel ranks, by name; it is empty except while the
+    window is replayed for gradients.
+    """
+
+    global_step: int = 0
+    total_steps: Optional[int] = None
+    collect_detailed_metrics: bool = True
+    accumulation_steps: int = 1
+    replay_values: Mapping[str, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProgramSpec:
+    """What a program declares to the frame and a runner, as values."""
+
+    #: The objective's name, for messages.
+    name: str
+    #: Batch tensors the program requires.
+    inputs: Tuple[str, ...]
+    #: Statistics it needs pooled over the whole window and every rank before
+    #: its gradient pass.
+    replay_statistics: Tuple[str, ...] = ()
+    #: Whether its evaluation reports the detailed metrics.
+    evaluation_diagnostics: bool = False
+
+
+class TrainingProgram(Protocol):
+    """A draft and the objective that drives it: what a runner executes.
+
+    It supervises, runs the draft and forms the loss terms. It knows nothing
+    of the data-parallel ranks, the optimizer or how it is wrapped. It is an
+    ``nn.Module``: a runner wraps it, reads its parameters and their device
+    and sets its mode. A runner calls the forward through its wrapper and the
+    other methods on the program itself.
+    """
+
+    #: The module's mode; a runner sets it with ``train()`` and ``eval()``.
+    training: bool
+
+    def train(self, mode: bool = True) -> "TrainingProgram":
+        """Set the mode of the whole module, the draft included."""
+
+    def eval(self) -> "TrainingProgram":
+        """``train(False)``."""
+
+    def parameters(self) -> Iterator[torch.nn.Parameter]:
+        """The module's parameters; their device is where batches are placed."""
+
+    def __call__(
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        step: int,
+        total_steps: Optional[int],
+        collect_detailed_metrics: bool,
+        prepass: bool = False,
+        **statistics: Optional[torch.Tensor],
+    ) -> "ObjectiveResult":
+        """Run the objective on one placed batch.
+
+        The result's numerator and denominator are this rank's; the update's
+        objective is their sums' ratio over the window and the ranks. A
+        program that declares a replay statistic also takes ``prepass=True``,
+        which asks for this rank's sums of each statistic in
+        ``result.statistics``, and in every call the keyword arguments that
+        ``replay_arguments`` returned for it.
+        """
+
+    def replay_arguments(
+        self, replay_values: Mapping[str, torch.Tensor], *, prepass: bool = False
+    ) -> Mapping[str, Optional[torch.Tensor]]:
+        """The forward's keyword arguments that carry the declared statistics.
+
+        For a prepass, a replay (``replay_values`` holds the pooled sums) and
+        any other call (it is empty). Any arithmetic on the pooled sums, a
+        ratio and its zero guard for one, is done here, outside the wrapper:
+        a wrapper may cast what passes through its forward. Empty for a
+        program without a statistic.
+        """
+
+    def host_inputs(
+        self, tensors: Mapping[str, torch.Tensor]
+    ) -> Mapping[str, torch.Tensor]:
+        """Extra batch tensors derived on the host, before the batch is placed."""
+
+    def kernel_record(self) -> Dict[str, str]:
+        """The kernels realised so far, by the choice they answer."""
+
+    def draft_state(self, state: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """The draft's weights under canonical keys, from the program's state dict."""
 
 
 @dataclass(frozen=True)
@@ -176,7 +277,7 @@ class StepRunner(Protocol):
     replay_statistics: Sequence[str]
 
     def forward_backward(
-        self, batch: "TrainBatch", ctx: "StepContext", *, is_boundary: bool
+        self, batch: "TrainBatch", ctx: StepContext, *, is_boundary: bool
     ) -> Optional[PendingStep]:
         """Run one micro-batch's forward and backward.
 
@@ -195,9 +296,7 @@ class StepRunner(Protocol):
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         """Normalize, clip and apply the window's update; report its metrics."""
 
-    def prepass(
-        self, batch: "TrainBatch", ctx: "StepContext"
-    ) -> Dict[str, torch.Tensor]:
+    def prepass(self, batch: "TrainBatch", ctx: StepContext) -> Dict[str, torch.Tensor]:
         """Run one micro-batch in training mode without gradients.
 
         Every replay statistic is delivered as zero. The runner remembers the
@@ -216,7 +315,7 @@ class StepRunner(Protocol):
         the pass raises. Every rank enters it, with or without batches.
         """
 
-    def evaluate(self, batch: "TrainBatch", ctx: "StepContext") -> "StepOutput":
+    def evaluate(self, batch: "TrainBatch", ctx: StepContext) -> "ObjectiveResult":
         """Run one batch of an evaluation pass, without gradients.
 
         The result is the program's own, normalized on this rank. The call

@@ -150,10 +150,10 @@ class DraftConfigProvider:
 class StepRuntimeConfig(Mapping[str, Any]):
     """Resolved step options and checkpoint policy for one training run.
 
-    The mapping interface exposes only strategy constructor options, so the
-    existing runtime builders can forward this object through their
-    ``strategy_kwargs`` seam. ``Trainer`` additionally reads the immutable
-    checkpoint metadata carried alongside those options.
+    The mapping interface exposes only the step options, which the resume
+    contract records. The runtime builders forward this object through their
+    ``strategy_kwargs`` argument; ``Trainer`` reads the immutable checkpoint
+    metadata carried alongside the options.
     """
 
     options: Mapping[str, Any]
@@ -229,19 +229,6 @@ class StepRuntimeConfig(Mapping[str, Any]):
 
     def __len__(self) -> int:
         return len(self.options)
-
-
-@dataclass(frozen=True)
-class StepProvider:
-    """Factories and persistence hooks for one algorithm's training step."""
-
-    build: Factory
-    uses_external_target_head: bool
-
-    def __post_init__(self) -> None:
-        _factories_are_callable((("build", self.build),))
-        if not isinstance(self.uses_external_target_head, bool):
-            raise TypeError("uses_external_target_head must be a bool")
 
 
 @dataclass(frozen=True)
@@ -505,7 +492,6 @@ class AlgorithmProviders:
     """Executable providers paired with one pure ``AlgorithmSpec``."""
 
     algorithm_name: str
-    step: StepProvider
     model: ModelProvider
     offline: Tuple[OfflineDataProvider, ...] = ()
     server_streaming: Tuple[ServerStreamingProvider, ...] = ()
@@ -513,8 +499,6 @@ class AlgorithmProviders:
 
     def __post_init__(self) -> None:
         _non_empty(self.algorithm_name, field_name="algorithm_name")
-        if not isinstance(self.step, StepProvider):
-            raise TypeError("step must be a StepProvider")
         if not isinstance(self.model, ModelProvider):
             raise TypeError("model must be a ModelProvider")
         offline = tuple(self.offline)
@@ -732,7 +716,6 @@ __all__ = [
     "ServerCaptureLayout",
     "ServerInputAdapter",
     "ServerStreamingProvider",
-    "StepProvider",
     "StepRuntimeConfig",
     "checkpoint_key_fingerprint",
     "make_registration",

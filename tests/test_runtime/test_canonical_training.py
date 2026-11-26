@@ -16,8 +16,7 @@ from specforge.config.draft.codec import encode_config
 from specforge.loading import load_draft
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
-from specforge.training.strategies.base import StepContext
-from specforge.training.strategies.canonical import CanonicalTrainStrategy
+from specforge.training.contracts import StepContext
 from tests.test_algorithms.test_objectives import configurations, training_batch
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_modeling.test_canonical_eagle3 import model_config as eagle_config
@@ -545,6 +544,7 @@ class CanonicalTrainingTest(unittest.TestCase):
         from specforge.algorithms.objectives import build_objective_model
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from specforge.training.frame import run_window
+        from specforge.training.program import program_spec
         from specforge.training.runner import DataParallelRunner
         from tests.test_modeling.test_canonical_dspine import initialized_model
 
@@ -555,21 +555,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             target_head=torch.nn.Linear(32, 64, bias=False),
         )
 
-        class Strategy(CanonicalTrainStrategy):
-            """Keeps the outputs of the replayed forwards."""
-
-            replayed = []
-
-            def forward_loss(self, batch, ctx=None):
-                output = super().forward_loss(batch, ctx)
-                if ctx.replay_values:
-                    self.replayed.append(output)
-                return output
-
         class Runner(DataParallelRunner):
-            """Pools to fixed sums and records when, as other ranks would change them."""
+            """Pools to fixed sums and keeps what each replayed forward returned."""
 
             pooled = []
+            replayed = []
 
             def reduce_sum(self, values):
                 if values.numel() == 2:
@@ -578,20 +568,20 @@ class CanonicalTrainingTest(unittest.TestCase):
                     return torch.tensor([0.1, 0.2])
                 return values
 
-        strategy = Strategy(
-            runtime,
-            name="dspine",
-            objective="dspine",
-            required_features=runtime.registration.inputs,
-        )
+            def _forward(self, batch, ctx, **replay):
+                result = super()._forward(batch, ctx, **replay)
+                if replay["alignment_ce"] is not None and not replay.get("prepass"):
+                    self.replayed.append(result)
+                return result
+
         backend = FSDPTrainingBackend(ParallelConfig())
         backend.prepare_model(runtime, wrap=False)
         backend.set_optimizer(torch.optim.SGD(model.parameters(), lr=0.0))
-        runner = Runner(strategy, backend)
+        runner = Runner(runtime, backend, program_spec(runtime))
         batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
         for accumulation in (1, 2):
             with self.subTest(accumulation=accumulation):
-                strategy.replayed.clear()
+                runner.replayed.clear()
                 runner.pooled.clear()
                 model.zero_grad(set_to_none=True)
                 initial_rng = torch.get_rng_state().clone()
@@ -603,7 +593,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 # leaves the generator where they left it.
                 self.assertEqual(len(runner.pooled), 1)
                 torch.testing.assert_close(runner.pooled[0], torch.get_rng_state())
-                self.assertEqual(len(strategy.replayed), accumulation)
+                self.assertEqual(len(runner.replayed), accumulation)
                 with torch.random.fork_rng():
                     torch.set_rng_state(initial_rng)
                     expected = runtime(
@@ -612,7 +602,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                         total_steps=10,
                         alignment_ce=torch.tensor(0.5),
                     )
-                torch.testing.assert_close(strategy.replayed[0].loss, expected.loss)
+                torch.testing.assert_close(runner.replayed[0].loss, expected.loss)
                 self.assertTrue(
                     all(
                         p.grad is not None
@@ -620,15 +610,79 @@ class CanonicalTrainingTest(unittest.TestCase):
                         if p.requires_grad
                     )
                 )
-        strategy.trainable_module().eval()
-        self.assertFalse(runtime.training)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("torch.distributed.all_reduce") as reduce,
+            runner.evaluation(),
         ):
-            evaluated = strategy.forward_loss(batch, StepContext(global_step=1))
+            self.assertFalse(runtime.training)
+            evaluated = runner.evaluate(batch, StepContext(global_step=1))
         self.assertEqual(evaluated.statistics, {})
         reduce.assert_not_called()
+
+    def test_dspine_replay_ratio_is_formed_before_a_wrapper_casts(self):
+        """Under FSDP's mixed precision the forward's inputs are cast on the way in."""
+        from unittest.mock import Mock
+
+        from specforge.algorithms.objectives import build_objective_model
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.frame import run_window
+        from specforge.training.program import program_spec
+        from specforge.training.runner import DataParallelRunner
+        from tests.test_modeling.test_canonical_dspine import initialized_model
+
+        model = initialized_model()
+        runtime = build_objective_model(
+            model,
+            options={"num_anchors": 2, "alignment_warmup_steps": 0},
+            target_head=torch.nn.Linear(32, 64, bias=False),
+        )
+
+        class Casting(torch.nn.Module):
+            """Casts floating keyword tensors to bfloat16, nested ones included."""
+
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
+            def cast(self, value):
+                if isinstance(value, dict):
+                    return {name: self.cast(item) for name, item in value.items()}
+                if torch.is_tensor(value) and value.is_floating_point():
+                    return value.to(torch.bfloat16)
+                return value
+
+            def forward(self, tensors, **keywords):
+                return self.module(tensors, **self.cast(keywords))
+
+        class Runner(DataParallelRunner):
+            def reduce_sum(self, values):
+                # Sums whose ratio is not the ratio of their bfloat16 values:
+                # 257 rounds to 256 there.
+                return torch.tensor([768.0, 257.0]) if values.numel() == 2 else values
+
+        backend = FSDPTrainingBackend(ParallelConfig())
+        backend.prepare_model(runtime, wrap=False)
+        backend.set_optimizer(torch.optim.SGD(model.parameters(), lr=0.0))
+        runner = Runner(Casting(runtime), backend, program_spec(runtime))
+        objective = runtime.objective
+        runtime.objective = Mock(wraps=objective)
+        batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
+        run_window(runner, [batch], StepContext(global_step=1, total_steps=10))
+        prepass, replay = (
+            call.kwargs["alignment_ce"] for call in runtime.objective.call_args_list
+        )
+        # Both pass through the wrapper, as every argument of the forward does.
+        self.assertEqual((prepass.item(), prepass.dtype), (0.0, torch.bfloat16))
+        self.assertEqual(replay.dtype, torch.bfloat16)
+        # 768 / 257 in fp32, then cast; the cast sums would give exactly 3.
+        self.assertEqual(replay.item(), 2.984375)
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""
