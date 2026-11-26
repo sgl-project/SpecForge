@@ -299,6 +299,18 @@ def _streaming_collate(
     return algorithm.providers.server_streaming_for(modality).build_collator()
 
 
+def _resolve_dispatch_block_size(draft_model: Any, default: int = 16) -> int:
+    """Resolve the model's block width for cost-balanced dispatch."""
+    inner = getattr(draft_model, "draft_model", None) or draft_model
+    try:
+        slots = inner.config.draft.spec_config.protocol.num_model_slots
+    except AttributeError:
+        slots = None
+    if slots is not None:
+        return int(slots)
+    return int(getattr(draft_model, "block_size", default))
+
+
 def _resolve_metadata_store(
     metadata_store: Optional[MetadataStore],
     metadata_db_path: Optional[str],
@@ -1435,8 +1447,14 @@ def build_disagg_online_producer(
                 fatal.append((w.worker_id, exc))
                 abort.set()
 
+        def signal_abort() -> None:
+            abort.set()
+            stop_attempts = getattr(feature_store, "stop_external_attempts", None)
+            if callable(stop_attempts):
+                stop_attempts()
+
         try:
-            threads = []
+            started_threads = []
             try:
                 if should_stop is not None and should_stop():
                     feed["stopped"] = True
@@ -1453,21 +1471,32 @@ def build_disagg_online_producer(
                 ]
                 for t in threads:
                     t.start()
+                    started_threads.append(t)
                 # Keep feeding while any worker runs; a worker leaves an empty
                 # pool only after ingest_closed, so no chunk boundary drains
                 # the servers. All-dropped workers end the feed early.
                 while not (feed["exhausted"] or feed["stopped"] or abort.is_set()):
-                    if not any(t.is_alive() for t in threads):
+                    if not any(t.is_alive() for t in started_threads):
                         break
                     sleep(backpressure_poll_s)
                     feed_pool()
             except BaseException:
-                abort.set()
+                signal_abort()
                 raise
             finally:
                 ingest_closed.set()
-                for t in threads:
-                    t.join()
+                join_exc: Optional[BaseException] = None
+                for t in started_threads:
+                    while t.is_alive():
+                        try:
+                            t.join()
+                        except BaseException as exc:
+                            if join_exc is not None:
+                                raise
+                            join_exc = exc
+                            signal_abort()
+                if join_exc is not None:
+                    raise join_exc
             if fatal:
                 raise fatal[0][1]
             st = controller.status()
@@ -1664,10 +1693,12 @@ def build_disagg_online_consumer(
     distributor = None
     inbox_server = None
     store = None
+    owns_metadata_store = False
     setup_exc = None
     if dp_rank == 0:
         try:
             store = _resolve_metadata_store(metadata_store, metadata_db_path)
+            owns_metadata_store = metadata_store is None and store is not None
             if store is None or isinstance(store, NoOpMetadataStore):
                 raise ValueError("online consumer requires a retaining metadata ledger")
             controller = DPAckController(
@@ -1733,7 +1764,7 @@ def build_disagg_online_consumer(
                 refs_per_rank_batch=batch_size,
                 dispatch_policy=consumer_dispatch,
                 num_anchors=dispatch_num_anchors,
-                block_size=getattr(draft_model, "block_size", 16),
+                block_size=_resolve_dispatch_block_size(draft_model),
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
@@ -1767,7 +1798,7 @@ def build_disagg_online_consumer(
     if setup_error is not None:
         if dp_rank == 0 and inbox_server is not None:
             inbox_server.stop()
-        if dp_rank == 0 and store is not None and hasattr(store, "close"):
+        if owns_metadata_store:
             store.close()
         if not distributed or world == 1:
             raise setup_exc
@@ -1840,36 +1871,59 @@ def build_disagg_online_consumer(
             print(f"failed to publish consumer failure: {signal_exc}", flush=True)
 
     def stop_distributor_and_drain() -> None:
-        if distributor is not None:
-            distributor.stop()
-        if inbox_server is not None:
-            inbox_server.stop()
-        # The success hook already drained before publishing consumer_done. On
-        # an exception, finalization still makes one bounded local attempt and
-        # reports a cleanup failure loudly without replacing the primary fit
-        # exception that is already propagating through Trainer.fit().
-        if not drain_state["attempted"]:
-            try:
-                drain_consumer_store()
-            except BaseException as cleanup_exc:
-                primary = fit_failure["error"]
-                if primary is None:
-                    raise
-                combined = RuntimeError(
-                    f"primary consumer failure ({type(primary).__name__}: "
-                    f"{primary}); pending-remove drain also failed "
-                    f"({type(cleanup_exc).__name__}: {cleanup_exc})"
-                )
+        distributor_stopped = True
+        stop_error: Optional[BaseException] = None
+        try:
+            if distributor is not None:
                 try:
-                    channel.mark_consumer_failed(
-                        f"{type(combined).__name__}: {combined}"
+                    distributor.stop()
+                except BaseException as exc:
+                    distributor_stopped = not distributor.is_alive()
+                    stop_error = exc
+                    if fit_failure["error"] is None:
+                        logging.getLogger(__name__).error("%s", exc)
+                    else:
+                        logging.getLogger(__name__).error(
+                            "primary consumer failure (%s: %s); distributor stop "
+                            "also failed (%s: %s)",
+                            type(fit_failure["error"]).__name__,
+                            fit_failure["error"],
+                            type(exc).__name__,
+                            exc,
+                        )
+            if inbox_server is not None:
+                inbox_server.stop()
+            # The success hook already drained before publishing consumer_done. On
+            # an exception, finalization still makes one bounded local attempt and
+            # reports a cleanup failure loudly without replacing the primary fit
+            # exception that is already propagating through Trainer.fit().
+            if not drain_state["attempted"]:
+                try:
+                    drain_consumer_store()
+                except BaseException as cleanup_exc:
+                    primary = fit_failure["error"]
+                    if primary is None:
+                        raise
+                    combined = RuntimeError(
+                        f"primary consumer failure ({type(primary).__name__}: "
+                        f"{primary}); pending-remove drain also failed "
+                        f"({type(cleanup_exc).__name__}: {cleanup_exc})"
                     )
-                except Exception as signal_exc:
-                    print(
-                        f"failed to publish consumer cleanup failure: {signal_exc}",
-                        flush=True,
-                    )
-                logging.getLogger(__name__).error("%s", combined)
+                    try:
+                        channel.mark_consumer_failed(
+                            f"{type(combined).__name__}: {combined}"
+                        )
+                    except Exception as signal_exc:
+                        print(
+                            f"failed to publish consumer cleanup failure: {signal_exc}",
+                            flush=True,
+                        )
+                    logging.getLogger(__name__).error("%s", combined)
+            if stop_error is not None and fit_failure["error"] is None:
+                raise stop_error
+        finally:
+            if distributor_stopped and owns_metadata_store:
+                store.close()
 
     try:
         trainer = _assemble_trainer(

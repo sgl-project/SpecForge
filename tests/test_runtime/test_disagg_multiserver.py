@@ -878,6 +878,51 @@ class TestMultiServerProducer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least one rollout worker"):
             _build(adapter, _prompts(2), store, channel, num_rollout_workers=0)
 
+    def test_producer_join_interruption_stops_external_attempts_and_joins_workers(self):
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        in_post = threading.Event()
+        release_post = threading.Event()
+        worker_done = threading.Event()
+        stub = _StubCaptureServer(backend)
+
+        def slow_post(url, json_body, timeout):
+            in_post.set()
+            release_post.wait(timeout=5.0)
+            try:
+                return stub(url, json_body, timeout)
+            finally:
+                worker_done.set()
+
+        adapter = _adapter(store, slow_post)
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [adapter], _prompts(2), store, channel, lease=1, producer_concurrency=1
+        )
+        real_join = threading.Thread.join
+        interrupted = {"done": False}
+
+        def interrupt_first_join(self_thread, timeout=None):
+            if self_thread.name.startswith("drive-") and not interrupted["done"]:
+                self.assertTrue(in_post.wait(timeout=2.0))
+                interrupted["done"] = True
+                release_post.set()
+                raise KeyboardInterrupt("sigterm during join")
+            return real_join(self_thread, timeout=timeout)
+
+        with (
+            patch.object(threading.Thread, "join", interrupt_first_join),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            drive(max_rounds=10_000)
+
+        self.assertTrue(worker_done.is_set())
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            store.track_external_attempt(
+                "s-late", generation=1, feature_names=["hidden_state"]
+            )
+        self.assertIn("KeyboardInterrupt", channel.failure())
+
 
 def _plan_task_ids(prompts, epochs, seed):
     """The chunked producer's FIFO dispatch plan (epoch order, then shuffle)."""

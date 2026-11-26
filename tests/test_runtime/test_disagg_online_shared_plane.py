@@ -68,6 +68,9 @@ class _FakeDistributor:
     def stop(self) -> None:
         self.stopped = True
 
+    def is_alive(self) -> bool:
+        return self.started and not self.stopped
+
 
 class TestSharedPlaneConsumerResume(unittest.TestCase):
     def setUp(self):
@@ -92,7 +95,9 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
             )
         store.close()
 
-    def _build(self, *, resume_from=None, idle_timeout_s=None, **kwargs):
+    def _build(
+        self, *, resume_from=None, idle_timeout_s=None, draft_model=None, **kwargs
+    ):
         from specforge.launch import build_disagg_online_consumer
 
         captured = {}
@@ -115,7 +120,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 algorithm=ALGORITHM,
                 feature_store=self.features,
                 channel=self.channel,
-                draft_model=object(),
+                draft_model=object() if draft_model is None else draft_model,
                 optimizer_factory=object(),
                 run_id="run0",
                 output_dir=os.path.join(self.work, "output"),
@@ -194,6 +199,59 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
         self.features.retain_on_release = False
         with self.assertRaisesRegex(ValueError, "retain_on_release=True"):
             self._build()
+
+    def test_resolve_dispatch_block_size_and_wiring_to_ref_distributor(self):
+        from dataclasses import replace
+
+        from specforge.launch import _resolve_dispatch_block_size
+        from tests.test_config.draft_fixtures import draft_config
+
+        cfg = draft_config()
+        cfg = replace(
+            cfg,
+            spec_config=replace(
+                cfg.spec_config,
+                block=replace(cfg.spec_config.block, block_size=8),
+            ),
+        )
+        canonical_wrapped = SimpleNamespace(
+            draft_model=SimpleNamespace(config=SimpleNamespace(draft=cfg))
+        )
+        canonical_bare = SimpleNamespace(config=SimpleNamespace(draft=cfg))
+        legacy_model = SimpleNamespace(block_size=6)
+
+        self.assertEqual(_resolve_dispatch_block_size(canonical_wrapped), 8)
+        self.assertEqual(_resolve_dispatch_block_size(canonical_bare), 8)
+        self.assertEqual(_resolve_dispatch_block_size(legacy_model), 6)
+        self.assertEqual(_resolve_dispatch_block_size(object(), default=16), 16)
+
+        _trainer, captured, distributor = self._build(draft_model=canonical_wrapped)
+        captured["on_fit_finally"]()
+        self.assertEqual(distributor.kwargs["block_size"], 8)
+
+    def test_online_consumer_finally_closes_owned_sqlite_metadata_store(self):
+        import sqlite3
+
+        _trainer, captured, _distributor = self._build()
+        store = captured["controller"].store
+        self.assertIsInstance(store, SQLiteMetadataStore)
+        captured["on_fit_finally"]()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            store.committed_count()
+
+    def test_online_consumer_finally_keeps_sqlite_open_when_distributor_stop_times_out(
+        self,
+    ):
+        _trainer, captured, distributor = self._build()
+        store = captured["controller"].store
+        distributor.stop = mock.Mock(side_effect=RuntimeError("did not stop"))
+        distributor.is_alive = mock.Mock(return_value=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "did not stop"):
+                captured["on_fit_finally"]()
+            self.assertEqual(store.committed_count(), 0)
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
