@@ -71,14 +71,14 @@ def read_reference_state(
     trainable: str,
     frozen: Sequence[str],
     blocks: Sequence[str],
-    group=None,
-    keep: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
-    state_indices: Optional[Sequence[int]] = None,
+    group,
+    keep: Callable[[int, torch.Tensor], torch.Tensor],
+    state_indices: Sequence[int],
 ) -> ReferenceState:
     """This rank's saved ``BF16Optimizer`` state, read whole, kept in part.
 
-    A collective over ``group`` when ``torch.distributed`` is initialized:
-    every rank calls it with its own ``saved``. The ranks first agree on
+    A collective over ``group``: every rank calls it with its own
+    ``saved``. The ranks first agree on
     whether the state is whole (DDP) or FSDP1 slices, which one rank's shapes
     cannot always tell.
 
@@ -96,33 +96,31 @@ def read_reference_state(
         group: The group the reference sharded over, gloo, in its rank order.
         keep: ``keep(index, full)``: what this rank keeps of ``full``, the
             whole master or moment of trainable parameter ``index``, on the
-            host. Whole when omitted. One parameter is whole at a time.
+            host. One parameter is whole at a time.
         state_indices: For each trainable parameter ``index`` in
             ``named_parameters()`` order, its key in
             ``saved["optimizer_state_dict"]["state"]`` (which uses flattened
-            ``param_groups`` order). Defaults to ``range(len(shapes))``.
+            ``param_groups`` order).
 
     Raises:
         ValueError: The saved state does not fit the parameters, or the
             replayed layout does not place every slice exactly once.
     """
-    keep = keep or (lambda index, full: full)
     masters = list(saved["fp32_params"])
     if len(masters) != len(shapes):
         raise ValueError(
             f"saved optimizer has {len(masters)} masters for {len(shapes)} "
             "trainable parameters"
         )
-    index_map = range(len(masters)) if state_indices is None else state_indices
-    if len(index_map) != len(masters):
+    if len(state_indices) != len(masters):
         raise ValueError(
-            f"state_indices has {len(index_map)} entries for {len(masters)} "
+            f"state_indices has {len(state_indices)} entries for {len(masters)} "
             "trainable parameters"
         )
     optimizer = saved["optimizer_state_dict"]
     states = [
         _checked_state(optimizer["state"].get(state_index, {}), index)
-        for index, state_index in enumerate(index_map)
+        for index, state_index in enumerate(state_indices)
     ]
     whole = _all_agree(all(m.shape == s for m, s in zip(masters, shapes)), group)
     spans = (
@@ -181,8 +179,6 @@ def _checked_state(state: Mapping, index: int) -> dict:
 
 
 def _all_agree(value: bool, group) -> bool:
-    if not (dist.is_available() and dist.is_initialized()):
-        return value
     votes = [None] * dist.get_world_size(group)
     dist.all_gather_object(votes, value, group=group)
     return all(votes)

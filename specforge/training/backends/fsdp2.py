@@ -390,41 +390,41 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         # FSDP1 layout replay) with flattened param_groups order (used by
         # optimizer_state_dict["state"] and _load_torch_optimizer_state_dict).
         by_id = {id(p): i for i, p in enumerate(self._trainable)}
-        if self.optimizer is not None:
-            opt_params = _optimizer_params(self.optimizer)
-            if len(opt_params) != len(self._trainable) or any(
-                id(p) not in by_id for p in opt_params
-            ):
-                raise ValueError(
-                    "optimizer parameters do not match trainable draft parameters"
-                )
-            opt_to_named = [by_id[id(p)] for p in opt_params]
-            saved_groups = saved.get("optimizer_state_dict", {}).get("param_groups")
-            if saved_groups is not None:
-                saved_sizes = [len(g["params"]) for g in saved_groups]
-                current_sizes = [len(g["params"]) for g in self.optimizer.param_groups]
-                if saved_sizes != current_sizes:
-                    raise ValueError(
-                        f"checkpoint param_groups sizes {saved_sizes} do not match "
-                        f"current optimizer param_groups {current_sizes}"
-                    )
-        else:
-            opt_to_named = list(range(len(self._trainable)))
+        if self.optimizer is None:
+            raise ValueError(
+                "reading the fsdp runtime's optimizer state needs this runtime's "
+                "optimizer to read it into"
+            )
+        opt_params = _optimizer_params(self.optimizer)
+        if len(opt_params) != len(self._trainable) or any(
+            id(p) not in by_id for p in opt_params
+        ):
+            raise ValueError(
+                "optimizer parameters do not match trainable draft parameters"
+            )
+        opt_to_named = [by_id[id(p)] for p in opt_params]
+        saved_groups = saved["optimizer_state_dict"]["param_groups"]
+        saved_sizes = [len(g["params"]) for g in saved_groups]
+        current_sizes = [len(g["params"]) for g in self.optimizer.param_groups]
+        if saved_sizes != current_sizes:
+            raise ValueError(
+                f"checkpoint param_groups sizes {saved_sizes} do not match "
+                f"current optimizer param_groups {current_sizes}"
+            )
         named_to_opt = {ni: oi for oi, ni in enumerate(opt_to_named)}
         state_indices = [named_to_opt[i] for i in range(len(self._trainable))]
 
         group = self.parallel_config.fsdp_process_group or dist.group.WORLD
         replay_group = None
-        if dist.is_initialized():
-            if dist.get_world_size(group) != dist.get_world_size():
-                raise ValueError(
-                    "reading the fsdp runtime's optimizer state needs this runtime's "
-                    "group to be the whole job, as the reference's was"
-                )
-            if dist.get_backend(group) != "gloo":
-                # The replay runs FSDP1 on the host. Over the whole job, in its
-                # rank order: the order the reference sharded in.
-                replay_group = group = dist.new_group(backend="gloo")
+        if dist.get_world_size(group) != dist.get_world_size():
+            raise ValueError(
+                "reading the fsdp runtime's optimizer state needs this runtime's "
+                "group to be the whole job, as the reference's was"
+            )
+        if dist.get_backend(group) != "gloo":
+            # The replay runs FSDP1 on the host. Over the whole job, in its
+            # rank order: the order the reference sharded in.
+            replay_group = group = dist.new_group(backend="gloo")
         try:
             state = read_reference_state(
                 saved,
@@ -509,10 +509,8 @@ def _local_part(full: torch.Tensor, param) -> torch.Tensor:
     """This rank's part of the whole tensor ``full``, cut on the host as
     ``param`` is sharded (``torch.chunk`` per sharded mesh dimension, empty
     parts last, as ``Shard`` splits)."""
-    from torch.distributed.tensor import DTensor, Shard
+    from torch.distributed.tensor import Shard
 
-    if not isinstance(param, DTensor):
-        return full
     part = full
     coordinate = param.device_mesh.get_coordinate()
     for mesh_dim, placement in enumerate(param.placements):
