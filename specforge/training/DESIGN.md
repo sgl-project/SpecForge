@@ -53,12 +53,13 @@ reads five import rules from the source:
 |---|---|---|
 | A collective across samples appears only in a runner | objectives, drafts, losses, layers; the frame; the run loop and the evaluator; the checkpoint manager, the profiler and `trainer.py` | `torch.distributed`, `specforge.distributed` |
 | The frame imports the shared contracts only | `contracts.py`, `frame.py`, `program.py` | anything else in `specforge` |
-| The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling` |
+| The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling`, `layers`, `losses`, `torch.optim` |
 | A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
-| A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.nn.parallel` |
+| A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.optim`, `torch.nn.parallel` |
 
 The shared contracts are `training.contracts`, `runtime.contracts` and the
-value types of `config.draft`.
+value types of `config.draft`, which the test lists by name (`DraftConfig`):
+another name the package exports is followed to where it comes from.
 
 A module reaches a name by importing it, at module level or inside a function;
 by using the imported name, through its alias and with the attributes that
@@ -66,8 +67,9 @@ follow (`import torch as t; t.distributed.barrier()`); by a literal
 `importlib.import_module`; or through the package: a name another module
 re-exports is followed to its origin with the rest of the chain, and a helper
 function brings what its own body uses. Names are resolved in the scope they
-are used in. The run-loop rule also forbids `layers`, `losses` and
-`torch.optim`, and the program rule `torch.optim`.
+are used in: a comprehension is a scope of its own, a function's defaults,
+decorators and annotations belong to the scope around it, and a class body's
+names are not in scope for its methods.
 
 The scan follows names. It does not see which process group a collective runs
 on, what a method called on a value does (the run loop holds a runner and the
@@ -75,15 +77,17 @@ scan does not stop it from reaching through it), a decision taken from
 `spec.name` in place of a declaration, or a name computed at run time.
 
 Every module that breaks a rule today is listed in the test with the reason
-and with each forbidden name it reaches and how many times; one use more or
-one fewer fails. Three are the sequence-parallel axis (the cached rollout,
-ring attention), whose groups share a sequence and never samples. Four are the run
-loop's own uses of the process group (`controller.py`, `checkpoint.py`,
-`profiling.py`, `trainer.py`). The design moves the reads to a topology value
-and the error gathers to `runner.agree`; rank 0's two broadcast verdicts
-(whether an evaluation runs, whether a checkpoint is the best) need either a
-way to distribute a decision or every rank computing it, which the contract
-does not have yet.
+and with each forbidden name it reaches. A name that communicates or reads
+the process-global topology is listed with how many times; one use more or
+one fewer fails. A type, a constant or a query of the process's own rank or
+of a group's size is listed by name only. Two are the sequence-parallel axis
+(the rollout, ring attention), whose groups share a sequence and never
+samples. Four are the run loop's own uses of the process group
+(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`). The design
+moves the reads to a topology value and the error gathers to `runner.agree`;
+rank 0's two broadcast verdicts (whether an evaluation runs, whether a
+checkpoint is the best) need either a way to distribute a decision or every
+rank computing it, which the contract does not have yet.
 
 ### Conformance
 
@@ -109,12 +113,16 @@ does not have yet.
   in flight; a complete run does not raise.
 - `RunnerChecks`: one job per declaration in one process, compared with the
   reference runner bit for bit: every update's metrics, gradient norm,
-  learning rate and weights, and the exported draft, the optimizer state and
-  the generator at the end. The program's loss reads the step and the noise
-  it draws, its replay statistic depends on the mode and the generator of the
-  prepass, and one job runs in bfloat16, where the optimizer's fp32 masters
-  hold more than the weights. Plus the single-use handle, a refused batch,
-  evaluation, and resume in bfloat16 through two further updates.
+  learning rate and weights, and the exported draft and the generator at the
+  end. The optimizer state is not compared across runners: what a runner
+  resumes from is its own to lay out, and the resume job holds it to the
+  runner's own uninterrupted run. The program's loss reads the step, the
+  run's length and the noise it draws, detailed metrics are asked for on
+  every second update, its replay statistic depends on the mode and the
+  generator of the prepass, and one job runs in bfloat16, where the
+  optimizer's fp32 masters hold more than the weights. Plus the single-use
+  handle, a refused batch, evaluation, and resume in bfloat16 through two
+  further updates.
 
 A new runner adds two test classes that set `make_runner`; those hold it in
 one process, on the host. Not in the kit: a recorded case with sequence

@@ -1,7 +1,11 @@
 """Tensor-only EAGLE branch-cache kernels, shared by FlashAttention and USP."""
 
+from typing import TYPE_CHECKING
+
 import torch
-import torch.distributed as dist
+
+if TYPE_CHECKING:
+    import torch.distributed as dist
 
 try:
     from flash_attn import flash_attn_varlen_func as _std_flash_attn_varlen_func
@@ -284,7 +288,7 @@ def _update_ring_out_and_lse(
 class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float
+        ctx, q, cache_k, cache_v, ring_group: "dist.ProcessGroup", softmax_scale: float
     ):
         from specforge.layers.ring.ring_flash_attn import ring_flash_attn_forward
 

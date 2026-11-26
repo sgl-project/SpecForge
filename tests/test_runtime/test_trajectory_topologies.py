@@ -67,7 +67,7 @@ class TrajectoryTopologiesTest(unittest.TestCase):
         )
 
         def inspect_rank_inputs(worker, args, nprocs, join):
-            _, runs = args
+            _, runs, _ = args
             config, overrides, _, _ = runs[0]
             cfg = load_config(config, overrides)
             self.assertEqual(nprocs, cfg.deployment.trainer.nproc_per_node)
