@@ -571,7 +571,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             payload.update(overrides)
             torch.save(payload, os.path.join(d, "training_state.pt"))
             torch.save(
-                {"optimizer": None, "rng": {}},
+                {"optimizer": {}, "rng": {}},
                 os.path.join(d, "training_state_rank0.pt"),
             )
             return d

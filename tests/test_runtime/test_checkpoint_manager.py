@@ -310,8 +310,8 @@ class TestReadResumeState(unittest.TestCase):
 
         out = tempfile.mkdtemp(prefix="ckpt_root_")
         mgr = _mgr(out)
-        mgr.save(_state(2, world_size=1), 2, rank_state={"optimizer": {}})
-        mgr.save(_state(7, world_size=1), 7, rank_state={"optimizer": {}})
+        mgr.save(_state(2, world_size=1), 2, rank_state={"optimizer": {}, "rng": {}})
+        mgr.save(_state(7, world_size=1), 7, rank_state={"optimizer": {}, "rng": {}})
         os.remove(os.path.join(out, "run-latest"))
 
         state = CheckpointManager.read_resume_state(out)
@@ -322,9 +322,11 @@ class TestReadResumeState(unittest.TestCase):
 
         out = tempfile.mkdtemp(prefix="ckpt_ambiguous_")
         _mgr(out, "alpha").save(
-            _state(2, world_size=1), 2, rank_state={"optimizer": {}}
+            _state(2, world_size=1), 2, rank_state={"optimizer": {}, "rng": {}}
         )
-        _mgr(out, "beta").save(_state(3, world_size=1), 3, rank_state={"optimizer": {}})
+        _mgr(out, "beta").save(
+            _state(3, world_size=1), 3, rank_state={"optimizer": {}, "rng": {}}
+        )
         with self.assertRaisesRegex(ValueError, "multiple complete.*latest"):
             CheckpointManager.read_resume_state(out)
 
@@ -408,6 +410,141 @@ class TestReadResumeState(unittest.TestCase):
         ):
             CheckpointManager.read_resume_state(ckpt)
 
+    def test_resume_gathers_non_dict_shared_state_across_ranks(self):
+        from specforge.training.checkpoint import STATE_FILE, CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_non_dict_")
+        ckpt = os.path.join(out, "run-step2")
+        os.makedirs(ckpt)
+        torch.save(["not", "a", "dict"], os.path.join(ckpt, STATE_FILE))
+        gathered = []
+
+        def gather(descriptors, local):
+            gathered.append(local)
+            descriptors[0] = local
+            descriptors[1] = {
+                "error": None,
+                "checkpoint": "run-step2",
+                "run_id": "run",
+                "global_step": 2,
+                "strategy": "dspark",
+            }
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch("torch.distributed.all_gather_object", side_effect=gather),
+            self.assertRaisesRegex(RuntimeError, r"shared state must be a dict"),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
+        self.assertEqual(len(gathered), 1)
+        self.assertIn("shared state must be a dict", gathered[0]["error"])
+
+    def test_resume_coordinates_cancellation_and_preserves_signal(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        out = tempfile.mkdtemp(prefix="ckpt_cancel_")
+        ckpt = _mgr(out).save(
+            _state(4, world_size=2, run_id="run", strategy="dspark"),
+            4,
+            rank_state={"optimizer": {}, "rng": {}},
+        )
+        # Phase 2 cancellation on local rank joins gather and preserves KeyboardInterrupt.
+        calls = []
+
+        def gather_phase2(items, local):
+            calls.append(local)
+            if len(calls) == 1:
+                items[0] = local
+                items[1] = dict(local)
+            else:
+                items[0] = local
+                items[1] = None
+
+        real_load = torch.load
+        load_count = {"n": 0}
+
+        def interrupt_on_rank_shard(*args, **kwargs):
+            load_count["n"] += 1
+            if load_count["n"] == 2:
+                raise KeyboardInterrupt("sigterm")
+            return real_load(*args, **kwargs)
+
+        with (
+            mock.patch("torch.distributed.is_initialized", return_value=True),
+            mock.patch("torch.distributed.get_world_size", return_value=2),
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch(
+                "torch.distributed.all_gather_object", side_effect=gather_phase2
+            ),
+            mock.patch("torch.load", side_effect=interrupt_on_rank_shard),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            CheckpointManager.read_resume_state(ckpt)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("KeyboardInterrupt", calls[1])
+
+    def test_resume_rejects_missing_optimizer_or_rng_in_full_state_shard(self):
+        from specforge.training.checkpoint import CheckpointManager
+
+        for name, shared_extra, rank_state, expected_missing in (
+            ("empty_shard", {}, {}, "optimizer, rng"),
+            (
+                "ddp_fallback_missing_rng",
+                {"replicated_optimizer_state": {"step": 1}},
+                {"optimizer": None},
+                "rng",
+            ),
+            (
+                "missing_optimizer",
+                {},
+                {"rng": {"torch": torch.tensor([1])}},
+                "optimizer",
+            ),
+        ):
+            with self.subTest(case=name):
+                out = tempfile.mkdtemp(prefix=f"ckpt_missing_{name}_")
+                ckpt = _mgr(out).save(
+                    _state(3, world_size=1, **shared_extra),
+                    3,
+                    rank_state=rank_state,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"missing required full-state field\(s\): {expected_missing}",
+                ):
+                    CheckpointManager.read_resume_state(ckpt)
+                # Weights-only resume still permits partial rank shards.
+                loaded = CheckpointManager.read_resume_state(
+                    ckpt, require_full_state=False
+                )
+                self.assertEqual(loaded["global_step"], 3)
+
+
+def _dist_missing_shard_worker(rank, world, port, ckpt_dir, results_dir):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world,
+        timeout=timedelta(seconds=30),
+    )
+    from specforge.training.checkpoint import CheckpointManager
+
+    try:
+        try:
+            CheckpointManager.read_resume_state(ckpt_dir)
+            outcome = {"error_type": None, "message": None}
+        except Exception as exc:
+            outcome = {"error_type": type(exc).__name__, "message": str(exc)}
+        with open(os.path.join(results_dir, f"rank{rank}.json"), "w") as fh:
+            json.dump(outcome, fh)
+    finally:
+        dist.destroy_process_group()
+
 
 def _dist_worker(rank, world, port, out_dir, results_dir):
     import torch.distributed as dist
@@ -474,6 +611,28 @@ class TestDistributedSaveAndResume(unittest.TestCase):
             self.assertEqual(res["global_step"], 3)
             self.assertTrue(res["verdict"])
             self.assertEqual(res["best_step"], 3)
+
+    def test_two_rank_resume_fails_symmetrically_when_one_rank_shard_missing(self):
+        import torch.multiprocessing as mp
+
+        out = tempfile.mkdtemp(prefix="ckpt_dist_missing_")
+        ckpt = _mgr(out, "dist").save(
+            {"global_step": 3, "world_size": 2, "run_id": "dist", "strategy": "eagle3"},
+            3,
+            rank_state={"optimizer": {"rank": 0}, "rng": {}},
+        )
+        results = tempfile.mkdtemp(prefix="ckpt_dist_missing_res_")
+        mp.spawn(
+            _dist_missing_shard_worker,
+            args=(2, _free_port(), ckpt, results),
+            nprocs=2,
+            join=True,
+        )
+        for rank in range(2):
+            with open(os.path.join(results, f"rank{rank}.json")) as fh:
+                outcome = json.load(fh)
+            self.assertEqual(outcome["error_type"], "RuntimeError", f"rank {rank}")
+            self.assertIn("rank 1", outcome["message"], f"rank {rank}")
 
 
 if __name__ == "__main__":
