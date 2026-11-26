@@ -491,7 +491,7 @@ class Trainer:
         wrapped = backend.prepare_model(
             model,
             optimizer_target=model.draft_model,
-            frozen=model.frozen,
+            frozen_modules=model.frozen_modules,
             blocks=program_spec.partition.blocks,
         )
         runner = DataParallelRunner(wrapped, backend, program_spec)
