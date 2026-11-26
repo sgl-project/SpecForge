@@ -90,7 +90,7 @@ def _runner(program, sharding, *, opt_spec=None, sched_spec=None, max_grad_norm=
     wrapped = backend.prepare_model(
         program,
         optimizer_target=program.draft_model,
-        frozen=program.frozen,
+        frozen_modules=program.frozen_modules,
         blocks=spec.partition.blocks,
     )
     return DataParallelRunner(wrapped, backend, spec), backend
@@ -260,7 +260,9 @@ def _wrapped_toy(sharding, weights=None, *, opt_spec=None, sched_spec=None):
     if weights is not None:
         program.load_state_dict(weights)
     backend = _toy_backend(sharding, opt_spec=opt_spec, sched_spec=sched_spec)
-    backend.prepare_model(program, frozen=(program.block.table,), blocks=("_Block",))
+    backend.prepare_model(
+        program, frozen_modules=(program.block.table,), blocks=("_Block",)
+    )
     return program, backend
 
 
@@ -380,7 +382,7 @@ class StoreInFP32Test(unittest.TestCase):
         module = _Aliased()
         module.frozen.register_buffer("scale", torch.ones(2, dtype=torch.bfloat16))
         written = _store_in_fp32(
-            module, frozen=(module.frozen,), artifact_dtype=torch.float16
+            module, frozen_modules=(module.frozen,), artifact_dtype=torch.float16
         )
         self.assertIs(module.a, module.b)
         self.assertEqual(module.a.dtype, torch.float32)
@@ -791,7 +793,7 @@ class FSDP2ProtocolTest(ProtocolChecks, unittest.TestCase):
         )
         wrapped = backend.prepare_model(
             program,
-            frozen=program.frozen,
+            frozen_modules=program.frozen_modules,
             blocks=spec.partition.blocks,
         )
         return DataParallelRunner(wrapped, backend, spec)
@@ -843,7 +845,7 @@ class FSDP2EquivalentUpdateTest(unittest.TestCase):
                     )
                     wrapped = fsdp2_backend.prepare_model(
                         fsdp2_prog,
-                        frozen=fsdp2_prog.frozen,
+                        frozen_modules=fsdp2_prog.frozen_modules,
                         blocks=spec.partition.blocks,
                     )
                     fsdp2_runner = DataParallelRunner(wrapped, fsdp2_backend, spec)

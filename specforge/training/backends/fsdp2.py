@@ -131,7 +131,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
-        frozen: Tuple[nn.Module, ...] = (),
+        frozen_modules: Tuple[nn.Module, ...] = (),
         blocks: Tuple[str, ...] = (),
     ) -> nn.Module:
         """Store the trainable draft in fp32 and shard it with FSDP2.
@@ -141,7 +141,8 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             wrap: Must be True; FSDP2 always wraps the program.
             optimizer_target: The module whose parameters the optimizer takes;
                 the program when omitted.
-            frozen: Frozen modules of ``model``: kept as built, replicated.
+            frozen_modules: Frozen modules of ``model``: kept as built,
+                replicated.
             blocks: Class names of the modules sharded as one unit each.
 
         Raises:
@@ -152,12 +153,15 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
 
         if not wrap:
             raise ValueError("the FSDP2 runtime requires wrap=True")
-        frozen = tuple(frozen)
-        if any(p.requires_grad for module in frozen for p in module.parameters()):
+        if any(
+            p.requires_grad for module in frozen_modules for p in module.parameters()
+        ):
             raise ValueError("frozen modules must contain only frozen parameters")
         target = model if optimizer_target is None else optimizer_target
         self._artifact_dtypes = _store_in_fp32(
-            model, frozen=frozen, artifact_dtype=self.precision.artifact_dtype
+            model,
+            frozen_modules=frozen_modules,
+            artifact_dtype=self.precision.artifact_dtype,
         )
         mesh = self._mesh(next(model.parameters()).device)
         policy = MixedPrecisionPolicy(
@@ -171,7 +175,9 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             mp_policy=policy,
             # Every unit, not only the root: a frozen table inside a block is
             # otherwise taken by that block's unit before the root sees it.
-            ignored_params={p for module in frozen for p in module.parameters()},
+            ignored_params={
+                p for module in frozen_modules for p in module.parameters()
+            },
         )
         block_classes = {
             type(module)
@@ -195,7 +201,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         self._wrapped = True
         self._wrapper_kind = "fsdp2"
         self.auto_wrap_block_classes = block_classes
-        self.ignored_frozen_modules = frozen
+        self.ignored_frozen_modules = frozen_modules
         self._trainable = tuple(p for p in target.parameters() if p.requires_grad)
         if self._optimizer_spec is not None:
             self._build_configured_optimizer(target)
@@ -333,7 +339,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
 
 
 def _store_in_fp32(
-    program: nn.Module, *, frozen, artifact_dtype: torch.dtype
+    program: nn.Module, *, frozen_modules, artifact_dtype: torch.dtype
 ) -> Dict[str, torch.dtype]:
     """Store the trainable parameters and floating buffers of ``program`` in fp32.
 
@@ -347,7 +353,7 @@ def _store_in_fp32(
         in: ``artifact_dtype`` for parameters, the built dtype for buffers
         (FSDP1's full state dict restores buffers to it).
     """
-    inside_frozen = {id(m) for module in frozen for m in module.modules()}
+    inside_frozen = {id(m) for module in frozen_modules for m in module.modules()}
     artifact: Dict[str, torch.dtype] = {}
     replaced: Dict[int, torch.Tensor] = {}
     for prefix, owner in program.named_modules(remove_duplicate=False):
