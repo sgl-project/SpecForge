@@ -17,6 +17,7 @@ in the shared payload. Run-scoped ``{run_id}-latest``/``{run_id}-best`` links an
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import logging
@@ -405,11 +406,9 @@ class CheckpointManager:
             torch.save(obj, tmp)
             os.replace(tmp, path)
         except BaseException:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+            # Best effort: the write's own error is the one to report.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
             raise
 
     @staticmethod
@@ -420,11 +419,9 @@ class CheckpointManager:
                 json.dump(obj, fh, indent=2)
             os.replace(tmp, path)
         except BaseException:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+            # Best effort: the write's own error is the one to report.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
             raise
 
     def _point(self, name: str, ckpt_dir: str) -> None:

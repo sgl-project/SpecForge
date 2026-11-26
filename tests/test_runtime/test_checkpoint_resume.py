@@ -1986,9 +1986,11 @@ def _atomic_checkpoint_worker(rank, world, store_path, out_dir, scenario, report
             mgr.save(shared_payload(1), 1, rank_state=shard_payload(1))
 
         target_step = 1 if scenario == "shard_fail_first_step" else 2
-        original_save = CheckpointManager._atomic_save
+        publish = os.replace
 
-        def failing_atomic_save(obj, path):
+        def failing_publish(written, path):
+            # The file is written; its move into place fails, so the writer's
+            # cleanup of the temporary file runs.
             if (
                 scenario in ("shard_fail_first_step", "shard_fail_second_step")
                 and rank == 1
@@ -2001,12 +2003,10 @@ def _atomic_checkpoint_worker(rank, world, store_path, out_dir, scenario, report
                 and os.path.basename(path) == STATE_FILE
             ):
                 raise OSError("commit failed")
-            return original_save(obj, path)
+            return publish(written, path)
 
         error = None
-        with mock.patch.object(
-            CheckpointManager, "_atomic_save", staticmethod(failing_atomic_save)
-        ):
+        with mock.patch("specforge.training.checkpoint.os.replace", failing_publish):
             try:
                 mgr.save(
                     shared_payload(target_step),
