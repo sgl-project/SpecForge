@@ -391,6 +391,7 @@ class TestServerCaptureGate(unittest.TestCase):
 
     def test_eagle3_zero_copy_end_to_end(self):
         from specforge.inference.adapters.server_capture import (
+            CaptureOutput,
             SGLangServerCaptureAdapter,
         )
         from specforge.inference.capture import CaptureConfig
@@ -398,14 +399,6 @@ class TestServerCaptureGate(unittest.TestCase):
 
         rows = [[5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10]]
         store = self._store("gate-eagle3")
-        adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}",
-            store,
-            run_id="gate0",
-            algorithm="eagle3",
-            schema=_capture_schema("eagle3"),
-            server_capture=SERVER_CAPTURE,
-        )
         contract = CaptureConfig.from_strategy(
             required_features={
                 "input_ids",
@@ -417,11 +410,26 @@ class TestServerCaptureGate(unittest.TestCase):
             target_repr="hidden_state",
             target_hidden_size=H,
         )
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}",
+            store,
+            outputs=[
+                CaptureOutput(
+                    run_id="gate0",
+                    algorithm="eagle3",
+                    schema=_capture_schema("eagle3"),
+                    capture=contract,
+                )
+            ],
+            server_capture=SERVER_CAPTURE,
+        )
         # Submit sequentially so the second identical prompt would hit the
         # first request's radix entry if the adapter did not isolate attempts.
         refs = []
         for task in self._tasks(rows):
-            refs.extend(adapter.produce_refs([task], capture=contract))
+            (result,) = adapter.produce_refs([task])
+            self.assertIsInstance(result, list, f"expected refs, got: {result}")
+            refs.extend(result)
         for ref in refs:
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 
@@ -500,6 +508,7 @@ class TestServerCaptureGate(unittest.TestCase):
 
     def test_dflash_capture_same_server(self):
         from specforge.inference.adapters.server_capture import (
+            CaptureOutput,
             SGLangServerCaptureAdapter,
         )
         from specforge.inference.capture import CaptureConfig
@@ -507,21 +516,28 @@ class TestServerCaptureGate(unittest.TestCase):
 
         rows = [[3, 1, 4, 1, 5]]
         store = self._store("gate-dflash")
-        adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}",
-            store,
-            run_id="gate1",
-            algorithm="dflash",
-            schema=_capture_schema("dflash"),
-            server_capture=SERVER_CAPTURE,
-        )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
             aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}",
+            store,
+            outputs=[
+                CaptureOutput(
+                    run_id="gate1",
+                    algorithm="dflash",
+                    schema=_capture_schema("dflash"),
+                    capture=contract,
+                )
+            ],
+            server_capture=SERVER_CAPTURE,
+        )
+        (result,) = adapter.produce_refs(self._tasks(rows))
+        self.assertIsInstance(result, list, f"expected refs, got: {result}")
+        (ref,) = result
         self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
         out, handle = store.get(ref)
         self.assertEqual(
@@ -543,6 +559,7 @@ class TestServerCaptureGate(unittest.TestCase):
 
     def test_dflash_capture_without_teacher_metrics_skips_last_hidden(self):
         from specforge.inference.adapters.server_capture import (
+            CaptureOutput,
             SGLangServerCaptureAdapter,
         )
         from specforge.inference.capture import CaptureConfig
@@ -550,23 +567,30 @@ class TestServerCaptureGate(unittest.TestCase):
 
         rows = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8]]
         store = self._store("gate-dflash-noteacher")
-        adapter = SGLangServerCaptureAdapter(
-            f"http://localhost:{PORT}",
-            store,
-            run_id="gate2",
-            algorithm="dflash",
-            schema=_capture_schema("dflash", teacher_metrics=False),
-            server_capture=SERVER_CAPTURE,
-        )
         contract = CaptureConfig.from_strategy(
             required_features={"input_ids", "hidden_states", "loss_mask"},
             aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
             target_repr="hidden_state",
             target_hidden_size=H,
         )
-        refs = adapter.produce_refs(self._tasks(rows), capture=contract)
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}",
+            store,
+            outputs=[
+                CaptureOutput(
+                    run_id="gate2",
+                    algorithm="dflash",
+                    schema=_capture_schema("dflash", teacher_metrics=False),
+                    capture=contract,
+                )
+            ],
+            server_capture=SERVER_CAPTURE,
+        )
+        results = adapter.produce_refs(self._tasks(rows))
         aux_ref, _ = self._hf_reference(rows)
-        for i, ref in enumerate(refs):
+        for i, result in enumerate(results):
+            self.assertIsInstance(result, list, f"expected refs, got: {result}")
+            (ref,) = result
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
             self.assertEqual(
                 ["hidden_states", "input_ids", "loss_mask"], sorted(ref.feature_specs)

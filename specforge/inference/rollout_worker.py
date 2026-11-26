@@ -13,7 +13,8 @@ asks an external-server ``feature_source`` for per-sample features,
 verifies them against the typed ``CaptureConfig`` *before* writing, writes them
 to the ``FeatureStore``, and commits the resulting ``SampleRef`` metadata to the
 controller. A server-side capture source may instead return already-written
-``SampleRef``s via ``produce_refs``. It never hands a tensor to the controller.
+``SampleRef``s via ``produce_refs``, a list per task, verified against its own
+capture contract. It never hands a tensor to the controller.
 Strategy-specific capture requirements live in ``CaptureConfig`` + the feature
 schema, not here.
 """
@@ -42,9 +43,7 @@ class FeatureSource(Protocol):
 
 
 class RefSource(Protocol):
-    def produce_refs(
-        self, tasks: List[PromptTask], *, capture: CaptureConfig
-    ) -> List[Any]: ...
+    def produce_refs(self, tasks: List[PromptTask]) -> List[Any]: ...
 
 
 class RolloutWorker:
@@ -53,7 +52,7 @@ class RolloutWorker:
         controller,
         feature_store,
         feature_source: FeatureSource,
-        capture: CaptureConfig,
+        capture: Optional[CaptureConfig] = None,
         *,
         run_id: str,
         worker_id: Optional[str] = None,
@@ -252,7 +251,7 @@ class RolloutWorker:
 
     def _run_ref_source(self, tasks: List[PromptTask], produce_refs) -> List[SampleRef]:
         try:
-            results = produce_refs(tasks, capture=self.capture)
+            results = produce_refs(tasks)
         except Exception as exc:
             self._mark_unhealthy(f"produce_refs: {exc}")
             self.controller.fail_prompt_tasks(
@@ -279,15 +278,16 @@ class RolloutWorker:
 
         refs: List[SampleRef] = []
         for result in results:
-            if isinstance(result, SampleRef):
-                refs.append(result)
+            if isinstance(result, list):
+                refs.extend(result)
                 continue
 
             task_id = getattr(result, "task_id", None)
             reason = getattr(
                 result,
                 "reason",
-                f"produce_refs returned {type(result).__name__}, not SampleRef",
+                f"produce_refs returned {type(result).__name__}, not a list of "
+                "SampleRef",
             )
             retryable = bool(getattr(result, "retryable", True))
             if task_id is None:

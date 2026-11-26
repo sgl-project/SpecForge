@@ -22,6 +22,7 @@ from specforge.cli import (
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
 from specforge.training.assembly import TrainingRun
+from specforge.training.capture_contract import ServerCaptureContract
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
     _build_online,
@@ -176,8 +177,15 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     mock.patch("specforge.training.assembly._load_input_tools"),
                     mock.patch("specforge.training.model_loading.resolve_draft_config"),
                     mock.patch(
-                        "specforge.training.disaggregated._producer_capture_metadata",
-                        return_value=([1, 2], 8, 32, 32),
+                        "specforge.training.capture_contract."
+                        "resolve_server_capture_contract",
+                        return_value=ServerCaptureContract(
+                            method="dflash",
+                            aux_layer_ids=(1, 2),
+                            target_hidden_size=8,
+                            target_vocab_size=32,
+                            draft_vocab_size=32,
+                        ),
                     ),
                     mock.patch(
                         "specforge.inference.adapters.server_capture."
@@ -198,7 +206,8 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         preflight_model_bundle=preflight,
                     )
                 preflight.assert_not_called()
-                schema = adapter_cls.call_args.kwargs["schema"]
+                (output,) = adapter_cls.call_args.kwargs["outputs"]
+                schema = output.schema
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
 

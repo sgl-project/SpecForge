@@ -549,15 +549,53 @@ def _build_offline(
     )
 
 
-def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
+def capture_output_for(cfg: Config, algorithm: AlgorithmRegistration):
+    """The sample one run takes from each captured prompt, from its config."""
+    from specforge.algorithms.common.providers import resolve_server_capture_layout
+    from specforge.inference.adapters.server_capture import (
+        CaptureOutput,
+        ServerCaptureSchema,
+    )
+    from specforge.inference.capture import CaptureConfig
     from specforge.training.capture_contract import resolve_server_capture_contract
 
+    modality = cfg.model.input_modality
+    streaming = algorithm.providers.server_streaming_for(modality)
+    feature_contract = algorithm.spec.feature_contract("streaming", modality)
+    target_repr = streaming.target_representation
+    allowed_target_representations = feature_contract.allowed_target_representations
+    if allowed_target_representations and (
+        target_repr not in allowed_target_representations
+    ):
+        raise ValueError(
+            f"target representation {target_repr!r} is not supported by "
+            f"algorithm {algorithm.name!r} for modality {modality!r}; "
+            f"expected one of {sorted(allowed_target_representations)}"
+        )
+    if not allowed_target_representations and target_repr is not None:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} for modality {modality!r} does not "
+            f"consume a target representation, got {target_repr!r}"
+        )
     contract = resolve_server_capture_contract(cfg, algorithm=algorithm)
-    return (
-        list(contract.aux_layer_ids),
-        contract.target_hidden_size,
-        contract.target_vocab_size,
-        contract.draft_vocab_size,
+    layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
+    return CaptureOutput(
+        run_id=cfg.run_id,
+        algorithm=algorithm.name,
+        schema=ServerCaptureSchema(
+            aux_feature=layout.aux_feature,
+            last_hidden_feature=layout.last_hidden_feature,
+            passthrough=layout.passthrough,
+            attention_mask_feature=layout.attention_mask_feature,
+        ),
+        capture=CaptureConfig.from_strategy(
+            required_features=feature_contract.required_tensors,
+            aux_hidden_state_layer_ids=contract.aux_layer_ids,
+            target_repr=target_repr,
+            target_hidden_size=contract.target_hidden_size,
+            target_vocab_size=contract.target_vocab_size,
+            draft_vocab_size=contract.draft_vocab_size,
+        ),
     )
 
 
@@ -597,9 +635,7 @@ def _build_online(
     channel = StreamingRefChannel(channel_path)
 
     if cfg.training.role == "producer":
-        from specforge.algorithms.common.providers import resolve_server_capture_layout
         from specforge.inference.adapters.server_capture import (
-            ServerCaptureSchema,
             SGLangServerCaptureAdapter,
         )
         from specforge.launch import build_disagg_online_producer
@@ -639,34 +675,21 @@ def _build_online(
                 channel_path + _ONLINE_SCHEDULE_SUFFIX,
                 json.dumps(schedule, sort_keys=True),
             )
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
-            cfg, algorithm
-        )
-        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
-        capture_schema = ServerCaptureSchema(
-            aux_feature=layout.aux_feature,
-            last_hidden_feature=layout.last_hidden_feature,
-            passthrough=layout.passthrough,
-            attention_mask_feature=layout.attention_mask_feature,
-        )
+        outputs = [capture_output_for(cfg, algorithm)]
         adapters = [
             SGLangServerCaptureAdapter(
                 url,
                 store,
-                run_id=cfg.run_id,
-                algorithm=algorithm.name,
-                schema=capture_schema,
+                outputs=outputs,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
                 server_capture=_server_capture(cfg),
             )
             for url in _server_urls(cfg)
         ]
-        target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
         _workers, drive = build_disagg_online_producer(
-            algorithm=algorithm,
-            modality=modality,
+            strategy=algorithm.name,
             prompts=prompts,
             feature_store=store,
             channel=channel,
@@ -674,11 +697,6 @@ def _build_online(
             num_rollout_workers=len(adapters),
             producer_concurrency=cfg.runtime.producer_concurrency,
             run_id=cfg.run_id,
-            target_hidden_size=hidden_size,
-            target_vocab_size=target_vocab,
-            draft_vocab_size=draft_vocab,
-            target_repr=target_repr,
-            aux_hidden_state_layer_ids=layers,
             prompt_epochs=cfg.training.num_epochs,
             prompt_seed=_online_prompt_seed(cfg),
             lease=cfg.runtime.producer_lease,
