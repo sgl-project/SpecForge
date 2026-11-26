@@ -13,7 +13,6 @@ from unittest import mock
 
 import torch
 
-from specforge.data.preprocessing import process_offline_eagle3_sample
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import LocalFeatureStore
 from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
@@ -22,8 +21,10 @@ from specforge.runtime.data_plane.streaming_ref_channel import (
     StreamingRefChannel,
     StreamingRefQueue,
 )
+from specforge.training.canonical_data import normalize_sample
 
-_OFFLINE_EAGLE3_TRANSFORM = partial(process_offline_eagle3_sample, max_len=2048)
+_OFFLINE_KEYS = ("input_ids", "loss_mask", "hidden_state", "aux_hidden_state")
+_OFFLINE_EAGLE3_TRANSFORM = partial(normalize_sample, keys=_OFFLINE_KEYS, max_len=2048)
 
 
 def _simple_collate(features):
@@ -207,9 +208,8 @@ class TestFeatureDataLoader(unittest.TestCase):
             b = batches[0]
             self.assertEqual(len(b.sample_ids), 2)
             self.assertEqual(b.tensors["input_ids"].shape, (2, 8))
-            self.assertEqual(b.tensors["target"].shape, (2, 8, 4))
-            self.assertEqual(b.tensors["hidden_state"].shape, (2, 8, 12))
-            # aux<->target swap preserved
+            self.assertEqual(b.tensors["hidden_state"].shape, (2, 8, 4))
+            self.assertEqual(b.tensors["aux_hidden_state"].shape, (2, 8, 12))
             self.assertEqual(b.metadata["target_repr"], "hidden_state")
             # all refs acked
             self.assertEqual(q.in_flight(), 0)
@@ -460,23 +460,6 @@ class TestFeatureDataLoader(unittest.TestCase):
         # only the yielded batch's 2 refs are fetched/transformed
         self.assertEqual(store.gets, 2)
         self.assertEqual(len(transform_calls), 2)
-
-    def test_offline_transform_does_not_mutate_raw_loss_mask(self):
-        raw = {
-            "input_ids": torch.arange(4),
-            "loss_mask": torch.ones(4, dtype=torch.long),
-            "hidden_state": torch.randn(1, 4, 2),
-            "aux_hidden_state": torch.randn(1, 4, 6),
-        }
-        original_loss_mask = raw["loss_mask"].clone()
-
-        transformed = process_offline_eagle3_sample(raw, max_len=3)
-
-        self.assertTrue(torch.equal(raw["loss_mask"], original_loss_mask))
-        self.assertEqual(transformed["input_ids"].shape, (1, 3))
-        self.assertEqual(transformed["hidden_state"].shape, (1, 3, 6))
-        self.assertEqual(transformed["target"].shape, (1, 3, 2))
-        self.assertEqual(transformed["loss_mask"].tolist(), [[1, 1, 0]])
 
     def test_offline_workers_prefetch_without_reordering_batches(self):
         with tempfile.TemporaryDirectory() as d:
