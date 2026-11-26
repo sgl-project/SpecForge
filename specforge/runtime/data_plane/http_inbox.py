@@ -28,7 +28,9 @@ applied under a per-rank server lock.
 from __future__ import annotations
 
 import base64
+import codecs
 import json
+import logging
 import os
 import threading
 import time
@@ -43,8 +45,12 @@ from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.ref_serialization import ref_from_dict
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
+logger = logging.getLogger(__name__)
+
 _CLOSED_SUFFIX = ".closed"
 _FAILED_SUFFIX = ".failed"
+_TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+_TRANSIENT_HTTP_RETRIES = 3
 
 
 class _InboxThreadingHTTPServer(ThreadingHTTPServer):
@@ -151,6 +157,9 @@ class InboxHTTPServer:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid offset"})
                     return
                 path = RefDistributor.inbox_path(owner.inbox_dir, rank)
+                # Check closure before reading so a response with closed=True
+                # is guaranteed to include every byte written before close().
+                closed = os.path.exists(path + _CLOSED_SUFFIX)
                 data = b""
                 next_offset = offset
                 try:
@@ -171,7 +180,7 @@ class InboxHTTPServer:
                     {
                         "data": base64.b64encode(data).decode("ascii"),
                         "next_offset": next_offset,
-                        "closed": os.path.exists(path + _CLOSED_SUFFIX),
+                        "closed": closed,
                         "failure": failure,
                     },
                 )
@@ -222,12 +231,12 @@ class InboxHTTPServer:
         return self
 
     def stop(self) -> None:
-        if self._thread is None:
-            return
-        self._httpd.shutdown()
+        thread = self._thread
+        if thread is not None:
+            self._httpd.shutdown()
+            thread.join(timeout=5.0)
+            self._thread = None
         self._httpd.server_close()
-        self._thread.join(timeout=5.0)
-        self._thread = None
 
 
 class RemoteInboxChannel:
@@ -240,7 +249,7 @@ class RemoteInboxChannel:
         self.path = f"{origin.rstrip('/')}/v1/inboxes/{dp_rank}"
         self.timeout_s = timeout_s
         self._read_offset = 0
-        self._buf = ""
+        self._raw_buf = b""
         self._closed = False
         self._failure: str | None = None
         self._pending: list[SampleRef] = []
@@ -251,47 +260,90 @@ class RemoteInboxChannel:
         self._consumed_lock = threading.Lock()
         self._consumed_target = 0
 
-    def _pull(self) -> None:
-        with self._pull_lock:
-            request = Request(f"{self.path}?offset={self._read_offset}")
+    def _pull_locked(self) -> None:
+        request = Request(f"{self.path}?offset={self._read_offset}")
+        for attempt in range(_TRANSIENT_HTTP_RETRIES + 1):
             try:
                 with urlopen(request, timeout=self.timeout_s) as response:
                     payload = json.load(response)
+                break
+            except HTTPError as exc:
+                if (
+                    exc.code in _TRANSIENT_HTTP_STATUSES
+                    and attempt < _TRANSIENT_HTTP_RETRIES
+                ):
+                    logger.warning(
+                        "inbox HTTP pull transient HTTP %s for %s (attempt %d/%d): %s",
+                        exc.code,
+                        self.path,
+                        attempt + 1,
+                        _TRANSIENT_HTTP_RETRIES + 1,
+                        exc.reason,
+                    )
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.error(
+                    "inbox HTTP pull failed with HTTP %s for %s: %s",
+                    exc.code,
+                    self.path,
+                    exc.reason,
+                )
+                raise
             except (URLError, OSError, TimeoutError):
                 # Let StreamingRefQueue's configured idle timeout distinguish a
                 # transient network outage from a dead rank-0 service.
                 return
-            data = base64.b64decode(payload["data"])
-            next_offset = int(payload["next_offset"])
-            if (
-                next_offset < self._read_offset
-                or next_offset - self._read_offset != len(data)
-            ):
-                raise RuntimeError("inbox HTTP server returned an invalid byte range")
-            self._read_offset = next_offset
-            self._closed = bool(payload["closed"])
-            self._failure = payload.get("failure")
-            self._buf += data.decode("utf-8")
-            lines = self._buf.split("\n")
-            self._buf = lines.pop()
-            self._pending.extend(
-                ref_from_dict(json.loads(line)) for line in lines if line
-            )
+        data = base64.b64decode(payload["data"])
+        next_offset = int(payload["next_offset"])
+        if next_offset < self._read_offset or next_offset - self._read_offset != len(
+            data
+        ):
+            raise RuntimeError("inbox HTTP server returned an invalid byte range")
+        closed = bool(payload["closed"])
+        combined = self._raw_buf + data
+        parts = combined.split(b"\n")
+        trailing = parts.pop()
+        if trailing:
+            if closed:
+                try:
+                    trailing.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"closed inbox {self.path} ended with incomplete UTF-8 "
+                        f"bytes ({len(trailing)} bytes)"
+                    ) from exc
+                raise ValueError(
+                    f"closed inbox {self.path} ended with an incomplete JSONL "
+                    f"record ({len(trailing)} bytes)"
+                )
+            # Validate trailing bytes without failing on a split UTF-8 codepoint.
+            codecs.getincrementaldecoder("utf-8")().decode(trailing, final=False)
+        parsed = [
+            ref_from_dict(json.loads(line.decode("utf-8"))) for line in parts if line
+        ]
+        self._read_offset = next_offset
+        self._raw_buf = trailing
+        self._closed = closed
+        self._failure = payload.get("failure")
+        self._pending.extend(parsed)
 
     def poll(self) -> list[SampleRef]:
-        self._pull()
-        refs, self._pending = self._pending, []
-        return refs
+        with self._pull_lock:
+            self._pull_locked()
+            refs, self._pending = self._pending, []
+            return refs
 
     def is_closed(self) -> bool:
-        self._pull()
-        return self._closed
+        with self._pull_lock:
+            self._pull_locked()
+            return self._closed
 
     def failure(self) -> str | None:
-        self._pull()
-        if self._failure is None:
-            return None
-        return f"ref-distributor died:\n{self._failure}"
+        with self._pull_lock:
+            self._pull_locked()
+            if self._failure is None:
+                return None
+            return f"ref-distributor died:\n{self._failure}"
 
     def mark_consumed(self, n: int) -> None:
         if n < 1:
@@ -303,7 +355,7 @@ class RemoteInboxChannel:
         target = self._consumed_target + n
         body = json.dumps({"target": target}, separators=(",", ":")).encode("utf-8")
         transient_error = None
-        for attempt in range(4):
+        for attempt in range(_TRANSIENT_HTTP_RETRIES + 1):
             request = Request(
                 f"{self.path}/consumed",
                 data=body,
@@ -313,11 +365,18 @@ class RemoteInboxChannel:
             try:
                 with urlopen(request, timeout=self.timeout_s) as response:
                     payload = json.load(response)
-            except HTTPError:
+            except HTTPError as exc:
+                if (
+                    exc.code in _TRANSIENT_HTTP_STATUSES
+                    and attempt < _TRANSIENT_HTTP_RETRIES
+                ):
+                    transient_error = exc
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
                 raise
             except (URLError, OSError, TimeoutError) as exc:
                 transient_error = exc
-                if attempt < 3:
+                if attempt < _TRANSIENT_HTTP_RETRIES:
                     time.sleep(0.05 * (attempt + 1))
                 continue
             if int(payload.get("consumed", -1)) != target:
