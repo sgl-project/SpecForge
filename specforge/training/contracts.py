@@ -15,6 +15,7 @@ is declared here, so a second runner needs nothing from the first.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -31,6 +32,34 @@ import torch
 if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
     from specforge.training.strategies.base import StepContext, StepOutput
+
+
+@dataclass(frozen=True)
+class CheckpointState:
+    """What a runner hands over when a checkpoint is taken."""
+
+    #: The draft's weights under canonical keys: complete on the first rank,
+    #: empty on the others.
+    draft: Dict[str, torch.Tensor]
+    #: This rank's own state for continuing the run; every rank's is saved.
+    rank: Dict[str, Any]
+    #: The optimizer state where every rank holds the same one: saved once
+    #: and handed back to every rank on resume. None where each rank's is its
+    #: own, in ``rank``.
+    replicated: Optional[Dict[str, Any]]
+    #: The kernels this rank has realised so far, by the choice they answer.
+    #: Ranks have to agree on them before a checkpoint records them.
+    kernels: Mapping[str, str]
+
+
+class RankFailure(RuntimeError):
+    """This rank failed outside any collective, where its peers will succeed.
+
+    Whoever catches it reports it through ``StepRunner.agree`` and then
+    raises its cause, so the other ranks do not wait for this one in their
+    next collective. A failure inside a collective is not one: the ranks are
+    already apart there, and it propagates so the launcher tears the job down.
+    """
 
 
 class IncompleteWindow(RuntimeError):
@@ -199,6 +228,35 @@ class StepRunner(Protocol):
         then have to evaluate the same batches. Detailed metrics are collected
         when the program declares that its evaluation reports them, whatever
         ``ctx.collect_detailed_metrics`` says.
+        """
+
+    def checkpoint_state(self) -> CheckpointState:
+        """The draft's weights and this rank's state for continuing the run.
+
+        Gathering the weights is a collective when the wrapper shards. Legal
+        between an applied step and the next window.
+        """
+
+    def load_resume(self, state: Mapping[str, Any]) -> None:
+        """Restore the state a checkpoint saved for this rank.
+
+        ``state`` is :attr:`CheckpointState.rank` as it was saved, with the
+        replicated part filled in.
+        """
+
+    def agree(self, error: Optional[str], *, value: Any = None) -> None:
+        """Have every rank learn every rank's outcome.
+
+        One gather of an error and a value per rank. Raises on every rank when
+        any rank reports an error or the values differ, so a rank-local
+        failure never leaves the others waiting in a later collective. It is
+        not for use inside a step.
+
+        Args:
+            error: This rank's failure, or None; any string is a failure, an
+                empty one included.
+            value: Plain data that ``==`` compares to a bool, the same on
+                every rank when the ranks agree.
         """
 
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:

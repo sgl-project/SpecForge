@@ -1,7 +1,6 @@
 """Unset kernel settings resolve to the validated defaults; explicit ones are strict."""
 
 import unittest
-from unittest.mock import Mock
 
 import torch
 
@@ -92,7 +91,7 @@ class KernelDefaultsTest(unittest.TestCase):
             with self.subTest(architecture=architecture):
                 self.assertEqual(protocol_chunk(architecture), expected)
 
-    def test_implementations_are_agreed_before_a_checkpoint(self):
+    def test_strategy_reports_the_implementations_it_resolved(self):
         _, runtime = build_runtime("DFlashDraftModel")
         strategy = CanonicalTrainStrategy(
             runtime,
@@ -100,9 +99,11 @@ class KernelDefaultsTest(unittest.TestCase):
             objective="dflash",
             required_features=runtime.registration.inputs,
         )
-        runtime.loss_implementations.agree = Mock()
-        strategy.before_checkpoint()
-        runtime.loss_implementations.agree.assert_called_once_with()
+        runtime.loss_implementations.names["0:0"] = "reference"
+        kernels = strategy.kernels()
+        self.assertEqual(kernels, {"0:0": "reference"})
+        # A copy: what a checkpoint compares must not change under it.
+        self.assertIsNot(kernels, runtime.loss_implementations.names)
 
 
 if __name__ == "__main__":

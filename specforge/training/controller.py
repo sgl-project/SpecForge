@@ -28,10 +28,9 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 import torch
 
 from specforge.runtime.contracts import TrainBatch
-from specforge.training.backend import TrainingBackend
-from specforge.training.contracts import StepMetrics, StepRunner
+from specforge.training.contracts import RankFailure, StepMetrics, StepRunner
 from specforge.training.frame import run_window
-from specforge.training.strategies.base import DraftTrainStrategy, StepContext
+from specforge.training.strategies.base import StepContext
 
 logger = logging.getLogger(__name__)
 
@@ -190,8 +189,7 @@ class TrainerController:
         self,
         runner: StepRunner,
         *,
-        strategy: DraftTrainStrategy,
-        backend: TrainingBackend,
+        strategy_name: str,
         accumulation_steps: int = 1,
         data_parallel_size: int = 1,
         run_id: str,
@@ -224,8 +222,8 @@ class TrainerController:
                 f"nonzero together"
             )
         self.runner = runner
-        self.strategy = strategy
-        self.backend = backend
+        # Recorded in every checkpoint and checked on resume.
+        self.strategy_name = strategy_name
         # Micro-batches per optimizer update.
         self.accumulation_steps = max(1, accumulation_steps)
         # Ranks that receive different samples; scales the logged throughput.
@@ -659,26 +657,38 @@ class TrainerController:
         # A checkpoint must never be ahead of its durable ack: resume requires
         # the ledger marker to equal the checkpoint step.
         self._flush_durable_ack()
-        self.strategy.before_checkpoint()
-        # Every rank participates: FSDP model gathering is collective and every
-        # rank persists its RNG. Sharded optimizer state stays rank-local; the
-        # identical DDP optimizer is written once in the shared rank0 payload.
-        full = self.backend.state_dict()
+        # Every rank participates: gathering a sharded model is collective and
+        # every rank saves its own state. A rank that fails once the gather is
+        # over, copying its optimizer state for one, reports it through the
+        # agreement; raising here would leave the others waiting in it. A
+        # failure inside the gather propagates: the ranks are apart already.
+        state = failure = None
+        try:
+            state = self.runner.checkpoint_state()
+        except RankFailure as error:
+            failure = error
+        # What rank 0 records for resume has to hold for every rank; a
+        # difference raises here, before anything is written.
+        try:
+            self.runner.agree(
+                None if failure is None else str(failure),
+                value=None if state is None else ("loss kernels", state.kernels),
+            )
+        except Exception:
+            if failure is not None:
+                # The rank that failed raises what it failed with.
+                raise failure.__cause__ or failure
+            raise
         mgr = self._checkpoint_manager()
-        replicated_optimizer = bool(
-            getattr(self.backend, "optimizer_state_is_replicated", False)
-        )
         shared = None
         if mgr.is_rank0():
             shared = {
-                "draft_state_dict": self.strategy.checkpoint_state_filter(
-                    full["model"]
-                ),
+                "draft_state_dict": state.draft,
                 "global_step": step,
                 "epoch": self.epoch,
                 "epoch_batch": self._epoch_batch,
                 "epoch_samples": self._epoch_samples,
-                "strategy": self.strategy.name,
+                "strategy": self.strategy_name,
                 "run_id": self.run_id,
                 "world_size": (
                     torch.distributed.get_world_size()
@@ -687,25 +697,20 @@ class TrainerController:
                 ),
                 **self.checkpoint_extra,
             }
-            if replicated_optimizer:
-                # DDP ranks have identical parameters, gradients, optimizer
-                # moments, and scheduler state. Persist that large state once;
-                # rank files still preserve their distinct RNG streams.
-                shared["replicated_optimizer_state"] = full["optimizer"]
-        ckpt_dir = mgr.save(
-            shared,
-            step,
-            rank_state={
-                "optimizer": None if replicated_optimizer else full["optimizer"],
-                "rng": full["rng"],
-            },
-        )
+            if "canonical_loss_implementations" in shared:
+                # Write the exact kernel snapshot that was agreed across ranks above.
+                shared["canonical_loss_implementations"] = dict(state.kernels)
+            if state.replicated is not None:
+                # Saved once in the shared payload; the rank files still keep
+                # each rank's own state.
+                shared["replicated_optimizer_state"] = state.replicated
+        ckpt_dir = mgr.save(shared, step, rank_state=state.rank)
         self.last_checkpoint_step = step
         return Checkpoint(
             checkpoint_uri=f"file://{os.path.abspath(ckpt_dir)}",
             global_step=step,
             epoch=self.epoch,
-            strategy=self.strategy.name,
+            strategy=self.strategy_name,
         )
 
 

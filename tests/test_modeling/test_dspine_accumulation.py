@@ -152,8 +152,7 @@ class DSpineAccumulationTest(unittest.TestCase):
         with TemporaryDirectory() as directory:
             controller = TrainerController(
                 runner,
-                strategy=runner.strategy,
-                backend=runner.backend,
+                strategy_name=runner.strategy.name,
                 accumulation_steps=2,
                 run_id="dspine-evaluation",
                 output_dir=directory,
@@ -230,8 +229,7 @@ class DSpineAccumulationTest(unittest.TestCase):
             (runner, optimizer) = training_runner(model)
             controller = TrainerController(
                 runner,
-                strategy=runner.strategy,
-                backend=runner.backend,
+                strategy_name=runner.strategy.name,
                 accumulation_steps=2,
                 run_id="dspine-incomplete",
                 output_dir=tmp_path,

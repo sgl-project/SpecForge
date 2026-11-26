@@ -34,6 +34,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
+from specforge.training.contracts import RankFailure
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
 
@@ -470,14 +471,27 @@ class Trainer:
         # AFTER wrapping; the strategy MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
         wrapped = backend.prepare_model(model, optimizer_target=model.draft_model)
-        if resume is not None:
-            backend.load_state_dict(resume["backend"])
         strategy = make_step_strategy(
             wrapped,
             target_head=target_head,
             **resolved_strategy_kwargs,
         )
         runner = DataParallelRunner(strategy, backend)
+        if resume is not None:
+            # A rank whose own state does not restore tells the others, which
+            # would otherwise wait for it in the first step's collectives.
+            failure = None
+            try:
+                runner.load_resume(resume["backend"])
+            except RankFailure as error:
+                failure = error
+            try:
+                runner.agree(None if failure is None else str(failure))
+            except Exception:
+                if failure is not None:
+                    # The rank that failed raises what it failed with.
+                    raise failure.__cause__ or failure
+                raise
         ack_fn = None
         if durable_ack:
 
@@ -495,8 +509,7 @@ class Trainer:
 
         controller_obj = TrainerController(
             runner,
-            strategy=strategy,
-            backend=backend,
+            strategy_name=algorithm_name,
             accumulation_steps=accumulation_steps,
             data_parallel_size=max(
                 1, parallel.world_size // (parallel.tp_size * parallel.sp_size)
