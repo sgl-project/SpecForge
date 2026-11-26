@@ -1731,9 +1731,7 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
         def draft_state(self, state):
             prefix = "draft_model."
             return {
-                k[len(prefix) :]: v
-                for k, v in state.items()
-                if k.startswith(prefix)
+                k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)
             }
 
     if use_cuda:
