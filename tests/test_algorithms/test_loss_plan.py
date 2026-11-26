@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 from torch import nn
 
 from specforge.algorithms.objectives.base import ObjectiveResult
+from specforge.algorithms.objectives.computation import LossComputation
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
 from specforge.algorithms.objectives.implementations import domino_ce  # noqa: F401
@@ -31,9 +32,20 @@ from specforge.algorithms.objectives.plan import LossPlan, LossTerm
 from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
 from specforge.algorithms.objectives.projection import LinearProjection, Projection
 from specforge.algorithms.objectives.reductions import PlanResult
+from specforge.losses import fused as fused_loss
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
 from tests.test_runtime._fixtures import FakeProgram, fake_spec
+
+
+def _spy_evaluate(calls):
+    orig = LossComputation.evaluate
+
+    def wrapper(calc, key, *args, **kwargs):
+        calls.append((key, kwargs))
+        return orig(calc, key, *args, **kwargs)
+
+    return patch.object(LossComputation, "evaluate", wrapper)
 
 
 def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
@@ -195,7 +207,7 @@ def distributed_reduction(rank, rendezvous):
                     side_effect=ImportError("missing kernel dependency"),
                 ),
                 unittest.TestCase().assertRaisesRegex(
-                    ValueError, "missing kernel dependency"
+                    ImportError, "missing kernel dependency"
                 ),
             ):
                 ExecutionSelection().resolve(request, (0,), 0)
@@ -662,6 +674,13 @@ class LossPlanTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "unknown ce options"):
             TokenLoss(kind="ce", options={"teacher_l1": True})
+        with self.assertRaisesRegex(ValueError, "Unknown CE/L1 outputs"):
+            TokenLoss("ce_l1").evaluate(
+                hidden,
+                labels,
+                teacher=teacher,
+                requested_outputs={"teacher_l1_grad": False},
+            )
 
     def test_new_statistics_belong_to_the_mathematical_loss(self):
         from specforge.algorithms.objectives.losses import _LOSSES, LossOutput
@@ -1028,3 +1047,138 @@ class LossPlanTest(unittest.TestCase):
                 )
                 torch.testing.assert_close(actual_grad, gradients, rtol=5e-4, atol=3e-5)
                 torch.testing.assert_close(actual.ratios, expected.ratios)
+
+    def test_dflash2_single_pass(self):
+        for stop_grad in (False, True):
+            config, runtime = build_runtime(
+                "DFlash2DraftModel",
+                options={"num_anchors": 3, "selector_stop_gradient": stop_grad},
+            )
+            batch = training_batch(config)
+            expected = None
+            for chunk, checkpoint in ((0, False), (1, True)):
+                with self.subTest(stop_grad=stop_grad, chunk=chunk):
+                    runtime.execution = LossExecution(
+                        chunk_size=chunk, checkpoint=checkpoint, fused=False
+                    )
+                    runtime.zero_grad(set_to_none=True)
+                    torch.manual_seed(41)
+                    eval_calls = []
+                    with (
+                        patch.object(
+                            fused_loss, "ce_l1_loss", wraps=fused_loss.ce_l1_loss
+                        ) as ce_l1_calls,
+                        _spy_evaluate(eval_calls),
+                    ):
+                        actual = runtime(
+                            batch,
+                            step=1,
+                            total_steps=10,
+                            collect_detailed_metrics=False,
+                        )
+                        actual.loss.backward()
+                    self.assertNotIn("candidates", [key for key, _ in eval_calls])
+                    vocab_calls = [
+                        c
+                        for c in ce_l1_calls.call_args_list
+                        if c.args[0].shape[-1] == config.vocab_size
+                    ]
+                    if chunk == 0:
+                        self.assertEqual(len(vocab_calls), 1)
+                    grads = {
+                        n: p.grad.clone()
+                        for n, p in runtime.named_parameters()
+                        if p.grad is not None
+                    }
+                    if expected is None:
+                        expected = (actual.loss.detach(), grads, actual.ratios)
+                    else:
+                        torch.testing.assert_close(
+                            (actual.loss.detach(), grads, actual.ratios), expected
+                        )
+
+    def test_dspine_single_pass(self):
+        for token_kind in ("ce_l1", "ce"):
+            for alignment_ce in (None, torch.tensor(0.5)):
+                with self.subTest(
+                    token_kind=token_kind, alignment_ce=alignment_ce is not None
+                ):
+                    loss_cfg = (
+                        None
+                        if token_kind == "ce_l1"
+                        else {"terms": {"token": {"kind": "ce"}}}
+                    )
+                    config, runtime = build_runtime(
+                        "DSpineDraftModel",
+                        options={"num_anchors": 3},
+                        loss=loss_cfg,
+                    )
+                    batch = training_batch(config)
+                    runtime.execution = LossExecution(
+                        chunk_size=0, checkpoint=False, fused=False
+                    )
+                    runtime.zero_grad(set_to_none=True)
+                    torch.manual_seed(43)
+                    eval_calls = []
+                    with (
+                        patch.object(
+                            fused_loss, "ce_l1_loss", wraps=fused_loss.ce_l1_loss
+                        ) as ce_l1_calls,
+                        _spy_evaluate(eval_calls),
+                    ):
+                        actual = runtime(
+                            batch,
+                            step=1,
+                            total_steps=10,
+                            alignment_ce=alignment_ce,
+                        )
+                        actual.loss.backward()
+                    self.assertNotIn("candidates", [key for key, _ in eval_calls])
+                    vocab_calls = [
+                        c
+                        for c in ce_l1_calls.call_args_list
+                        if c.args[0].shape[-1] == config.vocab_size
+                    ]
+                    self.assertEqual(len(vocab_calls), 1)
+                    if token_kind == "ce":
+                        self.assertIs(vocab_calls[0].kwargs["teacher_l1_grad"], False)
+                    self.assertTrue(torch.isfinite(actual.loss))
+                    for metric in (
+                        "dspine/backbone_ce",
+                        "dspine/backbone_l1",
+                        "dspine/refinement_loss",
+                        "dspine/alignment_loss",
+                        "dspine/candidate_coverage",
+                    ):
+                        self.assertIn(metric, actual.ratios)
+
+    def test_custom_loss_falls_back_to_candidate_evaluation(self):
+        for architecture, extra_kwargs, expected_metric in (
+            ("DFlash2DraftModel", {"collect_detailed_metrics": False}, "kl_loss"),
+            (
+                "DSpineDraftModel",
+                {"alignment_ce": torch.tensor(0.5)},
+                "dspine/backbone_ce",
+            ),
+        ):
+            with self.subTest(architecture=architecture):
+                config, runtime = build_runtime(
+                    architecture,
+                    options={"num_anchors": 3},
+                    loss={"terms": {"token": {"kind": "kl"}}},
+                )
+                batch = training_batch(config)
+                eval_calls = []
+                with _spy_evaluate(eval_calls):
+                    result = runtime(batch, step=1, total_steps=10, **extra_kwargs)
+                    result.loss.backward()
+                candidate_calls = [kw for key, kw in eval_calls if key == "candidates"]
+                self.assertEqual(len(candidate_calls), 1)
+                expected_k = (
+                    config.spec_config.selector_top_k
+                    if architecture == "DFlash2DraftModel"
+                    else runtime.objective.top_k
+                )
+                self.assertEqual(candidate_calls[0]["top_k"], expected_k)
+                self.assertIn(expected_metric, result.ratios)
+                self.assertTrue(torch.isfinite(result.loss))

@@ -1,5 +1,7 @@
 """Joint CE implementation for the Domino block-suffix projection."""
 
+from specforge.losses import fused as fused_loss
+
 from ..projection import DominoSuffixProjection
 from .ce import projection_ce_support
 from .registry import GroupResult, register_implementation
@@ -22,7 +24,12 @@ def _domino_suffix_support(request, group):
         for i in group
     ):
         return "joint CE requires shared supervision weights"
-    return projection_ce_support(request, group)
+    reason = projection_ce_support(request, group)
+    if reason is not None:
+        return reason
+    if not fused_loss.triton_available(p.hidden.device):
+        raise ImportError("fused Domino CE requires Triton")
+    return None
 
 
 @register_implementation(

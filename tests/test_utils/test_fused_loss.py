@@ -16,23 +16,15 @@ loop.
 """
 
 import math
+import sys
+import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from specforge.losses import fused as fused_loss
-
-
-def _triton_available() -> bool:
-    """True only for a real Triton install; a stray ``triton/`` namespace
-    directory on sys.path (no ``jit``, no ``language``) must not count."""
-    try:
-        import triton
-        import triton.language  # noqa: F401
-    except ImportError:
-        return False
-    return hasattr(triton, "jit")
 
 
 def _npu_available() -> bool:
@@ -57,7 +49,7 @@ def _accelerator_device() -> str | None:
 
 DEVICE = _accelerator_device()
 requires_fused = unittest.skipUnless(
-    DEVICE is not None and _triton_available(),
+    DEVICE is not None and fused_loss.triton_available(DEVICE),
     "fused Triton losses require Triton plus a CUDA or Ascend NPU accelerator",
 )
 
@@ -270,6 +262,64 @@ class TestFusedLoss(unittest.TestCase):
             reduction="none",
         ).reshape(1, 8)
         torch.testing.assert_close(ce, ref)
+
+    def test_triton_available_checks_constexpr_and_device_backend(self):
+        with patch.dict(
+            sys.modules,
+            {"triton": None, "triton.language": None, "triton.runtime": None},
+        ):
+            self.assertFalse(fused_loss.triton_available())
+            self.assertFalse(fused_loss.triton_available("cuda"))
+
+        def make_triton(backend=None, *, with_constexpr=True, raise_driver=False):
+            mod = types.ModuleType("triton")
+            mod.jit = lambda fn: fn
+            tl = types.ModuleType("triton.language")
+            if with_constexpr:
+                tl.constexpr = lambda v: v
+            if raise_driver:
+
+                def get_target():
+                    raise RuntimeError("0 active drivers")
+
+            else:
+
+                def get_target():
+                    return SimpleNamespace(backend=backend)
+
+            runtime = types.ModuleType("triton.runtime")
+            runtime.driver = SimpleNamespace(
+                active=SimpleNamespace(get_current_target=get_target)
+            )
+            mod.runtime = runtime
+            return {
+                "triton": mod,
+                "triton.language": tl,
+                "triton.runtime": runtime,
+            }
+
+        with patch.dict(sys.modules, make_triton(with_constexpr=False)):
+            self.assertFalse(fused_loss.triton_available())
+            self.assertFalse(fused_loss.triton_available("cuda"))
+
+        with patch.dict(sys.modules, make_triton(backend="cuda")):
+            self.assertTrue(fused_loss.triton_available())
+            self.assertTrue(fused_loss.triton_available("cuda"))
+            self.assertTrue(fused_loss.triton_available(torch.device("cuda:0")))
+            self.assertFalse(fused_loss.triton_available("npu"))
+            self.assertFalse(fused_loss.triton_available("cpu"))
+
+        with patch.dict(sys.modules, make_triton(backend="hip")):
+            self.assertTrue(fused_loss.triton_available("cuda"))
+            self.assertFalse(fused_loss.triton_available("npu"))
+
+        with patch.dict(sys.modules, make_triton(backend="npu")):
+            self.assertTrue(fused_loss.triton_available("npu"))
+            self.assertFalse(fused_loss.triton_available("cuda"))
+
+        with patch.dict(sys.modules, make_triton(raise_driver=True)):
+            self.assertFalse(fused_loss.triton_available("cuda"))
+            self.assertFalse(fused_loss.triton_available("npu"))
 
 
 if __name__ == "__main__":

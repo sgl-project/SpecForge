@@ -608,10 +608,13 @@ def execute_batch(
         else:
             statistics = []
             device = predictions[0].hidden.device
-            devices = [device.index] if device.type == "cuda" else []
+            devices = [] if device.type == "cpu" else [device.index]
             # This pass collects detached chain probabilities. Restore RNG so the
             # differentiable pass sees the same stochastic projector outputs.
-            with torch.random.fork_rng(devices=devices), torch.no_grad():
+            with (
+                torch.random.fork_rng(devices=devices, device_type=device.type),
+                torch.no_grad(),
+            ):
                 for prediction in predictions:
                     pieces = [
                         chain_statistics(

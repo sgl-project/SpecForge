@@ -11,7 +11,7 @@ import triton.language as tl
 MAX_FUSED_TOP_K = 64
 
 
-def _statistics(logits, targets, top_k=0):
+def _statistics(logits, targets, top_k=0, *, layout=None):
     rows = logits.shape[0]
     lse = torch.empty(rows, device=logits.device, dtype=torch.float32)
     target = torch.empty_like(lse)
@@ -21,7 +21,9 @@ def _statistics(logits, targets, top_k=0):
     topv = torch.empty(rows, fused_k, device=logits.device, dtype=torch.float32)
     topi = torch.empty(rows, fused_k, device=logits.device, dtype=torch.long)
     if rows:
-        _launch_stats(logits, targets, lse, target, ids, topv, topi, top1)
+        _launch_stats(
+            logits, targets, lse, target, ids, topv, topi, top1, layout=layout
+        )
     if fused_k != top_k:
         topv, topi = torch.topk(logits, top_k, dim=-1)
         topv = topv.float()
@@ -30,13 +32,23 @@ def _statistics(logits, targets, top_k=0):
 
 class _FusedCEL1Loss(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, targets, teacher, top_k):
-        lse, target, ids, top1, topv, topi = _statistics(logits, targets, top_k)
-        teacher_lse = teacher_ids = teacher_top1 = l1_dot = l1 = None
+    def forward(ctx, logits, targets, teacher, top_k, teacher_l1_grad=True):
         rows, vocab = logits.shape
+        fused_k = top_k if top_k <= MAX_FUSED_TOP_K else 0
+        # Share the exact tile/split/warp reduction between draft and teacher
+        # logits when top-k narrows draft tiles so identical inputs give 0 L1.
+        layout = (
+            _stats_settings(rows, vocab, fused_k)
+            if rows and teacher is not None and fused_k > 0
+            else None
+        )
+        lse, target, ids, top1, topv, topi = _statistics(
+            logits, targets, top_k, layout=layout
+        )
+        teacher_lse = teacher_ids = teacher_top1 = l1_dot = l1 = None
         if teacher is not None:
             teacher_lse, _, teacher_ids, teacher_top1, _, _ = _statistics(
-                teacher, targets
+                teacher, targets, layout=layout
             )
             tiles = triton.cdiv(vocab, 4096)
             partial = torch.empty(
@@ -55,18 +67,25 @@ class _FusedCEL1Loss(torch.autograd.Function):
                     BLOCK=4096,
                 )
             l1, l1_dot = partial.sum(-1).unbind(0)
-        ctx.save_for_backward(logits, targets, lse, teacher, teacher_lse, l1_dot, topi)
+        if teacher_l1_grad:
+            ctx.save_for_backward(
+                logits, targets, lse, teacher, teacher_lse, l1_dot, topi
+            )
+        else:
+            ctx.save_for_backward(logits, targets, lse, None, None, None, topi)
         ctx.set_materialize_grads(False)
         diagnostics = [topi, ids, top1]
         if teacher is not None:
             diagnostics.extend([teacher_ids, teacher_top1])
+            if not teacher_l1_grad:
+                diagnostics.append(l1)
         ctx.mark_non_differentiable(*diagnostics)
         return lse - target, l1, topv, topi, ids, top1, teacher_ids, teacher_top1
 
     @staticmethod
     def backward(ctx, grad_ce, grad_l1, grad_topv, *_diagnostics):
         if not ctx.needs_input_grad[0]:
-            return None, None, None, None
+            return None, None, None, None, None
         logits, targets, lse, teacher, teacher_lse, l1_dot, topi = ctx.saved_tensors
         grad_ce = torch.zeros_like(lse) if grad_ce is None else grad_ce.contiguous()
         has_l1 = teacher is not None and grad_l1 is not None
@@ -108,7 +127,7 @@ class _FusedCEL1Loss(torch.autograd.Function):
                     BLOCK=triton.next_power_of_2(topi.shape[-1]),
                     HAS_L1=has_l1,
                 )
-        return grad_logits, None, None, None
+        return grad_logits, None, None, None, None
 
 
 @triton.jit
@@ -304,13 +323,17 @@ def _launch_stats(
     topk_values,
     topk_ids,
     top1=None,
+    *,
+    layout=None,
 ):
     """Write each row's FP32 log-sum-exp, target logit, argmax, and top-k."""
     num_rows, vocab_size = logits.shape
     if top1 is None:
         top1 = torch.empty_like(lse)
     top_k = topk_ids.shape[-1]
-    vocab_block, num_splits, num_warps = _stats_settings(num_rows, vocab_size, top_k)
+    vocab_block, num_splits, num_warps = layout or _stats_settings(
+        num_rows, vocab_size, top_k
+    )
     split_size = triton.cdiv(triton.cdiv(vocab_size, num_splits), vocab_block)
     split_size *= vocab_block
     num_splits = triton.cdiv(vocab_size, split_size)
@@ -424,7 +447,10 @@ def _logits_partial_stats_kernel(
         )
         argmax = tl.where(block_max > row_max, block_argmax + offset, argmax)
         new_max = tl.maximum(row_max, block_max)
-        exp_sum = exp_sum * tl.exp(row_max - new_max) + tl.sum(tl.exp(block - new_max))
+        # Guard against exp(-inf - -inf) = NaN when leading tiles are all -inf.
+        scale = tl.where(row_max != float("-inf"), tl.exp(row_max - new_max), 0.0)
+        tile_exp = tl.where(block != float("-inf"), tl.exp(block - new_max), 0.0)
+        exp_sum = exp_sum * scale + tl.sum(tile_exp)
         row_max = new_max
 
         if TOP_K > 0:
@@ -511,7 +537,11 @@ def _logits_combine_stats_kernel(
     )
     row_max = tl.max(partial_max, axis=0)
     exp_sum = tl.sum(
-        tl.where(split_mask, partial_exp_sum * tl.exp(partial_max - row_max), 0.0)
+        tl.where(
+            split_mask & (partial_max != float("-inf")),
+            partial_exp_sum * tl.exp(partial_max - row_max),
+            0.0,
+        )
     )
     first_split = tl.min(
         tl.where(split_mask & (partial_max == row_max), splits, BLOCK_SPLITS),

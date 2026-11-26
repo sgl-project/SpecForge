@@ -9,13 +9,6 @@ import torch.nn.functional as F
 from specforge.losses import fused as fused_loss
 from specforge.losses.fused import fused_ce_l1_loss
 
-try:
-    import triton  # noqa: F401
-
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
 
 class CEL1InterfaceTest(unittest.TestCase):
     def test_eager_uses_explicit_labels_and_stops_teacher_gradients(self):
@@ -47,9 +40,39 @@ class CEL1InterfaceTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "target_ids"):
                     fused_loss.fused_ce_l1_loss(logits, labels)
 
+    def test_eager_detached_teacher_l1_saves_fewer_tensors(self):
+        logits = torch.randn(2, 3, 17, requires_grad=True)
+        teacher = torch.randn(2, 3, 17)
+        labels = torch.randint(0, 17, (2, 3))
+
+        def run(teacher_l1_grad):
+            saved = []
+            with torch.autograd.graph.saved_tensors_hooks(
+                lambda t: (saved.append(t), t)[1], lambda t: t
+            ):
+                out = fused_loss.ce_l1_loss(
+                    logits,
+                    labels,
+                    teacher_logits=teacher,
+                    top_k=4,
+                    teacher_l1_grad=teacher_l1_grad,
+                )
+            return out, len(saved)
+
+        grad_out, grad_saved = run(True)
+        detached_out, detached_saved = run(False)
+        self.assertTrue(grad_out.teacher_l1.requires_grad)
+        self.assertFalse(detached_out.teacher_l1.requires_grad)
+        self.assertTrue(detached_out.cross_entropy.requires_grad)
+        torch.testing.assert_close(detached_out.teacher_l1, grad_out.teacher_l1)
+        self.assertLess(detached_saved, grad_saved)
+        detached_out.cross_entropy.sum().backward()
+        self.assertIsNotNone(logits.grad)
+
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and TRITON_AVAILABLE, "CUDA/Triton required"
+    torch.cuda.is_available() and fused_loss.triton_available("cuda"),
+    "CUDA/Triton required",
 )
 class LogitsLossTest(unittest.TestCase):
     def test_weighted_ce_and_teacher_l1(self):
@@ -147,6 +170,71 @@ class LogitsLossTest(unittest.TestCase):
         torch.testing.assert_close(
             terms.teacher_l1, torch.zeros_like(terms.teacher_l1), rtol=0, atol=0
         )
+
+    def test_leading_neg_inf_tile(self):
+        logits = torch.randn(1, 1024, device="cuda", dtype=torch.float32)
+        logits[:, :512] = float("-inf")
+        logits.requires_grad_(True)
+        targets = torch.tensor([600], device="cuda", dtype=torch.long)
+        terms = fused_ce_l1_loss(logits, targets, top_k=16)
+        expected_ce = F.cross_entropy(logits.detach(), targets, reduction="none")
+        self.assertTrue(torch.isfinite(terms.cross_entropy).all())
+        torch.testing.assert_close(terms.cross_entropy, expected_ce)
+        terms.cross_entropy.sum().backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_identical_logits_with_topk_have_zero_l1(self):
+        identical = torch.full((1, 8192), -1000.0, device="cuda", dtype=torch.float32)
+        identical[:, 0] = 0.0
+        identical[:, 512::512] = -17.5
+        identical.requires_grad_(True)
+        terms = fused_ce_l1_loss(
+            identical,
+            torch.zeros(1, device="cuda", dtype=torch.long),
+            teacher_logits=identical.detach().clone(),
+            top_k=16,
+        )
+        torch.testing.assert_close(
+            terms.teacher_l1, torch.zeros_like(terms.teacher_l1), rtol=0, atol=0
+        )
+        terms.teacher_l1.sum().backward()
+        torch.testing.assert_close(
+            identical.grad, torch.zeros_like(identical.grad), rtol=0, atol=0
+        )
+
+    def test_detached_teacher_l1_does_not_save_teacher_storage(self):
+        draft = torch.randn(
+            2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        teacher = torch.randn(2, 1024, device="cuda", dtype=torch.bfloat16)
+        targets = torch.zeros(2, device="cuda", dtype=torch.long)
+        teacher_ptr = teacher.untyped_storage().data_ptr()
+
+        def run(teacher_l1_grad):
+            saved_ptrs = set()
+            with torch.autograd.graph.saved_tensors_hooks(
+                lambda t: (saved_ptrs.add(t.untyped_storage().data_ptr()), t)[1],
+                lambda t: t,
+            ):
+                out = fused_ce_l1_loss(
+                    draft,
+                    targets,
+                    teacher_logits=teacher,
+                    top_k=16,
+                    teacher_l1_grad=teacher_l1_grad,
+                )
+            return out, saved_ptrs
+
+        grad_out, grad_ptrs = run(True)
+        self.assertTrue(grad_out.teacher_l1.requires_grad)
+        self.assertIn(teacher_ptr, grad_ptrs)
+
+        detached_out, detached_ptrs = run(False)
+        self.assertFalse(detached_out.teacher_l1.requires_grad)
+        self.assertNotIn(teacher_ptr, detached_ptrs)
+        torch.testing.assert_close(detached_out.teacher_l1, grad_out.teacher_l1)
+        detached_out.cross_entropy.sum().backward()
+        self.assertIsNotNone(draft.grad)
 
 
 if __name__ == "__main__":

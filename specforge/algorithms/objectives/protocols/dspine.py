@@ -171,19 +171,39 @@ class DSpineObjective:
         beta = self.alignment_scale(step, total_steps)
 
         def compute(calc):
-            calc.run((0,))
             predictions, labels, teacher = calc.predictions, calc.labels, calc.teacher
-            terms = calc.evaluate(
-                "candidates",
-                TokenLoss(kind="ce"),
-                calc.outputs()["logits"],
-                labels,
-                teacher=teacher,
-                return_teacher_l1=True,
-                top_k=self.top_k,
-                term_index=0,
-            )
-            ids = terms.statistics["topk_ids"]
+            kind = calc.request.terms[0].loss.kind
+            if kind == "ce_l1":
+                calc.run((0,), top_k=self.top_k)
+                stats = calc.statistics[0]
+                ids, teacher_l1 = stats["topk_ids"], stats["teacher_l1"]
+                ce_num = (stats["cross_entropy"] * calc.weights).sum()
+            elif kind == "ce":
+                calc.run(
+                    (0,),
+                    top_k=self.top_k,
+                    return_teacher_l1=True,
+                    teacher_l1_grad=False,
+                )
+                stats = calc.statistics[0]
+                ids, teacher_l1 = stats["topk_ids"], stats["teacher_l1"]
+                ce_num = calc.numerators[0]
+            else:
+                calc.run((0,))
+                terms = calc.evaluate(
+                    "candidates",
+                    TokenLoss(kind="ce"),
+                    calc.outputs()["logits"],
+                    labels,
+                    teacher=teacher,
+                    return_teacher_l1=True,
+                    teacher_l1_grad=False,
+                    top_k=self.top_k,
+                    term_index=0,
+                )
+                ids = terms.statistics["topk_ids"]
+                teacher_l1 = terms.statistics["teacher_l1"]
+                ce_num = (terms.values * calc.weights).sum()
             refined = model.refine(
                 predictions.context_inputs["pre_injection"],
                 predictions.context_inputs["predecessors"],
@@ -213,7 +233,6 @@ class DSpineObjective:
                 ).values
                 / model.backbone.num_layers
             )
-            ce_num = (terms.values * calc.weights).sum()
             denominator = calc.weights.sum().detach()
             coefficient = alignment_ce
             if coefficient is None:
@@ -230,7 +249,7 @@ class DSpineObjective:
             calc.add(2, coefficient.detach() * alignment)
             calc.ratios["dspine/backbone_ce"] = (ce_num.detach(), denominator)
             for name, values in (
-                ("backbone_l1", terms.statistics["teacher_l1"]),
+                ("backbone_l1", teacher_l1),
                 ("alignment_loss", alignment),
             ):
                 calc.ratios[f"dspine/{name}"] = (

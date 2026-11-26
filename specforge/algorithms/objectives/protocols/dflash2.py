@@ -116,19 +116,26 @@ class DFlash2Objective:
         scale = self.selector_scale(step, total_steps)
 
         def compute(calc):
-            calc.run((0,))
-            report_token_loss(calc)
+            top_k = model.config.draft.spec_config.selector_top_k
             predictions, labels = calc.predictions, calc.labels
-            terms = calc.evaluate(
-                "candidates",
-                TokenLoss(kind="ce"),
-                calc.outputs()["logits"],
-                labels,
-                top_k=model.config.draft.spec_config.selector_top_k,
-                term_index=0,
-            )
-            ids = terms.statistics["topk_ids"]
-            unary, hidden = terms.statistics["topk_values"], predictions.hidden
+            if calc.request.terms[0].loss.kind in ("ce", "ce_l1"):
+                calc.run((0,), top_k=top_k)
+                stats = calc.statistics[0]
+                ids, unary = stats["topk_ids"], stats["topk_values"]
+            else:
+                calc.run((0,))
+                terms = calc.evaluate(
+                    "candidates",
+                    TokenLoss(kind="ce"),
+                    calc.outputs()["logits"],
+                    labels,
+                    top_k=top_k,
+                    term_index=0,
+                )
+                ids = terms.statistics["topk_ids"]
+                unary = terms.statistics["topk_values"]
+            report_token_loss(calc)
+            hidden = predictions.hidden
             if self.selector_stop_gradient:
                 unary, hidden = unary.detach(), hidden.detach()
             scores = model.candidate_selector.score_candidates(
