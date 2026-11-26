@@ -265,10 +265,6 @@ def build_param_groups(
 def _build_adamw(
     param_groups: List[Dict[str, Any]], spec: OptimizerSpec
 ) -> torch.optim.Optimizer:
-    if spec.extra:
-        raise ValueError(
-            f"adamw optimizer accepts no extra options, got {sorted(spec.extra)}"
-        )
     params = [p for group in param_groups for p in group["params"]]
     # One fused kernel updates every CUDA parameter; CPU parameters keep the
     # default AdamW implementation.
@@ -414,16 +410,12 @@ def build_optimizer(
     param_ndims: Optional[Mapping[int, int]] = None,
 ) -> torch.optim.Optimizer:
     """Build an optimizer from the shared registry over ``target``."""
-    builder = _OPTIMIZERS.get(spec.kind)
-    if builder is None:
-        raise ValueError(
-            f"unsupported optimizer={spec.kind!r}; expected one of {sorted(_OPTIMIZERS)}"
-        )
+    validate_optimizer_spec(spec)
     named_params = (
         target.named_parameters() if isinstance(target, nn.Module) else target
     )
     param_groups = build_param_groups(named_params, spec, param_ndims=param_ndims)
-    return builder(param_groups, spec)
+    return _OPTIMIZERS[spec.kind](param_groups, spec)
 
 
 # ---------------------------------------------------------------------------

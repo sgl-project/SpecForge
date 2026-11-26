@@ -219,24 +219,9 @@ def validate_scheduler_spec(
         _validate_wsd_options(spec, total_steps=total)
 
 
-def _validate_curve_spec(spec: SchedulerSpec) -> Tuple[int, int]:
-    if spec.total_steps is None or spec.total_steps <= 0:
-        raise ValueError(f"total_steps must be positive, got {spec.total_steps}")
-    if not 0.0 <= spec.warmup_ratio <= 1.0:
-        raise ValueError(f"warmup_ratio must be in [0, 1], got {spec.warmup_ratio}")
-    if not 0.0 <= spec.min_lr_ratio <= 1.0:
-        raise ValueError(f"min_lr_ratio must be in [0, 1], got {spec.min_lr_ratio}")
-    warmup = warmup_steps_from_ratio(spec.warmup_ratio, spec.total_steps)
-    if not 0 <= warmup < spec.total_steps:
-        raise ValueError(
-            "warmup_steps must be in [0, total_steps), got "
-            f"{warmup} for total_steps={spec.total_steps}"
-        )
-    return spec.total_steps, warmup
-
-
 def _cosine_factor(step: int, spec: SchedulerSpec) -> float:
-    total, warmup = _validate_curve_spec(spec)
+    total = spec.total_steps
+    warmup = warmup_steps_from_ratio(spec.warmup_ratio, total)
     if warmup > 0 and step < warmup:
         return (step + 1) / warmup
     decay_steps = max(1, total - warmup)
@@ -246,7 +231,8 @@ def _cosine_factor(step: int, spec: SchedulerSpec) -> float:
 
 
 def _linear_factor(step: int, spec: SchedulerSpec) -> float:
-    total, warmup = _validate_curve_spec(spec)
+    total = spec.total_steps
+    warmup = warmup_steps_from_ratio(spec.warmup_ratio, total)
     if warmup > 0 and step < warmup:
         return (step + 1) / warmup
     decay_steps = max(1, total - warmup)
@@ -261,34 +247,21 @@ def _wsd_factor(step: int, spec: SchedulerSpec) -> float:
         decay_ratio: Fraction of ``total_steps`` spent decaying (default 0.1).
         decay_style: ``"linear"`` (default) or ``"cosine"``.
     """
-    total, warmup = _validate_curve_spec(spec)
-    unknown = sorted(set(spec.extra) - {"decay_ratio", "decay_style"})
-    if unknown:
-        raise ValueError(f"unknown wsd scheduler options: {unknown}")
-    decay_ratio = float(spec.extra.get("decay_ratio", 0.1))
-    if not 0.0 <= decay_ratio <= 1.0:
-        raise ValueError(f"wsd decay_ratio must be in [0, 1], got {decay_ratio}")
+    total = spec.total_steps
+    warmup = warmup_steps_from_ratio(spec.warmup_ratio, total)
+    decay_steps = int(float(spec.extra.get("decay_ratio", 0.1)) * total)
     decay_style = spec.extra.get("decay_style", "linear")
-    if decay_style not in ("linear", "cosine"):
-        raise ValueError(
-            f"wsd decay_style must be 'linear' or 'cosine', got {decay_style!r}"
-        )
-    decay_steps = int(decay_ratio * total)
-    if warmup + decay_steps > total:
-        raise ValueError(
-            f"wsd warmup ({warmup}) + decay ({decay_steps}) exceeds "
-            f"total_steps ({total})"
-        )
     if warmup > 0 and step < warmup:
         return (step + 1) / warmup
     stable_end = total - decay_steps
     if decay_steps <= 0 or step < stable_end:
         return 1.0
     progress = min(1.0, max(0.0, (step - stable_end) / decay_steps))
-    if decay_style == "cosine":
-        tail = 0.5 * (1.0 + math.cos(math.pi * progress))
-    else:
-        tail = 1.0 - progress
+    tail = (
+        0.5 * (1.0 + math.cos(math.pi * progress))
+        if decay_style == "cosine"
+        else 1.0 - progress
+    )
     return spec.min_lr_ratio + (1.0 - spec.min_lr_ratio) * tail
 
 
@@ -331,33 +304,16 @@ class FunctionalLRScheduler(_LRScheduler):
 
 
 def _build_cosine(optimizer, spec: SchedulerSpec) -> _LRScheduler:
-    if spec.extra:
-        raise ValueError(
-            f"cosine scheduler accepts no extra options, got {sorted(spec.extra)}"
-        )
-    if spec.total_steps is None or spec.total_steps <= 0:
-        raise ValueError(f"total_steps must be positive, got {spec.total_steps}")
     if spec.min_lr_ratio == 0.0:
         return CosineAnnealingWarmupLR(
             optimizer,
             total_steps=spec.total_steps,
             warmup_steps=warmup_steps_from_ratio(spec.warmup_ratio, spec.total_steps),
         )
-    _validate_curve_spec(spec)
     return FunctionalLRScheduler(optimizer, spec, _cosine_factor)
 
 
 def _build_constant(optimizer, spec: SchedulerSpec) -> _LRScheduler:
-    if spec.extra:
-        raise ValueError(
-            f"constant scheduler accepts no extra options, got {sorted(spec.extra)}"
-        )
-    if spec.min_lr_ratio != 0.0:
-        raise ValueError(
-            f"constant scheduler does not use min_lr_ratio={spec.min_lr_ratio}"
-        )
-    if spec.total_steps is None or spec.total_steps <= 0:
-        raise ValueError(f"total_steps must be positive, got {spec.total_steps}")
     return ConstantWarmupLR(
         optimizer,
         total_steps=spec.total_steps,
@@ -366,17 +322,10 @@ def _build_constant(optimizer, spec: SchedulerSpec) -> _LRScheduler:
 
 
 def _build_linear(optimizer, spec: SchedulerSpec) -> _LRScheduler:
-    if spec.extra:
-        raise ValueError(
-            f"linear scheduler accepts no extra options, got {sorted(spec.extra)}"
-        )
-    _validate_curve_spec(spec)
     return FunctionalLRScheduler(optimizer, spec, _linear_factor)
 
 
 def _build_wsd(optimizer, spec: SchedulerSpec) -> _LRScheduler:
-    # Eagerly validate options at construction so bad configs fail fast.
-    _wsd_factor(0, spec)
     return FunctionalLRScheduler(optimizer, spec, _wsd_factor)
 
 
@@ -411,7 +360,6 @@ def register_lr_curve(
     """Register a pure scalar LR curve ``curve(step, spec) -> multiplier``."""
 
     def _build(optimizer, spec: SchedulerSpec) -> _LRScheduler:
-        _validate_curve_spec(spec)
         return FunctionalLRScheduler(optimizer, spec, curve)
 
     register_lr_scheduler(name, _build, override=override)
@@ -424,13 +372,8 @@ def registered_lr_schedulers() -> Tuple[str, ...]:
 
 def build_lr_scheduler(optimizer, spec: SchedulerSpec) -> _LRScheduler:
     """Build the learning-rate scheduler described by ``spec``."""
-    builder = _LR_SCHEDULERS.get(spec.kind)
-    if builder is None:
-        raise ValueError(
-            f"unsupported lr_scheduler={spec.kind!r}; "
-            f"expected one of {sorted(_LR_SCHEDULERS)}"
-        )
-    return builder(optimizer, spec)
+    validate_scheduler_spec(spec, require_total_steps=True)
+    return _LR_SCHEDULERS[spec.kind](optimizer, spec)
 
 
 __all__ = [
