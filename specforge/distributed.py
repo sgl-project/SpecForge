@@ -1,4 +1,5 @@
 import os
+import threading
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -16,6 +17,11 @@ _DRAFT_DP_GROUP = None
 _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
+
+# Upper bound on any single process-group teardown. ``abort()`` on an NCCL
+# communicator blocks while peers are mid-collective; a failure path must not
+# inherit that wait (see destroy_distributed).
+_TEARDOWN_TIMEOUT_S = float(os.environ.get("SPECFORGE_TEARDOWN_TIMEOUT_S", "30"))
 
 _DISTRIBUTED_BACKENDS = {
     "cpu": "gloo",
@@ -211,16 +217,43 @@ def init_distributed(
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
 
 
-def destroy_distributed(*, abort: bool = False):
+def _run_teardown_bounded(fn, timeout: Optional[float] = None) -> bool:
+    """Run ``fn`` on a daemon thread; return False if it is still blocked.
+
+    Only used while tearing down after a failure, so a leaked thread is
+    preferable to a hung job: the process is about to exit anyway.
+    """
+    timeout = _TEARDOWN_TIMEOUT_S if timeout is None else timeout
+    worker = threading.Thread(target=fn, name="teardown", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return not worker.is_alive()
+
+
+def destroy_distributed(*, abort: bool = False) -> bool:
     """Tear down every cached process group and device mesh.
 
     ``abort=True`` (rank-local failure path) aborts communicators instead of the
     collective destroy, so this rank exits with its traceback instead of hanging
     behind peers stuck in a collective; torchrun then terminates the peers.
+
+    Every teardown call is bounded by ``_TEARDOWN_TIMEOUT_S``. ``abort()`` on an
+    NCCL communicator blocks while other ranks are mid-collective (observed in
+    production: a rank whose training raised sat in abort for 30+ min while its
+    peers spun in all-gather, so the job never surfaced the original traceback
+    and never exited). A dead teardown must not outlive the failure it is
+    cleaning up, so the group is torn down on a daemon thread and we move on
+    once the timeout expires.
+
+    Returns ``False`` when some group could not be torn down in time. The
+    backend state is then still live, and normal interpreter shutdown can block
+    again on the same call, so a failure path should exit the process directly
+    instead of returning to Python.
     """
     global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
     global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
+    clean = True
     # Teardown must never crash the process. Several handles can alias the same
     # underlying group (e.g. DP and draft-DP when there is no sequence
     # parallelism), and degenerate single-rank SP groups (created when
@@ -241,16 +274,28 @@ def destroy_distributed(*, abort: bool = False):
         if group is None or id(group) in seen:
             continue
         seen.add(id(group))
-        try:
-            abort_group = getattr(group, "abort", None)
-            if abort and callable(abort_group):
-                abort_group()
-            else:
-                dist.destroy_process_group(group)
-        except Exception:
+        abort_group = getattr(group, "abort", None)
+
+        def _teardown(g=group, a=abort and callable(abort_group)):
             # Group not registered (e.g. degenerate single-rank SP group) or
-            # already destroyed.
-            pass
+            # already destroyed — teardown must never crash the process.
+            try:
+                if a:
+                    g.abort()
+                else:
+                    dist.destroy_process_group(g)
+            except Exception:
+                pass
+
+        if not _run_teardown_bounded(_teardown):
+            # The thread is still blocked inside the backend. Leaving it as a
+            # daemon lets the process exit; continuing would hang the job on a
+            # teardown that can never complete.
+            clean = False
+            print_with_rank(
+                f"destroy_distributed: group teardown exceeded "
+                f"{_TEARDOWN_TIMEOUT_S}s, abandoning it"
+            )
 
     # Process-group and DeviceMesh objects are invalid after teardown. Keeping
     # them reachable makes a later single-process load look initialized while
@@ -264,6 +309,7 @@ def destroy_distributed(*, abort: bool = False):
     _DRAFT_SP_GROUP = None
     _SP_ULYSSES_GROUP = None
     _SP_RING_GROUP = None
+    return clean
 
 
 def shard_tensor(
