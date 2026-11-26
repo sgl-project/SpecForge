@@ -125,7 +125,7 @@ class PrecisionSpec:
     artifact_dtype: torch.dtype
     #: What floating-point buffers are cast to while wrapped; None leaves
     #: buffers in the dtype they were built in (DDP / unwrapped).
-    buffer_dtype: Optional[torch.dtype] = None
+    buffer_dtype: Optional[torch.dtype]
 
     @classmethod
     def resolve(
