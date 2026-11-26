@@ -70,8 +70,8 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
 
-            def prepare_model(self, model, *, optimizer_target, frozen, blocks):
-                cap["prepare_model"] = (model, optimizer_target, frozen, blocks)
+            def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
+                cap["prepare_model"] = (model, optimizer_target, frozen_modules, blocks)
                 return "WRAPPED"
 
         class FakeRunner:
@@ -115,7 +115,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
             def ack_train_refs(self, tid, ids, *, global_step, optimizer_durable):
                 dfc_calls.append(("ack", tid, ids, global_step, optimizer_durable))
 
-        model = SimpleNamespace(draft_model="DRAFT", frozen=("TABLE",))
+        model = SimpleNamespace(draft_model="DRAFT", frozen_modules=("TABLE",))
         dfc = FakeDataflowController()
 
         with mock.patch.multiple(

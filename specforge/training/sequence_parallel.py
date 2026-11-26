@@ -43,6 +43,11 @@ class SequenceParallel:
         if missing:
             raise ValueError(f"sequence parallelism without its {', '.join(missing)}")
 
+    @property
+    def size(self) -> int:
+        """Number of ranks one sequence is split over."""
+        return self.sequence_group.size()
+
     def reduce_statistics(self, accepted, count, denominator):
         """Sum detached loss statistics over the ranks of one sequence."""
         return reduce_statistics(
