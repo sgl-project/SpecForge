@@ -12,6 +12,7 @@ from specforge.modeling import build_draft_model
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import StepContext
+from specforge.training.program import program_spec
 from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objectives import dflash2_config, training_batch
 from tests.test_runtime._fixtures import FakeProgram, fake_spec
@@ -23,9 +24,16 @@ def main():
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         torch.manual_seed(7)
-        config = dflash2_config()
+        config = dflash2_config(bound=True)
         model = build_draft_model(config, device=device)
-        runtime = build_objective_model(model, options={"num_anchors": 2})
+        tables = [model.get_submodule(name) for name in config.target_bindings]
+        for table in tables:
+            table.load_target_weight(
+                torch.randn(config.vocab_size, config.hidden_size, device=device)
+            )
+        runtime = build_objective_model(
+            model, options={"num_anchors": 2}, frozen_modules=tables
+        )
         batch = training_batch(config, device)
         torch.manual_seed(19)
         with torch.no_grad():
@@ -33,7 +41,16 @@ def main():
         backend = FSDPTrainingBackend(
             ParallelConfig(world_size=2, param_dtype=torch.float32)
         )
-        wrapped = backend.prepare_model(runtime, optimizer_target=model)
+        whole = [p.numel() for table in tables for p in table.parameters()]
+        wrapped = backend.prepare_model(
+            runtime,
+            optimizer_target=model,
+            frozen_modules=runtime.frozen_modules,
+            blocks=program_spec(runtime).partition.blocks,
+        )
+        # The bound tables stay whole on each rank; outside a forward a sharded
+        # parameter would hold its shard.
+        assert [p.numel() for table in tables for p in table.parameters()] == whole
         torch.manual_seed(19)
         result = wrapped(batch, step=0, total_steps=10)
         torch.testing.assert_close(result.loss, reference)

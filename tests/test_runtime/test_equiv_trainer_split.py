@@ -13,6 +13,7 @@ import unittest
 
 import torch
 
+from specforge.training.program import program_spec
 from tests.test_runtime import _fixtures as fx
 
 CUDA = torch.cuda.is_available()
@@ -84,6 +85,8 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     runner_model,
                     wrap=True,
                     optimizer_target=runner_model.draft_model,
+                    frozen_modules=runner_model.frozen_modules,
+                    blocks=program_spec(runner_model).partition.blocks,
                 )
                 runner = fx.build_runner(wrapped, backend)
                 batch = next(

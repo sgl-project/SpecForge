@@ -175,7 +175,33 @@ class TrainingBackend(abc.ABC):
         return contextlib.nullcontext()
 
     @abc.abstractmethod
-    def prepare_model(self, model: nn.Module) -> nn.Module: ...
+    def prepare_model(
+        self,
+        model: nn.Module,
+        *,
+        wrap: bool = True,
+        optimizer_target: Optional[nn.Module] = None,
+        frozen_modules: Tuple[nn.Module, ...] = (),
+        blocks: Tuple[str, ...] = (),
+    ) -> nn.Module:
+        """Register the program and wrap it for data-parallel training.
+
+        Args:
+            model: The program.
+            wrap: Whether to wrap it for data-parallel training.
+            optimizer_target: The module whose parameters the optimizer takes;
+                the wrapped module when omitted.
+            frozen_modules: Frozen modules of ``model`` that stay replicated.
+                They are target tables used only inside the loss: sharding them
+                would all-gather them before every optimizer window without
+                saving optimizer memory.
+            blocks: Class names of the modules a sharding backend wraps as one
+                unit each, which overlaps their all-gather and reduce-scatter
+                with the decoder's compute. Empty: one root unit.
+
+        Returns:
+            The module the runner calls.
+        """
 
     @abc.abstractmethod
     def backward(self, loss: torch.Tensor, *, is_boundary: bool = True) -> None: ...
@@ -231,46 +257,29 @@ class FSDPTrainingBackend(TrainingBackend):
         """Whether every rank owns the same complete optimizer state."""
         return self._wrapper_kind == "ddp"
 
-    @staticmethod
-    def _frozen_target_modules(model: nn.Module) -> tuple[nn.Module, ...]:
-        """Return frozen target tables that should remain replicated.
-
-        DFlash-family wrappers carry the target embedding and LM head only for
-        inference inside the loss.  Sharding those frozen tables makes FSDP
-        all-gather them before every optimizer window without saving optimizer
-        memory, which is the wrong trade-off for the current trainer recipes.
-        """
-        modules = list(getattr(model, "frozen_target_modules", ()))
-        if any(
-            parameter.requires_grad
-            for module in modules
-            for parameter in module.parameters()
-        ):
-            raise ValueError(
-                "frozen_target_modules must contain only frozen parameters"
-            )
-        for name in ("lm_head", "embed_tokens"):
-            module = getattr(model, name, None)
-            if not isinstance(module, nn.Module):
-                continue
-            parameters = tuple(module.parameters())
-            if parameters and not any(
-                parameter.requires_grad for parameter in parameters
-            ):
-                modules.append(module)
-        return tuple(modules)
-
     def prepare_model(
         self,
         model: nn.Module,
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        frozen_modules: Tuple[nn.Module, ...] = (),
+        blocks: Tuple[str, ...] = (),
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
+
+        Raises:
+            ValueError: A module in ``frozen_modules`` holds a trainable
+                parameter, or ``blocks`` names no module class of ``model``.
         """
+        if any(
+            parameter.requires_grad
+            for module in frozen_modules
+            for parameter in module.parameters()
+        ):
+            raise ValueError("frozen modules must contain only frozen parameters")
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -279,21 +288,19 @@ class FSDPTrainingBackend(TrainingBackend):
             import functools
 
             pc = self.parallel_config
-            ignored_frozen_modules = self._frozen_target_modules(model)
-            # DFlash-family models expose their transformer block class through
-            # ``_no_split_modules``.  Preserve the legacy per-block FSDP policy:
-            # it overlaps all-gather/reduce-scatter with decoder compute and is
-            # required for the memory envelope of the larger recipes.  EAGLE
-            # models do not advertise block classes and retain a single root
-            # FSDP unit.
-            block_names = set(
-                getattr(optimizer_target, "_no_split_modules", None) or ()
-            )
             block_classes = {
                 type(module)
                 for module in model.modules()
-                if type(module).__name__ in block_names
+                if type(module).__name__ in blocks
             }
+            # A draft class may name a block only some of its models hold (a
+            # one-layer P-EAGLE has the first stage and no decoder layer), so
+            # a name without a module is not an error. Names that match
+            # nothing are: the model would train as one root unit.
+            if blocks and not block_classes:
+                raise ValueError(
+                    f"blocks {sorted(blocks)} name no module class of the model"
+                )
             if pc.sharding_strategy == "NO_SHARD":
                 # PyTorch deprecated FSDP's NO_SHARD mode in favor of DDP.
                 # DDP gives this small draft model replicated-param execution
@@ -336,8 +343,8 @@ class FSDPTrainingBackend(TrainingBackend):
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
                 )
-                if ignored_frozen_modules:
-                    fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
+                if frozen_modules:
+                    fsdp_kwargs["ignored_modules"] = frozen_modules
                 if block_classes:
                     fsdp_kwargs.update(
                         auto_wrap_policy=functools.partial(
@@ -352,10 +359,10 @@ class FSDPTrainingBackend(TrainingBackend):
                 self._wrapper_kind = "fsdp"
             self.module = model
             self._wrapped = True
-            self.auto_wrap_block_classes = (
-                block_classes if self._wrapper_kind == "fsdp" else set()
-            )
-            self.ignored_frozen_modules = ignored_frozen_modules
+            # What the sharding wrapper was given; DDP takes neither.
+            sharded = self._wrapper_kind == "fsdp"
+            self.auto_wrap_block_classes = block_classes if sharded else set()
+            self.ignored_frozen_modules = frozen_modules if sharded else ()
         if self._optimizer_factory is not None:
             target = optimizer_target if optimizer_target is not None else self.module
             self.optimizer = self._optimizer_factory(target)

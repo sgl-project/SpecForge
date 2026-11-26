@@ -54,6 +54,7 @@ class ObjectiveModel(nn.Module):
         weighting=None,
         frozen_parameters=(),
         execution=None,
+        frozen_modules=(),
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -69,6 +70,20 @@ class ObjectiveModel(nn.Module):
         self.loss_configuration = loss_configuration
         self.weighting = weighting
         self.frozen_parameters = tuple(frozen_parameters)
+        # Frozen modules a runner neither shards nor optimizes: target tables
+        # used only inside the loss, as whoever built this model declared them.
+        # Each once: the teacher may be the draft's own bound head.
+        self.frozen_modules = tuple(dict.fromkeys(frozen_modules))
+        own = {id(module) for module in self.modules()}
+        strangers = [
+            type(module).__name__
+            for module in self.frozen_modules
+            if id(module) not in own
+        ]
+        if strangers:
+            raise ValueError(
+                f"frozen_modules holds modules this model does not: {strangers}"
+            )
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()

@@ -126,6 +126,7 @@ class _RecordingModel(ObjectiveModel):
 
         draft = nn.Linear(4, 4)
         draft.config = SimpleNamespace(draft=None)
+        draft._no_split_modules = []
         super().__init__(
             draft,
             objective=None,
