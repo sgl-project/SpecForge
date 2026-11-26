@@ -453,8 +453,7 @@ class TestServerCaptureAdapter(unittest.TestCase):
                 ref.feature_specs["target_last_hidden_states"].target_repr,
                 "hidden_state",
             )
-            # offline convention for the hidden_state train path: (B, L);
-            # TargetHead.preprocess adds the trailing mask dim
+            # canonical objective input convention: [batch, sequence]
             self.assertEqual(ref.feature_specs["loss_mask"].shape, (1, length))
             # zero-copy consume: bytes come back bit-exact from the fake store
             out, handle = store.get(ref)

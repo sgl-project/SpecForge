@@ -2,7 +2,7 @@
 """Shared tiny synthetic fixtures for canonical runtime GPU tests.
 
 Not a test module (no ``test_`` prefix). Builds a tiny EAGLE3 draft model, a
-``TargetHead``, a vocab mapping, and offline ``.ckpt`` feature files — all from
+frozen target LM head, a vocab mapping, and offline ``.ckpt`` feature files — all from
 random tensors, with NO model download. Offline batches are materialized through
 the same manifest-reader and feature-loader path used by training.
 """
@@ -281,13 +281,33 @@ def build_offline_eagle3_loader(
     )
 
 
+def load_target_head(
+    target_dir,
+    *,
+    lm_head_key=None,
+    device=None,
+    dtype=torch.bfloat16,
+):
+    from specforge.checkpoint.target import TargetWeights
+    from specforge.utils import get_local_device
+
+    keys = {"lm_head": lm_head_key} if lm_head_key is not None else None
+    weight = TargetWeights(target_dir, keys=keys).resolve("lm_head").read()
+    head = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=dtype)
+    with torch.no_grad():
+        head.weight.copy_(weight.to(dtype=dtype))
+    head.requires_grad_(False)
+    return head.eval().to(
+        device=get_local_device() if device is None else device, dtype=dtype
+    )
+
+
 def load_eagle3(
     config_path, target_dir, vocab_path, *, ttt=3, backend="sdpa", **options
 ):
     from specforge.algorithms.objectives import build_objective_model
     from specforge.config.draft.codec import decode_config
     from specforge.modeling import build_draft_model
-    from specforge.modeling.target.target_head import TargetHead
 
     with open(config_path) as stream:
         config = decode_config(json.load(stream))
@@ -296,7 +316,7 @@ def load_eagle3(
     ).to(device="cuda", dtype=torch.bfloat16)
     draft.vocabulary.load_mapping(**torch.load(vocab_path, weights_only=True))
     draft.embed_tokens.requires_grad_(False)
-    head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
+    head = load_target_head(target_dir, lm_head_key="lm_head.weight")
     sequence_parallel = None
     if backend == "usp":
         from specforge.training.sequence_parallel import sequence_parallel_groups
@@ -304,7 +324,7 @@ def load_eagle3(
         sequence_parallel = sequence_parallel_groups()
     model = build_objective_model(
         draft,
-        target_head=head.fc,
+        target_head=head,
         options=dict(ttt_length=ttt, **options),
         attention_backend=backend,
         sequence_parallel=sequence_parallel,
@@ -396,8 +416,8 @@ def build_block_model(
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
     from specforge.algorithms.objectives import build_objective_model
+    from specforge.checkpoint.target import TargetWeights
     from specforge.modeling import build_draft_model
-    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     target_config = Qwen3Config(
         hidden_size=hidden,
@@ -426,19 +446,32 @@ def build_block_model(
     draft = build_draft_model(config, backend=attention_backend).to(
         device="cuda", dtype=torch.bfloat16
     )
-    target = TargetEmbeddingsAndHead.from_pretrained(
-        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    target = TargetWeights(target_dir, keys={"lm_head": "lm_head.weight"})
+    embed_weight = (
+        target.resolve("embed_tokens").read().to(device="cuda", dtype=torch.bfloat16)
+    )
+    head_weight = (
+        target.resolve("lm_head").read().to(device="cuda", dtype=torch.bfloat16)
+    )
+    target_head = torch.nn.Linear(
+        head_weight.shape[1],
+        head_weight.shape[0],
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     with torch.no_grad():
-        draft.embed_tokens.weight.copy_(target.embed_tokens.weight)
-        draft.lm_head.weight.copy_(target.lm_head.weight)
+        draft.embed_tokens.weight.copy_(embed_weight)
+        draft.lm_head.weight.copy_(head_weight)
+        target_head.weight.copy_(head_weight)
     draft.embed_tokens.requires_grad_(False)
     draft.lm_head.requires_grad_(False)
+    target_head.requires_grad_(False).eval()
     if hasattr(draft, "initialize_transfer_space"):
         draft.initialize_transfer_space()
     options = dict(num_anchors=num_anchors)
     model = build_objective_model(
-        draft, target_head=target.lm_head, options=options
+        draft, target_head=target_head, options=options
     ).cuda()
     layers = list(config.spec_config.target_features.target_layer_ids)
     return model, len(layers) * hidden, target_dir, layers

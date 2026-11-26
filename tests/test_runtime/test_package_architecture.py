@@ -21,11 +21,6 @@ REMOVED_MODULE_FILES = (
     "specforge/algorithms/builtin.py",
     "specforge/algorithms/model_providers.py",
     "specforge/checkpoint/formats/legacy.py",
-    "specforge/modeling/target/base.py",
-    "specforge/modeling/target/factory.py",
-    "specforge/modeling/target/dflash_target_model.py",
-    "specforge/modeling/target/eagle3_target_model.py",
-    "specforge/modeling/target/sglang_backend/__init__.py",
     "specforge/runtime/inference/capture.py",
     "specforge/runtime/inference/dflash_adapter.py",
     "specforge/runtime/inference/sglang_adapter.py",
@@ -150,22 +145,15 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
 }
 
 REMOVED_PACKAGE_DIRECTORIES = (
-    "specforge/modeling/target/sglang_backend",
-    "specforge/modeling/target/custom_backend",
+    "specforge/modeling/target",
     "specforge/inference/target_engine",
-    "tests/test_modeling/test_target/test_custom_backend",
-    "tests/test_modeling/test_target/test_sglang_backend",
+    "tests/test_modeling/test_target",
     "specforge/runtime/inference",
     "specforge/runtime/training",
 )
 
 REMOVED_MODULE_PREFIXES = (
-    "specforge.modeling.target.base",
-    "specforge.modeling.target.factory",
-    "specforge.modeling.target.dflash_target_model",
-    "specforge.modeling.target.eagle3_target_model",
-    "specforge.modeling.target.sglang_backend",
-    "specforge.modeling.target.custom_backend",
+    "specforge.modeling.target",
     "specforge.runtime.inference",
     "specforge.runtime.training",
     "specforge.args",
@@ -264,6 +252,8 @@ LEGACY_API_NAMES = {
     "train_lease",
     "build_control_plane_for_mode",
     "LogSoftmaxLoss",
+    "TargetHead",
+    "TargetEmbeddingsAndHead",
 }
 
 CANONICAL_LAUNCH_EXPORTS = {
@@ -283,7 +273,6 @@ DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
-    "specforge/modeling/target/__init__.py",
 )
 
 
@@ -338,8 +327,12 @@ class TestPackageArchitecture(unittest.TestCase):
     def test_removed_move_shims_stay_deleted(self):
         present = [
             relative_path
-            for relative_path in REMOVED_MODULE_FILES + REMOVED_PACKAGE_DIRECTORIES
+            for relative_path in REMOVED_MODULE_FILES
             if (REPO_ROOT / relative_path).exists()
+        ] + [
+            relative_path
+            for relative_path in REMOVED_PACKAGE_DIRECTORIES
+            if (path := REPO_ROOT / relative_path).is_file() or any(path.rglob("*.py"))
         ]
         self.assertEqual([], present, f"old-path shims reintroduced: {present}")
 
