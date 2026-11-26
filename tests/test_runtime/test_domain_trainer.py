@@ -37,8 +37,10 @@ class DomainTrainerWiringTest(unittest.TestCase):
         store="STORE",
     ):
         import specforge.training.trainer as tr
+        from specforge.training.contracts import ProgramSpec
 
-        cap = {}
+        spec = ProgramSpec(name="eagle3", inputs=())
+        cap = {"program_spec": spec}
         events = [] if events is None else events
 
         class FakeLoader:
@@ -129,7 +131,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 store=store,
                 ref_source=ref_source,
                 model=model,
-                program_spec="SPEC",
+                program_spec=spec,
                 optimizer_factory="OPT",
                 run_id="run",
                 output_dir="/out",
@@ -209,7 +211,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         program, backend, spec = cap["runner"]
         self.assertEqual(program, "WRAPPED")
         self.assertIs(backend, trainer.backend)
-        self.assertEqual(spec, "SPEC")
+        self.assertIs(spec, cap["program_spec"])
 
         # the run loop drives that runner and holds neither the program nor the backend
         self.assertIs(cap["ctrl_runner"], trainer.runner)
