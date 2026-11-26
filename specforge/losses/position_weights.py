@@ -13,6 +13,9 @@ DPACE_LOSS_TYPES = frozenset(
 )
 
 
+CHAIN_WEIGHTINGS = DPACE_LOSS_TYPES | {"dpal"}
+
+
 @torch.no_grad()
 def dpace_weights(
     target_probability: torch.Tensor,
@@ -21,9 +24,10 @@ def dpace_weights(
     alpha: float,
     mode: str = "dpace",
 ) -> torch.Tensor:
-    """Return D-PACE credit weights for matching ``[..., positions]`` inputs.
+    """Return chain credit weights for matching ``[..., positions]`` inputs.
 
-    ``target_probability`` is the draft probability of each hard target token;
+    ``target_probability`` is the per-slot acceptance probability (hard-token
+    probability for D-PACE, distribution overlap for D-PAL);
     ``mask`` is a binary supervision mask. ``alpha`` in [0, 1] smooths the
     probabilities toward one. Masked slots leave prefix products unchanged and
     contribute nothing to suffix sums. Returned weights are detached and are
@@ -39,7 +43,7 @@ def dpace_weights(
     suffix = torch.flip(
         torch.cumsum(torch.flip(prefix * mask, dims=[-1]), dim=-1), dims=[-1]
     )
-    if mode == "dpace":
+    if mode in ("dpace", "dpal"):
         return suffix
     if mode == "dpace-continuation-value-only":
         return suffix / prefix.clamp_min(torch.finfo(prefix.dtype).tiny)

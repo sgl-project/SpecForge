@@ -634,6 +634,8 @@ does not imply optimizer-state resharding.
 Training metrics are printed every `training.log_interval` steps and forwarded
 to the configured tracking backend.
 
+For DFlash with teacher-distribution supervision and acceptance-derived block weights, see the [D-PAL weighting](/concepts/dpal).
+
 ## Export a trained draft
 
 Runtime checkpoints contain training state and are not serving model

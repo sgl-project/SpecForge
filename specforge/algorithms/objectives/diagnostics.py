@@ -13,7 +13,7 @@ from specforge.algorithms.metrics.dflash import (
 )
 from specforge.algorithms.metrics.dflash_terms import DFlashMetricTerms
 from specforge.algorithms.metrics.report import format_block_metrics
-from specforge.losses.position_weights import DPACE_LOSS_TYPES
+from specforge.losses.position_weights import CHAIN_WEIGHTINGS
 
 
 def block_diagnostics(
@@ -72,13 +72,21 @@ def diagnostic_weights(runtime, predictions, slices):
     from .execution import ChainStatistics, chain_weights
 
     weighting = predictions.plan.terms[0].weighting or runtime.weighting
-    if weighting.kind in DPACE_LOSS_TYPES:
+    if weighting.kind in CHAIN_WEIGHTINGS:
         probabilities = []
         for part in slices:
             p = predictions.select(part)
             logits = p.project()["logits"].float()
             probabilities.append(
-                logits.softmax(-1).gather(-1, p.labels[..., None]).squeeze(-1)
+                weighting.chain_probability(
+                    logits,
+                    p.labels,
+                    (
+                        p.teacher.logits()
+                        if "teacher_logits" in weighting.requires
+                        else None
+                    ),
+                )
             )
         statistics = ChainStatistics(predictions.mask, torch.cat(probabilities))
         return chain_weights([predictions], [statistics], weighting)[0][0].view_as(

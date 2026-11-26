@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn.functional as F
 
+from specforge.losses import distribution
 from specforge.losses import fused as fused_loss
-from specforge.losses.position_weights import DPACE_LOSS_TYPES
+from specforge.losses.position_weights import CHAIN_WEIGHTINGS
 
 from .base import check_options
 
@@ -269,6 +270,8 @@ def distillation_loss(compute):
 
 
 for _name, _compute in {
+    "renyi_half": distribution.renyi_half,
+    "neg_log_overlap": distribution.neg_log_overlap,
     "kl": fused_loss.kl_div_loss,
     "reverse_kl": fused_loss.reverse_kl_div_loss,
     "js": fused_loss.js_div_loss,
@@ -536,8 +539,10 @@ class PositionWeighting:
         if self.kind == "uniform":
             return frozenset()
         flags = {"chain_positions"}
-        if self.kind in DPACE_LOSS_TYPES:
+        if self.kind in CHAIN_WEIGHTINGS:
             flags |= {"logits", "labels", "acceptance_chain"}
+        if self.kind == "dpal":
+            flags.update(("overlap_chain", "teacher_logits"))
         return frozenset(flags)
 
     kind: str = "uniform"
@@ -546,7 +551,7 @@ class PositionWeighting:
     alpha: float | None = None
 
     def __post_init__(self):
-        if self.kind not in {"uniform", "exponential", "geometric"} | DPACE_LOSS_TYPES:
+        if self.kind not in {"uniform", "exponential", "geometric"} | CHAIN_WEIGHTINGS:
             raise ValueError(f"unknown position weighting: {self.kind!r}")
         check_options(
             positive={"gamma": self.gamma},
@@ -558,15 +563,29 @@ class PositionWeighting:
         if (self.kind == "geometric") != (self.factor is not None):
             raise ValueError("factor is required only for geometric weighting")
 
-        if self.kind in DPACE_LOSS_TYPES:
+        if self.kind in CHAIN_WEIGHTINGS:
             if self.alpha is None:
-                object.__setattr__(self, "alpha", 0.5)
+                object.__setattr__(self, "alpha", 0.3 if self.kind == "dpal" else 0.5)
         elif self.alpha is not None:
-            raise ValueError("alpha is only valid for D-PACE")
+            raise ValueError("alpha is only valid for D-PACE or D-PAL")
+
+    @property
+    def chain_name(self):
+        return "D-PAL" if self.kind == "dpal" else "D-PACE"
+
+    @torch.no_grad()
+    def chain_probability(self, logits, labels, teacher):
+        """Return per-slot acceptance for the configured chain weighting."""
+        q = logits.float().softmax(-1)
+        if self.kind == "dpal":
+            return torch.minimum(q, teacher.float().softmax(-1)).sum(-1).clamp_max(1)
+        return q.gather(-1, labels[..., None]).squeeze(-1)
 
     def __call__(self, weights, positions):
-        if self.kind in DPACE_LOSS_TYPES:
-            raise ValueError("D-PACE requires complete chains in the batch executor")
+        if self.kind in CHAIN_WEIGHTINGS:
+            raise ValueError(
+                "Chain weighting requires complete chains in the batch executor"
+            )
         if self.kind == "uniform":
             return weights
         if self.kind == "geometric":

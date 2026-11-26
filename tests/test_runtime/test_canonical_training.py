@@ -302,7 +302,13 @@ class CanonicalTrainingTest(unittest.TestCase):
 
         with TemporaryDirectory() as temp:
             target = target_directory(Path(temp))
-            for kind in ("ce", "kl", "lk_lambda"):
+            for kind, weighting in (
+                ("ce", "dpace"),
+                ("kl", "dpace"),
+                ("lk_lambda", "dpace"),
+                ("ce", "dpal"),
+                ("renyi_half", "dpal"),
+            ):
                 with self.subTest(loss=kind):
                     loss = {"kind": kind}
                     if kind == "lk_lambda":
@@ -313,14 +319,14 @@ class CanonicalTrainingTest(unittest.TestCase):
                         training={
                             "attention_backend": "eager",
                             "loss": {"terms": {"token": loss}},
-                            "weighting": {"kind": "dpace", "alpha": 0.3},
+                            "weighting": {"kind": weighting, "alpha": 0.3},
                         },
                     )
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
                         resolved.config, algorithm=resolved.algorithm
                     )
-                    needs_teacher = kind != "ce"
+                    needs_teacher = kind != "ce" or weighting == "dpal"
                     layout = resolved.algorithm.providers.offline_for(
                         "text"
                     ).capture_layout
@@ -336,6 +342,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     self.assertEqual(
                         contract["canonical_loss"]["terms"]["token"]["kind"], kind
                     )
+                    self.assertEqual(contract["canonical_weighting"]["kind"], weighting)
                     self.assertEqual(contract["canonical_weighting"]["alpha"], 0.3)
                     if bundle.target_head is not None:
                         self.assertFalse(

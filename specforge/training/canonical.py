@@ -155,11 +155,12 @@ def resolve_run(cfg, *, target_config=None):
     ):
         raise ValueError("sequence parallelism requires an objective supporting USP")
     if sequence_parallel:
-        from specforge.losses.position_weights import DPACE_LOSS_TYPES
+        from specforge.losses.position_weights import CHAIN_WEIGHTINGS
 
-        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+        if resolved.weighting.kind in CHAIN_WEIGHTINGS:
+            method = resolved.weighting.chain_name
             raise ValueError(
-                "D-PACE weighting is not supported with sequence parallelism: "
+                f"{method} weighting is not supported with sequence parallelism: "
                 "chain weights are normalized within each sequence shard"
             )
     # Retain the established strategy name for data/rendezvous identifiers.

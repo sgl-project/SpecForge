@@ -29,12 +29,13 @@ result = runtime(batch, step=optimizer_step, total_steps=total_optimizer_steps)
 `loss.terms.<name>.kind` accepts `ce` (the protocol's labels: data tokens for block and
 MTP protocols, the teacher's top-1 within the draft vocabulary for EAGLE3/P-EAGLE),
 `soft_ce`, `kl`, `reverse_kl`,
-`js`, `tv`, `nla`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
+`js`, `tv`, `nla`, `renyi_half`, `neg_log_overlap`, `lk`, `lk_alpha`, `lk_tv`, `lk_lambda` and `ce_l1`. Distillation needs aligned teacher logits or final states
 plus a frozen head. Omitting a term preserves its algorithm default. Selector,
 confidence, refinement and alignment supervision remain owned by the algorithm.
 Weighting accepts `uniform`, `exponential` (gamma), `geometric` (factor),
 `dpace`, `dpace-cumulative-confidence-only` or `dpace-continuation-value-only`
-(alpha, default 0.5).
+(alpha, default 0.5). Selector-free DFlash also supports [D-PAL weighting](sections/concepts/dpal.md)
+(`kind: dpal`, alpha defaults to 0.3).
 Omitting it preserves block loss decay and EAGLE's geometric factor of 0.8.
 An explicit weighting replaces that default; EAGLE does not apply another depth
 factor, and `loss_decay_gamma` or `depth_decay` given with it is rejected, rather than silently ignored. EAGLE/P-EAGLE apply weighting to rollout depth; MTP proposes one token per

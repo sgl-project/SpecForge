@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
+from specforge.losses.position_weights import CHAIN_WEIGHTINGS, dpace_weights
 
 from .base import ObjectiveResult
 from .computation import LossComputation
@@ -261,14 +261,10 @@ class ChainStatistics:
 
 
 @torch.no_grad()
-def chain_statistics(projected):
+def chain_statistics(projected, weighting):
     """Return detached chain masks/probabilities from resolved logits and labels."""
-    probability = (
-        projected.output["logits"]
-        .float()
-        .softmax(-1)
-        .gather(-1, projected.labels[..., None])
-        .squeeze(-1)
+    probability = weighting.chain_probability(
+        projected.output["logits"], projected.labels, projected.teacher
     )
     return ChainStatistics(projected.mask, probability)
 
@@ -280,7 +276,7 @@ def chain_weights(predictions, projected, weighting):
     Args:
         predictions: Aligned prediction sets with chain, sequence and position IDs.
         projected: Matching Projected objects or detached ChainStatistics.
-        weighting: D-PACE weighting configuration.
+        weighting: Complete-chain weighting configuration.
 
     Returns:
         One pair of flattened (weights, denominator contributions) per set.
@@ -290,7 +286,11 @@ def chain_weights(predictions, projected, weighting):
         ValueError: Chain positions repeat or a chain spans multiple sequences.
     """
     statistics = [
-        value if isinstance(value, ChainStatistics) else chain_statistics(value)
+        (
+            value
+            if isinstance(value, ChainStatistics)
+            else chain_statistics(value, weighting)
+        )
         for value in projected
     ]
     if not any(p.mask.numel() for p in predictions):
@@ -427,7 +427,7 @@ def evaluate_chunks(
     if (
         execution.trim
         and not reduced
-        and weighting.kind not in DPACE_LOSS_TYPES
+        and weighting.kind not in CHAIN_WEIGHTINGS
         and not whole_set
         and predictions.chunk_safe
         and predictions.projection.chunk_safe
@@ -546,7 +546,7 @@ def execute_batch(
 
     Returns:
         ObjectiveResult containing the trainer loss numerator/denominator and
-        metric counts. D-PACE weights are prepared over complete chains.
+        metric counts. Acceptance weights are prepared over complete chains.
 
     Raises:
         ValueError: The batch is empty, its reduction is unknown, or independent
@@ -556,14 +556,15 @@ def execute_batch(
     chunk_size = (
         batch.chunk_size if execution.chunk_size is None else execution.chunk_size
     )
-    if weighting.kind in DPACE_LOSS_TYPES:
+    if weighting.kind in CHAIN_WEIGHTINGS:
+        method = weighting.chain_name
         predictions = list(batch.predictions)
         requested_split = any(0 < chunk_size < p.hidden.shape[0] for p in predictions)
         if not predictions:
             raise ValueError("protocol must produce at least one prediction set")
         if any(not p.plan.shared_reduction for p in predictions):
             raise ValueError(
-                "D-PACE currently requires shared loss masks and weighting"
+                f"{method} currently requires shared loss masks and weighting"
             )
         if any(
             not p.projection.chunk_safe or not p.projection.recompute_safe
@@ -571,7 +572,7 @@ def execute_batch(
         ):
             if chunk_size and execution.chunk_size is not None:
                 warnings.warn(
-                    "D-PACE loss chunking is disabled: the projection cannot "
+                    f"{method} loss chunking is disabled: the projection cannot "
                     "be safely chunked and replayed.",
                     RuntimeWarning,
                     stacklevel=2,
@@ -580,7 +581,7 @@ def execute_batch(
         if not chunk_size:
             if requested_split and execution.checkpoint:
                 warnings.warn(
-                    "Loss checkpointing is disabled for unchunked D-PACE: "
+                    f"Loss checkpointing is disabled for unchunked {method}: "
                     "chain weighting uses materialized predictions.",
                     RuntimeWarning,
                     stacklevel=2,
@@ -617,7 +618,8 @@ def execute_batch(
                         chain_statistics(
                             project_predictions(
                                 prediction.select(part), loss, weighting, execution
-                            )
+                            ),
+                            weighting,
                         )
                         for part in prediction_slices(prediction, chunk_size)
                     ]
@@ -659,7 +661,7 @@ def execute_batch(
         raise ValueError("protocol must produce at least one prediction set")
     if batch.finalize is not None:
         return batch.finalize(combine_results(results))
-    if batch.reduction == "sum_means" and weighting.kind not in DPACE_LOSS_TYPES:
+    if batch.reduction == "sum_means" and weighting.kind not in CHAIN_WEIGHTINGS:
         # Prediction sets can have distinct plans; only their metrics are additive.
         ratios = {}
         for item in results:

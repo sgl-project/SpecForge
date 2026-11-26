@@ -332,3 +332,5 @@ If you have multiple datasets, you can just merge them into the one jsonl file. 
 ```bash
 cat dataset1.jsonl dataset2.jsonl > merged_dataset.jsonl
 ```
+
+For D-PAL, pass the training YAML to offline capture so it records final teacher hidden states as well as auxiliary features. See the [D-PAL weighting](/concepts/dpal).

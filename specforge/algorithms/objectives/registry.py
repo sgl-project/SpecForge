@@ -239,6 +239,13 @@ def resolve_objective(
     if weighting is None:
         weighting = getattr(objective, "default_weighting", None) or {}
     position_weighting = PositionWeighting(**weighting)
+    if position_weighting.kind == "dpal" and any(
+        term.loss.kind in {"lk", "lk_alpha", "lk_tv", "lk_lambda"}
+        for term in loss_configuration.terms.values()
+    ):
+        raise ValueError("D-PAL weighting cannot be combined with LK")
+    if "teacher_logits" in position_weighting.requires:
+        entry = replace(entry, requires=entry.requires | {"teacher_logits"})
     if execution.teacher_chunk_size and not entry.training.supports_vocab_mapping:
         raise ValueError("compact teacher requires a vocabulary-aware protocol")
     missing = (

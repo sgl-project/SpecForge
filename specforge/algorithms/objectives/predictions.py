@@ -143,6 +143,8 @@ class Predictions:
             flags.add("labels")
         if self.teacher is not None:
             flags.add("teacher_logits")
+            if "acceptance_chain" in flags:
+                flags.add("overlap_chain")
         return frozenset(flags)
 
     def project(self):

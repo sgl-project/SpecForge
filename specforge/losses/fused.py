@@ -143,7 +143,9 @@ def _online_stats(row_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
         x = tl.load(row_ptr + offsets, mask=mask, other=float("-inf")).cast(tl.float32)
         block_max = tl.max(tl.where(mask, x, float("-inf")))
         m_new = tl.maximum(m, block_max)
-        d = d * tl.exp(m - m_new) + tl.sum(tl.where(mask, tl.exp(x - m_new), 0.0))
+        # An entirely masked (-inf) tile contributes zero softmax mass.
+        shift = tl.where(m_new == -float("inf"), 0.0, m_new)
+        d = d * tl.exp(m - shift) + tl.sum(tl.where(mask, tl.exp(x - shift), 0.0))
         m = m_new
     return m, d
 
@@ -216,7 +218,7 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
             dp = tl.exp(ldp)
             tp = tl.exp(ltp)
             if OP == _OP_KL:
-                acc += tl.sum(tl.where(mask, tp * (ltp - ldp), 0.0))
+                acc += tl.sum(tl.where(mask & (tp > 0), tp * (ltp - ldp), 0.0))
             elif OP == _OP_SOFT_CE:
                 acc += tl.sum(tl.where(mask, -tp * ldp, 0.0))
             elif OP == _OP_RKL:

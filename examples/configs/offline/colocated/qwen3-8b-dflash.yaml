@@ -13,6 +13,10 @@ data:
   cache_dir: ./cache
 
 training:
+  # For D-PAL, replace the weighting block below with these two settings.
+  # Capture final teacher hidden states using the same modified recipe.
+  # loss: {terms: {token: {kind: renyi_half}}}
+  # weighting: {kind: dpal, alpha: 0.3}
   weighting:
     kind: exponential
     gamma: 7.0
