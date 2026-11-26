@@ -104,7 +104,7 @@ def forward_program(model, batch, ctx=None, **replay):
 class FakeProgram(torch.nn.Module):
     """Base of test programs: a subclass's forward returns an ``ObjectiveResult``."""
 
-    frozen = ()
+    frozen_modules = ()
 
     def host_inputs(self, tensors):
         return {}

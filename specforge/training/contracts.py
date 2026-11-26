@@ -99,7 +99,7 @@ class TrainingProgram(Protocol):
 
     #: Frozen modules a runner neither shards nor optimizes (target tables,
     #: the teacher head), as declared when the program was built.
-    frozen: Tuple[torch.nn.Module, ...]
+    frozen_modules: Tuple[torch.nn.Module, ...]
 
     #: The module's mode; a runner sets it with ``train()`` and ``eval()``.
     training: bool

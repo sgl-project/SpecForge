@@ -85,7 +85,7 @@ class TestEquivTrainerSplit(unittest.TestCase):
                     runner_model,
                     wrap=True,
                     optimizer_target=runner_model.draft_model,
-                    frozen=runner_model.frozen,
+                    frozen_modules=runner_model.frozen_modules,
                     blocks=program_spec(runner_model).partition.blocks,
                 )
                 runner = fx.build_runner(wrapped, backend)
