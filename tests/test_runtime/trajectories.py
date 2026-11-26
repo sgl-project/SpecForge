@@ -24,7 +24,7 @@ import os
 import re
 import struct
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -367,7 +367,7 @@ class _Replica:
         return {"applied_lr": self.applied_lr, "updates": self.updates}
 
 
-def _train_rank(rank, world_size, runs):
+def _train_rank(rank, world_size, runs, around_training):
     """Run every case on one rank, as a worker ``torchrun`` started would."""
     from specforge.cli import main
 
@@ -383,6 +383,7 @@ def _train_rank(rank, world_size, runs):
                 lambda metrics, step: logged.append((step, _on_host(metrics))),
             ),
             _Replica() as replica,
+            around_training() if around_training else nullcontext(),
         ):
             status = main(
                 ["train", "-c", config, *overrides, *rank_overrides.get(rank, ())]
@@ -487,11 +488,17 @@ def _read_case(output, case):
     ]
 
 
-def record(selected):
+def record(selected, *, around_training=None):
     """Train every case and return ``{case name: what the run left}``.
 
     Cases of one world size share their worker processes, so a recording pays
     for the Python imports once per rank.
+
+    Args:
+        selected: The cases to train.
+        around_training: A module-level function that returns a context
+            manager; every rank enters it around each run. The conformance
+            kit uses it to train a deliberately broken reference.
     """
     if not selected:
         raise ValueError("no case to record: this host can place none of them")
@@ -541,7 +548,10 @@ def record(selected):
                 ]
                 runs.append((str(config), overrides, str(output), rank_overrides))
             multiprocessing.spawn(
-                _train_rank, args=(world_size, runs), nprocs=world_size, join=True
+                _train_rank,
+                args=(world_size, runs, around_training),
+                nprocs=world_size,
+                join=True,
             )
             for case, (_, _, output, _) in zip(group, runs):
                 recording[case.name] = _read_case(Path(output), case)

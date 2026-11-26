@@ -90,6 +90,48 @@ broadcast verdicts (whether an evaluation runs, whether a checkpoint is the
 best) need either a way to distribute a decision or every rank computing it,
 which the contract does not have yet.
 
+### Conformance
+
+`tests/test_runtime/conformance.py` is what a step runner is held to:
+
+- `declaration_cases()`: one recorded training case for each thing a program
+  declares to a runner (each reduction, a replay statistic, evaluation
+  diagnostics), at two ranks. They train the runner `specforge train`
+  assembles, which is the reference: no configuration key selects another.
+  A candidate is recorded by substituting it around every rank's run
+  (`record(cases, around_training=...)`), and a runner of the `exact` class
+  then reproduces the reference's recording on the same machine.
+- `MUTATIONS`: three broken references (gradients scaled by the world size,
+  clipping skipped, the learning-rate schedule shifted by one step). Each has
+  to change the recording, or the replay proves nothing.
+- `ProtocolChecks`: the run loop over the runner with a stream that is read
+  once and a ledger of what was read, handed to the runner, applied,
+  committed, snapshotted and checkpointed. The runner is handed the stream's
+  batches, each once and in order; an update consumes one whole window; a
+  commit names every sample its step's update consumed and follows it;
+  nothing is committed for an incomplete window; a checkpoint's state is
+  collected and written with every update committed and no acknowledgement
+  in flight; a complete run does not raise.
+- `RunnerChecks`: one job per declaration in one process, compared with the
+  reference runner bit for bit: every update's metrics, gradient norm,
+  learning rate and weights, and the exported draft and the generator at the
+  end. The optimizer state is not compared across runners: what a runner
+  resumes from is its own to lay out, and the resume job holds it to the
+  runner's own uninterrupted run. The program's loss reads the step, the
+  run's length and the noise it draws, detailed metrics are asked for on
+  every second update, its replay statistic depends on the mode and the
+  generator of the prepass, and one job runs in bfloat16, where the
+  optimizer's fp32 masters hold more than the weights. Plus the single-use
+  handle, a refused batch, evaluation, and resume in bfloat16 through two
+  further updates.
+
+A new runner adds two test classes that set `make_runner`; those hold it in
+one process, on the host. Not in the kit: a recorded case with sequence
+parallelism (it needs `flash_attn` and accelerators); the order of commits
+across ranks; a prepass in the protocol's ledger; evaluation with unequal
+denominators or an empty shard across ranks; frozen modules and partition
+blocks, which only a sharding runner acts on.
+
 ## Internal mechanics
 
 ```mermaid
