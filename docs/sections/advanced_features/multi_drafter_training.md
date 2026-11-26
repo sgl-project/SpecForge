@@ -295,6 +295,162 @@ drafters the store held about 30 GB at the default watermarks.
 Not tested yet: acceptance length after a full run, a long run against solo
 runs, targets other than Qwen3, and drafters whose trainers use several GPUs.
 
+## Capture speed
+
+Several drafters share one target forward but add bytes to every write. This
+section says when that slows capture down. It only matters when capture is the
+bottleneck, that is when every drafter alone could train faster than capture
+produces samples. Otherwise the slowest trainer sets the pace and capture idles
+between refills.
+
+Per capture server:
+
+| Name | Meaning |
+| --- | --- |
+| `b` | samples per request, `runtime.producer_lease` (default 8) |
+| `c` | requests the producer keeps in flight, `runtime.producer_concurrency` (default 1) |
+| `F` | GPU time of one target forward over one request |
+| `W` | time the plugin's single writer thread takes to store one request's batch: staging plus `batch_put_from` (`total_ms` with `SGLANG_SPEC_CAPTURE_TIMING=1`) |
+
+A second drafter leaves `F` alone, since the target runs once and computes every
+layer anyway. It raises `W`, since each prompt now stores every drafter's
+layers.
+
+```text
+                         too few requests    GPU-bound    writer-bound
+samples/s  =  b  x  min(   c / (F + W),        1 / F,       1 / W   )
+```
+
+```text
+1. Too few requests: c x max(F, W) < F + W, which means c = 1.
+   The GPU waits for every write and for the next request.
+
+   GPU     [    F    ]         [    F    ]
+   writer             [  W  ]             [  W  ]
+
+2. GPU-bound: c large enough and F >= W.
+   Each write ends before the next forward does.
+
+   GPU     [    F    ][    F    ][    F    ][    F    ]
+   writer             [  W  ]    [  W  ]    [  W  ]
+
+3. Writer-bound: c large enough and W > F.
+   At most two batches wait for the writer and the scheduler stalls on a
+   third, so the GPU waits.
+
+   GPU     [  F  ]    [  F  ]    [  F  ]
+   writer         [    W    ][    W    ][    W    ]
+```
+
+Measured on Qwen3-8B with `b = 8` and about 930 tokens per prompt, as the
+capture speed during refills:
+
+```text
+samples/s                          c=1     c=2     c=3     c=4     c=8
+B200, dspark                       63.2    76.5      -     81.8    83.6
+B200, dflash + dspark              52.3    73.0      -     80.1    83.6
+H200, dflash                       34.5    42.3      -     43.8      -
+H200, dflash + dspark              26.5      -       -     42.0      -
+B300, dflash + dspark, memcpy      33.5    55.0    59.7    59.2      -
+B300, dflash + dspark, TCP x16     44.3    72.0    81.2    80.4      -
+
+                     F        W, one drafter    W, dflash + dspark
+B200                 98 ms    25 ms             45 ms
+H200                183 ms    50 ms            110 ms
+B300, memcpy           -        -              132 ms
+B300, TCP x16       100 ms      -               71 ms
+```
+
+`W` is measured; `F` is `b` divided by the speed at `c = 4` where `F > W`.
+`memcpy` and `TCP x16` are two Mooncake settings, explained below.
+
+- Case 1 is `c = 1`, the default. Every write adds to every request, so a
+  second drafter costs directly: -17% on B200 and -23% on H200.
+- Case 2 covers every setup above at `c >= 4` except B300 with `memcpy`.
+  `F > W` even with two drafters, so capture stays bound by the target forward
+  and a second drafter costs almost nothing: -2% at `c = 4` and 0% at `c = 8`
+  on B200.
+- Case 3 starts when `W` catches up with `F`. `W` grows with the drafters' total
+  captured width and with a slow host; `F` shrinks with a faster GPU or a
+  smaller target. The B300 host with `memcpy` is an example: `W = 132 ms`
+  against `F = 100 ms`, so capture stops at `b / W`, about 61 samples/s, from
+  `c = 3` on, and a larger `c` does not help.
+
+Both `F` and `W` grow with the tokens per prompt, so the case depends on the
+target, the drafters and the hardware, but hardly on prompt length.
+
+### `W` depends on the host
+
+When only TCP is available, Mooncake (0.3.14) does not send the local write
+over TCP. It copies the batch into the store with `memcpy` on a single thread
+(`kDefaultMemcpyWorkers = 1`, not configurable), and one `batch_put_from` is one
+copy task. `W` is therefore set by how fast one CPU core copies memory: about
+25 GB/s on the B200 host and 7-8 GB/s on the H200 and B300 hosts. More plugin
+writer threads would only queue on that same thread.
+
+On a slow host, turning the copy off and giving TCP more threads spreads the
+copy over several cores:
+
+```text
+B300, dflash + dspark, c = 4                         put         W        samples/s
+memcpy: the default                                   7.1 GB/s   132 ms   59.2
+MC_STORE_MEMCPY=0, MC_NUM_TCP_IO_THREADS=8           10.6 GB/s   102 ms   75.0
+TCP x16: MC_STORE_MEMCPY=0, MC_NUM_TCP_IO_THREADS=16,
+         MC_TCP_LANES_PER_PEER=16                    23.7 GB/s    71 ms   80.4
+```
+
+This moved the B300 host from case 3 to case 2. The variables were set for the
+whole `specforge train` run, and the trainers' fetch time did not change.
+
+### SGLang answers only between forwards
+
+The writer runs in the background, but SGLang sends each held response from its
+scheduler thread, and that thread checks held responses only between batches
+(`process_batch_result` and `on_idle`). While a forward runs, the scheduler
+waits for it. A request whose write ends during another request's forward is
+therefore answered when that forward ends, not when its write ends:
+
+```text
+c = 2, F > W           _ = the answer travels back and the next request arrives
+
+GPU        [   C   ]_[   D   ]_[   E   ]_
+request C  [   C   ][WC]......> answered when D ends, then E is sent
+request D           _[   D   ][WD]......> answered when E ends
+```
+
+Each request goes around in about `2F`, and the GPU idles for one short return
+trip after every forward. With `c >= 3` another request is always queued when a
+forward ends, so the gap closes. At `c = 1` the scheduler is idle and polls, so
+a request is answered as soon as its write ends.
+
+This was timed on the B300 host with TCP x16, where `F > W`, using millisecond
+logs and a test build of SGLang that also releases held responses while it
+waits for the GPU:
+
+```text
+dflash + dspark            samples/s   write ends during the next forward:
+                                       write done -> answered
+c = 2, SGLang              72.0        median 36 ms, 93% within 3 ms after that forward
+c = 2, released early      77.0        median 0 ms
+c = 3, SGLang              81.2
+c = 4, SGLang              80.4
+```
+
+The gap costs about 7% at `c = 2`, which also explains why `c = 2` ran 6-9%
+below `c = 4` on B200. Releasing early recovers most of it, and `c = 3` all of
+it.
+
+### Choosing `c`
+
+`c` is `runtime.producer_concurrency`, set per rollout worker. Use `c = 3` or
+`4` for a capture-bound run: both cover `W` and the SGLang gap (`c = 3` matched
+`c = 4` on B300), and `c = 4` reached 96-98% of `c = 8` on B200. More does not
+help once the GPU is busy, because
+`max_prefill_tokens` (16384) fits about two requests in one forward. It only
+makes each request wait longer (0.37 s to 0.64 s with two drafters from `c = 4`
+to `c = 8`) and lets the store pass the high watermark by up to `c x b`
+samples.
+
 ## Limits of this version
 
 - Online disaggregated training only. No resume, inbox relay, NVLink or
