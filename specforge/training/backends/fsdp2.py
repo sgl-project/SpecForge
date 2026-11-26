@@ -438,7 +438,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         finally:
             if replay_group is not None:
                 dist.destroy_process_group(replay_group)
-        return {
+        converted = {
             "optimizer_state_dict": {
                 # A parameter the reference never stepped starts afresh.
                 "state": {
@@ -454,6 +454,16 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             "fp32_params": [state.masters[ni] for ni in opt_to_named],
             self.FORMAT_KEY: True,
         }
+        for key in (
+            "optimizer_type",
+            "param_group_policy",
+            "optimizer_options",
+            "lr_scheduler_min_lr_ratio",
+            "lr_scheduler_options",
+        ):
+            if key in saved:
+                converted[key] = saved[key]
+        return converted
 
     def _load_module_state_dict(self, model_state: dict) -> None:
         raise ValueError(

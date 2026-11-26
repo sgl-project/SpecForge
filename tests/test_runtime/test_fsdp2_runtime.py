@@ -967,6 +967,14 @@ class FSDP2PrecisionAndConfigTest(unittest.TestCase):
         cap = build_trainer(fsdp2_bf16, base_state, sharding="SHARD_GRAD_OP")
         self.assertIs(cap["prepare_kw"].get("retain_reference_layout"), True)
 
+        # 1b. Legacy pre-runtime checkpoints (no runtime/precision keys) also
+        # migrate to fsdp2 and retain the reference layout.
+        legacy_state = {
+            k: v for k, v in base_state.items() if k not in ("runtime", "precision")
+        }
+        cap_legacy = build_trainer(fsdp2_bf16, legacy_state, sharding="SHARD_GRAD_OP")
+        self.assertIs(cap_legacy["prepare_kw"].get("retain_reference_layout"), True)
+
         # 2. fsdp2 -> fsdp2 does NOT retain reference layout.
         fsdp2_state = {
             **base_state,

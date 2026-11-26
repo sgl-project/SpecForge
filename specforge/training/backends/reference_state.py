@@ -130,7 +130,7 @@ def read_reference_state(
     failure = None
     for index, shape in enumerate(shapes):
         if whole:
-            master, state = masters[index].float(), states[index]
+            master, state = masters[index].detach().cpu().float(), states[index]
         else:
             master, state = _gathered(
                 index, shape, spans[index], masters[index], states[index], group
@@ -174,7 +174,7 @@ def _checked_state(state: Mapping, index: int) -> dict:
         raise ValueError(f"parameter {index}'s saved optimizer state lacks {missing}")
     return {
         "step": torch.as_tensor(state["step"]).detach().cpu(),
-        **{name: state[name].float() for name in _MOMENTS},
+        **{name: state[name].detach().cpu().float() for name in _MOMENTS},
     }
 
 
@@ -191,7 +191,7 @@ def _gathered(index, shape, span, master, state, group):
     once the reference stepped it, its moments.
     """
     parts = [None] * dist.get_world_size(group)
-    dist.all_gather_object(parts, (span, master, state), group=group)
+    dist.all_gather_object(parts, (span, master.detach().cpu(), state), group=group)
     full_master = _place(shape, [(span, values) for span, values, _ in parts])
     holders = [part for part in parts if part[0] is not None]
     stepped = [part for part in holders if part[2]]
