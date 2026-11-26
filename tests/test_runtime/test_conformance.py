@@ -92,7 +92,9 @@ class KitCanFailTest(unittest.TestCase):
             def _apply_after_step_statistics(self, totals):
                 return {}
 
-        self.assertEqual(self.failures(SkippedAfterStep, "test_after_step_statistic"), 1)
+        self.assertEqual(
+            self.failures(SkippedAfterStep, "test_after_step_statistic"), 1
+        )
         self.assertEqual(self.failures(SkippedAfterStep, "test_window_reduction"), 0)
 
     def test_lost_resume_state_fails_the_resume_job(self):
