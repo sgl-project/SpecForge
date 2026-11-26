@@ -26,6 +26,7 @@ from .dflash import COMMON_MODULES
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
         dataloader_workers=8,
+        reduction="microbatch",
     ),
     requires=("teacher_logits",),
     architectures=("DSparkDraftModel",),

@@ -905,6 +905,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             StepRuntimeConfig,
             checkpoint_key_fingerprint,
         )
+        from specforge.algorithms.objectives.registry import TrainingRequirements
         from specforge.launch import _assemble_trainer
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -924,10 +925,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
             # the builder reads the program's declarations from these two
             objective_name = "eagle3"
             registration = SimpleNamespace(
-                inputs=("x",),
-                training=SimpleNamespace(
-                    window_statistic=None, evaluation_diagnostics=False
-                ),
+                inputs=("x",), training=TrainingRequirements()
             )
 
             def __init__(self):

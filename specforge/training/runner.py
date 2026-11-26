@@ -9,10 +9,9 @@
 """The DDP / FSDP step runner: one micro-batch per call over the wrapped model.
 
 The collectives across samples of a training step are issued here or in the
-backend this runner drives: gradient synchronization, the loss denominator,
-the gradient norm, the window's metrics and the replay statistics. The
-exception is an objective with the ``global_microbatch`` reduction, which
-reduces its own per-term denominators inside the forward.
+backend this runner drives: gradient synchronization, the loss denominators
+of either reduction, the gradient norm, the window's metrics and the replay
+statistics.
 """
 
 from __future__ import annotations
@@ -164,11 +163,19 @@ class _Window:
 class DataParallelRunner:
     """Step runner for a model wrapped by DDP or FSDP over data-parallel ranks.
 
-    The update's objective is ``sum(numerator) / sum(denominator)`` over the
-    window's micro-batches and the ranks. Each numerator is divided by the
-    window length before its backward, the wrapper averages gradients over the
-    ranks, and the accumulated gradients are rescaled once by
+    Under the ``window`` reduction the update's objective is
+    ``sum(numerator) / sum(denominator)`` over the window's micro-batches and
+    the ranks. Each numerator is divided by the window length before its
+    backward, the wrapper averages gradients over the ranks, and the
+    accumulated gradients are rescaled once by
     ``world size * window length / global denominator``.
+
+    Under ``microbatch`` every term's denominator is pooled over the ranks
+    between a micro-batch's forward and its backward, one reduction each. The
+    loss that is differentiated is ``world size * sum_t c_t * numerator_t /
+    pooled denominator_t``, which the wrapper's average over the ranks turns
+    into the micro-batch's global mean; its denominator is one, so the
+    window's rescale is by one.
 
     Args:
         program: The program as the backend wrapped it; its forward runs
@@ -455,7 +462,7 @@ class DataParallelRunner:
         with self.backend.accumulation_context(is_boundary=is_boundary):
             with self._replayed_rng():
                 result = self._forward(batch, ctx, **replay)
-            numerator, denominator = result.numerator, result.denominator
+            numerator, denominator = self._loss_terms(result)
             if numerator.numel() != 1 or denominator.numel() != 1:
                 raise ValueError("the loss numerator and denominator must be scalars")
             ratio_metrics = dict(result.ratios)
@@ -477,6 +484,38 @@ class DataParallelRunner:
                 )
             loss = numerator.reshape(()) / ctx.accumulation_steps
             self.backend.backward(loss, is_boundary=is_boundary)
+
+    def _loss_terms(
+        self, result: "ObjectiveResult"
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One micro-batch's loss numerator and denominator under the declared reduction."""
+        pooled = self.spec.reduction == "microbatch"
+        if pooled != bool(result.terms):
+            raise ValueError(
+                f"{self.spec.name} declares the {self.spec.reduction!r} reduction "
+                f"and returned {len(result.terms)} loss terms from a training call"
+            )
+        if not pooled:
+            return result.numerator, result.denominator
+        # Every rank holds the same terms in the same order. Each denominator
+        # is reduced on its own, in its own dtype and shape: a packed
+        # reduction rounds in one dtype and may sum the ranks of each element
+        # in another order. It is never differentiated.
+        pooled_denominators = [
+            self.reduce_sum(denominator.detach().clone())
+            for _, _, denominator in result.terms
+        ]
+        world_size = self._world_size()
+        loss = sum(
+            coefficient
+            * (world_size * numerator / denominator.where(denominator > 0, 1))
+            for (coefficient, numerator, _), denominator in zip(
+                result.terms, pooled_denominators
+            )
+        )
+        # The window counts its micro-batches with this one, in a dtype that
+        # holds the count whatever the terms' is.
+        return loss, torch.ones((), device=pooled_denominators[0].device)
 
     def apply_step(self, pending: PendingStep) -> StepMetrics:
         if pending is not self._pending:

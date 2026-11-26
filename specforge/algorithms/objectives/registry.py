@@ -62,6 +62,15 @@ class TrainingRequirements:
     #: Whether evaluation runs the objective's diagnostics, for an objective
     #: whose evaluation reports them.
     evaluation_diagnostics: bool = False
+    #: How a runner normalizes the loss: "window" pools one denominator over
+    #: the optimizer window and the ranks; "microbatch" pools every term's
+    #: denominator over the ranks of each micro-batch (the protocol's batches
+    #: use the "global_microbatch" reduction).
+    reduction: str = "window"
+
+    def __post_init__(self):
+        if self.reduction not in ("window", "microbatch"):
+            raise ValueError(f"unknown reduction: {self.reduction!r}")
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.algorithms.objectives.execution import execute_batch
 from specforge.algorithms.objectives.execution_options import LossExecution
 from specforge.algorithms.objectives.implementations import domino_ce  # noqa: F401
@@ -29,9 +30,10 @@ from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
 from specforge.algorithms.objectives.plan import LossPlan, LossTerm
 from specforge.algorithms.objectives.predictions import PredictionBatch, Predictions
 from specforge.algorithms.objectives.projection import LinearProjection, Projection
+from specforge.algorithms.objectives.reductions import PlanResult
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
-from tests.test_runtime._fixtures import fake_spec
+from tests.test_runtime._fixtures import FakeProgram, fake_spec
 
 
 def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
@@ -44,13 +46,19 @@ def run(prediction, *, fused=False, chunk=0, reduction="sum_means"):
     )
 
 
-class DistributedPlan(nn.Module):
+class DistributedPlan(FakeProgram):
+    """A program whose terms each keep a denominator of their own."""
+
+    inputs = ("hidden", "labels", "mask", "other")
+
     def __init__(self, scalar=False):
         super().__init__()
         self.scalar = scalar
         self.head = nn.Linear(4, 9).double()
 
-    def forward(self, hidden, labels, mask, other):
+    def forward(self, tensors, **context):
+        hidden, labels, mask, other = (tensors[name] for name in self.inputs)
+
         def compute(calc):
             calc.run((0,))
             calc.run((1,))
@@ -78,11 +86,14 @@ class DistributedPlan(nn.Module):
                 ),
             ),
         )
-        return run(prediction, chunk=1, reduction="global_microbatch").loss
+        return run(prediction, chunk=1, reduction="global_microbatch")
 
 
 def distributed_reduction(rank, rendezvous):
-    from torch.nn.parallel import DistributedDataParallel
+    from specforge.runtime.contracts import TrainBatch
+    from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+    from specforge.training.contracts import StepContext
+    from specforge.training.runner import DataParallelRunner
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     try:
@@ -91,7 +102,20 @@ def distributed_reduction(rank, rendezvous):
             model = DistributedPlan(scalar=scalar)
             reference = nn.Linear(4, 9).double()
             reference.load_state_dict(model.head.state_dict())
-            wrapped = DistributedDataParallel(model)
+            backend = FSDPTrainingBackend(
+                ParallelConfig(world_size=2, sharding_strategy="NO_SHARD"),
+                optimizer_factory=lambda module: torch.optim.SGD(
+                    module.parameters(), lr=0.1
+                ),
+            )
+            # The runner pools each term's denominator over the two ranks,
+            # between every forward and its backward.
+            runner = DataParallelRunner(
+                backend.prepare_model(model),
+                backend,
+                fake_spec(*model.inputs, reduction="microbatch"),
+            )
+            ctx = StepContext(accumulation_steps=2)
             expected = 0
             for step in range(2):
                 hidden = torch.arange(24, dtype=torch.float64).reshape(6, 1, 4) / (
@@ -101,9 +125,20 @@ def distributed_reduction(rank, rendezvous):
                 mask = torch.tensor([0, 0, 0, 1, 0.5, 1.0])[:, None]
                 other = torch.tensor([1, 0, 1, 0, 0.2, 0])[:, None]
                 part = slice(rank * 3, (rank + 1) * 3)
-                (
-                    wrapped(hidden[part], labels[part], mask[part], other[part]) / 2
-                ).backward()
+                runner.forward_backward(
+                    TrainBatch(
+                        [str(step)],
+                        "test",
+                        {
+                            name: tensor[part]
+                            for name, tensor in zip(
+                                model.inputs, (hidden, labels, mask, other)
+                            )
+                        },
+                    ),
+                    ctx,
+                    is_boundary=step == 1,
+                )
                 values = TokenLoss(kind="ce")(reference(hidden), labels)
                 expected = (
                     expected
@@ -123,7 +158,7 @@ def distributed_reduction(rank, rendezvous):
                 tuple(p.grad for p in reference.parameters()),
             )
             # Release DDP reducers and their autograd graphs while Gloo is alive.
-            del wrapped, model, expected
+            del runner, backend, model, expected
             gc.collect()
         # Ranks resolve independently; the runner's agreement sees a mismatch.
 
@@ -131,8 +166,6 @@ def distributed_reduction(rank, rendezvous):
             ExecutionSelection,
             Implementation,
         )
-        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
-        from specforge.training.runner import DataParallelRunner
 
         runner = DataParallelRunner(
             SimpleNamespace(), FSDPTrainingBackend(ParallelConfig()), fake_spec()
@@ -169,6 +202,27 @@ def distributed_reduction(rank, rendezvous):
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+class PlanResultTest(unittest.TestCase):
+    def test_per_term_normalization_never_differentiates_a_denominator(self):
+        weight = torch.tensor(2.0, requires_grad=True)
+        plan = PlanResult((ObjectiveResult(weight, weight),), (1.0,), False, {})
+        result = plan.objective_result(normalize=True, with_terms=True)
+        result.loss.backward()
+        # d/dw of w / 2 with the denominator held, not of w / w.
+        self.assertEqual(weight.grad.item(), 0.5)
+        ((coefficient, numerator, denominator),) = result.terms
+        self.assertEqual(coefficient, 1.0)
+        self.assertIs(numerator, weight)
+        self.assertFalse(denominator.requires_grad)
+
+    def test_terms_come_with_per_term_normalization_only(self):
+        one = torch.ones(())
+        plan = PlanResult((ObjectiveResult(one, one),), (1.0,), True, {})
+        with self.assertRaisesRegex(ValueError, "per-term normalization only"):
+            plan.objective_result(with_terms=True)
+        self.assertEqual(plan.objective_result().terms, ())
 
 
 class LossPlanTest(unittest.TestCase):

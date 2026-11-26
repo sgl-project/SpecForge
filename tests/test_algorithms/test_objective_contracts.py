@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from specforge.algorithms.objectives import build_objective_model
-from specforge.algorithms.objectives.base import ObjectiveResult, microbatch_mean
+from specforge.algorithms.objectives.base import ObjectiveResult
 from specforge.algorithms.objectives.execution import evaluate_predictions
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.algorithms.objectives.losses import PositionWeighting, TokenLoss
@@ -49,17 +49,9 @@ def build_runtime(architecture, *, dtype=None, **selection):
 
 
 class ObjectiveContractTest(unittest.TestCase):
-    def test_fractional_denominator_and_microbatch_mean(self):
+    def test_fractional_denominator_and_default_weighting(self):
         first = ObjectiveResult(torch.tensor(0.6), torch.tensor(0.2))
-        second = ObjectiveResult(torch.tensor(10.0), torch.tensor(2.0))
         self.assertAlmostEqual(first.loss.item(), 3)
-        means = [microbatch_mean(x) for x in (first, second)]
-        self.assertAlmostEqual(
-            (
-                sum(x.numerator for x in means) / sum(x.denominator for x in means)
-            ).item(),
-            4,
-        )
         self.assertEqual(
             ObjectiveResult(torch.tensor(0.0), torch.tensor(0.0)).loss.item(), 0
         )
@@ -614,6 +606,36 @@ class ObjectiveContractTest(unittest.TestCase):
     def test_dspark_returns_a_per_microbatch_mean(self):
         """Microbatches are averaged as means, like main, not pooled by token."""
         config, runtime = build_runtime("DSparkDraftModel")
-        result = runtime(training_batch(config), step=0, total_steps=1)
+        batch = training_batch(config)
+        torch.manual_seed(3)
+        result = runtime(batch, step=0, total_steps=1)
         self.assertEqual(result.denominator.item(), 1)
         torch.testing.assert_close(result.loss, result.numerator)
+        # A training call also hands every term to the runner, which pools
+        # each denominator over the ranks; on one rank that is this loss.
+        self.assertEqual(runtime.registration.training.reduction, "microbatch")
+        self.assertEqual(len(result.terms), 2)
+        self.assertTrue(all(not d.requires_grad for _, _, d in result.terms))
+        torch.testing.assert_close(
+            sum(c * n / d for c, n, d in result.terms), result.loss, rtol=0, atol=0
+        )
+        # A protocol whose batches contradict its declaration is refused where
+        # both are in hand, in evaluation as well.
+        registration = runtime.registration
+        runtime.registration = replace(
+            registration, training=replace(registration.training, reduction="window")
+        )
+        for mode in (runtime.train, runtime.eval):
+            mode()
+            with self.assertRaisesRegex(
+                ValueError, "declares the 'window' reduction and returned a 'global_"
+            ):
+                runtime(batch, step=0, total_steps=1)
+        runtime.registration = registration
+        # Outside training every term is normalized on its own rank.
+        runtime.eval()
+        torch.manual_seed(3)
+        with torch.no_grad():
+            evaluated = runtime(batch, step=0, total_steps=1)
+        self.assertEqual(evaluated.terms, ())
+        self.assertEqual(evaluated.denominator.item(), 1)

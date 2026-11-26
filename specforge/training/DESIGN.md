@@ -26,10 +26,11 @@ counting, interval checkpoints, and durable acknowledgements. The step frame
 runner sees its micro-batches. `DataParallelRunner` executes each micro-batch
 and applies the update: it issues the step's collectives across samples (the
 loss denominator, the window's metrics, the replay statistics), normalizes the
-gradients and owns the RNG. One collective of a step is still issued elsewhere:
-an objective with the `global_microbatch` reduction (DSpark) reduces each
-term's denominator itself, inside the forward
-(`algorithms.objectives.base.microbatch_mean`). The program the runner calls
+gradients and owns the RNG. That includes the `microbatch` reduction (DSpark,
+whose protocol batches are `global_microbatch`): the objective returns its loss
+terms and the runner pools each term's denominator over the ranks between the
+forward and the backward. No objective issues a collective across samples. The
+program the runner calls
 is the objective model itself (`algorithms.objectives.base.ObjectiveModel`): it
 owns the forward and the loss, the target projection, the host-side inputs it
 derives from a batch, and the mapping from a training state dict to the draft's
