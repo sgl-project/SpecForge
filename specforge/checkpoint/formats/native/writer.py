@@ -11,9 +11,9 @@ from safetensors.torch import save_file
 
 from specforge.checkpoint.initialization import resolve_bindings
 from specforge.checkpoint.native import resolve_native_target
-from specforge.checkpoint.resolve import resolve_directory
+from specforge.checkpoint.resolve import resolve_directory, target_configuration
 from specforge.checkpoint.tensors import TensorStore
-from specforge.checkpoint.weight_plan import _validate_unquantized
+from specforge.checkpoint.weight_plan import _QUANTIZED_DTYPES, _validate_unquantized
 
 
 def require(condition, message):
@@ -25,7 +25,7 @@ def export_native(config, state, target, output, *, copy_target=False):
     require(target is not None, "native export requires --target-model")
     source = resolve_directory(target)
     payload = json.loads((source / "config.json").read_text())
-    text = payload.get("text_config", payload)
+    text = target_configuration(source)
     native = resolve_native_target(config, text)
     require(
         not payload.get("quantization_config") and not text.get("quantization_config"),
@@ -53,7 +53,8 @@ def write_native(
     Family implementations supply the complete destination names and payload.
     binding_names maps each draft binding to its destination checkpoint key.
     """
-    text = payload.get("text_config", payload)
+    text = target_configuration(source)
+    weights = dict(weights)
     store = TensorStore(source)
     require(
         all(path.suffix == ".safetensors" for path in store.files.values()),
@@ -70,6 +71,10 @@ def write_native(
     shapes.update(
         {binding_names[name]: ref.info.shape for name, ref in bindings.items()}
     )
+    dtypes = {name: value.dtype for name, value in weights.items()}
+    dtypes.update(
+        {binding_names[name]: ref.info.dtype for name, ref in bindings.items()}
+    )
     previous = {
         name: info for name, info in store.metadata.items() if name.startswith(prefix)
     }
@@ -79,10 +84,19 @@ def write_native(
         not missing and not added,
         f"native weight coverage differs: missing={sorted(missing)}, unexpected={sorted(added)}",
     )
+    for name, value in weights.items():
+        require(
+            value.dtype not in _QUANTIZED_DTYPES and value.dtype.is_floating_point,
+            f"{name}: native export requires unquantized floating draft weights, got {value.dtype}",
+        )
     for name, info in previous.items():
         require(
             shapes[name] == info.shape,
             f"native weight shape differs for {name}: {shapes[name]} != {info.shape}",
+        )
+        require(
+            dtypes[name] == info.dtype,
+            f"native weight dtype differs for {name}: {dtypes[name]} != {info.dtype}",
         )
     for name, ref in bindings.items():
         weights[binding_names[name]] = ref.read()
