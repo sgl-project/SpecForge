@@ -114,6 +114,7 @@ QUERIES = tuple(
         "get_world_size",
         "is_available",
         "is_initialized",
+        "tensor.DTensor",
     )
 )
 
@@ -131,6 +132,10 @@ def _counted(name: str) -> bool:
 #: of the package brings: every use of a helper counts as the group reads in
 #: its body.
 EXCEPTED_COLLECTIVES = {
+    "specforge/modeling/draft/bindings.py": Excepted(
+        "checks whether an FSDP-wrapped target weight is a DTensor",
+        reads=(f"{_T}.tensor.DTensor",),
+    ),
     # The sequence-parallel axis: ranks of one group share a sequence, never
     # samples.
     "specforge/modeling/draft/models/eagle_rollout.py": Excepted(

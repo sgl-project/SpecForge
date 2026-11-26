@@ -1,14 +1,136 @@
 """Frozen target token modules; tensor installation only, without file I/O."""
 
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils._python_dispatch import (
+    TorchDispatchMode,
+    is_traceable_wrapper_subclass,
+)
+from torch.utils._pytree import tree_leaves
 
 from specforge.config.draft._validation import positive_int
 from specforge.config.draft.logits import TargetLogitSpec
 
 from .layers.logits import TargetLogitTransform
 from .layers.registry import build_component
+
+_VALUE_PRESERVING_APPLY_OPS = frozenset(
+    {
+        torch.ops.aten._pin_memory.default,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.alias.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.contiguous.default,
+        torch.ops.aten.detach.default,
+        torch.ops.aten.lift_fresh.default,
+        torch.ops.aten.to.device,
+        torch.ops.aten.to.dtype,
+        torch.ops.aten.to.dtype_layout,
+        torch.ops.aten.to.other,
+    }
+)
+
+
+@dataclass(frozen=True)
+class _TensorState:
+    storage_key: tuple[int, torch.device]
+    offset: int
+    shape: torch.Size
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+    mesh: object = None
+    placements: tuple | None = None
+    storage: object = field(default=None, compare=False, hash=False, repr=False)
+
+
+def _tensor_state(tensor: Tensor) -> _TensorState | None:
+    local = tensor
+    mesh = placements = None
+    if is_traceable_wrapper_subclass(tensor):
+        from torch.distributed.tensor import DTensor
+
+        if not isinstance(tensor, DTensor):
+            return None
+        local = tensor._local_tensor
+        mesh = tensor.device_mesh
+        placements = tensor.placements
+    if local.is_meta or local.layout != torch.strided:
+        return None
+    storage = local.untyped_storage()
+    return _TensorState(
+        storage_key=(storage.data_ptr(), storage.device),
+        offset=local.storage_offset(),
+        shape=tensor.shape,
+        stride=local.stride(),
+        dtype=tensor.dtype,
+        mesh=mesh,
+        placements=placements,
+        storage=storage,
+    )
+
+
+class _ValuePreservingApply(TorchDispatchMode):
+    def __init__(self, source: Tensor, initial_state: _TensorState):
+        self.dtype = source.dtype
+        self.shape = source.shape
+        self.placements = initial_state.placements
+        self.approved: set[_TensorState] = set()
+        self.storage_keys: set[tuple[int, torch.device]] = set()
+        self.tracked_ids: set[int] = set()
+        # Keep tracked tensors alive so Python ids cannot be recycled during fn().
+        self._keepalive: list[Tensor] = []
+        self._record(source, initial_state)
+        self.mutated = False
+
+    def _record(self, tensor: Tensor, state: _TensorState) -> None:
+        self.approved.add(state)
+        self.storage_keys.add(state.storage_key)
+        self.tracked_ids.add(id(tensor))
+        self._keepalive.append(tensor)
+
+    def _aliases_tracked(self, tensor: Tensor) -> bool:
+        if id(tensor) in self.tracked_ids:
+            return True
+        state = _tensor_state(tensor)
+        return state is not None and state.storage_key in self.storage_keys
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func._schema.is_mutable:
+            if any(
+                isinstance(leaf, Tensor) and self._aliases_tracked(leaf)
+                for leaf in tree_leaves((args, kwargs))
+            ):
+                self.mutated = True
+            return func(*args, **kwargs)
+        source_state = (
+            _tensor_state(args[0])
+            if func in _VALUE_PRESERVING_APPLY_OPS
+            and args
+            and isinstance(args[0], Tensor)
+            else None
+        )
+        result = func(*args, **kwargs)
+        if source_state is None or source_state not in self.approved:
+            return result
+        result_state = _tensor_state(result)
+        if (
+            result_state is not None
+            and result_state.shape == self.shape
+            and result_state.dtype == self.dtype
+            and result_state.placements == self.placements
+        ):
+            self._record(result, result_state)
+        return result
+
+    def is_preserved(self, tensor: Tensor) -> bool:
+        if self.mutated or not isinstance(tensor, Tensor):
+            return False
+        state = _tensor_state(tensor)
+        return state is not None and state in self.approved
 
 
 class _TargetWeight(nn.Module):
@@ -66,11 +188,28 @@ class _TargetWeight(nn.Module):
         self._bound = True
 
     def _apply(self, fn, recurse=True):
+        if not self._bound:
+            return super()._apply(fn, recurse=recurse)
         weight = self.weight
-        dtype, storage = weight.dtype, weight.untyped_storage()
-        result = super()._apply(fn, recurse=recurse)
-        if self.weight.dtype != dtype or self.weight.untyped_storage() is not storage:
-            self._bound = False
+        initial_state = _tensor_state(weight)
+        self._bound = False
+        if initial_state is None:
+            return super()._apply(fn, recurse=recurse)
+        tracker = None
+        preserved = False
+
+        def tracked(tensor):
+            nonlocal tracker, preserved
+            if tensor is not weight:
+                return fn(tensor)
+            with _ValuePreservingApply(tensor, initial_state) as tracker:
+                applied = fn(tensor)
+            preserved = tracker.is_preserved(applied)
+            return applied
+
+        result = super()._apply(tracked, recurse=recurse)
+        if preserved and tracker.is_preserved(self.weight):
+            self._bound = True
         return result
 
     def bound_weight(self) -> Tensor:
