@@ -290,8 +290,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 constructed["parallel"] = parallel
                 constructed["kw"] = kw
 
-            def prepare_model(self, model, *, optimizer_target, frozen, blocks):
-                constructed["prepare_model"] = (model, optimizer_target, frozen, blocks)
+            def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
+                constructed["prepare_model"] = (
+                    model,
+                    optimizer_target,
+                    frozen_modules,
+                    blocks,
+                )
                 return "WRAPPED_FSDP2"
 
             def close(self):

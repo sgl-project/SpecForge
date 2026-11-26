@@ -726,11 +726,7 @@ class FSDPTrainingBackend(TrainingBackend):
             # This rank's own state: its failure is this rank's alone.
             opt_state = state.get("optimizer")
             if opt_state is not None:
-                if (
-                    self.name == "fsdp"
-                    and isinstance(opt_state, Mapping)
-                    and "parameters_are_masters" in opt_state
-                ):
+                if self.name == "fsdp" and "parameters_are_masters" in opt_state:
                     raise ValueError(
                         "this optimizer state was written by the fsdp2 runtime; "
                         "resume it with training.runtime=fsdp2"

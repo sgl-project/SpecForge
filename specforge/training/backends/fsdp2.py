@@ -120,8 +120,6 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
     def close(self) -> None:
         """Destroy any auxiliary mesh subgroups created for ``NO_SHARD``."""
         groups, self._owned_groups = self._owned_groups, ()
-        if not (dist.is_available() and dist.is_initialized()):
-            return
         for group in groups:
             dist.destroy_process_group(group)
 
@@ -184,6 +182,12 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             for module in model.modules()
             if type(module).__name__ in blocks
         }
+        # As the reference runtime: names that match nothing would train the
+        # program as one root unit.
+        if blocks and not block_classes:
+            raise ValueError(
+                f"blocks {sorted(blocks)} name no module class of the model"
+            )
         # Wrap blocks bottom-up so nested _no_split_modules claim inner blocks
         # before their enclosing modules, and keep root reshard_after_forward=False
         # so FULL_SHARD does not immediately re-gather the root group for backward.
@@ -215,21 +219,20 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
 
         if self._max_grad_norm is None:
             raise ValueError("optimizer_spec requires max_grad_norm")
+        if self._scheduler_spec is None:
+            raise ValueError("optimizer_spec requires scheduler_spec")
         optimizer = build_optimizer(target, self._optimizer_spec)
-        scheduler = (
-            build_lr_scheduler(optimizer, self._scheduler_spec)
-            if self._scheduler_spec is not None
-            else None
+        self.set_optimizer(
+            optimizer, scheduler=build_lr_scheduler(optimizer, self._scheduler_spec)
         )
-        self.set_optimizer(optimizer, scheduler=scheduler)
 
     def _mesh(self, device: torch.device):
         from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
         group = self.parallel_config.fsdp_process_group
-        world = dist.get_world_size(group) if dist.is_initialized() else 1
+        world = dist.get_world_size(group)
         if self.parallel_config.sharding_strategy == "NO_SHARD":
-            if dist.is_initialized() and world != dist.get_world_size():
+            if world != dist.get_world_size():
                 raise ValueError(
                     "the fsdp2 runtime replicates (NO_SHARD) over every rank of the "
                     f"job; its group has {world} of {dist.get_world_size()}"
@@ -243,7 +246,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             seen = {id(dist.group.WORLD)}
             for dim in ("replicate", "shard"):
                 sub = mesh.get_group(dim)
-                if sub is not None and id(sub) not in seen:
+                if id(sub) not in seen:
                     seen.add(id(sub))
                     owned.append(sub)
             self._owned_groups = tuple(owned)
@@ -313,7 +316,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             self.module,
             options=StateDictOptions(full_state_dict=True, cpu_offload=True),
         )
-        if dist.is_initialized() and dist.get_rank() != 0:
+        if dist.get_rank() != 0:
             model = {}
         try:
             # Rounded as a cast rounds. This rank's own work, past the gather.
