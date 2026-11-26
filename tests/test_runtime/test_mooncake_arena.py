@@ -398,6 +398,10 @@ class ArenaStoreFactoryTest(unittest.TestCase):
             store = _mooncake_store(self._cfg("cuda"))
             self.assertIsInstance(store._store, ArenaObjectClient)
             self.assertEqual(store.receive_buffers, "cuda")
+            self.assertTrue(store._close_store)
+            with mock.patch.object(store._store, "close", return_value=0) as close_mock:
+                store.close()
+                close_mock.assert_called_once_with()
             with self.assertRaisesRegex(ValueError, "receive_buffers=cuda"):
                 _mooncake_store(self._cfg("pinned"))
 
