@@ -356,9 +356,18 @@ class Trainer:
                         sorted(step_options.items())
                     )
             # Checkpoints written before anchor_sampling existed drew anchors
-            # on the device.
-            if "canonical_anchor_sampling" not in state:
-                state = {**state, "canonical_anchor_sampling": "device"}
+            # on the device; pre-registry checkpoints used AdamW, the default
+            # param-group policy, min_lr_ratio=0.0, and no extra options.
+            for legacy_key, legacy_default in (
+                ("canonical_anchor_sampling", "device"),
+                ("canonical_optimizer", "adamw"),
+                ("canonical_param_group_policy", "default"),
+                ("canonical_optimizer_options", {}),
+                ("canonical_lr_scheduler_min_lr_ratio", 0.0),
+                ("canonical_lr_scheduler_options", {}),
+            ):
+                if legacy_key not in state:
+                    state = {**state, legacy_key: legacy_default}
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
             saved_loss = state.get("canonical_loss")

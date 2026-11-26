@@ -313,6 +313,104 @@ def registered_optimizers() -> Tuple[str, ...]:
     return tuple(sorted(_OPTIMIZERS))
 
 
+def validate_optimizer_spec(spec: OptimizerSpec) -> None:
+    """Validate optimizer and parameter-group policy names and built-in options."""
+    if spec.kind not in _OPTIMIZERS:
+        raise ValueError(
+            f"unsupported optimizer={spec.kind!r}; expected one of {sorted(_OPTIMIZERS)}"
+        )
+    if spec.param_group_policy not in _PARAM_GROUP_POLICIES:
+        raise ValueError(
+            f"unsupported param_group_policy={spec.param_group_policy!r}; "
+            f"expected one of {sorted(_PARAM_GROUP_POLICIES)}"
+        )
+    if spec.kind == "adamw" and spec.extra:
+        raise ValueError(
+            f"adamw optimizer accepts no extra options, got {sorted(spec.extra)}"
+        )
+
+
+def optimizer_resume_metadata(
+    *,
+    optimizer_spec: Optional[OptimizerSpec] = None,
+    scheduler_spec: Optional[SchedulerSpec] = None,
+) -> Dict[str, Any]:
+    """Build checkpoint resume metadata for optimizer/scheduler configuration."""
+    meta: Dict[str, Any] = {}
+    if optimizer_spec is not None:
+        meta["optimizer_type"] = optimizer_spec.kind
+        meta["param_group_policy"] = optimizer_spec.param_group_policy
+        meta["optimizer_options"] = dict(optimizer_spec.extra)
+    if scheduler_spec is not None:
+        meta["lr_scheduler_type"] = scheduler_spec.kind
+        meta["lr_scheduler_min_lr_ratio"] = float(scheduler_spec.min_lr_ratio)
+        meta["lr_scheduler_options"] = dict(scheduler_spec.extra)
+    return meta
+
+
+def validate_optimizer_resume_metadata(
+    state_dict: Mapping[str, Any],
+    *,
+    optimizer_spec: Optional[OptimizerSpec] = None,
+    scheduler_spec: Optional[SchedulerSpec] = None,
+    default_scheduler_type: Optional[str] = "cosine",
+) -> None:
+    """Refuse resuming across incompatible optimizer or LR-scheduler settings.
+
+    Missing keys fall back to pre-registry legacy defaults (``adamw``,
+    ``default`` policy, ``cosine`` scheduler with ``min_lr_ratio=0.0`` and no
+    extra options) so legacy checkpoints remain resumable while catching any
+    configuration drift—including switching ``cosine`` between
+    ``min_lr_ratio == 0.0`` (``CosineAnnealingWarmupLR``) and ``> 0.0``
+    (``FunctionalLRScheduler``).
+    """
+    if optimizer_spec is not None:
+        saved_opt = state_dict.get("optimizer_type", "adamw")
+        if saved_opt != optimizer_spec.kind:
+            raise ValueError(
+                f"checkpoint optimizer used optimizer={saved_opt!r} but this run "
+                f"has optimizer={optimizer_spec.kind!r}"
+            )
+        saved_policy = state_dict.get("param_group_policy", "default")
+        if saved_policy != optimizer_spec.param_group_policy:
+            raise ValueError(
+                "checkpoint optimizer used param_group_policy="
+                f"{saved_policy!r} but this run has "
+                f"param_group_policy={optimizer_spec.param_group_policy!r}"
+            )
+        saved_opt_extra = dict(state_dict.get("optimizer_options") or {})
+        live_opt_extra = dict(optimizer_spec.extra)
+        if saved_opt_extra != live_opt_extra:
+            raise ValueError(
+                "checkpoint optimizer used optimizer_options="
+                f"{saved_opt_extra!r} but this run has "
+                f"optimizer_options={live_opt_extra!r}"
+            )
+    if scheduler_spec is not None:
+        saved_sched = state_dict.get("lr_scheduler_type", default_scheduler_type)
+        if saved_sched != scheduler_spec.kind:
+            raise ValueError(
+                "checkpoint optimizer used lr_scheduler="
+                f"{saved_sched!r} but this run has "
+                f"lr_scheduler={scheduler_spec.kind!r}"
+            )
+        saved_min_lr = float(state_dict.get("lr_scheduler_min_lr_ratio", 0.0))
+        if saved_min_lr != float(scheduler_spec.min_lr_ratio):
+            raise ValueError(
+                "checkpoint optimizer used lr_scheduler_min_lr_ratio="
+                f"{saved_min_lr!r} but this run has "
+                f"lr_scheduler_min_lr_ratio={float(scheduler_spec.min_lr_ratio)!r}"
+            )
+        saved_sched_extra = dict(state_dict.get("lr_scheduler_options") or {})
+        live_sched_extra = dict(scheduler_spec.extra)
+        if saved_sched_extra != live_sched_extra:
+            raise ValueError(
+                "checkpoint optimizer used lr_scheduler_options="
+                f"{saved_sched_extra!r} but this run has "
+                f"lr_scheduler_options={live_sched_extra!r}"
+            )
+
+
 def build_optimizer(
     target: nn.Module | Iterable[Tuple[str, nn.Parameter]],
     spec: OptimizerSpec,
@@ -384,6 +482,8 @@ class BF16Optimizer:
                 warmup_ratio=warmup_ratio,
             )
         )
+        self._optimizer_spec = opt_spec
+        self._scheduler_spec = sched_spec
         self.model = model
         named_trainable = [
             (name, p) for name, p in model.named_parameters() if p.requires_grad
@@ -581,13 +681,12 @@ class BF16Optimizer:
                 "this optimizer state was written by the fsdp2 runtime; "
                 "resume it with training.runtime=fsdp2"
             )
-        saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
-        if saved_scheduler_type != self.lr_scheduler_type:
-            raise ValueError(
-                "checkpoint optimizer used lr_scheduler="
-                f"{saved_scheduler_type!r} but this run has "
-                f"lr_scheduler={self.lr_scheduler_type!r}"
-            )
+        validate_optimizer_resume_metadata(
+            state_dict,
+            optimizer_spec=self._optimizer_spec,
+            scheduler_spec=self._scheduler_spec,
+            default_scheduler_type="cosine",
+        )
         saved_max_grad_norm = state_dict.get("max_grad_norm")
         if saved_max_grad_norm is not None and float(saved_max_grad_norm) != float(
             self.max_grad_norm
@@ -633,7 +732,10 @@ class BF16Optimizer:
         return {
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
-            "lr_scheduler_type": self.lr_scheduler_type,
+            **optimizer_resume_metadata(
+                optimizer_spec=self._optimizer_spec,
+                scheduler_spec=self._scheduler_spec,
+            ),
             "max_grad_norm": self.max_grad_norm,
             # rank-local fp32 masters; without them a resume re-quantizes from bf16
             "fp32_params": [t.detach().cpu() for t in self.fp32_params],
@@ -665,10 +767,13 @@ __all__ = [
     "like_parameter",
     "local_tensor",
     "master_dtype_of",
+    "optimizer_resume_metadata",
     "register_optimizer",
     "register_param_group_policy",
     "registered_optimizers",
     "registered_param_group_policies",
     "restore_optimizer_kernel_state",
+    "validate_optimizer_resume_metadata",
+    "validate_optimizer_spec",
     "validate_step_scalars",
 ]

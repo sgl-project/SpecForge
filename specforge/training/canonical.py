@@ -136,11 +136,13 @@ def resolve_run(cfg, *, target_config=None):
         cfg.training.anchor_sampling,
         cfg.training.seed,
     )
-    from specforge.lr_scheduler import registered_lr_schedulers
+    from specforge.lr_scheduler import registered_lr_schedulers, validate_scheduler_spec
     from specforge.optimizer import (
         registered_optimizers,
         registered_param_group_policies,
+        validate_optimizer_spec,
     )
+    from specforge.training.contracts import OptimizerSpec, SchedulerSpec
 
     if cfg.training.optimizer not in registered_optimizers():
         raise ValueError(
@@ -158,6 +160,26 @@ def resolve_run(cfg, *, target_config=None):
             f"unsupported training.lr_scheduler={cfg.training.lr_scheduler!r}; "
             f"expected one of {list(registered_lr_schedulers())}"
         )
+    validate_optimizer_spec(
+        OptimizerSpec(
+            kind=cfg.training.optimizer,
+            lr=cfg.training.learning_rate,
+            weight_decay=cfg.training.weight_decay,
+            param_group_policy=cfg.training.param_group_policy,
+            offload_master=cfg.training.optimizer_cpu_offload,
+            extra=dict(cfg.training.optimizer_options),
+        )
+    )
+    validate_scheduler_spec(
+        SchedulerSpec(
+            kind=cfg.training.lr_scheduler,
+            total_steps=cfg.training.total_steps or cfg.training.max_steps,
+            warmup_ratio=cfg.training.warmup_ratio,
+            min_lr_ratio=cfg.training.min_lr_ratio,
+            extra=dict(cfg.training.lr_scheduler_options),
+        ),
+        require_total_steps=False,
+    )
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
@@ -614,6 +636,11 @@ def build_bundle(cfg, algorithm, topology):
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,
+        "canonical_optimizer": cfg.training.optimizer,
+        "canonical_param_group_policy": cfg.training.param_group_policy,
+        "canonical_optimizer_options": dict(cfg.training.optimizer_options),
+        "canonical_lr_scheduler_min_lr_ratio": float(cfg.training.min_lr_ratio),
+        "canonical_lr_scheduler_options": dict(cfg.training.lr_scheduler_options),
     }
     from specforge.training.provenance import model_resume_provenance
 
