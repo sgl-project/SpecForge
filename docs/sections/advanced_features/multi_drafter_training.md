@@ -440,6 +440,49 @@ The gap costs about 7% at `c = 2`, which also explains why `c = 2` ran 6-9%
 below `c = 4` on B200. Releasing early recovers most of it, and `c = 3` all of
 it.
 
+### Writing straight from the GPU
+
+Over TCP the plugin first copies captures to pinned host memory, and Mooncake
+then copies them into the store on one CPU thread. Mooncake can also take GPU
+pointers: its copy thread then calls `cudaMemcpy` device to host, and if the
+store segment is pinned, the GPU's copy engine writes into it directly.
+
+```text
+default:     GPU -> pinned buffer -> memcpy, one CPU thread -> segment
+GPU-direct:  GPU -> cudaMemcpy, DMA over PCIe -> pinned segment
+```
+
+This was tried on the B300 host with a one-line plugin change that lets
+`SGLANG_SPEC_CAPTURE_GPU_PUT=1` run over TCP, plus
+`MC_STORE_PIN_MEMORY_MAX_BYTES` above the segment size, so Mooncake pins the
+segment with `cudaHostRegister`:
+
+```text
+B300, samples/s                  c=2     c=4     W at c=4
+dflash + dspark, memcpy          55.0    59.2    132 ms
+dflash + dspark, TCP x16         72.0    80.4     71 ms
+dflash + dspark, GPU-direct      77.1    84.9     61 ms
+dspark, memcpy                   74.7    83.1     75 ms
+dspark, GPU-direct               87.4    88.2     41 ms
+```
+
+- At `c = 4` capture reaches the forward limit with one or two drafters. The
+  copy itself takes about 17 ms of the 61; most of the rest is Mooncake
+  registering and unregistering the batch's buffers, since each call sends the
+  client's whole buffer list to the metadata server.
+- Costs: pinning the 48 GiB segment takes about 15 s at the first write and keeps
+  that host memory locked, and captures stay on the GPU until written (at most
+  1.4 GiB more). Trainer speed and loss did not change.
+- With one drafter, `c = 2` matched `c = 4`. The scheduler checks held responses
+  once per forward, about 34 ms after the previous forward ends, right after it
+  launches the next prefill. A 29 ms write makes that check and is released
+  mid-forward, so the SGLang gap closes. This is a race, not a fix: with two
+  drafters the write takes 56 ms and the gap stays.
+
+The recipe refuses `gpu_put` over TCP, so the test set the variables by hand.
+Supporting it needs the plugin rule limited to a local segment with `memcpy`,
+the config check relaxed, and the launcher setting the pin size.
+
 ### Choosing `c`
 
 `c` is `runtime.producer_concurrency`, set per rollout worker. Use `c = 3` or
