@@ -2,8 +2,9 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Optional
 
-from .base import ObjectiveModel
+from .base import ObjectiveModel, SequenceParallelGroups
 from .configuration import (
     LossConfiguration,
     loss_definitions,
@@ -272,6 +273,25 @@ def resolve_objective(
     )
 
 
+def refuse_dpace_over_sequence_shards(weighting, *, sp_size):
+    """Refuse D-PACE weighting for a sequence that is split over ranks.
+
+    Args:
+        weighting: The resolved position weighting.
+        sp_size: Number of ranks one sequence is split over.
+
+    Raises:
+        ValueError: The weighting is D-PACE and ``sp_size`` is above one.
+    """
+    from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+    if sp_size > 1 and weighting.kind in DPACE_LOSS_TYPES:
+        raise ValueError(
+            "D-PACE weighting is not supported with sequence parallelism: "
+            "chain weights are normalized within each sequence shard"
+        )
+
+
 def build_objective_model(
     draft_model,
     *,
@@ -284,7 +304,7 @@ def build_objective_model(
     weighting=None,
     frozen_modules=(),
     attention_backend=None,
-    sequence_parallel=None,
+    sequence_parallel: Optional[SequenceParallelGroups] = None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -304,8 +324,8 @@ def build_objective_model(
             protocol whose rollout depends on it.
         sequence_parallel: The process groups of the sequence-parallel axis
             (the ring group, the Ulysses group and their product, over which
-            loss statistics of one sequence are reduced), when the run has
-            one.
+            loss statistics of one sequence are reduced). Given with the
+            ``usp`` backend and with no other.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -338,13 +358,15 @@ def build_objective_model(
     if attention_backend == "usp" and sequence_parallel is None:
         raise ValueError("attention backend 'usp' needs the sequence-parallel groups")
     if sequence_parallel is not None:
-        from specforge.losses.position_weights import DPACE_LOSS_TYPES
-
-        if resolved.weighting.kind in DPACE_LOSS_TYPES:
+        if attention_backend != "usp":
             raise ValueError(
-                "D-PACE weighting is not supported with sequence parallelism: "
-                "chain weights are normalized within each sequence shard"
+                "sequence-parallel groups need attention backend 'usp', not "
+                f"{attention_backend!r}: no other backend splits the sequence, "
+                "and its loss statistics would still be reduced over the groups"
             )
+        refuse_dpace_over_sequence_shards(
+            resolved.weighting, sp_size=sequence_parallel.size
+        )
     if resolved.execution.teacher_chunk_size:
         from torch import nn
 
