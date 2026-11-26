@@ -261,21 +261,28 @@ class SQLiteMetadataStore(MetadataStore):
         optimizer_durable: bool,
     ) -> None:
         # ONE transaction commits ack ids and the optimizer marker together.
+        step_json = json.dumps(global_step) if global_step is not None else None
+        durable_json = json.dumps(bool(optimizer_durable))
         with self._lock:
-            self._conn.executemany(
-                "INSERT OR IGNORE INTO acked (sample_id) VALUES (?)",
-                [(s,) for s in sample_ids],
-            )
-            if global_step is not None:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO marker (k, v) VALUES ('global_step', ?)",
-                    (json.dumps(global_step),),
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO acked (sample_id) VALUES (?)",
+                    [(s,) for s in sample_ids],
                 )
-            self._conn.execute(
-                "INSERT OR REPLACE INTO marker (k, v) VALUES ('optimizer_durable', ?)",
-                (json.dumps(bool(optimizer_durable)),),
-            )
-            self._conn.commit()
+                if step_json is not None:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO marker (k, v) VALUES ('global_step', ?)",
+                        (step_json,),
+                    )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO marker (k, v) VALUES ('optimizer_durable', ?)",
+                    (durable_json,),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     def durable_marker(self) -> Dict[str, Any]:
         with self._lock:
