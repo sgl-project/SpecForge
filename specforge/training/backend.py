@@ -377,6 +377,14 @@ class FSDPTrainingBackend(TrainingBackend):
         )
 
     def set_optimizer(self, optimizer, *, scheduler=None) -> None:
+        if scheduler is not None and not (
+            isinstance(optimizer, torch.optim.Optimizer)
+            and self._max_grad_norm is not None
+        ):
+            raise ValueError(
+                "passing scheduler to set_optimizer requires a runtime-owned "
+                "torch.optim.Optimizer with max_grad_norm set"
+            )
         self.optimizer = optimizer
         self.scheduler = scheduler
         self._configure_optimizer_grad_norm()
@@ -435,27 +443,80 @@ class FSDPTrainingBackend(TrainingBackend):
     def _global_grad_norm(self, params: Sequence[nn.Parameter]) -> torch.Tensor:
         """Compute the pre-clip global L2 gradient norm over ``params``."""
         from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard
 
-        grads = [p.grad for p in params if p.grad is not None]
-        if not grads:
-            device = params[0].device if params else "cpu"
-            return torch.zeros((), dtype=torch.float32, device=device)
-        if any(isinstance(grad, DTensor) for grad in grads):
-            norm = torch.nn.utils.get_total_norm(grads, norm_type=2.0)
-            return norm.full_tensor() if isinstance(norm, DTensor) else norm
-        from specforge.optimizer import _sum_of_squares
+        from specforge.optimizer import _sum_of_squares, local_tensor
 
-        total_norm_sq = _sum_of_squares([grad.detach() for grad in grads])
-        if (
+        dtensor_buckets: Dict[
+            Tuple[int, Tuple[int, ...]],
+            Tuple[Any, Tuple[int, ...], Any, List[torch.Tensor]],
+        ] = {}
+        plain_params: List[nn.Parameter] = []
+        for param in params:
+            if isinstance(param, DTensor):
+                mesh = param.device_mesh
+                shard_dims = tuple(
+                    idx
+                    for idx, placement in enumerate(param.placements)
+                    if isinstance(placement, Shard)
+                )
+                key = (id(mesh), shard_dims)
+                if key not in dtensor_buckets:
+                    dtensor_buckets[key] = (
+                        mesh,
+                        shard_dims,
+                        local_tensor(param).device,
+                        [],
+                    )
+                if param.grad is not None:
+                    dtensor_buckets[key][3].append(local_tensor(param.grad).detach())
+            else:
+                plain_params.append(param)
+
+        result_device = (
+            local_tensor(params[0]).device if params else torch.device("cpu")
+        )
+        parts: List[torch.Tensor] = []
+
+        for mesh, shard_dims, bucket_device, bucket_grads in dtensor_buckets.values():
+            bucket_sq = (
+                _sum_of_squares(bucket_grads)
+                if bucket_grads
+                else torch.zeros((), dtype=torch.float32, device=bucket_device)
+            )
+            if dist.is_available() and dist.is_initialized():
+                for dim_idx in shard_dims:
+                    pg = mesh.get_group(dim_idx)
+                    if dist.get_world_size(group=pg) > 1:
+                        dist.all_reduce(bucket_sq, op=dist.ReduceOp.SUM, group=pg)
+            parts.append(bucket_sq.to(device=result_device, dtype=torch.float32))
+
+        should_reduce_plain = (
             self._wrapped
             and self.parallel_config.sharding_strategy != "NO_SHARD"
             and dist.is_available()
             and dist.is_initialized()
-        ):
-            dist.all_reduce(
-                total_norm_sq, op=dist.ReduceOp.SUM, group=self.process_group
+        )
+        if plain_params or (not dtensor_buckets and should_reduce_plain):
+            plain_grads = [p.grad.detach() for p in plain_params if p.grad is not None]
+            plain_device = plain_params[0].device if plain_params else result_device
+            plain_sq = (
+                _sum_of_squares(plain_grads)
+                if plain_grads
+                else torch.zeros((), dtype=torch.float32, device=plain_device)
             )
-        return total_norm_sq.sqrt()
+            if should_reduce_plain:
+                dist.all_reduce(
+                    plain_sq, op=dist.ReduceOp.SUM, group=self.process_group
+                )
+            parts.append(plain_sq.to(device=result_device, dtype=torch.float32))
+
+        total_sq = (
+            torch.stack(parts).sum()
+            if parts
+            else torch.zeros((), dtype=torch.float32, device=result_device)
+        )
+        return total_sq.sqrt()
 
     def _step_torch_optimizer(
         self,
@@ -521,7 +582,7 @@ class FSDPTrainingBackend(TrainingBackend):
         self, *, include_params: bool = False, format_key: Optional[str] = None
     ) -> dict:
         """Serialize a runtime-owned ``torch.optim.Optimizer`` + optional scheduler."""
-        from specforge.optimizer import local_tensor
+        from specforge.optimizer import local_tensor, optimizer_resume_metadata
 
         optimizer_state = self.optimizer.state_dict()
         optimizer_state["state"] = {
@@ -538,11 +599,18 @@ class FSDPTrainingBackend(TrainingBackend):
         payload: Dict[str, Any] = {
             "optimizer_state_dict": optimizer_state,
             "max_grad_norm": self._max_grad_norm,
+            **optimizer_resume_metadata(
+                optimizer_spec=self._optimizer_spec,
+                scheduler_spec=(
+                    self._scheduler_spec if self.scheduler is not None else None
+                ),
+            ),
         }
         if self.scheduler is not None:
             payload["scheduler_state_dict"] = self.scheduler.state_dict()
-            payload["lr_scheduler_type"] = (
-                self._scheduler_spec.kind if self._scheduler_spec is not None else None
+            payload.setdefault(
+                "lr_scheduler_type",
+                self._scheduler_spec.kind if self._scheduler_spec is not None else None,
             )
         if include_params:
             payload["fp32_params"] = [
@@ -565,6 +633,7 @@ class FSDPTrainingBackend(TrainingBackend):
             like_parameter,
             local_tensor,
             restore_optimizer_kernel_state,
+            validate_optimizer_resume_metadata,
         )
 
         if format_key is not None and format_key not in state_dict:
@@ -572,14 +641,12 @@ class FSDPTrainingBackend(TrainingBackend):
                 f"this optimizer state was not written by the {self.name} runtime; "
                 "resume it with the runtime that wrote it"
             )
-        if self.scheduler is not None and self._scheduler_spec is not None:
-            saved_scheduler_type = state_dict.get("lr_scheduler_type", "cosine")
-            if saved_scheduler_type != self._scheduler_spec.kind:
-                raise ValueError(
-                    "checkpoint optimizer used lr_scheduler="
-                    f"{saved_scheduler_type!r} but this run has "
-                    f"lr_scheduler={self._scheduler_spec.kind!r}"
-                )
+        validate_optimizer_resume_metadata(
+            state_dict,
+            optimizer_spec=self._optimizer_spec,
+            scheduler_spec=self._scheduler_spec if self.scheduler is not None else None,
+            default_scheduler_type="cosine",
+        )
         saved_max_grad_norm = state_dict.get("max_grad_norm")
         if (
             self._max_grad_norm is not None

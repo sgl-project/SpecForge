@@ -161,6 +161,64 @@ class ConstantWarmupLR(_WarmupScheduler):
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
 
 
+def _validate_wsd_options(spec: SchedulerSpec, *, total_steps: int | None) -> None:
+    unknown = sorted(set(spec.extra) - {"decay_ratio", "decay_style"})
+    if unknown:
+        raise ValueError(f"unknown wsd scheduler options: {unknown}")
+    decay_ratio = float(spec.extra.get("decay_ratio", 0.1))
+    if not 0.0 <= decay_ratio <= 1.0:
+        raise ValueError(f"wsd decay_ratio must be in [0, 1], got {decay_ratio}")
+    decay_style = spec.extra.get("decay_style", "linear")
+    if decay_style not in ("linear", "cosine"):
+        raise ValueError(
+            f"wsd decay_style must be 'linear' or 'cosine', got {decay_style!r}"
+        )
+    if total_steps is not None:
+        warmup = warmup_steps_from_ratio(spec.warmup_ratio, total_steps)
+        decay_steps = int(decay_ratio * total_steps)
+        if warmup + decay_steps > total_steps:
+            raise ValueError(
+                f"wsd warmup ({warmup}) + decay ({decay_steps}) exceeds "
+                f"total_steps ({total_steps})"
+            )
+
+
+def validate_scheduler_spec(
+    spec: SchedulerSpec, *, require_total_steps: bool = True
+) -> None:
+    """Validate scheduler registration and built-in option combinations."""
+    if spec.kind not in _LR_SCHEDULERS:
+        raise ValueError(
+            f"unsupported lr_scheduler={spec.kind!r}; "
+            f"expected one of {sorted(_LR_SCHEDULERS)}"
+        )
+    if not 0.0 <= spec.warmup_ratio <= 1.0:
+        raise ValueError(f"warmup_ratio must be in [0, 1], got {spec.warmup_ratio}")
+    if not 0.0 <= spec.min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in [0, 1], got {spec.min_lr_ratio}")
+    if spec.kind in ("cosine", "constant", "linear") and spec.extra:
+        raise ValueError(
+            f"{spec.kind} scheduler accepts no extra options, got {sorted(spec.extra)}"
+        )
+    if spec.kind == "constant" and spec.min_lr_ratio != 0.0:
+        raise ValueError(
+            f"constant scheduler does not use min_lr_ratio={spec.min_lr_ratio}"
+        )
+    total = spec.total_steps
+    if require_total_steps or total is not None:
+        if total is None or total <= 0:
+            raise ValueError(f"total_steps must be positive, got {total}")
+        if not (spec.kind == "cosine" and spec.min_lr_ratio == 0.0):
+            warmup = warmup_steps_from_ratio(spec.warmup_ratio, total)
+            if not 0 <= warmup < total:
+                raise ValueError(
+                    "warmup_steps must be in [0, total_steps), got "
+                    f"{warmup} for total_steps={total}"
+                )
+    if spec.kind == "wsd":
+        _validate_wsd_options(spec, total_steps=total)
+
+
 def _validate_curve_spec(spec: SchedulerSpec) -> Tuple[int, int]:
     if spec.total_steps is None or spec.total_steps <= 0:
         raise ValueError(f"total_steps must be positive, got {spec.total_steps}")
@@ -383,5 +441,6 @@ __all__ = [
     "register_lr_curve",
     "register_lr_scheduler",
     "registered_lr_schedulers",
+    "validate_scheduler_spec",
     "warmup_steps_from_ratio",
 ]
