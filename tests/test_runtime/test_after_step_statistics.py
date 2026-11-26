@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import tempfile
 import unittest
@@ -11,7 +10,6 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch import nn
 
 from specforge.algorithms.objectives.base import ObjectiveModel, ObjectiveResult
@@ -28,7 +26,12 @@ from specforge.training.contracts import (
 from specforge.training.frame import run_window
 from specforge.training.runner import DataParallelRunner
 from tests.test_algorithms.test_objective_contracts import build_runtime
-from tests.test_runtime._fixtures import FakeProgram, fake_spec
+from tests.test_runtime._fixtures import (
+    FakeProgram,
+    fake_spec,
+    on_host_fsdp1,
+    spawn_gloo,
+)
 
 _GLOO = dist.is_available() and dist.is_gloo_available()
 
@@ -128,173 +131,119 @@ def _plain_runner(program):
     return DataParallelRunner(program, backend, program.spec())
 
 
-def _on_host_fsdp1():
-    """FSDP1 computes on the host only when told so (avoids macOS MPS probe)."""
-    from torch.distributed.fsdp import FullyShardedDataParallel
-
-    original = FullyShardedDataParallel.__init__
-
-    def on_host(self, module, *args, **kwargs):
-        kwargs.setdefault("device_id", torch.device("cpu"))
-        original(self, module, *args, **kwargs)
-
-    return mock.patch.object(FullyShardedDataParallel, "__init__", on_host)
-
-
-def _distributed_after_step_worker(rank, world, store_path, out_dir, mode, report_dir):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+def _distributed_after_step_worker(rank, world, workdir, mode):
+    if mode not in ("ddp", "fsdp1", "fsdp2"):
+        raise ValueError(mode)
+    dtype = torch.bfloat16 if mode == "fsdp2" else torch.float32
+    sharding = "NO_SHARD" if mode == "ddp" else "SHARD_GRAD_OP"
+    runtime_name = "fsdp2" if mode == "fsdp2" else "fsdp"
+    backend_cls = FSDP2TrainingBackend if mode == "fsdp2" else FSDPTrainingBackend
+    program = _MoELikeProgram(dtype=dtype)
+    spec = program.spec()
+    backend = backend_cls(
+        ParallelConfig(
+            world_size=world,
+            sharding_strategy=sharding,
+            fsdp_process_group=dist.group.WORLD,
+        ),
+        optimizer_spec=OptimizerSpec(kind="adamw", lr=1e-2),
+        scheduler_spec=SchedulerSpec(kind="constant", total_steps=10, warmup_ratio=0.0),
+        max_grad_norm=1.0,
+        precision=PrecisionSpec.resolve(
+            runtime=runtime_name,
+            model_dtype=dtype,
+            sharding_strategy=sharding,
+        ),
     )
-    try:
-        dtype = torch.bfloat16 if mode == "fsdp2" else torch.float32
-        program = _MoELikeProgram(dtype=dtype)
-        spec = program.spec()
-        opt_spec = OptimizerSpec(kind="adamw", lr=1e-2)
-        sched_spec = SchedulerSpec(kind="constant", total_steps=10, warmup_ratio=0.0)
-        if mode == "ddp":
-            backend = FSDPTrainingBackend(
-                ParallelConfig(
-                    world_size=world,
-                    sharding_strategy="NO_SHARD",
-                    fsdp_process_group=dist.group.WORLD,
-                ),
-                optimizer_spec=opt_spec,
-                scheduler_spec=sched_spec,
-                max_grad_norm=1.0,
-                precision=PrecisionSpec.resolve(
-                    runtime="fsdp",
-                    model_dtype=torch.float32,
-                    sharding_strategy="NO_SHARD",
-                ),
-            )
-        elif mode == "fsdp1":
-            backend = FSDPTrainingBackend(
-                ParallelConfig(
-                    world_size=world,
-                    sharding_strategy="SHARD_GRAD_OP",
-                    fsdp_process_group=dist.group.WORLD,
-                ),
-                optimizer_spec=opt_spec,
-                scheduler_spec=sched_spec,
-                max_grad_norm=1.0,
-                precision=PrecisionSpec.resolve(
-                    runtime="fsdp",
-                    model_dtype=torch.float32,
-                    sharding_strategy="SHARD_GRAD_OP",
-                ),
-            )
-        elif mode == "fsdp2":
-            backend = FSDP2TrainingBackend(
-                ParallelConfig(
-                    world_size=world,
-                    sharding_strategy="SHARD_GRAD_OP",
-                    fsdp_process_group=dist.group.WORLD,
-                ),
-                optimizer_spec=opt_spec,
-                scheduler_spec=sched_spec,
-                max_grad_norm=1.0,
-                precision=PrecisionSpec.resolve(
-                    runtime="fsdp2",
-                    model_dtype=torch.bfloat16,
-                    sharding_strategy="SHARD_GRAD_OP",
-                ),
-            )
-        else:
-            raise ValueError(mode)
 
-        with _on_host_fsdp1() if mode == "fsdp1" else contextlib.nullcontext():
-            wrapped = backend.prepare_model(
-                program, frozen_modules=program.frozen_modules
-            )
-        runner = DataParallelRunner(wrapped, backend, spec)
+    with on_host_fsdp1() if mode == "fsdp1" else contextlib.nullcontext():
+        wrapped = backend.prepare_model(program, frozen_modules=program.frozen_modules)
+    runner = DataParallelRunner(wrapped, backend, spec)
 
-        # Distinct per-rank, per-microbatch counts across two micro-batches:
-        # rank 0: m0=[1,2,3,4]/[1..6]/[[1,2,3],[4,5,6]], m1=[2,0,1,0]/[0.5]*6/[[0,1,0],[2,0,1]]
-        # rank 1: m0=[5,1,0,2]/[2..7]/[[3,0,1],[1,2,0]], m1=[0,3,2,1]/[1.5]*6/[[2,1,2],[0,1,3]]
-        if rank == 0:
-            window = [
-                _make_batch(
-                    "r0-0",
-                    [1, 2, 3, 4],
-                    [1, 2, 3, 4, 5, 6],
-                    [[1, 2, 3], [4, 5, 6]],
-                    x_val=1.0,
-                ),
-                _make_batch(
-                    "r0-1",
-                    [2, 0, 1, 0],
-                    [0.5] * 6,
-                    [[0, 1, 0], [2, 0, 1]],
-                    x_val=0.5,
-                ),
-            ]
-        else:
-            window = [
-                _make_batch(
-                    "r1-0",
-                    [5, 1, 0, 2],
-                    [2, 3, 4, 5, 6, 7],
-                    [[3, 0, 1], [1, 2, 0]],
-                    x_val=1.5,
-                ),
-                _make_batch(
-                    "r1-1",
-                    [0, 3, 2, 1],
-                    [1.5] * 6,
-                    [[2, 1, 2], [0, 1, 3]],
-                    x_val=0.75,
-                ),
-            ]
+    # Distinct per-rank, per-microbatch counts across two micro-batches:
+    # rank 0: m0=[1,2,3,4]/[1..6]/[[1,2,3],[4,5,6]], m1=[2,0,1,0]/[0.5]*6/[[0,1,0],[2,0,1]]
+    # rank 1: m0=[5,1,0,2]/[2..7]/[[3,0,1],[1,2,0]], m1=[0,3,2,1]/[1.5]*6/[[2,1,2],[0,1,3]]
+    if rank == 0:
+        window = [
+            _make_batch(
+                "r0-0",
+                [1, 2, 3, 4],
+                [1, 2, 3, 4, 5, 6],
+                [[1, 2, 3], [4, 5, 6]],
+                x_val=1.0,
+            ),
+            _make_batch(
+                "r0-1",
+                [2, 0, 1, 0],
+                [0.5] * 6,
+                [[0, 1, 0], [2, 0, 1]],
+                x_val=0.5,
+            ),
+        ]
+    else:
+        window = [
+            _make_batch(
+                "r1-0",
+                [5, 1, 0, 2],
+                [2, 3, 4, 5, 6, 7],
+                [[3, 0, 1], [1, 2, 0]],
+                x_val=1.5,
+            ),
+            _make_batch(
+                "r1-1",
+                [0, 3, 2, 1],
+                [1.5] * 6,
+                [[2, 1, 2], [0, 1, 3]],
+                x_val=0.75,
+            ),
+        ]
 
-        metrics = run_window(runner, window, StepContext(accumulation_steps=2))
-        materialized = metrics.materialize()
+    metrics = run_window(runner, window, StepContext(accumulation_steps=2))
+    materialized = metrics.materialize()
 
-        # Snapshot checkpoint right after step: updated expert_bias must be inside.
-        ckpt_state = runner.checkpoint_state()
-        mgr = CheckpointManager(out_dir, f"after-step-{mode}")
-        shared = (
-            {
-                "global_step": 1,
-                "world_size": world,
-                "draft_state_dict": ckpt_state.draft,
-            }
+    # Snapshot checkpoint right after step: updated expert_bias must be inside.
+    ckpt_state = runner.checkpoint_state()
+    out_dir = os.path.join(workdir, "checkpoints")
+    mgr = CheckpointManager(out_dir, f"after-step-{mode}")
+    shared = (
+        {
+            "global_step": 1,
+            "world_size": world,
+            "draft_state_dict": ckpt_state.draft,
+        }
+        if rank == 0
+        else None
+    )
+    mgr.save(shared, 1, rank_state=ckpt_state.rank)
+
+    c0_seen, c1_seen, c2_seen = program.received_pooled[0]
+    return {
+        "pooled_0": c0_seen.tolist(),
+        "pooled_1": c1_seen.tolist(),
+        "pooled_2": c2_seen.tolist(),
+        "pooled_0_dtype": str(c0_seen.dtype),
+        "pooled_1_dtype": str(c1_seen.dtype),
+        "pooled_2_dtype": str(c2_seen.dtype),
+        "bias_0": program.expert_bias_0.detach().cpu().tolist(),
+        "bias_1": program.expert_bias_1.detach().cpu().tolist(),
+        "bias_2": program.expert_bias_2.detach().cpu().tolist(),
+        "step_balance": materialized["moe/step_balance"],
+        "ckpt_bias_0": (
+            ckpt_state.draft["expert_bias_0"].detach().cpu().tolist()
             if rank == 0
             else None
-        )
-        mgr.save(shared, 1, rank_state=ckpt_state.rank)
-
-        c0_seen, c1_seen, c2_seen = program.received_pooled[0]
-        report = {
-            "pooled_0": c0_seen.tolist(),
-            "pooled_1": c1_seen.tolist(),
-            "pooled_2": c2_seen.tolist(),
-            "pooled_0_dtype": str(c0_seen.dtype),
-            "pooled_1_dtype": str(c1_seen.dtype),
-            "pooled_2_dtype": str(c2_seen.dtype),
-            "bias_0": program.expert_bias_0.detach().cpu().tolist(),
-            "bias_1": program.expert_bias_1.detach().cpu().tolist(),
-            "bias_2": program.expert_bias_2.detach().cpu().tolist(),
-            "step_balance": materialized["moe/step_balance"],
-            "ckpt_bias_0": (
-                ckpt_state.draft["expert_bias_0"].detach().cpu().tolist()
-                if rank == 0
-                else None
-            ),
-            "ckpt_bias_1": (
-                ckpt_state.draft["expert_bias_1"].detach().cpu().tolist()
-                if rank == 0
-                else None
-            ),
-            "ckpt_bias_2": (
-                ckpt_state.draft["expert_bias_2"].detach().cpu().tolist()
-                if rank == 0
-                else None
-            ),
-        }
-        with open(os.path.join(report_dir, f"rank{rank}.json"), "w") as fh:
-            json.dump(report, fh)
-    finally:
-        dist.destroy_process_group()
+        ),
+        "ckpt_bias_1": (
+            ckpt_state.draft["expert_bias_1"].detach().cpu().tolist()
+            if rank == 0
+            else None
+        ),
+        "ckpt_bias_2": (
+            ckpt_state.draft["expert_bias_2"].detach().cpu().tolist()
+            if rank == 0
+            else None
+        ),
+    }
 
 
 class AfterStepStatisticsTest(unittest.TestCase):
@@ -529,21 +478,11 @@ class AfterStepStatisticsTest(unittest.TestCase):
                 with tempfile.TemporaryDirectory(
                     prefix=f"after_step_{mode}_"
                 ) as workdir:
-                    store_path = os.path.join(workdir, "gloo.store")
                     out_dir = os.path.join(workdir, "checkpoints")
-                    report_dir = os.path.join(workdir, "reports")
                     os.makedirs(out_dir, exist_ok=True)
-                    os.makedirs(report_dir, exist_ok=True)
-                    mp.spawn(
-                        _distributed_after_step_worker,
-                        args=(2, store_path, out_dir, mode, report_dir),
-                        nprocs=2,
-                        join=True,
+                    reports = spawn_gloo(
+                        _distributed_after_step_worker, mode, workdir=workdir
                     )
-                    reports = []
-                    for rank in range(2):
-                        with open(os.path.join(report_dir, f"rank{rank}.json")) as fh:
-                            reports.append(json.load(fh))
 
                     for rank, rep in enumerate(reports):
                         self.assertEqual(
