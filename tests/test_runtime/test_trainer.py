@@ -944,7 +944,9 @@ class TestTrainerController(unittest.TestCase):
                     for _ in range(6):
                         # Hold nothing while suspended, as a loader would not.
                         handed = [_batch()]
-                        streamed.append(weakref.ref(handed[0]))
+                        # Track the tensor payload rather than the outer TrainBatch
+                        # wrapper, which TrainerController replaces to attach the epoch.
+                        streamed.append(weakref.ref(handed[0].tensors["x"]))
                         yield handed.pop()
 
                 Runner.replay_statistics = replay_statistics
