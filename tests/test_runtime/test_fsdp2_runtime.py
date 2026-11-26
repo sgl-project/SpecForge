@@ -452,7 +452,7 @@ class FSDP2RuntimeTest(unittest.TestCase):
         mp.spawn(worker, args=(world, store, directory, sharding), nprocs=world)
 
     def test_two_ranks_train_resume_and_write_the_draft_in_its_dtype(self):
-        for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):
+        for sharding in ("SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"):
             with self.subTest(sharding=sharding), tempfile.TemporaryDirectory() as d:
                 self._run(_worker, d, sharding)
                 report = torch.load(os.path.join(d, "report0.pt"), weights_only=False)
@@ -966,6 +966,14 @@ class FSDP2PrecisionAndConfigTest(unittest.TestCase):
         # 1. fsdp -> fsdp2 (even across sharding strategy) succeeds and sets retain_reference_layout=True.
         cap = build_trainer(fsdp2_bf16, base_state, sharding="SHARD_GRAD_OP")
         self.assertIs(cap["prepare_kw"].get("retain_reference_layout"), True)
+
+        # 1b. Legacy pre-runtime checkpoints (no runtime/precision keys) also
+        # migrate to fsdp2 and retain the reference layout.
+        legacy_state = {
+            k: v for k, v in base_state.items() if k not in ("runtime", "precision")
+        }
+        cap_legacy = build_trainer(fsdp2_bf16, legacy_state, sharding="SHARD_GRAD_OP")
+        self.assertIs(cap_legacy["prepare_kw"].get("retain_reference_layout"), True)
 
         # 2. fsdp2 -> fsdp2 does NOT retain reference layout.
         fsdp2_state = {
@@ -1498,6 +1506,17 @@ class FSDP2NestedBlocksAndBF16GradTest(unittest.TestCase):
                 self.assertTrue(report["inner_reshards"])
                 self.assertEqual(report["grad_dtypes"], ["torch.float32"])
                 self.assertTrue(report["norm_bf16_finite"])
+
+    def test_unknown_blocks_fails_before_fp32_mutation_or_mesh_creation(self):
+        model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+        backend = FSDP2TrainingBackend(
+            ParallelConfig(sharding_strategy="NO_SHARD"),
+            precision=_FSDP2_BF16,
+        )
+        with self.assertRaisesRegex(ValueError, "name no module class"):
+            backend.prepare_model(model, blocks=("DoesNotExist",))
+        self.assertEqual(model.weight.dtype, torch.bfloat16)
+        self.assertEqual(backend._owned_groups, ())
 
 
 if __name__ == "__main__":

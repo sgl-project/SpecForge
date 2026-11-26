@@ -554,5 +554,363 @@ class FSDP1NoDecay1DTest(unittest.TestCase):
                 )
 
 
+def _dtensor_and_grad_norm_worker(rank, world, store_path, out_dir):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from specforge.optimizer import like_parameter, local_tensor
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world,))
+        # 1. local_tensor & like_parameter on uneven Shard(0) DTensor (5 rows -> 3 / 2).
+        full = torch.arange(15, dtype=torch.float32).reshape(5, 3)
+        local_shard = full[:3].clone() if rank == 0 else full[3:].clone()
+        dt_param = nn.Parameter(
+            DTensor.from_local(
+                local_shard,
+                mesh,
+                [Shard(0)],
+                run_check=False,
+                shape=full.shape,
+                stride=full.stride(),
+            )
+        )
+        plain = torch.tensor([1.0, 2.0])
+        assert local_tensor(plain) is plain
+        assert torch.equal(local_tensor(dt_param), local_shard)
+
+        # Scalar tensor passes through like_parameter unchanged.
+        step_scalar = torch.tensor(3.0)
+        assert like_parameter(step_scalar, dt_param) is step_scalar
+
+        # Matching local shard wraps back with global shape/stride.
+        restored = like_parameter(local_shard.clone() * 2.0, dt_param)
+        assert isinstance(restored, DTensor)
+        assert restored.shape == full.shape
+        assert restored.stride() == full.stride()
+        assert torch.equal(restored.to_local(), local_shard * 2.0)
+
+        # Mismatched local shard shape raises ValueError.
+        mismatch_raised = False
+        try:
+            like_parameter(torch.zeros(4, 3), dt_param)
+        except ValueError as exc:
+            mismatch_raised = "does not match this rank's shard" in str(exc)
+        assert mismatch_raised
+
+        # 2. _global_grad_norm with rank 0 having NO gradients (DTensor AND plain sharded):
+        #    must still enter collective without deadlocking and agree on rank 1's norm.
+        dt_backend = FSDPTrainingBackend(
+            ParallelConfig(
+                world_size=world,
+                sharding_strategy="SHARD_GRAD_OP",
+                fsdp_process_group=dist.group.WORLD,
+            ),
+            max_grad_norm=1.0,
+        )
+        if rank == 1:
+            dt_param.grad = DTensor.from_local(
+                torch.full_like(local_shard, 2.0),
+                mesh,
+                [Shard(0)],
+                run_check=False,
+                shape=full.shape,
+                stride=full.stride(),
+            )
+        else:
+            dt_param.grad = None
+        dt_norm = float(dt_backend._global_grad_norm([dt_param]).item())
+
+        plain_p = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        plain_backend = FSDPTrainingBackend(
+            ParallelConfig(
+                world_size=world,
+                sharding_strategy="SHARD_GRAD_OP",
+                fsdp_process_group=dist.group.WORLD,
+            ),
+            max_grad_norm=1.0,
+        )
+        plain_backend._wrapped = True
+        plain_p.grad = torch.tensor([3.0, 4.0, 0.0, 0.0]) if rank == 1 else None
+        plain_norm = float(plain_backend._global_grad_norm([plain_p]).item())
+
+        torch.save(
+            {"dt_norm": dt_norm, "plain_norm": plain_norm},
+            os.path.join(out_dir, f"norm_{rank}.pt"),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+class ReviewFixesTest(unittest.TestCase):
+    def test_set_optimizer_refuses_scheduler_without_max_grad_norm(self):
+        model = _SmallModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1)
+        backend = FSDPTrainingBackend(ParallelConfig())
+        with self.assertRaisesRegex(ValueError, "max_grad_norm"):
+            backend.set_optimizer(opt, scheduler=sched)
+        self.assertIsNone(backend.optimizer)
+        self.assertIsNone(backend.scheduler)
+
+    def test_restore_optimizer_kernel_state_updates_adamw_flags_and_step(self):
+        from specforge.optimizer import restore_optimizer_kernel_state
+
+        model = _SmallModel()
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        for p in model.parameters():
+            p.grad = torch.ones_like(p)
+        opt.step()
+        # Simulate loading a checkpoint written with fused=True on a CPU run.
+        for g in opt.param_groups:
+            g["fused"] = True
+            g["foreach"] = False
+        restore_optimizer_kernel_state(opt)
+        for g in opt.param_groups:
+            self.assertIsNone(g["fused"])
+        for st in opt.state.values():
+            self.assertEqual(st["step"].device.type, "cpu")
+
+        # Explicit fused=True sets fused=True and clears foreach.
+        restore_optimizer_kernel_state(opt, fused=True)
+        for g in opt.param_groups:
+            self.assertTrue(g["fused"])
+            self.assertIsNone(g["foreach"])
+
+        # Non-AdamW optimizer is untouched.
+        sgd = torch.optim.SGD(model.parameters(), lr=0.1)
+        restore_optimizer_kernel_state(sgd, fused=True)
+        self.assertIsNone(sgd.param_groups[0].get("fused"))
+
+    def test_torch_optimizer_state_dict_include_params_and_format_key(self):
+        from specforge.lr_scheduler import build_lr_scheduler
+        from specforge.optimizer import build_optimizer
+
+        def _make_backend(opt_spec, sched_spec):
+            torch.manual_seed(0)
+            model = _SmallModel()
+            backend = FSDPTrainingBackend(
+                ParallelConfig(),
+                optimizer_spec=opt_spec,
+                scheduler_spec=sched_spec,
+                max_grad_norm=1.0,
+            )
+            backend.module = model
+            opt = build_optimizer(model, opt_spec)
+            sched = build_lr_scheduler(opt, sched_spec)
+            backend.set_optimizer(opt, scheduler=sched)
+            return model, backend
+
+        opt_spec = OptimizerSpec(
+            kind="adamw", lr=1e-2, param_group_policy="no_decay_1d"
+        )
+        sched_spec = SchedulerSpec(
+            kind="wsd",
+            total_steps=10,
+            warmup_ratio=0.1,
+            min_lr_ratio=0.1,
+            extra={"decay_ratio": 0.2, "decay_style": "cosine"},
+        )
+        m1, b1 = _make_backend(opt_spec, sched_spec)
+        for p in m1.parameters():
+            p.grad = torch.full_like(p, 0.25)
+        b1.step()
+        saved = b1._torch_optimizer_state_dict(
+            include_params=True, format_key="parameters_are_masters"
+        )
+        self.assertTrue(saved["parameters_are_masters"])
+        m2, b2 = _make_backend(opt_spec, sched_spec)
+        trainable_m1 = [p for p in m1.parameters() if p.requires_grad]
+        trainable_m2 = [p for p in m2.parameters() if p.requires_grad]
+        self.assertEqual(len(saved["fp32_params"]), len(trainable_m1))
+
+        # Missing format_key is rejected.
+        with self.assertRaisesRegex(ValueError, "was not written"):
+            b2._load_torch_optimizer_state_dict(
+                {k: v for k, v in saved.items() if k != "parameters_are_masters"},
+                restore_params=True,
+                format_key="parameters_are_masters",
+            )
+
+        # Corrupted fp32_params shape is rejected.
+        bad_shape = {
+            **saved,
+            "fp32_params": [torch.zeros(1), *saved["fp32_params"][1:]],
+        }
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            b2._load_torch_optimizer_state_dict(
+                bad_shape, restore_params=True, format_key="parameters_are_masters"
+            )
+
+        # Valid restore recovers weights, moments, and scheduler bit-for-bit.
+        with torch.no_grad():
+            for p in trainable_m2:
+                p.zero_()
+        b2._load_torch_optimizer_state_dict(
+            saved, restore_params=True, format_key="parameters_are_masters"
+        )
+        for p1, p2 in zip(trainable_m1, trainable_m2):
+            self.assertTrue(torch.equal(p1, p2))
+        self.assertEqual(b2.learning_rate(), b1.learning_rate())
+
+    def test_resume_rejects_mismatched_optimizer_policy_and_scheduler_options(self):
+        from specforge.lr_scheduler import build_lr_scheduler
+        from specforge.optimizer import BF16Optimizer, build_optimizer
+
+        # 1. Cosine min_lr_ratio=0.0 <-> 0.1 rejected in BOTH directions on BF16Optimizer
+        #    and on direct runtime backend (prevents silent TwoStage <-> Functional drift).
+        m_zero = _SmallModel().to(torch.bfloat16)
+        opt_zero = BF16Optimizer(
+            m_zero,
+            optimizer_spec=OptimizerSpec(kind="adamw", lr=1e-2),
+            scheduler_spec=SchedulerSpec(
+                kind="cosine", total_steps=10, warmup_ratio=0.2, min_lr_ratio=0.0
+            ),
+            max_grad_norm=1.0,
+        )
+        for _ in range(4):
+            for p in m_zero.parameters():
+                p.grad = torch.full_like(p, 0.1)
+            opt_zero.step()
+        sd_zero = opt_zero.state_dict()
+
+        m_pos = _SmallModel().to(torch.bfloat16)
+        opt_pos = BF16Optimizer(
+            m_pos,
+            optimizer_spec=OptimizerSpec(kind="adamw", lr=1e-2),
+            scheduler_spec=SchedulerSpec(
+                kind="cosine", total_steps=10, warmup_ratio=0.2, min_lr_ratio=0.1
+            ),
+            max_grad_norm=1.0,
+        )
+        for _ in range(4):
+            for p in m_pos.parameters():
+                p.grad = torch.full_like(p, 0.1)
+            opt_pos.step()
+        sd_pos = opt_pos.state_dict()
+
+        with self.assertRaisesRegex(ValueError, "lr_scheduler_min_lr_ratio"):
+            opt_pos.load_state_dict(sd_zero)
+        with self.assertRaisesRegex(ValueError, "lr_scheduler_min_lr_ratio"):
+            opt_zero.load_state_dict(sd_pos)
+
+        # Legacy checkpoint without the new metadata keys resumes into defaults
+        # (adamw / default / cosine / min_lr_ratio=0.0), and rejects min_lr_ratio=0.1.
+        legacy_sd = {
+            k: v
+            for k, v in sd_zero.items()
+            if k
+            not in (
+                "optimizer_type",
+                "param_group_policy",
+                "optimizer_options",
+                "lr_scheduler_min_lr_ratio",
+                "lr_scheduler_options",
+            )
+        }
+        with mock.patch("specforge.optimizer.print_on_rank0"):
+            opt_zero.load_state_dict(legacy_sd)
+        with self.assertRaisesRegex(ValueError, "lr_scheduler_min_lr_ratio"):
+            opt_pos.load_state_dict(legacy_sd)
+
+        # 2. param_group_policy mismatch rejected.
+        m_nd = _SmallModel().to(torch.bfloat16)
+        opt_nd = BF16Optimizer(
+            m_nd,
+            optimizer_spec=OptimizerSpec(
+                kind="adamw", lr=1e-2, param_group_policy="no_decay_1d"
+            ),
+            scheduler_spec=SchedulerSpec(
+                kind="cosine", total_steps=10, warmup_ratio=0.2, min_lr_ratio=0.0
+            ),
+            max_grad_norm=1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "param_group_policy"):
+            opt_nd.load_state_dict(sd_zero)
+
+        # 3. WSD option mismatch rejected on direct runtime backend.
+        def _direct_wsd(extra):
+            m = _SmallModel()
+            ospec = OptimizerSpec(kind="adamw", lr=1e-2)
+            sspec = SchedulerSpec(
+                kind="wsd",
+                total_steps=10,
+                warmup_ratio=0.1,
+                min_lr_ratio=0.1,
+                extra=extra,
+            )
+            b = FSDPTrainingBackend(
+                ParallelConfig(),
+                optimizer_spec=ospec,
+                scheduler_spec=sspec,
+                max_grad_norm=1.0,
+            )
+            b.module = m
+            o = build_optimizer(m, ospec)
+            b.set_optimizer(o, scheduler=build_lr_scheduler(o, sspec))
+            return b
+
+        b_lin = _direct_wsd({"decay_ratio": 0.2, "decay_style": "linear"})
+        b_cos = _direct_wsd({"decay_ratio": 0.2, "decay_style": "cosine"})
+        with self.assertRaisesRegex(ValueError, "lr_scheduler_options"):
+            b_cos._load_torch_optimizer_state_dict(b_lin._torch_optimizer_state_dict())
+
+    def test_resolve_run_rejects_invalid_optimizer_and_scheduler_option_combinations(
+        self,
+    ):
+        from specforge.config import Config
+        from specforge.config.draft.codec import encode_config
+        from specforge.training.canonical import resolve_run
+        from tests.test_config.draft_fixtures import draft_config
+
+        base = {
+            "model": {"target_model_path": "t"},
+            "draft": encode_config(draft_config()),
+            "data": {"hidden_states_path": "/tmp/features"},
+        }
+        target_cfg = {
+            "hidden_size": 32,
+            "num_hidden_layers": 16,
+            "vocab_size": 64,
+        }
+        for overrides, pattern in (
+            ({"optimizer_options": {"bogus": 1}}, "adamw optimizer accepts no extra"),
+            (
+                {"lr_scheduler": "constant", "min_lr_ratio": 0.1},
+                "constant scheduler does not use min_lr_ratio",
+            ),
+            (
+                {"lr_scheduler": "wsd", "lr_scheduler_options": {"decay_style": "exp"}},
+                "wsd decay_style",
+            ),
+            (
+                {"lr_scheduler": "wsd", "lr_scheduler_options": {"decay_ratio": 1.5}},
+                "wsd decay_ratio",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                cfg = Config.model_validate({**base, "training": overrides})
+                with self.assertRaisesRegex(ValueError, pattern):
+                    resolve_run(cfg, target_config=target_cfg)
+
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "needs gloo")
+    def test_dtensor_helpers_and_grad_norm_with_empty_rank_do_not_deadlock(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = os.path.join(d, "store")
+            mp.spawn(_dtensor_and_grad_norm_worker, args=(2, store, d), nprocs=2)
+            r0 = torch.load(os.path.join(d, "norm_0.pt"), weights_only=False)
+            r1 = torch.load(os.path.join(d, "norm_1.pt"), weights_only=False)
+            # Rank 1 had 2*3 = 6 elements of value 2.0 -> sqrt(6 * 4) = sqrt(24).
+            expected_dt = (6.0 * 4.0) ** 0.5
+            self.assertAlmostEqual(r0["dt_norm"], expected_dt, places=5)
+            self.assertAlmostEqual(r1["dt_norm"], expected_dt, places=5)
+            # Rank 1 had [3, 4, 0, 0] -> norm = 5.0.
+            self.assertAlmostEqual(r0["plain_norm"], 5.0, places=5)
+            self.assertAlmostEqual(r1["plain_norm"], 5.0, places=5)
+
+
 if __name__ == "__main__":
     unittest.main()
