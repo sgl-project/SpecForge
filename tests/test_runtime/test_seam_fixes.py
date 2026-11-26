@@ -147,7 +147,8 @@ class _FakeDFlashModel(ObjectiveModel):
 
         draft = nn.Module()
         draft.register_parameter("w", nn.Parameter(torch.ones(1)))
-        draft.config = SimpleNamespace(draft=SimpleNamespace(target_bindings=()))
+        draft.config = SimpleNamespace(draft=None)
+        draft._no_split_modules = []
         super().__init__(
             draft,
             objective=None,
