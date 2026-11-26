@@ -1726,7 +1726,7 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
     from specforge.training.checkpoint import CheckpointManager
     from specforge.training.controller import TrainerController
     from specforge.training.runner import DataParallelRunner
-    from tests.test_runtime._fixtures import FakeProgram, fake_spec
+    from tests.test_runtime._fixtures import FakeProgram, fake_spec, reference_runtime
 
     class Draft(nn.Module):
         def __init__(self):
@@ -1813,7 +1813,6 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
             pc = ParallelConfig(
                 world_size=2,
                 sharding_strategy="SHARD_GRAD_OP",
-                param_dtype=torch.float32,
                 fsdp_process_group=dist.group.WORLD,
             )
 
@@ -1828,6 +1827,8 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
                 optimizer_factory=lambda target: _ZeroingAdamW(
                     target.parameters(), lr=1e-2
                 ),
+                # A plain torch optimizer updates the parameters themselves.
+                precision=reference_runtime(torch.float32, master_dtype=None).precision,
             )
             with patch_ctx:
                 wrapped = backend.prepare_model(

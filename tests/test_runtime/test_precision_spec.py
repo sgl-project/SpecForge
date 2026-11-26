@@ -335,7 +335,7 @@ class CheckpointPrecisionContractTest(unittest.TestCase):
             with self.subTest(mismatch=key):
                 state = {**base_state, key: bad_value}
                 model = SimpleNamespace(
-                    draft_model=nn.Linear(1, 1, bias=False), frozen=()
+                    draft_model=nn.Linear(1, 1, bias=False), frozen_modules=()
                 )
                 declared = SimpleNamespace(
                     name="eagle3",

@@ -251,7 +251,10 @@ class FrozenModulesTest(unittest.TestCase):
             pass
 
         model = nn.Sequential(Block(2, 2), nn.Linear(2, 2))
-        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="SHARD_GRAD_OP"))
+        backend = FSDPTrainingBackend(
+            ParallelConfig(sharding_strategy="SHARD_GRAD_OP"),
+            precision=reference_runtime().precision,
+        )
         with self.assertRaisesRegex(ValueError, r"\['Blocks'\] name no module class"):
             backend.prepare_model(model, blocks=("Blocks",))
         # A draft class may name a block that only some of its models hold.
@@ -312,7 +315,9 @@ def sharded_rank(rank, directory):
             "blocks": elements(blocks),
         }
         backend = FSDPTrainingBackend(
-            ParallelConfig(world_size=2, sharding_strategy="SHARD_GRAD_OP")
+            ParallelConfig(world_size=2, sharding_strategy="SHARD_GRAD_OP"),
+            # No optimizer is built here: nothing keeps masters.
+            precision=reference_runtime(master_dtype=None).precision,
         )
         wrapped = backend.prepare_model(
             program,
