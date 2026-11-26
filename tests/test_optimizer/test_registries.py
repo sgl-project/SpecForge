@@ -321,7 +321,7 @@ class _DummyProgram(nn.Module):
     def __init__(self, *, microbatch: bool = False) -> None:
         super().__init__()
         self.linear = nn.Linear(2, 1, bias=False)
-        self.frozen = ()
+        self.frozen_modules = ()
         self._microbatch = microbatch
 
     def host_inputs(self, tensors, *, sample_ids, epoch):
