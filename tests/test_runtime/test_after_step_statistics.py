@@ -81,7 +81,9 @@ class _MoELikeProgram(FakeProgram):
     def apply_statistics(self, values):
         c0 = values["counts_0"]
         c1 = values["counts_1"]
-        self.received_pooled.append((c0.detach().cpu().clone(), c1.detach().cpu().clone()))
+        self.received_pooled.append(
+            (c0.detach().cpu().clone(), c1.detach().cpu().clone())
+        )
         with torch.no_grad():
             self.expert_bias_0.add_(0.1 * c0.to(self.expert_bias_0.dtype))
             self.expert_bias_1.add_(0.05 * c1.to(self.expert_bias_1.dtype))
@@ -187,7 +189,9 @@ def _distributed_after_step_worker(rank, world, store_path, out_dir, mode, repor
             raise ValueError(mode)
 
         with _on_host_fsdp1() if mode == "fsdp1" else contextlib.nullcontext():
-            wrapped = backend.prepare_model(program, frozen=program.frozen)
+            wrapped = backend.prepare_model(
+                program, frozen_modules=program.frozen_modules
+            )
         runner = DataParallelRunner(wrapped, backend, spec)
 
         # Distinct per-rank, per-microbatch counts across two micro-batches:
@@ -272,8 +276,12 @@ class AfterStepStatisticsTest(unittest.TestCase):
 
         # Checkpoint immediately after the step captures the updated bias.
         ckpt = runner.checkpoint_state()
-        torch.testing.assert_close(ckpt.draft["expert_bias_0"], torch.tensor(expected_b0))
-        torch.testing.assert_close(ckpt.draft["expert_bias_1"], torch.tensor(expected_b1))
+        torch.testing.assert_close(
+            ckpt.draft["expert_bias_0"], torch.tensor(expected_b0)
+        )
+        torch.testing.assert_close(
+            ckpt.draft["expert_bias_1"], torch.tensor(expected_b1)
+        )
 
         # Post-step metric merged into StepMetrics.
         self.assertAlmostEqual(
