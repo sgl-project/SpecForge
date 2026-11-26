@@ -44,7 +44,7 @@ def valid_tokens(batch):
     ids, mask = batch["input_ids"], batch["loss_mask"]
     if ids.ndim != 2 or mask.shape != ids.shape or ids.shape[1] < 2:
         raise ValueError("input_ids and loss_mask must be [batch, sequence>=2]")
-    padding = batch.get("attention_mask", torch.ones_like(ids, dtype=torch.bool))
+    padding = batch.get("attention_mask", torch.ones_like(mask, dtype=torch.bool))
     if padding.shape != ids.shape:
         raise ValueError("attention_mask must align with input_ids")
     for name in (
@@ -151,7 +151,7 @@ def host_anchor_inputs(
     import numpy as np
 
     batch = dict(batch)
-    for name in ("input_ids", "loss_mask", "attention_mask"):
+    for name in ("loss_mask", "attention_mask"):
         if name in batch:
             batch[name] = batch[name].cpu()
     supervised = valid_tokens(batch)
