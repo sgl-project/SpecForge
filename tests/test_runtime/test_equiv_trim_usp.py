@@ -38,31 +38,29 @@ class TestTrimLossAnalytic(unittest.TestCase):
     """Zero logits + normalized teachers => masked row loss == ln(D) exactly."""
 
     def test_trim_and_full_hit_closed_form(self):
-        from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
+        from specforge.losses.fused import fused_soft_ce_loss
 
         D = 64
         g = torch.Generator().manual_seed(2)
 
-        def one_hot_rows(n):
-            t = torch.zeros(1, n, D, device="cuda")
-            t[0, torch.arange(n), torch.randint(0, D, (n,), generator=g)] = 1.0
-            return t
+        def teacher_rows(n):
+            return torch.randn(1, n, D, generator=g).cuda()
 
         # Trim-shaped: 3 selected rows, all masked-in; kernel mean == ln(D);
         # rescaled by nrows/C = 3/6 -> 3*ln(64)/6.
-        kernel = LogSoftmaxLoss.apply(
+        kernel = fused_soft_ce_loss(
             torch.zeros(1, 3, D, device="cuda"),
-            one_hot_rows(3),
-            torch.ones(1, 3, 1, device="cuda"),
-        )
+            teacher_rows(3),
+        ).mean()
         self.assertAlmostEqual(kernel.item(), math.log(D), places=5)
         self.assertAlmostEqual((kernel * (3 / 6)).item(), 2.0794415417, places=5)
 
         # Full-shaped: 6 rows, 3 masked-in -> same constant with no rescale.
-        pm = torch.tensor([0, 1, 0, 1, 1, 0], device="cuda").view(1, 6, 1)
-        full = LogSoftmaxLoss.apply(
-            torch.zeros(1, 6, D, device="cuda"), one_hot_rows(6), pm
-        )
+        pm = torch.tensor([[0, 1, 0, 1, 1, 0]], device="cuda", dtype=torch.float32)
+        full = (
+            fused_soft_ce_loss(torch.zeros(1, 6, D, device="cuda"), teacher_rows(6))
+            * pm
+        ).mean()
         self.assertAlmostEqual(full.item(), 2.0794415417, places=5)
 
 

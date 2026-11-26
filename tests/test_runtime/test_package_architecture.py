@@ -39,6 +39,8 @@ REMOVED_MODULE_FILES = (
     "specforge/inference/target_engine/dflash_target_model.py",
     "specforge/inference/target_engine/eagle3_target_model.py",
     "specforge/modeling/utils.py",
+    "specforge/losses/lk.py",
+    "specforge/losses/soft_cross_entropy.py",
 )
 
 REMOVED_TRAINING_ENTRY_FILES = (
@@ -176,6 +178,8 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.inference.target_engine.dflash_target_model",
     "specforge.inference.target_engine.eagle3_target_model",
     "specforge.modeling.utils",
+    "specforge.losses.lk",
+    "specforge.losses.soft_cross_entropy",
     "scripts.train_eagle3",
     "scripts.train_eagle3_dataflow",
     "scripts.train_dflash",
@@ -259,6 +263,7 @@ LEGACY_API_NAMES = {
     "partition_key",
     "train_lease",
     "build_control_plane_for_mode",
+    "LogSoftmaxLoss",
 }
 
 CANONICAL_LAUNCH_EXPORTS = {

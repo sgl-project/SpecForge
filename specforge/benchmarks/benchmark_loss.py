@@ -3,9 +3,17 @@ import time
 
 import torch
 
-from specforge.losses.soft_cross_entropy import LogSoftmaxLoss, _compute_loss
+from specforge.losses.fused import fused_soft_ce_loss
 
 TTT_LENGTH = 7
+
+
+@torch.compile(dynamic=None)
+def _compute_loss(logits, target_logits, position_mask):
+    target_p = torch.softmax(target_logits.float(), dim=-1)
+    out_logp = torch.log_softmax(logits.float(), dim=-1)
+    plogp = target_p * out_logp
+    return -torch.sum(position_mask * plogp, dim=-1).mean()
 
 
 def benchmark_loss_method(
@@ -27,9 +35,7 @@ def benchmark_loss_method(
             torch.cuda.reset_peak_memory_stats()
 
         # Create tensors outside timing measurement
-        target = torch.softmax(
-            torch.randn(B, T, V, device="cuda", dtype=torch.float32), dim=-1
-        )
+        target_logits = torch.randn(B, T, V, device="cuda", dtype=torch.float32)
         position_mask = torch.ones((B, T, 1), dtype=torch.bool, device="cuda")
 
         # Pre-allocate logits tensors for each TTT step
@@ -47,9 +53,12 @@ def benchmark_loss_method(
         for i in range(TTT_LENGTH):
             logits = logits_list[i]
             if loss_method == "triton":
-                loss = LogSoftmaxLoss.apply(logits, target, position_mask)
+                loss = (
+                    fused_soft_ce_loss(logits, target_logits)
+                    * position_mask.squeeze(-1)
+                ).mean()
             else:
-                loss = _compute_loss(logits, target, position_mask)
+                loss = _compute_loss(logits, target_logits, position_mask)
             plosses.append(loss)
 
         ploss_weight = [0.8**i for i in range(len(plosses))]

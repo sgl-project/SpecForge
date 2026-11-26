@@ -579,7 +579,7 @@ calls as well as final terms. Checkpoints using the previous auxiliary primitive
 identities fail the existing resume check rather than silently changing execution.
 
 The fused soft CE kernel implements the same mathematical formula as the reference.
-Its BF16 loss and gradients are checked against the legacy `LogSoftmaxLoss`
+Its BF16 loss and gradients are checked against the eager soft cross-entropy reference
 on a 128,256-token vocabulary.
 
 Functionality and optimization support are separate: a method can use its ordinary
