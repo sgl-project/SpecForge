@@ -212,7 +212,7 @@ class TrainingRuntime:
     """The data-parallel runtime that trains the draft, and its precision.
 
     Resolved once for a run and handed to the trainer, which builds that
-    runtime; the runtime honours the precision or refuses it.
+    runtime; the runtime honors the precision or refuses it.
     """
 
     #: One of ``RUNTIMES``.
