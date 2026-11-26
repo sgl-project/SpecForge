@@ -321,10 +321,7 @@ class Trainer:
                     )
             # Checkpoints written before anchor_sampling existed drew anchors
             # on the device.
-            if (
-                "canonical_anchor_sampling" in resume_contract
-                and "canonical_anchor_sampling" not in state
-            ):
+            if "canonical_anchor_sampling" not in state:
                 state = {**state, "canonical_anchor_sampling": "device"}
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.

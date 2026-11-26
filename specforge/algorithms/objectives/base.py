@@ -146,10 +146,6 @@ class ObjectiveModel(nn.Module):
         # Where block anchors are drawn: "device" from the global generator in
         # the forward, "host" before placement from (anchor_seed, sample id,
         # epoch). Also fixed for the model's lifetime.
-        if registration is not None:
-            validate_anchor_sampling(
-                name, registration.training, anchor_sampling, anchor_seed
-            )
         self.anchor_sampling = anchor_sampling
         self.anchor_seed = anchor_seed
         if target_head is not None:
