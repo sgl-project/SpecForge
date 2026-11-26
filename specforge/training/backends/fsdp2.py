@@ -166,6 +166,18 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             p.requires_grad for module in frozen_modules for p in module.parameters()
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
+        block_classes = {
+            type(module)
+            for module in model.modules()
+            if type(module).__name__ in blocks
+        }
+        # As the reference runtime: names that match nothing would train the
+        # program as one root unit. Validate before mutating model dtypes or
+        # creating mesh subgroups so failure is side-effect-free.
+        if blocks and not block_classes:
+            raise ValueError(
+                f"blocks {sorted(blocks)} name no module class of the model"
+            )
         target = model if optimizer_target is None else optimizer_target
         if retain_reference_layout:
             from .reference_state import empty_structure
@@ -200,17 +212,6 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
                 p for module in frozen_modules for p in module.parameters()
             },
         )
-        block_classes = {
-            type(module)
-            for module in model.modules()
-            if type(module).__name__ in blocks
-        }
-        # As the reference runtime: names that match nothing would train the
-        # program as one root unit.
-        if blocks and not block_classes:
-            raise ValueError(
-                f"blocks {sorted(blocks)} name no module class of the model"
-            )
         # Wrap blocks bottom-up so nested _no_split_modules claim inner blocks
         # before their enclosing modules, and keep root reshard_after_forward=False
         # so FULL_SHARD does not immediately re-gather the root group for backward.
@@ -437,7 +438,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         finally:
             if replay_group is not None:
                 dist.destroy_process_group(replay_group)
-        return {
+        converted = {
             "optimizer_state_dict": {
                 # A parameter the reference never stepped starts afresh.
                 "state": {
@@ -453,6 +454,16 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             "fp32_params": [state.masters[ni] for ni in opt_to_named],
             self.FORMAT_KEY: True,
         }
+        for key in (
+            "optimizer_type",
+            "param_group_policy",
+            "optimizer_options",
+            "lr_scheduler_min_lr_ratio",
+            "lr_scheduler_options",
+        ):
+            if key in saved:
+                converted[key] = saved[key]
+        return converted
 
     def _load_module_state_dict(self, model_state: dict) -> None:
         raise ValueError(

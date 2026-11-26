@@ -397,6 +397,125 @@ class RunLoopTest(unittest.TestCase):
             runner.evaluate(batch, StepContext())
         self.assertEqual(program.seen, [(("e0",), EVALUATION_EPOCH)])
 
+    def test_dspine_host_sampling_end_to_end_replay(self):
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.program import program_spec
+
+        model = training_model(
+            chunk_size=1,
+            replacement_probability=0.5,
+            anchor_sampling="host",
+            anchor_seed=11,
+        )
+        spec = program_spec(model)
+        self.assertTrue(spec.replay_statistics)
+        backend = FSDPTrainingBackend(
+            ParallelConfig(),
+            optimizer_factory=lambda draft: torch.optim.SGD(
+                draft.parameters(), lr=0.05
+            ),
+        )
+        wrapped = backend.prepare_model(
+            model,
+            wrap=False,
+            optimizer_target=model.draft_model,
+            frozen_modules=model.frozen_modules,
+        )
+        runner = DataParallelRunner(wrapped, backend, spec)
+
+        seen_passes = []
+        orig_forward = model.forward
+
+        def record_forward(tensors, **kwargs):
+            seen_passes.append(
+                (
+                    bool(kwargs.get("prepass", False)),
+                    tensors["anchors"].clone(),
+                    tensors["anchor_draws"].clone(),
+                )
+            )
+            return orig_forward(tensors, **kwargs)
+
+        torch.manual_seed(0)
+        b0 = training_inputs()
+        b1 = training_inputs()
+        stream = [
+            TrainBatch(["s0", "s1"], "dspine", b0),
+            TrainBatch(["s2", "s3"], "dspine", b1),
+        ]
+        before = [
+            p.detach().clone()
+            for p in model.draft_model.parameters()
+            if p.requires_grad
+        ]
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(model, "forward", side_effect=record_forward),
+        ):
+            controller = TrainerController(
+                runner,
+                strategy_name="dspine",
+                accumulation_steps=2,
+                run_id="dspine-host",
+                output_dir=directory,
+                num_epochs=1,
+                max_steps=1,
+                rank=0,
+                world_size=1,
+            )
+            self.assertEqual(controller.fit(stream), 1)
+        # Two micro-batches in prepass, then the exact same two in forward_backward.
+        self.assertEqual(
+            [is_pre for is_pre, _, _ in seen_passes], [True, True, False, False]
+        )
+        for mb in range(2):
+            self.assertTrue(torch.equal(seen_passes[mb][1], seen_passes[mb + 2][1]))
+            self.assertTrue(torch.equal(seen_passes[mb][2], seen_passes[mb + 2][2]))
+        after = [p.detach() for p in model.draft_model.parameters() if p.requires_grad]
+        self.assertTrue(any(not torch.equal(a, b) for a, b in zip(before, after)))
+
+    def test_host_anchor_sampling_checkpoint_resume_contract(self):
+        from pathlib import Path
+
+        from tests.test_runtime import test_checkpoint_resume as resume_tests
+
+        harness = resume_tests.TestTrainerResumeEntrypoint()
+        if not torch.distributed.is_initialized():
+            harness.setUpClass()
+            self.addCleanup(harness.tearDownClass)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            features = resume_tests._write_feature_files(str(root / "features"), n=4)
+            trainer, _, _ = harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=1,
+                checkpoint_extra={"canonical_anchor_sampling": ("host", 42)},
+            )
+            self.assertEqual(trainer.fit(), 1)
+            source = str((root / "run" / "rz-latest").resolve())
+
+            # Matching ("host", 42) resumes cleanly.
+            resumed, _, _ = harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=2,
+                checkpoint_extra={"canonical_anchor_sampling": ("host", 42)},
+                resume_from=source,
+            )
+            self.assertEqual(resumed.fit(), 2)
+
+            # Changed seed or switching back to "device" is rejected.
+            for mismatch in (("host", 99), "device"):
+                with self.assertRaisesRegex(ValueError, "canonical_anchor_sampling"):
+                    harness._make_trainer(
+                        str(root / "run"),
+                        feat_dir=features,
+                        max_steps=2,
+                        checkpoint_extra={"canonical_anchor_sampling": mismatch},
+                        resume_from=source,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
