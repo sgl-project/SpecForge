@@ -17,6 +17,8 @@ class DenseMask:
 
 
 class DenseAttentionBackend(AttentionBackend):
+    _uses_dense_visibility: bool = True
+
     def prepare(self, layout, *, batch_size, num_heads, is_causal, sliding_window):
         mask = dense_attention_mask(
             layout,

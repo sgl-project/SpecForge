@@ -85,6 +85,23 @@ class ContextBlocks:
     def compute_active_queries(self) -> Tensor:
         return self.active_blocks.repeat_interleave(self.block_size, dim=1)
 
+    def __call__(self, b, h, q, k):
+        block_id = q // self.block_size
+        b_blocks = b % self.context_lengths.shape[0]
+        num_context = self.num_context_rows
+        if num_context == 0:
+            visible = (k // self.block_size) == block_id
+        else:
+            is_context = k < num_context
+            # zero non-context indices before indexing context_valid
+            context_k = torch.where(is_context, k, 0)
+            context_visible = (
+                k < self.context_lengths[b_blocks, block_id]
+            ) & self.context_valid[b % self.context_valid.shape[0], context_k]
+            draft_visible = ((k - num_context) // self.block_size) == block_id
+            visible = torch.where(is_context, context_visible, draft_visible)
+        return visible & self.active_blocks[b_blocks, block_id]
+
     def compute_visibility(self) -> Tensor:
         """Boolean [batch, 1, queries, context rows + queries] mask."""
         batch, count = self.context_lengths.shape
@@ -140,15 +157,7 @@ class AttentionLayout:
                 raise ValueError(
                     "context_blocks determine visibility and active_queries"
                 )
-            if (
-                q.shape[1] != blocks.num_queries
-                or k.shape[1] != blocks.num_context_rows + blocks.num_queries
-                or blocks.context_lengths.device != q.device
-            ):
-                raise ValueError(
-                    "context_blocks must describe the context-then-query positions"
-                )
-            object.__setattr__(self, "visibility", blocks.compute_visibility())
+            object.__setattr__(self, "visibility", blocks)
             object.__setattr__(self, "active_queries", blocks.compute_active_queries())
         elif self.visibility is None:
             raise ValueError("a layout requires visibility or context_blocks")
@@ -178,6 +187,18 @@ class AttentionLayout:
                         "padding masks must match layout lengths and device"
                     )
                 batches.add(valid.shape[0])
+        if isinstance(self.visibility, ContextBlocks):
+            if (
+                q.shape[1] != self.visibility.num_queries
+                or k.shape[1]
+                != self.visibility.num_context_rows + self.visibility.num_queries
+                or self.visibility.context_lengths.device != q.device
+            ):
+                raise ValueError(
+                    "context_blocks must describe the context-then-query positions"
+                )
+            batches.add(self.visibility.context_lengths.shape[0])
+            batches.add(self.visibility.context_valid.shape[0])
         if self.active_queries is not None:
             active = self.active_queries
             if (
@@ -203,6 +224,10 @@ class AttentionLayout:
                 raise ValueError("visibility heads must broadcast to attention heads")
         if isinstance(self.visibility, PaddingMask):
             tensors.extend((self.visibility.query_valid, self.visibility.key_valid))
+        if isinstance(self.visibility, ContextBlocks):
+            tensors.extend(
+                (self.visibility.context_lengths, self.visibility.context_valid)
+            )
         if self.active_queries is not None:
             tensors.append(self.active_queries)
         if any(t.shape[0] not in (1, batch_size) for t in tensors):
@@ -210,7 +235,7 @@ class AttentionLayout:
 
     def mask_heads(self, num_heads: int) -> int | None:
         """Share metadata across heads only when visibility guarantees it."""
-        if isinstance(self.visibility, PaddingMask):
+        if isinstance(self.visibility, (PaddingMask, ContextBlocks)):
             return None
         if isinstance(self.visibility, Tensor):
             return None if self.visibility.shape[1] == 1 else num_heads
@@ -276,10 +301,14 @@ def dense_attention_mask(
     """Materialize a reference mask once, never widen the layout's visibility."""
     if not isinstance(layout, AttentionLayout):
         raise TypeError("dense attention requires AttentionLayout")
-    if isinstance(layout.visibility, Tensor):
+    if isinstance(layout.visibility, (Tensor, ContextBlocks)):
         boolean("is_causal", is_causal)
         sliding_window = layout._resolve_window(sliding_window)
-        allowed = layout.visibility
+        allowed = (
+            layout.visibility.compute_visibility()
+            if isinstance(layout.visibility, ContextBlocks)
+            else layout.visibility
+        )
         q, k = layout.query_positions.unsqueeze(-1), layout.key_positions.unsqueeze(-2)
         if is_causal:
             allowed = allowed & (q >= k).unsqueeze(1)

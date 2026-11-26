@@ -2,9 +2,16 @@
 
 import dataclasses
 import unittest
+from unittest.mock import patch
 
 import torch
+from torch.nn.attention.flex_attention import create_block_mask, create_mask
 
+from specforge.modeling.draft.layers.attention.backends import (
+    AttentionPreparationScope,
+    EagerAttentionBackend,
+    SDPAAttentionBackend,
+)
 from specforge.modeling.draft.layers.attention.masks import (
     AttentionLayout,
     ContextBlocks,
@@ -253,22 +260,44 @@ class ContextBlocksTest(unittest.TestCase):
                 padding = torch.rand(batch, rows, generator=generator) < 0.8
             with self.subTest(trial=trial):
                 queries = (anchors[..., None] + torch.arange(size)).flatten(1)
+                blocks = ContextBlocks(
+                    block_size=size,
+                    context_lengths=(anchors + offset).clamp(0, rows),
+                    context_valid=padding,
+                    active_blocks=keep,
+                )
                 layout = AttentionLayout(
                     query_positions=queries,
                     key_positions=torch.cat(
                         (torch.arange(rows).expand(batch, -1), queries), dim=1
                     ),
-                    context_blocks=ContextBlocks(
-                        block_size=size,
-                        context_lengths=(anchors + offset).clamp(0, rows),
-                        context_valid=padding,
-                        active_blocks=keep,
-                    ),
+                    context_blocks=blocks,
                 )
                 visible, active = prepare_blocks_visibility(
                     anchors, keep, padding, size, offset
                 )
-                self.assertTrue(torch.equal(layout.visibility, visible))
+                self.assertIs(layout.visibility, blocks)
+                self.assertTrue(
+                    torch.equal(
+                        dense_attention_mask(
+                            layout, is_causal=False, sliding_window=None
+                        ),
+                        visible,
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        create_mask(
+                            layout.mask_mod(is_causal=False, sliding_window=None),
+                            batch,
+                            layout.mask_heads(4),
+                            queries.shape[1],
+                            rows + queries.shape[1],
+                            device=queries.device,
+                        ),
+                        visible,
+                    )
+                )
                 self.assertTrue(torch.equal(layout.active_queries, active))
 
     def test_block_layouts_derive_visibility_from_one_description(self):
@@ -312,3 +341,180 @@ class ContextBlocksTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "context_lengths"):
             dataclasses.replace(blocks, context_lengths=torch.ones(1, 2))
+
+    def test_context_blocks_stays_lazy_until_dense_materialization(self):
+        blocks = ContextBlocks(
+            block_size=3,
+            context_lengths=torch.tensor([[2, 5], [1, 4]]),
+            context_valid=torch.tensor([[True, True, False, True, True, True]]),
+            active_blocks=torch.tensor([[True, True], [True, False]]),
+        )
+        queries = torch.tensor([[2, 3, 4, 5, 6, 7], [1, 2, 3, 4, 5, 6]])
+        keys = torch.cat((torch.arange(6).expand(2, -1), queries), dim=1)
+        with patch.object(
+            ContextBlocks,
+            "compute_visibility",
+            side_effect=AssertionError("compute_visibility should not be called"),
+        ):
+            layout = AttentionLayout(
+                query_positions=queries, key_positions=keys, context_blocks=blocks
+            )
+            self.assertIs(layout.visibility, blocks)
+            self.assertIsNone(layout.mask_heads(8))
+            mask_mod = layout.mask_mod(is_causal=True, sliding_window=4)
+            mask = create_mask(
+                mask_mod,
+                2,
+                layout.mask_heads(8),
+                queries.shape[1],
+                keys.shape[1],
+                device=queries.device,
+            )
+            block_mask = create_block_mask(
+                mask_mod,
+                2,
+                layout.mask_heads(8),
+                queries.shape[1],
+                keys.shape[1],
+                device=queries.device,
+            )
+            self.assertEqual(block_mask.shape, (2, 1, queries.shape[1], keys.shape[1]))
+        expected = dense_attention_mask(layout, is_causal=True, sliding_window=4)
+        self.assertTrue(torch.equal(mask, expected))
+        with self.assertRaisesRegex(ValueError, "batch"):
+            layout.validate_dimensions(4, 8)
+
+    def test_context_blocks_mask_mod_matches_dense_across_broadcast_and_constraints(
+        self,
+    ):
+        cases = (
+            dict(
+                block_size=3,
+                context_lengths=torch.tensor([[2, 5], [0, 3]]),
+                context_valid=torch.tensor([[True, False, True, True, True, False]]),
+                active_blocks=torch.tensor([[True, True], [True, False]]),
+                query_batch=2,
+            ),
+            dict(
+                block_size=2,
+                context_lengths=torch.tensor([[1, 4]]),
+                context_valid=torch.tensor([[True, True, False, True, True]]),
+                active_blocks=torch.tensor([[True, False]]),
+                query_batch=2,
+            ),
+            dict(
+                block_size=2,
+                context_lengths=torch.tensor([[0, 0]]),
+                context_valid=torch.ones(1, 0, dtype=torch.bool),
+                active_blocks=torch.tensor([[True, True]]),
+                query_batch=1,
+            ),
+        )
+        for index, case in enumerate(cases):
+            blocks = ContextBlocks(
+                block_size=case["block_size"],
+                context_lengths=case["context_lengths"],
+                context_valid=case["context_valid"],
+                active_blocks=case["active_blocks"],
+            )
+            batch = case["query_batch"]
+            num_context = blocks.num_context_rows
+            num_queries = blocks.num_queries
+            queries = torch.arange(num_queries)[None] + torch.arange(batch)[:, None]
+            keys = torch.cat(
+                (torch.arange(num_context).expand(batch, -1), queries), dim=1
+            )
+            layout = AttentionLayout(
+                query_positions=queries, key_positions=keys, context_blocks=blocks
+            )
+            for is_causal, sliding_window in ((False, None), (True, 3)):
+                with self.subTest(
+                    case=index,
+                    is_causal=is_causal,
+                    sliding_window=sliding_window,
+                ):
+                    mask_mod = layout.mask_mod(
+                        is_causal=is_causal, sliding_window=sliding_window
+                    )
+                    from_mod = create_mask(
+                        mask_mod,
+                        batch,
+                        layout.mask_heads(4),
+                        num_queries,
+                        keys.shape[1],
+                        device=queries.device,
+                    )
+                    from_dense = dense_attention_mask(
+                        layout,
+                        is_causal=is_causal,
+                        sliding_window=sliding_window,
+                    ).expand(batch, -1, -1, -1)
+                    self.assertTrue(torch.equal(from_mod, from_dense))
+            mod = layout.mask_mod(is_causal=False, sliding_window=None)
+            oob = mod(
+                torch.tensor(0),
+                torch.tensor(0),
+                torch.tensor([0, num_queries, num_queries + 5]),
+                torch.tensor([keys.shape[1], 0, keys.shape[1] + 5]),
+            )
+            self.assertEqual(oob.tolist(), [False, False, False])
+
+    def test_dense_preparation_scope_shares_context_blocks_base_visibility(self):
+        blocks = ContextBlocks(
+            block_size=3,
+            context_lengths=torch.tensor([[2, 5], [1, 4]]),
+            context_valid=torch.ones(2, 6, dtype=torch.bool),
+            active_blocks=torch.tensor([[True, True], [True, False]]),
+        )
+        queries = torch.tensor([[2, 3, 4, 5, 6, 7], [1, 2, 3, 4, 5, 6]])
+        keys = torch.cat((torch.arange(6).expand(2, -1), queries), dim=1)
+        layout = AttentionLayout(
+            query_positions=queries, key_positions=keys, context_blocks=blocks
+        )
+        for backend in (EagerAttentionBackend(), SDPAAttentionBackend()):
+            with (
+                self.subTest(backend=type(backend).__name__),
+                patch.object(
+                    ContextBlocks,
+                    "compute_visibility",
+                    wraps=blocks.compute_visibility,
+                ) as compute,
+                AttentionPreparationScope() as scope,
+            ):
+                sliding = scope.prepare(
+                    backend,
+                    layout,
+                    batch_size=2,
+                    num_heads=4,
+                    is_causal=True,
+                    sliding_window=3,
+                )
+                full = scope.prepare(
+                    backend,
+                    layout,
+                    batch_size=2,
+                    num_heads=4,
+                    is_causal=False,
+                    sliding_window=None,
+                )
+            self.assertEqual(compute.call_count, 1)
+            self.assertIs(sliding.layout, layout)
+            self.assertIs(full.layout, layout)
+            for prepared, is_causal, sliding_window in (
+                (sliding, True, 3),
+                (full, False, None),
+            ):
+                ref_mask, ref_active = backend.prepare(
+                    layout,
+                    batch_size=2,
+                    num_heads=4,
+                    is_causal=is_causal,
+                    sliding_window=sliding_window,
+                )
+                self.assertTrue(
+                    torch.equal(prepared.mask.visibility, ref_mask.visibility)
+                )
+                self.assertTrue(
+                    torch.equal(prepared.mask.empty_rows, ref_mask.empty_rows)
+                )
+                self.assertTrue(torch.equal(prepared.active_queries, ref_active))

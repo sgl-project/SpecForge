@@ -6,6 +6,7 @@ import torch
 
 from specforge.algorithms.objectives import resolve_objective
 from specforge.algorithms.objectives.inputs import prepare_blocks, sequence_inputs
+from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from tests.test_algorithms.test_objectives import (
     dflash2_config,
     domino_config,
@@ -33,7 +34,10 @@ class FlexLayoutTest(unittest.TestCase):
                 layout = blocks.layer_inputs[0].attention_layout
                 self.assertIsNotNone(layout.active_queries)
                 torch.testing.assert_close(
-                    layout.active_queries, layout.visibility[:, 0].any(-1)
+                    layout.active_queries,
+                    dense_attention_mask(layout, is_causal=False, sliding_window=None)[
+                        :, 0
+                    ].any(-1),
                 )
 
     def test_sequence_layouts_carry_active_queries(self):
