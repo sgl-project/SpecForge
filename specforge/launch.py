@@ -467,8 +467,6 @@ def _assemble_server_rollout_workers(
     algorithm: AlgorithmRegistration,
     modality: str,
     controller: DataFlowController,
-    store: FeatureStore,
-    run_id: str,
     target_hidden_size: int,
     target_vocab_size: Optional[int],
     draft_vocab_size: Optional[int],
@@ -512,10 +510,8 @@ def _assemble_server_rollout_workers(
     return [
         RolloutWorker(
             controller,
-            store,
             source,
             capture_config,
-            run_id=run_id,
             worker_id=f"rollout-{index}",
             strategy=algorithm.name,
         )
@@ -826,13 +822,14 @@ def build_disagg_online_producer(
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
-    Workers put() into a cross-node ``feature_store``; committed refs stream to
-    the consumer via ``channel``. ``feature_source`` is an injected SGLang
-    server-capture transport; a *sequence* of sources fans out to one logical
-    worker per source (the multi-server topology). Each logical worker keeps
-    ``producer_concurrency`` capture calls in flight and replenishes a slot as
-    soon as that call completes. There is intentionally no in-process
-    target-model path.
+    The SGLang server-capture transport writes features into the cross-node
+    ``feature_store`` and returns adopted ``SampleRef``s via ``produce_refs``;
+    workers commit those refs and stream them to the consumer via ``channel``.
+    ``feature_source`` is an injected SGLang server-capture transport; a
+    *sequence* of sources fans out to one logical worker per source (the
+    multi-server topology). Each logical worker keeps ``producer_concurrency``
+    capture calls in flight and replenishes a slot as soon as that call
+    completes. There is intentionally no in-process target-model path.
     The producer has no training ledger or local ref queue; the consumer owns
     deduplication and durable acknowledgements. Returns ``(workers,
     drive_producer)``:
@@ -971,8 +968,6 @@ def build_disagg_online_producer(
         modality=modality,
         feature_source=feature_source,
         controller=controller,
-        store=feature_store,
-        run_id=run_id,
         target_hidden_size=target_hidden_size,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,

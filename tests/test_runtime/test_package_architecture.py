@@ -36,6 +36,9 @@ REMOVED_MODULE_FILES = (
     "specforge/losses/lk.py",
     "specforge/losses/soft_cross_entropy.py",
     "specforge/data/utils.py",
+    "specforge/training/model_utils.py",
+    "specforge/inference/media.py",
+    "specforge/inference/batch_partition.py",
 )
 
 REMOVED_TRAINING_ENTRY_FILES = (
@@ -82,7 +85,8 @@ CAPABILITY_TEST_REPLACEMENTS = {
         "tests/test_runtime/test_compact_teacher_strategy.py",
     ),
     "tests/test_scripts/test_disagg_dflash_mask_token.py": (
-        "tests/test_runtime/test_model_assembly_utils.py",
+        "tests/test_config/test_draft_contracts.py",
+        "tests/test_config/test_model_loading_schema.py",
     ),
     "tests/test_scripts/test_train_eagle3.py": (
         "tests/test_runtime/test_single_entry.py",
@@ -169,6 +173,9 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.losses.lk",
     "specforge.losses.soft_cross_entropy",
     "specforge.data.utils",
+    "specforge.training.model_utils",
+    "specforge.inference.media",
+    "specforge.inference.batch_partition",
     "scripts.train_eagle3",
     "scripts.train_eagle3_dataflow",
     "scripts.train_dflash",
@@ -255,6 +262,11 @@ LEGACY_API_NAMES = {
     "LogSoftmaxLoss",
     "TargetHead",
     "TargetEmbeddingsAndHead",
+    "TargetBatchPartition",
+    "MediaInputs",
+    "PreparedTargetInput",
+    "resolve_mask_token_id",
+    "complete_prompt_tasks",
 }
 
 CANONICAL_LAUNCH_EXPORTS = {
@@ -405,7 +417,9 @@ class TestPackageArchitecture(unittest.TestCase):
             bad_paths = [
                 path
                 for path in replacements
-                if not path.startswith("tests/test_runtime/test_")
+                if not path.startswith(
+                    ("tests/test_runtime/test_", "tests/test_config/test_")
+                )
                 or not path.endswith(".py")
             ]
             if bad_paths:

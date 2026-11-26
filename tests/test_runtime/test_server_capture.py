@@ -634,15 +634,13 @@ class TestServerCaptureAdapter(unittest.TestCase):
 
         backend = _FakeMooncakeStore()
         server = _StubCaptureServer(backend, error_sample_ids={"run0:t1"})
-        _, _, store, adapter = _mk(server=server, backend=backend)
+        _, _, _, adapter = _mk(server=server, backend=backend)
         controller = _FakeController()
         controller.leased = [_task(0, 4), _task(1, 4), _task(2, 7)]
         worker = RolloutWorker(
             controller,
-            store,
             adapter,
             _eagle3_contract(),
-            run_id="run0",
             worker_id="w0",
         )
         worker.start()
