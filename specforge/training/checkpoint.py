@@ -82,9 +82,9 @@ class CheckpointManager:
         1. Rank 0 deletes any on-disk steps >= ``step`` (fork/rollback semantics).
         2. Every rank atomically writes its own ``training_state_rank{r}.pt``.
         3. Only after every rank's shard is durable, rank 0 atomically writes
-           ``config.json`` (when present) and finally ``training_state.pt``, the
-           sole completeness marker readers inspect.
-        4. Rank 0 updates ``{run_id}-latest`` and rotates old checkpoints.
+           ``config.json`` (when present) and ``training_state.pt`` (the sole
+           completeness marker readers inspect), then updates
+           ``{run_id}-latest`` and rotates old checkpoints.
 
         Collective: any rank's failure in any phase raises on all ranks, and a
         failed rank shard never leaves ``training_state.pt`` visible to readers.
@@ -115,31 +115,24 @@ class CheckpointManager:
         self._all_ok(err)
 
         # Phase 3 (commit point): every rank's shard is durable; rank 0 writes
-        # config.json and last writes training_state.pt.
-        err = ""
-        try:
-            if self.is_rank0() and state is not None:
-                if "canonical_draft_config" in state:
-                    self._atomic_json(
-                        state["canonical_draft_config"]
-                        | {
-                            "specforge_artifact": {
-                                "format": "specforge",
-                                "version": 1,
-                            }
-                        },
-                        os.path.join(ckpt_dir, "config.json"),
-                    )
-                # training_state.pt marks a complete checkpoint to readers.
-                self._atomic_save(state, self._state_path(ckpt_dir))
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc}"
-        self._all_ok(err)
-
-        # Phase 4: repoint latest and rotate after every rank sees the commit.
+        # config.json and training_state.pt, then repoints latest and rotates.
         err = ""
         try:
             if self.is_rank0():
+                if state is not None:
+                    if "canonical_draft_config" in state:
+                        self._atomic_json(
+                            state["canonical_draft_config"]
+                            | {
+                                "specforge_artifact": {
+                                    "format": "specforge",
+                                    "version": 1,
+                                }
+                            },
+                            os.path.join(ckpt_dir, "config.json"),
+                        )
+                    # training_state.pt marks a complete checkpoint to readers.
+                    self._atomic_save(state, self._state_path(ckpt_dir))
                 self._point(f"{self.run_id}-latest", ckpt_dir)
                 self._rotate(keep_step=step)
         except Exception as exc:

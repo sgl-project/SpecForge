@@ -9,6 +9,7 @@ continuity after resume (weights/optimizer/scheduler/RNG/data position).
 
 import contextlib
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -2035,6 +2036,7 @@ class AtomicCheckpointPublicationTest(unittest.TestCase):
         import torch.multiprocessing as mp
 
         workdir = tempfile.mkdtemp(prefix=f"atomic_ckpt_{scenario}_")
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
         store_path = os.path.join(workdir, "gloo.store")
         out_dir = os.path.join(workdir, "checkpoints")
         report_dir = os.path.join(workdir, "reports")
