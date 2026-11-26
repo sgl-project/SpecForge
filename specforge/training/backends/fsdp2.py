@@ -155,6 +155,18 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             p.requires_grad for module in frozen_modules for p in module.parameters()
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
+        block_classes = {
+            type(module)
+            for module in model.modules()
+            if type(module).__name__ in blocks
+        }
+        # As the reference runtime: names that match nothing would train the
+        # program as one root unit. Validate before mutating model dtypes or
+        # creating mesh subgroups so failure is side-effect-free.
+        if blocks and not block_classes:
+            raise ValueError(
+                f"blocks {sorted(blocks)} name no module class of the model"
+            )
         target = model if optimizer_target is None else optimizer_target
         self._artifact_dtypes = _store_in_fp32(
             model,
@@ -177,17 +189,6 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
                 p for module in frozen_modules for p in module.parameters()
             },
         )
-        block_classes = {
-            type(module)
-            for module in model.modules()
-            if type(module).__name__ in blocks
-        }
-        # As the reference runtime: names that match nothing would train the
-        # program as one root unit.
-        if blocks and not block_classes:
-            raise ValueError(
-                f"blocks {sorted(blocks)} name no module class of the model"
-            )
         # Wrap blocks bottom-up so nested _no_split_modules claim inner blocks
         # before their enclosing modules, and keep root reshard_after_forward=False
         # so FULL_SHARD does not immediately re-gather the root group for backward.
