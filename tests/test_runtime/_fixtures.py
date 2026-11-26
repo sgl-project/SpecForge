@@ -113,9 +113,6 @@ class FakeProgram(torch.nn.Module):
         """The pooled sums as they came, under ``replay_values``."""
         return {"replay_values": dict(replay_values)} if replay_values else {}
 
-    def apply_statistics(self, values):
-        return {}
-
     def kernel_record(self):
         return {}
 

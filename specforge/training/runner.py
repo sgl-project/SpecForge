@@ -593,14 +593,11 @@ class DataParallelRunner:
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm)
             )
-        if post_metrics:
-            overlap = sorted(metrics.keys() & post_metrics.keys())
-            if overlap:
-                self._broken = f"ValueError: duplicate post-step metrics {overlap}"
-                raise ValueError(
-                    f"after_step metrics collide with step metrics: {overlap}"
-                )
-            metrics.update(post_metrics)
+        overlap = sorted(metrics.keys() & post_metrics.keys())
+        if overlap:
+            self._broken = f"ValueError: duplicate post-step metrics {overlap}"
+            raise ValueError(f"after_step metrics collide with step metrics: {overlap}")
+        metrics.update(post_metrics)
         return StepMetrics(
             metrics,
             has_grad_norm=grad_norm is not None,
@@ -660,7 +657,9 @@ class DataParallelRunner:
         # Pack tensors of the same dtype into one elementwise reduce_sum while
         # preserving each statistic's native dtype and shape.
         for dtype in dict.fromkeys(tensor.dtype for _, tensor in ordered):
-            members = [(name, tensor) for name, tensor in ordered if tensor.dtype == dtype]
+            members = [
+                (name, tensor) for name, tensor in ordered if tensor.dtype == dtype
+            ]
             if len(members) == 1:
                 name, tensor = members[0]
                 pooled[name] = self.reduce_sum(tensor.clone())
@@ -671,14 +670,12 @@ class DataParallelRunner:
                 for (name, tensor), chunk in zip(members, reduced.split(sizes)):
                     pooled[name] = chunk.reshape(tensor.shape)
         reported = self._unwrapped.apply_statistics(pooled)
-        if reported is None:
-            return {}
         if not isinstance(reported, Mapping):
             raise TypeError(
-                "TrainingProgram.apply_statistics must return a mapping or None, "
+                "TrainingProgram.apply_statistics must return a mapping, "
                 f"got {type(reported).__name__}"
             )
-        return dict(reported)
+        return reported
 
     def _check_training_call(self) -> None:
         if self._broken is not None:

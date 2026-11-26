@@ -350,16 +350,14 @@ class TrainingProgram(Protocol):
         a statistic.
         """
 
-    def apply_statistics(
-        self, values: Mapping[str, torch.Tensor]
-    ) -> Mapping[str, Any]:
+    def apply_statistics(self, values: Mapping[str, torch.Tensor]) -> Mapping[str, Any]:
         """Apply pooled after-step statistics once an optimizer update succeeds.
 
         Called on every rank inside :meth:`StepRunner.apply_step`, after the
         optimizer and scheduler advance and before any checkpoint snapshot.
         Must issue no collective and compute identical buffer updates on every
-        rank. Returns optional scalar post-step metrics to include in
-        :class:`StepMetrics`.
+        rank. Returns the scalar post-step metrics to include in
+        :class:`StepMetrics`; empty when it reports none.
         """
 
     def host_inputs(

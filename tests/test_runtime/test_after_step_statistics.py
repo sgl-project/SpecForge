@@ -381,9 +381,16 @@ class AfterStepStatisticsTest(unittest.TestCase):
 
     def test_objective_model_delegates_apply_statistics_or_refuses_unhandled(self):
         _, runtime = build_runtime("DFlashDraftModel")
-        self.assertEqual(runtime.apply_statistics({}), {})
-        with self.assertRaisesRegex(NotImplementedError, "without an apply_statistics"):
-            runtime.apply_statistics({"moe_counts": torch.ones(4)})
+        # Refused where the model is built, not after the first update.
+        with self.assertRaisesRegex(TypeError, "defines no apply_statistics"):
+            ObjectiveModel(
+                runtime.draft_model,
+                runtime.objective,
+                registration=runtime.registration,
+                name=runtime.objective_name,
+                loss_configuration=runtime.loss_configuration,
+                after_step_statistics=("moe_counts",),
+            )
 
         seen = []
 

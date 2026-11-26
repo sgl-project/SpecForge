@@ -143,24 +143,35 @@ class ProgramSpecTest(unittest.TestCase):
                 after_step_statistics=("s",),
             )
         _, runtime = build_runtime("DFlashDraftModel")
-        model = ObjectiveModel(
-            runtime.draft_model,
-            runtime.objective,
-            registration=replace(
-                runtime.registration,
-                training=replace(
-                    runtime.registration.training,
-                    after_step_statistics=("proto_stat",),
+
+        class Receiving:
+            def apply_statistics(self, model, values):
+                return {}
+
+        def declared(*names):
+            return ObjectiveModel(
+                runtime.draft_model,
+                Receiving(),
+                registration=replace(
+                    runtime.registration,
+                    training=replace(
+                        runtime.registration.training,
+                        after_step_statistics=("proto_stat",),
+                    ),
                 ),
-            ),
-            name=runtime.objective_name,
-            loss_configuration=runtime.loss_configuration,
-            after_step_statistics=("moe_expert_counts", "proto_stat"),
-        )
+                name=runtime.objective_name,
+                loss_configuration=runtime.loss_configuration,
+                after_step_statistics=names,
+            )
+
+        # The registration's, then the model's own.
         self.assertEqual(
-            program_spec(model).after_step_statistics,
+            program_spec(declared("moe_expert_counts")).after_step_statistics,
             ("proto_stat", "moe_expert_counts"),
         )
+        # One name from both sources is a mistake, not a merge.
+        with self.assertRaisesRegex(ValueError, "declared more than once"):
+            declared("moe_expert_counts", "proto_stat")
 
 
 class FrozenModulesTest(unittest.TestCase):

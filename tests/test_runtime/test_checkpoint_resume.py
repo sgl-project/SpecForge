@@ -936,6 +936,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 inputs=("x",), training=TrainingRequirements()
             )
             sequence_parallel = None
+            after_step_statistics = ()
 
             def __init__(self):
                 super().__init__(Draft())

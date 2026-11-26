@@ -147,9 +147,15 @@ class ObjectiveModel(nn.Module):
             if registration is not None
             else ()
         )
-        self.after_step_statistics = tuple(
-            dict.fromkeys((*declared_after_step, *after_step_statistics))
-        )
+        names = (*declared_after_step, *after_step_statistics)
+        if len(set(names)) != len(names):
+            raise ValueError(f"after_step_statistics declared more than once: {names}")
+        if names and not hasattr(objective, "apply_statistics"):
+            raise TypeError(
+                f"objective {name!r} declares after_step_statistics {names} and "
+                "defines no apply_statistics to receive them"
+            )
+        self.after_step_statistics = names
         # The attention backend the run trains with, and the process groups of
         # its sequence-parallel axis when it has one. A protocol that takes
         # either reads it here; both are fixed for the model's lifetime.
@@ -395,20 +401,12 @@ class ObjectiveModel(nn.Module):
     def apply_statistics(self, values):
         """Apply pooled after-step statistics once an optimizer update succeeds.
 
-        Delegates to ``self.objective.apply_statistics(self, values)`` when
-        the objective defines one. Issues no collective; every rank computes
-        identical buffer updates before any checkpoint snapshot.
+        Delegates to ``self.objective.apply_statistics(self, values)``; a
+        model that declares after-step statistics is built with an objective
+        that defines it. Issues no collective; every rank computes identical
+        buffer updates before any checkpoint snapshot.
         """
-        if not values:
-            return {}
-        handler = getattr(self.objective, "apply_statistics", None)
-        if not callable(handler):
-            raise NotImplementedError(
-                f"objective {self.objective_name!r} received after_step statistics "
-                f"{sorted(values)} without an apply_statistics handler"
-            )
-        metrics = handler(self, values)
-        return {} if metrics is None else dict(metrics)
+        return self.objective.apply_statistics(self, values)
 
     def forward(self, batch, *, step, total_steps, prepass=False, **context):
         """Run the objective on one batch.

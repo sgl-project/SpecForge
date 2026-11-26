@@ -224,8 +224,6 @@ class KitProgram(FakeProgram):
         return {"scale": count / (total + 1)}
 
     def apply_statistics(self, values):
-        if not self.after_step:
-            return {}
         counts = values["expert_counts"]
         with torch.no_grad():
             self.expert_bias.add_(0.01 * counts.to(self.expert_bias.dtype))

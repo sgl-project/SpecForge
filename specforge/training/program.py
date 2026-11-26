@@ -26,19 +26,11 @@ def program_spec(model) -> ProgramSpec:
             "registration and declares nothing a runner could honour"
         )
     statistic = registration.training.window_statistic
-    after_step = tuple(
-        dict.fromkeys(
-            (
-                *registration.training.after_step_statistics,
-                *model.after_step_statistics,
-            )
-        )
-    )
     return ProgramSpec(
         name=model.objective_name,
         inputs=tuple(registration.inputs),
         replay_statistics=() if statistic is None else (statistic.argument_name,),
-        after_step_statistics=after_step,
+        after_step_statistics=model.after_step_statistics,
         evaluation_diagnostics=registration.training.evaluation_diagnostics,
         reduction=registration.training.reduction,
         # A draft class names its transformer blocks; one that names none
