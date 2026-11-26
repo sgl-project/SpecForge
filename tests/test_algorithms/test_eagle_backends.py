@@ -21,6 +21,22 @@ from tests.test_modeling.test_canonical_eagle3 import install_mapping
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+class Ranks(str):
+    """Stands in for a process group: its name, and how many ranks it holds."""
+
+    def __new__(cls, name, size=2):
+        group = super().__new__(cls, name)
+        group.ranks = size
+        return group
+
+    def size(self):
+        return self.ranks
+
+
+def sequence_groups(size=2):
+    return SequenceParallel("ring", "ulysses", Ranks("sequence", size))
+
+
 def objective_model(backend, **selection):
     config = eagle_config()
     # FlexAttention's CUDA kernel needs head dimensions of at least 16.
@@ -82,27 +98,37 @@ class EagleBackendTest(unittest.TestCase):
         )
 
     def test_rollout_takes_the_groups_the_model_was_built_with(self):
-        def requested_groups(**construction):
+        def requested_groups(backend, **construction):
             config, runtime = objective_model(
-                "sdpa", attention_backend="flex_attention", **construction
+                "sdpa", attention_backend=backend, **construction
             )
             model = runtime.draft_model
             original, requested = model.new_rollout, []
 
             def new_rollout(backend, **groups):
                 requested.append(groups)
-                return original("sdpa")
+                return original("sdpa")  # stands in for the backend off CUDA
 
-            with patch.object(model, "new_rollout", new_rollout):
+            with (
+                patch.object(model, "new_rollout", new_rollout),
+                patch(
+                    "specforge.training.sequence_parallel.reduce_statistics",
+                    lambda accepted, count, denominator, *, group: (
+                        accepted,
+                        count,
+                        denominator,
+                    ),
+                ),
+            ):
                 forward_loss(config, runtime)
             return requested
 
         self.assertEqual(
-            requested_groups(), [{"ring_group": None, "ulysses_group": None}]
+            requested_groups("flex_attention"),
+            [{"ring_group": None, "ulysses_group": None}],
         )
-        groups = SequenceParallel("ring", "ulysses", "sequence")
         self.assertEqual(
-            requested_groups(sequence_parallel=groups),
+            requested_groups("usp", sequence_parallel=sequence_groups()),
             [{"ring_group": "ring", "ulysses_group": "ulysses"}],
         )
 
@@ -128,6 +154,8 @@ class EagleBackendTest(unittest.TestCase):
             (groups.ring_group, groups.ulysses_group, groups.sequence_group),
             ("ring", "ulysses", "draft"),
         )
+        # A sequence is split over the ranks of the product group.
+        self.assertEqual(sequence_groups(size=4).size, 4)
         # Statistics of one sequence are reduced over the product group.
         reduce.assert_called_with(4, 5, 6, group="draft")
         for getter in (a, b, c):
@@ -153,12 +181,22 @@ class EagleBackendTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not train with attention.*'usp'"):
             build_runtime("PEagleDraftModel", attention_backend="usp")
-        groups = SequenceParallel("ring", "ulysses", "sequence")
+        groups = sequence_groups()
         with self.assertRaisesRegex(ValueError, "does not support sequence parallel"):
             build_runtime("PEagleDraftModel", sequence_parallel=groups)
         # What the CLI refuses, the builder refuses.
         with self.assertRaisesRegex(ValueError, "needs the sequence-parallel groups"):
             objective_model("sdpa", attention_backend="usp")
+        # The groups come with the USP backend and with no other: a backend
+        # that does not split the sequence would still reduce over them.
+        for backend in ("sdpa", "flex_attention", None):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "need attention backend 'usp'"),
+            ):
+                objective_model(
+                    "sdpa", attention_backend=backend, sequence_parallel=groups
+                )
         with self.assertRaisesRegex(ValueError, "D-PACE weighting is not supported"):
             objective_model(
                 "sdpa",
@@ -166,6 +204,14 @@ class EagleBackendTest(unittest.TestCase):
                 sequence_parallel=groups,
                 weighting={"kind": "dpace"},
             )
+        # As the CLI does, the builder takes D-PACE while the sequence is whole.
+        whole = objective_model(
+            "sdpa",
+            attention_backend="usp",
+            sequence_parallel=sequence_groups(size=1),
+            weighting={"kind": "dpace"},
+        )[1]
+        self.assertEqual(whole.weighting.kind, "dpace")
 
     def test_assembled_usp_run_hands_the_process_groups_to_the_objective(self):
         """The handoff in ``build_bundle``, up to the objective model's construction."""
@@ -187,7 +233,7 @@ class EagleBackendTest(unittest.TestCase):
             received.update(arguments)
             raise Reached
 
-        groups = SequenceParallel("ring", "ulysses", "sequence")
+        groups = sequence_groups()
         draft = next(d for d in drafts() if d.architecture == "Eagle3DraftModel")
         with TemporaryDirectory() as temp:
             cfg = load_config(
@@ -230,15 +276,15 @@ class EagleBackendTest(unittest.TestCase):
         }
         results = {}
         for name, reducer in (("local", None), ("reduced", reduce)):
-            config, runtime = objective_model(
-                "eager",
-                loss=loss,
-                sequence_parallel=reducer
-                and SequenceParallel("ring", "ulysses", "sequence"),
-            )
+            config, runtime = objective_model("eager", loss=loss)
             with (
                 warnings.catch_warnings(record=True) as caught,
                 patch("specforge.training.sequence_parallel.reduce_statistics", reduce),
+                # Only the reducer differs between the two runs: a model built
+                # with the groups also runs the USP rollout over a shorter span.
+                patch.object(
+                    runtime, "sequence_parallel", reducer and sequence_groups()
+                ),
             ):
                 warnings.simplefilter("always")
                 results[name] = forward_loss(config, runtime)
