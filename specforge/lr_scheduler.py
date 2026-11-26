@@ -1,6 +1,6 @@
+import math
 from warnings import warn
 
-from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
 from torch.optim.lr_scheduler import LRScheduler as _LRScheduler
 
 
@@ -49,10 +49,9 @@ class _TwoStageScheduler(_LRScheduler):
         }
         super().load_state_dict(state_dict)
 
-        # Restore optimizer's lr from _last_lr to ensure consistency
-        # This is critical because PyTorch's CosineAnnealingLR.get_lr() uses
-        # group["lr"] to compute the next lr, but load_state_dict doesn't
-        # update the optimizer's lr automatically.
+        # Restore optimizer's lr from _last_lr: load_state_dict doesn't update
+        # the optimizer's lr, so without this the resumed run would use the
+        # freshly constructed scheduler's initial lr until its next step.
         if last_lr is not None:
             for param_group, lr in zip(self.optimizer.param_groups, last_lr):
                 param_group["lr"] = lr
@@ -115,13 +114,47 @@ class CosineAnnealingWarmupLR(_WarmupScheduler):
         eta_min: float = 0.0,
         last_epoch: int = -1,
     ):
-        base_scheduler = _CosineAnnealingLR(
+        _check_warmup_steps(total_steps, warmup_steps)
+        base_scheduler = _CosineLR(
             optimizer,
             total_steps - warmup_steps,
             eta_min=eta_min,
             last_epoch=last_epoch,
         )
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+
+def _check_warmup_steps(total_steps: int, warmup_steps: int) -> None:
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+    if not 0 <= warmup_steps < total_steps:
+        raise ValueError(
+            "warmup_steps must be in [0, total_steps), got "
+            f"{warmup_steps} for total_steps={total_steps}"
+        )
+
+
+class _CosineLR(_LRScheduler):
+    """Closed-form cosine decay from ``base_lrs`` to ``eta_min`` over ``T_max`` steps.
+
+    Unlike ``torch.optim.lr_scheduler.CosineAnnealingLR``, the lr never depends
+    on the current ``group["lr"]``, so handing over from warmup (or resuming)
+    cannot inflate it. ``T_max``/``eta_min`` keep torch's attribute names so
+    checkpoints saved with the torch scheduler still load.
+    """
+
+    def __init__(self, optimizer, T_max: int, eta_min: float = 0.0, last_epoch=-1):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        progress = min(self.last_epoch, self.T_max) / self.T_max
+        factor = (1 + math.cos(math.pi * progress)) / 2
+        return [
+            self.eta_min + (base_lr - self.eta_min) * factor
+            for base_lr in self.base_lrs
+        ]
 
 
 class _FlatLR(_LRScheduler):
@@ -141,13 +174,7 @@ class ConstantWarmupLR(_WarmupScheduler):
         warmup_steps: int = 0,
         last_epoch: int = -1,
     ):
-        if total_steps <= 0:
-            raise ValueError(f"total_steps must be positive, got {total_steps}")
-        if not 0 <= warmup_steps < total_steps:
-            raise ValueError(
-                "warmup_steps must be in [0, total_steps), got "
-                f"{warmup_steps} for total_steps={total_steps}"
-            )
+        _check_warmup_steps(total_steps, warmup_steps)
         base_scheduler = _FlatLR(optimizer, last_epoch=last_epoch)
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
 
