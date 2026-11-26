@@ -56,6 +56,20 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(topology.draft_dp_size, 4)
         self.assertEqual(topology.data_parallel_size, 2)
 
+    def test_impossible_shapes_are_refused(self):
+        for shape, message in (
+            ({"world_size": 0}, r"must be positive: \['world_size'\]"),
+            ({"world_size": 2, "sp_ring_size": 0}, r"positive: \['sp_ring_size'\]"),
+            ({"world_size": 2, "rank": 2}, "rank 2 is not a rank of a world of 2"),
+            ({"rank": -1}, "rank -1 is not a rank"),
+            # More model-parallel ranks than the world holds.
+            ({"world_size": 2, "tp_size": 2, "sp_ulysses_size": 2}, "is not divided"),
+            ({"world_size": 3, "sp_ring_size": 2}, "is not divided"),
+        ):
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, message):
+                    Topology(**shape)
+
     def test_layout_records_the_sizes(self):
         self.assertEqual(
             Topology(rank=3, world_size=8, sp_ring_size=4).layout(),
@@ -140,6 +154,7 @@ def _failed_init_worker(port, results_dir):
         LOCAL_RANK="0",
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
+        SPECFORGE_DEVICE="cpu",
     )
     from specforge.distributed import destroy_distributed, init_distributed
 

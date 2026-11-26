@@ -39,6 +39,26 @@ class Topology:
     sp_ulysses_group: Any = field(default=None, compare=False, repr=False)
     sp_ring_group: Any = field(default=None, compare=False, repr=False)
 
+    def __post_init__(self):
+        sizes = {
+            "world_size": self.world_size,
+            "tp_size": self.tp_size,
+            "sp_ulysses_size": self.sp_ulysses_size,
+            "sp_ring_size": self.sp_ring_size,
+        }
+        below_one = sorted(name for name, size in sizes.items() if size < 1)
+        if below_one:
+            raise ValueError(f"topology sizes must be positive: {below_one}")
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError(
+                f"rank {self.rank} is not a rank of a world of {self.world_size}"
+            )
+        if self.world_size % (self.tp_size * self.sp_size):
+            raise ValueError(
+                f"a world of {self.world_size} is not divided by tp_size "
+                f"{self.tp_size} x sp_size {self.sp_size}"
+            )
+
     @property
     def sp_size(self) -> int:
         return self.sp_ulysses_size * self.sp_ring_size

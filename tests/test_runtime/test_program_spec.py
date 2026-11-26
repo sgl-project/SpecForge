@@ -76,7 +76,7 @@ class ProgramSpecTest(unittest.TestCase):
         # A block draft is sharded per decoder layer; EAGLE is one unit.
         self.assertEqual(specs["DFlashDraftModel"].partition.blocks, ("DecoderLayer",))
         self.assertEqual(specs["Eagle3DraftModel"].partition.blocks, ())
-        self.assertEqual(specs["Eagle3DraftModel"].axes, {})
+        self.assertEqual(specs["Eagle3DraftModel"].axes, ())
         # In one order on every rank, whatever order the draft holds them in.
         _, peagle = build_runtime("PEagleDraftModel")
         for held in (
@@ -106,11 +106,20 @@ class ProgramSpecTest(unittest.TestCase):
             program_spec(runtime)
 
     def test_sequence_parallel_program_declares_part_axis(self):
+        from types import SimpleNamespace
+
         from specforge.training.sequence_parallel import SequenceParallel
 
-        _, runtime = build_runtime("Eagle3DraftModel")
-        runtime.sequence_parallel = SequenceParallel(object(), object(), object())
-        self.assertEqual(program_spec(runtime).axes, {"sequence": "part"})
+        group = SimpleNamespace(size=lambda: 2)
+        _, runtime = build_runtime(
+            "Eagle3DraftModel",
+            attention_backend="usp",
+            sequence_parallel=SequenceParallel(group, group, group),
+        )
+        spec = program_spec(runtime)
+        self.assertEqual(spec.axes, (("sequence", "part"),))
+        # A value: it hashes, as every other declaration does.
+        self.assertEqual(hash(spec), hash(program_spec(runtime)))
 
 
 class FrozenModulesTest(unittest.TestCase):
