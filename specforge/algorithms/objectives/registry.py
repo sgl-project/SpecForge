@@ -2,8 +2,9 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Optional
 
-from .base import ObjectiveModel
+from .base import ObjectiveModel, SequenceParallelGroups
 from .configuration import (
     LossConfiguration,
     loss_definitions,
@@ -272,6 +273,25 @@ def resolve_objective(
     )
 
 
+def refuse_dpace_over_sequence_shards(weighting, *, sp_size):
+    """Refuse D-PACE weighting for a sequence that is split over ranks.
+
+    Args:
+        weighting: The resolved position weighting.
+        sp_size: Number of ranks one sequence is split over.
+
+    Raises:
+        ValueError: The weighting is D-PACE and ``sp_size`` is above one.
+    """
+    from specforge.losses.position_weights import DPACE_LOSS_TYPES
+
+    if sp_size > 1 and weighting.kind in DPACE_LOSS_TYPES:
+        raise ValueError(
+            "D-PACE weighting is not supported with sequence parallelism: "
+            "chain weights are normalized within each sequence shard"
+        )
+
+
 def build_objective_model(
     draft_model,
     *,
@@ -283,6 +303,8 @@ def build_objective_model(
     loss=None,
     weighting=None,
     frozen_modules=(),
+    attention_backend=None,
+    sequence_parallel: Optional[SequenceParallelGroups] = None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -298,6 +320,12 @@ def build_objective_model(
         frozen_modules: Frozen modules of the composed model that a runner
             keeps out of sharding and out of the optimizer (bound target
             tables, the teacher head).
+        attention_backend: The attention backend the run trains with, for a
+            protocol whose rollout depends on it.
+        sequence_parallel: The process groups of the sequence-parallel axis
+            (the ring group, the Ulysses group and their product, over which
+            loss statistics of one sequence are reduced). Given with the
+            ``usp`` backend and with no other.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -316,6 +344,29 @@ def build_objective_model(
         weighting=weighting,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    if (
+        attention_backend is not None
+        and attention_backend not in entry.training.attention_backends
+    ):
+        raise ValueError(
+            f"objective {name!r} does not train with attention backend "
+            f"{attention_backend!r}; it supports "
+            f"{sorted(entry.training.attention_backends)}"
+        )
+    if sequence_parallel is not None and not entry.training.supports_sequence_parallel:
+        raise ValueError(f"objective {name!r} does not support sequence parallelism")
+    if attention_backend == "usp" and sequence_parallel is None:
+        raise ValueError("attention backend 'usp' needs the sequence-parallel groups")
+    if sequence_parallel is not None:
+        if attention_backend != "usp":
+            raise ValueError(
+                "sequence-parallel groups need attention backend 'usp', not "
+                f"{attention_backend!r}: no other backend splits the sequence, "
+                "and its loss statistics would still be reduced over the groups"
+            )
+        refuse_dpace_over_sequence_shards(
+            resolved.weighting, sp_size=sequence_parallel.size
+        )
     if resolved.execution.teacher_chunk_size:
         from torch import nn
 
@@ -380,6 +431,8 @@ def build_objective_model(
         frozen_parameters=frozen,
         execution=resolved.execution,
         frozen_modules=frozen_modules,
+        attention_backend=attention_backend,
+        sequence_parallel=sequence_parallel,
     )
 
 

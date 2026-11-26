@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
+from typing import Any, Optional, Protocol
 
 import torch
 from torch import Tensor, nn
@@ -35,6 +36,26 @@ class ObjectiveResult:
         return self.numerator / self.denominator.where(self.denominator > 0, 1)
 
 
+class SequenceParallelGroups(Protocol):
+    """The sequence-parallel axis an objective model is built with.
+
+    Ranks of one group share a sequence, not samples. The training side builds
+    the value; a protocol reads these members and nothing else of it.
+    """
+
+    #: Group of the ring-attention exchange.
+    ring_group: Any
+    #: Group of the Ulysses all-to-all.
+    ulysses_group: Any
+
+    @property
+    def size(self) -> int:
+        """Number of ranks one sequence is split over."""
+
+    def reduce_statistics(self, accepted, count, denominator):
+        """Sum detached loss statistics over the ranks of one sequence."""
+
+
 class ObjectiveModel(nn.Module):
     """One wrapped forward includes the draft and every differentiable loss path.
 
@@ -55,6 +76,8 @@ class ObjectiveModel(nn.Module):
         frozen_parameters=(),
         execution=None,
         frozen_modules=(),
+        attention_backend=None,
+        sequence_parallel: Optional[SequenceParallelGroups] = None,
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -84,6 +107,11 @@ class ObjectiveModel(nn.Module):
             raise ValueError(
                 f"frozen_modules holds modules this model does not: {strangers}"
             )
+        # The attention backend the run trains with, and the process groups of
+        # its sequence-parallel axis when it has one. A protocol that takes
+        # either reads it here; both are fixed for the model's lifetime.
+        self.attention_backend = attention_backend
+        self.sequence_parallel = sequence_parallel
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()

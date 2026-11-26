@@ -297,14 +297,18 @@ def load_eagle3(
     draft.vocabulary.load_mapping(**torch.load(vocab_path, weights_only=True))
     draft.embed_tokens.requires_grad_(False)
     head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
-    model = build_objective_model(
-        draft, target_head=head.fc, options=dict(ttt_length=ttt, **options)
-    )
-    model.attention_backend = backend
+    sequence_parallel = None
     if backend == "usp":
-        from specforge.training.sequence_parallel import configure_sequence_parallel
+        from specforge.training.sequence_parallel import sequence_parallel_groups
 
-        configure_sequence_parallel(model)
+        sequence_parallel = sequence_parallel_groups()
+    model = build_objective_model(
+        draft,
+        target_head=head.fc,
+        options=dict(ttt_length=ttt, **options),
+        attention_backend=backend,
+        sequence_parallel=sequence_parallel,
+    )
     return model.cuda()
 
 
