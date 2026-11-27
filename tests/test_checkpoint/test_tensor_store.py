@@ -12,8 +12,8 @@ import torch
 from safetensors.torch import save_file
 
 from specforge.checkpoint import TensorStore, make_weight_plan
+from specforge.checkpoint.layout import resolve_weight_layout
 from specforge.modeling import build_draft_model
-from specforge.modeling.target.checkpoint import list_checkpoint_keys
 from tests.test_config.draft_fixtures import draft_config
 
 
@@ -86,7 +86,7 @@ class TensorStoreTest(unittest.TestCase):
                 store.read("a")
                 self.assertEqual(load.call_count, 1)
 
-    def test_readers_share_single_file_precedence_and_fallback(self):
+    def test_single_file_precedence_and_fallback(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             file = root / "model.safetensors"
@@ -95,16 +95,16 @@ class TensorStoreTest(unittest.TestCase):
             index.write_text(
                 json.dumps({"weight_map": {"missing": "absent.safetensors"}})
             )
-            self.assertEqual(list_checkpoint_keys(tmp), ["weight"])
             with self.assertRaisesRegex(ValueError, "model.safetensors.*index"):
                 TensorStore(root)
             index.write_text(json.dumps({"weight_map": {"weight": file.name}}))
+            self.assertEqual(resolve_weight_layout(tmp), ("single", str(file)))
             self.assertEqual(list(TensorStore(root).metadata), ["weight"])
             index.unlink()
-            file.rename(root / "custom.safetensors")
-            self.assertEqual(
-                list(TensorStore(root).metadata), list_checkpoint_keys(tmp)
-            )
+            custom = root / "custom.safetensors"
+            file.rename(custom)
+            self.assertEqual(resolve_weight_layout(tmp), ("single", str(custom)))
+            self.assertEqual(list(TensorStore(root).metadata), ["weight"])
 
     def test_training_state_precedes_stray_weights(self):
         with TemporaryDirectory() as tmp:

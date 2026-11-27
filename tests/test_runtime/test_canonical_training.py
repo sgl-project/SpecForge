@@ -13,6 +13,7 @@ from transformers import Qwen3Config
 from specforge.application.composition import build_application_run, resolve_run
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
+from specforge.distributed import Topology
 from specforge.loading import load_draft
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.assembly import build_model_bundle
@@ -78,7 +79,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 },
             )
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertEqual(bundle.model.execution.chunk_size, 2)
             self.assertFalse(bundle.model.execution.checkpoint)
             contract = bundle.strategy_kwargs.resume_contract[
@@ -86,6 +89,38 @@ class CanonicalTrainingTest(unittest.TestCase):
             ]
             self.assertTrue(contract["trim"])
             self.assertEqual(contract["chunk_size"], 2)
+
+    def test_anchor_sampling_reaches_the_model_and_the_resume_contract(self):
+        with TemporaryDirectory() as temp:
+            target = target_directory(Path(temp))
+            for sampling, recorded in (("device", "device"), ("host", ("host", 7))):
+                cfg = run_config(
+                    target,
+                    draft_config(),
+                    training={
+                        "attention_backend": "eager",
+                        "anchor_sampling": sampling,
+                        "seed": 7,
+                    },
+                )
+                resolved = resolve_run(cfg)
+                bundle = build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm, topology=Topology()
+                )
+                self.assertEqual(bundle.model.anchor_sampling, sampling)
+                self.assertEqual(
+                    bundle.strategy_kwargs.resume_contract["canonical_anchor_sampling"],
+                    recorded,
+                )
+            # Refused while the run is resolved, before any data is read.
+            with self.assertRaisesRegex(ValueError, "block objectives only"):
+                resolve_run(
+                    run_config(
+                        target,
+                        eagle_config(target_width=32),
+                        training={"anchor_sampling": "host"},
+                    )
+                )
 
     def test_named_loss_settings_reach_capture_and_resume_contract(self):
         with TemporaryDirectory() as temp:
@@ -102,7 +137,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 },
             )
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertIsNotNone(bundle.model.target_head)
             term = bundle.model.loss_configuration.terms["token"]
             self.assertEqual(term.loss.kind, "kl")
@@ -119,11 +156,15 @@ class CanonicalTrainingTest(unittest.TestCase):
             cfg = run_config(target, owned_mtp_config())
             resolved = resolve_run(cfg)  # Capture planning does not initialize weights.
             with self.assertRaisesRegex(ValueError, "initialization: {}"):
-                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+                build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm, topology=Topology()
+                )
             raw = cfg.model_dump()
             raw["initialization"] = {}
             resolved = resolve_run(Config.model_validate(raw))
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertIsNotNone(bundle.draft_model)
 
     def test_target_tables_are_reused_and_owned_embedding_is_initialized(self):
@@ -152,13 +193,17 @@ class CanonicalTrainingTest(unittest.TestCase):
             )
             with patch.object(TensorStore, "read", read):
                 bundle = build_model_bundle(
-                    resolved.config, algorithm=resolved.algorithm
+                    resolved.config,
+                    algorithm=resolved.algorithm,
+                    topology=Topology(),
                 )
             self.assertIs(bundle.target_head, bundle.draft_model.lm_head)
             self.assertEqual(reads.count("lm_head.weight"), 1)
             draft = peagle_config(target_width=32)
             resolved = resolve_run(run_config(target, draft))
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             expected = load_file(target / "model.safetensors")[
                 "model.embed_tokens.weight"
             ]
@@ -178,7 +223,9 @@ class CanonicalTrainingTest(unittest.TestCase):
             (target / "config.json").write_text(json.dumps(payload))
             cfg = Config.model_validate(run_config(target, draft_config()).model_dump())
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             torch.testing.assert_close(
                 bundle.draft_model.embed_tokens.weight,
                 bundle.draft_model.lm_head.weight,
@@ -254,7 +301,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 resolved.config.draft["target_logit_transform"],
                 {"type": "mup", "multiplier": 8},
             )
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertEqual(bundle.draft_config.target_logit_transform.multiplier, 8)
             from safetensors.torch import load_file
 
@@ -267,7 +316,11 @@ class CanonicalTrainingTest(unittest.TestCase):
             ] = [99]
             with patch("specforge.loading.initialize_draft") as initialize:
                 with self.assertRaisesRegex(ValueError, "target_layer_ids"):
-                    build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+                    build_model_bundle(
+                        resolved.config,
+                        algorithm=resolved.algorithm,
+                        topology=Topology(),
+                    )
                 initialize.assert_not_called()
 
     def test_all_architectures_resolve_and_assemble(self):
@@ -282,7 +335,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                     cfg = run_config(target, draft, initialization={})
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
-                        resolved.config, algorithm=resolved.algorithm
+                        resolved.config,
+                        algorithm=resolved.algorithm,
+                        topology=Topology(),
                     )
                     self.assertEqual(bundle.draft_config, draft)
                     self.assertIs(bundle.model.draft_model, bundle.draft_model)
@@ -318,7 +373,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                     )
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
-                        resolved.config, algorithm=resolved.algorithm
+                        resolved.config,
+                        algorithm=resolved.algorithm,
+                        topology=Topology(),
                     )
                     needs_teacher = kind != "ce"
                     layout = resolved.algorithm.providers.offline_for(
@@ -380,7 +437,7 @@ class CanonicalTrainingTest(unittest.TestCase):
     def test_mtp_native_copy_sdpa_chunking_and_resume(self):
         self._train_and_resume(False, mtp=True)
 
-    def _train_and_resume(self, tied, mtp=False):
+    def _train_and_resume(self, tied, mtp=False, *, fsdp_sharding="SHARD_GRAD_OP"):
         with TemporaryDirectory() as temp:
             root = Path(temp)
             owns_group = not torch.distributed.is_initialized()
@@ -392,6 +449,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     world_size=1,
                 )
                 self.addCleanup(torch.distributed.destroy_process_group)
+            topology = Topology(world_group=torch.distributed.group.WORLD)
             target = target_directory(root)
             draft = draft_config(
                 tie_word_embeddings=tied,
@@ -440,6 +498,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 draft,
                 training={
                     "attention_backend": "sdpa" if mtp else "eager",
+                    "fsdp_sharding": fsdp_sharding,
                     "max_steps": 1,
                     "total_steps": 2,
                     "save_interval": 1,
@@ -458,7 +517,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                 raw = cfg.model_dump()
                 raw["initialization"] = {"from_target": NATIVE_MAPPING}
                 cfg = Config.model_validate(raw)
-            first = build_application_run(cfg)
+            first = build_application_run(cfg, topology=topology)
             first.run()
             checkpoint = root / "output" / "specforge-run-step1"
             self.assertTrue((checkpoint / "config.json").exists())
@@ -484,7 +543,7 @@ class CanonicalTrainingTest(unittest.TestCase):
             }
             torch.save(old, checkpoint / "training_state.pt")
             with self.assertRaisesRegex(ValueError, "canonical_loss"):
-                build_application_run(Config.model_validate(raw))
+                build_application_run(Config.model_validate(raw), topology=topology)
             # A checkpoint from before fused had an unset (auto) setting records
             # False. A run that leaves fused unset continues it as it was written.
             self.assertIsNone(saved["canonical_loss_execution"]["fused"])
@@ -496,7 +555,9 @@ class CanonicalTrainingTest(unittest.TestCase):
                 },
             }
             torch.save(saved, checkpoint / "training_state.pt")
-            second = build_application_run(Config.model_validate(raw))
+            second = build_application_run(
+                Config.model_validate(raw), topology=topology
+            )
             second.run()
             final = root / "output" / "specforge-run-step2"
             state = torch.load(
@@ -533,7 +594,7 @@ class CanonicalTrainingTest(unittest.TestCase):
                     incompatible = Config.model_validate(raw)
                     setattr(incompatible.training, key, changed)
                     with self.assertRaisesRegex(ValueError, f"canonical_{key}"):
-                        build_application_run(incompatible)
+                        build_application_run(incompatible, topology=topology)
             raw["draft"] = encode_config(
                 draft_config(hidden_size=32, layer_types=("full_dense",))
             )
@@ -621,7 +682,11 @@ class CanonicalTrainingTest(unittest.TestCase):
         reduce.assert_not_called()
 
     def test_dspine_replay_ratio_is_formed_before_a_wrapper_casts(self):
-        """Under FSDP's mixed precision the forward's inputs are cast on the way in."""
+        """A wrapper that casts the forward's inputs rounds the ratio, not its sums.
+
+        FSDP's mixed precision did cast them until the backend turned the root
+        cast off; ``test_fsdp_hands_the_program_its_inputs_uncast`` checks that.
+        """
         from unittest.mock import Mock
 
         from specforge.algorithms.objectives import build_objective_model
@@ -678,11 +743,97 @@ class CanonicalTrainingTest(unittest.TestCase):
         prepass, replay = (
             call.kwargs["alignment_ce"] for call in runtime.objective.call_args_list
         )
-        # Both pass through the wrapper, as every argument of the forward does.
+        # Both pass through the casting wrapper.
         self.assertEqual((prepass.item(), prepass.dtype), (0.0, torch.bfloat16))
         self.assertEqual(replay.dtype, torch.bfloat16)
         # 768 / 257 in fp32, then cast; the cast sums would give exactly 3.
         self.assertEqual(replay.item(), 2.984375)
+
+    def test_fsdp_hands_the_program_its_inputs_uncast(self):
+        """The sharding wrapper casts parameters for compute, not the program's tensors."""
+        from unittest.mock import Mock
+
+        import torch.distributed as dist
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        from specforge.algorithms.objectives import build_objective_model
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+        from specforge.training.frame import run_window
+        from specforge.training.program import program_spec
+        from specforge.training.runner import DataParallelRunner
+        from tests.test_modeling.test_canonical_dspine import initialized_model
+        from tests.test_runtime._fixtures import reference_runtime
+
+        if not (dist.is_available() and dist.is_gloo_available()):
+            self.skipTest("needs gloo")
+        original = FullyShardedDataParallel.__init__
+
+        def on_host(self, module, *args, **kwargs):
+            kwargs.setdefault("device_id", torch.device("cpu"))
+            original(self, module, *args, **kwargs)
+
+        class Runner(DataParallelRunner):
+            def reduce_sum(self, values):
+                # Sums whose ratio is not the ratio of their bfloat16 values.
+                return torch.tensor([768.0, 257.0]) if values.numel() == 2 else values
+
+        with TemporaryDirectory() as directory:
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{Path(directory) / 'store'}",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                model = initialized_model(dtype=torch.bfloat16)
+                head = torch.nn.Linear(32, 64, bias=False, dtype=torch.bfloat16)
+                runtime = build_objective_model(
+                    model,
+                    options={"num_anchors": 2, "alignment_warmup_steps": 0},
+                    target_head=head,
+                    frozen_modules=[model.embed_tokens, model.lm_head, head],
+                )
+                spec = program_spec(runtime)
+                backend = FSDPTrainingBackend(
+                    ParallelConfig(
+                        sharding_strategy="SHARD_GRAD_OP",
+                        fsdp_process_group=dist.group.WORLD,
+                    ),
+                    optimizer_factory=lambda module: torch.optim.SGD(
+                        module.parameters(), lr=0.0
+                    ),
+                    precision=reference_runtime(
+                        torch.bfloat16, master_dtype=None
+                    ).precision,
+                )
+                with patch.object(FullyShardedDataParallel, "__init__", on_host):
+                    wrapped = backend.prepare_model(
+                        runtime,
+                        optimizer_target=runtime.draft_model,
+                        frozen_modules=runtime.frozen_modules,
+                        blocks=spec.partition.blocks,
+                    )
+                features = []
+                runtime.draft_model.register_forward_pre_hook(
+                    lambda _module, args: features.append(args[1].dtype)
+                )
+                runtime.objective = Mock(wraps=runtime.objective)
+                batch = TrainBatch(["a"], "dspine", training_batch(model.config.draft))
+                run_window(
+                    Runner(wrapped, backend, spec),
+                    [batch],
+                    StepContext(global_step=1, total_steps=10),
+                )
+            finally:
+                dist.destroy_process_group()
+        replay = runtime.objective.call_args_list[-1].kwargs["alignment_ce"]
+        self.assertEqual(replay.dtype, torch.float32)
+        self.assertEqual(
+            replay.item(), (torch.tensor(768.0) / torch.tensor(257.0)).item()
+        )
+        # The draft still computes in bfloat16: the program casts its features.
+        self.assertTrue(features)
+        self.assertEqual(set(features), {torch.bfloat16})
 
     def test_eagle3_sdpa_is_selectable_and_matches_eager_loss(self):
         """EAGLE3 declares SDPA; switching backends must not change its loss."""

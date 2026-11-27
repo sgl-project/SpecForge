@@ -147,8 +147,17 @@ def register_loss(
     return register
 
 
-def ce_outputs(compute, logits, labels, teacher=None, *, top_k=None, teacher_l1=False):
-    """Return CE and explicitly requested, differentiable intermediate outputs."""
+def ce_outputs(
+    compute,
+    logits,
+    labels,
+    teacher=None,
+    *,
+    top_k=None,
+    teacher_l1=False,
+    teacher_l1_grad=True,
+):
+    """Return CE and explicitly requested intermediate outputs."""
     if teacher_l1 and (teacher is None or teacher.shape != logits.shape):
         raise ValueError("teacher_l1 requires aligned teacher and draft logits")
     result = compute(
@@ -156,6 +165,7 @@ def ce_outputs(compute, logits, labels, teacher=None, *, top_k=None, teacher_l1=
         labels,
         teacher_logits=teacher if teacher_l1 else None,
         top_k=top_k or 0,
+        teacher_l1_grad=teacher_l1_grad,
     )
     statistics = {}
     if teacher_l1:
@@ -167,16 +177,23 @@ def ce_outputs(compute, logits, labels, teacher=None, *, top_k=None, teacher_l1=
 
 def ce_output_options(requested):
     """Validate CE's optional outputs, shared by reference and fused execution."""
-    unknown = requested.keys() - {"return_teacher_l1", "top_k"}
+    unknown = requested.keys() - {"return_teacher_l1", "teacher_l1_grad", "top_k"}
     if unknown:
         raise ValueError(f"Unknown CE outputs: {sorted(unknown)}")
     teacher_l1 = requested.get("return_teacher_l1", False)
+    teacher_l1_grad = requested.get("teacher_l1_grad", True)
     k = requested.get("top_k")
     if type(teacher_l1) is not bool:
         raise ValueError("return_teacher_l1 must be boolean")
+    if type(teacher_l1_grad) is not bool:
+        raise ValueError("teacher_l1_grad must be boolean")
     if k is not None and (type(k) is not int or k < 1):
         raise ValueError("top_k must be a positive integer")
-    return {"teacher_l1": teacher_l1, "top_k": k}
+    return {
+        "teacher_l1": teacher_l1,
+        "teacher_l1_grad": teacher_l1_grad,
+        "top_k": k,
+    }
 
 
 def ce_reference_outputs(logits, labels, teacher, options, requested_outputs, context):
@@ -221,24 +238,82 @@ def soft_cross_entropy(logits, labels, teacher):
     return -(teacher.float().softmax(-1) * logits.float().log_softmax(-1)).sum(-1)
 
 
+def ce_l1_output_options(requested):
+    """Validate CE/L1's optional outputs, shared by reference and fused execution."""
+    unknown = requested.keys() - {"top_k"}
+    if unknown:
+        raise ValueError(f"Unknown CE/L1 outputs: {sorted(unknown)}")
+    k = requested.get("top_k")
+    if k is not None and (type(k) is not int or k < 1):
+        raise ValueError("top_k must be a positive integer")
+    return {"top_k": k}
+
+
+def ce_l1_outputs(
+    compute,
+    logits,
+    labels,
+    teacher,
+    *,
+    context=None,
+    ce_weight=0.1,
+    l1_weight=0.9,
+    top_k=None,
+):
+    """Compute CE/L1 plus optional top-k candidates in a single pass."""
+    terms = compute(
+        logits,
+        labels,
+        teacher_logits=teacher,
+        top_k=top_k or 0,
+    )
+    output = combine_ce_l1(
+        terms.cross_entropy, terms.teacher_l1, context, ce_weight, l1_weight
+    )
+    if top_k is not None:
+        output.statistics.update(topk_ids=terms.topk_ids, topk_values=terms.topk_values)
+    return output
+
+
+def ce_l1_reference_outputs(
+    logits, labels, teacher, options, requested_outputs, context
+):
+    """Compute CE/L1 with optional top-k candidates."""
+    return ce_l1_outputs(
+        fused_loss.ce_l1_loss,
+        logits,
+        labels,
+        teacher,
+        context=context,
+        **options,
+        **ce_l1_output_options(requested_outputs),
+    )
+
+
 @register_loss(
     "ce_l1",
     requires=("logits", "labels", "teacher_logits"),
     contextual=True,
+    outputs=ce_l1_reference_outputs,
     scope="positions",
     capabilities=("component_masks", "masked_ce_l1"),
     context_statistics=(),
 )
 def ce_l1(logits, labels, teacher, *, context=None, ce_weight=0.1, l1_weight=0.9):
-    terms = fused_loss.ce_l1_loss(logits, labels, teacher_logits=teacher)
-    return combine_ce_l1(
-        terms.cross_entropy, terms.teacher_l1, context, ce_weight, l1_weight
+    return ce_l1_outputs(
+        fused_loss.ce_l1_loss,
+        logits,
+        labels,
+        teacher,
+        context=context,
+        ce_weight=ce_weight,
+        l1_weight=l1_weight,
     )
 
 
 def combine_ce_l1(ce, l1, context, ce_weight, l1_weight):
     """Apply optional component supervision before combining CE and teacher L1."""
-    raw_l1 = l1
+    raw_ce, raw_l1 = ce, l1
     if context is not None:
         if context.ce_mask is not None:
             ce = ce * context.ce_mask
@@ -246,7 +321,7 @@ def combine_ce_l1(ce, l1, context, ce_weight, l1_weight):
             l1 = l1 * context.l1_mask
     ce = ce_weight * ce
     l1 = l1_weight * l1
-    statistics = {"teacher_l1": raw_l1}
+    statistics = {"cross_entropy": raw_ce, "teacher_l1": raw_l1}
     if context is not None and context.ce_mask is not None:
         statistics.update(masked_ce=ce, masked_l1=l1)
     return LossOutput(ce + l1, statistics)

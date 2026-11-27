@@ -135,7 +135,9 @@ def _rank0_setup_error_worker(
         _init_gloo(rank, init_method)
         initialized = True
 
+        from specforge.distributed import Topology
         from specforge.launch import build_disagg_online_consumer
+        from tests.test_runtime._fixtures import reference_runtime
 
         try:
             build_disagg_online_consumer(
@@ -144,11 +146,17 @@ def _rank0_setup_error_worker(
                 channel=_PathOnlyChannel(os.path.join(work_dir, "refs.jsonl")),
                 draft_model=None,
                 optimizer_factory=None,
+                runtime=reference_runtime(),
                 run_id="setup-error-run",
                 output_dir=work_dir,
                 metadata_db_path=metadata_db_path,
-                dp_rank=rank,
-                dp_size=WORLD_SIZE,
+                topology=Topology(
+                    rank=rank,
+                    world_size=WORLD_SIZE,
+                    dp_rank=rank,
+                    draft_dp_rank=rank,
+                    world_group=dist.group.WORLD,
+                ),
                 inbox_dir=os.path.join(work_dir, "inboxes"),
             )
         except BaseException as exc:
@@ -403,11 +411,13 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
         feature_store=None,
         metadata_db_path=None,
     ):
+        from specforge.distributed import Topology
         from specforge.launch import build_disagg_online_consumer
         from specforge.runtime.control_plane.metadata_store import InMemoryMetadataStore
         from specforge.runtime.data_plane.streaming_ref_channel import (
             StreamingRefChannel,
         )
+        from tests.test_runtime._fixtures import reference_runtime
 
         captured = {}
 
@@ -424,7 +434,6 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
             else {"metadata_store": InMemoryMetadataStore()}
         )
         with (
-            mock.patch.object(dist, "is_initialized", return_value=False),
             mock.patch(
                 "specforge.runtime.data_plane.ref_distributor.RefDistributor",
                 _FakeRefDistributor,
@@ -437,9 +446,11 @@ class TestSingleRankConsumerLifecycle(unittest.TestCase):
                 channel=channel,
                 draft_model=object(),
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="consumer-lifecycle",
                 output_dir=work,
                 inbox_dir=os.path.join(work, "inboxes"),
+                topology=Topology(),
                 **metadata_kwargs,
             )
         return trainer, channel, captured

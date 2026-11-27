@@ -22,11 +22,14 @@ import os
 import time
 import uuid
 from contextlib import suppress
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
 from specforge.config.schema import resolve_dispatch_watermarks
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
@@ -433,12 +436,28 @@ def _close_store_on_error(store: Any) -> None:
         )
 
 
+def _optimizer_kwargs(
+    cfg: Config, optimizer_factory: Optional[Callable]
+) -> Dict[str, Any]:
+    if optimizer_factory is not None:
+        return {"optimizer_factory": optimizer_factory(cfg)}
+    from specforge.training.assembly import _optimizer_spec, _scheduler_spec
+
+    return {
+        "optimizer_spec": _optimizer_spec(cfg),
+        "scheduler_spec": _scheduler_spec(cfg),
+        "max_grad_norm": cfg.training.max_grad_norm,
+    }
+
+
 def _build_offline(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    topology: Optional[Topology],
     build_model_bundle: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
     claim_token: Optional[str] = None,
@@ -561,7 +580,8 @@ def _build_offline(
             refs=read_ref_manifest(manifest),
             draft_model=bundle.model,
             target_head=bundle.target_head,
-            optimizer_factory=optimizer_factory(cfg),
+            **_optimizer_kwargs(cfg, optimizer_factory),
+            runtime=training_runtime(cfg),
             run_id=cfg.run_id,
             output_dir=cfg.output_dir,
             ttt_length=cfg.training.objective_options.get("ttt_length", 7),
@@ -579,9 +599,9 @@ def _build_offline(
             strategy_kwargs=bundle.strategy_kwargs,
             resume_from=cfg.resume_path,
             max_checkpoints=cfg.training.max_checkpoints,
-            tp_size=cfg.training.tp_size,
-            sp_ulysses_size=cfg.training.sp_ulysses_size,
-            sp_ring_size=cfg.training.sp_ring_size,
+            topology=topology,
+            fsdp_sharding=cfg.training.fsdp_sharding,
+            ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
             use_usp_preprocess=(cfg.training.attention_backend == "usp"),
             seed=cfg.training.seed,
             dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
@@ -622,9 +642,11 @@ def _build_online(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    topology: Optional[Topology],
     build_model_bundle: Callable,
     prepare_prompts: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
     claim_token: Optional[str] = None,
@@ -879,7 +901,8 @@ def _build_online(
             channel=channel,
             draft_model=bundle.model,
             target_head=bundle.target_head,
-            optimizer_factory=optimizer_factory(cfg),
+            **_optimizer_kwargs(cfg, optimizer_factory),
+            runtime=training_runtime(cfg),
             run_id=cfg.run_id,
             output_dir=cfg.output_dir,
             batch_size=cfg.training.batch_size,
@@ -893,9 +916,9 @@ def _build_online(
             log_interval=cfg.training.log_interval,
             strategy_kwargs=bundle.strategy_kwargs,
             max_checkpoints=cfg.training.max_checkpoints,
-            tp_size=cfg.training.tp_size,
-            sp_ulysses_size=cfg.training.sp_ulysses_size,
-            sp_ring_size=cfg.training.sp_ring_size,
+            topology=topology,
+            fsdp_sharding=cfg.training.fsdp_sharding,
+            ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
             inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
             resume_from=cfg.resume_path,
             dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
@@ -915,14 +938,17 @@ def build_disaggregated_run(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    topology: Optional[Topology],
     build_model_bundle: Callable,
     prepare_prompts: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
     """Assemble the configured producer or consumer role.
 
+    ``topology`` is the job's shape; a producer, which trains nothing, has none.
     ``preflight_model_bundle(cfg)`` runs on the consumer before it waits on the
     producer, so dependencies ``build_model_bundle`` needs fail at startup.
     """
@@ -936,8 +962,10 @@ def build_disaggregated_run(
             return _build_offline(
                 cfg,
                 algorithm=algorithm,
+                topology=topology,
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
+                training_runtime=training_runtime,
                 logger=logger,
                 preflight_model_bundle=preflight_model_bundle,
                 claim_token=claim_token,
@@ -945,9 +973,11 @@ def build_disaggregated_run(
         return _build_online(
             cfg,
             algorithm=algorithm,
+            topology=topology,
             build_model_bundle=build_model_bundle,
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
+            training_runtime=training_runtime,
             logger=logger,
             preflight_model_bundle=preflight_model_bundle,
             claim_token=claim_token,

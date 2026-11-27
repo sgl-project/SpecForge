@@ -1,6 +1,7 @@
 """Acceptance losses preserve legacy reduction and complete-chain weighting."""
 
 import functools
+import math
 import unittest
 from dataclasses import replace
 
@@ -24,9 +25,25 @@ from specforge.algorithms.objectives.predictions import (
     Teacher,
 )
 from specforge.algorithms.objectives.projection import Projection
-from specforge.losses.lk import compute_lk_loss
 from specforge.losses.position_weights import DPACE_LOSS_TYPES, dpace_weights
 from tests.test_algorithms.test_objectives import training_batch
+
+
+def _reference_lk_loss(
+    *,
+    kl_loss: torch.Tensor,
+    acceptance_rate: torch.Tensor,
+    log_acceptance_rate: torch.Tensor,
+    lk_loss_type: str,
+    kl_scale: float,
+    kl_decay: float,
+) -> torch.Tensor:
+    if lk_loss_type == "alpha":
+        return -log_acceptance_rate
+    if lk_loss_type == "tv":
+        return 1 - acceptance_rate
+    kl_weight = kl_scale * torch.exp(-kl_decay * acceptance_rate.detach())
+    return kl_weight * kl_loss + (1 - kl_weight) * (1 - acceptance_rate)
 
 
 class AcceptanceLossTest(unittest.TestCase):
@@ -50,7 +67,7 @@ class AcceptanceLossTest(unittest.TestCase):
                 )
                 denominator = weights.sum()
                 ce = -probability.log()
-                expected = compute_lk_loss(
+                expected = _reference_lk_loss(
                     kl_loss=(ce * weights).sum() / denominator,
                     acceptance_rate=(probability * weights).sum() / denominator,
                     log_acceptance_rate=(probability.log() * weights).sum()
@@ -104,7 +121,7 @@ class AcceptanceLossTest(unittest.TestCase):
                 ).sum() / denominator
                 acceptance = torch.minimum(p, logits.softmax(-1)).sum(-1)
                 ce = -(restricted.softmax(-1) * logits.log_softmax(-1)).sum(-1)
-                expected = compute_lk_loss(
+                expected = _reference_lk_loss(
                     kl_loss=(ce * mask).sum() / denominator,
                     acceptance_rate=(acceptance * mask).sum() / mask.sum(),
                     log_acceptance_rate=(acceptance.log() * mask).sum() / mask.sum(),
@@ -118,6 +135,94 @@ class AcceptanceLossTest(unittest.TestCase):
                     torch.autograd.grad(expected, logits, retain_graph=True)[0],
                 )
                 self.assertIn("target_last_hidden_states", loss.inputs)
+
+    def test_teacher_lk_zero_acceptance_and_masked_rows_across_optimizer_step(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        # Row 0: q=(sigmoid(2), 1-sigmoid(2)), p=(0.8, 0.2), acceptance=0.8+q1.
+        q0 = 1 / (1 + math.exp(-2))
+        acceptance = 0.8 + (1 - q0)
+        derivative = q0 * (1 - q0) / acceptance
+        teacher0 = [math.log(0.8), math.log(0.2)]
+        scenarios = (
+            ("masked padding", [1000.0, -1000.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0]),
+            (
+                "disjoint support",
+                [1000.0, -1000.0],
+                [-1000.0, 1000.0],
+                [1.0, 1.0],
+                [1.0, 1.0],
+            ),
+            ("ordinary padding", [1.0, -1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 0.0]),
+            ("fractional mask", [1000.0, -1000.0], [0.0, 0.0], [1.0, 0.0], [0.5, 0.0]),
+            ("empty mask", [1000.0, -1000.0], [0.0, 0.0], [1.0, 0.0], [0.0, 0.0]),
+        )
+        cases = (
+            (d, m, s)
+            for d in devices
+            for m in ("alpha", "tv", "lambda")
+            for s in scenarios
+        )
+        for device_name, mode, (name, z_logits, z_teacher, mass, mask_vals) in cases:
+            with self.subTest(device=device_name, mode=mode, scenario=name):
+                device = torch.device(device_name)
+                opts = {"target": "teacher"} | (
+                    {"kl_scale": 1.0, "kl_decay": 1.0} if mode == "lambda" else {}
+                )
+                loss_fn = TokenLoss(kind=f"lk_{mode}", options=opts)
+                logits = torch.nn.Parameter(
+                    torch.tensor([[[2.0, 0.0], z_logits]], device=device)
+                )
+                teacher = torch.tensor([[teacher0, z_teacher]], device=device)
+                labels = teacher.argmax(-1)
+                mask = torch.tensor([mask_vals], device=device)
+                denom = torch.tensor(2.0, device=device)
+                ctx = LossContext(mask, torch.tensor([mass], device=device), denom)
+                opt = torch.optim.SGD([logits], lr=0.1)
+
+                for step in range(2):
+                    opt.zero_grad(set_to_none=True)
+                    loss = (
+                        loss_fn(logits, labels, teacher=teacher, context=ctx) * mask
+                    ).sum() / denom
+                    self.assertTrue(bool(torch.isfinite(loss)))
+                    loss.backward()
+                    self.assertTrue(
+                        logits.grad is not None
+                        and bool(torch.isfinite(logits.grad).all())
+                    )
+                    if bool((mask == 0).any()):
+                        torch.testing.assert_close(
+                            logits.grad[mask == 0],
+                            torch.zeros_like(logits.grad[mask == 0]),
+                            atol=0.0,
+                            rtol=0.0,
+                        )
+                    if step == 0 and mode == "alpha":
+                        w = mask_vals[0] / max(sum(mask_vals), 1e-8)
+                        expected_grad = [
+                            [[derivative * w, -derivative * w], [0.0, 0.0]]
+                        ]
+                        torch.testing.assert_close(
+                            loss,
+                            torch.tensor(-math.log(acceptance) * w, device=device),
+                            atol=1e-6,
+                            rtol=1e-6,
+                        )
+                        torch.testing.assert_close(
+                            logits.grad,
+                            torch.tensor(expected_grad, device=device),
+                            atol=1e-6,
+                            rtol=1e-6,
+                        )
+                    if step == 1 and mode == "alpha" and name == "disjoint support":
+                        torch.testing.assert_close(
+                            logits.grad[0, 1],
+                            torch.zeros(2, device=device),
+                            atol=0.0,
+                            rtol=0.0,
+                        )
+                    if step == 0:
+                        opt.step()
 
     def test_dpace_groups_chains_across_prediction_sets(self):
         torch.manual_seed(13)

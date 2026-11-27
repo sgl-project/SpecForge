@@ -66,17 +66,25 @@ class LossComputation:
             term_index=index,
         )
 
-    def run(self, group=None):
+    def run(self, group=None, **requested_outputs):
         """Execute declared terms once.
 
         The shared fused setting controls automatic implementation selection.
+        Extra outputs may be requested when executing a single term.
         """
         groups = self.predictions.plan.groups if group is None else (tuple(group),)
+        if requested_outputs and (len(groups) != 1 or len(groups[0]) != 1):
+            raise ValueError("Requested outputs require running a single declared term")
         for indices in groups:
             if any(i in self.numerators for i in indices):
                 raise ValueError("Loss terms must execute exactly once")
+            request = (
+                replace(self.request, requested_outputs=requested_outputs)
+                if requested_outputs
+                else self.request
+            )
             result = self._execute(
-                self.request,
+                request,
                 indices,
                 self.prediction_index,
             )

@@ -84,6 +84,8 @@ def ring_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
     attn_type: AttnType = AttnType.FA,
+    *,
+    return_fp32_dq: bool = False,
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
@@ -150,7 +152,11 @@ def ring_flash_attn_backward(
 
     d_kv_comm.wait()
 
-    return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype)
+    return (
+        dq if return_fp32_dq else dq.to(q.dtype),
+        next_dk.to(q.dtype),
+        next_dv.to(q.dtype),
+    )
 
 
 class RingFlashAttnFunc(torch.autograd.Function):

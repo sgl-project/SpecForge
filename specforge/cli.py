@@ -122,13 +122,6 @@ def _train(resolved) -> int:
     from accelerate.utils import set_seed
 
     cfg = resolved.config
-    # Make the typed recipe authoritative for the backend's existing FSDP
-    # sharding seam in both direct and managed-local worker processes.
-    os.environ["FSDP_SHARDING"] = cfg.training.fsdp_sharding
-    if cfg.training.ddp_bucket_cap_mb is None:
-        os.environ.pop("SPECFORGE_DDP_BUCKET_CAP_MB", None)
-    else:
-        os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"] = str(cfg.training.ddp_bucket_cap_mb)
     set_seed(cfg.training.seed)
     if cfg.training.role == "producer":
         # A server-capture/offline-ingest producer owns no trainer process
@@ -141,7 +134,7 @@ def _train(resolved) -> int:
 
     _bootstrap_single_process_env()
     _validate_world_size(cfg, int(os.environ["WORLD_SIZE"]))
-    init_distributed(
+    topology = init_distributed(
         timeout=cfg.training.dist_timeout,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -149,17 +142,15 @@ def _train(resolved) -> int:
     )
     failed = True
     try:
-        import torch.distributed as dist
-
-        _validate_world_size(cfg, dist.get_world_size())
+        _validate_world_size(cfg, topology.world_size)
         from specforge.application import build_application_run
 
-        result = build_application_run(resolved).run()
+        result = build_application_run(resolved, topology=topology).run()
         failed = False
         return result
     finally:
         # On failure abort instead of collectively destroying; see destroy_distributed.
-        destroy_distributed(abort=failed)
+        destroy_distributed(topology, abort=failed)
 
 
 def _config_for_role(cfg: Config, role: str) -> Config:

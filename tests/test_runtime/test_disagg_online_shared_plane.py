@@ -11,12 +11,14 @@ from unittest import mock
 
 import torch
 
+from specforge.distributed import Topology
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.checkpoint import STATE_FILE
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -109,7 +111,6 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
         if resume_from is not None and self.channel.consumer_quantum() is None:
             self.channel.publish_consumer_quantum(1)
         with (
-            mock.patch("torch.distributed.is_initialized", return_value=False),
             mock.patch(
                 "specforge.runtime.data_plane.ref_distributor.RefDistributor",
                 _FakeDistributor,
@@ -122,6 +123,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 channel=self.channel,
                 draft_model=object() if draft_model is None else draft_model,
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run0",
                 output_dir=os.path.join(self.work, "output"),
                 collate_fn=lambda features: {},
@@ -129,6 +131,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
                 idle_timeout_s=idle_timeout_s,
+                topology=Topology(),
                 **kwargs,
             )
         return trainer, captured, _FakeDistributor.latest

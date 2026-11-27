@@ -21,6 +21,7 @@ from specforge.cli import (
 )
 from specforge.config import Config
 from specforge.config.draft.codec import encode_config
+from specforge.distributed import Topology
 from specforge.training.assembly import TrainingRun
 from specforge.training.disaggregated import (
     _ONLINE_CONTROL_SUFFIXES,
@@ -31,6 +32,7 @@ from specforge.training.disaggregated import (
 )
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
 from tests.test_config.draft_fixtures import draft_config
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("dflash")
 
@@ -114,9 +116,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     run = _build_online(
                         cfg,
                         algorithm=ALGORITHM,
+                        topology=Topology(),
                         build_model_bundle=lambda _cfg: bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=None,
                         preflight_model_bundle=preflight,
                     )
@@ -191,9 +195,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     _build_online(
                         cfg,
                         algorithm=resolved.algorithm,
+                        topology=None,
                         build_model_bundle=mock.Mock(),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=None,
                         preflight_model_bundle=preflight,
                     )
@@ -262,9 +268,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     run = _build_online(
                         cfg,
                         algorithm=resolved.algorithm,
+                        topology=None,
                         build_model_bundle=mock.Mock(),
                         prepare_prompts=lambda *_args, **_kwargs: [prompt],
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=None,
                     )
                     if drive_error is None:
@@ -420,9 +428,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                         build_disaggregated_run(
                             cfg,
                             algorithm=ALGORITHM,
+                            topology=None if role == "producer" else Topology(),
                             build_model_bundle=mock.Mock(),
                             prepare_prompts=mock.Mock(),
                             optimizer_factory=mock.Mock(),
+                            training_runtime=lambda _cfg: reference_runtime(),
                             logger=mock.Mock(),
                         )
 
@@ -472,9 +482,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     build_disaggregated_run(
                         cfg,
                         algorithm=ALGORITHM,
+                        topology=Topology(),
                         build_model_bundle=build_model_bundle,
                         prepare_prompts=mock.Mock(),
                         optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
                         logger=mock.Mock(),
                         preflight_model_bundle=preflight,
                     )
@@ -507,9 +519,41 @@ class TestTrainingRunLifecycle(unittest.TestCase):
         ):
             from specforge.training.assembly import build_training_run
 
-            build_training_run(cfg, algorithm=ALGORITHM)
+            build_training_run(cfg, algorithm=ALGORITHM, topology=Topology())
             build.call_args.kwargs["preflight_model_bundle"](cfg)
         preflight.assert_called_once_with(cfg, algorithm=ALGORITHM)
+
+    def test_training_without_a_topology_is_refused(self):
+        from specforge.training.assembly import build_training_run
+
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
+                "data": {"hidden_states_path": "/features"},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "topology"):
+            build_training_run(cfg, algorithm=ALGORITHM)
+
+    def test_a_topology_that_disagrees_with_the_recipe_is_refused(self):
+        from specforge.distributed import Topology
+        from specforge.training.assembly import build_training_run
+
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
+                "data": {"hidden_states_path": "/features"},
+            }
+        )
+        # Four ranks laid out for Ulysses 2, for a recipe that asks for none.
+        with self.assertRaisesRegex(ValueError, "configures"):
+            build_training_run(
+                cfg,
+                algorithm=ALGORITHM,
+                topology=Topology(world_size=4, sp_ulysses_size=2),
+            )
 
     def test_failed_claim_does_not_poison_an_existing_attempt(self):
         import tempfile
@@ -541,9 +585,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 build_disaggregated_run(
                     cfg,
                     algorithm=ALGORITHM,
+                    topology=None,
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
+                    training_runtime=lambda _cfg: reference_runtime(),
                     logger=mock.Mock(),
                 )
         self.assertFalse(os.path.exists(channel + ".failed"))
@@ -569,9 +615,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 build_disaggregated_run(
                     cfg,
                     algorithm=ALGORITHM,
+                    topology=None,
                     build_model_bundle=mock.Mock(),
                     prepare_prompts=mock.Mock(),
                     optimizer_factory=mock.Mock(),
+                    training_runtime=lambda _cfg: reference_runtime(),
                     logger=mock.Mock(),
                 )
         self.assertFalse(os.path.exists(channel + ".failed"))
@@ -629,9 +677,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
             build_disaggregated_run(
                 cfg,
                 algorithm=ALGORITHM,
+                topology=None,
                 build_model_bundle=mock.Mock(),
                 prepare_prompts=mock.Mock(return_value=[]),
                 optimizer_factory=mock.Mock(),
+                training_runtime=lambda _cfg: reference_runtime(),
                 logger=mock.Mock(),
             )
         fake_store.close.assert_called_once_with()
@@ -712,6 +762,7 @@ class TestCliLifecycle(unittest.TestCase):
         assembly.build_training_run.assert_called_once_with(
             cfg,
             algorithm=ALGORITHM,
+            topology=None,
         )
         run.run.assert_called_once_with()
 

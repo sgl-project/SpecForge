@@ -63,6 +63,8 @@ def diagnostic_slices(runtime, predictions, chunk_size):
     """Split units as the loss does: an explicit size wins and zero means unsplit."""
     explicit = runtime.execution.chunk_size
     units = predictions.mask.shape[0]
+    if units == 0:
+        return []
     size = (chunk_size if explicit is None else explicit) or units
     return [slice(start, min(start + size, units)) for start in range(0, units, size)]
 
@@ -71,6 +73,8 @@ def diagnostic_weights(runtime, predictions, slices):
     """Reuse objective weighting, including complete-chain D-PACE statistics."""
     from .execution import ChainStatistics, chain_weights
 
+    if not slices:
+        return predictions.mask.float()
     weighting = predictions.plan.terms[0].weighting or runtime.weighting
     if weighting.kind in DPACE_LOSS_TYPES:
         probabilities = []
@@ -163,14 +167,23 @@ def collect_block_metrics(
             if terms is None
             else DFlashMetricTerms(*(a + b for a, b in zip(terms, chunk)))
         )
-    terms = terms._replace(
-        unary_block_accepted=terms.unary_block_accepted.view_as(blocks.anchors),
-        selector_block_accepted=(
-            terms.selector_block_accepted.view_as(blocks.anchors)
-            if selector is not None
-            else terms.selector_block_accepted
-        ),
-    )
+    if terms is None:
+        width = min(top_k, predictions.project()["logits"].shape[-1])
+        terms = DFlashMetricTerms.zeros(
+            size,
+            anchors_shape=blocks.anchors.shape,
+            has_selector=selector is not None,
+            device=predictions.mask.device,
+        )
+    else:
+        terms = terms._replace(
+            unary_block_accepted=terms.unary_block_accepted.view_as(blocks.anchors),
+            selector_block_accepted=(
+                terms.selector_block_accepted.view_as(blocks.anchors)
+                if selector is not None
+                else terms.selector_block_accepted
+            ),
+        )
     token, kl_weight = predictions.plan.terms[0].loss, None
     if token.kind == "lk_lambda" and token.options.get("target", "labels") == "labels":
         kl_weight = (
@@ -227,7 +240,9 @@ def collect_prediction_metrics(
     ratios, prefixes = {}, {}
     slices = diagnostic_slices(runtime, predictions, chunk_size)
     weights = diagnostic_weights(runtime, predictions, slices)
-    for part in slices:
+    # Run one empty slice when a rank has zero units so it still emits zero
+    # numerator/denominator pairs with the populated schema for all_reduce.
+    for part in slices or (slice(0, 0),):
         chunk = predictions.select(part)
         teacher = chunk.teacher.logits() if chunk.teacher is not None else None
         values, tokens = measure(

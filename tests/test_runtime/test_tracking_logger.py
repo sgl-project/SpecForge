@@ -61,6 +61,7 @@ class TrackingLoggerTest(unittest.TestCase):
         else:
             trainer._controller.fit.side_effect = fit_error
         trainer._loader = object()
+        trainer.backend = mock.Mock()
         trainer._fit_context = None
         trainer._on_fit_success = None
         trainer._on_fit_failure = None

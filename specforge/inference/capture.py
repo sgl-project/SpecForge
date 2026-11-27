@@ -10,10 +10,12 @@
 
 ``capture`` is NOT an untyped ``dict[str, Any]``. It is a frozen config derived
 from the resolved algorithm feature contract and draft capture layers. Before
-any ``FeatureStore.put`` the rollout runs :func:`verify_capture`, which fails
-loudly on a name / aux-layer-id / width / target-dim mismatch — turning what
-would otherwise be a confusing downstream trainer bug into an immediate,
-localized error at the extraction boundary.
+adopting server-written features into the ``FeatureStore``, the server-capture
+adapter runs :func:`verify_capture_specs` (and :func:`verify_capture` checks
+materialized tensor dicts directly), failing loudly on a name / aux-layer-id /
+width / target-dim mismatch — turning what would otherwise be a confusing
+downstream trainer bug into an immediate, localized error at the extraction
+boundary.
 
 Import-light (stdlib only) so the assertions are unit-testable without a GPU.
 """

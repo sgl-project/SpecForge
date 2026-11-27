@@ -2,11 +2,22 @@
 
 import unittest
 from dataclasses import replace
+from functools import partial
 from pkgutil import resolve_name
 from unittest.mock import patch
 
 import torch
 
+from specforge.algorithms.metrics.domino import measure as domino_measure
+from specforge.algorithms.metrics.dspark import measure as dspark_measure
+from specforge.algorithms.objectives.diagnostics import (
+    collect_block_metrics,
+    collect_prediction_metrics,
+    diagnostic_slices,
+)
+from specforge.algorithms.objectives.inputs import prepare_blocks
+from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+from specforge.training.runner import _reduce_ratio_metrics
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import training_batch
 
@@ -151,6 +162,165 @@ class BlockDiagnosticsTest(unittest.TestCase):
         self.assertFalse(
             any(name.startswith("dflash/teacher/") for name in result.ratios)
         )
+
+    def test_zero_unit_block_diagnostics(self):
+        for architecture, teacher_metrics, weighting in (
+            ("DFlashDraftModel", False, None),
+            ("DFlashDraftModel", True, {"kind": "dpace"}),
+            ("DFlash2DraftModel", True, None),
+            ("DFlash2DraftModel", False, {"kind": "dpace"}),
+        ):
+            with self.subTest(
+                architecture=architecture,
+                teacher_metrics=teacher_metrics,
+                weighting=weighting,
+            ):
+                config, runtime = build_runtime(
+                    architecture,
+                    options={"num_anchors": 4, "teacher_metrics": teacher_metrics},
+                    weighting=weighting,
+                )
+                batch = training_batch(config)
+                blocks = prepare_blocks(config, batch, num_anchors=4)
+                output = runtime.draft_model(
+                    blocks.input_ids,
+                    batch["hidden_states"],
+                    blocks.layer_inputs,
+                    output_logits=False,
+                )
+                selector = getattr(runtime.draft_model, "candidate_selector", None)
+                extra = (
+                    {"predecessors": blocks.predecessors}
+                    if selector is not None
+                    else {}
+                )
+                plan_kwargs = (
+                    {"plan": LossPlan((LossTerm(), LossTerm("selector", 1.0)))}
+                    if selector is not None
+                    else {}
+                )
+                predictions = runtime.block_predictions(
+                    output, blocks, batch, context_inputs=extra, **plan_kwargs
+                )
+                kwargs = dict(
+                    chunk_size=0,
+                    top_k=selector.top_k if selector is not None else 16,
+                    selector=selector,
+                    selector_alpha=0.5 if selector is not None else None,
+                    teacher_metrics=teacher_metrics,
+                )
+                nonempty_ratios, nonempty_sums = collect_block_metrics(
+                    runtime, predictions, blocks, **kwargs
+                )
+                empty_predictions = predictions.select(slice(0, 0))
+                empty_blocks = replace(
+                    blocks,
+                    anchors=blocks.anchors[:, :0],
+                    weights=blocks.weights[:, :0],
+                    predecessors=blocks.predecessors[:, :0],
+                )
+                for chunk_size in (0, 4):
+                    self.assertEqual(
+                        diagnostic_slices(runtime, empty_predictions, chunk_size), []
+                    )
+                ratios, sums = collect_block_metrics(
+                    runtime, empty_predictions, empty_blocks, **kwargs
+                )
+                self.assertEqual(set(ratios), set(nonempty_ratios))
+                self.assertEqual(set(sums), set(nonempty_sums))
+                for name, (num, den) in ratios.items():
+                    self.assertEqual(num.shape, nonempty_ratios[name][0].shape)
+                    self.assertEqual(den.shape, nonempty_ratios[name][1].shape)
+                    self.assertTrue(torch.isfinite(num).all())
+                    self.assertTrue(torch.isfinite(den).all())
+                    if name != "selector_loss_alpha":
+                        self.assertEqual(den.sum().item(), 0.0, name)
+                        self.assertEqual(num.sum().item(), 0.0, name)
+                for name, count in sums.items():
+                    self.assertEqual(count.shape, nonempty_sums[name].shape)
+                    self.assertEqual(count.sum().item(), 0.0, name)
+
+    def test_zero_unit_prediction_diagnostics(self):
+        for architecture, weighting, label_offset, prefix, plan, measure_fn, slots in (
+            (
+                "DSparkDraftModel",
+                {"kind": "dpace"},
+                1,
+                True,
+                LossPlan((LossTerm(), LossTerm("confidence"))),
+                dspark_measure,
+                slice(None),
+            ),
+            (
+                "DominoDraftModel",
+                None,
+                0,
+                False,
+                LossPlan(
+                    (
+                        LossTerm("base_logits", 0.5, name="base"),
+                        LossTerm("logits", 0.5, name="final"),
+                    ),
+                    joint_groups=((0, 1),),
+                ),
+                partial(domino_measure, base_weight=0.5),
+                slice(1, None),
+            ),
+        ):
+            with self.subTest(architecture=architecture):
+                config, runtime = build_runtime(
+                    architecture, options={"num_anchors": 4}, weighting=weighting
+                )
+                batch = training_batch(config)
+                blocks = prepare_blocks(
+                    config,
+                    batch,
+                    num_anchors=4,
+                    label_offset=label_offset,
+                    prefix=prefix,
+                )
+                output = runtime.draft_model(
+                    blocks.input_ids,
+                    batch["hidden_states"],
+                    blocks.layer_inputs,
+                    predecessor_ids=blocks.predecessors.flatten(1),
+                    output_logits=False,
+                )
+                predictions = runtime.block_predictions(
+                    output,
+                    blocks,
+                    batch,
+                    projection_inputs={"predecessor_ids": blocks.predecessors},
+                    plan=plan,
+                )
+                runtime.execution = replace(runtime.execution, chunk_size=0)
+                nonempty_ratios, nonempty_sums = collect_prediction_metrics(
+                    runtime, predictions, blocks, measure_fn, chunk_size=0, slots=slots
+                )
+                empty_ratios, empty_sums = collect_prediction_metrics(
+                    runtime,
+                    predictions.select(slice(0, 0)),
+                    replace(blocks, anchors=blocks.anchors[:, :0]),
+                    measure_fn,
+                    chunk_size=0,
+                    slots=slots,
+                )
+                self.assertEqual(set(empty_ratios), set(nonempty_ratios))
+                self.assertEqual(empty_sums, nonempty_sums)
+                for name, (num, den) in empty_ratios.items():
+                    self.assertEqual(num.shape, nonempty_ratios[name][0].shape, name)
+                    self.assertEqual(den.shape, nonempty_ratios[name][1].shape, name)
+                    self.assertTrue(torch.isfinite(num).all(), name)
+                    self.assertTrue(torch.isfinite(den).all(), name)
+                    self.assertEqual(num.sum().item(), 0.0, name)
+                    self.assertEqual(den.sum().item(), 0.0, name)
+                reduce_kwargs = dict(
+                    device=torch.device("cpu"), process_group=None, reduce=False
+                )
+                self.assertEqual(
+                    set(_reduce_ratio_metrics(empty_ratios, **reduce_kwargs)),
+                    set(_reduce_ratio_metrics(nonempty_ratios, **reduce_kwargs)),
+                )
 
 
 if __name__ == "__main__":

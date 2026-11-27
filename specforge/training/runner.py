@@ -29,6 +29,8 @@ from torch.nn.parallel import DistributedDataParallel
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import TrainingBackend
 from specforge.training.contracts import (
+    EPOCH_METADATA_KEY,
+    EVALUATION_EPOCH,
     CheckpointState,
     PendingStep,
     ProgramSpec,
@@ -157,6 +159,8 @@ class _Window:
     #: This rank's ratio pairs and additive telemetry, summed over the window.
     ratio_totals: Dict[str, Tuple[torch.Tensor, torch.Tensor]]
     sum_totals: Dict[str, torch.Tensor]
+    #: This rank's declared after-step statistics, summed over the window.
+    after_step_totals: Dict[str, torch.Tensor]
     accumulation_steps: int
 
 
@@ -197,6 +201,7 @@ class DataParallelRunner:
         )
         self._ratio_totals: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._sum_totals: Dict[str, torch.Tensor] = {}
+        self._after_step_totals: Dict[str, torch.Tensor] = {}
         # RNG states of the window's prepasses, in the order they ran.
         self._prepass_rng: Deque[_RngState] = deque()
         # Micro-batches of the open window whose backward has run, and the
@@ -221,6 +226,18 @@ class DataParallelRunner:
             return dist.get_world_size(group=self.backend.process_group)
         return 1
 
+    def _grad_reduction_factor(self, world_size: int) -> int:
+        """Factor cancelling the backend's cross-rank gradient reduction."""
+        reduction = self.backend.grad_reduction
+        if reduction == "mean":
+            return world_size
+        if reduction == "sum":
+            return 1
+        raise ValueError(
+            f"unsupported backend grad_reduction={reduction!r}; "
+            "expected 'mean' or 'sum'"
+        )
+
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
         return self._reduce(values, dist.ReduceOp.SUM)
 
@@ -239,9 +256,12 @@ class DataParallelRunner:
         return next(self.program.parameters()).device
 
     def _forward(
-        self, batch: TrainBatch, ctx: StepContext, **replay: Any
+        self, batch: TrainBatch, ctx: StepContext, *, epoch=None, **replay: Any
     ) -> "ObjectiveResult":
-        """Place one batch on the training device and run the program on it."""
+        """Place one batch on the training device and run the program on it.
+
+        ``epoch`` defaults to the one the run loop recorded on the batch.
+        """
         missing = sorted(set(self.spec.inputs) - batch.tensors.keys())
         if missing:
             raise ValueError(
@@ -250,7 +270,11 @@ class DataParallelRunner:
             )
         device = self._device()
         inputs = batch.tensors
-        prepared = self._unwrapped.host_inputs(inputs)
+        prepared = self._unwrapped.host_inputs(
+            inputs,
+            sample_ids=batch.sample_ids,
+            epoch=batch.metadata.get(EPOCH_METADATA_KEY) if epoch is None else epoch,
+        )
         if prepared:
             if device.type != "cpu":
                 # a pageable source makes the non_blocking copy wait for the host
@@ -298,12 +322,11 @@ class DataParallelRunner:
         except Exception as error:
             raise RankFailure(f"{type(error).__name__}: {error}") from error
 
-    @staticmethod
-    def _first_rank() -> bool:
+    def _first_rank(self) -> bool:
         """Whether this is the process that writes a checkpoint's shared file."""
-        return not (dist.is_available() and dist.is_initialized()) or (
-            dist.get_rank() == 0
-        )
+        if not (dist.is_available() and dist.is_initialized()):
+            return True
+        return dist.get_rank(group=self.backend.process_group) == 0
 
     def load_resume(self, state: Mapping[str, Any]) -> None:
         self.backend.load_state_dict(state)
@@ -361,7 +384,7 @@ class DataParallelRunner:
             self._unwrapped.replay_arguments({}) if self.replay_statistics else {}
         )
         with torch.no_grad():
-            return self._forward(batch, ctx, **arguments)
+            return self._forward(batch, ctx, epoch=EVALUATION_EPOCH, **arguments)
 
     def prepass(self, batch: TrainBatch, ctx: StepContext) -> Dict[str, torch.Tensor]:
         self._check_training_call()
@@ -437,10 +460,12 @@ class DataParallelRunner:
             denominator=self.reduce_sum(self._ratio_totals["loss"][1].clone()),
             ratio_totals=self._ratio_totals,
             sum_totals=self._sum_totals,
+            after_step_totals=self._after_step_totals,
             accumulation_steps=ctx.accumulation_steps,
         )
         self._ratio_totals = {}
         self._sum_totals = {}
+        self._after_step_totals = {}
         self._pending = PendingStep(window)
         return self._pending
 
@@ -450,8 +475,8 @@ class DataParallelRunner:
         """One micro-batch's forward, its share of the window's totals, its backward."""
         self._train_mode()
         # A program that declares a replay statistic turns the pooled sums
-        # into its forward's arguments; that arithmetic stays out of the
-        # wrapper, which may cast what passes through its forward.
+        # into its forward's arguments here, in the precision they were pooled
+        # in, before entering the wrapped forward.
         replay = (
             self._unwrapped.replay_arguments(ctx.replay_values)
             if self.replay_statistics
@@ -471,17 +496,19 @@ class DataParallelRunner:
                 denominator.detach().reshape(()),
             )
             # Checked against the window so far, before this backward: found
-            # at the boundary, a malformed metric would raise after the update
-            # was applied and before it was counted or acknowledged.
+            # at the boundary, a malformed metric or statistic would raise after
+            # the update was applied and before it was counted or acknowledged.
             _check_metrics(
                 {**self._ratio_totals, **ratio_metrics},
                 {**self._sum_totals, **result.sums},
             )
+            next_after_step = self._accumulate_after_step_statistics(result.statistics)
             self._accumulate_ratio_metrics(ratio_metrics)
             for name, value in result.sums.items():
                 self._sum_totals[name] = (
                     self._sum_totals.get(name, 0) + torch.as_tensor(value).detach()
                 )
+            self._after_step_totals = next_after_step
             loss = numerator.reshape(()) / ctx.accumulation_steps
             self.backend.backward(loss, is_boundary=is_boundary)
 
@@ -531,8 +558,10 @@ class DataParallelRunner:
             if not math.isfinite(denominator_value) or denominator_value <= 0:
                 raise ValueError("global loss denominator must be finite and positive")
         # new_full fills on the device; new_tensor would be a synchronizing H2D.
+        world_size = self._world_size()
+        reduction_factor = self._grad_reduction_factor(world_size)
         scale = (
-            denominator.new_full((), self._world_size() * window.accumulation_steps)
+            denominator.new_full((), reduction_factor * window.accumulation_steps)
             / denominator
         )
         self.backend.scale_gradients(scale)
@@ -543,6 +572,11 @@ class DataParallelRunner:
         # The update is applied; a step that raised above leaves the handle in
         # place, so the runner starts no window on top of its gradients.
         self._pending = None
+        try:
+            post_metrics = self._apply_after_step_statistics(window.after_step_totals)
+        except BaseException as error:
+            self._broken = f"{type(error).__name__}: {error}"
+            raise
         # Ratios and sums are reduced as counts, in one collective.
         metrics: Dict[str, Any] = _reduce_ratio_metrics(
             window.ratio_totals,
@@ -550,7 +584,7 @@ class DataParallelRunner:
             # would otherwise pull every other one there.
             device=self._device(),
             process_group=self.backend.process_group,
-            reduce=True,
+            reduce=world_size > 1,
             sums=window.sum_totals,
         )
         if grad_norm is not None:
@@ -559,11 +593,89 @@ class DataParallelRunner:
                 if isinstance(grad_norm, torch.Tensor)
                 else float(grad_norm)
             )
+        overlap = sorted(metrics.keys() & post_metrics.keys())
+        if overlap:
+            self._broken = f"ValueError: duplicate post-step metrics {overlap}"
+            raise ValueError(f"after_step metrics collide with step metrics: {overlap}")
+        metrics.update(post_metrics)
         return StepMetrics(
             metrics,
             has_grad_norm=grad_norm is not None,
             learning_rate=self.backend.learning_rate(),
         )
+
+    def _accumulate_after_step_statistics(
+        self, statistics: Mapping[str, Any]
+    ) -> Dict[str, torch.Tensor]:
+        """Validate and add this micro-batch's declared after-step statistics."""
+        declared = self.spec.after_step_statistics
+        declared_set = set(declared)
+        present_set = set(statistics)
+        if present_set != declared_set:
+            missing = sorted(declared_set - present_set)
+            unexpected = sorted(present_set - declared_set)
+            raise ValueError(
+                f"{self.spec.name} after_step_statistics mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        if not declared:
+            return self._after_step_totals
+        updated = dict(self._after_step_totals)
+        for name in declared:
+            raw = statistics[name]
+            if not isinstance(raw, torch.Tensor):
+                raise TypeError(
+                    f"after-step statistic {name!r} must be a tensor, "
+                    f"got {type(raw).__name__}"
+                )
+            value = raw.detach()
+            previous = updated.get(name)
+            if previous is None:
+                updated[name] = value.clone()
+            else:
+                if value.shape != previous.shape or value.dtype != previous.dtype:
+                    raise ValueError(
+                        f"after-step statistic {name!r} changed shape/dtype mid-window: "
+                        f"expected {tuple(previous.shape)}/{previous.dtype}, "
+                        f"got {tuple(value.shape)}/{value.dtype}"
+                    )
+                updated[name] = previous + value.to(previous.device)
+        return updated
+
+    def _apply_after_step_statistics(
+        self, totals: Mapping[str, torch.Tensor]
+    ) -> Dict[str, Any]:
+        """Pool window after-step statistics across DP ranks and deliver to program."""
+        if not self.spec.after_step_statistics:
+            return {}
+        device = self._device()
+        ordered = [
+            (name, totals[name].detach().to(device))
+            for name in self.spec.after_step_statistics
+        ]
+        pooled: Dict[str, torch.Tensor] = {}
+        # Pack tensors of the same dtype into one elementwise reduce_sum while
+        # preserving each statistic's native dtype and shape.
+        for dtype in dict.fromkeys(tensor.dtype for _, tensor in ordered):
+            members = [
+                (name, tensor) for name, tensor in ordered if tensor.dtype == dtype
+            ]
+            if len(members) == 1:
+                name, tensor = members[0]
+                pooled[name] = self.reduce_sum(tensor.clone())
+            else:
+                flat = torch.cat([tensor.reshape(-1) for _, tensor in members])
+                reduced = self.reduce_sum(flat)
+                sizes = [tensor.numel() for _, tensor in members]
+                for (name, tensor), chunk in zip(members, reduced.split(sizes)):
+                    pooled[name] = chunk.reshape(tensor.shape)
+        reported = self._unwrapped.apply_statistics(pooled)
+        if not isinstance(reported, Mapping):
+            raise TypeError(
+                "TrainingProgram.apply_statistics must return a mapping, "
+                f"got {type(reported).__name__}"
+            )
+        return reported
 
     def _check_training_call(self) -> None:
         if self._broken is not None:

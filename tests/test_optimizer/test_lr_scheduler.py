@@ -40,7 +40,7 @@ class TestLearningRateScheduler(unittest.TestCase):
 
     def test_unknown_scheduler_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unsupported lr_scheduler"):
-            _optimizer(scheduler="linear")
+            _optimizer(scheduler="unknown_schedule")
 
     def test_resume_rejects_scheduler_change(self):
         _model, cosine = _optimizer(scheduler="cosine")
