@@ -449,8 +449,8 @@ class DataParallelRunner:
         """One micro-batch's forward, its share of the window's totals, its backward."""
         self._train_mode()
         # A program that declares a replay statistic turns the pooled sums
-        # into its forward's arguments; that arithmetic stays out of the
-        # wrapper, which may cast what passes through its forward.
+        # into its forward's arguments here, in the precision they were pooled
+        # in, before entering the wrapped forward.
         replay = (
             self._unwrapped.replay_arguments(ctx.replay_values)
             if self.replay_statistics

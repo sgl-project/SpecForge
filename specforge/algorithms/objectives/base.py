@@ -298,9 +298,9 @@ class ObjectiveModel(nn.Module):
         denominator and detached. Otherwise None: the objective then uses the
         batch's own value. Empty for an objective without a statistic.
 
-        A runner calls this outside its wrapper and passes the result through
-        it, so the division is done in the precision the sums were pooled in
-        and a wrapper that casts the forward's inputs casts the value.
+        A runner calls this outside its wrapper so the division runs in the
+        precision the sums were pooled in, and hands the result to forward
+        uncast.
 
         Args:
             replay_values: The pooled sums by statistic name; empty outside a

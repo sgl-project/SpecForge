@@ -204,6 +204,11 @@ class FrozenModulesTest(unittest.TestCase):
         )
         self.assertEqual(backend.ignored_frozen_modules, (table,))
         self.assertEqual(backend.auto_wrap_block_classes, {Block})
+        # The program receives its inputs as placed, as under DDP: the wrapper
+        # casts parameters, never the program's tensors.
+        precision = arguments["mixed_precision"]
+        self.assertFalse(precision.cast_root_forward_inputs)
+        self.assertFalse(precision.cast_forward_inputs)
         # Without declarations: nothing ignored, one root unit.
         with patch(
             "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
