@@ -1,11 +1,11 @@
 # coding=utf-8
-"""RolloutWorker drives PromptTask -> features -> SampleRef commit (CPU, fake source)."""
+"""RolloutWorker drives PromptTask -> RefSource.produce_refs -> SampleRef commit (CPU)."""
 
 import unittest
+from dataclasses import dataclass
 
 import torch
 
-from specforge.inference.batch_partition import TargetBatchPartition
 from specforge.inference.capture import CaptureConfig
 from specforge.inference.rollout_worker import RolloutWorker
 from specforge.runtime.control_plane import DataFlowController
@@ -30,20 +30,28 @@ def _capture(layer_ids=(1, 2, 3)):
     )
 
 
-class FakeSource:
-    """Stand-in for a FeatureSource: returns per-sample feature dicts."""
+@dataclass(frozen=True)
+class _TaskFailure:
+    task_id: str
+    reason: str
+    retryable: bool = True
 
-    def __init__(self, seq=4, target_dim=32, aux_layers=3, bad_layers=False):
+
+class FakeRefSource:
+    """Stand-in for a RefSource: writes features into a store and returns SampleRefs."""
+
+    def __init__(self, store, *, run_id="run", seq=4, target_dim=32, aux_layers=3):
+        self.store = store
+        self.run_id = run_id
         self.seq = seq
         self.target_dim = target_dim
         self.aux_layers = aux_layers
-        self.bad_layers = bad_layers
         self.task_batches = []
 
-    def generate_features(self, tasks, *, capture):
+    def produce_refs(self, tasks, *, capture):
         self.task_batches.append([task.task_id for task in tasks])
-        out = []
-        for _ in tasks:
+        refs = []
+        for task in tasks:
             feats = {
                 "input_ids": torch.zeros(1, self.seq, dtype=torch.long),
                 "attention_mask": torch.ones(1, self.seq, dtype=torch.long),
@@ -51,110 +59,146 @@ class FakeSource:
                 "hidden_state": torch.randn(1, self.seq, self.aux_layers * H),
                 "target": torch.randn(1, self.seq, self.target_dim),
             }
-            ids = (1, 2, 99) if self.bad_layers else (1, 2, 3)
-            feats["__aux_layer_ids__"] = ids
-            out.append(feats)
-        return out
+            refs.append(
+                self.store.put(
+                    feats,
+                    sample_id=f"{self.run_id}:{task.task_id}",
+                    metadata={
+                        "run_id": self.run_id,
+                        "source_task_id": task.task_id,
+                        "strategy": "eagle3",
+                        "target_repr": capture.target_repr,
+                    },
+                )
+            )
+        return refs
 
 
-class RaisingSource:
-    def generate_features(self, tasks, *, capture):
+class RaisingRefSource:
+    def produce_refs(self, tasks, *, capture):
         raise RuntimeError("temporary engine failure")
 
 
-class ShortSource:
-    def generate_features(self, tasks, *, capture):
+class ShortRefSource:
+    def produce_refs(self, tasks, *, capture):
         return []
 
 
-class MixedLayerSource(FakeSource):
-    def generate_features(self, tasks, *, capture):
-        out = super().generate_features(tasks, capture=capture)
-        out[-1]["__aux_layer_ids__"] = (1, 2, 99)
-        return out
+class MixedFailureRefSource(FakeRefSource):
+    def __init__(self, store, *, retryable=False):
+        super().__init__(store)
+        self.retryable = retryable
+
+    def produce_refs(self, tasks, *, capture):
+        refs = super().produce_refs(tasks[:-1], capture=capture)
+        refs.append(
+            _TaskFailure(
+                task_id=tasks[-1].task_id,
+                reason="capture mismatch",
+                retryable=self.retryable,
+            )
+        )
+        return refs
 
 
-class ShardedSource(FakeSource):
-    def __init__(self, partition):
-        super().__init__()
-        self.partition = partition
-
-    def generate_features(self, tasks, *, capture):
-        return super().generate_features(self.partition.select(tasks), capture=capture)
+class BadReturnRefSource:
+    def produce_refs(self, tasks, *, capture):
+        return [object() for _ in tasks]
 
 
 class TestRolloutWorker(unittest.TestCase):
+    def test_incompatible_source_rejected_at_construction(self):
+        ctrl = DataFlowController("run")
+        with self.assertRaisesRegex(TypeError, "produce_refs"):
+            RolloutWorker(ctrl, object(), _capture())
+        self.assertEqual(ctrl.status()["rollout_workers"], 0)
+
     def test_run_once_commits_refs(self):
         ctrl = DataFlowController("run")
         ctrl.ingest_prompts([{"payload": {"text": "a"}}, {"payload": {"text": "b"}}])
         store = LocalFeatureStore("st")
-        w = RolloutWorker(ctrl, store, FakeSource(), _capture(), run_id="run")
+        w = RolloutWorker(ctrl, FakeRefSource(store), _capture())
         w.start()
         refs = w.run_once(max_tasks=8)
         self.assertEqual(len(refs), 2)
         self.assertEqual(ctrl.status()["samples_committed"], 2)
         self.assertEqual(ctrl.sample_queue.depth(), 2)
-        # features landed in the store, retrievable by ref
         out, _ = store.get(refs[0])
         self.assertEqual(
             set(out),
             {"input_ids", "attention_mask", "loss_mask", "hidden_state", "target"},
         )
         self.assertEqual(w.health()["state"], "ready")
+        self.assertEqual(w.health()["committed"], 2)
 
-    def test_capture_mismatch_fails_loudly_and_commits_nothing(self):
-        ctrl = DataFlowController("run")
-        ctrl.ingest_prompts([{"payload": {"text": "a"}}])
-        store = LocalFeatureStore("st")
-        w = RolloutWorker(
-            ctrl, store, FakeSource(bad_layers=True), _capture(), run_id="run"
-        )
-        w.start()
-        from specforge.inference.capture import CaptureMismatchError
-
-        with self.assertRaises(CaptureMismatchError):
-            w.run_once(max_tasks=8)
-        self.assertEqual(ctrl.status()["samples_committed"], 0)
-        self.assertEqual(ctrl.sample_queue.depth(), 0)
-        self.assertEqual(ctrl.status()["prompts_leased"], 0)
-        self.assertEqual(ctrl.status()["prompts_failed"], 1)
-
-    def test_partial_capture_mismatch_releases_all_leases(self):
+    def test_partial_task_failure_commits_good_refs_and_releases_all_leases(self):
         ctrl = DataFlowController("run")
         ctrl.ingest_prompts([{"payload": {"text": "a"}}, {"payload": {"text": "bad"}}])
         store = LocalFeatureStore("st")
-        w = RolloutWorker(ctrl, store, MixedLayerSource(), _capture(), run_id="run")
+        w = RolloutWorker(
+            ctrl,
+            MixedFailureRefSource(store, retryable=False),
+            _capture(),
+        )
         w.start()
-        from specforge.inference.capture import CaptureMismatchError
-
-        with self.assertRaises(CaptureMismatchError):
-            w.run_once(max_tasks=8)
+        refs = w.run_once(max_tasks=8)
+        self.assertEqual(len(refs), 1)
         st = ctrl.status()
         self.assertEqual(st["samples_committed"], 1)
         self.assertEqual(st["queue_depth"], 1)
         self.assertEqual(st["prompts_leased"], 0)
         self.assertEqual(st["prompts_failed"], 1)
 
-    def test_generate_failure_requeues_prompt(self):
+    def test_retryable_task_failure_requeues_prompt(self):
+        ctrl = DataFlowController("run")
+        ids = ctrl.ingest_prompts(
+            [{"payload": {"text": "a"}}, {"payload": {"text": "retry"}}]
+        )
+        store = LocalFeatureStore("st")
+        w = RolloutWorker(
+            ctrl,
+            MixedFailureRefSource(store, retryable=True),
+            _capture(),
+        )
+        w.start()
+        refs = w.run_once(max_tasks=8)
+        self.assertEqual(len(refs), 1)
+        st = ctrl.status()
+        self.assertEqual(st["prompts_leased"], 0)
+        self.assertEqual(st["prompts_pending"], 1)
+        self.assertEqual(ctrl.lease_prompt_tasks("w2", 1)[0].task_id, ids[1])
+
+    def test_produce_refs_exception_requeues_prompt(self):
         ctrl = DataFlowController("run")
         ids = ctrl.ingest_prompts([{"payload": {"text": "a"}}])
-        store = LocalFeatureStore("st")
-        w = RolloutWorker(ctrl, store, RaisingSource(), _capture(), run_id="run")
+        w = RolloutWorker(ctrl, RaisingRefSource(), _capture())
         w.start()
         with self.assertRaises(RuntimeError):
             w.run_once(max_tasks=8)
         st = ctrl.status()
         self.assertEqual(st["prompts_leased"], 0)
         self.assertEqual(st["prompts_pending"], 1)
+        self.assertEqual(w.health()["state"], "unhealthy")
         self.assertEqual(ctrl.lease_prompt_tasks("w2", 1)[0].task_id, ids[0])
 
-    def test_wrong_feature_count_fails_prompt(self):
+    def test_wrong_record_count_fails_prompt(self):
         ctrl = DataFlowController("run")
         ctrl.ingest_prompts([{"payload": {"text": "a"}}])
-        store = LocalFeatureStore("st")
-        w = RolloutWorker(ctrl, store, ShortSource(), _capture(), run_id="run")
+        w = RolloutWorker(ctrl, ShortRefSource(), _capture())
         w.start()
         with self.assertRaises(ValueError):
+            w.run_once(max_tasks=8)
+        st = ctrl.status()
+        self.assertEqual(st["prompts_leased"], 0)
+        self.assertEqual(st["prompts_failed"], 1)
+        self.assertEqual(w.health()["state"], "unhealthy")
+
+    def test_unknown_result_type_fails_prompt(self):
+        ctrl = DataFlowController("run")
+        ctrl.ingest_prompts([{"payload": {"text": "a"}}])
+        w = RolloutWorker(ctrl, BadReturnRefSource(), _capture())
+        w.start()
+        with self.assertRaises(TypeError):
             w.run_once(max_tasks=8)
         st = ctrl.status()
         self.assertEqual(st["prompts_leased"], 0)
@@ -163,91 +207,22 @@ class TestRolloutWorker(unittest.TestCase):
     def test_no_tasks_returns_empty(self):
         ctrl = DataFlowController("run")
         store = LocalFeatureStore("st")
-        w = RolloutWorker(ctrl, store, FakeSource(), _capture(), run_id="run")
+        w = RolloutWorker(ctrl, FakeRefSource(store), _capture())
         w.start()
         self.assertEqual(w.run_once(8), [])
 
-    def test_target_tp_ranks_capture_same_batch_and_commit_disjoint_shards(self):
-        prompts = [
-            {"task_id": f"task-{index}", "payload": {"text": str(index)}}
-            for index in range(8)
-        ]
-        committed = []
-        captured = []
-        for rank in range(4):
-            ctrl = DataFlowController("run")
-            ctrl.ingest_prompts(prompts)
-            store = LocalFeatureStore(f"st-{rank}")
-            source = FakeSource()
-            worker = RolloutWorker(
-                ctrl,
-                store,
-                source,
-                _capture(),
-                run_id="run",
-                batch_partition=TargetBatchPartition(rank=rank, size=4),
-            )
-            worker.start()
-            refs = worker.run_once(max_tasks=8)
-            captured.append(source.task_batches[0])
-            committed.extend(ref.source_task_id for ref in refs)
-            self.assertEqual(len(refs), 2)
-            self.assertEqual(ctrl.status()["prompts"], 0)
-            self.assertEqual(ctrl.status()["prompts_failed"], 0)
-
-        self.assertEqual(captured, [captured[0]] * 4)
-        self.assertEqual(sorted(committed), [f"task-{index}" for index in range(8)])
-
-    def test_backend_sharded_source_returns_only_local_records(self):
-        partition = TargetBatchPartition(rank=1, size=2)
+    def test_drain_and_stop_prevent_new_leases(self):
         ctrl = DataFlowController("run")
-        ctrl.ingest_prompts(
-            [
-                {"task_id": f"task-{index}", "payload": {"text": str(index)}}
-                for index in range(4)
-            ]
-        )
+        ctrl.ingest_prompts([{"payload": {"text": "a"}}])
         store = LocalFeatureStore("st")
-        source = ShardedSource(partition)
-        worker = RolloutWorker(
-            ctrl,
-            store,
-            source,
-            _capture(),
-            run_id="run",
-            batch_partition=partition,
-            feature_source_returns_local_batch=True,
-        )
-        worker.start()
-
-        refs = worker.run_once(max_tasks=4)
-
-        self.assertEqual([ref.source_task_id for ref in refs], ["task-2", "task-3"])
-        self.assertEqual(ctrl.status()["prompts"], 0)
-
-    def test_target_tp_drops_incomplete_capture_batch_on_every_rank(self):
-        ctrl = DataFlowController("run")
-        ctrl.ingest_prompts(
-            [
-                {"task_id": f"task-{index}", "payload": {"text": str(index)}}
-                for index in range(3)
-            ]
-        )
-        source = FakeSource()
-        worker = RolloutWorker(
-            ctrl,
-            LocalFeatureStore("st"),
-            source,
-            _capture(),
-            run_id="run",
-            batch_partition=TargetBatchPartition(rank=0, size=4),
-        )
-        worker.start()
-
-        self.assertEqual(worker.run_once(max_tasks=8), [])
-        self.assertEqual(source.task_batches, [])
-        self.assertEqual(ctrl.status()["prompts"], 0)
-        self.assertEqual(ctrl.status()["prompts_failed"], 0)
+        w = RolloutWorker(ctrl, FakeRefSource(store), _capture())
+        w.start()
+        w.drain()
+        self.assertEqual(w.run_once(8), [])
+        self.assertEqual(ctrl.status()["prompts_pending"], 1)
+        w.stop()
+        self.assertEqual(w.run_once(8), [])
+        self.assertEqual(w.health()["state"], "stopped")
 
 
 if __name__ == "__main__":

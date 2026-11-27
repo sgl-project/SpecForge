@@ -27,6 +27,7 @@ class CanonicalDDPProgramTest(unittest.TestCase):
                 "rng": None,
             },
             optimizer_state_is_replicated=True,
+            process_group=None,
         )
 
         def handed(model):

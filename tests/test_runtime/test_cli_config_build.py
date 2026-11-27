@@ -23,7 +23,7 @@ class TestCliConfigBuild(unittest.TestCase):
         torch.manual_seed(0)
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29582")
+        topology = fx.build_single_rank_distributed(port="29582")
 
         import yaml
 
@@ -62,7 +62,7 @@ class TestCliConfigBuild(unittest.TestCase):
             yaml.safe_dump(run_config, f)
 
         cfg = load_config(yaml_path, ["training.max_steps=2"])  # override applies
-        run = build_application_run(resolve_run(cfg))
+        run = build_application_run(resolve_run(cfg), topology=topology)
         trainer = run.trainer
 
         # package-level assembly is the single wiring the CLI executes

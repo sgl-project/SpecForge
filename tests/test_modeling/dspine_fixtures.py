@@ -45,6 +45,8 @@ def training_model(
     backend="sdpa",
     dtype=torch.float32,
     device="cpu",
+    anchor_sampling="device",
+    anchor_seed=None,
     **options,
 ):
     torch.manual_seed(17)
@@ -65,6 +67,8 @@ def training_model(
         target_head=head,
         loss={"execution": {"chunk_size": chunk_size}},
         options=dict(num_anchors=4, top_k=3, **options),
+        anchor_sampling=anchor_sampling,
+        anchor_seed=anchor_seed,
     )
 
 

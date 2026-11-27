@@ -21,6 +21,8 @@ from ..registry import TrainingRequirements, WindowStatistic, register_protocol
     "dspine",
     training=TrainingRequirements(
         host_inputs=prepare_anchor_capacity,
+        samples_anchors=True,
+        draws_per_anchor=1,
         capture_method="dspark",
         minimum_loss_tokens=2,
         loss_mask_filter=has_consecutive_supervised_tokens,
@@ -151,11 +153,15 @@ class DSpineObjective:
                 ),
                 1,
             )
-        replacement = (
-            (torch.rand_like(blocks.keep.float()) < probability) & blocks.keep
-            if probability
-            else torch.zeros_like(blocks.keep)
-        )
+        if not probability:
+            replacement = torch.zeros_like(blocks.keep)
+        else:
+            draws = (
+                batch["anchor_draws"][..., 0]
+                if "anchor_draws" in batch
+                else torch.rand_like(blocks.keep.float())
+            )
+            replacement = (draws < probability) & blocks.keep
         masks = tuple(
             replacement if index < self.replacement_layers else None
             for index in range(model.backbone.num_layers)

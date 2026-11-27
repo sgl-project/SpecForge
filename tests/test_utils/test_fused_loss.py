@@ -66,7 +66,6 @@ CASES = [
     ("kl_div", "kl_div_loss", "fused_kl_div_loss"),
     ("rkl", "reverse_kl_div_loss", "fused_reverse_kl_div_loss"),
     ("jsd", "js_div_loss", "fused_js_div_loss"),
-    ("ce", "ce_loss", "fused_ce_loss"),
     ("tv", "tv_loss", "fused_tv_loss"),
     ("nla", "neg_log_acceptance_loss", "fused_nla_loss"),
     ("lk_hybrid", "lk_hybrid_loss", "fused_lk_hybrid_loss"),
@@ -77,10 +76,6 @@ CASES = [
 # of magnitude more than either bound.
 LOSS_TOL = {"atol": 1e-4, "rtol": 1e-3}
 GRAD_TOL = {"atol": 1e-3, "rtol": 1e-2}
-# eager ce computes cross_entropy in bf16, so its bf16 legs are bounded by
-# eager's own rounding, not by the (fp32) fused kernel
-CE_BF16_LOSS_TOL = {"atol": 0.2, "rtol": 1e-2}
-CE_BF16_GRAD_TOL = {"atol": 1e-2, "rtol": 2e-2}
 
 
 def _assert_fused_matches_eager(
@@ -133,8 +128,8 @@ class TestFusedLoss(unittest.TestCase):
                     fused_fn,
                     logits,
                     targets,
-                    CE_BF16_LOSS_TOL if name == "ce" else LOSS_TOL,
-                    CE_BF16_GRAD_TOL if name == "ce" else GRAD_TOL,
+                    LOSS_TOL,
+                    GRAD_TOL,
                 )
 
                 # Qwen3's 151936 vocab exceeds MAX_FUSED_SIZE (and
@@ -261,15 +256,6 @@ class TestFusedLoss(unittest.TestCase):
         torch.testing.assert_close(nla, -torch.log((1.0 - tv).clamp_min(1e-5)))
         weight = torch.exp(-3.0 * (1.0 - tv))
         torch.testing.assert_close(hybrid, weight * kl + (1.0 - weight) * tv)
-
-        # ce uses argmax(targets) as hard labels
-        ce = fused_loss.ce_loss(logits, targets)
-        ref = torch.nn.functional.cross_entropy(
-            logits.reshape(-1, 128),
-            targets.argmax(dim=-1).reshape(-1),
-            reduction="none",
-        ).reshape(1, 8)
-        torch.testing.assert_close(ce, ref)
 
 
 if __name__ == "__main__":

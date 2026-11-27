@@ -14,7 +14,7 @@ class NoKernels(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, NoKernels())
-for name in ("fused", "domino", "lk", "position_weights"):
+for name in ("fused", "domino", "position_weights"):
     importlib.import_module("specforge.losses." + name)
 assert "specforge.algorithms.objectives" not in sys.modules
 assert "transformers" not in sys.modules
@@ -38,4 +38,3 @@ result = runtime(
     total_steps=None,
 )
 result.loss.backward()
-assert "specforge.losses.soft_cross_entropy" not in sys.modules

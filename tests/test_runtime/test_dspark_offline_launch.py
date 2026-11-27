@@ -18,7 +18,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
     def test_dspark_trains_from_precomputed_target_features(self):
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29580")
+        topology = fx.build_single_rank_distributed(port="29580")
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -44,6 +44,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
         )
 
         trainer = build_offline_runtime(
+            topology=topology,
             algorithm=ALGORITHM,
             hidden_states_path=feature_dir,
             draft_model=model,
@@ -55,6 +56,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
                 warmup_ratio=0.0,
                 total_steps=2,
             ),
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="dspark-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,

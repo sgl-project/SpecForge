@@ -2,7 +2,6 @@
 
 import dataclasses
 import json
-import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +12,7 @@ import torch
 from specforge.application.composition import resolve_run
 from specforge.config import Config, apply_overrides
 from specforge.config.draft.codec import encode_config
+from specforge.distributed import Topology
 from specforge.training.canonical import capture_layers
 from specforge.training.checkpoint import CheckpointManager
 from tests.test_config.test_draft_mtp_spec import mtp_config
@@ -29,8 +29,7 @@ class CanonicalReviewTest(unittest.TestCase):
 
         case = CanonicalTrainingTest()
         try:
-            with patch.dict(os.environ, {"FSDP_SHARDING": "NO_SHARD"}):
-                case._train_and_resume(False)
+            case._train_and_resume(False, fsdp_sharding="NO_SHARD")
         finally:
             case.doCleanups()
 
@@ -133,7 +132,9 @@ class CanonicalReviewTest(unittest.TestCase):
                 },
             )
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertIs(bundle.target_head, bundle.draft_model.lm_head)
             self.assertEqual(
                 capture_layers(cfg, mtp_config(), config.text_config.to_dict()), [0]
@@ -274,7 +275,9 @@ class CanonicalReviewTest(unittest.TestCase):
                     )
                     resolved = resolve_run(cfg)
                     bundle = build_model_bundle(
-                        resolved.config, algorithm=resolved.algorithm
+                        resolved.config,
+                        algorithm=resolved.algorithm,
+                        topology=Topology(),
                     )
                     self.assertEqual(
                         bundle.strategy_kwargs.resume_contract[
@@ -282,6 +285,38 @@ class CanonicalReviewTest(unittest.TestCase):
                         ],
                         {"num_anchors": 512, "loss_decay_gamma": None},
                     )
+
+    def test_a_record_without_anchor_sampling_resumes_as_device_draws(self):
+        from tests.test_runtime import test_checkpoint_resume as resume_tests
+
+        harness = resume_tests.TestTrainerResumeEntrypoint()
+        if not torch.distributed.is_initialized():
+            harness.setUpClass()
+            self.addCleanup(harness.tearDownClass)
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            features = resume_tests._write_feature_files(str(root / "features"), n=4)
+            trainer, _, _ = harness._make_trainer(
+                str(root / "run"), feat_dir=features, max_steps=1
+            )
+            trainer.fit()
+            source = str((root / "run" / "rz-latest").resolve())
+            # Written before the key existed: those runs drew on the device.
+            harness._make_trainer(
+                str(root / "run"),
+                feat_dir=features,
+                max_steps=2,
+                checkpoint_extra={"canonical_anchor_sampling": "device"},
+                resume_from=source,
+            )
+            with self.assertRaisesRegex(ValueError, "canonical_anchor_sampling"):
+                harness._make_trainer(
+                    str(root / "run"),
+                    feat_dir=features,
+                    max_steps=2,
+                    checkpoint_extra={"canonical_anchor_sampling": ("host", 42)},
+                    resume_from=source,
+                )
 
     def test_resume_accepts_a_record_saved_with_logging_options(self):
         from tests.test_runtime import test_checkpoint_resume as resume_tests
@@ -364,6 +399,7 @@ class CanonicalReviewTest(unittest.TestCase):
                     world_size=1,
                 )
                 self.addCleanup(torch.distributed.destroy_process_group)
+            topology = Topology(world_group=torch.distributed.group.WORLD)
             target = target_directory(root)
             save_file(
                 {
@@ -394,6 +430,7 @@ class CanonicalReviewTest(unittest.TestCase):
                 },
                 training={
                     "attention_backend": "eager",
+                    "fsdp_sharding": "NO_SHARD",
                     "max_steps": 1,
                     "total_steps": 2,
                     "save_interval": 1,
@@ -403,9 +440,8 @@ class CanonicalReviewTest(unittest.TestCase):
             raw = cfg.model_dump()
             raw.update(draft=None, resume=str(root / "output" / "specforge-run-step1"))
             raw["training"]["max_steps"] = 2
-            with patch.dict(os.environ, {"FSDP_SHARDING": "NO_SHARD"}):
-                build_application_run(cfg).run()
-                build_application_run(Config.model_validate(raw)).run()
+            build_application_run(cfg, topology=topology).run()
+            build_application_run(Config.model_validate(raw), topology=topology).run()
             self.assertTrue((root / "output" / "specforge-run-step2").is_dir())
 
     def test_padded_target_vocabulary_sizes_the_teacher(self):
@@ -436,7 +472,9 @@ class CanonicalReviewTest(unittest.TestCase):
                     training={"attention_backend": "eager", "batch_size": 1},
                 )
             )
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             self.assertEqual(bundle.target_head.weight.shape[0], 64)
             self.assertEqual(bundle.target_vocab_size, 64)
             narrow = dataclasses.replace(eagle_config(target_width=32), vocab_size=60)
@@ -453,7 +491,9 @@ class CanonicalReviewTest(unittest.TestCase):
                 )
             )
             with self.assertRaisesRegex(ValueError, "target logit width 64"):
-                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+                build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm, topology=Topology()
+                )
 
     def test_vocab_mapping_cannot_replace_a_copied_vocabulary(self):
         """weights_from copies lm_head rows trained under the source's mapping."""
@@ -495,7 +535,9 @@ class CanonicalReviewTest(unittest.TestCase):
                 )
             )
             with self.assertRaisesRegex(ValueError, "vocab_mapping_path disagrees"):
-                build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+                build_model_bundle(
+                    resolved.config, algorithm=resolved.algorithm, topology=Topology()
+                )
 
     def test_objective_frozen_head_that_the_draft_disables_needs_no_weights(self):
         """DSpark freezes its confidence head at alpha 0, which a draft may omit."""
@@ -519,11 +561,15 @@ class CanonicalReviewTest(unittest.TestCase):
                         # a present but untrained head still needs a source
                         with self.assertRaisesRegex(ValueError, "require loaded"):
                             build_model_bundle(
-                                resolved.config, algorithm=resolved.algorithm
+                                resolved.config,
+                                algorithm=resolved.algorithm,
+                                topology=Topology(),
                             )
                         continue
                     bundle = build_model_bundle(
-                        resolved.config, algorithm=resolved.algorithm
+                        resolved.config,
+                        algorithm=resolved.algorithm,
+                        topology=Topology(),
                     )
                     self.assertIsNone(bundle.draft_model.confidence_head)
                     self.assertEqual(bundle.model.frozen_parameters, ())
@@ -546,7 +592,9 @@ class CanonicalReviewTest(unittest.TestCase):
             model = {"target_model_path": str(target), "torch_dtype": "bfloat16"}
             cfg = run_config(target, eagle(target_width=32), model=model)
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             embedding = bundle.draft_model.embed_tokens.weight.detach().cpu()
             self.assertEqual(embedding.dtype, torch.bfloat16)
             expected = tables["model.embed_tokens.weight"].to(torch.bfloat16)
@@ -586,7 +634,9 @@ class CanonicalReviewTest(unittest.TestCase):
                     run_config(target, draft_config(), training=training)
                 )
                 bundle = build_model_bundle(
-                    resolved.config, algorithm=resolved.algorithm
+                    resolved.config,
+                    algorithm=resolved.algorithm,
+                    topology=Topology(),
                 )
                 contract = bundle.strategy_kwargs.resume_contract
                 contracts.append(contract["canonical_frozen"])
@@ -611,7 +661,9 @@ class CanonicalReviewTest(unittest.TestCase):
                 initialization={"from_target": {"lm_head.weight": "lm_head.weight"}},
             )
             resolved = resolve_run(cfg)
-            bundle = build_model_bundle(resolved.config, algorithm=resolved.algorithm)
+            bundle = build_model_bundle(
+                resolved.config, algorithm=resolved.algorithm, topology=Topology()
+            )
             head = load_file(target / "model.safetensors")["lm_head.weight"]
             embedding = bundle.draft_model.embed_tokens.weight.detach().cpu()
             self.assertTrue(torch.equal(embedding, head))

@@ -20,7 +20,8 @@ from __future__ import annotations
 import logging
 import sys
 from contextlib import nullcontext
-from typing import Callable, Mapping, Optional
+from dataclasses import replace
+from typing import TYPE_CHECKING, Callable, Mapping, Optional
 
 import torch
 
@@ -34,9 +35,19 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.contracts import ProgramSpec, RankFailure
+from specforge.training.contracts import (
+    RUNTIMES,
+    OptimizerSpec,
+    ProgramSpec,
+    RankFailure,
+    SchedulerSpec,
+    TrainingRuntime,
+)
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +64,11 @@ class Trainer:
         ref_source: dict,  # {"refs": [...]} (offline) | {"queue": q} (online)
         model,  # the program; its ``draft_model`` is what the optimizer trains
         program_spec: ProgramSpec,  # what ``model`` declares
-        optimizer_factory,
+        optimizer_factory=None,
+        optimizer_spec: Optional[OptimizerSpec] = None,
+        scheduler_spec: Optional[SchedulerSpec] = None,
+        max_grad_norm: Optional[float] = None,
+        runtime: TrainingRuntime,  # which runtime trains, with what precision
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -76,9 +91,9 @@ class Trainer:
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
-        tp_size: int = 1,
-        sp_ulysses_size: int = 1,
-        sp_ring_size: int = 1,
+        topology: Topology,
+        fsdp_sharding: str = "SHARD_GRAD_OP",
+        ddp_bucket_cap_mb: Optional[float] = None,
         dataloader_num_workers: int = 0,
         profiling_options=None,
         fit_context=None,
@@ -86,6 +101,8 @@ class Trainer:
         on_fit_failure: Optional[Callable[[BaseException], None]] = None,
         on_fit_finally: Optional[Callable[[], None]] = None,
     ):
+        if runtime.name not in RUNTIMES:
+            raise ValueError(f"unknown training runtime {runtime.name!r}")
         ref_source = dict(ref_source)
         data_prepositioned = bool(ref_source.pop("prepositioned", False))
         defer_queue_ack = bool(ref_source.pop("defer_ack_until_durable", False))
@@ -233,14 +250,33 @@ class Trainer:
                 num_epochs=num_epochs,
             )
 
-        configure_schedule = getattr(optimizer_factory, "configure_total_steps", None)
-        if effective_total_steps is None and configure_schedule is not None:
+        if (optimizer_factory is None) == (optimizer_spec is None):
+            raise ValueError("pass exactly one of optimizer_factory or optimizer_spec")
+        if optimizer_spec is not None:
+            if scheduler_spec is None:
+                raise ValueError("optimizer_spec requires scheduler_spec")
+            if max_grad_norm is None:
+                raise ValueError("optimizer_spec requires max_grad_norm")
+            if effective_total_steps is None:
+                if scheduler_spec.total_steps is None:
+                    raise ValueError(
+                        "a configured optimizer on a streaming source requires "
+                        "total_steps or max_steps"
+                    )
+            elif scheduler_spec.total_steps is None:
+                scheduler_spec = replace(
+                    scheduler_spec, total_steps=effective_total_steps
+                )
+            elif scheduler_spec.total_steps != effective_total_steps:
+                raise ValueError(
+                    "optimizer/controller schedule mismatch: "
+                    f"{scheduler_spec.total_steps} != {effective_total_steps}"
+                )
+        elif scheduler_spec is not None or max_grad_norm is not None:
             raise ValueError(
-                "a configured optimizer on a streaming source requires total_steps "
-                "or max_steps"
+                "scheduler_spec and max_grad_norm come with optimizer_spec; an "
+                "optimizer_factory builds its own schedule and clipping"
             )
-        if configure_schedule is not None:
-            configure_schedule(effective_total_steps)
 
         standard_checkpoint_extra = {
             "dataset_size": dataset_size,
@@ -248,9 +284,12 @@ class Trainer:
             "accumulation_steps": accumulation_steps,
             "num_epochs": num_epochs,
             "effective_total_steps": effective_total_steps,
-            "tp_size": tp_size,
-            "sp_ulysses_size": sp_ulysses_size,
-            "sp_ring_size": sp_ring_size,
+            "tp_size": topology.tp_size,
+            "sp_ulysses_size": topology.sp_ulysses_size,
+            "sp_ring_size": topology.sp_ring_size,
+            "runtime": runtime.name,
+            "precision": runtime.precision.to_record(),
+            "fsdp_sharding": fsdp_sharding,
         }
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
@@ -276,6 +315,7 @@ class Trainer:
         # masters (cloned at build) start from them; this rank's own optimizer/RNG
         # shard (``state['backend']``) loads after the wrap builds the optimizer.
         resume = None
+        resuming_from_fsdp = False
         if resume_from:
             state = (
                 resume_state
@@ -288,13 +328,19 @@ class Trainer:
                     f"checkpoint {resume_from} was written by strategy "
                     f"{saved_strategy!r}; this run trains {algorithm_name!r}"
                 )
-            import torch.distributed as dist
-
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
             resume_contract = {
-                "world_size": world_size,
+                "world_size": topology.world_size,
                 **persisted_contract,
             }
+            # One-way migration: an fsdp2 run may resume a checkpoint written
+            # by the reference fsdp runtime (or a legacy checkpoint without a
+            # recorded runtime), provided compute_dtype and artifact_dtype
+            # match. The reverse (fsdp2 -> fsdp) is refused below.
+            saved_runtime = state.get("runtime")
+            resuming_from_fsdp = runtime.name == "fsdp2" and saved_runtime in (
+                None,
+                "fsdp",
+            )
             saved_options = state.get("canonical_objective_options")
             if "canonical_objective" in resume_contract and isinstance(
                 saved_options, dict
@@ -319,6 +365,19 @@ class Trainer:
                     state[STEP_OPTIONS_CONTRACT_KEY] = tuple(
                         sorted(step_options.items())
                     )
+            # Checkpoints written before anchor_sampling existed drew anchors
+            # on the device; pre-registry checkpoints used AdamW, the default
+            # param-group policy, min_lr_ratio=0.0, and no extra options.
+            for legacy_key, legacy_default in (
+                ("canonical_anchor_sampling", "device"),
+                ("canonical_optimizer", "adamw"),
+                ("canonical_param_group_policy", "default"),
+                ("canonical_optimizer_options", {}),
+                ("canonical_lr_scheduler_min_lr_ratio", 0.0),
+                ("canonical_lr_scheduler_options", {}),
+            ):
+                if legacy_key not in state:
+                    state = {**state, legacy_key: legacy_default}
             # Every checkpoint written before named loss terms stores a flat
             # canonical_loss, whatever else its record holds.
             saved_loss = state.get("canonical_loss")
@@ -352,8 +411,21 @@ class Trainer:
                     # this run writes keep recording what it follows.
                     current = model.adopt_recorded_execution(persisted)
                     persisted_contract[key] = current
+                if resuming_from_fsdp and key in ("runtime", "fsdp_sharding"):
+                    continue
                 comparison_current = current
                 comparison_persisted = persisted
+                if resuming_from_fsdp and key == "precision" and persisted_available:
+                    # Migration preserves compute and artifact dtypes; parameter,
+                    # gradient, master and buffer dtypes change by design.
+                    comparison_current = {
+                        field: current[field]
+                        for field in ("compute_dtype", "artifact_dtype")
+                    }
+                    comparison_persisted = {
+                        field: persisted.get(field)
+                        for field in ("compute_dtype", "artifact_dtype")
+                    }
                 if key == MODEL_PROVENANCE_CONTRACT_KEY and key in state:
                     from specforge.training.provenance import (
                         model_provenance_for_resume_comparison,
@@ -479,21 +551,38 @@ class Trainer:
             # drop the full draft state before the wrap
             del state, saved_weights
 
-        parallel = ParallelConfig.from_distributed(
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
+        parallel = ParallelConfig.from_topology(
+            topology,
+            sharding_strategy=fsdp_sharding,
+            ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
-        backend = FSDPTrainingBackend(parallel, optimizer_factory=optimizer_factory)
+        if runtime.name == "fsdp":
+            backend_class = FSDPTrainingBackend
+        elif runtime.name == "fsdp2":
+            from specforge.training.backends.fsdp2 import FSDP2TrainingBackend
+
+            backend_class = FSDP2TrainingBackend
+        else:
+            raise ValueError(f"unknown training runtime {runtime.name!r}")
+        backend = backend_class(
+            parallel,
+            precision=runtime.precision,
+            optimizer_factory=optimizer_factory,
+            optimizer_spec=optimizer_spec,
+            scheduler_spec=scheduler_spec,
+            max_grad_norm=max_grad_norm,
+        )
         # FSDP-wrap the composite model and build the optimizer over the inner draft
         # AFTER wrapping; the runner MUST run forward through the wrapped module so
         # FSDP is actually in the forward/backward path (not bypassed at >1 rank).
-        wrapped = backend.prepare_model(
-            model,
+        prepare_kwargs: dict[str, object] = dict(
             optimizer_target=model.draft_model,
             frozen_modules=model.frozen_modules,
             blocks=program_spec.partition.blocks,
         )
+        if resuming_from_fsdp:
+            prepare_kwargs["retain_reference_layout"] = True
+        wrapped = backend.prepare_model(model, **prepare_kwargs)
         runner = DataParallelRunner(wrapped, backend, program_spec)
         if resume is not None:
             # A rank whose own state does not restore tells the others, which
@@ -528,10 +617,10 @@ class Trainer:
         controller_obj = TrainerController(
             runner,
             strategy_name=algorithm_name,
+            rank=topology.rank,
+            world_size=topology.world_size,
             accumulation_steps=accumulation_steps,
-            data_parallel_size=max(
-                1, parallel.world_size // (parallel.tp_size * parallel.sp_size)
-            ),
+            data_parallel_size=topology.data_parallel_size,
             run_id=run_id,
             output_dir=output_dir,
             num_epochs=num_epochs,
@@ -641,6 +730,7 @@ class Trainer:
                 "TrainerController.close_profiler",
                 self._controller.close_profiler,
             )
+            capture_cleanup("TrainingBackend.close", self.backend.close)
             if self._on_fit_finally is not None:
                 capture_cleanup("on_fit_finally", self._on_fit_finally)
             close_logger = getattr(self._logger, "close", None)

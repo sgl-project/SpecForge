@@ -173,10 +173,16 @@ def _runner(program, backend, **declarations):
     )
 
 
-def _controller(program, backend, **options):
+def _controller(program, backend, *, rank=0, world_size=1, **options):
     """A run loop that drives ``program`` and ``backend`` through the step runner."""
     runner = _runner(program, backend)
-    return TrainerController(runner, strategy_name=runner.spec.name, **options)
+    return TrainerController(
+        runner,
+        strategy_name=runner.spec.name,
+        rank=rank,
+        world_size=world_size,
+        **options,
+    )
 
 
 class TestDataParallelRunner(unittest.TestCase):
@@ -616,8 +622,6 @@ class TestTrainerController(unittest.TestCase):
             mock.patch(
                 "specforge.training.controller.sys.stderr.isatty", return_value=True
             ),
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=False),
             mock.patch("tqdm.tqdm", return_value=progress) as build_progress,
         ):
             ctrl = _controller(
@@ -644,14 +648,13 @@ class TestTrainerController(unittest.TestCase):
             mock.patch(
                 "specforge.training.controller.sys.stderr.isatty", return_value=True
             ),
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_rank", return_value=1),
             mock.patch("tqdm.tqdm") as build_progress,
         ):
             ctrl = _controller(
                 program,
                 backend,
+                rank=1,
+                world_size=2,
                 run_id="r",
                 output_dir=d,
                 max_steps=1,
@@ -660,6 +663,36 @@ class TestTrainerController(unittest.TestCase):
             self.assertIsNone(ctrl._make_progress_bar())
 
         build_progress.assert_not_called()
+
+    def test_rank0_decision_is_broadcast_only_across_ranks(self):
+        program = TinyProgram()
+
+        def broadcast(box, src):
+            self.assertEqual((box, src), ([False], 0))
+            box[0] = True
+
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch(
+                "torch.distributed.broadcast_object_list", side_effect=broadcast
+            ) as call,
+        ):
+            single = _controller(
+                program, FakeBackend(program), run_id="r", output_dir=d
+            )
+            self.assertIs(single._rank0_decision(True), True)
+            call.assert_not_called()
+            peer = _controller(
+                program,
+                FakeBackend(program),
+                rank=1,
+                world_size=2,
+                run_id="r",
+                output_dir=d,
+            )
+            # Rank 1 follows rank 0's verdict, whatever it computed itself.
+            self.assertIs(peer._rank0_decision(False), True)
+            call.assert_called_once()
 
     def test_fit_and_checkpoint(self):
         program = TinyProgram()
@@ -911,7 +944,9 @@ class TestTrainerController(unittest.TestCase):
                     for _ in range(6):
                         # Hold nothing while suspended, as a loader would not.
                         handed = [_batch()]
-                        streamed.append(weakref.ref(handed[0]))
+                        # Track the tensor payload rather than the outer TrainBatch
+                        # wrapper, which TrainerController replaces to attach the epoch.
+                        streamed.append(weakref.ref(handed[0].tensors["x"]))
                         yield handed.pop()
 
                 Runner.replay_statistics = replay_statistics
@@ -919,6 +954,8 @@ class TestTrainerController(unittest.TestCase):
                     ctrl = TrainerController(
                         Runner(),
                         strategy_name="fake",
+                        rank=0,
+                        world_size=1,
                         accumulation_steps=3,
                         run_id="r",
                         output_dir=d,
