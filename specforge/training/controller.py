@@ -22,13 +22,14 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import torch
 
 from specforge.runtime.contracts import TrainBatch
 from specforge.training.contracts import (
+    EPOCH_METADATA_KEY,
     RankFailure,
     StepContext,
     StepMetrics,
@@ -584,7 +585,11 @@ class TrainerController:
                 self._perf.stream_s += time.perf_counter() - resumed
                 # Suspended here until the next batch is asked for, which may
                 # be a whole replay later: hold no reference meanwhile.
-                handed = [batch]
+                handed = [
+                    replace(
+                        batch, metadata={**batch.metadata, EPOCH_METADATA_KEY: epoch}
+                    )
+                ]
                 del batch
                 yield handed.pop()
                 resumed = time.perf_counter()

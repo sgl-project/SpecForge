@@ -1103,6 +1103,15 @@ class TrainingConfig(StrictConfigModel):
     #: and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
+    #: Where block objectives (DFlash, DFlash2, Domino, DSpark, DSpine, DMTP)
+    #: draw their anchors. ``device`` samples in the forward from the global
+    #: generator. ``host`` samples before the batch is placed, from ``seed``,
+    #: the sample's id and the epoch, so a sample's anchors do not depend on its
+    #: rank, its padding or the data-parallel size. Same sampling law; other
+    #: draws, so switching changes a run's trajectory, and a resume must keep
+    #: the mode and the seed (the checkpoint records both). Reproducible across
+    #: launches only where sample ids are.
+    anchor_sampling: Literal["device", "host"] = "device"
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
