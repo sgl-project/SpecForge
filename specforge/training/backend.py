@@ -8,25 +8,25 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
-single distributed lifecycle: trainer TP (fixed at one by public builders) plus
-draft DP/USP topology.
+FSDP-only for now. ``ParallelConfig`` carries the sharding strategy and the
+process group the job's topology gives the wrapper.
 """
 
 from __future__ import annotations
 
 import abc
 import contextlib
-import logging
-import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
 from specforge.training.contracts import RankFailure
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
 
 
 def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
@@ -52,97 +52,35 @@ def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
 
 @dataclass
 class ParallelConfig:
-    """Snapshot of the trainer-TP and draft-DP/SP layout.
+    """How the backend wraps the program, and over which process group.
 
-    Process-group handles are created once by :func:`init_distributed` and
-    carried into the trainer.  Re-deriving groups here can change collective
-    ordering and deadlock a multi-rank run.
+    The group comes from the job's topology, built once by
+    :func:`specforge.distributed.init_distributed`. Re-deriving groups here can
+    change collective ordering and deadlock a multi-rank run.
     """
 
     world_size: int = 1
-    tp_size: int = 1
-    sp_ulysses_size: int = 1
-    sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
     param_dtype: torch.dtype = torch.bfloat16
     fsdp_process_group: Any = None
-    dp_group: Any = None
-    draft_dp_group: Any = None
-    tp_group: Any = None
-    sp_ulysses_group: Any = None
-    sp_ring_group: Any = None
-    draft_sp_group: Any = None
-    device_mesh: Any = None
-    tp_device_mesh: Any = None
-    extra: dict = field(default_factory=dict)
-
-    @property
-    def sp_size(self) -> int:
-        return self.sp_ulysses_size * self.sp_ring_size
+    ddp_bucket_cap_mb: Optional[float] = None
 
     @classmethod
-    def from_distributed(
+    def from_topology(
         cls,
+        topology: Topology,
         *,
-        tp_size: int = 1,
-        sp_ulysses_size: int = 1,
-        sp_ring_size: int = 1,
         sharding_strategy: str = "SHARD_GRAD_OP",
         param_dtype: torch.dtype = torch.bfloat16,
+        ddp_bucket_cap_mb: Optional[float] = None,
     ) -> "ParallelConfig":
-        """Carry every group built by :func:`specforge.distributed.init_distributed`."""
-        # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
-        # runs DDP-style (full params replicated, one grad all-reduce, no param
-        # all-gather). Default unchanged when the env var is unset.
-        sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
-        if not dist.is_initialized():
-            return cls(
-                world_size=1,
-                tp_size=tp_size,
-                sp_ulysses_size=sp_ulysses_size,
-                sp_ring_size=sp_ring_size,
-                sharding_strategy=sharding_strategy,
-                param_dtype=param_dtype,
-            )
-        handles: Dict[str, Any] = {}
-        try:
-            from specforge import distributed as sfdist
-
-            for name, getter in (
-                ("dp_group", "get_dp_group"),
-                ("draft_dp_group", "get_draft_dp_group"),
-                ("tp_group", "get_tp_group"),
-                ("sp_ulysses_group", "get_sp_ulysses_group"),
-                ("sp_ring_group", "get_sp_ring_group"),
-                ("draft_sp_group", "get_draft_sp_group"),
-                ("device_mesh", "get_device_mesh"),
-                ("tp_device_mesh", "get_tp_device_mesh"),
-            ):
-                fn = getattr(sfdist, getter, None)
-                if fn is None:
-                    continue
-                try:
-                    handles[name] = fn()
-                except Exception as exc:
-                    logging.getLogger(__name__).warning(
-                        "ParallelConfig.from_distributed: %s() unavailable: %s",
-                        getter,
-                        exc,
-                    )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "ParallelConfig.from_distributed: distributed handles unavailable: %s",
-                exc,
-            )
+        """Wrap over the topology's world group."""
         return cls(
-            world_size=dist.get_world_size(),
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
+            world_size=topology.world_size,
             sharding_strategy=sharding_strategy,
             param_dtype=param_dtype,
-            fsdp_process_group=dist.group.WORLD,
-            **handles,
+            fsdp_process_group=topology.world_group,
+            ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
 
 
@@ -320,11 +258,7 @@ class FSDPTrainingBackend(TrainingBackend):
                     process_group=pc.fsdp_process_group,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
-                    bucket_cap_mb=(
-                        float(os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"])
-                        if "SPECFORGE_DDP_BUCKET_CAP_MB" in os.environ
-                        else None
-                    ),
+                    bucket_cap_mb=pc.ddp_bucket_cap_mb,
                 )
                 self._wrapper_kind = "ddp"
             else:

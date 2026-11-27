@@ -31,6 +31,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from specforge.algorithms.objectives.base import ObjectiveResult
+from specforge.distributed import Topology
 from specforge.runtime.contracts import FeatureSpec, SampleRef, TrainBatch
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.dp_ack import (
@@ -142,13 +143,17 @@ def _ref(sample_id: str) -> SampleRef:
     )
 
 
-def _controller(output_dir, *, on_forward=None, on_step=None, **kwargs):
+def _controller(
+    output_dir, *, on_forward=None, on_step=None, rank=0, world_size=1, **kwargs
+):
     program = _Program(on_forward)
     backend = _Backend(program, on_step)
     spec = fake_spec("x", name="fake")
     return TrainerController(
         DataParallelRunner(program, backend, spec),
         strategy_name=spec.name,
+        rank=rank,
+        world_size=world_size,
         run_id="run0",
         output_dir=output_dir,
         **kwargs,
@@ -423,11 +428,13 @@ class _FakeDistributor:
         pass
 
 
-def _build_consumer(work, *, resume_from=None, env=None, dist_patches=None):
+def _build_consumer(
+    work, *, resume_from=None, env=None, topology=Topology(), dist_patches=()
+):
     """Enter the real online-consumer builder below model/FSDP assembly.
 
-    ``dist_patches`` replaces the default single-process ``torch.distributed``
-    view (``is_initialized() -> False``) with a scripted one.
+    ``topology`` is the job the consumer is a rank of, one process by default;
+    ``dist_patches`` script the collectives of a larger one.
     """
     from contextlib import ExitStack
 
@@ -440,10 +447,6 @@ def _build_consumer(work, *, resume_from=None, env=None, dist_patches=None):
     if resume_from is not None and channel.consumer_quantum() is None:
         channel.publish_consumer_quantum(1)
     features = _RetainingFeatureStore()
-    if dist_patches is None:
-        dist_patches = [
-            mock.patch("torch.distributed.is_initialized", return_value=False)
-        ]
     with ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, env or {}))
         for patcher in dist_patches:
@@ -473,6 +476,7 @@ def _build_consumer(work, *, resume_from=None, env=None, dist_patches=None):
             metadata_db_path=os.path.join(work, "ledger.sqlite"),
             inbox_dir=os.path.join(work, "inboxes"),
             resume_from=resume_from,
+            topology=topology,
         )
     return captured, _FakeDistributor.latest, features
 
@@ -513,12 +517,8 @@ class TestConsumerAsyncAckSwitch(unittest.TestCase):
                 captured, _distributor, _features = _build_consumer(
                     work,
                     env={"DISAGG_ASYNC_ACK": "1" if local else "0"},
+                    topology=Topology(rank=0, world_size=2),
                     dist_patches=[
-                        mock.patch(
-                            "torch.distributed.is_initialized", return_value=True
-                        ),
-                        mock.patch("torch.distributed.get_world_size", return_value=2),
-                        mock.patch("torch.distributed.get_rank", return_value=0),
                         mock.patch(
                             "torch.distributed.all_gather_object", side_effect=gather
                         ),
@@ -741,6 +741,8 @@ def _two_rank_async_ack_worker(
         ctrl = _controller(
             os.path.join(work, "output"),
             on_step=training_collective,
+            rank=rank,
+            world_size=WORLD_SIZE,
             max_steps=8,
             save_interval=3,
             ack_fn=ack_fn,

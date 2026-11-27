@@ -11,6 +11,7 @@ from unittest import mock
 
 import torch
 
+from specforge.distributed import Topology
 from specforge.runtime.contracts import FeatureSpec, SampleRef
 from specforge.runtime.control_plane.controller import DataFlowController
 from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
@@ -104,7 +105,6 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
         if resume_from is not None and self.channel.consumer_quantum() is None:
             self.channel.publish_consumer_quantum(1)
         with (
-            mock.patch("torch.distributed.is_initialized", return_value=False),
             mock.patch(
                 "specforge.runtime.data_plane.ref_distributor.RefDistributor",
                 _FakeDistributor,
@@ -124,6 +124,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 inbox_dir=os.path.join(self.work, "inboxes"),
                 resume_from=resume_from,
                 idle_timeout_s=idle_timeout_s,
+                topology=Topology(),
                 **kwargs,
             )
         return trainer, captured, _FakeDistributor.latest

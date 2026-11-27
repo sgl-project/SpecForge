@@ -84,6 +84,7 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
             run = _build_offline(
                 self._config(),
                 algorithm=ALGORITHM,
+                topology=None,
                 build_model_bundle=lambda *_args, **_kwargs: None,
                 optimizer_factory=lambda *_args, **_kwargs: None,
                 logger=lambda *_args, **_kwargs: None,

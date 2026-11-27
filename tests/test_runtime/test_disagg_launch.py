@@ -164,7 +164,7 @@ class TestDisaggDataEquivalence(unittest.TestCase):
 class TestDisaggLaunchFSDP(unittest.TestCase):
     def test_build_disagg_runtime_trains_through_fsdp(self):
         torch.manual_seed(0)
-        fx.build_single_rank_distributed(port="29577")
+        topology = fx.build_single_rank_distributed(port="29577")
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -197,6 +197,7 @@ class TestDisaggLaunchFSDP(unittest.TestCase):
             )
 
         trainer = build_disagg_offline_runtime(
+            topology=topology,
             algorithm=ALGORITHM,
             feature_store=store,
             refs=consumer_refs,

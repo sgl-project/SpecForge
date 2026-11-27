@@ -158,16 +158,8 @@ EXCEPTED_COLLECTIVES = {
     # the process group, which the design moves to the runner and to a
     # topology value.
     "specforge/training/controller.py": Excepted(
-        "run loop: the progress bar's rank; rank 0's verdict on whether an "
-        "evaluation runs, broadcast; the world size written into a checkpoint",
+        "run loop: rank 0's verdict on whether an evaluation runs, broadcast",
         {f"{_T}.broadcast_object_list": 1},
-        reads=(
-            _T,
-            f"{_T}.get_rank",
-            f"{_T}.get_world_size",
-            f"{_T}.is_available",
-            f"{_T}.is_initialized",
-        ),
     ),
     "specforge/training/checkpoint.py": Excepted(
         "checkpoint sequence: the gather of write errors, the barrier, rank 0's "
@@ -192,10 +184,6 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.is_available",
             f"{_T}.is_initialized",
         ),
-    ),
-    "specforge/training/trainer.py": Excepted(
-        "resume: the world size compared with the checkpoint's",
-        reads=(_T, f"{_T}.get_world_size", f"{_T}.is_initialized"),
     ),
 }
 
@@ -625,8 +613,8 @@ class TrainingBoundaryTest(unittest.TestCase):
     def test_only_what_issues_no_communication_goes_uncounted(self):
         for name in ("barrier", "all_reduce", "all_gather_object", "isend", "P2POp"):
             self.assertTrue(_counted(f"torch.distributed.{name}"), name)
-        # Topology read from the process counts too, through its helpers.
-        self.assertTrue(_counted("specforge.distributed.get_tp_group"))
+        # Anything else of the package's own distributed module counts too.
+        self.assertTrue(_counted("specforge.distributed.init_distributed"))
         for name in ("get_rank", "is_initialized", "ProcessGroup", "ReduceOp.SUM"):
             self.assertFalse(_counted(f"torch.distributed.{name}"), name)
         self.assertFalse(_counted("torch.distributed"))

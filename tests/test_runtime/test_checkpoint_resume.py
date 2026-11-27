@@ -15,6 +15,8 @@ from unittest import mock
 
 import torch
 
+from specforge.distributed import Topology
+
 CUDA = torch.cuda.is_available()
 
 
@@ -235,6 +237,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 resume_from=resume_from,
                 checkpoint_extra=checkpoint_extra,
                 strategy_kwargs=strategy_kwargs,
+                topology=Topology(),
             )
         return trainer, model, seen
 
@@ -924,11 +927,12 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 self.embed_tokens.requires_grad_(False)
 
         class Composite(Program):
-            # the builder reads the program's declarations from these two
+            # the builder reads the program's declarations from these
             objective_name = "eagle3"
             registration = SimpleNamespace(
                 inputs=("x",), training=TrainingRequirements()
             )
+            sequence_parallel = None
 
             def __init__(self):
                 super().__init__(Draft())
@@ -1014,6 +1018,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     per_sample_transform=_x_transform,
                     resume_from=resume_from,
                     strategy_kwargs=strategy_runtime,
+                    topology=Topology(),
                 )
 
         output_dir = os.path.join(workdir, "out")
@@ -1237,6 +1242,8 @@ class TestFitReentry(unittest.TestCase):
         ctrl = TrainerController(
             _recording_runner(seen)(model, backend, spec),
             strategy_name=spec.name,
+            rank=0,
+            world_size=1,
             run_id="r",
             output_dir=out_dir,
             max_steps=max_steps,
@@ -1393,17 +1400,19 @@ class TestFitReentry(unittest.TestCase):
 class TestCheckpointResume(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from tests.test_runtime import _fixtures as fx
+
         if torch.distributed.is_initialized():
+            cls.topology = fx.build_single_rank_distributed(port="29563")
             return
 
         from specforge.distributed import destroy_distributed
-        from tests.test_runtime import _fixtures as fx
 
         env = mock.patch.dict(os.environ)
         env.start()
         cls.addClassCleanup(env.stop)
-        cls.addClassCleanup(destroy_distributed)
-        fx.build_single_rank_distributed(port="29563")
+        cls.topology = fx.build_single_rank_distributed(port="29563")
+        cls.addClassCleanup(destroy_distributed, cls.topology)
 
     def test_checkpoint_resume(self):
         torch.manual_seed(0)
@@ -1441,13 +1450,15 @@ class TestCheckpointResume(unittest.TestCase):
             warmup_ratio=0.0,
             total_steps=10,
         )
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDPTrainingBackend(ParallelConfig.from_topology(self.topology))
         backend.prepare_model(model, wrap=False)  # no FSDP at 1 rank
         backend.set_optimizer(opt)
         runner = fx.build_runner(model, backend)
         ctrl = TrainerController(
             runner,
             strategy_name=runner.spec.name,
+            rank=self.topology.rank,
+            world_size=self.topology.world_size,
             run_id="r",
             output_dir=out_dir,
             max_steps=3,
@@ -1553,7 +1564,7 @@ class TestCheckpointResume(unittest.TestCase):
         def build_run():
             torch.manual_seed(0)
             model, _ = fx.build_eagle3(workdir, ttt=TTT)
-            backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+            backend = FSDPTrainingBackend(ParallelConfig.from_topology(self.topology))
             backend.prepare_model(model, wrap=False)
             backend.set_optimizer(
                 BF16Optimizer(
@@ -1572,6 +1583,8 @@ class TestCheckpointResume(unittest.TestCase):
         ctrl_r = TrainerController(
             runner_r,
             strategy_name=runner_r.spec.name,
+            rank=self.topology.rank,
+            world_size=self.topology.world_size,
             run_id="ref",
             output_dir=os.path.join(workdir, "ref"),
             max_steps=TOTAL,
@@ -1592,6 +1605,8 @@ class TestCheckpointResume(unittest.TestCase):
         ctrl_a = TrainerController(
             runner_a,
             strategy_name=runner_a.spec.name,
+            rank=self.topology.rank,
+            world_size=self.topology.world_size,
             run_id="rez",
             output_dir=out_a,
             max_steps=CUT,
@@ -1656,6 +1671,8 @@ class TestCheckpointResume(unittest.TestCase):
         ctrl_b = TrainerController(
             runner_b,
             strategy_name=runner_b.spec.name,
+            rank=self.topology.rank,
+            world_size=self.topology.world_size,
             run_id="rez",
             output_dir=out_a,
             max_steps=TOTAL,
@@ -1818,6 +1835,8 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
             ctrl = TrainerController(
                 runner,
                 strategy_name="sharded-resume",
+                rank=rank,
+                world_size=2,
                 run_id="fsdp-resume",
                 output_dir=out_dir,
                 max_steps=max_steps,

@@ -38,7 +38,7 @@ def _draft_state(trainer):
 @unittest.skipUnless(CUDA, "colocated/disaggregated parity requires CUDA")
 class TestColocatedVsDisaggEquiv(unittest.TestCase):
     def test_current_builders_produce_identical_losses_and_weights(self):
-        fx.build_single_rank_distributed(port="29571")
+        topology = fx.build_single_rank_distributed(port="29571")
         from specforge.launch import build_disagg_offline_runtime, build_offline_runtime
         from specforge.runtime.data_plane.disagg_ingest import ingest_offline_features
         from specforge.runtime.data_plane.disaggregated import SharedDirFeatureStore
@@ -79,6 +79,7 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
 
                 local_losses = []
                 local_trainer = build_offline_runtime(
+                    topology=topology,
                     algorithm=ALGORITHM,
                     hidden_states_path=feature_dir,
                     draft_model=local_model,
@@ -97,6 +98,7 @@ class TestColocatedVsDisaggEquiv(unittest.TestCase):
                 )
                 disagg_losses = []
                 disagg_trainer = build_disagg_offline_runtime(
+                    topology=topology,
                     algorithm=ALGORITHM,
                     feature_store=shared_store,
                     refs=disagg_refs,
