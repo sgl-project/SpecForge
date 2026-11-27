@@ -24,6 +24,8 @@ import json
 import os
 import warnings
 from collections import Counter
+from collections.abc import Sequence
+from numbers import Integral
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -31,6 +33,7 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
+from .loss_mask import normalize_loss_mask_1d
 from .parse import (
     DeepSeekV4Parser,
     GeneralParser,
@@ -43,6 +46,35 @@ from .template import TEMPLATE_REGISTRY, ChatTemplate
 
 # define a type called conversation
 Conversation = List[Dict[str, str]]
+
+_PARSER_CLASSES = {
+    "general": GeneralParser,
+    "thinking": ThinkingParser,
+    "deepseek-v4": DeepSeekV4Parser,
+    "glm": GLMParser,
+    "openai-harmony": HarmonyParser,
+    "muse": MuseParser,
+}
+
+
+def _resolve_parser_class(chat_template: ChatTemplate):
+    parser_cls = _PARSER_CLASSES.get(chat_template.parser_type)
+    if parser_cls is None:
+        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+    return parser_cls
+
+
+def _require_int(
+    value, message: str, *, min_value: int = 0, max_value: Optional[int] = None
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Integral)
+        or value < min_value
+        or (max_value is not None and value >= max_value)
+    ):
+        raise ValueError(message)
+    return int(value)
 
 
 # ==============================
@@ -58,7 +90,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = [[]],
+    tools: Optional[List[List[Dict]]] = None,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -82,22 +114,20 @@ def preprocess_conversations(
     """
     # prepare result
     results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
-    if chat_template.parser_type == "general":
-        parser = GeneralParser(tokenizer, chat_template)
-    elif chat_template.parser_type == "thinking":
-        parser = ThinkingParser(tokenizer, chat_template)
-    elif chat_template.parser_type == "deepseek-v4":
-        parser = DeepSeekV4Parser(tokenizer, chat_template)
-    elif chat_template.parser_type == "glm":
-        parser = GLMParser(tokenizer, chat_template)
-    elif chat_template.parser_type == "openai-harmony":
-        parser = HarmonyParser(tokenizer, chat_template)
-    elif chat_template.parser_type == "muse":
-        parser = MuseParser(tokenizer, chat_template)
-    else:
-        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+    parser = _resolve_parser_class(chat_template)(tokenizer, chat_template)
+    if tools is None:
+        tools = [[] for _ in range(len(conversations))]
+    elif len(tools) != len(conversations):
+        raise ValueError(
+            f"tools length ({len(tools)}) must match conversations length ({len(conversations)})"
+        )
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
+        if len(value_list) != len(conversations):
+            raise ValueError(
+                f"keyword argument {key!r} length ({len(value_list)}) must match "
+                f"conversations length ({len(conversations)})"
+            )
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
     for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
@@ -134,7 +164,7 @@ def build_eagle3_dataset(
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
-    loss_mask_filter: Optional[Callable[[object], bool]] = None,
+    loss_mask_filter: Optional[Callable[[Sequence[int]], bool]] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -181,6 +211,7 @@ def build_eagle3_dataset(
     ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
+    accepted_columns = _resolve_parser_class(template).accepted_dataset_columns
 
     dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
@@ -208,11 +239,9 @@ def build_eagle3_dataset(
                 raise ValueError(
                     f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
                 )
-            conversations = examples.pop("conversations")
-            if "id" in examples:
-                examples.pop("id")
+            conversations = examples["conversations"]
             if "tools" in examples:
-                tools_raw = examples.pop("tools")
+                tools_raw = examples["tools"]
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
@@ -235,6 +264,11 @@ def build_eagle3_dataset(
                         tools.append([])
             else:
                 tools = [[] for _ in range(len(conversations))]
+            # Probe accepted keys before indexing so HF lazy batches never decode
+            # unused columns such as Image or Audio features.
+            template_kwargs = {
+                key: examples[key] for key in accepted_columns if key in examples
+            }
             processed = preprocess_conversations(
                 tokenizer,
                 conversations,
@@ -243,7 +277,7 @@ def build_eagle3_dataset(
                 is_preformatted=False,
                 train_only_last_turn=train_only_last_turn,
                 tools=tools,
-                **examples,
+                **template_kwargs,
             )
 
         return processed
@@ -257,10 +291,12 @@ def build_eagle3_dataset(
     elif cache_dir is None and cache_key is None:
         load_from_cache_file = False
         cache_file_name = None
-        print(f"dataset is not cached")
+        print("dataset is not cached")
     else:
+        load_from_cache_file = False
+        cache_file_name = None
         warnings.warn(
-            f"cache_dir and cache_key must be provided together to make caching work"
+            "cache_dir and cache_key must be provided together to make caching work"
         )
 
     # Disable tokenizers internal parallelism when using multiprocessing to avoid
@@ -307,7 +343,8 @@ def build_eagle3_dataset(
         before_filter = len(dataset)
 
         def has_eligible_loss_mask(example):
-            return loss_mask_filter(example["loss_mask"])
+            # preprocess_conversations stores batch-1 rows; loss_mask_filter expects 1D
+            return bool(loss_mask_filter(normalize_loss_mask_1d(example["loss_mask"])))
 
         dataset = dataset.filter(
             has_eligible_loss_mask,
@@ -399,17 +436,45 @@ def process_token_dict_to_mappings(
             - d2t: A tensor mapping draft token ids to target token ids.
             - t2d: A tensor mapping target token ids to draft token ids.
     """
-    if len(token_dict) < draft_vocab_size:
-        existing_tokens = set(token_dict.keys())
-        missing_tokens = set(range(draft_vocab_size)) - existing_tokens
-        for token in missing_tokens:
-            token_dict[token] = 0
-            if len(token_dict) >= draft_vocab_size:
-                break
+    draft_vocab_size = _require_int(
+        draft_vocab_size,
+        f"draft_vocab_size must be a positive integer, got {draft_vocab_size!r}",
+        min_value=1,
+    )
+    target_vocab_size = _require_int(
+        target_vocab_size,
+        f"target_vocab_size must be a positive integer, got {target_vocab_size!r}",
+        min_value=1,
+    )
+    if draft_vocab_size > target_vocab_size:
+        raise ValueError(
+            f"draft_vocab_size ({draft_vocab_size}) cannot exceed "
+            f"target_vocab_size ({target_vocab_size})"
+        )
+
+    token_counts: Counter = Counter()
+    for token, count in token_dict.items():
+        token_id = _require_int(
+            token,
+            f"token_dict contains token ID outside [0, {target_vocab_size}): {token!r}",
+            max_value=target_vocab_size,
+        )
+        token_counts[token_id] = _require_int(
+            count,
+            f"token_dict contains invalid count for token {token_id}: {count!r} "
+            "(expected a non-negative integer)",
+        )
+
+    if len(token_counts) < draft_vocab_size:
+        for token in range(draft_vocab_size):
+            if token not in token_counts:
+                token_counts[token] = 0
+                if len(token_counts) >= draft_vocab_size:
+                    break
     print(f"Added missing tokens to reach draft vocab size: {draft_vocab_size}")
-    print(f"Total tokens after addition: {len(token_dict)}")
-    total_frequency = sum(token_dict.values())
-    top_N = token_dict.most_common(draft_vocab_size)
+    print(f"Total tokens after addition: {len(token_counts)}")
+    total_frequency = sum(token_counts.values())
+    top_N = token_counts.most_common(draft_vocab_size)
     top_N_frequency_sum = sum(freq for key, freq in top_N)
 
     if total_frequency == 0:
@@ -424,9 +489,9 @@ def process_token_dict_to_mappings(
     used_tokens = [key for key, freq in top_N]
     used_tokens.sort()
 
-    d2t = [used_tokens[i] - i for i in range(len(used_tokens))]
-    t2d = [i in used_tokens for i in range(target_vocab_size)]
-    d2t = torch.tensor(d2t)
-    t2d = torch.tensor(t2d)
+    used = torch.tensor(used_tokens, dtype=torch.long)
+    d2t = used - torch.arange(len(used_tokens), dtype=torch.long)
+    t2d = torch.zeros(target_vocab_size, dtype=torch.bool)
+    t2d[used] = True
 
     return d2t, t2d

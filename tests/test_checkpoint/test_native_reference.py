@@ -51,14 +51,25 @@ class NativeReferenceTest(unittest.TestCase):
         )
         self.assertEqual(len({ref.key for _, ref in plan.bindings}), 1)
         store.read.assert_not_called()
-        # Export validates the independent names/shapes before its first data read.
+        # Export validates names, shapes, and dtypes before its first data read.
         with patch(
             "specforge.checkpoint.formats.native.writer.TensorStore", return_value=store
         ):
-            with self.assertRaisesRegex(AssertionError, "tensor read"):
+            with self.assertRaisesRegex(ValueError, "dtype"):
                 export_native(
                     config,
                     model.state_dict(),
+                    FIXTURE,
+                    "unused",
+                )
+            bf16_state = {
+                name: tensor.to(torch.bfloat16)
+                for name, tensor in model.state_dict().items()
+            }
+            with self.assertRaisesRegex(AssertionError, "tensor read"):
+                export_native(
+                    config,
+                    bf16_state,
                     FIXTURE,
                     "unused",
                 )

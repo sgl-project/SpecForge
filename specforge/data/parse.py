@@ -2,13 +2,15 @@ import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerBase
 
 from .encoders.deepseek_v4 import encode_messages as encode_deepseek_v4_messages
 from .template import ChatTemplate
+
+Conversation = List[Dict[str, Any]]
 
 __all__ = [
     "DeepSeekV4Parser",
@@ -21,6 +23,8 @@ __all__ = [
 
 
 class Parser(ABC):
+
+    accepted_dataset_columns: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -64,7 +68,7 @@ class Parser(ABC):
                     tool_calls = json.loads(tool_calls)
                 except json.JSONDecodeError:
                     warnings.warn(
-                        f"Failed to parse tool_calls JSON string, removing tool_calls"
+                        "Failed to parse tool_calls JSON string, removing tool_calls"
                     )
                     cleaned.pop("tool_calls", None)
                     return cleaned
@@ -131,6 +135,9 @@ _harmony_encoding = None
 class GeneralParser(Parser):
 
     allow_chat_template_fallback = True
+    accepted_dataset_columns: frozenset[str] = frozenset(
+        {"enable_thinking", "reasoning_effort", "clear_thinking"}
+    )
 
     def __init__(
         self,
@@ -216,13 +223,75 @@ class GeneralParser(Parser):
             )
         return end_of_turn_token
 
+    def _tokenizer_lacks_chat_template(self, **kwargs) -> bool:
+        if kwargs.get("chat_template") is not None:
+            return False
+        if getattr(self.tokenizer, "chat_template", None) is not None:
+            return False
+        apply_fn = getattr(self.tokenizer, "apply_chat_template", None)
+        if apply_fn is None:
+            return True
+        # Custom HF tokenizers can override or bind apply_chat_template or
+        # get_chat_template while leaving chat_template=None (e.g. XTML/Python).
+        if isinstance(self.tokenizer, PreTrainedTokenizerBase):
+            uses_base_apply = (
+                getattr(apply_fn, "__func__", None)
+                is PreTrainedTokenizerBase.apply_chat_template
+            )
+            get_template_fn = getattr(self.tokenizer, "get_chat_template", None)
+            uses_base_resolver = (
+                getattr(get_template_fn, "__func__", None)
+                is PreTrainedTokenizerBase.get_chat_template
+            )
+            return uses_base_apply and uses_base_resolver
+        return False
+
+    def _render_fallback_conversation(self, messages, tool, raw_messages) -> str:
+        prefix = (
+            "Tokenizer has no chat_template and fallback rendering does not support"
+        )
+        if tool:
+            raise ValueError(f"{prefix} tools.")
+        for msg, raw_msg in zip(messages, raw_messages):
+            role = msg["role"]
+            if role not in ("system", "user", "assistant"):
+                raise ValueError(f"{prefix} role {role!r}.")
+            for field, source in (
+                ("tools", raw_msg),
+                ("tool_calls", msg),
+                ("reasoning_content", raw_msg),
+            ):
+                if source.get(field):
+                    raise ValueError(f"{prefix} {field}.")
+
+        warnings.warn(
+            "Tokenizer does not have a chat_template, using fallback rendering."
+        )
+        parts = []
+        bos_token = getattr(self.tokenizer, "bos_token", None)
+        user_header = self.chat_template.user_header or ""
+        assistant_header = self.chat_template.assistant_header or ""
+        end_of_turn = self.chat_template.end_of_turn_token or ""
+
+        if bos_token:
+            parts.append(bos_token)
+
+        for msg in messages:
+            if msg["role"] == "system":
+                parts.append(msg["content"])
+            elif msg["role"] == "user":
+                parts.append(f"{user_header}{msg['content']}")
+            elif msg["role"] == "assistant":
+                parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
+        return "".join(parts)
+
     def parse(
         self,
         conversation: "Conversation",
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         if not preformatted:
@@ -230,16 +299,20 @@ class GeneralParser(Parser):
                 self._normalize_message(message) for message in conversation
             ]
             messages = []
+            raw_messages = []
 
-            if conversation[0]["role"] == "system":
+            if conversation and conversation[0]["role"] == "system":
                 warnings.warn(
-                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
+                    "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )
+                raw_messages.append(conversation[0])
                 messages.append(self._prepare_system_message(conversation[0]))
                 conversation = conversation[1:]
             else:
                 if self.system_prompt:
-                    messages.append({"role": "system", "content": self.system_prompt})
+                    system_message = {"role": "system", "content": self.system_prompt}
+                    raw_messages.append(system_message)
+                    messages.append(system_message)
 
             while conversation and conversation[0]["role"] != "user":
                 warnings.warn(
@@ -267,45 +340,22 @@ class GeneralParser(Parser):
                             f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
                         )
                         break
-                sentence = self._sanitize_message(sentence)
-                messages.append(sentence)
-            try:
-                conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
-            except IndexError:
-                # HF chat templates index messages[0] and fail on an empty list,
-                # which happens when the conversation has no 'user' turn and the
-                # template has no default system prompt.
-                if messages:
-                    raise
+                raw_messages.append(sentence)
+                messages.append(self._sanitize_message(sentence))
+            if not messages:
                 warnings.warn(
                     "Skipping conversation with no 'user' turn: nothing to render."
                 )
                 return None
-            except (ValueError, TypeError):
-                if not self.allow_chat_template_fallback:
-                    raise
-                # Fallback rendering for tokenizers without built-in chat_template
-                warnings.warn(
-                    "Tokenizer does not have a chat_template, using fallback rendering."
+            if (
+                self.allow_chat_template_fallback
+                and self._tokenizer_lacks_chat_template(**kwargs)
+            ):
+                conversation = self._render_fallback_conversation(
+                    messages, tool=tool, raw_messages=raw_messages
                 )
-                parts = []
-                bos_token = getattr(self.tokenizer, "bos_token", None)
-                user_header = self.chat_template.user_header or ""
-                assistant_header = self.chat_template.assistant_header or ""
-                end_of_turn = self.chat_template.end_of_turn_token or ""
-
-                # Add BOS token at the start
-                if bos_token:
-                    parts.append(bos_token)
-
-                for msg in messages:
-                    if msg["role"] == "system":
-                        parts.append(msg["content"])
-                    elif msg["role"] == "user":
-                        parts.append(f"{user_header}{msg['content']}")
-                    elif msg["role"] == "assistant":
-                        parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
-                conversation = "".join(parts)
+            else:
+                conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
 
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
@@ -431,7 +481,7 @@ class HarmonyParser(Parser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> List[torch.Tensor]:
         if not preformatted:
@@ -538,7 +588,7 @@ class ThinkingParser(GeneralParser):
         max_length: int,
         preformatted: bool = False,
         train_only_last_turn: bool = False,
-        tool: List[Dict] = [],
+        tool: Optional[List[Dict]] = None,
         **kwargs,
     ) -> Dict[str, List[torch.Tensor]]:
         """Parse conversation, processing all assistant turns for loss mask."""
@@ -553,6 +603,15 @@ class DeepSeekV4Parser(ThinkingParser):
     """Render DeepSeek-V4 conversations with its official Python encoder."""
 
     allow_chat_template_fallback = False
+    accepted_dataset_columns: frozenset[str] = frozenset(
+        {
+            "enable_thinking",
+            "context",
+            "drop_thinking",
+            "add_default_bos_token",
+            "reasoning_effort",
+        }
+    )
 
     def __init__(
         self,
@@ -656,6 +715,9 @@ class MuseParser(ThinkingParser):
     """
 
     allow_chat_template_fallback = False
+    accepted_dataset_columns: frozenset[str] = frozenset(
+        {"reasoning_effort", "current_date", "cutoff_date"}
+    )
 
     def __init__(
         self,

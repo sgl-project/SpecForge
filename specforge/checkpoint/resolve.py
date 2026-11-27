@@ -148,8 +148,10 @@ def read_target_config(source, *, cache_dir=None):
 
 def target_configuration(directory):
     config = read_json(Path(directory) / "config.json")
-    text = dict(config.get("text_config", config))
-    if "tie_word_embeddings" not in text and "tie_word_embeddings" in config:
+    text_section = config.get("text_config")
+    text = dict(text_section) if isinstance(text_section, dict) else dict(config)
+    # Composite wrappers (e.g. Qwen3.5 VL) own the top-level lm_head and tie flag.
+    if isinstance(config.get("tie_word_embeddings"), bool):
         text["tie_word_embeddings"] = config["tie_word_embeddings"]
     # Some targets (LongCat) store their depth as num_layers only.
     if "num_hidden_layers" not in text and "num_layers" in text:
