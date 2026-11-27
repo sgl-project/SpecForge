@@ -1523,6 +1523,86 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         gc.collect()
         self.assertIsNotNone(storage())
 
+    def test_close_waits_for_inflight_abort_and_rejects_post_close_cleanup_ops(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", close_store=True)
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, handle = fs.get(ref, names=["hidden_state"])
+        in_remove = threading.Event()
+        release_remove = threading.Event()
+        close_called = threading.Event()
+        order = []
+        original_remove = fake.remove
+
+        def slow_remove(key, **kwargs):
+            in_remove.set()
+            release_remove.wait(timeout=2.0)
+            order.append("remove_done")
+            return original_remove(key, **kwargs)
+
+        def record_close():
+            order.append("close")
+            close_called.set()
+            return 0
+
+        fake.remove = slow_remove
+        fake.close = record_close
+
+        abort_thread = threading.Thread(target=fs.abort, args=("s0",), daemon=True)
+        close_thread = threading.Thread(target=fs.close, daemon=True)
+        abort_thread.start()
+        self.assertTrue(in_remove.wait(timeout=2.0))
+        close_thread.start()
+        self.assertFalse(close_called.wait(timeout=0.05))
+        release_remove.set()
+        abort_thread.join(timeout=2.0)
+        close_thread.join(timeout=2.0)
+        self.assertFalse(abort_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertEqual(order[-1], "close")
+        self.assertIn("remove_done", order[:-1])
+
+        fake.remove = mock.Mock(return_value=0)
+        for op in (
+            lambda: fs.abort("s0"),
+            lambda: fs.release(handle),
+            lambda: fs.gc(),
+            lambda: fs.retry_sample_removals(["s0"]),
+            lambda: fs.drain_pending_removals(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                op()
+        fake.remove.assert_not_called()
+
+    def test_concurrent_close_calls_close_backend_once(self):
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0", close_store=True)
+        in_close = threading.Event()
+        release_close = threading.Event()
+        close_calls = 0
+
+        def slow_close():
+            nonlocal close_calls
+            close_calls += 1
+            in_close.set()
+            release_close.wait(timeout=2.0)
+            return 0
+
+        fake.close = slow_close
+        t1 = threading.Thread(target=fs.close, daemon=True)
+        t2 = threading.Thread(target=fs.close, daemon=True)
+        t1.start()
+        self.assertTrue(in_close.wait(timeout=2.0))
+        t2.start()
+        t2.join(timeout=0.05)
+        self.assertTrue(t2.is_alive())
+        release_close.set()
+        t1.join(timeout=2.0)
+        t2.join(timeout=2.0)
+        self.assertFalse(t1.is_alive())
+        self.assertFalse(t2.is_alive())
+        self.assertEqual(close_calls, 1)
+
 
 class TestMooncakeFeatureStoreWireContract(unittest.TestCase):
     """The only wire format is one raw Mooncake object per tensor."""

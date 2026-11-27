@@ -696,6 +696,7 @@ class MooncakeFeatureStore(FeatureStore):
         self._freed: set = set()
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
+        self._close_lock = threading.Lock()
         self._counter = 0
         self._gen_counter = 0
         self._stats = {"force_freed": 0, "force_freed_bytes": 0}
@@ -758,12 +759,15 @@ class MooncakeFeatureStore(FeatureStore):
         )
         return torch.device("cuda", index)
 
+    def _check_open_locked(self) -> None:
+        if self._closing or self._closed:
+            raise RuntimeError("Mooncake feature store is closed")
+
     @contextmanager
     def _admit_op(self):
         """Coordinate RPC admission with close() so teardown waits for active ops."""
         with self._cond:
-            if self._closing or self._closed:
-                raise RuntimeError("Mooncake feature store is closed")
+            self._check_open_locked()
             self._inflight_ops += 1
         try:
             yield
@@ -780,28 +784,29 @@ class MooncakeFeatureStore(FeatureStore):
         requested explicitly. Failed-transfer buffers stay quarantined unless
         the store owns and stops the native transport.
         """
-        with self._cond:
-            if self._closed:
-                return
-            self._closing = True
-            self._external_attempts_closed = True
-            self._closed_event.set()
-            while self._inflight_ops > 0:
-                self._cond.wait()
-        if self._receive_pool is not None:
-            self._receive_pool.close()
-        if self._close_store:
-            rc = self._store.close()
-            if rc is not None and int(rc) != 0:
-                raise RuntimeError(f"Mooncake transport close failed ({rc})")
-        if self._owns_store:
+        with self._close_lock:
+            with self._cond:
+                if self._closed:
+                    return
+                self._closing = True
+                self._external_attempts_closed = True
+                self._closed_event.set()
+                while self._inflight_ops > 0:
+                    self._cond.wait()
             if self._receive_pool is not None:
-                self._receive_pool.close(transport_stopped=True)
-            with self._quarantine_lock:
-                self._quarantined_buffers.clear()
-                self._quarantined_bytes = 0
-        with self._cond:
-            self._closed = True
+                self._receive_pool.close()
+            if self._close_store:
+                rc = self._store.close()
+                if rc is not None and int(rc) != 0:
+                    raise RuntimeError(f"Mooncake transport close failed ({rc})")
+            if self._owns_store:
+                if self._receive_pool is not None:
+                    self._receive_pool.close(transport_stopped=True)
+                with self._quarantine_lock:
+                    self._quarantined_buffers.clear()
+                    self._quarantined_bytes = 0
+            with self._cond:
+                self._closed = True
 
     def _fetch_tensor(self, key: str, spec, device="cpu") -> torch.Tensor:
         """Retry transient reads into fresh storage; return caller-owned tensors."""
@@ -1156,11 +1161,9 @@ class MooncakeFeatureStore(FeatureStore):
                         self._sample_bytes[sample_id] = 0
                         self._put_time[sample_id] = self._clock()
                     try:
-                        # RLock keeps adopt() from racing between the ownership
-                        # check above and this removal attempt. abort() reacquires
-                        # the same lock and either frees the keys or records them
-                        # in _release_pending for lifecycle drain.
-                        self.abort(sample_id, reason=reason)
+                        # Already admitted under _inflight_ops and holding _lock
+                        # so adopt() cannot race between ownership check and free.
+                        self._abort_locked(sample_id, reason=reason)
                     except BaseException as exc:
                         # Preserve both explicit provisional ownership and a
                         # retryable removal entry.  Terminal drain can now reclaim
@@ -1384,6 +1387,7 @@ class MooncakeFeatureStore(FeatureStore):
 
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
         with self._lock:
+            self._check_open_locked()
             self._active_leases.pop(handle.lease_token, None)
             if self.retain_on_release:
                 return  # offline re-iterable set: keep for the next epoch
@@ -1400,18 +1404,22 @@ class MooncakeFeatureStore(FeatureStore):
                 # remote free deferred (lease) / failed -> gc() retries
                 self._release_pending.setdefault(sid, 0)
 
+    def _abort_locked(self, sample_id: str, *, reason: str = "aborted") -> None:
+        gen = self._generation.get(sample_id)
+        if gen is not None:
+            self._freed.add((sample_id, gen))  # immediate logical free
+        for sid, inflight_gen in self._inflight_reads:
+            if sid == sample_id:
+                self._freed.add((sid, inflight_gen))
+        if self._try_physical_free(sample_id):
+            self._free_bookkeeping_locked(sample_id)
+        else:
+            self._release_pending.setdefault(sample_id, 0)
+
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
-            gen = self._generation.get(sample_id)
-            if gen is not None:
-                self._freed.add((sample_id, gen))  # immediate logical free
-            for sid, inflight_gen in self._inflight_reads:
-                if sid == sample_id:
-                    self._freed.add((sid, inflight_gen))
-            if self._try_physical_free(sample_id):
-                self._free_bookkeeping_locked(sample_id)
-            else:
-                self._release_pending.setdefault(sample_id, 0)
+            self._check_open_locked()
+            self._abort_locked(sample_id, reason=reason)
 
     def drain_sample_removals(
         self,
@@ -1444,6 +1452,7 @@ class MooncakeFeatureStore(FeatureStore):
         target_ids = set(sample_ids)
         removed = removed_bytes = 0
         with self._lock:
+            self._check_open_locked()
             pending = [
                 sample_id
                 for sample_id in self._release_pending
@@ -1541,6 +1550,7 @@ class MooncakeFeatureStore(FeatureStore):
         for attempt in range(max_attempts):
             attempts_run = attempt + 1
             with self._lock:
+                self._check_open_locked()
                 pending = [
                     sample_id
                     for sample_id in self._release_pending
@@ -1652,6 +1662,7 @@ class MooncakeFeatureStore(FeatureStore):
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
+            self._check_open_locked()
             # max-hold sweep: force-free abandoned samples (spare still-leased)
             if self.max_hold_age_s is not None:
                 stale = [

@@ -820,14 +820,12 @@ def _build_online(
                                 f"failed to publish producer failure: {signal_exc}",
                                 flush=True,
                             )
-                    stop_attempts = getattr(store, "stop_external_attempts", None)
-                    if callable(stop_attempts):
-                        try:
-                            stop_attempts(wait=True)
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"stop-external-attempts: {type(exc).__name__}: {exc}"
-                            )
+                    try:
+                        store.stop_external_attempts(wait=True)
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"stop-external-attempts: {type(exc).__name__}: {exc}"
+                        )
                     try:
                         reader = StreamingRefChannel(channel_path)
                         while True:
