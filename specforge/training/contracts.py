@@ -259,6 +259,11 @@ class ProgramSpec:
     #: Statistics it needs pooled over the whole window and every rank before
     #: its gradient pass.
     replay_statistics: Tuple[str, ...] = ()
+    #: Additive statistics it emits during training forwards to be summed over
+    #: the whole window and every rank and delivered through
+    #: :meth:`TrainingProgram.apply_statistics` once the optimizer update
+    #: succeeds (before any checkpoint snapshot).
+    after_step_statistics: Tuple[str, ...] = ()
     #: Whether its evaluation reports the detailed metrics.
     evaluation_diagnostics: bool = False
     #: How the loss is normalized. "window": the update's objective is
@@ -273,6 +278,14 @@ class ProgramSpec:
     #: kind: "copy" (same batch, count one rank), "part" (sharded sample, sum
     #: shards), or "own" (disjoint batches with sharded parameters, sum all).
     axes: Tuple[Tuple[str, Literal["copy", "part", "own"]], ...] = ()
+
+    def __post_init__(self) -> None:
+        overlap = sorted(set(self.replay_statistics) & set(self.after_step_statistics))
+        if overlap:
+            raise ValueError(
+                "replay_statistics and after_step_statistics must be distinct; "
+                f"overlap={overlap}"
+            )
 
 
 class TrainingProgram(Protocol):
@@ -320,7 +333,9 @@ class TrainingProgram(Protocol):
         here. A program that declares a replay statistic also takes
         ``prepass=True``, which asks for this rank's sums of each statistic
         in ``result.statistics``, and in every call the keyword arguments
-        that ``replay_arguments`` returned for it.
+        that ``replay_arguments`` returned for it. A program that declares
+        ``after_step_statistics`` returns each statistic's local sum in
+        ``result.statistics`` on every training forward.
         """
 
     def replay_arguments(
@@ -333,6 +348,16 @@ class TrainingProgram(Protocol):
         ratio and its zero guard for one, is done here in the precision the
         sums were pooled in, outside the wrapper. Empty for a program without
         a statistic.
+        """
+
+    def apply_statistics(self, values: Mapping[str, torch.Tensor]) -> Mapping[str, Any]:
+        """Apply pooled after-step statistics once an optimizer update succeeds.
+
+        Called on every rank inside :meth:`StepRunner.apply_step`, after the
+        optimizer and scheduler advance and before any checkpoint snapshot.
+        Must issue no collective and compute identical buffer updates on every
+        rank. Returns the scalar post-step metrics to include in
+        :class:`StepMetrics`; empty when it reports none.
         """
 
     def host_inputs(

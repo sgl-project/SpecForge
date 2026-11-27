@@ -1,0 +1,545 @@
+"""Tests for the ``after_step_statistics`` contract across DDP, FSDP1, and FSDP2."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+import torch
+import torch.distributed as dist
+from torch import nn
+
+from specforge.algorithms.objectives.base import ObjectiveModel, ObjectiveResult
+from specforge.runtime.contracts import TrainBatch
+from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backends.fsdp2 import FSDP2TrainingBackend
+from specforge.training.checkpoint import CheckpointManager
+from specforge.training.contracts import (
+    OptimizerSpec,
+    PrecisionSpec,
+    SchedulerSpec,
+    StepContext,
+)
+from specforge.training.frame import run_window
+from specforge.training.runner import DataParallelRunner
+from tests.test_algorithms.test_objective_contracts import build_runtime
+from tests.test_runtime._fixtures import (
+    FakeProgram,
+    fake_spec,
+    on_host_fsdp1,
+    spawn_gloo,
+)
+
+_GLOO = dist.is_available() and dist.is_gloo_available()
+
+
+class _MoELikeProgram(FakeProgram):
+    """Minimal program mimicking MoE #1179 per-layer expert counts and bias updates."""
+
+    def __init__(self, *, dtype=torch.float32, fail_grad=False, zero_denom=False):
+        super().__init__()
+        torch.manual_seed(7)
+        self.proj = nn.Linear(4, 4, bias=False).to(dtype)
+        # Three layers with heterogeneous shapes/dtypes, including two int64
+        # statistics of different shapes ((4,) and (2, 3)) to exercise same-dtype
+        # packing in DataParallelRunner._apply_after_step_statistics.
+        self.register_buffer("expert_bias_0", torch.zeros(4, dtype=torch.float32))
+        self.register_buffer("expert_bias_1", torch.zeros(6, dtype=torch.float32))
+        self.register_buffer("expert_bias_2", torch.zeros((2, 3), dtype=torch.float32))
+        self.fail_grad = fail_grad
+        self.zero_denom = zero_denom
+        self.received_pooled = []
+
+    def spec(self):
+        return fake_spec(
+            "x",
+            "counts_0",
+            "counts_1",
+            "counts_2",
+            name="moe_like",
+            after_step_statistics=("counts_0", "counts_1", "counts_2"),
+        )
+
+    def forward(
+        self,
+        tensors,
+        *,
+        step=0,
+        total_steps=None,
+        collect_detailed_metrics=True,
+        prepass=False,
+        **context,
+    ):
+        x = tensors["x"].to(self.proj.weight.dtype)
+        y = self.proj(x)
+        loss = (y * y).sum()
+        if self.fail_grad:
+            loss = loss * float("nan")
+        denom = torch.zeros(()) if self.zero_denom else torch.ones(())
+        result = ObjectiveResult(loss, denom)
+        if self.training and not prepass:
+            result.statistics["counts_0"] = tensors["counts_0"]
+            result.statistics["counts_1"] = tensors["counts_1"]
+            result.statistics["counts_2"] = tensors["counts_2"]
+        return result
+
+    def apply_statistics(self, values):
+        c0 = values["counts_0"]
+        c1 = values["counts_1"]
+        c2 = values["counts_2"]
+        self.received_pooled.append(
+            (
+                c0.detach().cpu().clone(),
+                c1.detach().cpu().clone(),
+                c2.detach().cpu().clone(),
+            )
+        )
+        with torch.no_grad():
+            self.expert_bias_0.add_(0.1 * c0.to(self.expert_bias_0.dtype))
+            self.expert_bias_1.add_(0.05 * c1.to(self.expert_bias_1.dtype))
+            self.expert_bias_2.add_(0.2 * c2.to(self.expert_bias_2.dtype))
+        balance = (c0.float().mean() + c1.float().mean() + c2.float().mean()) / 3.0
+        return {"moe/step_balance": balance}
+
+
+def _make_batch(sample_id: str, c0, c1, c2=None, *, x_val: float = 1.0):
+    if c2 is None:
+        c2 = [[1, 0, 2], [0, 3, 1]]
+    return TrainBatch(
+        [sample_id],
+        "moe_like",
+        {
+            "x": torch.full((2, 4), x_val, dtype=torch.float32),
+            "counts_0": torch.tensor(c0, dtype=torch.int64),
+            "counts_1": torch.tensor(c1, dtype=torch.float32),
+            "counts_2": torch.tensor(c2, dtype=torch.int64),
+        },
+    )
+
+
+def _plain_runner(program):
+    backend = FSDPTrainingBackend(
+        ParallelConfig(),
+        optimizer_spec=OptimizerSpec(kind="adamw", lr=1e-2),
+        scheduler_spec=SchedulerSpec(kind="constant", total_steps=10, warmup_ratio=0.0),
+        max_grad_norm=1.0,
+    )
+    backend.prepare_model(program, wrap=False)
+    return DataParallelRunner(program, backend, program.spec())
+
+
+def _distributed_after_step_worker(rank, world, workdir, mode):
+    if mode not in ("ddp", "fsdp1", "fsdp2"):
+        raise ValueError(mode)
+    dtype = torch.bfloat16 if mode == "fsdp2" else torch.float32
+    sharding = "NO_SHARD" if mode == "ddp" else "SHARD_GRAD_OP"
+    runtime_name = "fsdp2" if mode == "fsdp2" else "fsdp"
+    backend_cls = FSDP2TrainingBackend if mode == "fsdp2" else FSDPTrainingBackend
+    program = _MoELikeProgram(dtype=dtype)
+    spec = program.spec()
+    backend = backend_cls(
+        ParallelConfig(
+            world_size=world,
+            sharding_strategy=sharding,
+            fsdp_process_group=dist.group.WORLD,
+        ),
+        optimizer_spec=OptimizerSpec(kind="adamw", lr=1e-2),
+        scheduler_spec=SchedulerSpec(kind="constant", total_steps=10, warmup_ratio=0.0),
+        max_grad_norm=1.0,
+        precision=PrecisionSpec.resolve(
+            runtime=runtime_name,
+            model_dtype=dtype,
+            sharding_strategy=sharding,
+        ),
+    )
+
+    with on_host_fsdp1() if mode == "fsdp1" else contextlib.nullcontext():
+        wrapped = backend.prepare_model(program, frozen_modules=program.frozen_modules)
+    runner = DataParallelRunner(wrapped, backend, spec)
+
+    # Distinct per-rank, per-microbatch counts across two micro-batches:
+    # rank 0: m0=[1,2,3,4]/[1..6]/[[1,2,3],[4,5,6]], m1=[2,0,1,0]/[0.5]*6/[[0,1,0],[2,0,1]]
+    # rank 1: m0=[5,1,0,2]/[2..7]/[[3,0,1],[1,2,0]], m1=[0,3,2,1]/[1.5]*6/[[2,1,2],[0,1,3]]
+    if rank == 0:
+        window = [
+            _make_batch(
+                "r0-0",
+                [1, 2, 3, 4],
+                [1, 2, 3, 4, 5, 6],
+                [[1, 2, 3], [4, 5, 6]],
+                x_val=1.0,
+            ),
+            _make_batch(
+                "r0-1",
+                [2, 0, 1, 0],
+                [0.5] * 6,
+                [[0, 1, 0], [2, 0, 1]],
+                x_val=0.5,
+            ),
+        ]
+    else:
+        window = [
+            _make_batch(
+                "r1-0",
+                [5, 1, 0, 2],
+                [2, 3, 4, 5, 6, 7],
+                [[3, 0, 1], [1, 2, 0]],
+                x_val=1.5,
+            ),
+            _make_batch(
+                "r1-1",
+                [0, 3, 2, 1],
+                [1.5] * 6,
+                [[2, 1, 2], [0, 1, 3]],
+                x_val=0.75,
+            ),
+        ]
+
+    metrics = run_window(runner, window, StepContext(accumulation_steps=2))
+    materialized = metrics.materialize()
+
+    # Snapshot checkpoint right after step: updated expert_bias must be inside.
+    ckpt_state = runner.checkpoint_state()
+    out_dir = os.path.join(workdir, "checkpoints")
+    mgr = CheckpointManager(out_dir, f"after-step-{mode}")
+    shared = (
+        {
+            "global_step": 1,
+            "world_size": world,
+            "draft_state_dict": ckpt_state.draft,
+        }
+        if rank == 0
+        else None
+    )
+    mgr.save(shared, 1, rank_state=ckpt_state.rank)
+
+    c0_seen, c1_seen, c2_seen = program.received_pooled[0]
+    return {
+        "pooled_0": c0_seen.tolist(),
+        "pooled_1": c1_seen.tolist(),
+        "pooled_2": c2_seen.tolist(),
+        "pooled_0_dtype": str(c0_seen.dtype),
+        "pooled_1_dtype": str(c1_seen.dtype),
+        "pooled_2_dtype": str(c2_seen.dtype),
+        "bias_0": program.expert_bias_0.detach().cpu().tolist(),
+        "bias_1": program.expert_bias_1.detach().cpu().tolist(),
+        "bias_2": program.expert_bias_2.detach().cpu().tolist(),
+        "step_balance": materialized["moe/step_balance"],
+        "ckpt_bias_0": (
+            ckpt_state.draft["expert_bias_0"].detach().cpu().tolist()
+            if rank == 0
+            else None
+        ),
+        "ckpt_bias_1": (
+            ckpt_state.draft["expert_bias_1"].detach().cpu().tolist()
+            if rank == 0
+            else None
+        ),
+        "ckpt_bias_2": (
+            ckpt_state.draft["expert_bias_2"].detach().cpu().tolist()
+            if rank == 0
+            else None
+        ),
+    }
+
+
+class AfterStepStatisticsTest(unittest.TestCase):
+    def test_accumulates_across_window_and_updates_before_checkpoint(self):
+        program = _MoELikeProgram()
+        runner = _plain_runner(program)
+        window = [
+            _make_batch("s0", [1, 2, 3, 4], [1, 0, 1, 0, 1, 0], [[1, 2, 3], [4, 5, 6]]),
+            _make_batch(
+                "s1", [2, 1, 0, 1], [0, 2, 0, 2, 0, 2], [[10, 20, 30], [40, 50, 60]]
+            ),
+            _make_batch("s2", [0, 3, 1, 0], [1, 1, 1, 1, 1, 1], [[1, 1, 1], [2, 2, 2]]),
+        ]
+        calls = []
+        orig_apply = runner._apply_after_step_statistics
+        orig_reduce = runner.reduce_sum
+        in_apply = False
+
+        def tracked_reduce(tensor):
+            if in_apply:
+                calls.append((tensor.dtype, tuple(tensor.shape)))
+            return orig_reduce(tensor)
+
+        def tracked_apply(totals):
+            nonlocal in_apply
+            in_apply = True
+            try:
+                return orig_apply(totals)
+            finally:
+                in_apply = False
+
+        with (
+            mock.patch.object(runner, "reduce_sum", side_effect=tracked_reduce),
+            mock.patch.object(
+                runner, "_apply_after_step_statistics", side_effect=tracked_apply
+            ),
+        ):
+            metrics = run_window(runner, window, StepContext(accumulation_steps=3))
+
+        # Three statistics (two int64 of shapes (4,) and (2, 3), one float32 of
+        # shape (6,)) pack into two reduce_sum collectives: one flat (10,) int64
+        # reduction and one (6,) float32 reduction.
+        self.assertEqual(calls, [(torch.int64, (10,)), (torch.float32, (6,))])
+
+        # Pooled sums: [3, 6, 4, 5], [2, 3, 2, 3, 2, 3], and [[12, 23, 34], [46, 57, 68]].
+        self.assertEqual(len(program.received_pooled), 1)
+        c0, c1, c2 = program.received_pooled[0]
+        self.assertEqual((c0.dtype, tuple(c0.shape)), (torch.int64, (4,)))
+        self.assertEqual((c1.dtype, tuple(c1.shape)), (torch.float32, (6,)))
+        self.assertEqual((c2.dtype, tuple(c2.shape)), (torch.int64, (2, 3)))
+        self.assertEqual(c0.tolist(), [3, 6, 4, 5])
+        self.assertEqual(c1.tolist(), [2.0, 3.0, 2.0, 3.0, 2.0, 3.0])
+        self.assertEqual(c2.tolist(), [[12, 23, 34], [46, 57, 68]])
+
+        expected_b0 = [0.3, 0.6, 0.4, 0.5]
+        expected_b1 = [0.1, 0.15, 0.1, 0.15, 0.1, 0.15]
+        expected_b2 = [[2.4, 4.6, 6.8], [9.2, 11.4, 13.6]]
+        torch.testing.assert_close(program.expert_bias_0, torch.tensor(expected_b0))
+        torch.testing.assert_close(program.expert_bias_1, torch.tensor(expected_b1))
+        torch.testing.assert_close(program.expert_bias_2, torch.tensor(expected_b2))
+
+        # Checkpoint immediately after the step captures the updated bias.
+        ckpt = runner.checkpoint_state()
+        torch.testing.assert_close(
+            ckpt.draft["expert_bias_0"], torch.tensor(expected_b0)
+        )
+        torch.testing.assert_close(
+            ckpt.draft["expert_bias_1"], torch.tensor(expected_b1)
+        )
+        torch.testing.assert_close(
+            ckpt.draft["expert_bias_2"], torch.tensor(expected_b2)
+        )
+
+        # Post-step metric merged into StepMetrics.
+        self.assertAlmostEqual(
+            metrics.materialize()["moe/step_balance"],
+            (
+                sum([3, 6, 4, 5]) / 4.0
+                + sum([2, 3, 2, 3, 2, 3]) / 6.0
+                + sum([12, 23, 34, 46, 57, 68]) / 6.0
+            )
+            / 3.0,
+            places=5,
+        )
+
+    def test_failed_optimizer_step_does_not_apply_after_step_statistics(self):
+        for failure_kind, kwargs, exc_type in (
+            ("zero_denom", {"zero_denom": True}, ValueError),
+            ("non_finite_grad", {"fail_grad": True}, FloatingPointError),
+        ):
+            with self.subTest(failure_kind=failure_kind):
+                program = _MoELikeProgram(**kwargs)
+                runner = _plain_runner(program)
+                with self.assertRaises(exc_type):
+                    run_window(
+                        runner,
+                        [_make_batch("s0", [4, 4, 4, 4], [2] * 6)],
+                        StepContext(accumulation_steps=1),
+                    )
+                self.assertEqual(program.received_pooled, [])
+                torch.testing.assert_close(program.expert_bias_0, torch.zeros(4))
+                torch.testing.assert_close(program.expert_bias_1, torch.zeros(6))
+                torch.testing.assert_close(program.expert_bias_2, torch.zeros((2, 3)))
+
+    def test_missing_or_unexpected_after_step_statistics_fail_before_backward(self):
+        class MissingStat(_MoELikeProgram):
+            def forward(self, tensors, **context):
+                res = super().forward(tensors, **context)
+                res.statistics.pop("counts_1", None)
+                return res
+
+        program = MissingStat()
+        runner = _plain_runner(program)
+        with self.assertRaisesRegex(ValueError, "missing=\\['counts_1'\\]"):
+            run_window(
+                runner,
+                [_make_batch("s0", [1, 1, 1, 1], [1] * 6)],
+                StepContext(accumulation_steps=1),
+            )
+        self.assertIsNone(program.proj.weight.grad)
+
+        class UndeclaredStat(FakeProgram):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 1, bias=False)
+
+            def spec(self):
+                return fake_spec("x", name="undeclared")
+
+            def forward(self, tensors, **context):
+                res = ObjectiveResult(self.linear(tensors["x"]).sum(), torch.ones(()))
+                res.statistics["secret"] = torch.ones(2)
+                return res
+
+        undeclared = UndeclaredStat()
+        runner2 = _plain_runner(undeclared)
+        with self.assertRaisesRegex(ValueError, "unexpected=\\['secret'\\]"):
+            run_window(
+                runner2,
+                [_make_batch("s0", [1, 1, 1, 1], [1] * 6)],
+                StepContext(accumulation_steps=1),
+            )
+        self.assertIsNone(undeclared.linear.weight.grad)
+
+    def test_shape_drift_and_metric_collision_fail_loudly(self):
+        program = _MoELikeProgram()
+        runner = _plain_runner(program)
+        bad_window = [
+            _make_batch("s0", [1, 2, 3, 4], [1] * 6),
+            TrainBatch(
+                ["s1"],
+                "moe_like",
+                {
+                    "x": torch.ones((2, 4)),
+                    "counts_0": torch.ones(3, dtype=torch.int64),
+                    "counts_1": torch.ones(6, dtype=torch.float32),
+                    "counts_2": torch.ones((2, 3), dtype=torch.int64),
+                },
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "changed shape/dtype mid-window"):
+            run_window(runner, bad_window, StepContext(accumulation_steps=2))
+
+        class CollidingMetric(_MoELikeProgram):
+            def apply_statistics(self, values):
+                return {"loss": torch.tensor(1.0)}
+
+        collider = CollidingMetric()
+        runner2 = _plain_runner(collider)
+        with self.assertRaisesRegex(ValueError, "collide with step metrics"):
+            run_window(
+                runner2,
+                [_make_batch("s0", [1, 1, 1, 1], [1] * 6)],
+                StepContext(accumulation_steps=1),
+            )
+
+    def test_objective_model_delegates_apply_statistics_or_refuses_unhandled(self):
+        _, runtime = build_runtime("DFlashDraftModel")
+        # Refused where the model is built, not after the first update.
+        with self.assertRaisesRegex(TypeError, "defines no apply_statistics"):
+            ObjectiveModel(
+                runtime.draft_model,
+                runtime.objective,
+                registration=runtime.registration,
+                name=runtime.objective_name,
+                loss_configuration=runtime.loss_configuration,
+                after_step_statistics=("moe_counts",),
+            )
+
+        seen = []
+
+        class ObjectiveWithHandler:
+            def apply_statistics(self, model, values):
+                seen.append((model, values["moe_counts"].tolist()))
+                return {"moe/step_balance": torch.tensor(0.75)}
+
+        model = ObjectiveModel(
+            runtime.draft_model,
+            ObjectiveWithHandler(),
+            registration=runtime.registration,
+            name=runtime.objective_name,
+            loss_configuration=runtime.loss_configuration,
+            after_step_statistics=("moe_counts",),
+        )
+        out = model.apply_statistics({"moe_counts": torch.tensor([2, 4, 6, 8])})
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0][0], model)
+        self.assertEqual(seen[0][1], [2, 4, 6, 8])
+        self.assertAlmostEqual(float(out["moe/step_balance"]), 0.75)
+
+    @unittest.skipUnless(_GLOO, "requires torch.distributed gloo backend")
+    def test_two_rank_pooling_updates_bias_and_checkpoint_across_ddp_fsdp1_fsdp2(self):
+        # Global expected sums across both ranks and both micro-batches:
+        # counts_0: [1,2,3,4]+[2,0,1,0]+[5,1,0,2]+[0,3,2,1] = [8, 6, 6, 7]
+        # counts_1: [1,2,3,4,5,6]+[0.5]*6+[2,3,4,5,6,7]+[1.5]*6 = [5,7,9,11,13,15]
+        # counts_2: [[1,2,3],[4,5,6]]+[[0,1,0],[2,0,1]]+[[3,0,1],[1,2,0]]+[[2,1,2],[0,1,3]]
+        #         = [[6, 4, 6], [7, 8, 10]]
+        expected_c0 = [8, 6, 6, 7]
+        expected_c1 = [5.0, 7.0, 9.0, 11.0, 13.0, 15.0]
+        expected_c2 = [[6, 4, 6], [7, 8, 10]]
+        expected_b0 = [0.1 * v for v in expected_c0]
+        expected_b1 = [0.05 * v for v in expected_c1]
+        expected_b2 = [[0.2 * v for v in row] for row in expected_c2]
+        expected_bal = (
+            sum(expected_c0) / 4.0
+            + sum(expected_c1) / 6.0
+            + sum(v for row in expected_c2 for v in row) / 6.0
+        ) / 3.0
+
+        for mode in ("ddp", "fsdp1", "fsdp2"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(
+                    prefix=f"after_step_{mode}_"
+                ) as workdir:
+                    out_dir = os.path.join(workdir, "checkpoints")
+                    os.makedirs(out_dir, exist_ok=True)
+                    reports = spawn_gloo(
+                        _distributed_after_step_worker, mode, workdir=workdir
+                    )
+
+                    for rank, rep in enumerate(reports):
+                        self.assertEqual(
+                            rep["pooled_0"], expected_c0, f"{mode} r{rank}"
+                        )
+                        self.assertEqual(
+                            rep["pooled_1"], expected_c1, f"{mode} r{rank}"
+                        )
+                        self.assertEqual(
+                            rep["pooled_2"], expected_c2, f"{mode} r{rank}"
+                        )
+                        self.assertEqual(rep["pooled_0_dtype"], "torch.int64")
+                        self.assertEqual(rep["pooled_1_dtype"], "torch.float32")
+                        self.assertEqual(rep["pooled_2_dtype"], "torch.int64")
+                        torch.testing.assert_close(
+                            torch.tensor(rep["bias_0"]), torch.tensor(expected_b0)
+                        )
+                        torch.testing.assert_close(
+                            torch.tensor(rep["bias_1"]), torch.tensor(expected_b1)
+                        )
+                        torch.testing.assert_close(
+                            torch.tensor(rep["bias_2"]), torch.tensor(expected_b2)
+                        )
+                        self.assertAlmostEqual(
+                            rep["step_balance"], expected_bal, places=5
+                        )
+
+                    # Rank 0 checkpoint artifact holds the post-step bias.
+                    torch.testing.assert_close(
+                        torch.tensor(reports[0]["ckpt_bias_0"]),
+                        torch.tensor(expected_b0),
+                    )
+                    torch.testing.assert_close(
+                        torch.tensor(reports[0]["ckpt_bias_1"]),
+                        torch.tensor(expected_b1),
+                    )
+                    torch.testing.assert_close(
+                        torch.tensor(reports[0]["ckpt_bias_2"]),
+                        torch.tensor(expected_b2),
+                    )
+                    # Saved training_state.pt on disk carries the same updated bias.
+                    saved = CheckpointManager.read_resume_state(
+                        out_dir, require_full_state=False
+                    )
+                    torch.testing.assert_close(
+                        saved["draft_state_dict"]["expert_bias_0"],
+                        torch.tensor(expected_b0),
+                    )
+                    torch.testing.assert_close(
+                        saved["draft_state_dict"]["expert_bias_1"],
+                        torch.tensor(expected_b1),
+                    )
+                    torch.testing.assert_close(
+                        saved["draft_state_dict"]["expert_bias_2"],
+                        torch.tensor(expected_b2),
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

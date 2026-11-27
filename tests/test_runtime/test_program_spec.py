@@ -122,6 +122,57 @@ class ProgramSpecTest(unittest.TestCase):
         # A value: it hashes, as every other declaration does.
         self.assertEqual(hash(spec), hash(program_spec(runtime)))
 
+    def test_after_step_statistics_declaration_and_overlap_refusal(self):
+        from dataclasses import replace
+
+        from specforge.algorithms.objectives.registry import (
+            TrainingRequirements,
+            WindowStatistic,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            ProgramSpec(
+                name="dup",
+                inputs=("x",),
+                replay_statistics=("s",),
+                after_step_statistics=("s",),
+            )
+        with self.assertRaisesRegex(ValueError, "both a replay window_statistic"):
+            TrainingRequirements(
+                window_statistic=WindowStatistic("r", "s"),
+                after_step_statistics=("s",),
+            )
+        _, runtime = build_runtime("DFlashDraftModel")
+
+        class Receiving:
+            def apply_statistics(self, model, values):
+                return {}
+
+        def declared(*names):
+            return ObjectiveModel(
+                runtime.draft_model,
+                Receiving(),
+                registration=replace(
+                    runtime.registration,
+                    training=replace(
+                        runtime.registration.training,
+                        after_step_statistics=("proto_stat",),
+                    ),
+                ),
+                name=runtime.objective_name,
+                loss_configuration=runtime.loss_configuration,
+                after_step_statistics=names,
+            )
+
+        # The registration's, then the model's own.
+        self.assertEqual(
+            program_spec(declared("moe_expert_counts")).after_step_statistics,
+            ("proto_stat", "moe_expert_counts"),
+        )
+        # One name from both sources is a mistake, not a merge.
+        with self.assertRaisesRegex(ValueError, "declared more than once"):
+            declared("moe_expert_counts", "proto_stat")
+
 
 class FrozenModulesTest(unittest.TestCase):
     def test_modules_are_frozen_where_the_builder_declares_them(self):
