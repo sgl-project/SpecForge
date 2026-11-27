@@ -19,7 +19,8 @@
 # SOFTWARE.
 #
 # Vendored from deepseek-ai/DeepSeek-V4-Flash-0731 at revision
-# 9e165c30e2704aec5d9d593cce3eebd58bbef1cb.
+# 9e165c30e2704aec5d9d593cce3eebd58bbef1cb (trimmed to encoding-only;
+# unused completion-decoding helpers removed).
 # isort: skip_file
 # fmt: off
 

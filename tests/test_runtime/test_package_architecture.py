@@ -508,7 +508,9 @@ class TestPackageArchitecture(unittest.TestCase):
             f"{path.relative_to(REPO_ROOT)}:{line_number}: {target}"
             for path in sorted((REPO_ROOT / "specforge" / "data").rglob("*.py"))
             for line_number, target in _matching_import_targets(
-                _module_tree(path), path, "specforge.distributed"
+                _module_tree(path),
+                path,
+                ("specforge.distributed", "torch.distributed"),
             )
         ]
         self.assertEqual(
