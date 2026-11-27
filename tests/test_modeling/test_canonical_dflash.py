@@ -7,12 +7,14 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 from specforge.config.draft.logits import MuPLogitTransformSpec
 from specforge.modeling import build_draft_model
 from specforge.modeling.draft.layers.inputs import LayerInputs
 from specforge.modeling.draft.models import DFlashDraftModel
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.draft_fixtures import draft_config, narrow_draft_config
 from tests.test_modeling.test_draft_gqa import layout_for
 
 
@@ -171,6 +173,47 @@ class CanonicalDFlashTest(unittest.TestCase):
         entries[0] = replace(entries[0], target_context=torch.randn(2, 3, 32))
         with self.assertRaisesRegex(ValueError, "trainable fusion"):
             model(ids, features, entries)
+
+    def test_equal_width_has_identity_adapters_and_unchanged_state(self):
+        model = build_draft_model(draft_config())
+        self.assertIsInstance(model.input_adapter, nn.Identity)
+        self.assertIsInstance(model.output_adapter, nn.Identity)
+        self.assertFalse(any("adapter" in name for name in model.state_dict()))
+
+    def test_narrow_draft_adapts_to_target_tables(self):
+        config = narrow_draft_config()
+        model = build_draft_model(config)
+        shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
+        self.assertEqual(shapes["input_adapter.weight"], (16, 32))
+        self.assertEqual(shapes["output_adapter.weight"], (32, 16))
+        self.assertEqual(shapes["fusion.fc.weight"], (16, 64))
+        for name in config.target_bindings:
+            self.assertEqual(tuple(getattr(model, name).weight.shape), (64, 32))
+            with self.assertRaisesRegex(ValueError, "shape must match"):
+                getattr(model, name).load_target_weight(torch.randn(64, 16))
+        tables = {name: torch.randn(64, 32) for name in config.target_bindings}
+        for name, value in tables.items():
+            getattr(model, name).load_target_weight(value)
+        args = inputs_for(config)
+        output = model(*args)
+        self.assertEqual(output.hidden_states.shape, (2, 4, 32))
+        torch.testing.assert_close(
+            output.logits, F.linear(output.hidden_states, tables["lm_head"])
+        )
+        output.logits.sum().backward()
+        for name in ("input_adapter.weight", "output_adapter.weight"):
+            self.assertIsNotNone(model.get_parameter(name).grad, name)
+        state = model.state_dict()
+        self.assertTrue({"input_adapter.weight", "output_adapter.weight"} <= set(state))
+        restored = build_draft_model(config)
+        restored.load_state_dict(state, strict=True)
+        for name, value in tables.items():
+            getattr(restored, name).load_target_weight(value)
+        torch.testing.assert_close(
+            restored(*args).logits, output.logits, rtol=0, atol=0
+        )
+        with self.assertRaises(RuntimeError):
+            build_draft_model(draft_config()).load_state_dict(state, strict=True)
 
 
 if __name__ == "__main__":

@@ -19,9 +19,9 @@ def validate_target_context(config: DraftConfig) -> None:
             "spec_config.target_features.mask_token_id must be below vocab_size"
         )
     # bound tables are the target's own, at the target's width
-    if (
-        config.target_bindings
-        and config.spec_config.target_features.hidden_size != config.hidden_size
+    spec = config.spec_config
+    if config.target_bindings and spec.target_features.hidden_size != (
+        spec.bound_table_width(config.hidden_size)
     ):
         raise ValueError(
             "target_bindings require spec_config.target_features.hidden_size "

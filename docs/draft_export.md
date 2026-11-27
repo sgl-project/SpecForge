@@ -92,7 +92,7 @@ loading rejects a serving artifact.
 
 | Architecture | Serving format / restriction |
 |---|---|
-| DFlash | `DFlashDraftModel`; both token tables bound to the target |
+| DFlash | `DFlashDraftModel`; both token tables bound to the target; may be narrower than the target (below) |
 | DFlash2 | `DFlash2DraftModel`, including convolution and selector |
 | Domino | `DFlashDraftModel` with explicit Domino projector settings |
 | DSpark | `DSparkDraftModel`; Markov head required; confidence head optional in static mode |
@@ -113,6 +113,18 @@ through its ragged-verification runtime mode; `cap-accept` exercises that head.
 Drafts without a confidence head require `SGLANG_RAGGED_VERIFY_MODE=static`.
 EAGLE3 supports multi-axis RoPE for VL targets; native MTP uses equal text
 positions on all axes.
+
+A DFlash draft may be narrower than its target: set `hidden_size` below
+`spec_config.target_features.hidden_size` and keep both tables bound. For example,
+`qwen3-8b-dflash.yaml` with `hidden_size: 2048` keeps the target's 4096-wide
+embedding and LM head, and `fc` still reads the 4096-wide target features. The
+draft then trains two bias-free adapters, `input_adapter` (target width to
+`hidden_size`, after the embedding) and `output_adapter` (back to target width,
+after the final norm). The export writes them under those names together with
+`target_hidden_size`. At equal widths both are identities and the export is
+unchanged. Serving a narrower draft needs an SGLang build whose `DFlashDraftModel`
+reads `target_hidden_size`; the pinned revision above does not. The other
+DFlash-family architectures still require equal widths.
 
 Compared with historical exports, configuration fields such as causality, heads,
 rotary settings and block quantities are now written explicitly. Canonical module

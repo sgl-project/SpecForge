@@ -1,6 +1,6 @@
 """Small effective draft configurations shared by configuration tests."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 from specforge.config.draft import DraftConfig
@@ -77,3 +77,8 @@ def draft_config(**overrides):
             **overrides,
         }
     )
+
+
+def narrow_draft_config(**overrides):
+    """DFlash draft of width 16 bound to target tables of width 32."""
+    return replace(draft_config(**overrides), hidden_size=16)

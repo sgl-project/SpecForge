@@ -18,6 +18,10 @@ class ArchitectureSpec(ABC):
         """Width consumed by attention at this layer, after architecture fusion."""
         return hidden_size
 
+    def bound_table_width(self, hidden_size: int) -> int:
+        """Width of bound target tables; a different width adds width adapters."""
+        return hidden_size
+
     @abstractmethod
     def validate_target(self, target: Mapping) -> None:
         """Check this architecture's target-derived fields against the text config."""

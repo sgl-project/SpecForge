@@ -12,6 +12,7 @@ from ..pretrained import DraftPreTrainedModel
 from .assembly import build_target_context_modules
 from .context import prepare_context_inputs
 from .registry import register_draft_model
+from .tokens import build_width_adapters
 
 
 @dataclass
@@ -50,6 +51,10 @@ class DFlashDraftModel(DraftPreTrainedModel):
                 dtype=dtype,
             )
         )
+        # Identity unless the draft is narrower than its bound target tables.
+        self.input_adapter, self.output_adapter = build_width_adapters(
+            draft, device=device, dtype=dtype
+        )
         self.post_init()
 
     def forward(
@@ -70,7 +75,11 @@ class DFlashDraftModel(DraftPreTrainedModel):
             layer_inputs,
             num_layers=self.backbone.num_layers,
         )
-        hidden = self.backbone(self.embed_tokens(input_ids), prepared)
+        hidden = self.backbone(
+            self.input_adapter(self.embed_tokens(input_ids)), prepared
+        )
+        # Return states at the bound LM head's width; losses project them directly.
+        hidden = self.output_adapter(hidden)
         return DFlashOutput(
             hidden_states=hidden,
             logits=self.compute_logits(hidden) if output_logits else None,

@@ -12,7 +12,7 @@ from specforge.algorithms.objectives import (
 )
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.modeling import build_draft_model
-from tests.test_config.draft_fixtures import draft_config
+from tests.test_config.draft_fixtures import draft_config, narrow_draft_config
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
 from tests.test_modeling.test_canonical_dmtp import model_config as dmtp_config
@@ -77,8 +77,13 @@ def capture_projections(model):
 class ObjectiveTest(unittest.TestCase):
     def test_defaults_train_every_serving_parameter(self):
         for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
-            for config in configurations():
-                with self.subTest(device=device, architecture=config.architecture):
+            # a narrow DFlash draft also trains its width adapters
+            for config in configurations() + [narrow_draft_config()]:
+                with self.subTest(
+                    device=device,
+                    architecture=config.architecture,
+                    hidden_size=config.hidden_size,
+                ):
                     torch.manual_seed(11)
                     model = build_draft_model(config, device=device)
                     if hasattr(model, "vocabulary"):
@@ -88,11 +93,10 @@ class ObjectiveTest(unittest.TestCase):
                             < config.draft_vocab_size,
                             d2t=torch.zeros_like(selected),
                         )
+                    width = config.spec_config.bound_table_width(config.hidden_size)
                     for name in config.target_bindings:
                         model.get_submodule(name).load_target_weight(
-                            torch.randn(
-                                config.vocab_size, config.hidden_size, device=device
-                            )
+                            torch.randn(config.vocab_size, width, device=device)
                         )
                     if hasattr(model, "initialize_transfer_space"):
                         model.initialize_transfer_space()

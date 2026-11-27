@@ -123,9 +123,7 @@ class LoadingReviewTest(unittest.TestCase):
                 )
                 store.assert_not_called()
                 with self.assertRaisesRegex(ValueError, "hidden_size"):
-                    initialize_draft(
-                        replace(draft_config(), hidden_size=16), target="test/target"
-                    )
+                    initialize_draft(draft_config(hidden_size=64), target="test/target")
                 store.assert_not_called()
                 with TemporaryDirectory() as other:
                     source = Path(other) / "draft"
