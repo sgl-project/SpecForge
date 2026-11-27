@@ -63,6 +63,29 @@ the same `specforge train` entry. On Linux it also installs `liger-kernel`,
 whose RMSNorm/SwiGLU kernels DFlash drafts use by default on CUDA and ROCm
 (`model.use_liger_kernel`).
 
+[`docker/Dockerfile`](https://github.com/sgl-project/SpecForge/blob/main/docker/Dockerfile)
+packages the source installation above as a CUDA 13 image. It starts from the
+SGLang release image with the same Torch and Transformers pins, moves that
+image's SGLang to the pinned revision, then clones SpecForge and installs it
+with the capture plugin and Mooncake into the image's virtual environment at
+`/opt/sglang`:
+
+```bash
+docker build -f docker/Dockerfile -t specforge:sgl0.5.23-cu130 .
+docker run --rm -it --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  specforge:sgl0.5.23-cu130
+```
+
+The tag follows the base image, `lmsysorg/sglang:v0.5.23-cu130`. The image
+clones the `main` branch; pass `--build-arg SPECFORGE_REF=<branch, tag or
+commit>` (and `SPECFORGE_REPO` for a fork) to build another revision. Docker
+caches the clone, so add `--no-cache` to pick up new commits on a branch.
+
+The clone lives in `/sgl-workspace/SpecForge` and is installed in editable
+mode, so `git pull` there, or a local checkout mounted over that path, takes
+effect without a rebuild.
+
 ### AMD ROCm
 
 On ROCm, install SpecForge into an environment that already provides a ROCm

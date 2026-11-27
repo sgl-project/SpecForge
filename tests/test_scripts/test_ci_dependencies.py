@@ -307,6 +307,12 @@ class CIDependencyTest(unittest.TestCase):
         self.assertIn(".", installs[0])
         self.assertIn("sf-capture/bin/python", installs[1])
 
+    def test_cuda_image_installs_ci_sglang_pin(self):
+        dockerfile = (ROOT / "docker/Dockerfile").read_text().splitlines()
+        self.assertIn(
+            f"ARG SGLANG_COMMIT={self.job['env']['SGLANG_COMMIT']}", dockerfile
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
