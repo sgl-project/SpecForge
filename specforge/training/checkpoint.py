@@ -17,6 +17,7 @@ in the shared payload. Run-scoped ``{run_id}-latest``/``{run_id}-best`` links an
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import logging
@@ -74,28 +75,51 @@ class CheckpointManager:
         *,
         rank_state: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Write ``step``'s checkpoint, first deleting any on-disk steps >= step
-        (fork/rollback semantics), then repoint ``{run_id}-latest`` and rotate.
-        ``state`` is the shared payload (rank0 writes it); ``rank_state`` is
-        written by every rank. Collective: any rank's failure raises on all ranks.
+        """Write ``step``'s checkpoint atomically across ranks.
+
+        Order of phases (each agreed across ranks via :meth:`_all_ok`):
+
+        1. Rank 0 deletes any on-disk steps >= ``step`` (fork/rollback semantics).
+        2. Every rank atomically writes its own ``training_state_rank{r}.pt``.
+        3. Only after every rank's shard is durable, rank 0 atomically writes
+           ``config.json`` (when present) and ``training_state.pt`` (the sole
+           completeness marker readers inspect), then updates
+           ``{run_id}-latest`` and rotates old checkpoints.
+
+        Collective: any rank's failure in any phase raises on all ranks, and a
+        failed rank shard never leaves ``training_state.pt`` visible to readers.
         """
         ckpt_dir = self.checkpoint_dir(step)
+
+        # Phase 1: rewind stale >= step dirs before any rank recreates them.
         err = ""
         try:
             if self.is_rank0():
                 self._rewind(step)
         except Exception as exc:
             err = f"rewind failed: {type(exc).__name__}: {exc}"
-        self._barrier()  # stale >= step dirs are gone before any rank recreates them
-        if not err:
-            try:
-                os.makedirs(ckpt_dir, exist_ok=True)
-                if rank_state is not None:
-                    self._atomic_save(
-                        rank_state,
-                        os.path.join(ckpt_dir, self._rank_file(self._rank())),
-                    )
-                if self.is_rank0() and state is not None:
+        self._all_ok(err)
+
+        # Phase 2: write every rank's shard before rank 0 publishes the commit
+        # marker, so a shard failure never exposes a partial checkpoint.
+        err = ""
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            if rank_state is not None:
+                self._atomic_save(
+                    rank_state,
+                    os.path.join(ckpt_dir, self._rank_file(self._rank())),
+                )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        self._all_ok(err)
+
+        # Phase 3 (commit point): every rank's shard is durable; rank 0 writes
+        # config.json and training_state.pt, then repoints latest and rotates.
+        err = ""
+        try:
+            if self.is_rank0():
+                if state is not None:
                     if "canonical_draft_config" in state:
                         self._atomic_json(
                             state["canonical_draft_config"]
@@ -109,13 +133,11 @@ class CheckpointManager:
                         )
                     # training_state.pt marks a complete checkpoint to readers.
                     self._atomic_save(state, self._state_path(ckpt_dir))
-            except Exception as exc:
-                err = f"{type(exc).__name__}: {exc}"
+                self._point(f"{self.run_id}-latest", ckpt_dir)
+                self._rotate(keep_step=step)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
         self._all_ok(err)
-        if self.is_rank0():
-            self._point(f"{self.run_id}-latest", ckpt_dir)
-            self._rotate(keep_step=step)
-        self._barrier()  # no rank proceeds before the checkpoint is complete
         return ckpt_dir
 
     def _rewind(self, step: int) -> None:
@@ -359,11 +381,6 @@ class CheckpointManager:
         return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     @staticmethod
-    def _barrier() -> None:
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
-    @staticmethod
     def _bcast_flag(flag: bool) -> bool:
         if (
             not torch.distributed.is_available()
@@ -378,15 +395,27 @@ class CheckpointManager:
     @staticmethod
     def _atomic_save(obj: Any, path: str) -> None:
         tmp = path + ".tmp"
-        torch.save(obj, tmp)
-        os.replace(tmp, path)
+        try:
+            torch.save(obj, tmp)
+            os.replace(tmp, path)
+        except BaseException:
+            # Best effort: the write's own error is the one to report.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     @staticmethod
     def _atomic_json(obj: Dict[str, Any], path: str) -> None:
         tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(obj, fh, indent=2)
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(obj, fh, indent=2)
+            os.replace(tmp, path)
+        except BaseException:
+            # Best effort: the write's own error is the one to report.
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     def _point(self, name: str, ckpt_dir: str) -> None:
         link = os.path.join(self.output_dir, name)

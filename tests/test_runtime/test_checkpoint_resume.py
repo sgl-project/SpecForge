@@ -9,6 +9,7 @@ continuity after resume (weights/optimizer/scheduler/RNG/data position).
 
 import contextlib
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -1951,6 +1952,180 @@ class TestTwoRankFSDPShardedResume(unittest.TestCase):
                 nprocs=2,
                 join=True,
             )
+
+
+def _atomic_checkpoint_worker(rank, world, store_path, out_dir, scenario, report_dir):
+    import json
+
+    import torch.distributed as dist
+
+    from specforge.training.checkpoint import STATE_FILE, CheckpointManager
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        mgr = CheckpointManager(out_dir, "atomic-run")
+
+        def shared_payload(step):
+            if rank != 0:
+                return None
+            return {
+                "global_step": step,
+                "epoch": 0,
+                "epoch_batch": step,
+                "epoch_samples": step,
+                "world_size": world,
+                "canonical_draft_config": {"architecture": "DFlashDraftModel"},
+                "draft_state_dict": {"weight": torch.zeros(2)},
+            }
+
+        def shard_payload(step):
+            return {"optimizer": {"step": step, "rank": rank}, "rng": {"rank": rank}}
+
+        if scenario in ("shard_fail_second_step", "commit_fail_rank0"):
+            mgr.save(shared_payload(1), 1, rank_state=shard_payload(1))
+
+        target_step = 1 if scenario == "shard_fail_first_step" else 2
+        publish = os.replace
+
+        def failing_publish(written, path):
+            # The file is written; its move into place fails, so the writer's
+            # cleanup of the temporary file runs.
+            if (
+                scenario in ("shard_fail_first_step", "shard_fail_second_step")
+                and rank == 1
+                and os.path.basename(path) == f"training_state_rank{rank}.pt"
+            ):
+                raise OSError("disk full")
+            if (
+                scenario == "commit_fail_rank0"
+                and rank == 0
+                and os.path.basename(path) == STATE_FILE
+            ):
+                raise OSError("commit failed")
+            return publish(written, path)
+
+        error = None
+        with mock.patch("specforge.training.checkpoint.os.replace", failing_publish):
+            try:
+                mgr.save(
+                    shared_payload(target_step),
+                    target_step,
+                    rank_state=shard_payload(target_step),
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+
+        with open(os.path.join(report_dir, f"rank{rank}.json"), "w") as fh:
+            json.dump({"error": error}, fh)
+    finally:
+        dist.destroy_process_group()
+
+
+class AtomicCheckpointPublicationTest(unittest.TestCase):
+    """Two-rank distributed proof that a failed shard write never publishes."""
+
+    @unittest.skipUnless(
+        torch.distributed.is_available() and torch.distributed.is_gloo_available(),
+        "requires torch.distributed gloo backend",
+    )
+    def _run_two_rank(self, scenario):
+        import json
+
+        import torch.multiprocessing as mp
+
+        workdir = tempfile.mkdtemp(prefix=f"atomic_ckpt_{scenario}_")
+        self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        store_path = os.path.join(workdir, "gloo.store")
+        out_dir = os.path.join(workdir, "checkpoints")
+        report_dir = os.path.join(workdir, "reports")
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(report_dir, exist_ok=True)
+        mp.spawn(
+            _atomic_checkpoint_worker,
+            args=(2, store_path, out_dir, scenario, report_dir),
+            nprocs=2,
+            join=True,
+        )
+        reports = []
+        for rank in range(2):
+            with open(os.path.join(report_dir, f"rank{rank}.json")) as fh:
+                reports.append(json.load(fh))
+        return out_dir, reports
+
+    def test_shard_write_failure_hides_first_step_from_explicit_and_auto_resolve(self):
+        from specforge.checkpoint.resolve import (
+            resolve_checkpoint_path,
+            resolve_run_directory,
+        )
+        from specforge.training.checkpoint import CheckpointManager
+
+        out_dir, reports = self._run_two_rank("shard_fail_first_step")
+        for rank, report in enumerate(reports):
+            self.assertIsNotNone(report["error"], f"rank {rank} did not raise")
+            self.assertIn("rank 1: OSError: disk full", report["error"])
+
+        step1 = os.path.join(out_dir, "atomic-run-step1")
+        self.assertTrue(os.path.isfile(os.path.join(step1, "training_state_rank0.pt")))
+        self.assertFalse(os.path.exists(os.path.join(step1, "training_state_rank1.pt")))
+        self.assertFalse(os.path.exists(os.path.join(step1, "config.json")))
+        self.assertFalse(os.path.exists(os.path.join(step1, "training_state.pt")))
+
+        with self.assertRaises(FileNotFoundError):
+            resolve_run_directory(step1)
+        with self.assertRaises(FileNotFoundError):
+            resolve_run_directory(out_dir)
+        with self.assertRaises(FileNotFoundError):
+            resolve_checkpoint_path(out_dir)
+        with self.assertRaises(FileNotFoundError):
+            CheckpointManager.read_resume_state(step1)
+        with self.assertRaises(FileNotFoundError):
+            CheckpointManager.read_resume_state(out_dir)
+
+    def test_shard_write_failure_preserves_prior_step_in_explicit_and_fallback_resolve(
+        self,
+    ):
+        from specforge.checkpoint.resolve import resolve_run_directory
+
+        out_dir, reports = self._run_two_rank("shard_fail_second_step")
+        for rank, report in enumerate(reports):
+            self.assertIsNotNone(report["error"], f"rank {rank} did not raise")
+            self.assertIn("rank 1: OSError: disk full", report["error"])
+
+        step1 = os.path.realpath(os.path.join(out_dir, "atomic-run-step1"))
+        step2 = os.path.join(out_dir, "atomic-run-step2")
+        self.assertTrue(os.path.isfile(os.path.join(step1, "training_state.pt")))
+        self.assertFalse(os.path.exists(os.path.join(step2, "training_state.pt")))
+        self.assertFalse(os.path.exists(os.path.join(step2, "config.json")))
+
+        # Explicit step2 must fail; auto-discovery must resolve to step1.
+        with self.assertRaises(FileNotFoundError):
+            resolve_run_directory(step2)
+        self.assertEqual(os.path.realpath(resolve_run_directory(out_dir)), step1)
+
+        # Even without *-latest (no-symlink filesystems), *-step* fallback must
+        # skip partial step2 and choose step1.
+        latest = os.path.join(out_dir, "atomic-run-latest")
+        if os.path.islink(latest) or os.path.exists(latest):
+            os.remove(latest)
+        self.assertEqual(os.path.realpath(resolve_run_directory(out_dir)), step1)
+
+    def test_rank0_commit_failure_is_agreed_across_ranks_and_leaves_latest_intact(self):
+        from specforge.checkpoint.resolve import resolve_run_directory
+
+        out_dir, reports = self._run_two_rank("commit_fail_rank0")
+        for rank, report in enumerate(reports):
+            self.assertIsNotNone(report["error"], f"rank {rank} did not raise")
+            self.assertIn("rank 0: OSError: commit failed", report["error"])
+
+        step1 = os.path.realpath(os.path.join(out_dir, "atomic-run-step1"))
+        step2 = os.path.join(out_dir, "atomic-run-step2")
+        self.assertFalse(os.path.exists(os.path.join(step2, "training_state.pt")))
+        self.assertFalse(os.path.exists(os.path.join(step2, "training_state.pt.tmp")))
+        with self.assertRaises(FileNotFoundError):
+            resolve_run_directory(step2)
+        self.assertEqual(os.path.realpath(resolve_run_directory(out_dir)), step1)
 
 
 if __name__ == "__main__":
