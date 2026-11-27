@@ -301,7 +301,7 @@ class GeneralParser(Parser):
             messages = []
             raw_messages = []
 
-            if conversation[0]["role"] == "system":
+            if conversation and conversation[0]["role"] == "system":
                 warnings.warn(
                     "The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
                 )

@@ -190,6 +190,9 @@ class GeneralParserFallbackTest(unittest.TestCase):
             )
         self.assertEqual(_decode_supervised(tok, ids, mask), "ok</eot>")
 
+        with _assert_warns(self, "Skipping conversation"):
+            self.assertIsNone(general.parse([], 256))
+
 
 class PreprocessingTest(unittest.TestCase):
     def _build(
