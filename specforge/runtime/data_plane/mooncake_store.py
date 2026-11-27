@@ -1452,12 +1452,18 @@ class MooncakeFeatureStore(FeatureStore):
         target_ids = set(sample_ids)
         removed = removed_bytes = 0
         with self._lock:
-            self._check_open_locked()
             pending = [
                 sample_id
                 for sample_id in self._release_pending
                 if sample_id in target_ids
             ]
+            partial_pending = [
+                attempt
+                for attempt in self._partial_put_pending
+                if attempt[0] in target_ids
+            ]
+            if pending or partial_pending:
+                self._check_open_locked()
             for sample_id in pending:
                 physically_removed = self._try_physical_free(
                     sample_id,
@@ -1475,11 +1481,6 @@ class MooncakeFeatureStore(FeatureStore):
                         self.max_release_attempts,
                         self._release_pending.get(sample_id, 0) + 1,
                     )
-            partial_pending = [
-                attempt
-                for attempt in self._partial_put_pending
-                if attempt[0] in target_ids
-            ]
             for attempt in partial_pending:
                 if self._try_partial_put_free_locked(attempt, force=True):
                     removed += 1
@@ -1550,7 +1551,6 @@ class MooncakeFeatureStore(FeatureStore):
         for attempt in range(max_attempts):
             attempts_run = attempt + 1
             with self._lock:
-                self._check_open_locked()
                 pending = [
                     sample_id
                     for sample_id in self._release_pending
@@ -1568,6 +1568,7 @@ class MooncakeFeatureStore(FeatureStore):
                         "release_pending": 0,
                         "attempts": attempt,
                     }
+                self._check_open_locked()
                 final_attempt = attempt + 1 == max_attempts
                 for sample_id in pending:
                     try:

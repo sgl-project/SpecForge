@@ -1563,16 +1563,36 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertIn("remove_done", order[:-1])
 
         fake.remove = mock.Mock(return_value=0)
+        # Empty drain/retry after close is a safe no-op matching discard_external_attempts.
+        self.assertEqual(fs.drain_pending_removals()["release_pending"], 0)
+        self.assertEqual(fs.retry_sample_removals(["s0"])["release_pending"], 0)
         for op in (
             lambda: fs.abort("s0"),
             lambda: fs.release(handle),
             lambda: fs.gc(),
-            lambda: fs.retry_sample_removals(["s0"]),
-            lambda: fs.drain_pending_removals(),
         ):
             with self.assertRaisesRegex(RuntimeError, "closed"):
                 op()
         fake.remove.assert_not_called()
+
+        # When pending removals exist, retry/drain must fail rather than touch a closed store.
+        pending_fake = _FakeMooncakeStore()
+        pending_fs = MooncakeFeatureStore(
+            store=pending_fake, store_id="run1", close_store=True
+        )
+        pending_fs.put(_tensors(), sample_id="s1", metadata=_meta())
+        pending_fake.remove = mock.Mock(return_value=-706)
+        pending_fs.abort("s1")
+        pending_fake.close = mock.Mock(return_value=0)
+        pending_fs.close()
+        pending_fake.remove.reset_mock()
+        for op in (
+            lambda: pending_fs.retry_sample_removals(["s1"]),
+            lambda: pending_fs.drain_pending_removals(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                op()
+        pending_fake.remove.assert_not_called()
 
     def test_concurrent_close_calls_close_backend_once(self):
         fake = _FakeMooncakeStore()
