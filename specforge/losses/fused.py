@@ -472,10 +472,12 @@ _TRITON_DEVICE_BACKENDS = {
     "cuda": ("cuda", "hip"),
     "npu": ("npu",),
 }
+_TRITON_TARGET_BACKEND: tuple[object, str | None] = (object(), None)
 
 
 def triton_available(device: torch.device | str | None = None) -> bool:
     """Whether Triton with a working compiler backend is available for ``device``."""
+    global _TRITON_TARGET_BACKEND
     try:
         import triton
         import triton.language as tl
@@ -492,10 +494,15 @@ def triton_available(device: torch.device | str | None = None) -> bool:
     try:
         import triton.runtime as runtime
 
-        target = runtime.driver.active.get_current_target()
+        active = runtime.driver.active
+        cached_driver, backend = _TRITON_TARGET_BACKEND
+        if cached_driver is not active:
+            backend = getattr(active.get_current_target(), "backend", None)
+            if backend is not None:
+                _TRITON_TARGET_BACKEND = (active, backend)
     except (ImportError, AttributeError, RuntimeError):
         return False
-    return getattr(target, "backend", None) in allowed
+    return backend in allowed
 
 
 def supports_fused_ce_l1_loss(logits: torch.Tensor) -> bool:

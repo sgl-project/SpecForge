@@ -321,6 +321,31 @@ class TestFusedLoss(unittest.TestCase):
             self.assertFalse(fused_loss.triton_available("cuda"))
             self.assertFalse(fused_loss.triton_available("npu"))
 
+        # Repeated probes against the same active driver cache backend lookup,
+        # while a transient failure is not cached and recovers once ready.
+        calls = 0
+        fail = True
+
+        def flaky_target():
+            nonlocal calls
+            calls += 1
+            if fail:
+                raise RuntimeError("driver not initialized")
+            return SimpleNamespace(backend="cuda")
+
+        flaky_mods = make_triton(backend="cuda")
+        flaky_mods["triton.runtime"].driver.active = SimpleNamespace(
+            get_current_target=flaky_target
+        )
+        with patch.dict(sys.modules, flaky_mods):
+            self.assertFalse(fused_loss.triton_available("cuda"))
+            self.assertEqual(calls, 1)
+            fail = False
+            self.assertTrue(fused_loss.triton_available("cuda"))
+            self.assertTrue(fused_loss.triton_available(torch.device("cuda:0")))
+            self.assertFalse(fused_loss.triton_available("npu"))
+            self.assertEqual(calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

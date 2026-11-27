@@ -1098,59 +1098,98 @@ class LossPlanTest(unittest.TestCase):
                         )
 
     def test_dspine_single_pass(self):
+        backbone_metrics = {}
+        shared_state = None
+        shared_batch = None
         for token_kind in ("ce_l1", "ce"):
+            loss_cfg = (
+                None if token_kind == "ce_l1" else {"terms": {"token": {"kind": "ce"}}}
+            )
+            config, runtime = build_runtime(
+                "DSpineDraftModel",
+                options={"num_anchors": 3},
+                loss=loss_cfg,
+            )
+            if shared_state is None:
+                shared_state = {k: v.clone() for k, v in runtime.state_dict().items()}
+                shared_batch = training_batch(config)
+            else:
+                runtime.load_state_dict(shared_state)
+            batch = shared_batch
             for alignment_ce in (None, torch.tensor(0.5)):
-                with self.subTest(
-                    token_kind=token_kind, alignment_ce=alignment_ce is not None
-                ):
-                    loss_cfg = (
-                        None
-                        if token_kind == "ce_l1"
-                        else {"terms": {"token": {"kind": "ce"}}}
-                    )
-                    config, runtime = build_runtime(
-                        "DSpineDraftModel",
-                        options={"num_anchors": 3},
-                        loss=loss_cfg,
-                    )
-                    batch = training_batch(config)
-                    runtime.execution = LossExecution(
-                        chunk_size=0, checkpoint=False, fused=False
-                    )
-                    runtime.zero_grad(set_to_none=True)
-                    torch.manual_seed(43)
-                    eval_calls = []
-                    with (
-                        patch.object(
-                            fused_loss, "ce_l1_loss", wraps=fused_loss.ce_l1_loss
-                        ) as ce_l1_calls,
-                        _spy_evaluate(eval_calls),
+                runs = (
+                    ((0, False),) if alignment_ce is None else ((0, False), (1, True))
+                )
+                expected = None
+                for chunk, checkpoint in runs:
+                    with self.subTest(
+                        token_kind=token_kind,
+                        alignment_ce=alignment_ce is not None,
+                        chunk=chunk,
                     ):
-                        actual = runtime(
-                            batch,
-                            step=1,
-                            total_steps=10,
-                            alignment_ce=alignment_ce,
+                        runtime.execution = LossExecution(
+                            chunk_size=chunk, checkpoint=checkpoint, fused=False
                         )
-                        actual.loss.backward()
-                    self.assertNotIn("candidates", [key for key, _ in eval_calls])
-                    vocab_calls = [
-                        c
-                        for c in ce_l1_calls.call_args_list
-                        if c.args[0].shape[-1] == config.vocab_size
-                    ]
-                    self.assertEqual(len(vocab_calls), 1)
-                    if token_kind == "ce":
-                        self.assertIs(vocab_calls[0].kwargs["teacher_l1_grad"], False)
-                    self.assertTrue(torch.isfinite(actual.loss))
-                    for metric in (
-                        "dspine/backbone_ce",
-                        "dspine/backbone_l1",
-                        "dspine/refinement_loss",
-                        "dspine/alignment_loss",
-                        "dspine/candidate_coverage",
-                    ):
-                        self.assertIn(metric, actual.ratios)
+                        runtime.zero_grad(set_to_none=True)
+                        torch.manual_seed(43)
+                        eval_calls = []
+                        with (
+                            patch.object(
+                                fused_loss, "ce_l1_loss", wraps=fused_loss.ce_l1_loss
+                            ) as ce_l1_calls,
+                            _spy_evaluate(eval_calls),
+                        ):
+                            actual = runtime(
+                                batch,
+                                step=1,
+                                total_steps=10,
+                                alignment_ce=alignment_ce,
+                            )
+                            actual.loss.backward()
+                        self.assertNotIn("candidates", [key for key, _ in eval_calls])
+                        vocab_calls = [
+                            c
+                            for c in ce_l1_calls.call_args_list
+                            if c.args[0].shape[-1] == config.vocab_size
+                        ]
+                        if chunk == 0:
+                            self.assertEqual(len(vocab_calls), 1)
+                        if token_kind == "ce":
+                            self.assertTrue(
+                                all(
+                                    c.kwargs["teacher_l1_grad"] is False
+                                    for c in vocab_calls
+                                )
+                            )
+                        self.assertTrue(torch.isfinite(actual.loss))
+                        for metric in (
+                            "dspine/backbone_ce",
+                            "dspine/backbone_l1",
+                            "dspine/refinement_loss",
+                            "dspine/alignment_loss",
+                            "dspine/candidate_coverage",
+                        ):
+                            self.assertIn(metric, actual.ratios)
+                        grads = {
+                            n: p.grad.clone()
+                            for n, p in runtime.named_parameters()
+                            if p.grad is not None
+                        }
+                        if expected is None:
+                            expected = (actual.loss.detach(), grads, actual.ratios)
+                            if alignment_ce is not None:
+                                backbone_metrics[token_kind] = {
+                                    k: actual.ratios[k]
+                                    for k in (
+                                        "dspine/backbone_ce",
+                                        "dspine/backbone_l1",
+                                    )
+                                }
+                        else:
+                            torch.testing.assert_close(
+                                (actual.loss.detach(), grads, actual.ratios), expected
+                            )
+        torch.testing.assert_close(backbone_metrics["ce"], backbone_metrics["ce_l1"])
 
     def test_custom_loss_falls_back_to_candidate_evaluation(self):
         for architecture, extra_kwargs, expected_metric in (
