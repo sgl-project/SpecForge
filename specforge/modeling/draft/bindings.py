@@ -97,12 +97,25 @@ class _ValuePreservingApply(TorchDispatchMode):
         state = _tensor_state(tensor)
         return state is not None and state.storage_key in self.storage_keys
 
+    @staticmethod
+    def _written_args(func, args, kwargs):
+        written = []
+        for index, schema_arg in enumerate(func._schema.arguments):
+            alias_info = schema_arg.alias_info
+            if alias_info is None or not alias_info.is_write:
+                continue
+            if index < len(args):
+                written.append(args[index])
+            elif schema_arg.name in kwargs:
+                written.append(kwargs[schema_arg.name])
+        return written
+
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         if func._schema.is_mutable:
             if any(
                 isinstance(leaf, Tensor) and self._aliases_tracked(leaf)
-                for leaf in tree_leaves((args, kwargs))
+                for leaf in tree_leaves(self._written_args(func, args, kwargs))
             ):
                 self.mutated = True
             return func(*args, **kwargs)

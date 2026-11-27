@@ -260,9 +260,16 @@ class BindingTest(unittest.TestCase):
         )
         head.load_target_weight(source)
         expected = source / 3
+        scratch = torch.empty_like(expected)
+
+        def copy_out_without_mutating(tensor):
+            scratch.copy_(tensor)
+            return tensor
+
         for transfer in (
             lambda: head._apply(lambda t: t.to(t.device, copy=True)),
             lambda: head._apply(lambda t: t.clone()),
+            lambda: head._apply(copy_out_without_mutating),
         ):
             transfer()
             torch.testing.assert_close(head.bound_weight(), expected, rtol=0, atol=0)
@@ -301,6 +308,7 @@ class BindingTest(unittest.TestCase):
         )
         for name, callback in (
             ("zero_", lambda t: t.zero_()),
+            ("out_kwarg", lambda t: torch.add(t, 1.0, out=t)),
             ("lossy_roundtrip", lambda t: t.bfloat16().float()),
         ):
             with self.subTest(callback=name):
@@ -310,10 +318,10 @@ class BindingTest(unittest.TestCase):
                     head.bound_weight()
 
     def test_dtensor_apply_preserves_or_unbinds_binding(self):
-        import torch.distributed as dist
-        import torch.testing._internal.distributed.fake_pg  # noqa: F401
         from torch.distributed.device_mesh import DeviceMesh
         from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from tests.test_runtime._fixtures import gloo_single_rank
 
         def bound_sharded_head(mesh):
             head = BoundLMHead(NoLogitTransformSpec(), vocab_size=4, hidden_size=2)
@@ -324,13 +332,8 @@ class BindingTest(unittest.TestCase):
             )
             return head
 
-        started = not dist.is_initialized()
-        if started:
-            dist.init_process_group(
-                backend="fake", store=dist.HashStore(), rank=0, world_size=1
-            )
-        try:
-            mesh = DeviceMesh("cpu", [0])
+        with gloo_single_rank() as group:
+            mesh = DeviceMesh.from_group(group, "cpu")
             head = bound_sharded_head(mesh)
             head.to("cpu")
             self.assertIs(head.bound_weight(), head.weight)
@@ -345,9 +348,6 @@ class BindingTest(unittest.TestCase):
             head.to_empty(device="cpu")
             with self.assertRaisesRegex(RuntimeError, "not bound"):
                 head.bound_weight()
-        finally:
-            if started:
-                dist.destroy_process_group()
 
 
 if __name__ == "__main__":
