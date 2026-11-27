@@ -2,7 +2,6 @@
 
 import gzip
 import os
-import sys
 import tempfile
 import threading
 import unittest
@@ -11,22 +10,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
-from scripts.prepare_hidden_states import HiddenStatesGenerator, sample_range
-from specforge.offline_capture import OfflineCaptureClient
-from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
-from tests.test_algorithms.fixtures import builtin_algorithm_registry
-from tests.test_runtime.test_server_capture import _FakeMooncakeStore, _request_specs
-
-sys.path.insert(
-    0, str(Path(__file__).resolve().parents[2] / "plugins/sglang-spec-capture")
-)
 from specforge_sglang_capture.capture import (
     CaptureHostOutput,
     CaptureItem,
     CaptureRuntime,
 )
 from specforge_sglang_capture.sink import SpecCaptureSink
+
+from scripts.prepare_hidden_states import HiddenStatesGenerator, sample_range
+from specforge.offline_capture import OfflineCaptureClient
+from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
+from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime.test_server_capture import _FakeMooncakeStore, _request_specs
 
 
 class OfflineCaptureTest(unittest.TestCase):

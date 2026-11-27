@@ -190,6 +190,17 @@ jobs:
         run: |
           source sf/bin/activate
           export PYTHONPATH=$PWD
+          python - <<'PYTHON'
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          import specforge_sglang_capture
+
+          package = distribution("specforge-sglang-capture").locate_file(
+              "specforge_sglang_capture/__init__.py"
+          )
+          assert Path(specforge_sglang_capture.__file__).samefile(package)
+          PYTHON
           python -m unittest discover -s ./tests -p "test_*.py" -v
 
       - name: Test optional TPU plugin
@@ -198,6 +209,45 @@ jobs:
           source sf/bin/activate
           uv pip install --no-deps ./plugins/specforge-tpu
           python -m unittest discover -s plugins/specforge-tpu/tests -v
+
+      - name: Run patched SGLang HS CPU contracts
+        timeout-minutes: 40
+        shell: bash
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          checkout=$(mktemp -d "${RUNNER_TEMP}/sglang-hs.XXXXXX")
+          trap 'rm -rf "$checkout"' EXIT
+          git -C "$checkout" init --quiet
+          git -C "$checkout" fetch --no-tags --depth=1 https://github.com/sgl-project/sglang.git "$SGLANG_COMMIT"
+          git -C "$checkout" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$checkout" rev-parse HEAD)" = "$SGLANG_COMMIT"
+          patches=("$PWD"/plugins/sglang-spec-capture/patches/sglang/c19e9c7d/000[1-3]-*.patch)
+          test "${#patches[@]}" -eq 3
+          git -C "$checkout" -c user.name="SpecForge CI" -c user.email="ci@specforge.invalid" am "${patches[@]}"
+          test "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = 7b4777b7a9081e8767b1794df1b56cda1db84a58
+          # The stock environments have already been cached and tested. Use
+          # the normal source installation in the isolated capture interpreter.
+          stock_version=$(sf-capture/bin/python -c 'from importlib.metadata import version; print(version("sglang"))')
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="$stock_version" \
+            uv pip install --python sf-capture/bin/python \
+            --no-deps --no-build-isolation --reinstall-package sglang -e "$checkout/python"
+          sf-capture/bin/python - "$checkout" <<'PYTHON'
+          import sys
+          from pathlib import Path
+
+          import sglang
+          from sglang.srt.managers import prefix_admission
+
+          source = Path(sys.argv[1]) / "python" / "sglang"
+          assert Path(sglang.__file__).samefile(source / "__init__.py")
+          assert Path(prefix_admission.__file__).samefile(source / "srt/managers/prefix_admission.py")
+          assert prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1
+          PYTHON
+          sf-capture/bin/python -m unittest tests.test_runtime.hs_tp_protocol -v
+          tests="$checkout/test/registered/unit/managers"
+          sf-capture/bin/python -m unittest discover -s "$tests" -p 'test_prefix_admission*.py' -v
+          sf-capture/bin/python "$tests/test_gdn_track_snapshot_contract.py" -v
 
       - name: Save cache
         run: |

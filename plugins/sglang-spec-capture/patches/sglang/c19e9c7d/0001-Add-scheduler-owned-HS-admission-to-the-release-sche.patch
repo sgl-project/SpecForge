@@ -1,0 +1,2900 @@
+From b822304af9c63d3ea6514ae700a2412a2324fd99 Mon Sep 17 00:00:00 2001
+From: Wilbolu <wilbolu@outlook.com>
+Date: Tue, 10 Nov 2026 02:10:37 +0800
+Subject: [PATCH 1/3] Add scheduler-owned HS admission to the release scheduler
+
+Migrate the prior admission transaction plus cancelled-control drain, request identity rollback, slotted request state and shutdown propagation to c19e9c7d. Use the native indexed request lists, retire path, KV budget, row state, batched tracking allocation and deferred responses.
+---
+ python/sglang/srt/managers/io_struct.py       |  15 +
+ .../sglang/srt/managers/prefix_admission.py   | 744 ++++++++++++++++++
+ python/sglang/srt/managers/schedule_batch.py  |   3 +
+ python/sglang/srt/managers/schedule_policy.py |  45 +-
+ python/sglang/srt/managers/scheduler.py       | 566 ++++++++-----
+ .../srt/managers/tokenizer_control_mixin.py   |  32 +
+ python/sglang/srt/mem_cache/allocation.py     |  11 +-
+ python/sglang/srt/mem_cache/kv/requests.py    |  16 +-
+ .../sglang/srt/mem_cache/kv/state_storage.py  |   8 +
+ python/sglang/srt/mem_cache/memory_pool.py    |  17 +-
+ python/sglang/srt/mem_cache/prefill_budget.py |  17 +
+ .../unified_cache/components/mamba.py         |  28 +-
+ .../unit/managers/test_prefix_admission.py    | 640 +++++++++++++++
+ .../test_prefix_admission_actual_req.py       | 253 ++++++
+ 14 files changed, 2174 insertions(+), 221 deletions(-)
+ create mode 100644 python/sglang/srt/managers/prefix_admission.py
+ create mode 100644 test/registered/unit/managers/test_prefix_admission.py
+ create mode 100644 test/registered/unit/managers/test_prefix_admission_actual_req.py
+
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 43a026b39f..73c0d459f9 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -2848,6 +2848,21 @@ class BlockReqInput(BaseReq, kw_only=True):
+     req_type: BlockReqType
+
+
++class PluginControlReqInput(BaseReq, kw_only=True):
++    """Ordered control dispatch to a scheduler-owned plugin."""
++
++    namespace: str
++    body: Dict[str, Any]
++    control_id: str
++
++
++class PluginControlReqOutput(BaseReq, kw_only=True):
++    control_id: str
++    success: bool
++    response: Dict[str, Any]
++    error: str = ""
++
++
+ class DumperControlReqInput(BaseReq, kw_only=True):
+     method: str
+     # JSON request body (guarded to be a dict at the /dumper endpoint).
+diff --git a/python/sglang/srt/managers/prefix_admission.py b/python/sglang/srt/managers/prefix_admission.py
+new file mode 100644
+index 0000000000..dc7ab36801
+--- /dev/null
++++ b/python/sglang/srt/managers/prefix_admission.py
+@@ -0,0 +1,744 @@
++"""Scheduler-owned, opt-in prefix admission transactions.
++
++The plugin owns its leases and output reservations.  The engine owns request
++state, exact tree-lock receipts and state-slot allocations.  This protocol is
++deliberately limited to nonchunked, device-resident prefill; tree splits, LRU
++refreshes and consumed cache-maintenance actions remain durable cache work.
++"""
++
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass, fields, is_dataclass
++from typing import Any, Callable, Protocol
++
++CAPTURE_ADMISSION_PROTOCOL = 1
++ExecutionIdentity = tuple[str, str, str, int]
++logger = logging.getLogger(__name__)
++
++
++def capture_checkpoint_capability(model_runner) -> dict:
++    """Inspect the *selected* backend and actual recurrent pool, without a probe.
++
++    This is an execution capability gate, not a certificate of numerical
++    equivalence. GPU feature/logit/loss/gradient validation remains required.
++    """
++    backend = model_runner.attn_backend
++    linear = getattr(backend, "linear_attn_backend", None)
++    recurrent = getattr(model_runner.req_to_token_pool, "holds_state_slots", False)
++    if linear is None and not recurrent:
++        return {
++            "supported": True,
++            "kind": "full_attention",
++            "backend": type(backend).__name__,
++        }
++    result = {"supported": False, "kind": "hybrid", "backend": type(linear).__name__}
++    if linear is None or type(linear).__name__ != "GDNAttnBackend":
++        return dict(
++            result, reason="only the selected CUDA Triton GDN path is supported"
++        )
++    pool = linear.state_pool.mamba_cache
++    kernel = linear.kernel_dispatcher.extend_kernel
++    result.update(
++        ssm_dtype=str(pool.temporal.dtype), selected_kernel=type(kernel).__name__
++    )
++    if str(model_runner.device).split(":")[0] != "cuda":
++        return dict(result, reason="exact GDN snapshot requires CUDA")
++    if str(pool.temporal.dtype) != "torch.float32":
++        return dict(result, reason="recurrent state pool must be FP32")
++    graph_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
++    if graph_runner is not None and type(graph_runner).__name__ != "EagerRunner":
++        return dict(
++            result,
++            reason="GDN prefill graph snapshots are not supported by this protocol",
++        )
++    if (
++        type(kernel).__name__ != "TritonGDNKernel"
++        or not kernel.supports_track_state_snapshot
++    ):
++        return dict(
++            result,
++            reason="selected prefill kernel does not supply FP32 track snapshots",
++        )
++    if getattr(model_runner.req_to_token_pool, "mamba_ckpt_pool", None) is not None:
++        return dict(result, reason="compressed Mamba checkpoints are unsupported")
++    if any(
++        getattr(pool, name, None) is not None
++        for name in ("replayssm_d", "replayssm_rawv")
++    ):
++        return dict(result, reason="ReplaySSM checkpoints are unsupported")
++    return dict(result, supported=True, kind="gdn_fp32_track_snapshot")
++
++
++def validate_capture_checkpoint_support(scheduler) -> dict:
++    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
++    from sglang.srt.runtime_context import get_exec
++
++    execution = get_exec()
++    if (
++        not execution.deterministic.enable_deterministic_inference
++        or not is_batch_invariant_mode_enabled()
++    ):
++        raise ValueError("HS reuse requires deterministic batch-invariant execution")
++    mamba = execution.mamba
++    if any(
++        getattr(mamba, name, False)
++        for name in (
++            "enable_int8_mamba_checkpoint",
++            "enable_mamba_cache_stochastic_rounding",
++            "enable_linear_replayssm",
++            "enable_linear_replayssm_spec",
++        )
++    ):
++        raise ValueError(
++            "HS reuse does not support lossy or replay recurrent checkpoints"
++        )
++    capability = capture_checkpoint_capability(scheduler.tp_worker.model_runner)
++    if not capability["supported"]:
++        raise ValueError("HS checkpoint capability refused: " + repr(capability))
++    return capability
++
++
++@dataclass(frozen=True)
++class PrefixAdmissionProposal:
++    max_prefix_len: int
++    identity: ExecutionIdentity
++    opaque: Any = None
++
++    def __post_init__(self):
++        if type(self.max_prefix_len) is not int or self.max_prefix_len < 0:
++            raise ValueError("max_prefix_len must be a nonnegative raw-token count")
++        if (
++            not isinstance(self.identity, tuple)
++            or len(self.identity) != 4
++            or any(not isinstance(x, str) or not x for x in self.identity[:3])
++            or type(self.identity[3]) is not int
++            or self.identity[3] < 0
++        ):
++            raise ValueError("invalid immutable prefix execution identity")
++
++
++class PrefixAdmissionObserver(Protocol):
++    def prepare(self, scheduler, req) -> PrefixAdmissionProposal | None: ...
++    def after_match(self, scheduler, req, proposal, lawful_prefix_len: int) -> None: ...
++    def reserve(self, scheduler, req, proposal, lawful_prefix_len: int) -> bool: ...
++    def commit(self, scheduler, req, proposal, lawful_prefix_len: int) -> None: ...
++    def rollback(self, scheduler, req, proposal, reason: str) -> None: ...
++    def poll(self, scheduler) -> None: ...
++    def lifecycle(self, scheduler, req, event: str, identity) -> None: ...
++    def control(self, scheduler, body: dict) -> dict: ...
++
++
++class AdmissionRollbackError(RuntimeError):
++    """At least one release is uncertain; this execution cannot be retried."""
++
++
++class PrefixAdmissionRejected(RuntimeError):
++    """A request failed admission after every rank completely rolled it back."""
++
++
++@dataclass
++class _Release:
++    description: str
++    release: Callable[[], None]
++    attempted: bool = False
++    error: str | None = None
++    on_commit: Callable[[], None] | None = None
++
++    def run(self):
++        # A release may raise after doing its physical work. Never call it twice.
++        if not self.attempted:
++            self.attempted = True
++            try:
++                self.release()
++            except Exception as exc:
++                self.error = repr(exc)
++                raise
++        elif self.error is not None:
++            raise AdmissionRollbackError(self.error)
++
++
++_REQUEST_FIELDS = (
++    "prefix_len",
++    "last_node",
++    "last_host_node",
++    "best_match_node",
++    "host_hit_length",
++    "swa_host_hit_length",
++    "mamba_host_hit_length",
++    "mamba_branching_seqlen",
++    "swa_branching_seqlen",
++    "num_matched_prefix_tokens",
++    "host_loaded_length",
++    "extend_end",
++    "lock",
++    "logprob_start_len",
++    "_prefix_admission_identity",
++    "_prefix_admission_lifecycle",
++    "extend_batch_idx",
++    "cached_tokens",
++    "cached_tokens_device",
++    "cached_tokens_host",
++    "cached_tokens_storage",
++    "_cache_breakdown_computed",
++    "already_computed",
++    "is_retracted",
++    "retracted_stain",
++    "extra_key",
++    "cache_salt",
++    "matched_window_host_hit_lengths",
++)
++_ADDER_FIELDS = (
++    "rem_input_tokens",
++    "rem_chunk_tokens",
++    "rem_dllm_tokens",
++    "new_chunked_req",
++    "log_hit_tokens",
++    "reprocessed_log_hit_tokens",
++    "log_device_hit_tokens",
++    "log_host_hit_tokens",
++    "log_storage_hit_tokens",
++    "log_input_tokens",
++    "log_replay_tokens",
++    "reprocessed_log_input_tokens",
++    "kv_shard_block_bound_pages",
++    "kv_shard_chunk_pages",
++)
++_MISSING = object()
++
++
++def _snapshot(obj, names):
++    return {name: getattr(obj, name, _MISSING) for name in names}
++
++
++def _restore(obj, values):
++    for name, value in values.items():
++        if value is _MISSING:
++            if hasattr(obj, name):
++                delattr(obj, name)
++        else:
++            setattr(obj, name, value)
++
++
++class NativeAdmissionReceipt:
++    """Own every attempt-local native acquisition until membership commits.
++
++    Allocation sites register physical release operations immediately. Python
++    snapshots restore scheduling metadata only; they do not stand in for frees.
++    A failed release is retained as an uncertain receipt and forbids retry.
++    """
++
++    def __init__(self, adder, req):
++        if getattr(req, "_prefix_native_admission_receipt", None) is not None:
++            raise RuntimeError("nested prefix admission transaction")
++        self.adder, self.req = adder, req
++        self.request_before = _snapshot(req, _REQUEST_FIELDS)
++        # ReqKvInfo is a slotted dataclass on this pin. Keep tensor/allocator
++        # handles by identity and copy only mutable metadata containers.
++        kv_names = (
++            (field.name for field in fields(req.kv))
++            if is_dataclass(req.kv)
++            else vars(req.kv).keys()
++        )
++        self.kv_before = {}
++        for name in kv_names:
++            value = getattr(req.kv, name)
++            self.kv_before[name] = (
++                value.copy() if isinstance(value, (dict, list)) else value
++            )
++        self.fill_ids_before = req.full_untruncated_fill_ids
++        self.fill_len_before = len(self.fill_ids_before)
++        self.adder_before = _snapshot(adder, _ADDER_FIELDS)
++        self.lists_before = {
++            name: list(getattr(adder, name))
++            for name in ("can_run_list", "preempt_list")
++        }
++        self.budget_before = adder.memory_budget.admission_checkpoint()
++        self.releases: list[_Release] = []
++        self.closed = False
++        self.commit_prepared = False
++        self.rollback_errors: list[str] = []
++        req._prefix_native_admission_receipt = self
++
++    def record(self, description, release, on_commit=None):
++        if self.closed:
++            raise RuntimeError("resource acquired after admission receipt closed")
++        item = _Release(description, release, on_commit=on_commit)
++        self.releases.append(item)
++        return item
++
++    def record_tree_lock(self, cache, lock):
++        return self.record("tree lock", lambda: cache.unlock(lock))
++
++    def record_state_slots(self, storage, sub_pool, slots):
++        # Retain the allocator's exact returned vector, including every slot.
++        return self.record(
++            "mamba state slots", lambda: storage.free_state_slots(sub_pool, slots)
++        )
++
++    def prepare_commit(self):
++        if self.closed:
++            raise RuntimeError("admission receipt already closed")
++        # Finalizers only detach admission bookkeeping. Keep physical receipts
++        # live until every rank has completed every potentially failing action.
++        for release in self.releases:
++            if release.on_commit is not None:
++                release.on_commit()
++        self.commit_prepared = True
++
++    def commit(self):
++        if self.closed:
++            raise RuntimeError("admission receipt already closed")
++        if not self.commit_prepared:
++            self.prepare_commit()
++        self.closed = True
++        self.req._prefix_native_admission_receipt = None
++        # Native Req/cache ownership now covers the committed resources.
++        self.releases.clear()
++
++    def rollback(self):
++        if self.closed:
++            if self.rollback_errors:
++                raise AdmissionRollbackError("; ".join(self.rollback_errors))
++            return
++        self.closed = True
++        self.req._prefix_native_admission_receipt = None
++        for item in reversed(self.releases):
++            try:
++                item.run()
++            except Exception as exc:
++                self.rollback_errors.append(f"{item.description}: {exc!r}")
++
++        # Restore metadata even when a physical release failed. The coordinator
++        # gathers that failure and terminates instead of attempting reclamation.
++        def restore_lists():
++            for name, before in self.lists_before.items():
++                getattr(self.adder, name)[:] = before
++
++        def restore_kv():
++            for name, value in self.kv_before.items():
++                setattr(self.req.kv, name, value)
++
++        def restore_ids():
++            del self.fill_ids_before[self.fill_len_before :]
++            self.req.full_untruncated_fill_ids = self.fill_ids_before
++
++        restores = (
++            ("adder metadata", lambda: _restore(self.adder, self.adder_before)),
++            ("adder membership", restore_lists),
++            (
++                "nested budget",
++                lambda: self.adder.memory_budget.restore_admission_checkpoint(
++                    self.budget_before
++                ),
++            ),
++            ("request metadata", lambda: _restore(self.req, self.request_before)),
++            ("request KV metadata", restore_kv),
++            ("request fill ids", restore_ids),
++        )
++        for description, restore in restores:
++            try:
++                restore()
++            except Exception as exc:
++                self.rollback_errors.append(f"{description}: {exc!r}")
++        if self.rollback_errors:
++            raise AdmissionRollbackError("; ".join(self.rollback_errors))
++
++
++def notify_prefix_lifecycle(req, event: str):
++    callback = getattr(req, "_prefix_admission_lifecycle", None)
++    if callback is not None:
++        callback(req, event, getattr(req, "_prefix_admission_identity", None))
++
++
++class PrefixAdmissionCoordinator:
++    """All TP ranks enter each decision and rollback barrier in the same order."""
++
++    def __init__(self, scheduler, *, parallel=None):
++        self.scheduler = scheduler
++        if parallel is None:
++            from sglang.srt.runtime_context import get_parallel
++
++            parallel = get_parallel()
++        self.parallel = parallel
++        self.lifecycle_errors: list[str] = []
++
++    def gather(self, value):
++        s = self.scheduler
++        if self.parallel.tp_size == 1:
++            return [value]
++        import torch.distributed as dist
++
++        values = [None] * self.parallel.tp_size
++        dist.all_gather_object(values, value, group=s.tp_cpu_group)
++        return values
++
++    def broadcast(self, value):
++        s = self.scheduler
++        if self.parallel.tp_size == 1:
++            return value
++        import torch.distributed as dist
++
++        values = [value]
++        dist.broadcast_object_list(
++            values, src=s.tp_group.ranks[0], group=s.tp_cpu_group
++        )
++        return values[0]
++
++    def phase(self, call):
++        value, error = None, None
++        try:
++            value = call()
++        except Exception as exc:
++            logger.warning(
++                "Prefix admission local phase failed: %s", exc, exc_info=True
++            )
++            error = f"{type(exc).__name__}: {exc}"
++        return value, self.gather(error)
++
++    @staticmethod
++    def check(errors, phase):
++        if any(x is not None for x in errors):
++            raise RuntimeError(f"TP prefix {phase} failed: {errors!r}")
++
++    def check_order(self, reqs):
++        orders = self.gather(tuple(req.rid for req in reqs))
++        if any(order != orders[0] for order in orders[1:]):
++            raise RuntimeError("TP prefix waiting request order differs")
++
++    def poll(self):
++        observer = self.scheduler.prefix_admission_observer
++        if observer is not None:
++
++            def poll_local():
++                if self.lifecycle_errors:
++                    raise RuntimeError(repr(self.lifecycle_errors))
++                return observer.poll(self.scheduler)
++
++            _, errors = self.phase(poll_local)
++            self.check(errors, "poll")
++
++    def lifecycle(self, req, event, identity=None):
++        observer = self.scheduler.prefix_admission_observer
++        if observer is not None:
++            try:
++                observer.lifecycle(self.scheduler, req, event, identity)
++            except Exception as exc:
++                # Deferred responses exist on the output rank only. Lifecycle
++                # itself cannot enter a collective; the next all-rank safe
++                # point gathers and raises local failures before new work.
++                self.lifecycle_errors.append(f"{event} {identity!r}: {exc!r}")
++        if event == "shutdown" and self.lifecycle_errors:
++            # Terminal teardown has no later all-rank poll. Preserve its local
++            # failure as a process error, without entering a collective while
++            # peer schedulers may already be exiting.
++            raise RuntimeError(f"prefix shutdown failed: {self.lifecycle_errors!r}")
++
++    def _validate_native_scope(self, req, adder):
++        s = self.scheduler
++        forbidden = (
++            adder.rem_chunk_tokens is not None,
++            req.session is not None,
++            req.kv.holds_kv,
++            req.lock is not None,
++            s.enable_hierarchical_cache,
++            s.enable_hicache_storage,
++            s.enable_lmcache,
++            getattr(s, "enable_unified_cache_external_linker", False),
++            s.enable_priority_preemption,
++            s.dllm_config is not None,
++            getattr(s, "enable_lora", False),
++            getattr(s, "enable_hisparse", False),
++            getattr(s, "uocr_runtime", None) is not None,
++            getattr(s, "is_mixed_chunk", False),
++            self.parallel.pp_size != 1,
++            self.parallel.attn_cp_size != 1,
++            self.parallel.dcp_size != 1,
++            self.parallel.attn_dp_size != 1,
++            getattr(req, "beam_group", None) is not None,
++        )
++        if any(forbidden):
++            raise ValueError(
++                "prefix admission v1 requires nonchunked device-only prefill"
++            )
++
++    def admit(self, req, adder, has_chunked_req, truncation_align_size):
++        """Return None for an ordinary request, otherwise native AddReqResult."""
++        from sglang.srt.managers.schedule_policy import AddReqResult
++        from sglang.srt.mem_cache.capacity import shares_memory
++
++        s, observer = self.scheduler, self.scheduler.prefix_admission_observer
++        for attempt in range(2):
++            receipt = None
++            proposal = None
++            committed = False
++            budget_declined = False
++            reason = "admission failed"
++            try:
++                receipt, errors = self.phase(lambda: NativeAdmissionReceipt(adder, req))
++                self.check(errors, "native receipt")
++
++                def prepare():
++                    value = observer.prepare(s, req)
++                    if value is not None and not isinstance(
++                        value, PrefixAdmissionProposal
++                    ):
++                        raise TypeError(
++                            "prepare must return PrefixAdmissionProposal or None"
++                        )
++                    return value
++
++                proposal, errors = self.phase(prepare)
++                self.check(errors, "prepare")
++                selected = self.gather(proposal is not None)
++                if not any(selected):
++                    # prepare(None) must not acquire plugin resources.
++                    _, errors = self.phase(receipt.rollback)
++                    self.check(errors, "ordinary request restoration")
++                    committed = True
++                    return (
++                        AddReqResult.OTHER
++                        if getattr(adder, "_prefix_pending_admissions", None)
++                        else None
++                    )
++                if not all(selected):
++                    raise RuntimeError("TP prefix protocol request membership differs")
++                if adder.can_run_list and not getattr(
++                    adder, "_prefix_pending_admissions", None
++                ):
++                    reason = "different_prefill_protocol"
++                    return AddReqResult.OTHER
++                _, errors = self.phase(lambda: self._validate_native_scope(req, adder))
++                self.check(errors, "scope")
++                identities = self.gather(proposal.identity)
++                if len(set(identities)) != 1:
++                    raise RuntimeError(
++                        f"TP prefix execution identities differ: {identities!r}"
++                    )
++                cap = self.broadcast(proposal.max_prefix_len)
++                proposal = PrefixAdmissionProposal(
++                    cap, proposal.identity, proposal.opaque
++                )
++                req._prefix_admission_identity = proposal.identity
++                req._prefix_admission_lifecycle = self.lifecycle
++                _, errors = self.phase(
++                    lambda: req.init_next_round_input(
++                        s.tree_cache,
++                        max_prefix_len=cap,
++                        defer_cow_slot=shares_memory(s.token_to_kv_pool_allocator),
++                    )
++                )
++                self.check(errors, "native match")
++                lengths = self.gather(req.prefix_len)
++                if len(set(lengths)) != 1 or not 0 <= lengths[0] <= cap:
++                    raise RuntimeError(f"TP prefix legal lengths differ: {lengths!r}")
++                lawful_l = lengths[0]
++                defer, errors = self.phase(lambda: adder.should_defer(req))
++                self.check(errors, "native deferral check")
++                if any(self.gather(defer)):
++                    reason = "native_admission_deferred"
++                    return AddReqResult.OTHER
++                if any(self.gather(req.needs_host_load_back())):
++                    raise ValueError(
++                        "prefix admission v1 does not support host load-back"
++                    )
++                _, errors = self.phase(
++                    lambda: observer.after_match(s, req, proposal, lawful_l)
++                )
++                self.check(errors, "after_match")
++                accepted, errors = self.phase(
++                    lambda: observer.reserve(s, req, proposal, lawful_l)
++                )
++                self.check(errors, "reserve")
++                if not all(self.gather(accepted is True)):
++                    budget_declined = True
++                    reason = "capture_budget_declined"
++                else:
++                    result, errors = self.phase(
++                        lambda: adder.add_one_req(
++                            req, has_chunked_req, truncation_align_size
++                        )
++                    )
++                    self.check(errors, "native admission")
++                    votes = self.gather(
++                        (
++                            any(item is req for item in adder.can_run_list),
++                            req.prefix_len,
++                            len(req.full_untruncated_fill_ids),
++                            proposal.identity,
++                            result.name,
++                        )
++                    )
++                    if any(v[1:4] != votes[0][1:4] for v in votes):
++                        raise RuntimeError(
++                            f"TP prefix admitted plans differ: {votes!r}"
++                        )
++                    if all(v[0] for v in votes):
++                        if not hasattr(adder, "_prefix_pending_admissions"):
++                            adder._prefix_pending_admissions = []
++                        adder._prefix_pending_admissions.append(
++                            (receipt, proposal, lawful_l)
++                        )
++                        committed = True
++                        # The verdict controls the next request, not membership.
++                        return (
++                            result
++                            if len({v[4] for v in votes}) == 1
++                            else AddReqResult.OTHER
++                        )
++                    reason = "native_admission_declined"
++            except Exception as exc:
++                reason = str(exc)
++                raise PrefixAdmissionRejected(reason) from exc
++            finally:
++                if not committed:
++                    cleanup_errors = []
++                    try:
++                        if receipt is not None:
++                            receipt.rollback()
++                    except Exception as exc:
++                        cleanup_errors.append(f"native: {exc!r}")
++                    try:
++                        observer.rollback(s, req, proposal, reason)
++                    except Exception as exc:
++                        cleanup_errors.append(f"plugin: {exc!r}")
++                    # A rank-local cleanup error cannot let its siblings retry.
++                    all_cleanup_errors = self.gather(cleanup_errors)
++                    if any(all_cleanup_errors):
++                        raise AdmissionRollbackError(
++                            f"TP prefix rollback failed: {all_cleanup_errors!r}"
++                        )
++            if budget_declined and attempt == 0:
++                self.poll()
++                continue
++            return AddReqResult.OTHER
++        raise AssertionError("unreachable prefix admission retry")
++
++    def prepare_batch(self, adder, batch):
++        """Acquire actual batch resources, agree TP success, then freeze plans."""
++        pending = getattr(adder, "_prefix_pending_admissions", [])
++        if not pending:
++            batch.prepare_for_extend()
++            return
++        observer, s = self.scheduler.prefix_admission_observer, self.scheduler
++        reason = "batch construction failed"
++        committed = False
++        try:
++            _, errors = self.phase(batch.prepare_for_extend)
++            self.check(errors, "batch allocation")
++            for receipt, proposal, lawful_l in pending:
++                _, errors = self.phase(
++                    lambda: observer.commit(s, receipt.req, proposal, lawful_l)
++                )
++                self.check(errors, "commit")
++            _, errors = self.phase(
++                lambda: [receipt.prepare_commit() for receipt, _, _ in pending]
++            )
++            self.check(errors, "native commit preparation")
++            for receipt, _, _ in pending:
++                receipt.commit()
++            committed = True
++        except Exception as exc:
++            reason = str(exc)
++            raise
++        finally:
++            if not committed:
++                self.rollback_pending(adder, reason)
++            adder._prefix_pending_admissions = []
++
++    def build_batch(self, adder, factory):
++        if not getattr(adder, "_prefix_pending_admissions", None):
++            batch = factory()
++            batch.prepare_for_extend()
++            return batch
++        try:
++            batch, errors = self.phase(factory)
++            self.check(errors, "batch construction")
++        except Exception:
++            self.rollback_pending(adder, "batch construction failed")
++            adder._prefix_pending_admissions = []
++            raise
++        self.prepare_batch(adder, batch)
++        return batch
++
++    def rollback_pending(self, adder, reason):
++        errors = []
++        for receipt, proposal, _ in reversed(
++            getattr(adder, "_prefix_pending_admissions", [])
++        ):
++            try:
++                receipt.rollback()
++            except Exception as exc:
++                errors.append(f"native {proposal.identity!r}: {exc!r}")
++            try:
++                self.scheduler.prefix_admission_observer.rollback(
++                    self.scheduler, receipt.req, proposal, reason
++                )
++            except Exception as exc:
++                errors.append(f"plugin {proposal.identity!r}: {exc!r}")
++        all_errors = self.gather(errors)
++        if any(all_errors):
++            raise AdmissionRollbackError(f"TP batch rollback failed: {all_errors!r}")
++        adder._prefix_pending_admissions = []
++
++
++def batch_admission_receipt(reqs):
++    receipts = [getattr(req, "_prefix_native_admission_receipt", None) for req in reqs]
++    if not any(receipts):
++        return None
++    if not all(receipts):
++        raise RuntimeError(
++            "transactional and ordinary prefills cannot share allocations"
++        )
++    return receipts[0]
++
++
++def record_batch_token_allocation(batch, storage, token_ids):
++    """Receipt for newly allocated pages, excluding a borrowed prefix tail."""
++    receipt = batch_admission_receipt(batch.reqs)
++    if receipt is None:
++        return None
++    page_size = batch.token_to_kv_pool_allocator.page_size
++    segments, offset = [], 0
++    for prefix_len, extend_len in zip(batch.prefix_lens, batch.extend_lens):
++        borrowed = min(extend_len, (-prefix_len) % page_size)
++        if borrowed < extend_len:
++            segments.append(token_ids[offset + borrowed : offset + extend_len])
++        offset += extend_len
++
++    def release():
++        for segment in segments:
++            storage.free_tokens(segment)
++
++    return receipt.record("batch token KV pages", release)
++
++
++def record_request_rows(table, rows, receipt):
++    """Record raw rows before generation updates, callbacks or Req binding."""
++    if receipt is None:
++        return
++    if not hasattr(table, "_prefix_admission_row_releases"):
++        table._prefix_admission_row_releases = {}
++    registry = table._prefix_admission_row_releases
++    for row in rows:
++        if row in registry:
++            raise RuntimeError("request row already has an admission owner")
++
++        def release(row=row):
++            registry.pop(row, None)
++            table._free_rows_without_admission([row])
++
++        registry[row] = receipt.record(
++            "request row", release, on_commit=lambda row=row: registry.pop(row, None)
++        )
++
++
++def free_request_rows(table, rows):
++    """Native exhaustion cleanup consumes the same exact row receipts."""
++    registry = getattr(table, "_prefix_admission_row_releases", {})
++    for row in rows:
++        release = registry.get(row)
++        if release is None:
++            table._free_rows_without_admission([row])
++        else:
++            release.run()
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 1ce1cbd27a..39255107fb 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1141,6 +1141,7 @@ class Req(ReqDllmMixin):
+         cow_mamba: Optional[bool] = None,
+         *,
+         defer_cow_slot: bool = False,
++        max_prefix_len: Optional[int] = None,
+     ):
+         if self.is_dllm():
+             self._init_fill_ids_for_dllm()
+@@ -1169,6 +1170,8 @@ class Req(ReqDllmMixin):
+         # avoiding an O(context) copy per prefill-batch build.
+         token_ids_to_match = self.full_untruncated_fill_ids
+         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
++        if max_prefix_len is not None:
++            key_limit = min(max(key_limit, 0), max_prefix_len)
+
+         # Disable prefix caching when embed overrides are present: same token IDs
+         # with different override vectors must not share cached KV values.
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index e1fd1892a4..ac78bb019a 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -240,13 +240,17 @@ class SchedulePolicy:
+         running_batch: Optional[ScheduleBatch] = None,
+         processed_tokens: int = 0,
+         bootstrap_queue: Iterable[Req] = (),
++        prefix_match_max_len: Optional[int] = None,
+     ) -> List[Req]:
+         """The waiting requests in the order the policy admits them."""
+         waiting_queue = list(waiting)
+-        if self._bounded_active or (
+-            len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+-            and self._bounded_lpm_enabled
+-            and self.policy == CacheAwarePolicy.LPM
++        if prefix_match_max_len is None and (
++            self._bounded_active
++            or (
++                len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
++                and self._bounded_lpm_enabled
++                and self.policy == CacheAwarePolicy.LPM
++            )
+         ):
+             was_active = self._bounded_active
+             if was_active:
+@@ -288,14 +292,19 @@ class SchedulePolicy:
+                 and get_disagg().disaggregation_mode != "decode"
+             ):
+                 for r in tail:
+-                    r.init_next_round_input(self.tree_cache)
+-            self._touch_waiting_prefixes(
+-                CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
+-            )
++                    r.init_next_round_input(
++                        self.tree_cache,
++                        cow_mamba=False if prefix_match_max_len is not None else None,
++                        max_prefix_len=prefix_match_max_len,
++                    )
++            if prefix_match_max_len is None:
++                self._touch_waiting_prefixes(
++                    CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
++                )
+             if not self._bounded_members:
+                 return waiting_queue
+             deprioritized = self._compute_prefix_matches(
+-                self._bounded_members, CacheAwarePolicy.LPM
++                self._bounded_members, CacheAwarePolicy.LPM, prefix_match_max_len
+             )
+             self._sort_by_longest_prefix(self._bounded_members, deprioritized)
+             next_ids = {id(r) for r in self._bounded_next_members}
+@@ -315,7 +324,7 @@ class SchedulePolicy:
+             and get_disagg().disaggregation_mode != "decode"
+         ):
+             for r in waiting_queue:
+-                match_kv_cache(r, self.tree_cache)
++                match_kv_cache(r, self.tree_cache, max_prefix_len=prefix_match_max_len)
+
+         if self.policy == CacheAgnosticPolicy.FCFS:
+             if self.enable_priority_scheduling:
+@@ -324,7 +333,7 @@ class SchedulePolicy:
+                 )
+         elif isinstance(policy, CacheAwarePolicy):
+             temporary_deprioritized = self._compute_prefix_matches(
+-                waiting_queue, policy
++                waiting_queue, policy, prefix_match_max_len
+             )
+             if policy == CacheAwarePolicy.LPM:
+                 SchedulePolicy._sort_by_longest_prefix(
+@@ -368,7 +377,8 @@ class SchedulePolicy:
+             else:
+                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+
+-        self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
++        if prefix_match_max_len is None:
++            self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
+         return waiting_queue
+
+     def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
+@@ -538,7 +548,8 @@ class SchedulePolicy:
+                 raise ValueError(f"Unknown schedule_policy: {policy=}")
+
+     def _compute_prefix_matches(
+-        self, waiting_queue: List[Req], policy: CacheAwarePolicy
++        self, waiting_queue: List[Req], policy: CacheAwarePolicy,
++        prefix_match_max_len: Optional[int] = None,
+     ) -> Set[int]:
+         temporary_deprioritized: Set[int] = set()
+         self.waiting_queue_radix_tree.reset()
+@@ -548,7 +559,7 @@ class SchedulePolicy:
+         candidates = []
+         for r in waiting_queue:
+             prefix_ids = r.origin_input_ids + r.output_ids
+-            match_kv_cache(r, self.tree_cache, prefix_ids)
++            match_kv_cache(r, self.tree_cache, prefix_ids, max_prefix_len=prefix_match_max_len)
+             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
+                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
+@@ -2222,7 +2233,11 @@ class PrefillAdder:
+     ) -> None:
+         assert req.prefix_len == admission.prefix_len
+         req.extend_end = admission.prefix_len + admission.extend_len
+-        req.lock = self.tree_cache.lock(req.last_node)
++        lock = self.tree_cache.lock(req.last_node)
++        receipt = getattr(req, "_prefix_native_admission_receipt", None)
++        if receipt is not None and lock is not None:
++            receipt.record_tree_lock(self.tree_cache, lock)
++        req.lock = lock
+         self.can_run_list.append(req)
+         if admission.is_chunked:
+             self.new_chunked_req = req
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index f3de591871..7d4ced2509 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -153,7 +153,10 @@ from sglang.srt.managers.io_struct import (
+     AttachHiCacheStorageReqOutput,
+     BatchTokenizedEmbeddingReqInput,
+     BatchTokenizedGenerateReqInput,
++    PluginControlReqInput,
++    PluginControlReqOutput,
+     BeginWeightUpdateReqInput,
++    BeginWeightUpdateReqOutput,
+     CheckWeightsReqInput,
+     ClearHiCacheReqInput,
+     ClearHiCacheReqOutput,
+@@ -167,6 +170,7 @@ from sglang.srt.managers.io_struct import (
+     DumperControlReqInput,
+     DumperControlReqOutput,
+     EndWeightUpdateReqInput,
++    EndWeightUpdateReqOutput,
+     ExpertDistributionReq,
+     ExpertDistributionReqOutput,
+     ExpertDistributionReqType,
+@@ -192,6 +196,7 @@ from sglang.srt.managers.io_struct import (
+     PauseGenerationReqInput,
+     PdRoleSwitchReqInput,
+     PluginWeightUpdateReqInput,
++    PluginWeightUpdateReqOutput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
+@@ -214,9 +219,13 @@ from sglang.srt.managers.io_struct import (
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
+     UpdateWeightFromDiskReqInput,
++    UpdateWeightFromDiskReqOutput,
+     UpdateWeightsFromDistributedReqInput,
++    UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
++    UpdateWeightsFromIPCReqOutput,
+     UpdateWeightsFromTensorReqInput,
++    UpdateWeightsFromTensorReqOutput,
+     UpdateWeightVersionReqInput,
+     UpdateWeightVersionReqOutput,
+     sock_send,
+@@ -239,6 +248,12 @@ from sglang.srt.managers.prefill_delayer import (
+     PrefillDelayerSinglePassExecutor,
+     RecentPrefillBatchSizeTracker,
+ )
++from sglang.srt.managers.prefix_admission import (
++    PrefixAdmissionCoordinator,
++    PrefixAdmissionRejected,
++    notify_prefix_lifecycle,
++)
++
+ from sglang.srt.managers.req_types import (
+     FINISH_ABORT,
+     MultimodalInputs,
+@@ -541,6 +556,8 @@ class Scheduler(
+         # with minimal glue. Move substantial component-specific logic into
+         # dedicated methods instead of adding inline blocks here.
+         self.init_startup_timing_begin()
++        self.prefix_admission_observer = None
++        self.prefix_admission_coordinator = PrefixAdmissionCoordinator(self, parallel=get_parallel())
+         self.is_initializing = True
+         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+         self.forward_ct: int = 0
+@@ -815,6 +832,13 @@ class Scheduler(
+         self.is_initializing = False
+         self.init_startup_timing_summary()
+
++    def prefix_admission_broadcast(self, value):
++        """Owner-thread TP helper for plugin epochs and server-issued tokens."""
++        return self.prefix_admission_coordinator.broadcast(value)
++
++    def prefix_admission_gather(self, value):
++        return self.prefix_admission_coordinator.gather(value)
++
+     def init_startup_timing_begin(self) -> None:
+         self.scheduler_startup_begin = time.perf_counter()
+
+@@ -2070,6 +2094,7 @@ class Scheduler(
+                 (ConfigureLoggingReq, self.configure_logging),
+                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
+                 (DumperControlReqInput, self.handle_dumper_control),
++                (PluginControlReqInput, self.handle_plugin_control),
+                 (AddExternalCorpusReqInput, self.add_external_corpus),
+                 (
+                     RemoveExternalCorpusReqInput,
+@@ -2360,6 +2385,7 @@ class Scheduler(
+             # Count successful receive/broadcast time as active; empty polls stay idle.
+             self.metrics_reporter.record_scheduler_active(recv_start_ns)
+         self.process_input_requests(recv_reqs)
++        self.prefix_admission_coordinator.poll()
+         return received_reqs
+
+     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
+@@ -2392,7 +2418,9 @@ class Scheduler(
+                 self._dispatch_tokenized_mm_requests(recv_req, vmm_errors)
+                 continue
+
+-            output = self._request_dispatcher(recv_req)
++            output = self._guard_prefix_weight_update(recv_req)
++            if output is None:
++                output = self._request_dispatcher(recv_req)
+             if output is None:
+                 output = self._rust_control_ack(recv_req)
+             if output is not None:
+@@ -3955,6 +3983,11 @@ class Scheduler(
+             return False
+         return True
+
++    def _reject_prefix_admission(self, req: Req, exc: PrefixAdmissionRejected) -> None:
++        logger.warning("Prefix admission rejected rid=%s: %s", req.rid, exc, exc_info=True)
++        reason = FINISH_ABORT(str(exc), HTTPStatus.BAD_REQUEST)
++        self.request_retirer.abort(req, reason=reason, finished_reason=reason.to_json())
++
+     def _abort_unavailable(self, req: Req, *, message: str) -> None:
+         self.request_retirer.abort(
+             req,
+@@ -4574,6 +4607,13 @@ class Scheduler(
+             # request clears the flag elsewhere, so admission would stay shut.
+             running_batch.batch_is_full = False
+
++        coordinator = (
++            self.prefix_admission_coordinator if self.prefix_admission_observer is not None else None
++        )
++        if coordinator is not None:
++            coordinator.check_order(self.waiting_queue)
++            running_batch.batch_is_full = any(coordinator.gather(running_batch.batch_is_full))
++
+         if (
+             running_batch.batch_is_full or len(self.waiting_queue) == 0
+         ) and self.chunked_req is None:
+@@ -4581,7 +4621,7 @@ class Scheduler(
+
+         running_bs = len(running_batch.reqs)
+         # Skipped during a chunked prefill: that pass must proceed regardless.
+-        if (
++        delay_prefill = (
+             self.min_free_slots_delayer is not None
+             and self.chunked_req is None
+             and self.min_free_slots_delayer.should_delay(
+@@ -4590,7 +4630,10 @@ class Scheduler(
+                     running_bs, running_batch=running_batch
+                 ),
+             )
+-        ):
++        )
++        if coordinator is not None:
++            delay_prefill = any(coordinator.gather(delay_prefill))
++        if delay_prefill:
+             return None, running_batch
+
+         num_allocatable_reqs = self.get_num_allocatable_reqs(
+@@ -4604,11 +4647,14 @@ class Scheduler(
+                     running_bs, running_batch=running_batch
+                 )
+
++        no_rows = num_allocatable_reqs <= 0
++        if coordinator is not None:
++            no_rows = any(coordinator.gather(no_rows))
+         # A chunked request skips this check: it keeps its req_to_token row across
+         # chunks, and under PP it (or a dllm request) may finish in another
+         # microbatch, so holding it back here would leak its memory.
+         if (
+-            num_allocatable_reqs <= 0
++            no_rows
+             and self.chunked_req is None
+             and not self.enable_priority_preemption
+         ):
+@@ -4619,18 +4665,26 @@ class Scheduler(
+         self._ack_waiting_health_checks()
+         # Get priority queue
+         self.policy.poll_storage_prefetches(self.waiting_queue)
+-        self.waiting_queue.reorder(
+-            self.policy.calc_priority(
+-                self.waiting_queue,
+-                running_batch,
+-                processed_tokens=self.processed_tokens_counter,
+-                bootstrap_queue=(
+-                    self.disagg_prefill_bootstrap_queue.queue
+-                    if self.disagg_prefill_bootstrap_queue is not None
+-                    else []
+-                ),
++        def prioritize():
++            self.waiting_queue.reorder(
++                self.policy.calc_priority(
++                    self.waiting_queue,
++                    running_batch,
++                    processed_tokens=self.processed_tokens_counter,
++                    bootstrap_queue=(
++                        self.disagg_prefill_bootstrap_queue.queue
++                        if self.disagg_prefill_bootstrap_queue is not None
++                        else []
++                    ),
++                    prefix_match_max_len=0 if coordinator is not None else None,
++                )
+             )
+-        )
++        if coordinator is not None:
++            _, errors = coordinator.phase(prioritize)
++            coordinator.check(errors, "policy probe")
++            coordinator.check_order(self.waiting_queue)
++        else:
++            prioritize()
+
+         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+             # If we are testing retraction and the running batch size exceeds
+@@ -4717,160 +4771,199 @@ class Scheduler(
+
+         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
+         if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+-        buffer_pipeline = self.tree_cache.buffer_pipeline
+-        # A parked chunk found no budget in this pass: admit no one ahead of it,
+-        # so no batch carries a chunked request it does not run.
+-        chunk_parked = (
+-            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+-        )
+-        # Requests no memory will ever come back for; aborted after the loop.
+-        unschedulable: List[Req] = []
+-        # Get requests from the waiting queue to a new prefill batch
+-        bounded_active = self.policy._bounded_active
+-        candidates = (
+-            self.policy.admission_candidates(self.waiting_queue)
+-            if bounded_active
+-            else self.waiting_queue
+-        )
+-        for req in candidates:
+-            if bounded_active and not self.policy.allows_admission(req):
+-                break
+-            # A spent pass budget admits no one, even before the first
+-            # candidate: the resumed chunk or mixed decode rows can spend it.
+-            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
+-                break
+-            if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
+-                continue
+-
+-            # A forward batch runs one pooling mode, so setwise readout requests
+-            # (token_indices_to_pool) cannot share a batch with last-token ones.
+-            # Admit only the first request's mode; the other stays queued.
+-            if adder.can_run_list and (
+-                (req.token_indices_to_pool is not None)
+-                != (adder.can_run_list[0].token_indices_to_pool is not None)
+-            ):
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
+-                continue
+-
+-            running_bs = len(running_batch.reqs)
+-            candidate_beam_width = (
+-                req.beam_group.beam_width if req.beam_group is not None else None
+-            )
+-            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+-                running_bs,
+-                candidate_beam_width,
+-                running_batch=running_batch,
+-                num_held_rows=num_held_rows,
+-                admitted_reqs=adder.can_run_list,
+-            ):
+-                running_batch.batch_is_full = True
+-
+-            if running_batch.batch_is_full:
+-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+-                    req
+-                ):
+-                    break
+-
+-            if (
+-                self.enable_hicache_storage
+-                or self.enable_lmcache
+-                or self.enable_unified_cache_external_linker
+-            ):
+-                prefetch_done = self.tree_cache.check_prefetch_progress(
+-                    req.cache_request_handle
++            if coordinator is None:
++                mamba_allocator.alloc_group_begin(len(self.waiting_queue))
++            else:
++                _, errors = coordinator.phase(
++                    lambda: mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+                 )
+-                req.time_stats.observe_storage_prefetch_ready(prefetch_done)
+-                if not prefetch_done:
+-                    # skip staging requests that are ongoing prefetch
++                coordinator.check(errors, "state allocation group begin")
++        try:
++            buffer_pipeline = self.tree_cache.buffer_pipeline
++            # A parked chunk found no budget in this pass: admit no one ahead of it,
++            # so no batch carries a chunked request it does not run.
++            chunk_parked = (
++                self.chunked_req is not None and self.chunked_req not in adder.can_run_list
++            )
++            # Requests no memory will ever come back for; aborted after the loop.
++            unschedulable: List[Req] = []
++            # Get requests from the waiting queue to a new prefill batch
++            bounded_active = self.policy._bounded_active
++            candidates = (
++                self.policy.admission_candidates(self.waiting_queue)
++                if bounded_active
++                else self.waiting_queue
++            )
++            if coordinator is not None:
++                candidates = tuple(candidates)
++                coordinator.check_order(candidates)
++            for req in candidates:
++                if bounded_active and not self.policy.allows_admission(req):
++                    break
++                # A spent pass budget admits no one, even before the first
++                # candidate: the resumed chunk or mixed decode rows can spend it.
++                exhausted = chunk_parked or adder.budget_state() == AddReqResult.OTHER
++                if coordinator is not None:
++                    exhausted = any(coordinator.gather(exhausted))
++                if exhausted:
++                    break
++                if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                     if bounded_active:
+                         self.policy.mark_admission_skipped(req)
+                     continue
+-                # Pop the L3-loaded span. Unified cache exposes its absolute
+-                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+-                loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+-                    req.cache_request_handle
+-                )
+-                if loaded_tokens > 0:
+-                    req.storage_hit_length = loaded_tokens
+-                    req.storage_hit_start = loaded_start
+-                    # Cache-mode host memory is a resident L2 tier. Buffer mode
+-                    # marks the staged span below once it is surfaced.
+-                    req.host_hit_is_storage = False
+-
+-            # On a shared memory the match takes no state slot: admission prices
+-            # it, and the slot is bound with the row. A request this pass leaves
+-            # queued drops the copy its match staged.
+-            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
+-            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+-            if adder.should_defer(req):
+-                if defer_cow_slot:
+-                    self._drop_unadmitted_match(req)
+-                break
+-            if self.enable_hicache_storage and (
+-                self._prefetch_after_device_hit_loss(req)
+-            ):
+-                if defer_cow_slot:
+-                    self._drop_unadmitted_match(req)
+-                if bounded_active:
+-                    self.policy.mark_admission_skipped(req)
+-                continue
+-            if self.enable_hicache_storage and buffer_pipeline is not None:
+-                staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
+-                req.time_stats.observe_storage_staging_ready(staging_ready)
+-                if not staging_ready:
+-                    if defer_cow_slot:
+-                        self._drop_unadmitted_match(req)
++
++                # A forward batch runs one pooling mode, so setwise readout requests
++                # (token_indices_to_pool) cannot share a batch with last-token ones.
++                # Admit only the first request's mode; the other stays queued.
++                if adder.can_run_list and (
++                    (req.token_indices_to_pool is not None)
++                    != (adder.can_run_list[0].token_indices_to_pool is not None)
++                ):
+                     if bounded_active:
+                         self.policy.mark_admission_skipped(req)
+                     continue
+-            res = adder.add_one_req(
+-                req,
+-                has_chunked_req=(self.chunked_req is not None),
+-                truncation_align_size=self.truncation_align_size,
+-            )
+
+-            if self.enable_lora:
+-                running_loras.add(req.lora_id)
++                running_bs = len(running_batch.reqs)
++                candidate_beam_width = (
++                    req.beam_group.beam_width if req.beam_group is not None else None
++                )
++                num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
++                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
++                    running_bs,
++                    candidate_beam_width,
++                    running_batch=running_batch,
++                    num_held_rows=num_held_rows,
++                    admitted_reqs=adder.can_run_list,
++                ):
++                    running_batch.batch_is_full = True
+
+-            if res != AddReqResult.CONTINUE:
+-                if res == AddReqResult.NO_TOKEN:
+-                    running_batch.batch_is_full = adder.batch_is_full_after_rejection(
++                if coordinator is not None:
++                    running_batch.batch_is_full = any(coordinator.gather(running_batch.batch_is_full))
++                if running_batch.batch_is_full:
++                    if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                         req
++                    ):
++                        break
++
++                if (
++                    self.enable_hicache_storage
++                    or self.enable_lmcache
++                    or self.enable_unified_cache_external_linker
++                ):
++                    prefetch_done = self.tree_cache.check_prefetch_progress(
++                        req.cache_request_handle
++                    )
++                    req.time_stats.observe_storage_prefetch_ready(prefetch_done)
++                    if not prefetch_done:
++                        # skip staging requests that are ongoing prefetch
++                        if bounded_active:
++                            self.policy.mark_admission_skipped(req)
++                        continue
++                    # Pop the L3-loaded span. Unified cache exposes its absolute
++                    # start so cache-mode L2/L3 attribution survives L3-tail eviction.
++                    loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
++                        req.cache_request_handle
++                    )
++                    if loaded_tokens > 0:
++                        req.storage_hit_length = loaded_tokens
++                        req.storage_hit_start = loaded_start
++                        # Cache-mode host memory is a resident L2 tier. Buffer mode
++                        # marks the staged span below once it is surfaced.
++                        req.host_hit_is_storage = False
++
++                res = None
++                if coordinator is not None:
++                    try:
++                        res = coordinator.admit(
++                            req,
++                            adder,
++                            self.chunked_req is not None,
++                            self.truncation_align_size,
++                        )
++                    except PrefixAdmissionRejected as exc:
++                        self._reject_prefix_admission(req, exc)
++                        continue
++                ordinary = res is None
++                if ordinary:
++                    # On a shared memory the match takes no state slot: admission prices
++                    # it, and the slot is bound with the row. A request this pass leaves
++                    # queued drops the copy its match staged.
++                    defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
++                    req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
++                    if adder.should_defer(req):
++                        if defer_cow_slot:
++                            self._drop_unadmitted_match(req)
++                        break
++                    if self.enable_hicache_storage and (
++                        self._prefetch_after_device_hit_loss(req)
++                    ):
++                        if defer_cow_slot:
++                            self._drop_unadmitted_match(req)
++                        if bounded_active:
++                            self.policy.mark_admission_skipped(req)
++                        continue
++                    if self.enable_hicache_storage and buffer_pipeline is not None:
++                        staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
++                        req.time_stats.observe_storage_staging_ready(staging_ready)
++                        if not staging_ready:
++                            if defer_cow_slot:
++                                self._drop_unadmitted_match(req)
++                            if bounded_active:
++                                self.policy.mark_admission_skipped(req)
++                            continue
++                    res = adder.add_one_req(
++                        req,
++                        has_chunked_req=(self.chunked_req is not None),
++                        truncation_align_size=self.truncation_align_size,
+                     )
+-                # revert matched mamba idx to avoid memory leak, if req is not added.
+-                # Only free if the slot was freshly allocated in this batch (not
+-                # pre-existing from a session). Session-held slots have their own
+-                # lifecycle and freeing them here causes double-free.
+-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+-                if not added:
+-                    self._drop_unadmitted_match(req)
+-                if res == AddReqResult.UNSCHEDULABLE and not added:
+-                    # Nothing holding memory will give it back: waiting would
+-                    # keep the request queued forever.
+-                    unschedulable.append(req)
+-                    continue
+-                break
+
+-        for req in unschedulable:
+-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+-                # As a queued abort: the sender goes before the KV it reads.
+-                self.release_prefill_sender(req, abort_sender=True)
+-            self._abort_unavailable(
+-                req,
+-                message=(
+-                    "The request cannot be scheduled: it fits the KV memory "
+-                    "pool only once memory held elsewhere is freed, and "
+-                    "nothing that holds memory will free it."
+-                ),
+-            )
++                if self.enable_lora:
++                    running_loras.add(req.lora_id)
+
+-        if mamba_allocator is not None:
+-            mamba_allocator.alloc_group_end()
++                if res != AddReqResult.CONTINUE:
++                    if res == AddReqResult.NO_TOKEN:
++                        running_batch.batch_is_full = adder.batch_is_full_after_rejection(
++                            req
++                        )
++                    # revert matched mamba idx to avoid memory leak, if req is not added.
++                    # Only free if the slot was freshly allocated in this batch (not
++                    # pre-existing from a session). Session-held slots have their own
++                    # lifecycle and freeing them here causes double-free.
++                    added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
++                    if not added and ordinary:
++                        self._drop_unadmitted_match(req)
++                    if res == AddReqResult.UNSCHEDULABLE and not added:
++                        # Nothing holding memory will give it back: waiting would
++                        # keep the request queued forever.
++                        unschedulable.append(req)
++                        continue
++                    break
++
++            for req in unschedulable:
++                if self.disaggregation_mode == DisaggregationMode.PREFILL:
++                    # As a queued abort: the sender goes before the KV it reads.
++                    self.release_prefill_sender(req, abort_sender=True)
++                self._abort_unavailable(
++                    req,
++                    message=(
++                        "The request cannot be scheduled: it fits the KV memory "
++                        "pool only once memory held elsewhere is freed, and "
++                        "nothing that holds memory will free it."
++                    ),
++                )
++        except Exception:
++            if coordinator is not None and getattr(adder, "_prefix_pending_admissions", None):
++                coordinator.rollback_pending(adder, "prefill pass failed")
++            raise
++        finally:
++            if mamba_allocator is not None:
++                if coordinator is None:
++                    mamba_allocator.alloc_group_end()
++                else:
++                    _, errors = coordinator.phase(mamba_allocator.alloc_group_end)
++                    if any(error is not None for error in errors):
++                        coordinator.rollback_pending(adder, "state allocation group cleanup failed")
++                    coordinator.check(errors, "state allocation group end")
+
+         # Update waiting queue
+         can_run_list: List[Req] = adder.can_run_list
+@@ -4886,6 +4979,37 @@ class Scheduler(
+             return None, running_batch
+
+         can_run_set = set(can_run_list)
++        batch_chunked_req = adder.new_chunked_req or self.chunked_req
++
++        def create_batch():
++            # Create a new batch
++            new_batch = ScheduleBatch.init_new(
++                can_run_list,
++                self.req_to_token_pool,
++                self.token_to_kv_pool_allocator,
++                self.tree_cache,
++                self.model_config,
++                self.enable_overlap,
++                self.spec_algorithm,
++                chunked_req=batch_chunked_req,
++            )
++
++            # A parked chunked request runs no chunk in this batch.
++            new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
++                batch_chunked_req in can_run_set
++            )
++            new_batch.hisparse_coordinator = self.hisparse_coordinator
++
++            if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
++                # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
++                new_batch.hicache_consumer_index = (
++                    self.tree_cache.ready_to_load_host_cache()
++                )
++            return new_batch
++
++        transactional = coordinator is not None and getattr(adder, "_prefix_pending_admissions", None)
++        if transactional:
++            new_batch = coordinator.build_batch(adder, create_batch)
+         retries = self.tree_cache.storage_prefetch_retries
+         if self.enable_hicache_storage and retries is not None:
+             for req in can_run_list:
+@@ -4913,31 +5037,10 @@ class Scheduler(
+
+         set_time_batch(can_run_list, "set_forward_entry_time")
+
+-        # Create a new batch
+-        new_batch = ScheduleBatch.init_new(
+-            can_run_list,
+-            self.req_to_token_pool,
+-            self.token_to_kv_pool_allocator,
+-            self.tree_cache,
+-            self.model_config,
+-            self.enable_overlap,
+-            self.spec_algorithm,
+-            chunked_req=self.chunked_req,
+-        )
+-
+-        # A parked chunked request runs no chunk in this batch.
+-        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+-            self.chunked_req in can_run_set
+-        )
+-        new_batch.hisparse_coordinator = self.hisparse_coordinator
+-
+-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
+-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+-            new_batch.hicache_consumer_index = (
+-                self.tree_cache.ready_to_load_host_cache()
+-            )
+
+-        new_batch.prepare_for_extend()
++        if not transactional:
++            new_batch = create_batch()
++            new_batch.prepare_for_extend()
+
+         if self.tp_worker.model_runner.prefill_aware_swa:
+             for req in can_run_list:
+@@ -5876,6 +5979,14 @@ class Scheduler(
+             self.batch_result_processor.process_batch_result_prebuilt(batch)
+         elif batch.forward_mode.is_idle():
+             self.batch_result_processor.process_batch_result_idle(batch, result)
++        if self.prefix_admission_observer is not None:
++            for req in batch.reqs:
++                identity = getattr(req, "_prefix_admission_identity", None)
++                if req.finished() and identity is not None and (
++                    getattr(req, "_prefix_finished_identity", None) != identity
++                ):
++                    notify_prefix_lifecycle(req, "finish")
++                    req._prefix_finished_identity = identity
+         self._on_step_processed(batch, result)
+
+         # Submit this batch's queued host backups before the next scheduler step.
+@@ -6087,7 +6198,9 @@ class Scheduler(
+             self.load_inquirer.get_loads, force=True, snapshot=snapshot
+         )
+
+-        if self.deferred_responses.has_pending():
++        observer = self.prefix_admission_observer
++        observer_pending = observer is not None and observer.has_pending_work()
++        if self.deferred_responses.has_pending() or observer_pending:
+             # Held responses are released by polling, not by a socket event:
+             # keep polling, and yield the GIL to the completion's worker.
+             time.sleep(0)
+@@ -6549,6 +6662,16 @@ class Scheduler(
+                 self._pending_chunked_abort_req = chunked_req
+
+     def abort_request(self, recv_req: AbortReq):
++        if self.prefix_admission_observer is not None:
++            active = self.collect_inflight_reqs()
++            for request_list in self.request_lists().values():
++                active.update(request_list)
++            for req in sorted(active, key=lambda item: item.rid):
++                if recv_req.matches(req.rid):
++                    # Queued requests may own a registration before admission.
++                    self.prefix_admission_coordinator.lifecycle(
++                        req, "cancel", getattr(req, "_prefix_admission_identity", None)
++                    )
+         # Abort requests still waiting for encoder embeddings (EPD language-only)
+         if self.mm_receiver is not None:
+             self.mm_receiver.abort_waiting_requests(recv_req)
+@@ -6977,6 +7100,56 @@ class Scheduler(
+         if self.rust_server is None:
+             self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
+
++    def _guard_prefix_weight_update(self, recv_req):
++        observer = self.prefix_admission_observer
++        if observer is None:
++            return None
++        response_types = {
++            UpdateWeightFromDiskReqInput: UpdateWeightFromDiskReqOutput,
++            UpdateWeightsFromDistributedReqInput: UpdateWeightsFromDistributedReqOutput,
++            UpdateWeightsFromTensorReqInput: UpdateWeightsFromTensorReqOutput,
++            UpdateWeightsFromIPCReqInput: UpdateWeightsFromIPCReqOutput,
++            BeginWeightUpdateReqInput: BeginWeightUpdateReqOutput,
++            EndWeightUpdateReqInput: EndWeightUpdateReqOutput,
++            PluginWeightUpdateReqInput: PluginWeightUpdateReqOutput,
++            RpcReqInput: RpcReqOutput,
++        }
++        response_type = response_types.get(type(recv_req))
++        if response_type is None:
++            return None
++        _, errors = self.prefix_admission_coordinator.phase(
++            lambda: observer.lifecycle(self, None, "weight_update", None)
++        )
++        if any(error is not None for error in errors):
++            return response_type(success=False, message=repr(errors))
++        return None
++
++    def handle_plugin_control(self, recv_req: PluginControlReqInput):
++        observer = self.prefix_admission_observer
++
++        def dispatch():
++            if observer is None or recv_req.namespace != getattr(
++                observer, "control_namespace", None
++            ):
++                raise ValueError("unknown scheduler plugin control namespace")
++            response = observer.control(self, recv_req.body)
++            if not isinstance(response, dict):
++                raise TypeError("plugin control must return a JSON object")
++            return response
++
++        response, errors = self.prefix_admission_coordinator.phase(dispatch)
++        if any(error is not None for error in errors):
++            result = PluginControlReqOutput(
++                control_id=recv_req.control_id, success=False, response={}, error=repr(errors)
++            )
++        else:
++            result = PluginControlReqOutput(
++                control_id=recv_req.control_id,
++                success=True,
++                response=self.prefix_admission_coordinator.broadcast(response),
++            )
++        return result
++
+     def handle_dumper_control(self, recv_req: DumperControlReqInput):
+         from sglang.srt.debug_utils.dumper import dumper
+
+@@ -7183,20 +7356,23 @@ def run_scheduler_process(
+                 pass
+     finally:
+         if scheduler is not None:
+-            # FPM has a background ZMQ publisher thread that needs explicit
+-            # teardown to flush queued metrics and close the socket cleanly.
+-            scheduler.metrics_reporter._shutdown_fpm()
+-            # Stop the async D2H copy worker thread if any.
+-            if scheduler.async_d2h_worker is not None:
+-                scheduler.async_d2h_worker.shutdown()
+-                scheduler.async_d2h_worker = None
+-            # Graceful path only: on the exception path the GPU may be wedged
+-            # and the synchronize() in destroy() could itself hang.
+-            if scheduler.gracefully_exit:
+-                scheduler.release_host_resources()
+-                close_custom_all_reduce()
+-                # Last: anything above may still need a working communicator.
+-                abort_distributed_environment()
++            try:
++                scheduler.prefix_admission_coordinator.lifecycle(None, "shutdown", None)
++            finally:
++                # FPM has a background ZMQ publisher thread that needs explicit
++                # teardown to flush queued metrics and close the socket cleanly.
++                scheduler.metrics_reporter._shutdown_fpm()
++                # Stop the async D2H copy worker thread if any.
++                if scheduler.async_d2h_worker is not None:
++                    scheduler.async_d2h_worker.shutdown()
++                    scheduler.async_d2h_worker = None
++                # Graceful path only: on the exception path the GPU may be wedged
++                # and the synchronize() in destroy() could itself hang.
++                if scheduler.gracefully_exit:
++                    scheduler.release_host_resources()
++                    close_custom_all_reduce()
++                    # Last: anything above may still need a working communicator.
++                    abort_distributed_environment()
+
+     # SubprocessWatchdog treats exit code 0 as a clean shutdown, so a crash must not exit 0.
+     if hit_exception:
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index c9f1e07550..fead3a32dc 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -57,6 +57,8 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
++    PluginControlReqInput,
++    PluginControlReqOutput,
+     PdRoleSwitchReqInput,
+     PdRoleSwitchReqOutput,
+     PluginWeightUpdateReqInput,
+@@ -148,6 +150,7 @@ _COMMUNICATOR_SPECS = [
+     ("plugin_weight_update", PluginWeightUpdateReqOutput),
+     ("update_lora_adapter", LoRAUpdateOutput),
+     ("dumper_control", DumperControlReqOutput),
++    ("plugin_control", PluginControlReqOutput),
+     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+ ]
+
+@@ -188,6 +191,35 @@ class TokenizerControlMixin:
+     FanOutCommunicator, as opposed to data-plane inference requests multiplexed by rid.
+     """
+
++    async def plugin_control(self: TokenizerManager, namespace: str, body: dict) -> dict:
++        """Forward control only; plugin state belongs to scheduler threads."""
++        if not namespace or not isinstance(body, dict):
++            raise ValueError("plugin control requires a namespace and JSON object")
++        self.auto_create_handle_loop()
++        control_id = uuid.uuid4().hex
++        pending = asyncio.create_task(self.plugin_control_communicator(
++            PluginControlReqInput(namespace=namespace, body=body, control_id=control_id)
++        ))
++        # Keep the communicator's FIFO lock until its reply is drained even if
++        # the HTTP waiter disappears. A new caller cannot consume its late reply.
++        try:
++            results = await asyncio.shield(pending)
++        except asyncio.CancelledError:
++            def consume_cancelled_call(task):
++                if not task.cancelled():
++                    task.exception()
++            pending.add_done_callback(consume_cancelled_call)
++            raise
++        if any(result.control_id != control_id for result in results):
++            raise ValueError("stale plugin control response")
++        errors = [result.error for result in results if not result.success]
++        if errors:
++            raise ValueError("; ".join(errors))
++        payloads = [result.response for result in results]
++        if not payloads or any(value != payloads[0] for value in payloads[1:]):
++            raise ValueError("plugin control responses differ between worker groups")
++        return payloads[0]
++
+     def init_communicators(self: TokenizerManager):
+         dispatch_pairs = []
+         for spec in _COMMUNICATOR_SPECS:
+diff --git a/python/sglang/srt/mem_cache/allocation.py b/python/sglang/srt/mem_cache/allocation.py
+index 3d63cf607b..3c2a41aa15 100644
+--- a/python/sglang/srt/mem_cache/allocation.py
++++ b/python/sglang/srt/mem_cache/allocation.py
+@@ -483,6 +483,12 @@ def alloc_for_extend(
+             batch=batch,
+         )
+
++    # The receipt starts before any row write or auxiliary allocation. Its page
++    # segments exclude a prefix page the tree already owns.
++    from sglang.srt.managers.prefix_admission import record_batch_token_allocation
++
++    token_receipt = record_batch_token_allocation(batch, storage, out_cache_loc)
++
+     # Write to req_to_token_pool
+     if is_cp_sharded_padded():
+         # Rollback owns physical rows; the request table and caller need cache ids.
+@@ -542,7 +548,10 @@ def alloc_for_extend(
+     except Exception:
+         if is_cp_sharded_padded():
+             out_cache_loc = physical_out_cache_loc
+-        storage.free_tokens(out_cache_loc)
++        if token_receipt is not None:
++            token_receipt.run()
++        else:
++            storage.free_tokens(out_cache_loc)
+         raise
+
+     # DSV4-NPU hook: no-op on non-DSV4 paths.
+diff --git a/python/sglang/srt/mem_cache/kv/requests.py b/python/sglang/srt/mem_cache/kv/requests.py
+index d26b8ed235..518869cbd3 100644
+--- a/python/sglang/srt/mem_cache/kv/requests.py
++++ b/python/sglang/srt/mem_cache/kv/requests.py
+@@ -26,6 +26,7 @@ import msgspec
+ import torch
+
+ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
++from sglang.srt.managers.prefix_admission import batch_admission_receipt, free_request_rows, record_request_rows
+ from sglang.srt.utils.device import async_h2d
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+@@ -217,7 +218,11 @@ class RequestTable:
+         assert all(r.kv.kv_allocated_len > 0 for r in reusing), (
+             "a reused row must carry allocated KV"
+         )
+-        rows = self.alloc_rows(len(reqs) - len(reusing))
++        receipt = batch_admission_receipt(reqs)
++        if receipt is None:
++            rows = self.alloc_rows(len(reqs) - len(reusing))
++        else:
++            rows = self.alloc_rows(len(reqs) - len(reusing), admission_receipt=receipt)
+         if rows is None:
+             return None
+         fresh = iter(rows)
+@@ -227,7 +232,7 @@ class RequestTable:
+         return [r.kv.req_pool_idx for r in reqs]
+
+     def alloc_rows(
+-        self, need_size: int, *, state: RowState = RowState.ACTIVE
++        self, need_size: int, *, state: RowState = RowState.ACTIVE, admission_receipt=None
+     ) -> Optional[List[int]]:
+         """Take rows from the tail of the free list into ``state``, with no
+         request bound."""
+@@ -244,12 +249,19 @@ class RequestTable:
+         del self.free_slots[-need_size:]
+         for row in rows:
+             self._move(row, (RowState.FREE,), state)
++        record_request_rows(self, rows, admission_receipt)
+         self.req_generation[rows] += 1
+         return rows
+
+     def free_rows(self, rows: List[int]) -> None:
+         """Give rows back, from any state but FREE: a second release of a row
+         fails here instead of handing it out twice."""
++        if getattr(self, "_prefix_admission_row_releases", None):
++            free_request_rows(self, rows)
++        else:
++            self._free_rows_without_admission(rows)
++
++    def _free_rows_without_admission(self, rows: List[int]) -> None:
+         for row in rows:
+             self._move(row, _HOLDING, RowState.FREE)
+         if self._row_units is not None and rows:
+diff --git a/python/sglang/srt/mem_cache/kv/state_storage.py b/python/sglang/srt/mem_cache/kv/state_storage.py
+index 14578bbd26..f03d585b97 100644
+--- a/python/sglang/srt/mem_cache/kv/state_storage.py
++++ b/python/sglang/srt/mem_cache/kv/state_storage.py
+@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional
+
+ import torch
+
++from sglang.srt.managers.prefix_admission import batch_admission_receipt
++
+ from sglang.srt.mem_cache.kv.decl import STATE_PART
+ from sglang.srt.utils.device import async_h2d
+
+@@ -159,6 +161,9 @@ class StateStorage:
+                     f"{self.pool.size=}, {self.slots.available_size()=}, "
+                     f"{len(needing)=}, {len(untracked)=}, {per_request=}"
+                 )
++            receipt = batch_admission_receipt(reqs)
++            if receipt is not None:
++                receipt.record("batch state and tracking slots", lambda: self.slots.free(slots))
+             mids = slots[: len(needing)]
+             for req, mid in zip(needing, mids):
+                 req.kv.mamba_pool_idx = mid
+@@ -224,6 +229,9 @@ class StateStorage:
+         slots = self.slots.alloc(table.mamba_initial_tracking_slots)
+         if slots is None:
+             return False
++        receipt = getattr(req, "_prefix_native_admission_receipt", None)
++        if receipt is not None:
++            receipt.record("request tracking slots", lambda: self.slots.free(slots))
+         self._hand_out_tracking(table, [req], slots)
+         return True
+
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index d79235ff45..57ba7dd234 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
+
+ import numpy as np
+ import torch
++from sglang.srt.managers.prefix_admission import free_request_rows, record_request_rows
+ import triton
+ import triton.language as tl
+
+@@ -440,7 +441,12 @@ class ReqToTokenPool:
+             "a reused row must carry allocated KV"
+         )
+
+-        select_index = self.alloc_rows(len(reqs) - len(reusing))
++        receipt = next((getattr(req, "_prefix_native_admission_receipt", None)
++                        for req in reqs if getattr(req, "_prefix_native_admission_receipt", None) is not None), None)
++        select_index = (
++            self.alloc_rows(len(reqs) - len(reusing), admission_receipt=receipt)
++            if receipt is not None else self.alloc_rows(len(reqs) - len(reusing))
++        )
+         if select_index is None:
+             return None
+         offset = 0
+@@ -450,7 +456,7 @@ class ReqToTokenPool:
+                 offset += 1
+         return [r.kv.req_pool_idx for r in reqs]
+
+-    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
++    def alloc_rows(self, need_size: int, admission_receipt=None) -> Optional[List[int]]:
+         """Take need_size rows and bump their generation, with no Req bound to
+         them. alloc() layers Req binding on top; beam member rows have no Req."""
+         if need_size > len(self.free_slots):
+@@ -462,12 +468,19 @@ class ReqToTokenPool:
+         # O(len(free_slots)).
+         select_index = self.free_slots[-need_size:]
+         del self.free_slots[-need_size:]
++        record_request_rows(self, select_index, admission_receipt)
+         self.req_generation[select_index] += 1
+         if self._on_alloc_rows is not None:
+             self._on_alloc_rows(select_index)
+         return select_index
+
+     def free_rows(self, indices: List[int]) -> None:
++        if getattr(self, "_prefix_admission_row_releases", None):
++            free_request_rows(self, indices)
++        else:
++            self._free_rows_without_admission(indices)
++
++    def _free_rows_without_admission(self, indices: List[int]) -> None:
+         # Per-row, so beam member rows release their aux entries too: they reach
+         # alloc_aux_to_lengths via the decode batch's req_pool_indices_cpu.
+         if self._aux_cache is not None:
+diff --git a/python/sglang/srt/mem_cache/prefill_budget.py b/python/sglang/srt/mem_cache/prefill_budget.py
+index 47cccf23e2..43aa056d80 100644
+--- a/python/sglang/srt/mem_cache/prefill_budget.py
++++ b/python/sglang/srt/mem_cache/prefill_budget.py
+@@ -121,6 +121,23 @@ class PrefillBudget:
+         self.current_offset = num_mixed_decode_tokens
+         self.swa_offset = 0
+
++    def admission_checkpoint(self) -> dict:
++        names = (
++            "total_offset", "current_offset", "swa_offset",
++            "pending_state_slots", "pending_request_rows",
++            "window_offsets", "window_current_offsets", "unschedulable",
++        )
++        mark = {}
++        for name in names:
++            if hasattr(self, name):
++                value = getattr(self, name)
++                mark[name] = value.copy() if isinstance(value, dict) else value
++        return mark
++
++    def restore_admission_checkpoint(self, mark: dict) -> None:
++        for name, value in mark.items():
++            setattr(self, name, value)
++
+     def ceil_paged_tokens(self, tokens: int) -> int:
+         return -(-tokens // self.page_size) * self.page_size
+
+diff --git a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
+index ba4aaa4c06..08b7e03b0e 100644
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
+@@ -247,17 +247,33 @@ class MambaComponent(TreeComponent):
+         # staged copy still runs, as it does into a slot taken here.
+         if not req.kv.holds_mamba and not params.defer_cow_slot:
+             storage, sub_pool = self._state()
+-            dst_index = storage.take_state_slots(sub_pool, 1)
++            receipt = getattr(req, "_prefix_native_admission_receipt", None)
++
++            def take_slot():
++                slots = storage.take_state_slots(sub_pool, 1)
++                if slots is not None and receipt is not None:
++                    receipt.record_state_slots(storage, sub_pool, slots)
++                return slots
++
++            dst_index = take_slot()
+             if dst_index is None:
+                 # Pin the window via inc/dec_lock_ref so evict's SWA release
+                 # stops at this request's window boundary instead of walking to
+                 # root and over-decrementing locks held by other requests.
+-                lock_result = self.cache.inc_lock_ref(result.best_match_node)
+-                self.cache.evict_for_alloc(KVDemand(state_slots=1))
+-                dst_index = storage.take_state_slots(sub_pool, 1)
+-                self.cache.dec_lock_ref(
+-                    result.best_match_node, lock_result.to_dec_params()
++                lock = self.cache.lock(result.best_match_node)
++                lock_release = (
++                    receipt.record_tree_lock(self.cache, lock)
++                    if receipt is not None and lock is not None
++                    else None
+                 )
++                try:
++                    self.cache.evict_for_alloc(KVDemand(state_slots=1))
++                    dst_index = take_slot()
++                finally:
++                    if lock_release is not None:
++                        lock_release.run()
++                    else:
++                        self.cache.unlock(lock)
+                 assert dst_index is not None, "Can not alloc mamba cache"
+             req.kv.mamba_pool_idx = dst_index[0]
+         req.kv.mamba_cow_src_index = src_index
+diff --git a/test/registered/unit/managers/test_prefix_admission.py b/test/registered/unit/managers/test_prefix_admission.py
+new file mode 100644
+index 0000000000..49a01fbf98
+--- /dev/null
++++ b/test/registered/unit/managers/test_prefix_admission.py
+@@ -0,0 +1,640 @@
++"""CPU ownership/collective contracts; these do not certify GPU numerics."""
++
++import ast
++import asyncio
++import concurrent.futures
++import importlib.util
++import sys
++import threading
++import types
++import unittest
++import uuid
++from enum import Enum
++from pathlib import Path
++from unittest.mock import patch
++
++
++SOURCE = (
++    Path(__file__).resolve().parents[4]
++    / "python/sglang/srt/managers/prefix_admission.py"
++)
++SPEC = importlib.util.spec_from_file_location("prefix_admission_contract", SOURCE)
++P = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = P
++SPEC.loader.exec_module(P)
++
++
++class Result(Enum):
++    CONTINUE = 1
++    OTHER = 2
++    NO_TOKEN = 3
++
++
++class Budget:
++    def __init__(self):
++        self.total_offset = 3
++        self.current_offset = 2
++        self.swa_offset = 1
++        self.rem_state_slots = 9
++
++    def admission_checkpoint(self):
++        return vars(self).copy()
++
++    def restore_admission_checkpoint(self, mark):
++        vars(self).update(mark)
++
++
++class Request:
++    def __init__(self, rid="r", match_len=2):
++        self.rid = rid
++        self.kv = types.SimpleNamespace(
++            holds_kv=False,
++            mamba_pool_idx=None,
++            req_pool_idx=None,
++            cache_protected_len=0,
++            component_evicted_seqlens={},
++        )
++        self.session = self.lock = self.extend_end = None
++        self.prefix_len = 0
++        self.origin_input_ids = list(range(8))
++        self.full_untruncated_fill_ids = []
++        self.resources = set()
++        self.match_len = match_len
++
++    def acquire(self, name):
++        if name in self.resources:
++            raise AssertionError("resource allocated twice")
++        self.resources.add(name)
++        self._prefix_native_admission_receipt.record(
++            name, lambda: self.resources.remove(name)
++        )
++
++    def init_next_round_input(self, cache, *, max_prefix_len, defer_cow_slot=False):
++        self.full_untruncated_fill_ids[:] = self.origin_input_ids
++        self.prefix_len = min(max_prefix_len, self.match_len)
++        if self.kv.mamba_pool_idx is None:
++            self.acquire("cow")
++            self.kv.mamba_pool_idx = "cow"
++
++    def needs_host_load_back(self):
++        return False
++
++
++class Adder:
++    def __init__(self, mode="append"):
++        self.can_run_list = []
++        self.preempt_list = []
++        self.rem_chunk_tokens = None
++        self.rem_input_tokens = 100
++        self.new_chunked_req = None
++        self.memory_budget = Budget()
++        self.mode = mode
++
++    def should_defer(self, req):
++        return False
++
++    def add_one_req(self, req, *args):
++        req.extend_end = len(req.origin_input_ids)
++        self.rem_input_tokens -= 6
++        self.memory_budget.total_offset += 13
++        self.memory_budget.swa_offset += 5
++        self.memory_budget.rem_state_slots -= 3
++        req.acquire("lock")
++        if self.mode != "no_membership":
++            self.can_run_list.append(req)
++        if self.mode == "append_then_raise":
++            raise RuntimeError("after append")
++        return Result.CONTINUE
++
++
++class Observer:
++    def __init__(self, *, rank=0, accepted=True):
++        self.rank = rank
++        self.accepted = accepted
++        self.prepares = self.polls = self.rollbacks = self.commits = 0
++        self.fail_poll = self.fail_commit = False
++        self.reservations = set()
++
++    def prepare(self, s, req):
++        self.prepares += 1
++        return P.PrefixAdmissionProposal(
++            6 if self.rank == 0 else 0, ("server", req.rid, "attempt", 0)
++        )
++
++    def after_match(self, *args):
++        pass
++
++    def reserve(self, s, req, proposal, lawful_l):
++        if self.accepted:
++            self.reservations.add(proposal.identity)
++        return self.accepted
++
++    def commit(self, s, req, proposal, lawful_l):
++        self.commits += 1
++        # Freeze is permitted only after actual row/token/tracking acquisition.
++        if not {"row", "tokens", "tracking"} <= req.resources:
++            raise AssertionError("plan froze before physical batch allocation")
++        if self.fail_commit:
++            raise RuntimeError("publication plan freeze failed")
++
++    def rollback(self, s, req, proposal, reason):
++        self.rollbacks += 1
++        if proposal is not None:
++            self.reservations.discard(proposal.identity)
++
++    def poll(self, s):
++        self.polls += 1
++        if self.fail_poll:
++            raise RuntimeError("rank-local reclaim failure")
++
++    def lifecycle(self, *args):
++        pass
++
++
++class Batch:
++    def __init__(self, reqs, *, fail=False, fail_finalizer=False):
++        self.reqs = reqs
++        self.fail = fail
++        self.fail_finalizer = fail_finalizer
++
++    def prepare_for_extend(self):
++        for req in self.reqs:
++            for name in ("row", "tracking", "tokens"):
++                req.acquire(name)
++            req.kv.req_pool_idx = 7
++            if self.fail:
++                raise RuntimeError("partial physical allocation")
++            if self.fail_finalizer:
++
++                def fail():
++                    raise RuntimeError("commit finalizer failed")
++
++                req._prefix_native_admission_receipt.record(
++                    "finalizer", lambda: None, on_commit=fail
++                )
++
++
++def scheduler(observer, tp=1):
++    s = types.SimpleNamespace(
++        prefix_admission_observer=observer,
++        tree_cache=object(),
++        token_to_kv_pool_allocator=object(),
++        enable_hierarchical_cache=False,
++        enable_hicache_storage=False,
++        enable_lmcache=False,
++        enable_priority_preemption=False,
++        dllm_config=None,
++    )
++    parallel = types.SimpleNamespace(
++        tp_size=tp, pp_size=1, attn_cp_size=1, dcp_size=1, attn_dp_size=1
++    )
++    return s, parallel
++
++
++class CollectiveGroup:
++    """Deterministic two-rank rendezvous; a missing phase fails the test."""
++
++    def __init__(self):
++        self.barrier = threading.Barrier(2, timeout=3)
++        self.values = {}
++        self.lock = threading.Lock()
++
++    def gather(self, rank, phase, value):
++        with self.lock:
++            self.values.setdefault(phase, {})[rank] = value
++        self.barrier.wait()
++        result = [self.values[phase][i] for i in range(2)]
++        self.barrier.wait()
++        return result
++
++
++class Coordinator(P.PrefixAdmissionCoordinator):
++    def __init__(self, s, parallel, group=None, rank=0):
++        super().__init__(s, parallel=parallel)
++        self.group, self.rank, self.round = group, rank, 0
++
++    def gather(self, value):
++        if self.group is None:
++            return [value]
++        phase = self.round
++        self.round += 1
++        return self.group.gather(self.rank, phase, value)
++
++    def broadcast(self, value):
++        return self.gather(value)[0]
++
++
++class PrefixAdmissionTests(unittest.TestCase):
++    def setUp(self):
++        self.patch = patch.dict(
++            sys.modules,
++            {
++                "sglang.srt.managers.schedule_policy": types.SimpleNamespace(
++                    AddReqResult=Result
++                ),
++                "sglang.srt.mem_cache.capacity": types.SimpleNamespace(
++                    shares_memory=lambda _: False
++                ),
++            },
++        )
++        self.patch.start()
++
++    def tearDown(self):
++        self.patch.stop()
++
++    def make(self, observer=None, mode="append"):
++        observer = observer or Observer()
++        s, parallel = scheduler(observer)
++        return Coordinator(s, parallel), observer, Request(), Adder(mode)
++
++    def test_terminal_shutdown_reports_current_and_previously_deferred_errors(self):
++        for previous in (False, True):
++            with self.subTest(previous=previous):
++                c, observer, _, _ = self.make()
++
++                def fail(*args):
++                    raise RuntimeError("native drain unproven")
++
++                observer.lifecycle = fail
++                if previous:
++                    c.lifecycle(None, "cancel", ("epoch", "rid", "attempt", 1))
++                    observer.lifecycle = lambda *args: None
++                with self.assertRaisesRegex(
++                    RuntimeError, "prefix shutdown failed.*native drain unproven"
++                ):
++                    c.lifecycle(None, "shutdown")
++                self.assertEqual(len(c.lifecycle_errors), 1)
++                self.assertEqual(c.round, 0)  # Terminal cleanup must stay rank-local.
++
++    def test_scheduler_native_cleanup_runs_when_plugin_shutdown_fails(self):
++        # Execute the actual finalizer AST, retaining its try/finally nesting.
++        # The fixture records native teardown; no GPU process is started.
++        tree = ast.parse((SOURCE.parent / "scheduler.py").read_text())
++        call_name = "prefix_admission_coordinator"
++        finalizer = next(
++            node.finalbody
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Try)
++            and node.finalbody
++            and any(
++                isinstance(child, ast.Attribute) and child.attr == call_name
++                for statement in node.finalbody
++                for child in ast.walk(statement)
++            )
++        )
++        events = []
++
++        def fail(*args):
++            events.append("plugin")
++            raise RuntimeError("unproven drain")
++
++        s = types.SimpleNamespace(
++            prefix_admission_coordinator=types.SimpleNamespace(lifecycle=fail),
++            metrics_reporter=types.SimpleNamespace(
++                _shutdown_fpm=lambda: events.append("metrics")
++            ),
++            async_d2h_worker=types.SimpleNamespace(
++                shutdown=lambda: events.append("d2h")
++            ),
++            gracefully_exit=True,
++            release_host_resources=lambda: events.append("host"),
++        )
++        namespace = {
++            "scheduler": s,
++            "close_custom_all_reduce": lambda: events.append("all_reduce"),
++            "abort_distributed_environment": lambda: events.append("distributed"),
++        }
++        code = compile(
++            ast.fix_missing_locations(ast.Module(body=finalizer, type_ignores=[])),
++            "actual_scheduler_finalizer",
++            "exec",
++        )
++        with self.assertRaisesRegex(RuntimeError, "unproven drain"):
++            exec(code, namespace)
++        self.assertEqual(
++            events, ["plugin", "metrics", "d2h", "host", "all_reduce", "distributed"]
++        )
++        self.assertIsNone(s.async_d2h_worker)
++
++    def test_reverse_physical_release_and_nested_budget_restore(self):
++        _, _, req, adder = self.make()
++        req.extra_key = "original-attempt-namespace"
++        before = adder.memory_budget.admission_checkpoint()
++        receipt = P.NativeAdmissionReceipt(adder, req)
++        order = []
++        receipt.record("first", lambda: order.append(1))
++        receipt.record("second", lambda: order.append(2))
++        adder.memory_budget.swa_offset = 100
++        adder.memory_budget.rem_state_slots = -4
++        adder.can_run_list.append(req)
++        req.kv.component_evicted_seqlens["full"] = 11
++        req.extra_key = "content-namespace-selected-by-plugin"
++        receipt.rollback()
++        self.assertEqual(order, [2, 1])
++        self.assertEqual(vars(adder.memory_budget), before)
++        self.assertEqual(adder.can_run_list, [])
++        self.assertEqual(req.kv.component_evicted_seqlens, {})
++        self.assertEqual(req.extra_key, "original-attempt-namespace")
++
++    def test_release_exception_is_not_retried_and_other_resources_are_released(self):
++        _, _, req, adder = self.make()
++        receipt = P.NativeAdmissionReceipt(adder, req)
++        calls = []
++        receipt.record("safe", lambda: calls.append("safe"))
++
++        def uncertain():
++            calls.append("uncertain")
++            raise RuntimeError("failed after physical release")
++
++        receipt.record("uncertain", uncertain)
++        for _ in range(2):
++            with self.assertRaises(P.AdmissionRollbackError):
++                receipt.rollback()
++        self.assertEqual(calls, ["uncertain", "safe"])
++
++    def test_raw_rows_are_receipted_before_req_binding(self):
++        _, _, req, adder = self.make()
++        receipt = P.NativeAdmissionReceipt(adder, req)
++        table = types.SimpleNamespace(free_slots=[])
++        table._free_rows_without_admission = lambda rows: table.free_slots.extend(rows)
++        P.record_request_rows(table, [4, 5], receipt)
++        # Native exhaustion can free a row before the transaction rolls back.
++        P.free_request_rows(table, [4])
++        receipt.rollback()
++        self.assertEqual(sorted(table.free_slots), [4, 5])
++
++    def test_commit_finalizer_failure_retains_physical_receipts(self):
++        _, _, req, adder = self.make()
++        receipt = P.NativeAdmissionReceipt(adder, req)
++        req.acquire("tokens")
++
++        def fail():
++            raise RuntimeError("detach failed")
++
++        receipt.record("detach", lambda: None, on_commit=fail)
++        with self.assertRaisesRegex(RuntimeError, "detach failed"):
++            receipt.commit()
++        self.assertFalse(receipt.closed)
++        receipt.rollback()
++        self.assertEqual(req.resources, set())
++
++    def test_freeze_waits_for_physical_batch_allocation(self):
++        c, observer, req, adder = self.make()
++        self.assertEqual(c.admit(req, adder, False, None), Result.CONTINUE)
++        self.assertEqual(observer.commits, 0)
++        self.assertIsNotNone(req._prefix_native_admission_receipt)
++        c.build_batch(adder, lambda: Batch([req]))
++        self.assertEqual(observer.commits, 1)
++        self.assertIsNone(req._prefix_native_admission_receipt)
++        self.assertEqual(req.resources, {"cow", "lock", "row", "tracking", "tokens"})
++
++    def test_continue_without_membership_never_freezes(self):
++        c, observer, req, adder = self.make(mode="no_membership")
++        self.assertEqual(c.admit(req, adder, False, None), Result.OTHER)
++        self.assertEqual(observer.commits, 0)
++        self.assertEqual(req.resources, set())
++        self.assertEqual(adder.memory_budget.rem_state_slots, 9)
++
++    def test_exception_after_append_restores_membership_and_physical_lock(self):
++        c, observer, req, adder = self.make(mode="append_then_raise")
++        with self.assertRaises(P.PrefixAdmissionRejected):
++            c.admit(req, adder, False, None)
++        self.assertEqual(req.resources, set())
++        self.assertEqual(adder.can_run_list, [])
++        self.assertEqual(observer.reservations, set())
++
++    def test_partial_batch_allocation_rolls_back_all_requests(self):
++        c, observer, first, adder = self.make()
++        second = Request("second")
++        for req in (first, second):
++            c.admit(req, adder, False, None)
++        with self.assertRaisesRegex(RuntimeError, "batch allocation"):
++            c.build_batch(adder, lambda: Batch([first, second], fail=True))
++        self.assertEqual(first.resources | second.resources, set())
++        self.assertEqual(adder.can_run_list, [])
++        self.assertEqual(observer.reservations, set())
++
++    def test_batch_construction_failure_rolls_back_staged_match(self):
++        c, observer, req, adder = self.make()
++        c.admit(req, adder, False, None)
++
++        def fail_factory():
++            raise RuntimeError("batch init failed")
++
++        with self.assertRaisesRegex(RuntimeError, "batch construction"):
++            c.build_batch(adder, fail_factory)
++        self.assertEqual(req.resources, set())
++        self.assertEqual(observer.reservations, set())
++
++    def test_temporary_pressure_permits_only_one_fully_rolled_back_retry(self):
++        c, observer, req, adder = self.make(Observer(accepted=False))
++        self.assertEqual(c.admit(req, adder, False, None), Result.OTHER)
++        self.assertEqual(
++            (observer.prepares, observer.polls, observer.rollbacks), (2, 1, 2)
++        )
++        self.assertEqual(req.resources, set())
++
++    def test_preexisting_recurrent_state_is_preserved(self):
++        c, observer, req, adder = self.make(mode="no_membership")
++        req.kv.mamba_pool_idx = "existing-owned-state"
++        self.assertEqual(c.admit(req, adder, False, None), Result.OTHER)
++        self.assertEqual(req.kv.mamba_pool_idx, "existing-owned-state")
++        self.assertEqual(req.resources, set())
++
++    def run_two(self, operation):
++        group = CollectiveGroup()
++        replicas = []
++        for rank in range(2):
++            observer = Observer(rank=rank)
++            s, parallel = scheduler(observer, tp=2)
++            replicas.append(
++                (Coordinator(s, parallel, group, rank), observer, Request(), Adder())
++            )
++        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
++            futures = [
++                executor.submit(operation, rank, *replica)
++                for rank, replica in enumerate(replicas)
++            ]
++            results = [future.result(timeout=8) for future in futures]
++        return replicas, results
++
++    def test_tp_match_disagreement_rolls_back_every_rank(self):
++        def run(rank, c, observer, req, adder):
++            req.match_len += rank
++            with self.assertRaises(P.PrefixAdmissionRejected):
++                c.admit(req, adder, False, None)
++
++        replicas, _ = self.run_two(run)
++        for c, observer, req, adder in replicas:
++            self.assertEqual(req.resources, set())
++            self.assertEqual(observer.prepares, 1)
++
++    def test_tp_reclaim_failure_prevents_all_ranks_from_retrying(self):
++        def run(rank, c, observer, req, adder):
++            observer.accepted = rank != 0
++            observer.fail_poll = rank == 0
++            with self.assertRaisesRegex(RuntimeError, "poll failed"):
++                c.admit(req, adder, False, None)
++
++        replicas, _ = self.run_two(run)
++        for c, observer, req, adder in replicas:
++            self.assertEqual((observer.prepares, observer.polls), (1, 1))
++            self.assertEqual(req.resources, set())
++            self.assertEqual(observer.reservations, set())
++
++    def test_tp_commit_finalizer_failure_keeps_entire_batch_rollbackable(self):
++        def run(rank, c, observer, req, adder):
++            c.admit(req, adder, False, None)
++            with self.assertRaisesRegex(RuntimeError, "native commit preparation"):
++                c.build_batch(adder, lambda: Batch([req], fail_finalizer=rank == 0))
++
++        replicas, _ = self.run_two(run)
++        for c, observer, req, adder in replicas:
++            self.assertEqual(req.resources, set())
++            self.assertEqual(adder.can_run_list, [])
++            self.assertEqual(observer.reservations, set())
++
++    def test_tp_plan_freeze_failure_releases_physically_allocated_batch(self):
++        def run(rank, c, observer, req, adder):
++            observer.fail_commit = rank == 1
++            c.admit(req, adder, False, None)
++            with self.assertRaisesRegex(RuntimeError, "prefix commit failed"):
++                c.build_batch(adder, lambda: Batch([req]))
++
++        replicas, _ = self.run_two(run)
++        for c, observer, req, adder in replicas:
++            self.assertEqual(req.resources, set())
++            self.assertEqual(observer.reservations, set())
++
++    def test_tp_ordinary_prepare_restoration_failure_cannot_return_early(self):
++        def run(rank, c, observer, req, adder):
++            observer.prepare = lambda *args: None
++            if rank == 0:
++
++                def fail(mark):
++                    raise RuntimeError("nested budget restore failed")
++
++                adder.memory_budget.restore_admission_checkpoint = fail
++            with self.assertRaises(P.AdmissionRollbackError):
++                c.admit(req, adder, False, None)
++
++        self.run_two(run)
++
++    def test_tp_rank_local_rollback_error_forbids_reclaim_retry(self):
++        def run(rank, c, observer, req, adder):
++            observer.accepted = False
++            if rank == 0:
++
++                def fail(*args):
++                    raise RuntimeError("plugin rollback failed")
++
++                observer.rollback = fail
++            with self.assertRaises(P.AdmissionRollbackError):
++                c.admit(req, adder, False, None)
++
++        replicas, _ = self.run_two(run)
++        for c, observer, req, adder in replicas:
++            self.assertEqual((observer.prepares, observer.polls), (1, 0))
++
++
++class PluginControlCancellationTests(unittest.IsolatedAsyncioTestCase):
++    def method(self):
++        # Execute the actual tokenizer method and real FanOutCommunicator;
++        # only IPC transport/messages are replaced by in-process callbacks.
++        source = ast.parse((SOURCE.parent / "tokenizer_control_mixin.py").read_text())
++        cls = next(
++            node
++            for node in source.body
++            if isinstance(node, ast.ClassDef) and node.name == "TokenizerControlMixin"
++        )
++        method = next(
++            node
++            for node in cls.body
++            if isinstance(node, ast.AsyncFunctionDef) and node.name == "plugin_control"
++        )
++        body = [
++            ast.ImportFrom(
++                module="__future__", names=[ast.alias(name="annotations")], level=0
++            ),
++            method,
++        ]
++        namespace = {
++            "asyncio": asyncio,
++            "uuid": uuid,
++            "PluginControlReqInput": types.SimpleNamespace,
++        }
++        exec(
++            compile(
++                ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
++                "actual_tokenizer_plugin_control",
++                "exec",
++            ),
++            namespace,
++        )
++        spec = importlib.util.spec_from_file_location(
++            "actual_fanout", SOURCE.parent / "communicator.py"
++        )
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return namespace["plugin_control"], module.FanOutCommunicator
++
++    async def test_cancelled_http_waiter_drains_reply_before_next_dispatch(self):
++        method, communicator_type = self.method()
++        sent = []
++        events = [asyncio.Event(), asyncio.Event()]
++
++        def send(obj):
++            sent.append(obj)
++            events[len(sent) - 1].set()
++
++        comm = communicator_type(send, 1)
++        tokenizer = types.SimpleNamespace(
++            auto_create_handle_loop=lambda: None, plugin_control_communicator=comm
++        )
++        first = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "old"}))
++        await asyncio.wait_for(events[0].wait(), 1)
++        first.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await first
++        second = asyncio.create_task(method(tokenizer, "plugin", {"attempt": "new"}))
++        await asyncio.sleep(0)
++        self.assertEqual(len(sent), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id=sent[0].control_id,
++                success=True,
++                response={"attempt": "old"},
++                error="",
++            )
++        )
++        await asyncio.wait_for(events[1].wait(), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id=sent[1].control_id,
++                success=True,
++                response={"attempt": "new"},
++                error="",
++            )
++        )
++        self.assertEqual(await asyncio.wait_for(second, 1), {"attempt": "new"})
++
++    async def test_wrong_control_generation_is_rejected(self):
++        method, communicator_type = self.method()
++        event = asyncio.Event()
++        comm = communicator_type(lambda obj: event.set(), 1)
++        tokenizer = types.SimpleNamespace(
++            auto_create_handle_loop=lambda: None, plugin_control_communicator=comm
++        )
++        call = asyncio.create_task(method(tokenizer, "plugin", {}))
++        await asyncio.wait_for(event.wait(), 1)
++        comm.handle_recv(
++            types.SimpleNamespace(
++                control_id="stale", success=True, response={}, error=""
++            )
++        )
++        with self.assertRaisesRegex(ValueError, "stale plugin control response"):
++            await asyncio.wait_for(call, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/managers/test_prefix_admission_actual_req.py b/test/registered/unit/managers/test_prefix_admission_actual_req.py
+new file mode 100644
+index 0000000000..865cd6e77a
+--- /dev/null
++++ b/test/registered/unit/managers/test_prefix_admission_actual_req.py
+@@ -0,0 +1,253 @@
++"""Actual pinned Req/ReqKvInfo/budget CPU interface regression.
++
++Source method bodies and dataclass decorators are executed unchanged. Clock,
++mode enum and IPC leaves are small doubles; no model, CUDA or venv is loaded.
++This establishes the CPU boundary, not real scheduler/GPU acceptance.
++"""
++
++import ast
++import copy
++import dataclasses
++import importlib.util
++import logging
++import sys
++import types
++import unittest
++from array import array
++from http import HTTPStatus
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[4]
++SOURCE = ROOT / "python/sglang/srt"
++spec = importlib.util.spec_from_file_location(
++    "actual_req_prefix_admission", SOURCE / "managers/prefix_admission.py"
++)
++P = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = P
++spec.loader.exec_module(P)
++
++
++def extract(relative, names, namespace, methods=None):
++    source = ast.parse((SOURCE / relative).read_text())
++    selected = [
++        node
++        for node in source.body
++        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names
++    ]
++    if methods:
++        for cls in selected:
++            if isinstance(cls, ast.ClassDef) and cls.name in methods:
++                cls.body = [
++                    node
++                    for node in cls.body
++                    if isinstance(node, ast.FunctionDef)
++                    and node.name in methods[cls.name]
++                ]
++    body = [
++        ast.ImportFrom(
++            module="__future__", names=[ast.alias(name="annotations")], level=0
++        ),
++        *selected,
++    ]
++    exec(
++        compile(
++            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
++            str(SOURCE / relative),
++            "exec",
++        ),
++        namespace,
++    )
++
++
++class ClockLeaf:
++    def __init__(self, **kwargs):
++        pass
++
++    def set_metrics_collector(self, value):
++        pass
++
++    def set_scheduler_recv_time(self):
++        pass
++
++
++def actual_namespace():
++    module = types.ModuleType("pinned_actual_req_methods")
++    sys.modules[module.__name__] = module
++    namespace = vars(module)
++    namespace.update(
++        dataclasses=dataclasses,
++        dataclass=dataclasses.dataclass,
++        array=array,
++        copy=copy,
++        HTTPStatus=HTTPStatus,
++        SchedulerReqTimeStats=ClockLeaf,
++        CaptureHiddenMode=types.SimpleNamespace(NULL=0, FULL=1, LAST=2),
++        FAKE_BOOTSTRAP_HOST="fake",
++        is_cp_sharded_padded=lambda: False,
++    )
++    extract("mem_cache/base_prefix_cache.py", {"CacheRequestHandle"}, namespace)
++    extract(
++        "dllm/mixin/req.py",
++        {"ReqDllmMixin"},
++        namespace,
++        {"ReqDllmMixin": {"init_diffusion_llm", "is_dllm", "reset_dllm_progress"}},
++    )
++    extract(
++        "managers/req_types.py",
++        {"get_return_hidden_states_mode", "BaseFinishReason", "FINISH_ABORT"},
++        namespace,
++    )
++    extract(
++        "managers/schedule_batch.py",
++        {
++            "ReqKvInfo",
++            "ReqLogprob",
++            "Req",
++            "BaseFinishReason",
++            "FINISH_ABORT",
++        },
++        namespace,
++        {
++            "Req": {
++                "__init__",
++                "refresh_fill_ids",
++                "init_next_round_input",
++                "_compute_max_prefix_len",
++                "needs_host_load_back",
++                "auxiliary_swa_host_hit_length",
++                "finish_outside_step",
++            }
++        },
++    )
++    extract(
++        "mem_cache/prefill_budget.py",
++        {"PrefillAdmissionCheckpoint", "PrefillBudget"},
++        namespace,
++    )
++    return namespace
++
++
++class ActualReqContracts(unittest.TestCase):
++    def setUp(self):
++        self.ns = actual_namespace()
++        self.req = self.ns["Req"](
++            "actual-req",
++            None,
++            array("q", [11, 22, 33, 44]),
++            types.SimpleNamespace(max_new_tokens=0, custom_params={}),
++            return_hidden_states=True,
++        )
++        self.budget = self.ns["PrefillBudget"](types.SimpleNamespace(page_size=1), None)
++        self.adder = types.SimpleNamespace(
++            memory_budget=self.budget,
++            can_run_list=[],
++            preempt_list=[],
++            rem_input_tokens=100,
++            rem_chunk_tokens=None,
++        )
++
++    def test_actual_slotted_req_kv_receipt_restores_metadata_and_resource_identity(
++        self,
++    ):
++        self.assertFalse(hasattr(self.req.kv, "__dict__"))
++        with self.assertRaises(TypeError):
++            vars(self.req.kv)  # The exact failed operation from the first smoke.
++        existing_tensor_handle = object()
++        self.req.kv.mamba_pool_idx = existing_tensor_handle
++        self.req.kv.window_evicted_seqlens["full"] = 7
++        self.req.kv.mamba_ping_pong_empty = [True, False]
++        before = self.budget.admission_checkpoint()
++        mark = P.NativeAdmissionReceipt(self.adder, self.req)
++        self.assertIs(mark.kv_before["mamba_pool_idx"], existing_tensor_handle)
++        self.assertIsNot(
++            mark.kv_before["window_evicted_seqlens"], self.req.kv.window_evicted_seqlens
++        )
++        self.req.kv.mamba_pool_idx = object()
++        self.req.kv.window_evicted_seqlens["full"] = 9
++        self.req.kv.mamba_ping_pong_empty[0] = False
++        self.budget.reserve(4, 2)
++        self.req.init_next_round_input(None, max_prefix_len=0)
++        mark.rollback()
++        self.assertIs(self.req.kv.mamba_pool_idx, existing_tensor_handle)
++        self.assertEqual(self.req.kv.window_evicted_seqlens, {"full": 7})
++        self.assertEqual(self.req.kv.mamba_ping_pong_empty, [True, False])
++        self.assertEqual(self.budget.admission_checkpoint(), before)
++        self.assertEqual(list(self.req.origin_input_ids), [11, 22, 33, 44])
++        self.assertEqual(list(self.req.full_untruncated_fill_ids), [])
++
++    def test_actual_req_can_prepare_commit_without_kv_dict(self):
++        mark = P.NativeAdmissionReceipt(self.adder, self.req)
++        self.req.init_next_round_input(None, max_prefix_len=0)
++        mark.prepare_commit()
++        mark.commit()
++        self.assertEqual(list(self.req.full_untruncated_fill_ids), [11, 22, 33, 44])
++        self.assertIsNone(self.req._prefix_native_admission_receipt)
++
++    def test_local_phase_logs_original_native_trace_before_tp_string_vote(self):
++        coordinator = P.PrefixAdmissionCoordinator(
++            types.SimpleNamespace(), parallel=types.SimpleNamespace(tp_size=1)
++        )
++        with self.assertLogs(P.__name__, level="WARNING") as logs:
++            _, errors = coordinator.phase(lambda: vars(self.req.kv))
++        self.assertIn("TypeError", errors[0])
++        self.assertIsNotNone(logs.records[0].exc_info)
++        self.assertIn("vars(self.req.kv)", "\n".join(logs.output))
++
++    def test_actual_scheduler_rejection_preserves_phase_status_and_trace(self):
++        namespace = self.ns
++        namespace.update(
++            logger=logging.getLogger("actual_prefix_rejection"),
++            AbortReq=types.SimpleNamespace,
++            PrefixAdmissionRejected=P.PrefixAdmissionRejected,
++            compute_weight_version_spans=lambda *args, **kwargs: [],
++            get_serving=lambda: types.SimpleNamespace(weight_version="default"),
++        )
++        for name in (
++            "SchedulerDisaggregationDecodeMixin",
++            "SchedulerDisaggregationPrefillMixin",
++            "SchedulerPPMixin",
++            "SchedulerDllmMixin",
++            "SchedulerMlxOverlapMixin",
++        ):
++            namespace[name] = type(name, (), {})
++        namespace["resolve_forward_inputs"] = None
++        extract(
++            "managers/scheduler.py",
++            {"Scheduler"},
++            namespace,
++            {"Scheduler": {"_reject_prefix_admission"}},
++        )
++        scheduler = namespace["Scheduler"]()
++        scheduler.waiting_queue = [self.req]
++        released, sent = [], []
++
++        def abort(req, *, reason, finished_reason):
++            self.assertIs(req, self.req)
++            scheduler.waiting_queue.remove(req)
++            released.append(req)
++            req.finished_reason = reason
++            sent.append(types.SimpleNamespace(finished_reason=finished_reason))
++
++        scheduler.request_retirer = types.SimpleNamespace(abort=abort)
++        with self.assertLogs("actual_prefix_rejection", level="WARNING") as logs:
++            try:
++                raise TypeError("vars() argument must have __dict__ attribute")
++            except TypeError as native:
++                try:
++                    raise P.PrefixAdmissionRejected(
++                        "TP prefix native receipt failed: TypeError: " + str(native)
++                    ) from native
++                except P.PrefixAdmissionRejected as exc:
++                    scheduler._reject_prefix_admission(self.req, exc)
++        self.assertEqual(released, [self.req])
++        self.assertEqual(scheduler.waiting_queue, [])
++        self.assertEqual(sent[0].finished_reason, self.req.finished_reason.to_json())
++        self.assertEqual(sent[0].finished_reason["status_code"], 400)
++        self.assertIn("native receipt failed", sent[0].finished_reason["message"])
++        self.assertIn("__dict__", "\n".join(logs.output))
++        self.assertIsNotNone(logs.records[0].exc_info)
++
++
++if __name__ == "__main__":
++    unittest.main()

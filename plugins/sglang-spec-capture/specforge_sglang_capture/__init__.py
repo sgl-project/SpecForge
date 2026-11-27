@@ -44,6 +44,16 @@ def register() -> None:
     HookRegistry.register(
         f"{_SCHEDULER}.get_internal_state", _capture_internal_state, HookType.AFTER
     )
+    from specforge_sglang_capture.hs.config import HSConfig
+
+    if HSConfig.from_env().capture:
+        from specforge_sglang_capture.hs.http import install_control_route
+
+        HookRegistry.register(
+            "sglang.srt.entrypoints.http_server.set_global_state",
+            install_control_route,
+            HookType.AFTER,
+        )
 
 
 def _capture_streamer_class(streamer_class, scheduler, *args, **kwargs):
@@ -69,6 +79,10 @@ def _capture_internal_state(result, scheduler, *args, **kwargs):
         result.internal_state["spec_capture_backend"] = "plugin"
         result.internal_state["spec_capture_method"] = runtime.capture_method
         result.internal_state["spec_capture_aux_layer_ids"] = runtime.sink.aux_layer_ids
+        hs = getattr(runtime, "hs", None)
+        if hs is not None:
+            result.internal_state["spec_capture_hs_protocol"] = 1
+            result.internal_state["spec_capture_hs_cache"] = hs.enabled
         if runtime.is_writer:
             control = runtime.sink.control_endpoint()
             if control is not None:

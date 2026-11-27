@@ -14,25 +14,12 @@ import asyncio
 import ctypes
 import importlib.util
 import json
-import os
-import sys
 import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
-
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        "plugins",
-        "sglang-spec-capture",
-    ),
-)
 
 
 def _has_extension_points() -> bool:

@@ -123,14 +123,37 @@ class RolloutWorker:
     def _sample_id(self, task: PromptTask) -> str:
         return f"{self.run_id}:{task.task_id}"
 
-    def run_once(self, max_tasks: int) -> List[SampleRef]:
+    def lease_tasks(self, max_tasks: int) -> List[PromptTask]:
+        """Lease once, including queued preparation in worker health."""
         with self._health_lock:
             if self._state in ("stopped", "draining"):
                 return []
         tasks = self.controller.lease_prompt_tasks(self.worker_id, max_tasks)
+        if tasks:
+            self._begin_batch(len(tasks))
+        return tasks
+
+    def fail_leased(self, tasks, reason: str, *, unhealthy: bool = True) -> None:
+        if unhealthy:
+            self._mark_unhealthy(reason)
+        self.controller.fail_prompt_tasks(
+            self.worker_id,
+            [task.task_id for task in tasks],
+            reason=reason,
+            retryable=True,
+        )
+        self._finish_batch(len(tasks))
+
+    def run_once(self, max_tasks: int) -> List[SampleRef]:
+        return self.run_leased(self.lease_tasks(max_tasks), max_tasks=max_tasks)
+
+    def run_leased(
+        self, tasks: List[PromptTask], *, max_tasks: Optional[int] = None, prepared=None
+    ) -> List[SampleRef]:
+        """Execute an existing lease; preparation never leases a second time."""
         if not tasks:
             return []
-        self._begin_batch(len(tasks))
+        max_tasks = len(tasks) if max_tasks is None else max_tasks
         # Legacy colocated target-TP training used a drop-last target batch.
         # A partial target batch would give ranks different local batch sizes
         # and break the all-rank draft/FSDP step contract.
@@ -150,6 +173,12 @@ class RolloutWorker:
                 raise NotImplementedError(
                     "target-TP batch partitioning is supported for colocated "
                     "feature capture only"
+                )
+            if prepared is not None:
+                produce_refs = (
+                    lambda _tasks, *, capture: self.feature_source.produce_prepared(
+                        prepared, capture=capture
+                    )
                 )
             return self._run_ref_source(tasks, produce_refs)
 

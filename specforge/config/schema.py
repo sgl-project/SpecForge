@@ -145,7 +145,7 @@ _SGLANG_FLAG_NAMES: Mapping[str, str] = {
 #: ``sglang_*`` fields that carry raw argv tokens instead of one flag.
 SGLANG_PASSTHROUGH_FIELDS = frozenset({"sglang_extra_args"})
 #: Capture-server environment the managed-local launcher sets itself.
-_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_")
+_OWNED_SERVER_ENV_PREFIXES = ("MOONCAKE_", "DISAGG_", "SPECFORGE_HS_")
 _OWNED_SERVER_ENV = {
     "CUDA_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
     "ASCEND_RT_VISIBLE_DEVICES": "capture_servers[].cuda_visible_devices",
@@ -870,6 +870,17 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     #: backend: managed_local probes each capture server's interpreter while
     #: planning; the producer reads an external server's ``/server_info``.
     server_capture: Literal["auto", "plugin"] = "auto"
+    #: Native HS protocol and content-cache reuse are separate opt-ins so
+    #: cache-off/on comparisons share the same publication/ownership path.
+    hs_capture: bool = False
+    hs_prefix_cache: bool = False
+    hs_chunk_tokens: int = Field(default=256, gt=0)
+    hs_cache_bytes: int = Field(default=1 << 30, gt=0)
+    hs_pinned_bytes: int = Field(default=256 << 20, gt=0)
+    hs_output_bytes: int = Field(default=512 << 20, gt=0)
+    hs_device_bytes: int = Field(default=256 << 20, gt=0)
+    hs_max_workers: int = Field(default=4, gt=0)
+    hs_attempt_capacity: int = Field(default=4096, gt=0)
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
     mooncake_local_hostname: Optional[str] = None
@@ -909,6 +920,10 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_store(self):
+        if self.hs_prefix_cache and not self.hs_capture:
+            raise ValueError("hs_prefix_cache requires hs_capture")
+        if self.hs_capture and self.backend != "mooncake":
+            raise ValueError("HS capture requires backend=mooncake")
         if not self.control_dir:
             raise ValueError("deployment.disaggregated.control_dir must not be empty")
         if self.managed_local is not None:

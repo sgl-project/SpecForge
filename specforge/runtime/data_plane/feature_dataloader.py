@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 import torch
 
 from specforge.runtime.contracts import SampleRef, TrainBatch
-from specforge.runtime.data_plane.feature_store import FeatureStore
+from specforge.runtime.data_plane.feature_store import FeatureStore, abort_feature_ref
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue
 
 PerSampleTransform = Callable[[Dict[str, torch.Tensor]], Dict[str, torch.Tensor]]
@@ -352,7 +352,7 @@ class FeatureDataLoader:
                 adopt = getattr(self.store, "adopt", None)
                 if callable(adopt):
                     adopt(ref)
-                self.store.abort(ref.sample_id, reason=reason)
+                abort_feature_ref(self.store, ref, reason=reason)
             except Exception as exc:  # settle the full tail, then fail loudly
                 cleanup_errors.append(f"{ref.sample_id}: {exc}")
         if cleanup_errors:

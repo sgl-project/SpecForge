@@ -54,6 +54,7 @@ from itertools import islice
 from typing import Iterable, List, Optional
 
 from specforge.runtime.contracts import SampleRef, consumer_dispatch_quantum
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
 logger = logging.getLogger(__name__)
@@ -473,7 +474,7 @@ class RefDistributor:
                     adopt = getattr(self.feature_store, "adopt", None)
                     if callable(adopt):
                         adopt(ref)
-                    self.feature_store.abort(ref.sample_id, reason=reason)
+                    abort_feature_ref(self.feature_store, ref, reason=reason)
                 except Exception as exc:  # best effort before the loud failure
                     cleanup_errors.append(f"{ref.sample_id}: {exc}")
             self.source.mark_consumed(

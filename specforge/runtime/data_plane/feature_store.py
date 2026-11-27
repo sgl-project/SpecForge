@@ -166,6 +166,15 @@ class FeatureStore(abc.ABC):
         return {"force_freed": 0, "force_freed_bytes": 0, "release_pending": 0}
 
 
+def abort_feature_ref(store, ref: SampleRef, *, reason: str) -> None:
+    """Abort the exact ref held by a delayed callback, with legacy fallback."""
+    abort_ref = getattr(store, "abort_ref", None)
+    if callable(abort_ref):
+        abort_ref(ref, reason=reason)
+    else:
+        store.abort(ref.sample_id, reason=reason)
+
+
 def drain_feature_store_removals(
     store: FeatureStore,
     *,

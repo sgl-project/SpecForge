@@ -225,6 +225,13 @@ class StreamingRefChannel:
         """Return the consumer failure reason, if one has been published."""
         return self._read_sidecar(_CONSUMER_FAILED_SUFFIX)
 
+    def consumer_done(self) -> bool:
+        """Successful consumer drain proof; a failure sentinel always wins."""
+        return (
+            os.path.exists(self.path + _CONSUMER_DONE_SUFFIX)
+            and self.consumer_failure() is None
+        )
+
     def consumer_stopped(self) -> bool:
         """Whether the remote consumer completed or failed."""
         return os.path.exists(self.path + _CONSUMER_DONE_SUFFIX) or os.path.exists(
