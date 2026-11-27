@@ -59,7 +59,6 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         import torch.distributed as dist
 
         from specforge.launch import _shard_offline_refs, build_offline_runtime
-        from specforge.modeling.target.target_head import TargetHead
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.data_plane import FeatureDataLoader, LocalFeatureStore
         from tests.test_algorithms.fixtures import builtin_algorithm_registry
@@ -71,7 +70,7 @@ def _worker(rank: int, world_size: int, port: int, workdir: str) -> None:
         reference_model = _build_model(workdir, "sdpa", topology)
         usp_model = _build_model(workdir, "usp", topology)
         usp_model.load_state_dict(reference_model.state_dict())
-        target_head = TargetHead.from_pretrained(
+        target_head = fx.load_target_head(
             os.path.join(workdir, "target"), lm_head_key="lm_head.weight"
         )
 

@@ -52,13 +52,13 @@ class TensorStore:
     def __init__(self, path):
         root = Path(path).expanduser()
         if root.is_file():
-            layout, root = root, root.parent
+            layout = root
         else:
             _, filename = resolve_weight_layout(str(root))
             layout = Path(filename)
             if not layout.is_file():
                 raise FileNotFoundError(f"no checkpoint weights in {root}")
-        self.root = root.resolve()
+        self.root = layout.parent.resolve()
         self.metadata, self.files = {}, {}
         self._loaded = {}
         weight_map = None
@@ -68,10 +68,8 @@ class TensorStore:
         else:
             filenames = [layout.name]
         for filename in filenames:
+            # Shard containment is validated by read_weight_map_file.
             file = self.root / filename
-            if Path(filename).is_absolute() or ".." in Path(filename).parts:
-                raise ValueError(f"checkpoint shard leaves its directory: {filename}")
-            # HF snapshot caches legitimately link shard files to their blob store.
             if file.suffix == ".safetensors":
                 with safe_open(file, framework="pt", device="cpu") as handle:
                     # get_slice reads header metadata, never the tensor payload.

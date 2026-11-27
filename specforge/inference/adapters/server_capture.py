@@ -172,11 +172,11 @@ def _capture_result_for_task(
 class SGLangServerCaptureAdapter:
     """RefSource over a live spec-capture SGLang server.
 
-    Implements ``produce_refs`` (not ``generate_features``): the returned
-    ``SampleRef``s point at tensors the SERVER already wrote to the Mooncake
-    store, so the RolloutWorker commits them without any local put. The refs
-    are verified against the :class:`CaptureConfig` from their FeatureSpecs
-    alone — same loud extraction-boundary guarantee, no tensor fetch.
+    Implements ``produce_refs``: the returned ``SampleRef``s point at tensors
+    the SERVER already wrote to the Mooncake store, so the RolloutWorker
+    commits them without any local put. The refs are verified against the
+    :class:`CaptureConfig` from their FeatureSpecs alone — same loud
+    extraction-boundary guarantee, no tensor fetch.
 
     ``store`` must be the run's :class:`MooncakeFeatureStore` (its ``store_id``
     namespaces the keys and ``adopt()`` registers each ref so a later
@@ -431,7 +431,7 @@ class SGLangServerCaptureAdapter:
         Order-aligned with ``tasks``; a per-task server error becomes a
         :class:`ServerCaptureFailure` (the worker fails just that lease). Any
         transport-level error raises — the worker fails the whole lease batch
-        retryable, mirroring ``generate_features`` semantics.
+        as retryable.
         """
         server_capture = self._resolve_server_capture()
         body = self._request_inputs(tasks)

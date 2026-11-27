@@ -116,7 +116,6 @@ Import losses from `specforge.losses.fused`. Unprefixed functions are eager.
 
 | API pair (eager / fused) | Label input | Per-token objective |
 | --- | --- | --- |
-| `ce_loss` / `fused_ce_loss` | Teacher logits `[B, T, V]` | CE against the teacher argmax |
 | `tv_loss` / `fused_tv_loss` | Teacher logits `[B, T, V]` | `1 - sum(min(p, q))` |
 | `ce_l1_loss` / `fused_ce_l1_loss` | Explicit token IDs `[...]`; optional teacher logits `[..., V]` | CE and optional `sum(abs(p - q))`, returned separately |
 
