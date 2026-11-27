@@ -1073,10 +1073,30 @@ class TrainingConfig(StrictConfigModel):
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    #: The data-parallel runtime. ``fsdp`` (DDP for ``NO_SHARD``, FSDP1
+    #: otherwise) stores the trainable draft in ``model.torch_dtype``,
+    #: accumulates and reduces gradients in it, and keeps fp32 masters in the
+    #: optimizer. ``fsdp2`` stores the trainable draft in fp32 (the masters),
+    #: computes in ``model.torch_dtype``, and accumulates and reduces gradients in
+    #: fp32 by default (or ``model.torch_dtype`` via ``training.gradient_dtype``),
+    #: driving registry-built optimizers directly.
+    runtime: Literal["fsdp", "fsdp2"] = "fsdp"
+    #: Optional gradient accumulation and reduction dtype override. ``None``
+    #: follows the runtime default (``model.torch_dtype`` for ``fsdp``,
+    #: ``float32`` for ``fsdp2``). Under ``fsdp2``, setting this to
+    #: ``model.torch_dtype`` (e.g. ``bfloat16``) avoids 2x unsharded fp32
+    #: gradient buffers across micro-batches and gives FSDP1 parity.
+    gradient_dtype: Optional[Literal["bfloat16", "float16", "float32"]] = None
     ddp_bucket_cap_mb: Optional[float] = Field(default=None, gt=0)
+    optimizer: str = Field(default="adamw", min_length=1)
+    optimizer_options: dict = Field(default_factory=dict)
+    param_group_policy: str = Field(default="default", min_length=1)
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    lr_scheduler: str = Field(default="cosine", min_length=1)
+    lr_scheduler_options: dict = Field(default_factory=dict)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
+    min_lr_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
@@ -1103,6 +1123,15 @@ class TrainingConfig(StrictConfigModel):
     #: and different roles.
     role: Literal["auto", "all", "producer", "consumer"] = "all"
     seed: int = 42
+    #: Where block objectives (DFlash, DFlash2, Domino, DSpark, DSpine, DMTP)
+    #: draw their anchors. ``device`` samples in the forward from the global
+    #: generator. ``host`` samples before the batch is placed, from ``seed``,
+    #: the sample's id and the epoch, so a sample's anchors do not depend on its
+    #: rank, its padding or the data-parallel size. Same sampling law; other
+    #: draws, so switching changes a run's trajectory, and a resume must keep
+    #: the mode and the seed (the checkpoint records both). Reproducible across
+    #: launches only where sample ids are.
+    anchor_sampling: Literal["device", "host"] = "device"
     #: Deterministic online prompt ordering. ``None`` preserves the historical
     #: behavior of using the run RNG seed for both model and prompt sampling.
     prompt_seed: Optional[int] = None
@@ -1137,6 +1166,18 @@ class TrainingConfig(StrictConfigModel):
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
             )
+        if self.runtime == "fsdp2":
+            if self.optimizer_cpu_offload:
+                raise ValueError(
+                    "training.runtime=fsdp2 keeps the fp32 masters in the "
+                    "parameters; training.optimizer_cpu_offload has no copy to "
+                    "move to the host"
+                )
+            if self.attention_backend == "usp":
+                raise ValueError(
+                    "training.runtime=fsdp2 is untested with sequence "
+                    "parallelism (attention_backend=usp)"
+                )
         return self
 
 
@@ -1222,6 +1263,26 @@ class Config(StrictConfigModel):
                 "profiling.enabled applies to trainer roles, not a capture-only "
                 "producer"
             )
+        if self.training.gradient_dtype is not None:
+            if (
+                self.training.runtime == "fsdp"
+                and self.training.gradient_dtype != self.model.torch_dtype
+            ):
+                raise ValueError(
+                    "training.runtime=fsdp accumulates and reduces gradients in "
+                    f"model.torch_dtype ({self.model.torch_dtype}); got "
+                    f"training.gradient_dtype={self.training.gradient_dtype}"
+                )
+            if (
+                self.training.runtime == "fsdp2"
+                and self.training.gradient_dtype
+                not in ("float32", self.model.torch_dtype)
+            ):
+                raise ValueError(
+                    "training.runtime=fsdp2 supports training.gradient_dtype in "
+                    f"('float32', {self.model.torch_dtype!r}); got "
+                    f"{self.training.gradient_dtype!r}"
+                )
         if self.data.eval_data_path:
             raise ValueError(
                 "data.eval_data_path is unsupported; online evaluation is not "

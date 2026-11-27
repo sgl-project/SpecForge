@@ -8,25 +8,45 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """TrainingBackend: model wrapping / backward / optimizer step / state dict.
 
-FSDP-only for now. ``ParallelConfig`` carries the process groups created by the
-single distributed lifecycle: trainer TP (fixed at one by public builders) plus
-draft DP/USP topology.
+FSDP-only for now. ``ParallelConfig`` carries the sharding strategy and the
+process group the job's topology gives the wrapper.
 """
 
 from __future__ import annotations
 
 import abc
 import contextlib
-import logging
-import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import KW_ONLY, dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from specforge.training.contracts import RankFailure
+from specforge.training.contracts import (
+    OptimizerSpec,
+    PrecisionSpec,
+    RankFailure,
+    SchedulerSpec,
+)
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
+
+
+def _optimizer_params(optimizer: torch.optim.Optimizer) -> List[nn.Parameter]:
+    """Parameters in the exact flat index order ``optimizer.state_dict()`` uses."""
+    return [param for group in optimizer.param_groups for param in group["params"]]
 
 
 def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
@@ -52,102 +72,42 @@ def _foreach_scale_(tensors: List[torch.Tensor], factor: torch.Tensor) -> None:
 
 @dataclass
 class ParallelConfig:
-    """Snapshot of the trainer-TP and draft-DP/SP layout.
+    """How the backend wraps the program, and over which process group.
 
-    Process-group handles are created once by :func:`init_distributed` and
-    carried into the trainer.  Re-deriving groups here can change collective
-    ordering and deadlock a multi-rank run.
+    The group comes from the job's topology, built once by
+    :func:`specforge.distributed.init_distributed`. Re-deriving groups here can
+    change collective ordering and deadlock a multi-rank run.
     """
 
     world_size: int = 1
-    tp_size: int = 1
-    sp_ulysses_size: int = 1
-    sp_ring_size: int = 1
     sharding_strategy: str = "SHARD_GRAD_OP"
-    param_dtype: torch.dtype = torch.bfloat16
+    _: KW_ONLY
     fsdp_process_group: Any = None
-    dp_group: Any = None
-    draft_dp_group: Any = None
-    tp_group: Any = None
-    sp_ulysses_group: Any = None
-    sp_ring_group: Any = None
-    draft_sp_group: Any = None
-    device_mesh: Any = None
-    tp_device_mesh: Any = None
-    extra: dict = field(default_factory=dict)
-
-    @property
-    def sp_size(self) -> int:
-        return self.sp_ulysses_size * self.sp_ring_size
+    ddp_bucket_cap_mb: Optional[float] = None
 
     @classmethod
-    def from_distributed(
+    def from_topology(
         cls,
+        topology: Topology,
         *,
-        tp_size: int = 1,
-        sp_ulysses_size: int = 1,
-        sp_ring_size: int = 1,
         sharding_strategy: str = "SHARD_GRAD_OP",
-        param_dtype: torch.dtype = torch.bfloat16,
+        ddp_bucket_cap_mb: Optional[float] = None,
     ) -> "ParallelConfig":
-        """Carry every group built by :func:`specforge.distributed.init_distributed`."""
-        # Env override for the FSDP sharding strategy — e.g. FSDP_SHARDING=NO_SHARD
-        # runs DDP-style (full params replicated, one grad all-reduce, no param
-        # all-gather). Default unchanged when the env var is unset.
-        sharding_strategy = os.environ.get("FSDP_SHARDING", sharding_strategy)
-        if not dist.is_initialized():
-            return cls(
-                world_size=1,
-                tp_size=tp_size,
-                sp_ulysses_size=sp_ulysses_size,
-                sp_ring_size=sp_ring_size,
-                sharding_strategy=sharding_strategy,
-                param_dtype=param_dtype,
-            )
-        handles: Dict[str, Any] = {}
-        try:
-            from specforge import distributed as sfdist
-
-            for name, getter in (
-                ("dp_group", "get_dp_group"),
-                ("draft_dp_group", "get_draft_dp_group"),
-                ("tp_group", "get_tp_group"),
-                ("sp_ulysses_group", "get_sp_ulysses_group"),
-                ("sp_ring_group", "get_sp_ring_group"),
-                ("draft_sp_group", "get_draft_sp_group"),
-                ("device_mesh", "get_device_mesh"),
-                ("tp_device_mesh", "get_tp_device_mesh"),
-            ):
-                fn = getattr(sfdist, getter, None)
-                if fn is None:
-                    continue
-                try:
-                    handles[name] = fn()
-                except Exception as exc:
-                    logging.getLogger(__name__).warning(
-                        "ParallelConfig.from_distributed: %s() unavailable: %s",
-                        getter,
-                        exc,
-                    )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "ParallelConfig.from_distributed: distributed handles unavailable: %s",
-                exc,
-            )
+        """Wrap over the topology's world group."""
         return cls(
-            world_size=dist.get_world_size(),
-            tp_size=tp_size,
-            sp_ulysses_size=sp_ulysses_size,
-            sp_ring_size=sp_ring_size,
+            world_size=topology.world_size,
             sharding_strategy=sharding_strategy,
-            param_dtype=param_dtype,
-            fsdp_process_group=dist.group.WORLD,
-            **handles,
+            fsdp_process_group=topology.world_group,
+            ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
 
 
 class TrainingBackend(abc.ABC):
     name: str
+    #: How backward reduces gradients across ``process_group``: ``"mean"``
+    #: (DDP/FSDP1/FSDP2 average) or ``"sum"`` (gradient-summing runtimes).
+    #: The step runner cancels ``"mean"`` by multiplying by world size.
+    grad_reduction: Literal["mean", "sum"] = "mean"
     #: Whether ``step(loss_denominator=...)`` validates the global loss
     #: denominator inside the optimizer's single host read, letting the step
     #: runner skip its own synchronizing check.
@@ -170,6 +130,12 @@ class TrainingBackend(abc.ABC):
     def learning_rate(self) -> Any:
         """The optimizer's current rate, or None when it does not report one."""
         return None
+
+    def close(self) -> None:
+        """Release runtime-owned resources (e.g. auxiliary process groups).
+
+        Must be idempotent: callers invoke it from ``finally`` blocks.
+        """
 
     def accumulation_context(self, *, is_boundary: bool = True):
         return contextlib.nullcontext()
@@ -223,9 +189,11 @@ class TrainingBackend(abc.ABC):
 
 
 class FSDPTrainingBackend(TrainingBackend):
-    """FSDP1 backend for the canonical SpecForge training math: FSDP with
-    ``use_orig_params=True`` / bf16 mixed precision over the configured process
-    group, optimizer targeting the inner trainable submodule."""
+    """The ``fsdp`` runtime: DDP for ``NO_SHARD``, FSDP1 (``use_orig_params``)
+    otherwise, over the configured process group. Parameters, compute,
+    gradients and the artifact share the parameter dtype the ``PrecisionSpec``
+    declares; the optimizer keeps the declared master weights and targets the
+    inner trainable submodule."""
 
     name = "fsdp"
 
@@ -234,15 +202,55 @@ class FSDPTrainingBackend(TrainingBackend):
         parallel_config: ParallelConfig,
         *,
         optimizer_factory=None,
+        optimizer_spec: Optional[OptimizerSpec] = None,
+        scheduler_spec: Optional[SchedulerSpec] = None,
+        max_grad_norm: Optional[float] = None,
+        precision: Optional[PrecisionSpec] = None,
     ) -> None:
+        if optimizer_factory is not None and optimizer_spec is not None:
+            raise ValueError(
+                "pass either optimizer_factory or optimizer_spec, not both"
+            )
         self.parallel_config = parallel_config
+        if precision is not None:
+            self._validate_precision(precision)
         self._optimizer_factory = optimizer_factory
+        self._optimizer_spec = optimizer_spec
+        self._scheduler_spec = scheduler_spec
+        self._max_grad_norm = max_grad_norm
+        self.precision = precision
         self.module: Optional[nn.Module] = None
         self.optimizer = None
+        self.scheduler = None
+        self.last_grad_norm: Optional[torch.Tensor] = None
         self._wrapped = False
         self._wrapper_kind = "none"
         self.auto_wrap_block_classes = set()
         self.ignored_frozen_modules = tuple()
+
+    def _validate_precision(self, precision: PrecisionSpec) -> None:
+        if not (
+            precision.parameter_dtype
+            == precision.compute_dtype
+            == precision.gradient_dtype
+        ):
+            raise ValueError(
+                "the fsdp runtime stores, computes and accumulates gradients in one "
+                f"dtype; {precision} asks for more than one"
+            )
+        if precision.artifact_dtype != precision.parameter_dtype:
+            raise ValueError(
+                "the fsdp runtime writes the weights in the dtype they are stored "
+                f"in; {precision} asks for another"
+            )
+        if (
+            self.parallel_config.sharding_strategy == "NO_SHARD"
+            and precision.buffer_dtype is not None
+        ):
+            raise ValueError(
+                "DDP (NO_SHARD) leaves floating buffers in their built dtype; "
+                f"PrecisionSpec.buffer_dtype must be None, got {precision.buffer_dtype}"
+            )
 
     @property
     def process_group(self) -> Any:
@@ -250,7 +258,11 @@ class FSDPTrainingBackend(TrainingBackend):
 
     def learning_rate(self) -> Any:
         get_learning_rate = getattr(self.optimizer, "get_learning_rate", None)
-        return get_learning_rate() if callable(get_learning_rate) else None
+        if callable(get_learning_rate):
+            return get_learning_rate()
+        if isinstance(self.optimizer, torch.optim.Optimizer):
+            return self.optimizer.param_groups[0]["lr"]
+        return None
 
     @property
     def optimizer_state_is_replicated(self) -> bool:
@@ -280,6 +292,22 @@ class FSDPTrainingBackend(TrainingBackend):
             for parameter in module.parameters()
         ):
             raise ValueError("frozen modules must contain only frozen parameters")
+        pre_wrap_target = optimizer_target if optimizer_target is not None else model
+        if self.precision is not None:
+            # The precision a run declares is the precision that runs.
+            stored = {p.dtype for p in pre_wrap_target.parameters() if p.requires_grad}
+            if stored - {self.precision.parameter_dtype}:
+                raise ValueError(
+                    f"trainable parameters are {sorted(map(str, stored))}; the run "
+                    f"declares {self.precision.parameter_dtype}"
+                )
+        elif wrap and self.parallel_config.sharding_strategy != "NO_SHARD":
+            raise ValueError("the sharding wrapper needs the run's PrecisionSpec")
+        # Record pre-sharding parameter ranks by object identity before FSDP1
+        # flattens shards to 1-D (and inserts ``_fsdp_wrapped_module`` into names).
+        orig_ndims = {
+            id(p): p.ndim for p in pre_wrap_target.parameters() if p.requires_grad
+        }
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -320,11 +348,7 @@ class FSDPTrainingBackend(TrainingBackend):
                     process_group=pc.fsdp_process_group,
                     broadcast_buffers=False,
                     gradient_as_bucket_view=True,
-                    bucket_cap_mb=(
-                        float(os.environ["SPECFORGE_DDP_BUCKET_CAP_MB"])
-                        if "SPECFORGE_DDP_BUCKET_CAP_MB" in os.environ
-                        else None
-                    ),
+                    bucket_cap_mb=pc.ddp_bucket_cap_mb,
                 )
                 self._wrapper_kind = "ddp"
             else:
@@ -337,8 +361,12 @@ class FSDPTrainingBackend(TrainingBackend):
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=getattr(model, "fsdp_param_dtype", pc.param_dtype),
-                        buffer_dtype=torch.float32,
+                        param_dtype=self.precision.compute_dtype,
+                        reduce_dtype=self.precision.gradient_dtype,
+                        buffer_dtype=self.precision.buffer_dtype,
+                        # The program casts what it computes with; the wrapper
+                        # leaves its inputs as the runner placed them, as DDP does.
+                        cast_root_forward_inputs=False,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
@@ -363,14 +391,64 @@ class FSDPTrainingBackend(TrainingBackend):
             sharded = self._wrapper_kind == "fsdp"
             self.auto_wrap_block_classes = block_classes if sharded else set()
             self.ignored_frozen_modules = frozen_modules if sharded else ()
-        if self._optimizer_factory is not None:
-            target = optimizer_target if optimizer_target is not None else self.module
-            self.optimizer = self._optimizer_factory(target)
-            self._configure_optimizer_grad_norm()
+        target = optimizer_target if optimizer_target is not None else self.module
+        if self._optimizer_spec is not None:
+            self._build_configured_optimizer(target, param_ndims=orig_ndims)
+        elif self._optimizer_factory is not None:
+            self.set_optimizer(self._optimizer_factory(target))
         return self.module
 
-    def set_optimizer(self, optimizer) -> None:
+    def _build_configured_optimizer(
+        self,
+        target: nn.Module,
+        *,
+        param_ndims: Optional[Mapping[int, int]] = None,
+    ) -> None:
+        from specforge.optimizer import BF16Optimizer
+
+        if self._scheduler_spec is None:
+            raise ValueError("optimizer_spec requires scheduler_spec")
+        if self._max_grad_norm is None:
+            raise ValueError("optimizer_spec requires max_grad_norm")
+        self.set_optimizer(
+            BF16Optimizer(
+                target,
+                optimizer_spec=self._optimizer_spec,
+                scheduler_spec=self._scheduler_spec,
+                max_grad_norm=self._max_grad_norm,
+                param_ndims=param_ndims,
+            )
+        )
+
+    def set_optimizer(self, optimizer, *, scheduler=None) -> None:
+        """Train with ``optimizer`` (and optional runtime-owned ``scheduler``).
+
+        Raises:
+            ValueError: ``optimizer`` keeps other master weights than the
+                ``PrecisionSpec`` declares, or ``scheduler`` is given without a
+                runtime-owned ``torch.optim.Optimizer`` and ``max_grad_norm``.
+            TypeError: With a ``PrecisionSpec``, ``master_dtype_of`` does not
+                know ``optimizer``.
+        """
+        if self.precision is not None:
+            from specforge.optimizer import master_dtype_of
+
+            masters = master_dtype_of(optimizer)
+            if masters != self.precision.master_dtype:
+                raise ValueError(
+                    f"{type(optimizer).__name__} keeps master_dtype={masters}; "
+                    f"the run declares master_dtype={self.precision.master_dtype}"
+                )
+        if scheduler is not None and not (
+            isinstance(optimizer, torch.optim.Optimizer)
+            and self._max_grad_norm is not None
+        ):
+            raise ValueError(
+                "passing scheduler to set_optimizer requires a runtime-owned "
+                "torch.optim.Optimizer with max_grad_norm set"
+            )
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self._configure_optimizer_grad_norm()
 
     def _configure_optimizer_grad_norm(self) -> None:
@@ -411,8 +489,135 @@ class FSDPTrainingBackend(TrainingBackend):
             )
 
     @property
+    def _runtime_owns_step(self) -> bool:
+        """Whether this runtime owns grad norm, clipping, checks and scheduling."""
+        return (
+            isinstance(self.optimizer, torch.optim.Optimizer)
+            and self._max_grad_norm is not None
+        )
+
+    @property
     def checks_loss_denominator(self) -> bool:
+        if self._runtime_owns_step:
+            return True
         return bool(getattr(self.optimizer, "checks_loss_denominator", False))
+
+    def _global_grad_norm(self, params: Sequence[nn.Parameter]) -> torch.Tensor:
+        """Compute the pre-clip global L2 gradient norm over ``params``."""
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard
+
+        from specforge.optimizer import _sum_of_squares, local_tensor
+
+        dtensor_buckets: Dict[
+            Tuple[int, Tuple[int, ...]],
+            Tuple[Any, Tuple[int, ...], Any, List[torch.Tensor]],
+        ] = {}
+        plain_params: List[nn.Parameter] = []
+        for param in params:
+            if isinstance(param, DTensor):
+                mesh = param.device_mesh
+                shard_dims = tuple(
+                    idx
+                    for idx, placement in enumerate(param.placements)
+                    if isinstance(placement, Shard)
+                )
+                key = (id(mesh), shard_dims)
+                if key not in dtensor_buckets:
+                    dtensor_buckets[key] = (
+                        mesh,
+                        shard_dims,
+                        local_tensor(param).device,
+                        [],
+                    )
+                if param.grad is not None:
+                    dtensor_buckets[key][3].append(local_tensor(param.grad).detach())
+            else:
+                plain_params.append(param)
+
+        result_device = (
+            local_tensor(params[0]).device if params else torch.device("cpu")
+        )
+        parts: List[torch.Tensor] = []
+
+        for mesh, shard_dims, bucket_device, bucket_grads in dtensor_buckets.values():
+            bucket_sq = (
+                _sum_of_squares(bucket_grads)
+                if bucket_grads
+                else torch.zeros((), dtype=torch.float32, device=bucket_device)
+            )
+            if dist.is_available() and dist.is_initialized():
+                for dim_idx in shard_dims:
+                    pg = mesh.get_group(dim_idx)
+                    if dist.get_world_size(group=pg) > 1:
+                        dist.all_reduce(bucket_sq, op=dist.ReduceOp.SUM, group=pg)
+            parts.append(bucket_sq.to(device=result_device, dtype=torch.float32))
+
+        should_reduce_plain = (
+            self._wrapped
+            and self.parallel_config.sharding_strategy != "NO_SHARD"
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if plain_params or (not dtensor_buckets and should_reduce_plain):
+            plain_grads = [p.grad.detach() for p in plain_params if p.grad is not None]
+            plain_device = plain_params[0].device if plain_params else result_device
+            plain_sq = (
+                _sum_of_squares(plain_grads)
+                if plain_grads
+                else torch.zeros((), dtype=torch.float32, device=plain_device)
+            )
+            if should_reduce_plain:
+                dist.all_reduce(
+                    plain_sq, op=dist.ReduceOp.SUM, group=self.process_group
+                )
+            parts.append(plain_sq.to(device=result_device, dtype=torch.float32))
+
+        total_sq = (
+            torch.stack(parts).sum()
+            if parts
+            else torch.zeros((), dtype=torch.float32, device=result_device)
+        )
+        return total_sq.sqrt()
+
+    def _step_torch_optimizer(
+        self,
+        params: Sequence[nn.Parameter],
+        *,
+        loss_denominator: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the runtime-owned update for a direct ``torch.optim.Optimizer``.
+
+        Computes global grad norm, validates it (and optional
+        ``loss_denominator``) in one host read before mutating any state,
+        clips gradients, steps the optimizer, clears gradients, and advances
+        the LR scheduler when present.
+        """
+        from specforge.optimizer import validate_step_scalars
+
+        assert self._max_grad_norm is not None
+        grad_norm = self._global_grad_norm(params)
+
+        def clear_grads() -> None:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        try:
+            validate_step_scalars(
+                grad_norm,
+                max_grad_norm=self._max_grad_norm,
+                loss_denominator=loss_denominator,
+                on_error=clear_grads,
+            )
+        except FloatingPointError:
+            self.last_grad_norm = grad_norm.detach()
+            raise
+        torch.nn.utils.clip_grads_with_norm_(params, self._max_grad_norm, grad_norm)
+        self.last_grad_norm = grad_norm.detach()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.scheduler is not None:
+            self.scheduler.step()
+        return self.last_grad_norm
 
     def step(
         self, *, loss_denominator: Optional[torch.Tensor] = None
@@ -420,15 +625,146 @@ class FSDPTrainingBackend(TrainingBackend):
         """Run the optimizer step, which clips and returns the global grad norm.
 
         ``loss_denominator`` is forwarded only when set; it requires an
-        optimizer that ``checks_loss_denominator``.
+        optimizer or runtime-owned update that ``checks_loss_denominator``.
         """
         if self.optimizer is None:
             raise RuntimeError(
-                "FSDPTrainingBackend.step called before optimizer is set"
+                f"{type(self).__name__}.step called before optimizer is set"
+            )
+        if self._runtime_owns_step:
+            return self._step_torch_optimizer(
+                _optimizer_params(self.optimizer),
+                loss_denominator=loss_denominator,
             )
         if loss_denominator is None:
             return self.optimizer.step()
         return self.optimizer.step(loss_denominator=loss_denominator)
+
+    def _torch_optimizer_state_dict(
+        self, *, include_params: bool = False, format_key: Optional[str] = None
+    ) -> dict:
+        """Serialize a runtime-owned ``torch.optim.Optimizer`` + optional scheduler."""
+        from specforge.optimizer import local_tensor, optimizer_resume_metadata
+
+        optimizer_state = self.optimizer.state_dict()
+        optimizer_state["state"] = {
+            index: {
+                key: (
+                    local_tensor(value).detach().cpu().clone()
+                    if torch.is_tensor(value)
+                    else value
+                )
+                for key, value in state.items()
+            }
+            for index, state in optimizer_state["state"].items()
+        }
+        payload: Dict[str, Any] = {
+            "optimizer_state_dict": optimizer_state,
+            "max_grad_norm": self._max_grad_norm,
+            **optimizer_resume_metadata(
+                optimizer_spec=self._optimizer_spec,
+                scheduler_spec=(
+                    self._scheduler_spec if self.scheduler is not None else None
+                ),
+            ),
+        }
+        if self.scheduler is not None:
+            payload["scheduler_state_dict"] = self.scheduler.state_dict()
+            payload.setdefault(
+                "lr_scheduler_type",
+                self._scheduler_spec.kind if self._scheduler_spec is not None else None,
+            )
+        if include_params:
+            payload["fp32_params"] = [
+                local_tensor(param.detach()).cpu().clone()
+                for param in _optimizer_params(self.optimizer)
+            ]
+        if format_key is not None:
+            payload[format_key] = True
+        return payload
+
+    def _load_torch_optimizer_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        *,
+        restore_params: bool = False,
+        format_key: Optional[str] = None,
+    ) -> None:
+        """Restore a runtime-owned ``torch.optim.Optimizer`` + optional scheduler."""
+        from specforge.optimizer import (
+            like_parameter,
+            local_tensor,
+            restore_optimizer_kernel_state,
+            validate_optimizer_resume_metadata,
+        )
+
+        if format_key is not None and format_key not in state_dict:
+            raise ValueError(
+                f"this optimizer state was not written by the {self.name} runtime; "
+                "resume it with the runtime that wrote it"
+            )
+        validate_optimizer_resume_metadata(
+            state_dict,
+            optimizer_spec=self._optimizer_spec,
+            scheduler_spec=self._scheduler_spec if self.scheduler is not None else None,
+            default_scheduler_type="cosine",
+        )
+        saved_max_grad_norm = state_dict.get("max_grad_norm")
+        if (
+            self._max_grad_norm is not None
+            and saved_max_grad_norm is not None
+            and float(saved_max_grad_norm) != float(self._max_grad_norm)
+        ):
+            raise ValueError(
+                "checkpoint optimizer used max_grad_norm="
+                f"{saved_max_grad_norm} but this run has "
+                f"max_grad_norm={self._max_grad_norm}"
+            )
+        params = _optimizer_params(self.optimizer)
+        if restore_params:
+            saved = state_dict["fp32_params"]
+            if len(saved) != len(params):
+                raise ValueError(
+                    f"checkpoint carries {len(saved)} fp32 parameters but this rank "
+                    f"has {len(params)}"
+                )
+            with torch.no_grad():
+                for index, (value, param) in enumerate(zip(saved, params)):
+                    local = local_tensor(param)
+                    if value.shape != local.shape:
+                        raise ValueError(
+                            f"fp32 parameter {index} shape mismatch: checkpoint "
+                            f"{tuple(value.shape)} vs current {tuple(local.shape)}"
+                        )
+                    local.copy_(value.to(local.device, local.dtype))
+        optimizer_state = dict(state_dict["optimizer_state_dict"])
+        optimizer_state["state"] = {
+            index: {
+                key: like_parameter(
+                    value.clone() if torch.is_tensor(value) else value,
+                    params[int(index)],
+                )
+                for key, value in state.items()
+            }
+            for index, state in optimizer_state["state"].items()
+        }
+        self.optimizer.load_state_dict(optimizer_state)
+        restore_optimizer_kernel_state(self.optimizer)
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(state_dict["scheduler_state_dict"])
+
+    def _optimizer_state_dict(self) -> Any:
+        if self.optimizer is None:
+            return None
+        if self._runtime_owns_step:
+            return self._torch_optimizer_state_dict()
+        return self.optimizer.state_dict()
+
+    def _load_optimizer_state_dict(self, state: Mapping[str, Any]) -> None:
+        if self._runtime_owns_step:
+            self._load_torch_optimizer_state_dict(state)
+            return
+        self.optimizer.load_state_dict(state)
 
     def state_dict(self) -> dict:
         """Full training state ``{"model", "optimizer", "rng"}`` for resume.
@@ -444,9 +780,7 @@ class FSDPTrainingBackend(TrainingBackend):
         model = self._module_state_dict()
         try:
             # This rank's own work, once the gather is over.
-            optimizer = (
-                self.optimizer.state_dict() if self.optimizer is not None else None
-            )
+            optimizer = self._optimizer_state_dict()
             rng = self._rng_state()
         except Exception as error:
             raise RankFailure(f"{type(error).__name__}: {error}") from error
@@ -458,8 +792,17 @@ class FSDPTrainingBackend(TrainingBackend):
             self._load_module_state_dict(state["model"])
         try:
             # This rank's own state: its failure is this rank's alone.
-            if self.optimizer is not None and state.get("optimizer") is not None:
-                self.optimizer.load_state_dict(state["optimizer"])
+            opt_state = state.get("optimizer")
+            if opt_state is not None:
+                from specforge.optimizer import FSDP2_OPTIMIZER_FORMAT_KEY
+
+                if self.name == "fsdp" and FSDP2_OPTIMIZER_FORMAT_KEY in opt_state:
+                    raise ValueError(
+                        "this optimizer state was written by the fsdp2 runtime; "
+                        "resume it with training.runtime=fsdp2"
+                    )
+                if self.optimizer is not None:
+                    self._load_optimizer_state_dict(opt_state)
             if state.get("rng") is not None:
                 self._set_rng_state(state["rng"])
         except Exception as error:

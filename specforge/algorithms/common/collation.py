@@ -5,22 +5,6 @@ from __future__ import annotations
 from typing import Mapping, Sequence
 
 
-def concatenate_features(features):
-    """Concatenate equal-shaped per-sample feature dictionaries."""
-
-    if not features:
-        raise ValueError("cannot collate an empty feature batch")
-    import torch
-
-    keys = tuple(features[0])
-    expected_keys = set(keys)
-    if any(set(feature) != expected_keys for feature in features[1:]):
-        raise ValueError("all samples must expose the same feature keys")
-    return {
-        key: torch.cat([feature[key] for feature in features], dim=0) for key in keys
-    }
-
-
 def pad_and_concatenate_features(
     features,
     *,
@@ -88,4 +72,4 @@ def pad_and_concatenate_features(
     return batch
 
 
-__all__ = ["concatenate_features", "pad_and_concatenate_features"]
+__all__ = ["pad_and_concatenate_features"]

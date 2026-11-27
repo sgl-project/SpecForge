@@ -120,22 +120,6 @@ class DataFlowController:
                 out.append(self._prompts[task_id])
         return out
 
-    def complete_prompt_tasks(self, worker_id: str, task_ids: List[str]) -> None:
-        """Retire successfully captured prompts that belong to another TP rank.
-
-        Colocated target-TP ranks keep replicated prompt schedules so they can
-        execute the same frozen-target forward.  After capture, each rank trains
-        only its local batch partition; peer-owned prompts therefore complete on
-        this controller without producing a local ``SampleRef``.
-        """
-        with self._lock:
-            for task_id in task_ids:
-                owner = self._prompt_leased.get(task_id)
-                if owner is not None and owner != worker_id:
-                    continue
-                self._prompt_leased.pop(task_id, None)
-                self._prompts.pop(task_id, None)
-
     def fail_prompt_tasks(
         self, worker_id: str, task_ids: List[str], reason: str, retryable: bool
     ) -> None:

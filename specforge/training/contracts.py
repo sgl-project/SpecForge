@@ -38,6 +38,15 @@ if TYPE_CHECKING:
     from specforge.runtime.contracts import TrainBatch
 
 
+#: Key of ``TrainBatch.metadata`` under which the run loop records the epoch a
+#: training batch belongs to, as it pulls the batch. A window can span an epoch
+#: boundary, so the epoch belongs to the batch, not to the window.
+EPOCH_METADATA_KEY = "epoch"
+#: The epoch an evaluation forward reports: one value for every pass, so a
+#: draw keyed on the epoch is the same at every evaluation.
+EVALUATION_EPOCH = -1
+
+
 @dataclass(frozen=True)
 class StepContext:
     """Schedule state for one optimizer window; values only.
@@ -53,6 +62,181 @@ class StepContext:
     collect_detailed_metrics: bool = True
     accumulation_steps: int = 1
     replay_values: Mapping[str, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OptimizerSpec:
+    """Declarative optimizer configuration consumed by the shared registry.
+
+    The runtime constructs the optimizer over the wrapped trainable module so
+    parameter names and sharded/DTensor layouts stay intact.
+    """
+
+    kind: str = "adamw"
+    lr: float = 1e-4
+    weight_decay: float = 0.0
+    betas: Tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    param_group_policy: str = "default"
+    offload_master: bool = False
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SchedulerSpec:
+    """Declarative learning-rate schedule consumed by the shared registry."""
+
+    kind: str = "cosine"
+    total_steps: Optional[int] = None
+    warmup_ratio: float = 0.015
+    min_lr_ratio: float = 0.0
+    extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+#: Runtimes ``training.runtime`` names, and how each holds the trainable draft.
+RUNTIMES = ("fsdp", "fsdp2")
+
+
+@dataclass(frozen=True)
+class PrecisionSpec:
+    """How the trainable draft's numbers are stored, computed, reduced and written.
+
+    Resolved once for a run (``resolve``) and handed to the trainer. The
+    runtime refuses a combination it cannot hold, and checks the trainable
+    parameters are stored as declared and the optimizer keeps the declared
+    masters. Under ``fsdp`` the separate fp32 master copy is
+    ``BF16Optimizer``'s, and the artifact is written in the parameter dtype.
+    Frozen modules (bound target tables, the teacher head) keep the dtype they
+    were built in and are not described here.
+    """
+
+    #: What the trainable parameters are stored in.
+    parameter_dtype: torch.dtype
+    #: What the runtime gives the parameters in for forward and backward. A
+    #: module may cast further inside (Domino's GRU runs fp16 on Ascend).
+    compute_dtype: torch.dtype
+    #: What gradients accumulate in across micro-batches and are reduced in
+    #: across ranks.
+    gradient_dtype: torch.dtype
+    #: The optimizer's own copy of the parameters, when it keeps one; None
+    #: when the parameters themselves are the masters.
+    master_dtype: Optional[torch.dtype]
+    #: What checkpoints and exports write the draft's weights in.
+    artifact_dtype: torch.dtype
+    #: What floating-point buffers are cast to while wrapped; None leaves
+    #: buffers in the dtype they were built in (DDP / unwrapped).
+    buffer_dtype: Optional[torch.dtype]
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        runtime: str,
+        model_dtype: torch.dtype,
+        sharding_strategy: Optional[str] = None,
+        gradient_dtype: Optional[torch.dtype] = None,
+    ) -> "PrecisionSpec":
+        """The precision a runtime trains a draft built in ``model_dtype`` with.
+
+        ``fsdp`` (DDP / FSDP1): parameters, compute, gradients and the artifact
+        in ``model_dtype``; ``BF16Optimizer`` keeps fp32 masters; FSDP1 casts
+        floating buffers to fp32 while DDP (``NO_SHARD``) leaves them as built.
+        ``fsdp2``: fp32 parameters that are the masters, compute in
+        ``model_dtype``, fp32 gradients by default (or ``model_dtype`` when
+        explicitly requested via ``gradient_dtype``), fp32 floating buffers,
+        artifact in ``model_dtype``.
+        """
+        if not model_dtype.is_floating_point:
+            raise ValueError(f"model dtype must be floating point, not {model_dtype}")
+        if gradient_dtype is not None and not gradient_dtype.is_floating_point:
+            raise ValueError(
+                f"gradient dtype must be floating point, not {gradient_dtype}"
+            )
+        if runtime == "fsdp":
+            resolved_gradient_dtype = (
+                model_dtype if gradient_dtype is None else gradient_dtype
+            )
+            if resolved_gradient_dtype != model_dtype:
+                raise ValueError(
+                    "the fsdp runtime accumulates and reduces gradients in "
+                    f"{model_dtype}; got gradient_dtype={resolved_gradient_dtype}"
+                )
+            return cls(
+                parameter_dtype=model_dtype,
+                compute_dtype=model_dtype,
+                gradient_dtype=resolved_gradient_dtype,
+                master_dtype=torch.float32,
+                artifact_dtype=model_dtype,
+                buffer_dtype=(
+                    None if sharding_strategy == "NO_SHARD" else torch.float32
+                ),
+            )
+        if runtime == "fsdp2":
+            resolved_gradient_dtype = (
+                torch.float32 if gradient_dtype is None else gradient_dtype
+            )
+            if resolved_gradient_dtype not in (torch.float32, model_dtype):
+                raise ValueError(
+                    "the fsdp2 runtime supports fp32 or compute-dtype "
+                    f"({model_dtype}) gradients; got gradient_dtype="
+                    f"{resolved_gradient_dtype}"
+                )
+            return cls(
+                parameter_dtype=torch.float32,
+                compute_dtype=model_dtype,
+                gradient_dtype=resolved_gradient_dtype,
+                master_dtype=None,
+                artifact_dtype=model_dtype,
+                buffer_dtype=torch.float32,
+            )
+        raise ValueError(f"unknown runtime {runtime!r}; expected one of {RUNTIMES}")
+
+    def to_record(self) -> Dict[str, Optional[str]]:
+        """Plain string representation recorded in checkpoints for resume checks."""
+        return {
+            "parameter_dtype": str(self.parameter_dtype),
+            "compute_dtype": str(self.compute_dtype),
+            "gradient_dtype": str(self.gradient_dtype),
+            "master_dtype": (
+                None if self.master_dtype is None else str(self.master_dtype)
+            ),
+            "artifact_dtype": str(self.artifact_dtype),
+            "buffer_dtype": (
+                None if self.buffer_dtype is None else str(self.buffer_dtype)
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class TrainingRuntime:
+    """The data-parallel runtime that trains the draft, and its precision.
+
+    Resolved once for a run and handed to the trainer, which builds that
+    runtime; the runtime honors the precision or refuses it.
+    """
+
+    #: One of ``RUNTIMES``.
+    name: str
+    precision: PrecisionSpec
+
+    @classmethod
+    def resolve(
+        cls,
+        name: str,
+        *,
+        model_dtype: torch.dtype,
+        sharding_strategy: Optional[str] = None,
+        gradient_dtype: Optional[torch.dtype] = None,
+    ) -> "TrainingRuntime":
+        return cls(
+            name,
+            PrecisionSpec.resolve(
+                runtime=name,
+                model_dtype=model_dtype,
+                sharding_strategy=sharding_strategy,
+                gradient_dtype=gradient_dtype,
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -75,6 +259,11 @@ class ProgramSpec:
     #: Statistics it needs pooled over the whole window and every rank before
     #: its gradient pass.
     replay_statistics: Tuple[str, ...] = ()
+    #: Additive statistics it emits during training forwards to be summed over
+    #: the whole window and every rank and delivered through
+    #: :meth:`TrainingProgram.apply_statistics` once the optimizer update
+    #: succeeds (before any checkpoint snapshot).
+    after_step_statistics: Tuple[str, ...] = ()
     #: Whether its evaluation reports the detailed metrics.
     evaluation_diagnostics: bool = False
     #: How the loss is normalized. "window": the update's objective is
@@ -85,6 +274,18 @@ class ProgramSpec:
     #: their denominators between each forward and its backward.
     reduction: Literal["window", "microbatch"] = "window"
     partition: PartitionHints = PartitionHints()
+    #: Model-parallel axes the program communicates on, each with its counting
+    #: kind: "copy" (same batch, count one rank), "part" (sharded sample, sum
+    #: shards), or "own" (disjoint batches with sharded parameters, sum all).
+    axes: Tuple[Tuple[str, Literal["copy", "part", "own"]], ...] = ()
+
+    def __post_init__(self) -> None:
+        overlap = sorted(set(self.replay_statistics) & set(self.after_step_statistics))
+        if overlap:
+            raise ValueError(
+                "replay_statistics and after_step_statistics must be distinct; "
+                f"overlap={overlap}"
+            )
 
 
 class TrainingProgram(Protocol):
@@ -132,7 +333,9 @@ class TrainingProgram(Protocol):
         here. A program that declares a replay statistic also takes
         ``prepass=True``, which asks for this rank's sums of each statistic
         in ``result.statistics``, and in every call the keyword arguments
-        that ``replay_arguments`` returned for it.
+        that ``replay_arguments`` returned for it. A program that declares
+        ``after_step_statistics`` returns each statistic's local sum in
+        ``result.statistics`` on every training forward.
         """
 
     def replay_arguments(
@@ -142,15 +345,34 @@ class TrainingProgram(Protocol):
 
         For a prepass, a replay (``replay_values`` holds the pooled sums) and
         any other call (it is empty). Any arithmetic on the pooled sums, a
-        ratio and its zero guard for one, is done here, outside the wrapper:
-        a wrapper may cast what passes through its forward. Empty for a
-        program without a statistic.
+        ratio and its zero guard for one, is done here in the precision the
+        sums were pooled in, outside the wrapper. Empty for a program without
+        a statistic.
+        """
+
+    def apply_statistics(self, values: Mapping[str, torch.Tensor]) -> Mapping[str, Any]:
+        """Apply pooled after-step statistics once an optimizer update succeeds.
+
+        Called on every rank inside :meth:`StepRunner.apply_step`, after the
+        optimizer and scheduler advance and before any checkpoint snapshot.
+        Must issue no collective and compute identical buffer updates on every
+        rank. Returns the scalar post-step metrics to include in
+        :class:`StepMetrics`; empty when it reports none.
         """
 
     def host_inputs(
-        self, tensors: Mapping[str, torch.Tensor]
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        sample_ids: Sequence[str],
+        epoch: Optional[int],
     ) -> Mapping[str, torch.Tensor]:
-        """Extra batch tensors derived on the host, before the batch is placed."""
+        """Extra batch tensors derived on the host, before the batch is placed.
+
+        ``sample_ids`` are the batch's, one per row; ``epoch`` is the one the
+        run loop recorded on the batch (``EPOCH_METADATA_KEY``), or
+        ``EVALUATION_EPOCH`` in an evaluation pass.
+        """
 
     def kernel_record(self) -> Dict[str, str]:
         """The kernels realised so far, by the choice they answer."""

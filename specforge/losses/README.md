@@ -7,13 +7,10 @@ not register algorithms or choose execution policies.
 | --- | --- |
 | `fused.py` | Reference and fused token losses |
 | `domino.py` | Weighted loss for base logits and suffix corrections |
-| `lk.py` | Acceptance metrics and LK losses |
 | `position_weights.py` | Detached position weighting |
-| `soft_cross_entropy.py` | Historical soft cross-entropy autograd implementation |
 
-Private Triton modules implement the kernels. Importing portable loss modules
-does not require Triton; `soft_cross_entropy` retains its existing Triton dependency.
-The package initializer does not eagerly import these modules.
+Private Triton modules implement the kernels. Importing loss modules does not
+require Triton. The package initializer does not eagerly import these modules.
 
 `algorithms/objectives/implementations/` adapts numerical functions to execution
 requests and selects optimizations. Chunk scheduling and teacher preparation are

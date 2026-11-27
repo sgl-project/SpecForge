@@ -47,15 +47,16 @@ state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
 ### Boundaries
 
 The parts meet through `contracts.py`. `tests/test_runtime/test_training_boundaries.py`
-reads five import rules from the source:
+reads six import rules from the source:
 
 | Rule | Modules | May not reach |
 |---|---|---|
 | A collective across samples appears only in a runner | objectives, drafts, losses, layers; the frame; the run loop and the evaluator; the checkpoint manager, the profiler and `trainer.py` | `torch.distributed`, `specforge.distributed` |
 | The frame imports the shared contracts only | `contracts.py`, `frame.py`, `program.py` | anything else in `specforge` |
 | The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling`, `layers`, `losses`, `torch.optim` |
-| A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
+| A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `backends/`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
 | A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.optim`, `torch.nn.parallel` |
+| Only the trainer imports a runtime package | everything in `specforge` outside `training/backends/` and `trainer.py` | `specforge.training.backends` |
 
 The shared contracts are `training.contracts`, `runtime.contracts` and the
 value types of `config.draft`, which the test lists by name (`DraftConfig`):
@@ -82,12 +83,13 @@ the process-global topology is listed with how many times; one use more or
 one fewer fails. A type, a constant or a query of the process's own rank or
 of a group's size is listed by name only. Two are the sequence-parallel axis
 (the rollout, ring attention), whose groups share a sequence and never
-samples. Four are the run loop's own uses of the process group
-(`controller.py`, `checkpoint.py`, `profiling.py`, `trainer.py`). The design
-moves the reads to a topology value and the error gathers to `runner.agree`;
-rank 0's two broadcast verdicts (whether an evaluation runs, whether a
-checkpoint is the best) need either a way to distribute a decision or every
-rank computing it, which the contract does not have yet.
+samples. Three are the run loop's own uses of the process group
+(`controller.py`, `checkpoint.py`, `profiling.py`). `controller.py` and
+`trainer.py` take ranks and the world size from the job's `Topology`; the
+design moves the remaining reads to that value and the error gathers to
+`runner.agree`; rank 0's two broadcast verdicts (whether an evaluation runs,
+whether a checkpoint is the best) need either a way to distribute a decision
+or every rank computing it, which the contract does not have yet.
 
 ### Conformance
 

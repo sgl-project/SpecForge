@@ -132,9 +132,15 @@ the capture server.
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.ddp_bucket_cap_mb` | unset | Optional DDP bucket target in MiB for `NO_SHARD`; unset keeps PyTorch's default. Benchmark changes because larger buckets trade launch overhead for later overlap. |
+| `training.optimizer` | `adamw` | Registered optimizer name (built-in: `adamw`; extensions register via `specforge.optimizer.register_optimizer`). |
+| `training.optimizer_options` | `{}` | Extra keyword options forwarded to the registered optimizer builder. |
+| `training.param_group_policy` | `default` | Registered parameter-grouping policy (`default` or `no_decay_1d`; extensions register via `specforge.optimizer.register_param_group_policy`). |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
-| `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
+| `training.weight_decay` | `0.0` | Non-negative decoupled weight decay. |
+| `training.lr_scheduler` | `cosine` | Registered learning-rate schedule (`cosine`, `constant`, `linear`, `wsd`, or a custom registered scheduler/curve). |
+| `training.lr_scheduler_options` | `{}` | Extra options forwarded to the registered LR scheduler (for `wsd`: `decay_ratio` and `decay_style`). |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
+| `training.min_lr_ratio` | `0.0` | Minimum learning-rate floor as a fraction in `[0, 1]` of `learning_rate` (used by decaying schedules). |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. Canonical objectives accept `eager` (EAGLE3 also `sdpa`), so a canonical YAML must set it. |
@@ -149,6 +155,9 @@ the capture server.
 | `training.resume_from` | `null` | Alias for `resume`. Restores a canonical full training checkpoint and excludes `initialization`. If both aliases are set they must agree. |
 | `training.role` | `all` | Use `all` for offline colocated training; disaggregated entrypoints select `auto`, `producer`, or `consumer`. |
 | `training.seed` | `42` | Run and per-rank RNG seed. |
+| `training.runtime` | `fsdp` | Data-parallel runtime. `fsdp`: DDP (`NO_SHARD`) or FSDP1, the draft stored and gradients accumulated and reduced in `model.torch_dtype`, fp32 masters in the optimizer. `fsdp2`: the draft stored in fp32 (the masters), computed in `model.torch_dtype`, gradients accumulated and reduced in fp32 by default (or `model.torch_dtype` via `training.gradient_dtype`); drives registry-built optimizers directly and resumes both its own checkpoints and the `fsdp` runtime's (same world size and module structure). Not with `optimizer_cpu_offload` or `usp`. |
+| `training.gradient_dtype` | `null` | Optional gradient accumulation and reduction dtype override (`bfloat16`, `float16`, `float32`). `null` uses the runtime default (`model.torch_dtype` for `fsdp`, `float32` for `fsdp2`). Setting `bfloat16` under `fsdp2` halves unsharded accumulation-buffer memory for `accumulation_steps > 1` and matches FSDP1's bf16 gradient reduction. |
+| `training.anchor_sampling` | `device` | Where block objectives (DFlash, DFlash2, Domino, DSpark, DSpine, DMTP) draw anchors. `device` samples in the forward from the global generator. `host` samples before placement from `training.seed`, the sample id and the epoch: a sample's anchors do not depend on its rank, padding or the data-parallel size (a batch with no row of `num_anchors` valid positions still gives every row fewer slots). Same law, other draws; a resume must keep the mode and seed. Reproducible across launches only where sample ids are (single-epoch online prompts get fresh ids per launch); a padded repeat of a sample in one epoch repeats its draw. |
 | `training.prompt_seed` | `null` | Optional online prompt-shuffle seed. `null` preserves the historical behavior of using `training.seed`. |
 | Strategy | Fields and defaults |
 | --- | --- |

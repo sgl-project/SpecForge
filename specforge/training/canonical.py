@@ -127,6 +127,59 @@ def resolve_run(cfg, *, target_config=None):
         )
         validate_target_initialization(draft, target, cfg.initialization.from_target)
     resolved = resolve_objective(draft.architecture, **_objective_settings(cfg))
+    from specforge.algorithms.objectives.base import validate_anchor_sampling
+
+    # At resolution, before a producer ingests data for a run that cannot train.
+    validate_anchor_sampling(
+        resolved.name,
+        resolved.registration.training,
+        cfg.training.anchor_sampling,
+        cfg.training.seed,
+    )
+    from specforge.lr_scheduler import registered_lr_schedulers, validate_scheduler_spec
+    from specforge.optimizer import (
+        registered_optimizers,
+        registered_param_group_policies,
+        validate_optimizer_spec,
+    )
+    from specforge.training.contracts import OptimizerSpec, SchedulerSpec
+
+    if cfg.training.optimizer not in registered_optimizers():
+        raise ValueError(
+            f"unsupported training.optimizer={cfg.training.optimizer!r}; "
+            f"expected one of {list(registered_optimizers())}"
+        )
+    if cfg.training.param_group_policy not in registered_param_group_policies():
+        raise ValueError(
+            "unsupported training.param_group_policy="
+            f"{cfg.training.param_group_policy!r}; "
+            f"expected one of {list(registered_param_group_policies())}"
+        )
+    if cfg.training.lr_scheduler not in registered_lr_schedulers():
+        raise ValueError(
+            f"unsupported training.lr_scheduler={cfg.training.lr_scheduler!r}; "
+            f"expected one of {list(registered_lr_schedulers())}"
+        )
+    validate_optimizer_spec(
+        OptimizerSpec(
+            kind=cfg.training.optimizer,
+            lr=cfg.training.learning_rate,
+            weight_decay=cfg.training.weight_decay,
+            param_group_policy=cfg.training.param_group_policy,
+            offload_master=cfg.training.optimizer_cpu_offload,
+            extra=dict(cfg.training.optimizer_options),
+        )
+    )
+    validate_scheduler_spec(
+        SchedulerSpec(
+            kind=cfg.training.lr_scheduler,
+            total_steps=cfg.training.total_steps or cfg.training.max_steps,
+            warmup_ratio=cfg.training.warmup_ratio,
+            min_lr_ratio=cfg.training.min_lr_ratio,
+            extra=dict(cfg.training.lr_scheduler_options),
+        ),
+        require_total_steps=False,
+    )
     if resolved.execution.teacher_chunk_size and cfg.mode != "offline":
         raise ValueError("compact teacher currently requires offline training")
     from specforge.config.schema import ModelConfig
@@ -394,7 +447,7 @@ def _raise_flex_recompile_limit():
     dynamo.config.recompile_limit = max(dynamo.config.recompile_limit, 64)
 
 
-def build_bundle(cfg, algorithm):
+def build_bundle(cfg, algorithm, topology):
     import torch
 
     from specforge.algorithms.common.providers import (
@@ -550,7 +603,7 @@ def build_bundle(cfg, algorithm):
     if cfg.training.attention_backend == "usp":
         from .sequence_parallel import sequence_parallel_groups
 
-        sequence_parallel = sequence_parallel_groups()
+        sequence_parallel = sequence_parallel_groups(topology)
     runtime = build_objective_model(
         model,
         **_objective_settings(cfg),
@@ -560,8 +613,9 @@ def build_bundle(cfg, algorithm):
         + ([teacher] if teacher is not None else []),
         attention_backend=cfg.training.attention_backend,
         sequence_parallel=sequence_parallel,
+        anchor_sampling=cfg.training.anchor_sampling,
+        anchor_seed=cfg.training.seed,
     )
-    runtime.fsdp_param_dtype = dtype
     contract = {
         "canonical_draft_config": encode_config(draft),
         "canonical_objective": runtime.objective_name,
@@ -570,11 +624,23 @@ def build_bundle(cfg, algorithm):
         ),
         "canonical_use_liger_kernel": use_liger,
         "canonical_use_fused_conv": use_fused_conv,
+        # A resume keeps drawing anchors as the run did: the host draw keys on
+        # the seed, so it is part of the record.
+        "canonical_anchor_sampling": (
+            ("host", cfg.training.seed)
+            if cfg.training.anchor_sampling == "host"
+            else "device"
+        ),
         "canonical_frozen": tuple(sorted(set(cfg.training.frozen))),
         "canonical_loss": runtime.loss_configuration.to_dict(),
         "canonical_weighting": asdict(runtime.weighting),
         "canonical_loss_execution": asdict(runtime.execution),
         "canonical_loss_implementations": runtime.loss_implementations.names,
+        "canonical_optimizer": cfg.training.optimizer,
+        "canonical_param_group_policy": cfg.training.param_group_policy,
+        "canonical_optimizer_options": dict(cfg.training.optimizer_options),
+        "canonical_lr_scheduler_min_lr_ratio": float(cfg.training.min_lr_ratio),
+        "canonical_lr_scheduler_options": dict(cfg.training.lr_scheduler_options),
     }
     from specforge.training.provenance import model_resume_provenance
 

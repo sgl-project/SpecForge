@@ -14,6 +14,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from specforge.distributed import Topology
+from tests.test_runtime._fixtures import reference_runtime
+
 
 class DomainTrainerWiringTest(unittest.TestCase):
     def _build(
@@ -31,10 +34,9 @@ class DomainTrainerWiringTest(unittest.TestCase):
         on_fit_success=None,
         on_fit_failure=None,
         on_fit_finally=None,
-        tp_size=1,
-        sp_ulysses_size=1,
-        sp_ring_size=1,
+        topology=Topology(rank=3, world_size=8),
         store="STORE",
+        runtime=None,
     ):
         import specforge.training.trainer as tr
         from specforge.training.contracts import PartitionHints, ProgramSpec
@@ -60,22 +62,35 @@ class DomainTrainerWiringTest(unittest.TestCase):
 
         class FakeParallel:
             @classmethod
-            def from_distributed(cls, **kw):
+            def from_topology(cls, topology, **kw):
+                cap["parallel_topology"] = topology
                 cap["parallel_kw"] = kw
-                return SimpleNamespace(
-                    world_size=8,
-                    tp_size=kw["tp_size"],
-                    sp_size=kw["sp_ulysses_size"] * kw["sp_ring_size"],
-                )
+                return SimpleNamespace()
 
         class FakeBackend:
-            def __init__(self, parallel, *, optimizer_factory):
+            def __init__(
+                self,
+                parallel,
+                *,
+                optimizer_factory=None,
+                optimizer_spec=None,
+                scheduler_spec=None,
+                max_grad_norm=None,
+                precision=None,
+            ):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
+                cap["optimizer_spec"] = optimizer_spec
+                cap["scheduler_spec"] = scheduler_spec
+                cap["max_grad_norm"] = max_grad_norm
+                cap["precision"] = precision
 
             def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
                 cap["prepare_model"] = (model, optimizer_target, frozen_modules, blocks)
                 return "WRAPPED"
+
+            def close(self):
+                cap["backend_closes"] = cap.get("backend_closes", 0) + 1
 
         class FakeRunner:
             def __init__(self, program, backend, spec):
@@ -121,6 +136,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
         model = SimpleNamespace(draft_model="DRAFT", frozen_modules=("TABLE",))
         dfc = FakeDataflowController()
 
+        runtime = reference_runtime() if runtime is None else runtime
         with mock.patch.multiple(
             tr,
             FeatureDataLoader=FakeLoader,
@@ -137,6 +153,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 model=model,
                 program_spec=spec,
                 optimizer_factory="OPT",
+                runtime=runtime,
                 run_id="run",
                 output_dir="/out",
                 batch_size=2,
@@ -153,9 +170,7 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 on_fit_success=on_fit_success,
                 on_fit_failure=on_fit_failure,
                 on_fit_finally=on_fit_finally,
-                tp_size=tp_size,
-                sp_ulysses_size=sp_ulysses_size,
-                sp_ring_size=sp_ring_size,
+                topology=topology,
             )
         return trainer, cap, dfc_calls, model
 
@@ -223,11 +238,14 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertEqual(cap["ctrl_kw"]["strategy_name"], "eagle3")
         self.assertEqual(cap["ctrl_kw"]["accumulation_steps"], 3)
         self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 8)
+        # the run loop's rank and world size are the topology's
+        self.assertEqual((cap["ctrl_kw"]["rank"], cap["ctrl_kw"]["world_size"]), (3, 8))
 
         self.assertIsNone(cap["ctrl_kw"]["ack_fn"])
+        self.assertEqual(cap["parallel_topology"], Topology(rank=3, world_size=8))
         self.assertEqual(
             cap["parallel_kw"],
-            {"tp_size": 1, "sp_ulysses_size": 1, "sp_ring_size": 1},
+            {"sharding_strategy": "SHARD_GRAD_OP", "ddp_bucket_cap_mb": None},
         )
 
         # run identity rides the shared checkpoint payload, validated on resume
@@ -242,15 +260,68 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 "tp_size": 1,
                 "sp_ulysses_size": 1,
                 "sp_ring_size": 1,
+                "runtime": "fsdp",
+                "precision": reference_runtime().precision.to_record(),
+                "fsdp_sharding": "SHARD_GRAD_OP",
             },
         )
+        self.assertEqual(cap["precision"], reference_runtime().precision)
+
+    def test_unknown_runtime_is_refused_before_wrapping(self):
+        from dataclasses import replace
+
+        unknown = replace(reference_runtime(), name="unknown_rt")
+        with self.assertRaisesRegex(
+            ValueError, "unknown training runtime 'unknown_rt'"
+        ):
+            self._build({"refs": list(range(6))}, runtime=unknown)
+
+    def test_fsdp2_runtime_wires_fsdp2_backend(self):
+        import torch
+
+        import specforge.training.backends.fsdp2 as fsdp2_mod
+        from specforge.training.contracts import TrainingRuntime
+
+        fsdp2_rt = TrainingRuntime.resolve("fsdp2", model_dtype=torch.bfloat16)
+        constructed = {}
+
+        class FakeFSDP2:
+            def __init__(self, parallel, **kw):
+                constructed["parallel"] = parallel
+                constructed["kw"] = kw
+
+            def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
+                constructed["prepare_model"] = (
+                    model,
+                    optimizer_target,
+                    frozen_modules,
+                    blocks,
+                )
+                return "WRAPPED_FSDP2"
+
+            def close(self):
+                constructed["closed"] = True
+
+        with mock.patch.object(fsdp2_mod, "FSDP2TrainingBackend", FakeFSDP2):
+            trainer, cap, _, _ = self._build({"refs": list(range(6))}, runtime=fsdp2_rt)
+        self.assertIsInstance(trainer.backend, FakeFSDP2)
+        self.assertEqual(constructed["kw"]["precision"], fsdp2_rt.precision)
+        self.assertEqual(cap["ctrl_kw"]["checkpoint_extra"]["runtime"], "fsdp2")
 
     def test_throughput_scale_counts_only_data_parallel_ranks(self):
         _, cap, _, _ = self._build(
-            {"refs": list(range(6))}, tp_size=2, sp_ulysses_size=2
+            {"refs": list(range(6))},
+            topology=Topology(world_size=8, tp_size=2, sp_ulysses_size=2),
         )
         # 8 ranks in groups of tp 2 x sp 2 receive 2 different sample streams
         self.assertEqual(cap["ctrl_kw"]["data_parallel_size"], 2)
+        self.assertEqual(
+            {
+                key: cap["ctrl_kw"]["checkpoint_extra"][key]
+                for key in ("tp_size", "sp_ulysses_size", "sp_ring_size")
+            },
+            {"tp_size": 2, "sp_ulysses_size": 2, "sp_ring_size": 1},
+        )
 
     def test_fixed_refs_reject_partial_accumulation_during_assembly(self):
         try:
@@ -274,11 +345,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertIs(cap["fit"], cap["loader"])
         self.assertEqual(cap["saves"], [42])
         self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(cap["backend_closes"], 1)
 
         # Re-entering at an already durable step does not write it twice.
         self.assertEqual(trainer.fit(), 42)
         self.assertEqual(cap["saves"], [42])
         self.assertEqual(cap["loader_closes"], 2)
+        self.assertEqual(cap["backend_closes"], 2)
 
     def test_offline_loader_rebuilds_the_ref_plan_on_set_epoch(self):
         try:

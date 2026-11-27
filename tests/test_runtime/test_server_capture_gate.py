@@ -7,7 +7,7 @@ What is pinned here:
   -> engine-side sink put (SpecForge key layout) -> ``SampleRef`` from
   ``meta_info`` only -> ``MooncakeFeatureStore.get`` reads the server-written
   bytes -> one real eagle3 train step (``target_repr="hidden_state"``, the
-  frozen TargetHead recomputes logits);
+  frozen target ``lm_head`` loaded via ``TargetWeights`` recomputes logits);
 - extraction correctness: the server-captured aux hidden states match an
   independent HF ``output_hidden_states=True`` forward at the configured
   layers, and ``lm_head(last_hidden)`` matches the HF logits (norm-placement
@@ -426,9 +426,9 @@ class TestServerCaptureGate(unittest.TestCase):
             self.assertIsInstance(ref, SampleRef, f"expected a ref, got failure: {ref}")
 
         aux_ref, logits_ref = self._hf_reference(rows)
-        from specforge.modeling.target.target_head import TargetHead
+        from tests.test_runtime import _fixtures as fx
 
-        head = TargetHead.from_pretrained(self.target_dir)
+        head = fx.load_target_head(self.target_dir)
 
         fetched = []
         for i, ref in enumerate(refs):
@@ -464,7 +464,7 @@ class TestServerCaptureGate(unittest.TestCase):
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(
+        topology = fx.build_single_rank_distributed(
             port=os.environ.get("SPECFORGE_CAPTURE_GATE_TRAIN_PORT", "29576")
         )
         torch.manual_seed(0)
@@ -472,7 +472,7 @@ class TestServerCaptureGate(unittest.TestCase):
         vocab_path = fx.write_vocab_mapping(os.path.join(self.workdir, "vm.pt"))
         model = fx.load_eagle3(config_path, self.target_dir, vocab_path, ttt=3)
         dm = model.draft_model
-        backend = FSDPTrainingBackend(ParallelConfig.from_distributed())
+        backend = FSDPTrainingBackend(ParallelConfig.from_topology(topology))
         backend.prepare_model(model, wrap=False)
         backend.set_optimizer(
             BF16Optimizer(

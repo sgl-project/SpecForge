@@ -350,9 +350,8 @@ class LossExecutionTest(unittest.TestCase):
                                 runtime(batch, step=1, total_steps=10)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-    def test_fused_soft_ce_matches_legacy_real_vocabulary(self):
+    def test_fused_soft_ce_matches_eager_real_vocabulary(self):
         from specforge.losses.fused import fused_soft_ce_loss
-        from specforge.losses.soft_cross_entropy import LogSoftmaxLoss
 
         torch.manual_seed(1175)
         logits = torch.randn(2, 3, 128256, device="cuda", dtype=torch.bfloat16)
@@ -360,9 +359,12 @@ class LossExecutionTest(unittest.TestCase):
         mask = torch.tensor([[1, 0, 1], [0, 1, 1]], device="cuda")
         expected_input = logits.clone().requires_grad_()
         actual_input = logits.clone().requires_grad_()
-        expected = LogSoftmaxLoss.apply(
-            expected_input, teacher.float().softmax(-1), mask[..., None]
-        )
+        expected = (
+            -(teacher.float().softmax(-1) * expected_input.float().log_softmax(-1)).sum(
+                -1
+            )
+            * mask
+        ).mean()
         actual = (fused_soft_ce_loss(actual_input, teacher) * mask).mean()
         (expected_grad,) = torch.autograd.grad(expected, expected_input)
         (actual_grad,) = torch.autograd.grad(actual, actual_input)

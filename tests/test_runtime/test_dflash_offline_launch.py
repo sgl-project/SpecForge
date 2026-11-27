@@ -18,7 +18,7 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
     def test_dflash_trains_from_precomputed_features(self):
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29567")
+        topology = fx.build_single_rank_distributed(port="29567")
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -52,11 +52,13 @@ class TestDFlashOfflineLaunch(unittest.TestCase):
             )
 
         trainer = build_offline_runtime(
+            topology=topology,
             algorithm=ALGORITHM,
             hidden_states_path=feature_dir,
             draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="dflash-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,

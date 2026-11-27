@@ -2,8 +2,8 @@
 """CPU seams for the unified entry's TP/DP/USP topology wiring."""
 
 import unittest
-from unittest import mock
 
+from specforge.distributed import Topology
 from specforge.launch import (
     _offline_io,
     _shard_offline_refs,
@@ -11,37 +11,34 @@ from specforge.launch import (
     build_offline_runtime,
 )
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime._fixtures import reference_runtime
 
 
 class ParallelTopologyTest(unittest.TestCase):
     def test_offline_ref_sharding_pads_every_replica_to_equal_steps(self):
-        dp_group = object()
-        draft_dp_group = object()
         refs = list(range(5))
-
-        def world_size(group):
-            self.assertIn(group, (dp_group, draft_dp_group))
-            return 2
-
-        with (
-            mock.patch("torch.distributed.is_available", return_value=True),
-            mock.patch("torch.distributed.is_initialized", return_value=True),
-            mock.patch("torch.distributed.get_world_size", side_effect=world_size),
-            mock.patch("torch.distributed.get_rank", return_value=1),
-            mock.patch("specforge.distributed.get_dp_group", return_value=dp_group),
-            mock.patch(
-                "specforge.distributed.get_draft_dp_group",
-                return_value=draft_dp_group,
+        # Rank 1 of two trainer-DP replicas; rank 2 of four ranks in two
+        # draft-DP replicas of an SP-2 sequence group.
+        self.assertEqual(
+            _shard_offline_refs(
+                refs,
+                topology=Topology(rank=1, world_size=2, dp_rank=1),
+                use_usp_preprocess=False,
+                shuffle=False,
             ),
-        ):
-            self.assertEqual(
-                _shard_offline_refs(refs, use_usp_preprocess=False, shuffle=False),
-                [1, 3, 0],
-            )
-            self.assertEqual(
-                _shard_offline_refs(refs, use_usp_preprocess=True, shuffle=False),
-                [1, 3, 0],
-            )
+            [1, 3, 0],
+        )
+        self.assertEqual(
+            _shard_offline_refs(
+                refs,
+                topology=Topology(
+                    rank=2, world_size=4, sp_ulysses_size=2, dp_rank=2, draft_dp_rank=1
+                ),
+                use_usp_preprocess=True,
+                shuffle=False,
+            ),
+            [1, 3, 0],
+        )
 
     def test_offline_sampler_rebuilds_seeded_dp_order_for_each_epoch(self):
         from torch.utils.data.distributed import DistributedSampler
@@ -63,11 +60,10 @@ class ParallelTopologyTest(unittest.TestCase):
                 expected = list(expected_sampler)
                 actual = _shard_offline_refs(
                     refs,
+                    topology=Topology(rank=dp_rank, world_size=2, dp_rank=dp_rank),
                     use_usp_preprocess=False,
                     seed=23,
                     epoch=epoch,
-                    dp_rank=dp_rank,
-                    dp_size=2,
                 )
                 self.assertEqual(actual, expected)
                 # Repeating a draft-DP rank models the SP peers that must share
@@ -76,11 +72,12 @@ class ParallelTopologyTest(unittest.TestCase):
                     actual,
                     _shard_offline_refs(
                         refs,
+                        topology=Topology(
+                            world_size=4, sp_ulysses_size=2, draft_dp_rank=dp_rank
+                        ),
                         use_usp_preprocess=True,
                         seed=23,
                         epoch=epoch,
-                        dp_rank=dp_rank,
-                        dp_size=2,
                     ),
                 )
                 epoch_shards.append(actual[:2])
@@ -98,10 +95,9 @@ class ParallelTopologyTest(unittest.TestCase):
         rank_shards = [
             _shard_offline_refs(
                 refs,
+                topology=Topology(rank=rank, world_size=4, dp_rank=rank),
                 use_usp_preprocess=False,
                 shuffle=False,
-                dp_rank=rank,
-                dp_size=4,
             )
             for rank in range(4)
         ]
@@ -127,9 +123,10 @@ class ParallelTopologyTest(unittest.TestCase):
                 draft_model=object(),
                 target_head=None,
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run",
                 output_dir="/unused",
-                tp_size=2,
+                topology=Topology(world_size=2, tp_size=2),
             )
 
         with self.assertRaisesRegex(
@@ -142,9 +139,10 @@ class ParallelTopologyTest(unittest.TestCase):
                 draft_model=object(),
                 target_head=None,
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run",
                 output_dir="/unused",
-                tp_size=2,
+                topology=Topology(world_size=2, tp_size=2),
             )
 
     def test_offline_io_resolves_the_builtin_provider_for_text(self):
@@ -157,12 +155,27 @@ class ParallelTopologyTest(unittest.TestCase):
             4096,
             ttt_length=7,
             use_usp_preprocess=False,
+            topology=Topology(),
         )
 
         expected_normalizer = provider.build_normalizer(4096)
         self.assertIsInstance(collator, type(provider.build_collator()))
         self.assertIs(normalizer.func, expected_normalizer.func)
         self.assertEqual(normalizer.keywords, expected_normalizer.keywords)
+
+    def test_usp_normalizer_keeps_the_topologys_sequence_shard(self):
+        algorithm = builtin_algorithm_registry().resolve("eagle3")
+        _, normalizer = _offline_io(
+            algorithm,
+            "text",
+            4096,
+            ttt_length=7,
+            use_usp_preprocess=True,
+            topology=Topology(rank=1, world_size=2, sp_ulysses_size=2, sp_rank=1),
+        )
+        self.assertEqual(
+            (normalizer.keywords["rank"], normalizer.keywords["size"]), (1, 2)
+        )
 
 
 if __name__ == "__main__":
