@@ -5,6 +5,9 @@ The cross-plane picture (whole-system map, endpoint reference, autonomy) lives i
 [`../runtime/ARCHITECTURE.md`](../runtime/ARCHITECTURE.md); the shared records
 every plane exchanges are in
 [`../runtime/contracts.py`](../runtime/contracts.py).
+The backend architecture (program, shared step layer, parallel runtime and
+update registries) is in [`BACKENDS.md`](BACKENDS.md); this note describes what
+runs on `main` today.
 
 ## Responsibility
 
