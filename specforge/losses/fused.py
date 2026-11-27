@@ -38,6 +38,7 @@ treated as constant), L the row loss:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
@@ -53,6 +54,7 @@ __all__ = [
     "fused_lk_hybrid_loss",
     "fused_ce_l1_loss",
     "supports_fused_ce_l1_loss",
+    "triton_available",
     "CEL1Loss",
     # Eager reference/fallback implementations (pure PyTorch, CPU-safe)
     "kl_div_loss",
@@ -408,7 +410,8 @@ class CEL1Loss(NamedTuple):
 
     Losses and IDs have shape ``logits.shape[:-1]``; top-k outputs append a
     ``top_k`` dimension. ``teacher_l1`` and both top-1 probabilities/teacher IDs
-    are None without teacher logits. Only CE, L1 and top-k values carry gradients.
+    are None without teacher logits. Only CE, L1 (when ``teacher_l1_grad=True``)
+    and top-k values carry gradients.
     """
 
     cross_entropy: torch.Tensor
@@ -421,6 +424,43 @@ class CEL1Loss(NamedTuple):
     teacher_top1_probability: torch.Tensor | None
 
 
+_TRITON_DEVICE_BACKENDS = {
+    "cuda": ("cuda", "hip"),
+    "npu": ("npu",),
+}
+_TRITON_TARGET_BACKEND: tuple[object, str | None] = (object(), None)
+
+
+def triton_available(device: torch.device | str | None = None) -> bool:
+    """Whether Triton with a working compiler backend is available for ``device``."""
+    global _TRITON_TARGET_BACKEND
+    try:
+        import triton
+        import triton.language as tl
+    except ImportError:
+        return False
+    if not (callable(getattr(triton, "jit", None)) and hasattr(tl, "constexpr")):
+        return False
+    if device is None:
+        return True
+    device_type = device.split(":", 1)[0] if isinstance(device, str) else device.type
+    allowed = _TRITON_DEVICE_BACKENDS.get(device_type)
+    if allowed is None:
+        return False
+    try:
+        import triton.runtime as runtime
+
+        active = runtime.driver.active
+        cached_driver, backend = _TRITON_TARGET_BACKEND
+        if cached_driver is not active:
+            backend = getattr(active.get_current_target(), "backend", None)
+            if backend is not None:
+                _TRITON_TARGET_BACKEND = (active, backend)
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+    return backend in allowed
+
+
 def supports_fused_ce_l1_loss(logits: torch.Tensor) -> bool:
     """Whether an optimized CE/L1 implementation supports this device and dtype."""
     if logits.device.type != "cuda" or logits.dtype not in (
@@ -429,11 +469,7 @@ def supports_fused_ce_l1_loss(logits: torch.Tensor) -> bool:
         torch.float32,
     ):
         return False
-    try:
-        import triton  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    return triton_available(logits.device)
 
 
 def fused_ce_l1_loss(
@@ -442,6 +478,7 @@ def fused_ce_l1_loss(
     *,
     teacher_logits: torch.Tensor | None = None,
     top_k: int = 0,
+    teacher_l1_grad: bool = True,
 ) -> CEL1Loss:
     """Hard-label CE and optional teacher L1; optimized twin of ``ce_l1_loss``.
 
@@ -459,6 +496,8 @@ def fused_ce_l1_loss(
         teacher_logits: Optional same-shaped logits, not probabilities. Always
             stop-gradient; omitted for CE-only training.
         top_k: Number of draft-logit candidates to return; zero skips selection.
+        teacher_l1_grad: Whether ``teacher_l1`` carries gradients and retains
+            teacher logits for backward. Set False when L1 is diagnostic-only.
 
     Returns:
         ``CEL1Loss`` with FP32 per-position CE/L1 and candidate values. Apply
@@ -514,6 +553,7 @@ def fused_ce_l1_loss(
             else teacher_logits.detach().reshape(-1, vocab).contiguous()
         ),
         int(top_k),
+        bool(teacher_l1_grad),
     )
     return CEL1Loss(
         cross_entropy=cross_entropy.reshape(shape),
@@ -734,6 +774,7 @@ def ce_l1_loss(
     *,
     teacher_logits: torch.Tensor | None = None,
     top_k: int = 0,
+    teacher_l1_grad: bool = True,
 ) -> CEL1Loss:
     """CPU-safe reference for ``fused_ce_l1_loss``, with the same input/result API.
 
@@ -755,9 +796,10 @@ def ce_l1_loss(
             q = teacher_logits.float().softmax(-1)
             teacher_ids = teacher_logits.argmax(-1)
             teacher_top1 = q.max(-1).values
-        p = ce_logits.float().softmax(-1)
-        l1 = (p - q).abs().sum(-1)
-        top1 = p.detach().max(-1).values
+        with nullcontext() if teacher_l1_grad else torch.no_grad():
+            p = ce_logits.float().softmax(-1)
+            l1 = (p - q).abs().sum(-1)
+            top1 = p.detach().max(-1).values
     return CEL1Loss(
         cross_entropy=ce,
         teacher_l1=l1,

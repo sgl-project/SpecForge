@@ -182,8 +182,7 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
             none applies; an unsupported device or dtype and a missing optional
             dependency are reasons to skip, not errors. True considers every
             implementation, propagates their dependency errors, and raises
-            when a categorical loss can only be evaluated by the reference
-            off CUDA/ROCm or outside FP16/BF16/FP32.
+            when no optimized implementation supports a categorical loss.
 
     Support checks must not materialize predictions.
     """
@@ -197,6 +196,7 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
         ),
         key=lambda entry: (entry.category == "reference", -entry.priority, entry.name),
     )
+    relevant = []
     for entry in candidates:
         if entry.losses and any(
             request.terms[i].loss.kind not in entry.losses for i in group
@@ -222,6 +222,8 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
                 if fused is not None:
                     raise
                 reason = str(error)
+            if reason is not None:
+                relevant.append(f"{entry.name}: {reason}")
         if reason is None:
             if (
                 fused is True
@@ -230,13 +232,22 @@ def select_implementation(request, group=(0,), *, rejections=None, fused=False):
                     request.terms[i].loss.registration.input_kind == "categorical"
                     for i in group
                 )
-                and (
-                    not request.input_tensor.is_cuda
-                    or request.input_tensor.dtype
-                    not in (torch.float16, torch.bfloat16, torch.float32)
-                )
             ):
-                raise ValueError("fused loss requires CUDA/ROCm FP16/BF16/FP32 inputs")
+                tensor = request.input_tensor
+                if tensor.device.type not in ("cuda", "npu") or tensor.dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    raise ValueError(
+                        "fused loss requires CUDA/ROCm/NPU FP16/BF16/FP32 inputs"
+                    )
+                kinds = ", ".join(request.terms[i].loss.kind for i in group)
+                details = "; ".join(relevant)
+                raise ValueError(
+                    f"No fused implementation supports categorical loss ({kinds})"
+                    + (f": {details}" if details else "")
+                )
             return entry
         if rejections is not None:
             rejections.append(f"{entry.name}: {reason}")
@@ -314,38 +325,38 @@ class ExecutionSelection:
         if fused is False:
             return select_implementation(request, group)
         key = f"{prediction_index}:" + ",".join(map(str, group))
-        reasons, error, entry = [], None, None
-        try:
-            entry = select_implementation(
-                request, group, fused=fused, rejections=reasons
+        reasons = []
+        # Honor checkpoints written before automatic-mode NPU kernels existed.
+        effective_fused = (
+            False
+            if (
+                fused is None
+                and self._expected is not None
+                and self._expected.get(key) == "reference"
+                and request.input_tensor.device.type == "npu"
             )
-        except (ImportError, ValueError, RuntimeError) as exc:
-            error = str(exc)
+            else fused
+        )
+        entry = select_implementation(
+            request, group, fused=effective_fused, rejections=reasons
+        )
         name = entry.name if entry else ("split" if len(group) > 1 else "reference")
-        self.record(key, name, error=error, reasons=reasons)
+        self.record(key, name, reasons=reasons)
         return entry
 
-    def record(self, key, name, *, error=None, reasons=()):
+    def record(self, key, name, *, reasons=()):
         """Record a main or auxiliary implementation once and check consistency."""
         if key in self.names:
-            if error is not None:
-                raise ValueError(error)
             if self.names[key] != name:
                 raise ValueError(
                     f"Loss implementation changed for {key}: {self.names[key]} -> {name}"
                 )
             return
-        if (
-            error is None
-            and self._expected is not None
-            and self._expected.get(key) != name
-        ):
-            error = (
+        if self._expected is not None and self._expected.get(key) != name:
+            raise ValueError(
                 f"loss implementation {key} changed on resume: "
                 f"{self._expected.get(key)!r} -> {name!r}"
             )
-        if error is not None:
-            raise ValueError(error)
         self.names[key] = name
         logger.info(
             "Loss group %s uses %s%s",

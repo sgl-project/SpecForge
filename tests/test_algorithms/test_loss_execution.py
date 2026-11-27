@@ -322,12 +322,18 @@ class LossExecutionTest(unittest.TestCase):
                     if not fused:
                         expected = actual
                     else:
-                        if architecture in ("DFlash2DraftModel", "DSpineDraftModel"):
+                        single_pass = {
+                            "DFlash2DraftModel": "token_ce",
+                            "DSpineDraftModel": "token_ce_l1",
+                        }
+                        if architecture in single_pass:
                             self.assertEqual(
-                                runtime.loss_implementations.names[
-                                    "0/compute/candidates:0"
-                                ],
-                                "token_ce",
+                                runtime.loss_implementations.names["0:0"],
+                                single_pass[architecture],
+                            )
+                            self.assertNotIn(
+                                "0/compute/candidates:0",
+                                runtime.loss_implementations.names,
                             )
                         torch.testing.assert_close(
                             actual, expected, rtol=8e-4, atol=3e-5
@@ -336,7 +342,7 @@ class LossExecutionTest(unittest.TestCase):
                             self.assertGreater(kernel.call_count, 0)
                         if architecture == "DFlash2DraftModel":
                             saved = dict(runtime.loss_implementations.names)
-                            saved["0/compute/candidates:0"] = "reference"
+                            saved["0:0"] = "reference"
                             runtime.loss_implementations.restore(saved)
                             with self.assertRaisesRegex(
                                 ValueError, "changed on resume"
@@ -465,13 +471,13 @@ class LossExecutionTest(unittest.TestCase):
             labels=torch.zeros(3, 1, device="cuda", dtype=torch.long),
         )
 
-        def run(selection, p=prediction):
+        def run(selection, p=prediction, *, fused=True):
             return execute_batch(
                 PredictionBatch((p,)),
                 TokenLoss(kind="ce"),
                 PositionWeighting(),
                 training=True,
-                execution=LossExecution(fused=True),
+                execution=LossExecution(fused=fused),
                 selection=selection,
             )
 
@@ -490,23 +496,20 @@ class LossExecutionTest(unittest.TestCase):
         restored.restore({"0:0": "linear_ce"})
         with self.assertRaisesRegex(ValueError, "changed on resume"):
             run(restored)
-        # An unsupported loss contract is a visible reference fallback.
-        with (
-            patch.dict(
-                _IMPLEMENTATIONS,
-                {
-                    k: v
-                    for k, v in _IMPLEMENTATIONS.items()
-                    if v.category == "reference"
-                },
-                clear=True,
-            ),
-            self.assertLogs(
-                "specforge.algorithms.objectives.implementations.registry", level="INFO"
-            ) as logs,
+        # An unsupported loss contract raises under fused=True and is a visible
+        # reference fallback under fused=None.
+        with patch.dict(
+            _IMPLEMENTATIONS,
+            {k: v for k, v in _IMPLEMENTATIONS.items() if v.category == "reference"},
+            clear=True,
         ):
-            fallback = ExecutionSelection()
-            torch.testing.assert_close(run(fallback).loss, expected)
+            with self.assertRaisesRegex(ValueError, "No fused implementation supports"):
+                run(ExecutionSelection(), fused=True)
+            with self.assertLogs(
+                "specforge.algorithms.objectives.implementations.registry", level="INFO"
+            ) as logs:
+                fallback = ExecutionSelection()
+                torch.testing.assert_close(run(fallback, fused=None).loss, expected)
         self.assertEqual(fallback.names, {"0:0": "reference"})
         self.assertIn("reference", logs.output[0])
 
@@ -519,3 +522,60 @@ class LossExecutionTest(unittest.TestCase):
         ):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 LossExecution(**values)
+
+    def test_chunked_dpace_forks_rng_with_device_type(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        hidden = torch.randn(4, 2, 5, requires_grad=True)
+        labels = torch.zeros(4, 2, dtype=torch.long)
+        draws = {False: [], True: []}
+
+        def stochastic_project(x):
+            raw = x._tensor if hasattr(x, "_tensor") else x
+            noise = torch.randn_like(raw)
+            draws[torch.is_grad_enabled()].append(noise.detach().clone())
+            return {"logits": raw + 0.1 * noise}
+
+        base = Predictions(
+            hidden=hidden,
+            projection=Projection(stochastic_project),
+            mask=torch.ones(4, 2),
+            positions=torch.arange(2).expand(4, 2),
+            chain_ids=torch.arange(4)[:, None].expand(4, 2),
+            sequence_ids=torch.zeros(4, 2, dtype=torch.long),
+            labels=labels,
+        )
+
+        def run_dpace(pred):
+            execute_batch(
+                PredictionBatch((pred,)),
+                TokenLoss(kind="ce"),
+                PositionWeighting(kind="dpace"),
+                training=True,
+                execution=LossExecution(chunk_size=2, checkpoint=False, fused=False),
+            )
+
+        torch.manual_seed(77)
+        run_dpace(base)
+        self.assertEqual(len(draws[False]), 2)
+        for stats_draw, grad_draw in zip(draws[False], draws[True]):
+            self.assertTrue(torch.equal(stats_draw, grad_draw))
+
+        class _DeviceHidden:
+            def __init__(self, tensor, device):
+                self._tensor, self.device = tensor, device
+                self.shape, self.ndim = tensor.shape, tensor.ndim
+
+            def __getitem__(self, item):
+                return _DeviceHidden(self._tensor[item], self.device)
+
+            def __getattr__(self, name):
+                return getattr(self._tensor, name)
+
+        npu_pred = replace(
+            base, hidden=_DeviceHidden(hidden, SimpleNamespace(type="npu", index=2))
+        )
+        with patch("torch.random.fork_rng", return_value=nullcontext()) as fork_rng:
+            run_dpace(npu_pred)
+        fork_rng.assert_called_once_with(devices=[2], device_type="npu")

@@ -472,9 +472,9 @@ entry chooses how to evaluate them:
 
 | Mode | Configuration | Selection |
 | --- | --- | --- |
-| Default | fused unset | A default-enabled optimization where one applies, otherwise the reference formula; nothing raises for an unsupported device, dtype or missing kernel package |
+| Default | fused unset | A default-enabled optimization where one applies (CUDA/ROCm, plus Ascend NPU for Triton distillation kernels), otherwise the reference formula. Unsupported devices, dtypes, or missing kernel packages fall back silently. |
 | Reference | fused: false | Registered mathematical formulas |
-| Required | fused: true | Compatible joint or per-term optimization, including opt-in ones such as `linear_ce`. A categorical loss raises off CUDA/ROCm or outside FP16/BF16/FP32; a loss kind with no optimized implementation uses its reference formula |
+| Required | fused: true | Compatible joint or per-term optimization, including opt-in kernels such as `linear_ce`. Categorical losses require an optimized kernel on a supported device and FP16/BF16/FP32 dtype and raise otherwise; non-categorical losses fall back to their reference implementations. |
 
 Both generic kernels and projection-specific kernels participate in automatic
 selection. Matching checks the mathematical loss, projection, requested outputs,

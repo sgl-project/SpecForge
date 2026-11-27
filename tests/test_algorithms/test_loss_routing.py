@@ -1,7 +1,10 @@
 """Public loss modes preserve the mathematical contract and output requests."""
 
+import sys
+import types
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -9,6 +12,7 @@ import torch
 from specforge.algorithms.objectives.implementations.registry import (
     _IMPLEMENTATIONS,
     ExecutionRequest,
+    ExecutionSelection,
     TermInputs,
     compute_loss,
     implementation_registrations,
@@ -151,6 +155,13 @@ class LossRoutingTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Scalar loss must return"):
             run(scalar)
+        multi = replace(
+            prediction,
+            plan=LossPlan((LossTerm(), LossTerm()), ((0, 1),)),
+            compute=lambda calc: calc.run((0, 1), top_k=2),
+        )
+        with self.assertRaisesRegex(ValueError, "single declared term"):
+            run(multi)
 
     def request(self):
         logits = torch.randn(2, 1, 5, requires_grad=True)
@@ -578,10 +589,6 @@ class LossRoutingTest(unittest.TestCase):
 
     def test_selection_issues_no_collective(self):
         """Ranks agree on their selections at a checkpoint, through the step runner."""
-        from specforge.algorithms.objectives.implementations.registry import (
-            ExecutionSelection,
-        )
-
         selection = ExecutionSelection()
         with (
             patch("torch.distributed.is_initialized", return_value=True),
@@ -592,10 +599,6 @@ class LossRoutingTest(unittest.TestCase):
         self.assertEqual(selection.names, {"0:0": "reference"})
 
     def test_saved_implementation_names_are_checked_without_aliases(self):
-        from specforge.algorithms.objectives.implementations.registry import (
-            ExecutionSelection,
-        )
-
         selection = ExecutionSelection()
         selection.restore({"0:0": "token_ce"})
         selection.record("0:0", "token_ce")
@@ -610,10 +613,6 @@ class LossRoutingTest(unittest.TestCase):
 
     @patch.dict(_IMPLEMENTATIONS)
     def test_empty_joint_split_keeps_selection_sequence(self):
-        from specforge.algorithms.objectives.implementations.registry import (
-            ExecutionSelection,
-        )
-
         @register_implementation(
             "test_token",
             losses=("ce",),
@@ -645,3 +644,278 @@ class LossRoutingTest(unittest.TestCase):
                 selection.names,
                 {"0:0,1": "split", "0:0": "test_token", "0:1": "test_token"},
             )
+
+    def _device_request(
+        self, loss, *, device_type="cuda", dtype=torch.bfloat16, shape=(2, 1, 5)
+    ):
+        tensor = SimpleNamespace(
+            device=SimpleNamespace(type=device_type),
+            is_cuda=device_type == "cuda",
+            dtype=dtype,
+            shape=shape,
+            numel=lambda: 10,
+        )
+        labels = torch.zeros(shape[:-1], dtype=torch.long)
+        weights = torch.ones_like(labels, dtype=torch.float32)
+        term = TermInputs(loss, weights, weights, weights.sum(), LossContext(weights))
+        return ExecutionRequest(
+            None,
+            (term,),
+            labels,
+            tensor if loss.requires_teacher else None,
+            None,
+            {},
+            unreduced=True,
+            tensors={0: tensor},
+        )
+
+    def test_fused_true_rejects_unsupported_categorical_loss_on_cuda_and_npu(self):
+        from specforge.algorithms.objectives.losses import _LOSSES, register_loss
+
+        for device_type in ("cuda", "npu"):
+            with self.subTest(device_type=device_type):
+                teacher_lk = self._device_request(
+                    TokenLoss("lk_alpha", {"target": "teacher"}),
+                    device_type=device_type,
+                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "No fused implementation supports categorical loss.*teacher LK uses the reference formula",
+                ):
+                    select_implementation(teacher_lk, fused=True)
+                self.assertEqual(
+                    select_implementation(teacher_lk, fused=None).name, "reference"
+                )
+
+                with patch.dict(_LOSSES):
+                    register_loss("custom_cat")(
+                        lambda logits, labels, teacher=None: logits[..., 0]
+                    )
+                    custom = self._device_request(
+                        TokenLoss("custom_cat"), device_type=device_type
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        r"No fused implementation supports categorical loss \(custom_cat\)$",
+                    ):
+                        select_implementation(custom, fused=True)
+
+                for kind, expected_impl in (
+                    ("value", "value"),
+                    ("bce", "reference"),
+                    ("cosine", "reference"),
+                ):
+                    non_cat = self._device_request(
+                        TokenLoss(kind), device_type=device_type
+                    )
+                    self.assertEqual(
+                        select_implementation(non_cat, fused=True).name, expected_impl
+                    )
+
+    @staticmethod
+    def _fake_triton_modules(*, backend="cuda", with_constexpr=True):
+        fake_triton = types.ModuleType("triton")
+        fake_triton.jit = lambda fn: fn
+        fake_tl = types.ModuleType("triton.language")
+        if with_constexpr:
+            fake_tl.constexpr = lambda value: value
+        fake_runtime = types.ModuleType("triton.runtime")
+        if backend is not None:
+            fake_runtime.driver = SimpleNamespace(
+                active=SimpleNamespace(
+                    get_current_target=lambda: SimpleNamespace(backend=backend)
+                )
+            )
+        fake_triton.runtime = fake_runtime
+        return {
+            "triton": fake_triton,
+            "triton.language": fake_tl,
+            "triton.runtime": fake_runtime,
+        }
+
+    def test_auto_fused_checks_triton_for_all_kernels_and_allows_npu(self):
+        from specforge.losses import fused as fused_loss
+
+        npu_kinds = ("soft_ce", "kl", "reverse_kl", "js", "tv", "nla", "lk")
+        cuda_only_kinds = ("ce", "ce_l1", "lk_alpha", "lk_tv", "lk_lambda")
+        all_token_kinds = npu_kinds + cuda_only_kinds
+
+        with patch.dict(
+            sys.modules,
+            {"triton": None, "triton.language": None, "triton.runtime": None},
+        ):
+            for kind in all_token_kinds:
+                with self.subTest(missing_triton=kind):
+                    req = self._device_request(TokenLoss(kind), device_type="cuda")
+                    reasons = []
+                    self.assertEqual(
+                        select_implementation(req, fused=None, rejections=reasons).name,
+                        "reference",
+                    )
+                    self.assertTrue(
+                        any("requires Triton" in r for r in reasons), reasons
+                    )
+                    with self.assertRaisesRegex(ImportError, "requires Triton"):
+                        select_implementation(req, fused=True)
+            with self.assertRaisesRegex(ImportError, "requires Triton"):
+                ExecutionSelection().resolve(
+                    self._device_request(TokenLoss("ce"), device_type="cuda"),
+                    (0,),
+                    0,
+                    fused=True,
+                )
+
+        with patch.dict(sys.modules, self._fake_triton_modules(backend="npu")):
+            for kind in npu_kinds:
+                with self.subTest(npu_supported=kind):
+                    req = self._device_request(TokenLoss(kind), device_type="npu")
+                    self.assertEqual(
+                        select_implementation(req, fused=None).name, f"token_{kind}"
+                    )
+                    self.assertEqual(
+                        select_implementation(req, fused=True).name, f"token_{kind}"
+                    )
+
+            kl_req = self._device_request(TokenLoss("kl"), device_type="npu")
+            npu_logits = kl_req.tensor(0)
+            expected_kl = torch.full((2, 1), 0.25)
+            with (
+                patch.object(fused_loss, "_require_triton"),
+                patch.object(fused_loss, "_OP_KL", SimpleNamespace(value=0)),
+                patch.object(
+                    fused_loss._FusedLoss, "apply", return_value=expected_kl
+                ) as mock_apply,
+            ):
+                entry = select_implementation(kl_req, fused=True)
+                self.assertEqual(entry.name, "token_kl")
+                out = entry.compute(kl_req, (0,))
+                mock_apply.assert_called_once_with(npu_logits, npu_logits, 0)
+                torch.testing.assert_close(out.values[0], expected_kl)
+
+            for kind in cuda_only_kinds:
+                with self.subTest(npu_cuda_only=kind):
+                    req = self._device_request(TokenLoss(kind), device_type="npu")
+                    reasons = []
+                    self.assertEqual(
+                        select_implementation(req, fused=None, rejections=reasons).name,
+                        "reference",
+                    )
+                    self.assertTrue(
+                        any("requires CUDA/ROCm inputs" in r for r in reasons), reasons
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "No fused implementation supports categorical loss"
+                    ):
+                        select_implementation(req, fused=True)
+
+    @patch.dict(_IMPLEMENTATIONS)
+    def test_custom_token_kernel_does_not_inherit_triton_dependency(self):
+        from specforge.algorithms.objectives.implementations.token_kernels import (
+            register_token_kernel,
+        )
+
+        register_token_kernel(
+            "bce", lambda logits, labels, teacher=None: torch.zeros_like(labels).float()
+        )
+        req = self._device_request(TokenLoss("bce"), device_type="cuda")
+        with patch.dict(
+            sys.modules,
+            {"triton": None, "triton.language": None, "triton.runtime": None},
+        ):
+            self.assertEqual(select_implementation(req, fused=None).name, "token_bce")
+            self.assertEqual(select_implementation(req, fused=True).name, "token_bce")
+
+    def test_npu_automatic_mode_checkpoint_resume_honors_reference(self):
+        npu_req = self._device_request(TokenLoss("soft_ce"), device_type="npu")
+        with patch.dict(sys.modules, self._fake_triton_modules(backend="npu")):
+            resumed = ExecutionSelection()
+            resumed.restore({"0:0": "reference"})
+            entry = resumed.resolve(npu_req, (0,), 0, fused=None)
+            self.assertEqual(entry.name, "reference")
+            self.assertEqual(resumed.names, {"0:0": "reference"})
+
+            strict = ExecutionSelection()
+            strict.restore({"0:0": "reference"})
+            with self.assertRaisesRegex(ValueError, "changed on resume"):
+                strict.resolve(npu_req, (0,), 0, fused=True)
+
+        with patch.dict(
+            sys.modules,
+            {"triton": None, "triton.language": None, "triton.runtime": None},
+        ):
+            downgraded = ExecutionSelection()
+            downgraded.restore({"0:0": "token_soft_ce"})
+            with self.assertRaisesRegex(ValueError, "changed on resume"):
+                downgraded.resolve(npu_req, (0,), 0, fused=None)
+
+    def test_domino_execute_batch_missing_triton_auto_and_strict(self):
+        from specforge.algorithms.objectives.execution import execute_batch
+        from specforge.algorithms.objectives.execution_options import LossExecution
+        from specforge.algorithms.objectives.losses import PositionWeighting
+        from specforge.algorithms.objectives.plan import LossPlan, LossTerm
+        from specforge.algorithms.objectives.predictions import (
+            PredictionBatch,
+            Predictions,
+        )
+        from specforge.algorithms.objectives.projection import DominoSuffixProjection
+
+        class _CudaHidden:
+            def __init__(self, tensor):
+                self._tensor = tensor
+                self.device = SimpleNamespace(type="cuda")
+                self.is_cuda = True
+                self.dtype = torch.bfloat16
+                self.shape = tensor.shape
+                self.ndim = tensor.ndim
+
+            def numel(self):
+                return self._tensor.numel()
+
+            def __getitem__(self, item):
+                return _CudaHidden(self._tensor[item])
+
+        raw = torch.randn(2, 4, 6)
+        labels = torch.zeros(2, 4, dtype=torch.long)
+        mask = torch.ones(2, 4)
+        projection = DominoSuffixProjection(
+            lambda h: {"logits": h._tensor, "base_logits": h._tensor},
+            lambda h: (h._tensor, h._tensor),
+            block_size=4,
+            suffix_start=1,
+        )
+        pred = Predictions(
+            hidden=_CudaHidden(raw),
+            projection=projection,
+            labels=labels,
+            mask=mask,
+            positions=torch.arange(4).expand(2, 4),
+            plan=LossPlan((LossTerm("logits"), LossTerm("base_logits")), ((0, 1),)),
+        )
+        batch = PredictionBatch((pred,))
+        with patch.dict(
+            sys.modules,
+            {"triton": None, "triton.language": None, "triton.runtime": None},
+        ):
+            auto_selection = ExecutionSelection()
+            result = execute_batch(
+                batch,
+                TokenLoss("ce"),
+                PositionWeighting(),
+                training=False,
+                execution=LossExecution(chunk_size=0, checkpoint=False, fused=None),
+                selection=auto_selection,
+            )
+            self.assertTrue(torch.isfinite(result.loss))
+            self.assertEqual(
+                auto_selection.names,
+                {"0:0,1": "split", "0:0": "reference", "0:1": "reference"},
+            )
+            with self.assertRaisesRegex(ImportError, "requires Triton"):
+                execute_batch(
+                    batch,
+                    TokenLoss("ce"),
+                    PositionWeighting(),
+                    training=False,
+                    execution=LossExecution(chunk_size=0, checkpoint=False, fused=True),
+                    selection=ExecutionSelection(),
+                )
