@@ -386,7 +386,7 @@ class AccumulationPrecisionTest(unittest.TestCase):
     """Micro-batch gradients accumulate in fp32, not in the compute dtype."""
 
     def test_window_gradient_is_the_fp32_sum_of_the_bf16_gradients(self):
-        with gloo_single_rank():
+        with gloo_single_rank() as group:
             torch.manual_seed(0)
             reference = _Toy().to(torch.bfloat16)
             program = _Toy().to(torch.bfloat16)
@@ -394,7 +394,7 @@ class AccumulationPrecisionTest(unittest.TestCase):
             backend = FSDP2TrainingBackend(
                 ParallelConfig(
                     sharding_strategy="SHARD_GRAD_OP",
-                    fsdp_process_group=dist.group.WORLD,
+                    fsdp_process_group=group,
                 ),
                 precision=_FSDP2_BF16,
             )
@@ -716,18 +716,18 @@ class FSDP2ProtocolTest(ProtocolChecks, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._gloo = gloo_single_rank()
-        cls._gloo.__enter__()
+        cls._group = cls._gloo.__enter__()
 
     @classmethod
     def tearDownClass(cls):
         cls._gloo.__exit__(None, None, None)
 
-    @staticmethod
-    def make_runner(program, spec):
+    @classmethod
+    def make_runner(cls, program, spec):
         backend = FSDP2TrainingBackend(
             ParallelConfig(
                 sharding_strategy="SHARD_GRAD_OP",
-                fsdp_process_group=dist.group.WORLD,
+                fsdp_process_group=cls._group,
             ),
             optimizer_spec=OptimizerSpec(kind="adamw", lr=0.05),
             scheduler_spec=SchedulerSpec(
@@ -751,7 +751,7 @@ class FSDP2EquivalentUpdateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._gloo = gloo_single_rank()
-        cls._gloo.__enter__()
+        cls._group = cls._gloo.__enter__()
 
     @classmethod
     def tearDownClass(cls):
@@ -770,7 +770,7 @@ class FSDP2EquivalentUpdateTest(unittest.TestCase):
                     fsdp2_backend = FSDP2TrainingBackend(
                         ParallelConfig(
                             sharding_strategy="SHARD_GRAD_OP",
-                            fsdp_process_group=dist.group.WORLD,
+                            fsdp_process_group=self._group,
                         ),
                         optimizer_spec=OptimizerSpec(kind="adamw", lr=0.05),
                         scheduler_spec=SchedulerSpec(
