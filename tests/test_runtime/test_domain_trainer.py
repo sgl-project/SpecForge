@@ -66,13 +66,27 @@ class DomainTrainerWiringTest(unittest.TestCase):
                 return SimpleNamespace()
 
         class FakeBackend:
-            def __init__(self, parallel, *, optimizer_factory):
+            def __init__(
+                self,
+                parallel,
+                *,
+                optimizer_factory=None,
+                optimizer_spec=None,
+                scheduler_spec=None,
+                max_grad_norm=None,
+            ):
                 cap["backend_parallel"] = parallel
                 cap["optimizer_factory"] = optimizer_factory
+                cap["optimizer_spec"] = optimizer_spec
+                cap["scheduler_spec"] = scheduler_spec
+                cap["max_grad_norm"] = max_grad_norm
 
             def prepare_model(self, model, *, optimizer_target, frozen_modules, blocks):
                 cap["prepare_model"] = (model, optimizer_target, frozen_modules, blocks)
                 return "WRAPPED"
+
+            def close(self):
+                cap["backend_closes"] = cap.get("backend_closes", 0) + 1
 
         class FakeRunner:
             def __init__(self, program, backend, spec):
@@ -280,11 +294,13 @@ class DomainTrainerWiringTest(unittest.TestCase):
         self.assertIs(cap["fit"], cap["loader"])
         self.assertEqual(cap["saves"], [42])
         self.assertEqual(cap["loader_closes"], 1)
+        self.assertEqual(cap["backend_closes"], 1)
 
         # Re-entering at an already durable step does not write it twice.
         self.assertEqual(trainer.fit(), 42)
         self.assertEqual(cap["saves"], [42])
         self.assertEqual(cap["loader_closes"], 2)
+        self.assertEqual(cap["backend_closes"], 2)
 
     def test_offline_loader_rebuilds_the_ref_plan_on_set_epoch(self):
         try:

@@ -223,6 +223,18 @@ class DataParallelRunner:
             return dist.get_world_size(group=self.backend.process_group)
         return 1
 
+    def _grad_reduction_factor(self, world_size: int) -> int:
+        """Factor cancelling the backend's cross-rank gradient reduction."""
+        reduction = self.backend.grad_reduction
+        if reduction == "mean":
+            return world_size
+        if reduction == "sum":
+            return 1
+        raise ValueError(
+            f"unsupported backend grad_reduction={reduction!r}; "
+            "expected 'mean' or 'sum'"
+        )
+
     def reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
         return self._reduce(values, dist.ReduceOp.SUM)
 
@@ -540,8 +552,9 @@ class DataParallelRunner:
                 raise ValueError("global loss denominator must be finite and positive")
         # new_full fills on the device; new_tensor would be a synchronizing H2D.
         world_size = self._world_size()
+        reduction_factor = self._grad_reduction_factor(world_size)
         scale = (
-            denominator.new_full((), world_size * window.accumulation_steps)
+            denominator.new_full((), reduction_factor * window.accumulation_steps)
             / denominator
         )
         self.backend.scale_gradients(scale)

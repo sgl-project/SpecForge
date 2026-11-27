@@ -397,13 +397,27 @@ def _cleanup_offline_mooncake_refs(store, refs: Sequence, *, reason: str) -> Non
         )
 
 
+def _optimizer_kwargs(
+    cfg: Config, optimizer_factory: Optional[Callable]
+) -> Dict[str, Any]:
+    if optimizer_factory is not None:
+        return {"optimizer_factory": optimizer_factory(cfg)}
+    from specforge.training.assembly import _optimizer_spec, _scheduler_spec
+
+    return {
+        "optimizer_spec": _optimizer_spec(cfg),
+        "scheduler_spec": _scheduler_spec(cfg),
+        "max_grad_norm": cfg.training.max_grad_norm,
+    }
+
+
 def _build_offline(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
     topology: Optional[Topology],
     build_model_bundle: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
@@ -511,7 +525,7 @@ def _build_offline(
         refs=read_ref_manifest(manifest),
         draft_model=bundle.model,
         target_head=bundle.target_head,
-        optimizer_factory=optimizer_factory(cfg),
+        **_optimizer_kwargs(cfg, optimizer_factory),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         ttt_length=cfg.training.objective_options.get("ttt_length", 7),
@@ -572,7 +586,7 @@ def _build_online(
     topology: Optional[Topology],
     build_model_bundle: Callable,
     prepare_prompts: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
@@ -796,7 +810,7 @@ def _build_online(
         channel=channel,
         draft_model=bundle.model,
         target_head=bundle.target_head,
-        optimizer_factory=optimizer_factory(cfg),
+        **_optimizer_kwargs(cfg, optimizer_factory),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=cfg.training.batch_size,
@@ -832,7 +846,7 @@ def build_disaggregated_run(
     topology: Optional[Topology],
     build_model_bundle: Callable,
     prepare_prompts: Callable,
-    optimizer_factory: Callable,
+    optimizer_factory: Optional[Callable] = None,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
