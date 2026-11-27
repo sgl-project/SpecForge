@@ -257,6 +257,37 @@ class OfflineMooncakeCleanupTest(unittest.TestCase):
         self.assertEqual([], store.abort_calls)
         self.assertEqual(0, store.drain_calls)
 
+    def test_offline_producer_closes_store_on_success_and_failure(self):
+        class _ClosableStore(_RecordingStore):
+            def __init__(self):
+                super().__init__()
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        refs = [SimpleNamespace(sample_id="sample-0")]
+        for hold_error in (None, RuntimeError("remote consumer failed")):
+            with self.subTest(error=hold_error):
+                store = _ClosableStore()
+                with (
+                    tempfile.TemporaryDirectory() as tmp,
+                    self._producer_run(
+                        tmp,
+                        store,
+                        self._successful_ingest(refs),
+                        hold_side_effect=hold_error,
+                    ) as (run, _write_manifest, _manifest),
+                ):
+                    if hold_error is None:
+                        self.assertEqual(1, run.run())
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "remote consumer failed"
+                        ):
+                            run.run()
+                self.assertEqual(1, store.close_calls)
+
 
 class OfflineIngestTrackingTest(unittest.TestCase):
     def test_successful_refs_are_reported_before_a_later_put_fails(self):

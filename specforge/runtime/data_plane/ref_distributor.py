@@ -540,10 +540,19 @@ class RefDistributor:
         self._thread.start()
         return self
 
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
     def stop(self, join_timeout_s: float = 10.0) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=join_timeout_s)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=join_timeout_s)
+            if thread.is_alive():
+                raise RuntimeError(
+                    f"RefDistributor thread did not stop within {join_timeout_s:.1f}s"
+                )
+            self._thread = None
 
 
 __all__ = ["InboxChannel", "RefDistributor"]

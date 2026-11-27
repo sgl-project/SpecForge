@@ -135,7 +135,7 @@ class FakeBackend(TrainingBackend):
     def state_dict(self):
         return {
             "model": {"draft_model.w": self.model.w.detach().clone()},
-            "optimizer": None,
+            "optimizer": {},
             "rng": {},
         }
 

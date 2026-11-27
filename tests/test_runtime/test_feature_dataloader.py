@@ -875,6 +875,143 @@ class TestFeatureDataLoader(unittest.TestCase):
         with self.assertRaises(ValueError):
             FeatureDataLoader(store, SampleRefQueue(), refs=[])  # both
 
+    def test_prefetch_does_not_leak_executor_before_worker_starts(self):
+        created = []
+
+        class _SyncExecutor:
+            def __init__(self, *args, **kwargs):
+                self.shutdown_calls = []
+                created.append(self)
+
+            def submit(self, fn, *args):
+                fut = futures.Future()
+                fut.set_result(fn(*args))
+                return fut
+
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                self.shutdown_calls.append((wait, cancel_futures))
+
+        store = LocalFeatureStore("st")
+        refs = [
+            store.put(
+                {"x": torch.tensor([i])},
+                sample_id=f"s{i}",
+                metadata={"run_id": "run"},
+            )
+            for i in range(2)
+        ]
+
+        # Case 1: second concurrent iterator raises without leaking an executor.
+        q1 = _DurableQueue()
+        q1.put(refs)
+        loader1 = FeatureDataLoader(store, q1, num_workers=1)
+        with mock.patch(
+            "specforge.runtime.data_plane.feature_dataloader.futures.ThreadPoolExecutor",
+            _SyncExecutor,
+        ):
+            it1 = iter(loader1)
+            try:
+                next(it1)
+                before = len(created)
+                with self.assertRaisesRegex(
+                    RuntimeError, "already has an active iterator"
+                ):
+                    next(iter(loader1))
+                leaked = [ex for ex in created[before:] if not ex.shutdown_calls]
+                self.assertEqual(
+                    leaked, [], "leaked ThreadPoolExecutor on active iterator"
+                )
+            finally:
+                loader1.close()
+                it1.close()
+
+        # Case 2: worker.start() failure shuts down the newly created executor.
+        q2 = SampleRefQueue()
+        loader2 = FeatureDataLoader(store, q2, num_workers=1)
+        created.clear()
+        with (
+            mock.patch(
+                "specforge.runtime.data_plane.feature_dataloader.futures.ThreadPoolExecutor",
+                _SyncExecutor,
+            ),
+            mock.patch.object(
+                threading.Thread,
+                "start",
+                side_effect=RuntimeError("cannot start thread"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "cannot start thread"),
+        ):
+            next(iter(loader2))
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].shutdown_calls, [(False, True)])
+        self.assertIsNone(loader2._prefetch_state)
+
+    def test_maybe_gc_serializes_interval_check_across_threads(self):
+        in_gc = threading.Event()
+        release_gc = threading.Event()
+        gc_calls = []
+
+        class _BlockingGcStore:
+            def gc(self):
+                gc_calls.append(threading.current_thread().name)
+                in_gc.set()
+                release_gc.wait(timeout=5.0)
+
+        store = _BlockingGcStore()
+        loader = FeatureDataLoader(store, refs=[], gc_interval_s=10.0)
+        loader._last_gc = 0.0
+
+        with mock.patch(
+            "specforge.runtime.data_plane.feature_dataloader.time.monotonic",
+            return_value=100.0,
+        ):
+            first = threading.Thread(target=loader._maybe_gc, name="gc-1")
+            second = threading.Thread(target=loader._maybe_gc, name="gc-2")
+            first.start()
+            self.assertTrue(in_gc.wait(timeout=2.0))
+            try:
+                second.start()
+                second.join(timeout=2.0)
+                self.assertFalse(second.is_alive())
+            finally:
+                release_gc.set()
+                first.join(timeout=2.0)
+
+        self.assertEqual(len(gc_calls), 1)
+
+    def test_interrupted_prefetch_start_stops_worker_and_settles_leases(self):
+        store = LocalFeatureStore("st")
+        refs = [
+            store.put(
+                {"x": torch.tensor([i])},
+                sample_id=f"s{i}",
+                metadata={"run_id": "run"},
+            )
+            for i in range(2)
+        ]
+        queue = _DurableQueue()
+        queue.put(refs)
+        loader = FeatureDataLoader(store, queue, batch_size=1, num_workers=1)
+        real_start = threading.Thread.start
+
+        def interrupted_start(self_thread):
+            real_start(self_thread)
+            if self_thread.name == "loader-prefetch":
+                # Simulate a managed termination unwinding worker.start() after
+                # the OS thread started (without interrupting executor threads).
+                raise KeyboardInterrupt("sigterm during start")
+
+        with (
+            mock.patch.object(threading.Thread, "start", interrupted_start),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            next(iter(loader))
+
+        self.assertIsNone(loader._prefetch_state)
+        self.assertEqual(queue.in_flight(), 0)
+        self.assertEqual(queue.depth(), 2)
+        self.assertEqual(store.health()["active_leases"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

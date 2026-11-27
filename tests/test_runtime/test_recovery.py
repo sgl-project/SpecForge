@@ -85,6 +85,30 @@ class TestDurableRecovery(unittest.TestCase):
         self.assertEqual([ref.sample_id for ref in replay], ["s2"])
         reopened.close()
 
+    def test_record_train_ack_rolls_back_on_error_and_does_not_poison_commits(self):
+        import sqlite3
+
+        store = SQLiteMetadataStore(self.path)
+        try:
+            store._conn.execute(
+                "CREATE TRIGGER fail_marker BEFORE INSERT ON marker "
+                "BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END"
+            )
+            store._conn.commit()
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "injected marker failure"
+            ):
+                store.record_train_ack(
+                    ["s0", "s1"], global_step=1, optimizer_durable=True
+                )
+            self.assertFalse(store._conn.in_transaction)
+            store._conn.execute("DROP TRIGGER fail_marker")
+            store._conn.commit()
+            self.assertEqual(store.durable_marker()["acked"], set())
+            self.assertEqual(store.commit_samples([_ref("s0")]), [True])
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

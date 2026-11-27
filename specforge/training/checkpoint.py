@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import shutil
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 
@@ -255,6 +255,31 @@ class CheckpointManager:
             self._state_path(target), map_location=map_location, weights_only=False
         )
 
+    @staticmethod
+    def _sync_rank_error(
+        world: int,
+        local_error: Optional[BaseException],
+        payload: Any,
+        *,
+        failure_prefix: str,
+        extract_error: Callable[[Any], Optional[str]] = lambda item: item,
+    ) -> list[Any]:
+        gathered = [None] * world
+        torch.distributed.all_gather_object(gathered, payload)
+        if local_error is not None and not isinstance(local_error, Exception):
+            raise local_error
+        failures = [
+            (rank, err)
+            for rank, item in enumerate(gathered)
+            if (err := extract_error(item)) is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                f"{failure_prefix}: "
+                + "; ".join(f"rank {rank}: {err}" for rank, err in failures)
+            ) from local_error
+        return gathered
+
     @classmethod
     def read_resume_state(
         cls,
@@ -271,47 +296,53 @@ class CheckpointManager:
         """
         initialized = torch.distributed.is_initialized()
         original_path = path
-        local_error = None
+        local_error: Optional[BaseException] = None
         state = None
         try:
             path = cls.resolve_resume_dir(path)
-            state = torch.load(
+            loaded = torch.load(
                 os.path.join(path, STATE_FILE),
                 map_location=map_location,
                 weights_only=False,
             )
-        except Exception as exc:
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"checkpoint {path} shared state must be a dict, got "
+                    f"{type(loaded).__name__}"
+                )
+            state = loaded
+        except BaseException as exc:
             local_error = exc
 
         world = torch.distributed.get_world_size() if initialized else 1
         if initialized and world > 1:
-            descriptor = {
-                "error": (
-                    None
-                    if local_error is None
-                    else f"{type(local_error).__name__}: {local_error}"
+            descriptor = (
+                {
+                    "error": f"{type(local_error).__name__}: {local_error}",
+                    "checkpoint": None,
+                    "run_id": None,
+                    "global_step": None,
+                    "strategy": None,
+                }
+                if local_error is not None
+                else {
+                    "error": None,
+                    "checkpoint": os.path.basename(path),
+                    "run_id": state.get("run_id"),
+                    "global_step": state.get("global_step"),
+                    "strategy": state.get("strategy"),
+                }
+            )
+            descriptors = cls._sync_rank_error(
+                world,
+                local_error,
+                descriptor,
+                failure_prefix=(
+                    f"resume checkpoint {original_path!r} is not readable on every rank"
                 ),
-                "checkpoint": (
-                    None if local_error is not None else os.path.basename(path)
-                ),
-                "run_id": None if state is None else state.get("run_id"),
-                "global_step": None if state is None else state.get("global_step"),
-                "strategy": None if state is None else state.get("strategy"),
-            }
-            descriptors = [None] * world
-            torch.distributed.all_gather_object(descriptors, descriptor)
-            failures = [
-                (rank, item["error"])
-                for rank, item in enumerate(descriptors)
-                if item["error"] is not None
-            ]
-            if failures:
-                raise RuntimeError(
-                    f"resume checkpoint {original_path!r} is not readable on "
-                    "every rank: "
-                    + "; ".join(f"rank {rank}: {error}" for rank, error in failures)
-                )
-            identities = {
+                extract_error=lambda item: item["error"],
+            )
+            identities = [
                 (
                     item["checkpoint"],
                     item["run_id"],
@@ -319,38 +350,83 @@ class CheckpointManager:
                     item["strategy"],
                 )
                 for item in descriptors
-            }
-            if len(identities) != 1:
+            ]
+            if any(identity != identities[0] for identity in identities[1:]):
                 raise ValueError(
                     f"resume checkpoint {original_path!r} resolves to different "
                     f"training states across ranks: {descriptors}"
                 )
-        if local_error is not None:
+        elif local_error is not None:
             raise local_error
         assert state is not None
 
         rank = torch.distributed.get_rank() if initialized else 0
         saved_world = state.get("world_size")
         rank_path = os.path.join(path, cls._rank_file(rank))
-        if os.path.exists(rank_path) and (saved_world is None or saved_world == world):
-            state["backend"] = torch.load(
-                rank_path, map_location=map_location, weights_only=False
+        rank_error: Optional[BaseException] = None
+        try:
+            need_full_state = (
+                require_full_state and int(state.get("global_step") or 0) > 0
             )
-            if (
-                state["backend"].get("optimizer") is None
-                and "replicated_optimizer_state" in state
+            if os.path.exists(rank_path) and (
+                saved_world is None or saved_world == world
             ):
-                state["backend"]["optimizer"] = state["replicated_optimizer_state"]
-            return state
-        state["backend"] = {}
-        if require_full_state and int(state.get("global_step") or 0) > 0:
-            raise ValueError(
-                f"checkpoint {path} has no usable per-rank state for rank {rank} at "
-                f"world_size={world} (written at world_size={saved_world}): resuming "
-                f"training needs each rank's optimizer/RNG shard — resume at the "
-                f"original world size, or pass require_full_state=False to restore "
-                f"weights and counters only"
+                backend_state = torch.load(
+                    rank_path, map_location=map_location, weights_only=False
+                )
+                if not isinstance(backend_state, dict):
+                    raise ValueError(
+                        f"checkpoint {path} per-rank state for rank {rank} "
+                        f"must be a dict, got {type(backend_state).__name__}"
+                    )
+                if (
+                    backend_state.get("optimizer") is None
+                    and "replicated_optimizer_state" in state
+                ):
+                    backend_state["optimizer"] = state["replicated_optimizer_state"]
+                if need_full_state:
+                    missing = [
+                        field
+                        for field in ("optimizer", "rng")
+                        if not isinstance(backend_state.get(field), dict)
+                    ]
+                    if missing:
+                        raise ValueError(
+                            f"checkpoint {path} per-rank state for rank {rank} "
+                            f"is missing required full-state field(s): "
+                            f"{', '.join(missing)}"
+                        )
+                state["backend"] = backend_state
+            else:
+                state["backend"] = {}
+                # step-0 checkpoints may be weights-only without rank shards
+                if need_full_state:
+                    raise ValueError(
+                        f"checkpoint {path} has no usable per-rank state for rank {rank} at "
+                        f"world_size={world} (written at world_size={saved_world}): resuming "
+                        f"training needs each rank's optimizer/RNG shard — resume at the "
+                        f"original world size, or pass require_full_state=False to restore "
+                        f"weights and counters only"
+                    )
+        except BaseException as exc:
+            rank_error = exc
+
+        if initialized and world > 1:
+            cls._sync_rank_error(
+                world,
+                rank_error,
+                (
+                    None
+                    if rank_error is None
+                    else f"{type(rank_error).__name__}: {rank_error}"
+                ),
+                failure_prefix=(
+                    f"resume checkpoint {original_path!r} could not load "
+                    "per-rank state on every rank"
+                ),
             )
+        elif rank_error is not None:
+            raise rank_error
         return state
 
     @classmethod

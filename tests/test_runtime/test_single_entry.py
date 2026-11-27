@@ -208,6 +208,80 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                 self.assertEqual("hidden_states", schema.aux_feature)
                 self.assertEqual(last_hidden, schema.last_hidden_feature)
 
+    def test_online_producer_closes_its_store_on_success_and_failure(self):
+        import tempfile
+
+        from specforge.application import resolve_run
+
+        for drive_error in (None, RuntimeError("drive exploded")):
+            with self.subTest(error=drive_error):
+                root = tempfile.mkdtemp(prefix="producer_close_")
+                channel_path = os.path.join(root, "refs.jsonl")
+                cfg = Config.model_validate(
+                    {
+                        "model": {"target_model_path": "t"},
+                        "draft": encode_config(draft_config()),
+                        "data": {"prompts_path": "prompts.jsonl"},
+                        "training": {"role": "producer", "max_steps": 1},
+                        "deployment": _disaggregated_deployment(
+                            root, server_urls=["http://capture:30000"]
+                        ),
+                    }
+                )
+                resolved = resolve_run(cfg)
+                prompt = {"task_id": "p0", "payload": {"input_ids": [1, 2, 3]}}
+                store = mock.Mock()
+                store.discard_external_attempts.return_value = 0
+
+                def fake_drive(*_args, **_kwargs):
+                    if drive_error is not None:
+                        raise drive_error
+                    with open(channel_path + ".consumer_done", "w", encoding="utf-8"):
+                        pass
+                    return 2
+
+                with (
+                    mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel_path}),
+                    mock.patch(
+                        "specforge.training.disaggregated._mooncake_store",
+                        return_value=store,
+                    ),
+                    mock.patch("specforge.training.assembly._load_input_tools"),
+                    mock.patch("specforge.training.model_loading.resolve_draft_config"),
+                    mock.patch(
+                        "specforge.training.disaggregated._producer_capture_metadata",
+                        return_value=([1, 2], 8, 32, 32),
+                    ),
+                    mock.patch(
+                        "specforge.inference.adapters.server_capture."
+                        "SGLangServerCaptureAdapter"
+                    ),
+                    mock.patch(
+                        "specforge.launch.build_disagg_online_producer",
+                        return_value=([], fake_drive),
+                    ),
+                    mock.patch(
+                        "specforge.runtime.data_plane.feature_store."
+                        "drain_feature_store_removals"
+                    ),
+                ):
+                    run = _build_online(
+                        cfg,
+                        algorithm=resolved.algorithm,
+                        topology=None,
+                        build_model_bundle=mock.Mock(),
+                        prepare_prompts=lambda *_args, **_kwargs: [prompt],
+                        optimizer_factory=mock.Mock(),
+                        training_runtime=lambda _cfg: reference_runtime(),
+                        logger=None,
+                    )
+                    if drive_error is None:
+                        self.assertEqual(run.run(), 2)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "drive exploded"):
+                            run.run()
+                store.close.assert_called_once_with()
+
     def test_training_run_delegates_to_the_one_trainer_entry(self):
         trainer = _FakeTrainer(fit_step=3)
         self.assertEqual(TrainingRun(trainer=trainer).run(), 3)
@@ -334,9 +408,11 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     }
                 )
 
-                def fail_during_assembly(*_args, **_kwargs):
+                def fail_during_assembly(*_args, claim_token=None, **_kwargs):
                     if role == "producer":
-                        _claim_fresh_control_path(channel, (".failed",))
+                        _claim_fresh_control_path(
+                            channel, (".failed",), claim_token=claim_token
+                        )
                     raise RuntimeError("assembly exploded")
 
                 with (
@@ -517,6 +593,100 @@ class TestTrainingRunLifecycle(unittest.TestCase):
                     logger=mock.Mock(),
                 )
         self.assertFalse(os.path.exists(channel + ".failed"))
+
+    def test_same_pid_container_cannot_poison_live_producer_channel(self):
+        import tempfile
+
+        root = tempfile.mkdtemp(prefix="assembly_same_pid_")
+        channel = os.path.join(root, "refs.jsonl")
+        # Live container A holds the claim with the same PID as container B.
+        _claim_fresh_control_path(channel, _ONLINE_CONTROL_SUFFIXES)
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
+                "data": {"prompts_path": "/prompts.jsonl"},
+                "training": {"role": "producer", "max_steps": 1},
+                "deployment": _disaggregated_deployment(root),
+            }
+        )
+        with mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False):
+            with self.assertRaisesRegex(ValueError, "existing attempt"):
+                build_disaggregated_run(
+                    cfg,
+                    algorithm=ALGORITHM,
+                    topology=None,
+                    build_model_bundle=mock.Mock(),
+                    prepare_prompts=mock.Mock(),
+                    optimizer_factory=mock.Mock(),
+                    training_runtime=lambda _cfg: reference_runtime(),
+                    logger=mock.Mock(),
+                )
+        self.assertFalse(os.path.exists(channel + ".failed"))
+
+    def test_interrupted_producer_claim_leaves_no_empty_claim(self):
+        import tempfile
+
+        root = tempfile.mkdtemp(prefix="claim_atomic_")
+        channel = os.path.join(root, "refs.jsonl")
+        with (
+            mock.patch(
+                "specforge.training.disaggregated.os.fsync",
+                side_effect=KeyboardInterrupt("sigterm during claim"),
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _claim_fresh_control_path(channel, _ONLINE_CONTROL_SUFFIXES)
+        self.assertEqual(os.listdir(root), [])
+        # A replacement producer can immediately claim the path cleanly.
+        token = _claim_fresh_control_path(channel, _ONLINE_CONTROL_SUFFIXES)
+        with open(channel + ".producer_claim", encoding="utf-8") as stream:
+            self.assertEqual(stream.read().strip(), token)
+
+    def test_online_assembly_failure_closes_acquired_feature_store(self):
+        import tempfile
+
+        root = tempfile.mkdtemp(prefix="online_assembly_close_")
+        channel = os.path.join(root, "refs.jsonl")
+        cfg = Config.model_validate(
+            {
+                "model": {"target_model_path": "t"},
+                "draft": encode_config(draft_config()),
+                "data": {"prompts_path": "/prompts.jsonl"},
+                "training": {"role": "producer", "max_steps": 1},
+                "deployment": _disaggregated_deployment(root),
+            }
+        )
+        fake_store = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {"DISAGG_REF_CHANNEL": channel}, clear=False),
+            mock.patch(
+                "specforge.training.disaggregated._mooncake_store",
+                return_value=fake_store,
+            ),
+            mock.patch(
+                "specforge.training.assembly._load_input_tools",
+                return_value=mock.Mock(),
+            ),
+            mock.patch(
+                "specforge.training.model_loading.resolve_draft_config",
+                return_value=draft_config(),
+            ),
+            self.assertRaisesRegex(ValueError, "no prompts satisfy"),
+        ):
+            build_disaggregated_run(
+                cfg,
+                algorithm=ALGORITHM,
+                topology=None,
+                build_model_bundle=mock.Mock(),
+                prepare_prompts=mock.Mock(return_value=[]),
+                optimizer_factory=mock.Mock(),
+                training_runtime=lambda _cfg: reference_runtime(),
+                logger=mock.Mock(),
+            )
+        fake_store.close.assert_called_once_with()
+        with open(channel + ".failed", encoding="utf-8") as stream:
+            self.assertIn("no prompts satisfy", stream.read())
 
 
 class TestCliLifecycle(unittest.TestCase):

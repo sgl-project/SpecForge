@@ -156,7 +156,13 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         for name in ("loss", "ce_loss", "l1_loss", "confidence_loss"):
             self.assertIn(name, logged_metrics[-1])
             self.assertTrue(torch.isfinite(torch.tensor(logged_metrics[-1][name])))
-        marker = trainer.dataflow_controller.store.durable_marker()
+        from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
+
+        reopened_store = SQLiteMetadataStore(os.path.join(workdir, "consumer.sqlite"))
+        try:
+            marker = reopened_store.durable_marker()
+        finally:
+            reopened_store.close()
         self.assertEqual(marker["global_step"], 1)
         self.assertEqual(
             marker["acked"],

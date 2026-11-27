@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Sequence
 
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -43,15 +45,15 @@ _ONLINE_CONTROL_SUFFIXES = (
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
 
 
+def _new_claim_token() -> str:
+    return f"pid={os.getpid()}:{uuid.uuid4().hex}"
+
+
 def _write_control(path: str, value: str = "") -> None:
     """Atomically publish one small filesystem control record."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as stream:
-        stream.write(value)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
+    from specforge.runtime.data_plane.streaming_ref_channel import atomic_write_text
+
+    atomic_write_text(path, value, fsync=True)
 
 
 def _read_control(path: str) -> Optional[str]:
@@ -73,7 +75,12 @@ def _publish_control_failure(path: str, exc: BaseException) -> None:
         )
 
 
-def _claim_fresh_control_path(path: str, suffixes: Sequence[str]) -> None:
+def _claim_fresh_control_path(
+    path: str,
+    suffixes: Sequence[str],
+    *,
+    claim_token: Optional[str] = None,
+) -> str:
     """Reject artifact reuse and atomically claim a new producer attempt."""
     claim = path + _PRODUCER_CLAIM_SUFFIX
     artifacts = [path, claim, *(path + suffix for suffix in suffixes)]
@@ -84,33 +91,48 @@ def _claim_fresh_control_path(path: str, suffixes: Sequence[str]) -> None:
             f"{existing}; choose a new attempt-specific path"
         )
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    token = claim_token or _new_claim_token()
+    tmp = f"{claim}.tmp.{uuid.uuid4().hex}"
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     try:
-        fd = os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError as exc:
-        raise ValueError(
-            f"control path {path!r} is already claimed by another producer; "
-            "choose a new attempt-specific path"
-        ) from exc
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(f"pid={os.getpid()}\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(f"{token}\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(tmp, claim)
+        except FileExistsError as exc:
+            raise ValueError(
+                f"control path {path!r} is already claimed by another producer; "
+                "choose a new attempt-specific path"
+            ) from exc
+    finally:
+        with suppress(OSError):
+            os.unlink(tmp)
+    return token
 
 
-def _publish_role_assembly_failure(cfg: Config, exc: BaseException) -> None:
+def _publish_role_assembly_failure(
+    cfg: Config,
+    exc: BaseException,
+    *,
+    claim_token: Optional[str] = None,
+) -> None:
     """Notify the peer when a role fails before its run closure is returned.
 
-    Producer notification is allowed only after this process successfully
-    claimed the attempt path.  That prevents a typo/retry using an occupied
-    path from poisoning another live producer's channel.
+    Producer notification is allowed only when this assembly scope holds the
+    matching unique claim token, preventing another container sharing PID 1
+    from poisoning a live producer's channel.
     """
     env_name = "DISAGG_MANIFEST" if cfg.mode == "offline" else "DISAGG_REF_CHANNEL"
     path = os.environ.get(env_name)
     if not path:
         return
     if cfg.training.role == "producer":
+        if not claim_token:
+            return
         claim = _read_control(path + _PRODUCER_CLAIM_SUFFIX)
-        if claim != f"pid={os.getpid()}":
+        if claim != claim_token:
             return
         failure_path = path + ".failed"
     else:
@@ -150,7 +172,8 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
         from specforge.runtime.data_plane.mooncake_arena import ArenaObjectClient
 
         store_kwargs: Dict[str, Any] = {
-            "store": ArenaObjectClient(local_hostname=local_hostname)
+            "store": ArenaObjectClient(local_hostname=local_hostname),
+            "close_store": True,
         }
     else:
         setup_kwargs = {
@@ -397,6 +420,22 @@ def _cleanup_offline_mooncake_refs(store, refs: Sequence, *, reason: str) -> Non
         )
 
 
+def _close_store(store: Any) -> None:
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+
+
+def _close_store_on_error(store: Any) -> None:
+    try:
+        _close_store(store)
+    except Exception as close_exc:
+        print(
+            f"failed to close feature store during assembly cleanup: {close_exc}",
+            flush=True,
+        )
+
+
 def _optimizer_kwargs(
     cfg: Config, optimizer_factory: Optional[Callable]
 ) -> Dict[str, Any]:
@@ -421,6 +460,7 @@ def _build_offline(
     training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
+    claim_token: Optional[str] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -432,7 +472,9 @@ def _build_offline(
     done = manifest + ".done"
 
     if cfg.training.role == "producer":
-        _claim_fresh_control_path(manifest, _OFFLINE_CONTROL_SUFFIXES)
+        _claim_fresh_control_path(
+            manifest, _OFFLINE_CONTROL_SUFFIXES, claim_token=claim_token
+        )
 
         def produce() -> int:
             from specforge.runtime.data_plane.disagg_ingest import (
@@ -444,66 +486,77 @@ def _build_offline(
             tracked_refs = []
             produced = 0
             primary_exc = None
-            try:
-                store = _offline_store(cfg)
-                refs = ingest_offline_features(
-                    store,
-                    cfg.data.hidden_states_path,
-                    algorithm_name=algorithm.name,
-                    build_reader=algorithm.providers.offline_for(
-                        cfg.model.input_modality
-                    ).build_reader,
-                    run_id=cfg.run_id,
-                    ttt_length=cfg.training.objective_options.get("ttt_length", 7),
-                    max_len=cfg.data.max_length,
-                    on_ref=tracked_refs.append,
-                )
-                produced = len(refs)
-                write_ref_manifest(refs, manifest)
-                _write_control(done)
-                _hold_mooncake_producer(manifest)
-            except BaseException as exc:
-                primary_exc = exc
-                # Publish the failure sentinel BEFORE the Mooncake abort sweep:
-                # the sweep can take minutes over thousands of refs, and a
-                # supervisor SIGKILL at grace expiry mid-sweep must not leave a
-                # remote consumer waiting forever on a sentinel that never
-                # arrives. A cleanup failure below overwrites this record with
-                # the combined error.
-                _publish_control_failure(manifest + ".failed", primary_exc)
-
             cleanup_exc = None
-            if (
-                store is not None
-                and os.environ.get("DISAGG_BACKEND", "shared_dir") == "mooncake"
-            ):
+            try:
                 try:
-                    _cleanup_offline_mooncake_refs(
+                    store = _offline_store(cfg)
+                    refs = ingest_offline_features(
                         store,
-                        tracked_refs,
-                        reason=(
-                            "offline-attempt-failed"
-                            if primary_exc is not None
-                            else "offline-attempt-finished"
-                        ),
+                        cfg.data.hidden_states_path,
+                        algorithm_name=algorithm.name,
+                        build_reader=algorithm.providers.offline_for(
+                            cfg.model.input_modality
+                        ).build_reader,
+                        run_id=cfg.run_id,
+                        ttt_length=cfg.training.objective_options.get("ttt_length", 7),
+                        max_len=cfg.data.max_length,
+                        on_ref=tracked_refs.append,
                     )
-                except Exception as exc:
-                    cleanup_exc = exc
+                    produced = len(refs)
+                    write_ref_manifest(refs, manifest)
+                    _write_control(done)
+                    _hold_mooncake_producer(manifest)
+                except BaseException as exc:
+                    primary_exc = exc
+                    # Publish the failure sentinel BEFORE the Mooncake abort sweep:
+                    # the sweep can take minutes over thousands of refs, and a
+                    # supervisor SIGKILL at grace expiry mid-sweep must not leave a
+                    # remote consumer waiting forever on a sentinel that never
+                    # arrives. A cleanup failure below overwrites this record with
+                    # the combined error.
+                    _publish_control_failure(manifest + ".failed", primary_exc)
 
-            if primary_exc is not None and cleanup_exc is not None:
-                combined = RuntimeError(
-                    f"offline producer failed ({type(primary_exc).__name__}: "
-                    f"{primary_exc}) and Mooncake cleanup also failed "
-                    f"({type(cleanup_exc).__name__}: {cleanup_exc})"
-                )
-                _publish_control_failure(manifest + ".failed", combined)
-                raise combined from primary_exc
-            if primary_exc is not None:
-                raise primary_exc
-            if cleanup_exc is not None:
-                _publish_control_failure(manifest + ".failed", cleanup_exc)
-                raise cleanup_exc
-            return produced
+                if (
+                    store is not None
+                    and os.environ.get("DISAGG_BACKEND", "shared_dir") == "mooncake"
+                ):
+                    try:
+                        _cleanup_offline_mooncake_refs(
+                            store,
+                            tracked_refs,
+                            reason=(
+                                "offline-attempt-failed"
+                                if primary_exc is not None
+                                else "offline-attempt-finished"
+                            ),
+                        )
+                    except Exception as exc:
+                        cleanup_exc = exc
+
+                if primary_exc is not None and cleanup_exc is not None:
+                    combined = RuntimeError(
+                        f"offline producer failed ({type(primary_exc).__name__}: "
+                        f"{primary_exc}) and Mooncake cleanup also failed "
+                        f"({type(cleanup_exc).__name__}: {cleanup_exc})"
+                    )
+                    _publish_control_failure(manifest + ".failed", combined)
+                    raise combined from primary_exc
+                if primary_exc is not None:
+                    raise primary_exc
+                if cleanup_exc is not None:
+                    _publish_control_failure(manifest + ".failed", cleanup_exc)
+                    raise cleanup_exc
+                return produced
+            finally:
+                try:
+                    _close_store(store)
+                except Exception as close_exc:
+                    if primary_exc is None and cleanup_exc is None:
+                        raise
+                    print(
+                        f"failed to close offline feature store: {close_exc}",
+                        flush=True,
+                    )
 
         return TrainingRun(execute=produce)
 
@@ -519,54 +572,58 @@ def _build_offline(
     if cfg.training.attention_backend == "usp":
         accumulation_steps *= cfg.training.sp_ulysses_size * cfg.training.sp_ring_size
     store = _offline_store(cfg, retain_on_release=True)
-    trainer = build_disagg_offline_runtime(
-        algorithm=algorithm,
-        modality=cfg.model.input_modality,
-        feature_store=store,
-        refs=read_ref_manifest(manifest),
-        draft_model=bundle.model,
-        target_head=bundle.target_head,
-        **_optimizer_kwargs(cfg, optimizer_factory),
-        runtime=training_runtime(cfg),
-        run_id=cfg.run_id,
-        output_dir=cfg.output_dir,
-        ttt_length=cfg.training.objective_options.get("ttt_length", 7),
-        max_len=cfg.data.max_length,
-        batch_size=cfg.training.batch_size,
-        accumulation_steps=accumulation_steps,
-        num_epochs=cfg.training.num_epochs,
-        max_steps=cfg.training.max_steps,
-        total_steps=cfg.training.total_steps,
-        save_interval=cfg.training.save_interval,
-        eval_interval=cfg.training.eval_interval,
-        eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
-        logger=logger,
-        log_interval=cfg.training.log_interval,
-        strategy_kwargs=bundle.strategy_kwargs,
-        resume_from=cfg.resume_path,
-        max_checkpoints=cfg.training.max_checkpoints,
-        topology=topology,
-        fsdp_sharding=cfg.training.fsdp_sharding,
-        ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
-        use_usp_preprocess=(cfg.training.attention_backend == "usp"),
-        seed=cfg.training.seed,
-        dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
-        profiling_options=_profiling_options(cfg),
-    )
+    try:
+        trainer = build_disagg_offline_runtime(
+            algorithm=algorithm,
+            modality=cfg.model.input_modality,
+            feature_store=store,
+            refs=read_ref_manifest(manifest),
+            draft_model=bundle.model,
+            target_head=bundle.target_head,
+            **_optimizer_kwargs(cfg, optimizer_factory),
+            runtime=training_runtime(cfg),
+            run_id=cfg.run_id,
+            output_dir=cfg.output_dir,
+            ttt_length=cfg.training.objective_options.get("ttt_length", 7),
+            max_len=cfg.data.max_length,
+            batch_size=cfg.training.batch_size,
+            accumulation_steps=accumulation_steps,
+            num_epochs=cfg.training.num_epochs,
+            max_steps=cfg.training.max_steps,
+            total_steps=cfg.training.total_steps,
+            save_interval=cfg.training.save_interval,
+            eval_interval=cfg.training.eval_interval,
+            eval_hidden_states_path=cfg.data.eval_hidden_states_path or None,
+            logger=logger,
+            log_interval=cfg.training.log_interval,
+            strategy_kwargs=bundle.strategy_kwargs,
+            resume_from=cfg.resume_path,
+            max_checkpoints=cfg.training.max_checkpoints,
+            topology=topology,
+            fsdp_sharding=cfg.training.fsdp_sharding,
+            ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
+            use_usp_preprocess=(cfg.training.attention_backend == "usp"),
+            seed=cfg.training.seed,
+            dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
+            profiling_options=_profiling_options(cfg),
+        )
 
-    def mark_consumed(_step: int) -> None:
-        if _primary_rank():
-            _write_control(manifest + ".consumed")
+        def mark_consumed(_step: int) -> None:
+            if _primary_rank():
+                _write_control(manifest + ".consumed")
 
-    def mark_consumer_failed(exc: BaseException) -> None:
-        _publish_control_failure(manifest + ".consumer_failed", exc)
+        def mark_consumer_failed(exc: BaseException) -> None:
+            _publish_control_failure(manifest + ".consumer_failed", exc)
 
-    return TrainingRun(
-        trainer=trainer,
-        on_success=mark_consumed,
-        on_failure=mark_consumer_failed,
-        on_finally=getattr(store, "close", None),
-    )
+        return TrainingRun(
+            trainer=trainer,
+            on_success=mark_consumed,
+            on_failure=mark_consumer_failed,
+            on_finally=getattr(store, "close", None),
+        )
+    except BaseException:
+        _close_store_on_error(store)
+        raise
 
 
 def _producer_capture_metadata(cfg: Config, algorithm: AlgorithmRegistration):
@@ -592,6 +649,7 @@ def _build_online(
     training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
+    claim_token: Optional[str] = None,
 ):
     from specforge.training.assembly import (
         TrainingRun,
@@ -604,7 +662,9 @@ def _build_online(
     streaming = algorithm.providers.server_streaming_for(modality)
     channel_path = _env("DISAGG_REF_CHANNEL")
     if cfg.training.role == "producer":
-        _claim_fresh_control_path(channel_path, _ONLINE_CONTROL_SUFFIXES)
+        _claim_fresh_control_path(
+            channel_path, _ONLINE_CONTROL_SUFFIXES, claim_token=claim_token
+        )
     elif preflight_model_bundle is not None:
         # Check trainer dependencies before opening the store or waiting on
         # the producer, so a failed preflight owns no transport resources.
@@ -613,234 +673,263 @@ def _build_online(
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
     store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
-    from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
-    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
-
-    channel = StreamingRefChannel(channel_path)
-
-    if cfg.training.role == "producer":
-        from specforge.algorithms.common.providers import resolve_server_capture_layout
-        from specforge.inference.adapters.server_capture import (
-            ServerCaptureSchema,
-            SGLangServerCaptureAdapter,
+    try:
+        from specforge.runtime.data_plane.feature_store import (
+            drain_feature_store_removals,
         )
-        from specforge.launch import build_disagg_online_producer
-        from specforge.training.model_loading import resolve_draft_config
+        from specforge.runtime.data_plane.streaming_ref_channel import (
+            StreamingRefChannel,
+        )
 
-        # This check is independent of dataset size. Keep it before tokenizer
-        # loading and prompt preparation so an invalid window fails cheaply.
-        in_flight_high_watermark, in_flight_low_watermark = resolve_dispatch_watermarks(
-            cfg
-        )
-        input_adapter = streaming.create_input_adapter(cfg)
-        input_tools = _load_input_tools(
-            cfg,
-            algorithm,
-            input_adapter=input_adapter,
-        )
-        draft_config = resolve_draft_config(cfg)
-        if input_adapter is None:
-            prompts = prepare_prompts(
+        channel = StreamingRefChannel(channel_path)
+
+        if cfg.training.role == "producer":
+            from specforge.algorithms.common.providers import (
+                resolve_server_capture_layout,
+            )
+            from specforge.inference.adapters.server_capture import (
+                ServerCaptureSchema,
+                SGLangServerCaptureAdapter,
+            )
+            from specforge.launch import build_disagg_online_producer
+            from specforge.training.model_loading import resolve_draft_config
+
+            # This check is independent of dataset size. Keep it before tokenizer
+            # loading and prompt preparation so an invalid window fails cheaply.
+            in_flight_high_watermark, in_flight_low_watermark = (
+                resolve_dispatch_watermarks(cfg)
+            )
+            input_adapter = streaming.create_input_adapter(cfg)
+            input_tools = _load_input_tools(
                 cfg,
-                input_tools,
-                draft_config=draft_config,
+                algorithm,
+                input_adapter=input_adapter,
             )
-        else:
-            prompts = input_adapter.prepare_prompts(
-                cfg,
-                input_tools,
-                draft_config=draft_config,
+            draft_config = resolve_draft_config(cfg)
+            if input_adapter is None:
+                prompts = prepare_prompts(
+                    cfg,
+                    input_tools,
+                    draft_config=draft_config,
+                )
+            else:
+                prompts = input_adapter.prepare_prompts(
+                    cfg,
+                    input_tools,
+                    draft_config=draft_config,
+                )
+            if not prompts:
+                raise ValueError(
+                    f"no prompts satisfy {algorithm.name} training eligibility"
+                )
+            if cfg.training.total_steps is None and cfg.training.max_steps is None:
+                schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
+                _write_control(
+                    channel_path + _ONLINE_SCHEDULE_SUFFIX,
+                    json.dumps(schedule, sort_keys=True),
+                )
+            layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
+                cfg, algorithm
             )
-        if not prompts:
-            raise ValueError(
-                f"no prompts satisfy {algorithm.name} training eligibility"
+            layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
+            capture_schema = ServerCaptureSchema(
+                aux_feature=layout.aux_feature,
+                last_hidden_feature=layout.last_hidden_feature,
+                passthrough=layout.passthrough,
+                attention_mask_feature=layout.attention_mask_feature,
             )
-        if cfg.training.total_steps is None and cfg.training.max_steps is None:
-            schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
-            _write_control(
-                channel_path + _ONLINE_SCHEDULE_SUFFIX,
-                json.dumps(schedule, sort_keys=True),
-            )
-        layers, hidden_size, target_vocab, draft_vocab = _producer_capture_metadata(
-            cfg, algorithm
-        )
-        layout = resolve_server_capture_layout(algorithm, cfg, modality=modality)
-        capture_schema = ServerCaptureSchema(
-            aux_feature=layout.aux_feature,
-            last_hidden_feature=layout.last_hidden_feature,
-            passthrough=layout.passthrough,
-            attention_mask_feature=layout.attention_mask_feature,
-        )
-        adapters = [
-            SGLangServerCaptureAdapter(
-                url,
-                store,
+            adapters = [
+                SGLangServerCaptureAdapter(
+                    url,
+                    store,
+                    run_id=cfg.run_id,
+                    algorithm=algorithm.name,
+                    schema=capture_schema,
+                    request_input_adapter=input_adapter,
+                    target_model_version=cfg.model.target_model_path,
+                    server_capture=_server_capture(cfg),
+                )
+                for url in _server_urls(cfg)
+            ]
+            target_repr = streaming.target_representation
+            peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
+            _workers, drive = build_disagg_online_producer(
+                algorithm=algorithm,
+                modality=modality,
+                prompts=prompts,
+                feature_store=store,
+                channel=channel,
+                feature_source=adapters if len(adapters) > 1 else adapters[0],
+                num_rollout_workers=len(adapters),
+                producer_concurrency=cfg.runtime.producer_concurrency,
                 run_id=cfg.run_id,
-                algorithm=algorithm.name,
-                schema=capture_schema,
-                request_input_adapter=input_adapter,
-                target_model_version=cfg.model.target_model_path,
-                server_capture=_server_capture(cfg),
+                target_hidden_size=hidden_size,
+                target_vocab_size=target_vocab,
+                draft_vocab_size=draft_vocab,
+                target_repr=target_repr,
+                aux_hidden_state_layer_ids=layers,
+                prompt_epochs=cfg.training.num_epochs,
+                prompt_seed=_online_prompt_seed(cfg),
+                lease=cfg.runtime.producer_lease,
+                in_flight_high_watermark=in_flight_high_watermark,
+                in_flight_low_watermark=in_flight_low_watermark,
+                resident_high_watermark_bytes=(
+                    int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
+                    if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
+                    else cfg.runtime.resident_high_watermark_bytes
+                ),
+                resident_low_watermark_bytes=(
+                    int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
+                    if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
+                    else cfg.runtime.resident_low_watermark_bytes
+                ),
+                feature_store_max_resident_bytes=(
+                    cfg.runtime.feature_store_max_resident_bytes
+                ),
+                peer_wait_timeout_s=peer_wait_timeout_s,
             )
-            for url in _server_urls(cfg)
-        ]
-        target_repr = streaming.target_representation
-        peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
-        _workers, drive = build_disagg_online_producer(
+
+            def produce() -> int:
+                produced = 0
+                primary_exc = None
+                cleanup_errors = []
+                try:
+                    try:
+                        produced = drive(should_stop=channel.consumer_stopped)
+                        deadline = (
+                            time.monotonic() + peer_wait_timeout_s
+                            if peer_wait_timeout_s is not None
+                            else None
+                        )
+                        while not channel.consumer_stopped():
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    "producer timed out waiting for the consumer result "
+                                    f"after {peer_wait_timeout_s:.0f}s"
+                                )
+                            time.sleep(0.25)
+                        consumer_failure = channel.consumer_failure()
+                        if consumer_failure is not None:
+                            raise RuntimeError(f"consumer failed: {consumer_failure}")
+                    except BaseException as exc:
+                        primary_exc = exc
+                        try:
+                            channel.fail(f"{type(exc).__name__}: {exc}")
+                        except Exception as signal_exc:
+                            print(
+                                f"failed to publish producer failure: {signal_exc}",
+                                flush=True,
+                            )
+                    try:
+                        store.stop_external_attempts(wait=True)
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"stop-external-attempts: {type(exc).__name__}: {exc}"
+                        )
+                    try:
+                        reader = StreamingRefChannel(channel_path)
+                        while True:
+                            refs = reader.poll(max_n=1024)
+                            if not refs:
+                                break
+                            for ref in refs:
+                                try:
+                                    store.abort(
+                                        ref.sample_id, reason="online-attempt-finished"
+                                    )
+                                except Exception as exc:
+                                    cleanup_errors.append(
+                                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                                    )
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"published-ref scan: {type(exc).__name__}: {exc}"
+                        )
+                    try:
+                        store.discard_external_attempts(
+                            reason="online-attempt-unadopted-capture"
+                        )
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
+                        )
+                    try:
+                        drain_feature_store_removals(store)
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"pending-remove drain: {type(exc).__name__}: {exc}"
+                        )
+                    if primary_exc is not None and cleanup_errors:
+                        raise RuntimeError(
+                            f"producer failed ({type(primary_exc).__name__}: "
+                            f"{primary_exc}) and Mooncake cleanup also failed: "
+                            f"{cleanup_errors}"
+                        ) from primary_exc
+                    if primary_exc is not None:
+                        raise primary_exc
+                    if cleanup_errors:
+                        raise RuntimeError(
+                            "producer could not clean all published Mooncake features: "
+                            f"{cleanup_errors}"
+                        )
+                    return produced
+                finally:
+                    try:
+                        _close_store(store)
+                    except Exception as close_exc:
+                        if primary_exc is None and not cleanup_errors:
+                            raise
+                        print(
+                            f"failed to close online feature store: {close_exc}",
+                            flush=True,
+                        )
+
+            return TrainingRun(execute=produce)
+
+        from specforge.launch import build_disagg_online_consumer
+
+        total_steps = cfg.training.total_steps
+        if total_steps is None and cfg.training.max_steps is None:
+            total_steps = _read_online_total_steps(cfg, channel_path)
+        bundle = build_model_bundle(cfg)
+        trainer = build_disagg_online_consumer(
             algorithm=algorithm,
             modality=modality,
-            prompts=prompts,
             feature_store=store,
             channel=channel,
-            feature_source=adapters if len(adapters) > 1 else adapters[0],
-            num_rollout_workers=len(adapters),
-            producer_concurrency=cfg.runtime.producer_concurrency,
+            draft_model=bundle.model,
+            target_head=bundle.target_head,
+            **_optimizer_kwargs(cfg, optimizer_factory),
+            runtime=training_runtime(cfg),
             run_id=cfg.run_id,
-            target_hidden_size=hidden_size,
-            target_vocab_size=target_vocab,
-            draft_vocab_size=draft_vocab,
-            target_repr=target_repr,
-            aux_hidden_state_layer_ids=layers,
-            prompt_epochs=cfg.training.num_epochs,
-            prompt_seed=_online_prompt_seed(cfg),
-            lease=cfg.runtime.producer_lease,
-            in_flight_high_watermark=in_flight_high_watermark,
-            in_flight_low_watermark=in_flight_low_watermark,
-            resident_high_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_HIGH_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_HIGH_WATERMARK_BYTES")
-                else cfg.runtime.resident_high_watermark_bytes
-            ),
-            resident_low_watermark_bytes=(
-                int(os.environ["DISAGG_RESIDENT_LOW_WATERMARK_BYTES"])
-                if os.environ.get("DISAGG_RESIDENT_LOW_WATERMARK_BYTES")
-                else cfg.runtime.resident_low_watermark_bytes
-            ),
-            feature_store_max_resident_bytes=(
-                cfg.runtime.feature_store_max_resident_bytes
-            ),
-            peer_wait_timeout_s=peer_wait_timeout_s,
+            output_dir=cfg.output_dir,
+            batch_size=cfg.training.batch_size,
+            accumulation_steps=cfg.training.accumulation_steps,
+            max_steps=cfg.training.max_steps,
+            total_steps=total_steps,
+            save_interval=cfg.training.save_interval,
+            idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
+            metadata_db_path=_consumer_database_path(cfg),
+            logger=logger,
+            log_interval=cfg.training.log_interval,
+            strategy_kwargs=bundle.strategy_kwargs,
+            max_checkpoints=cfg.training.max_checkpoints,
+            topology=topology,
+            fsdp_sharding=cfg.training.fsdp_sharding,
+            ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
+            inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
+            resume_from=cfg.resume_path,
+            dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
+            profiling_options=_profiling_options(cfg),
+            async_ack=_consumer_async_ack(cfg),
+            consumer_dispatch=cfg.runtime.consumer_dispatch,
+            dispatch_num_anchors=cfg.training.objective_options.get("num_anchors", 512),
         )
 
-        def produce() -> int:
-            produced = 0
-            primary_exc = None
-            try:
-                produced = drive(should_stop=channel.consumer_stopped)
-                deadline = (
-                    time.monotonic() + peer_wait_timeout_s
-                    if peer_wait_timeout_s is not None
-                    else None
-                )
-                while not channel.consumer_stopped():
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            "producer timed out waiting for the consumer result "
-                            f"after {peer_wait_timeout_s:.0f}s"
-                        )
-                    time.sleep(0.25)
-                consumer_failure = channel.consumer_failure()
-                if consumer_failure is not None:
-                    raise RuntimeError(f"consumer failed: {consumer_failure}")
-            except BaseException as exc:
-                primary_exc = exc
-                try:
-                    channel.fail(f"{type(exc).__name__}: {exc}")
-                except Exception as signal_exc:
-                    print(
-                        f"failed to publish producer failure: {signal_exc}",
-                        flush=True,
-                    )
-            cleanup_errors = []
-            try:
-                reader = StreamingRefChannel(channel_path)
-                while True:
-                    refs = reader.poll(max_n=1024)
-                    if not refs:
-                        break
-                    for ref in refs:
-                        try:
-                            store.abort(ref.sample_id, reason="online-attempt-finished")
-                        except Exception as exc:
-                            cleanup_errors.append(
-                                f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                            )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"published-ref scan: {type(exc).__name__}: {exc}"
-                )
-            try:
-                store.discard_external_attempts(
-                    reason="online-attempt-unadopted-capture"
-                )
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"unadopted-capture cleanup: {type(exc).__name__}: {exc}"
-                )
-            try:
-                drain_feature_store_removals(store)
-            except Exception as exc:
-                cleanup_errors.append(
-                    f"pending-remove drain: {type(exc).__name__}: {exc}"
-                )
-            if primary_exc is not None and cleanup_errors:
-                raise RuntimeError(
-                    f"producer failed ({type(primary_exc).__name__}: "
-                    f"{primary_exc}) and Mooncake cleanup also failed: "
-                    f"{cleanup_errors}"
-                ) from primary_exc
-            if primary_exc is not None:
-                raise primary_exc
-            if cleanup_errors:
-                raise RuntimeError(
-                    "producer could not clean all published Mooncake features: "
-                    f"{cleanup_errors}"
-                )
-            return produced
-
-        return TrainingRun(execute=produce)
-
-    from specforge.launch import build_disagg_online_consumer
-
-    total_steps = cfg.training.total_steps
-    if total_steps is None and cfg.training.max_steps is None:
-        total_steps = _read_online_total_steps(cfg, channel_path)
-    bundle = build_model_bundle(cfg)
-    trainer = build_disagg_online_consumer(
-        algorithm=algorithm,
-        modality=modality,
-        feature_store=store,
-        channel=channel,
-        draft_model=bundle.model,
-        target_head=bundle.target_head,
-        **_optimizer_kwargs(cfg, optimizer_factory),
-        runtime=training_runtime(cfg),
-        run_id=cfg.run_id,
-        output_dir=cfg.output_dir,
-        batch_size=cfg.training.batch_size,
-        accumulation_steps=cfg.training.accumulation_steps,
-        max_steps=cfg.training.max_steps,
-        total_steps=total_steps,
-        save_interval=cfg.training.save_interval,
-        idle_timeout_s=float(os.environ.get("DISAGG_IDLE_TIMEOUT", "0")) or None,
-        metadata_db_path=_consumer_database_path(cfg),
-        logger=logger,
-        log_interval=cfg.training.log_interval,
-        strategy_kwargs=bundle.strategy_kwargs,
-        max_checkpoints=cfg.training.max_checkpoints,
-        topology=topology,
-        fsdp_sharding=cfg.training.fsdp_sharding,
-        ddp_bucket_cap_mb=cfg.training.ddp_bucket_cap_mb,
-        inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
-        resume_from=cfg.resume_path,
-        dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
-        profiling_options=_profiling_options(cfg),
-        async_ack=_consumer_async_ack(cfg),
-        consumer_dispatch=cfg.runtime.consumer_dispatch,
-        dispatch_num_anchors=cfg.training.objective_options.get("num_anchors", 512),
-    )
-
-    return TrainingRun(trainer=trainer, on_finally=store.close)
+        return TrainingRun(trainer=trainer, on_finally=store.close)
+    except BaseException:
+        _close_store_on_error(store)
+        raise
 
 
 def build_disaggregated_run(
@@ -865,6 +954,7 @@ def build_disaggregated_run(
         raise ValueError(
             "disaggregated runs require training.role=producer or consumer"
         )
+    claim_token = _new_claim_token() if cfg.training.role == "producer" else None
     try:
         if cfg.mode == "offline":
             return _build_offline(
@@ -876,6 +966,7 @@ def build_disaggregated_run(
                 training_runtime=training_runtime,
                 logger=logger,
                 preflight_model_bundle=preflight_model_bundle,
+                claim_token=claim_token,
             )
         return _build_online(
             cfg,
@@ -887,9 +978,10 @@ def build_disaggregated_run(
             training_runtime=training_runtime,
             logger=logger,
             preflight_model_bundle=preflight_model_bundle,
+            claim_token=claim_token,
         )
     except BaseException as exc:
-        _publish_role_assembly_failure(cfg, exc)
+        _publish_role_assembly_failure(cfg, exc, claim_token=claim_token)
         raise
 
 

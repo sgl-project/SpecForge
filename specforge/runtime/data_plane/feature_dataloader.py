@@ -71,6 +71,7 @@ class _QueuePrefetchState:
         self.buffer: queue_module.Queue[Any] = queue_module.Queue(maxsize=depth)
         self.stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        self.pool: Optional[futures.ThreadPoolExecutor] = None
         self.outstanding: "OrderedDict[str, _OutstandingRef]" = OrderedDict()
         self.outstanding_lock = threading.Lock()
         self.fetches: Dict[Any, List[SampleRef]] = {}
@@ -195,6 +196,7 @@ class FeatureDataLoader:
         # after max_release_attempts, so rapid retries would leak the object.
         self.gc_interval_s = gc_interval_s if hasattr(store, "gc") else None
         self._last_gc = time.monotonic()
+        self._gc_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._prefetch_state: Optional[_QueuePrefetchState] = None
         self._queue_closed = False
@@ -246,10 +248,12 @@ class FeatureDataLoader:
     def _maybe_gc(self) -> None:
         if self.gc_interval_s is None:
             return
-        now = time.monotonic()
-        if now - self._last_gc >= self.gc_interval_s:
+        with self._gc_lock:
+            now = time.monotonic()
+            if now - self._last_gc < self.gc_interval_s:
+                return
             self._last_gc = now
-            self.store.gc()
+        self.store.gc()
 
     def _validate_refs(self, refs: List[SampleRef]) -> None:
         strategies = {ref.strategy for ref in refs}
@@ -484,11 +488,9 @@ class FeatureDataLoader:
         # concurrently while the worker goes back to leasing; the consuming
         # thread resolves them in submission order. Lease/ack semantics are
         # unchanged.
-        pool = futures.ThreadPoolExecutor(
-            max_workers=depth, thread_name_prefix="loader-fetch"
-        )
-
         def _worker() -> None:
+            pool = state.pool
+            assert pool is not None
             try:
                 while not state.stop.is_set():
                     refs = get_refs_interruptibly()
@@ -518,6 +520,7 @@ class FeatureDataLoader:
                 # this worker on fetches either. Early-stop cancellation and
                 # bounded waiting belong to _shutdown_prefetch, even if this
                 # worker has already exited after enqueueing eos.
+                state.pool = None
                 pool.shutdown(wait=False, cancel_futures=False)
 
         worker = threading.Thread(
@@ -528,15 +531,22 @@ class FeatureDataLoader:
             daemon=True,
         )
         state.thread = worker
-        with self._lifecycle_lock:
-            if self._queue_closed:
-                return
-            if self._prefetch_state is not None:
-                raise RuntimeError("FeatureDataLoader already has an active iterator")
-            self._prefetch_state = state
-            worker.start()
-
+        active = False
         try:
+            with self._lifecycle_lock:
+                if self._queue_closed:
+                    return
+                if self._prefetch_state is not None:
+                    raise RuntimeError(
+                        "FeatureDataLoader already has an active iterator"
+                    )
+                state.pool = futures.ThreadPoolExecutor(
+                    max_workers=depth, thread_name_prefix="loader-fetch"
+                )
+                self._prefetch_state = state
+                active = True
+                worker.start()
+
             while not state.stop.is_set():
                 # An empty buffer means the worker is still leasing refs:
                 # producer-bound wait. Time spent resolving an already
@@ -584,7 +594,8 @@ class FeatureDataLoader:
                 if self.ack:
                     self.queue.ack(refs)
         finally:
-            self._shutdown_prefetch(state)
+            if active:
+                self._shutdown_prefetch(state)
 
     def _shutdown_prefetch(self, state: _QueuePrefetchState) -> None:
         """Stop one worker and return every not-yet-yielded lease explicitly."""
@@ -595,14 +606,18 @@ class FeatureDataLoader:
                 state.stop.set()
             worker = state.thread
             if worker is not None and worker is not threading.current_thread():
-                worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
-                if worker.is_alive():
-                    outstanding_ids = state.outstanding_ids()
-                    raise RuntimeError(
-                        "FeatureDataLoader prefetch worker did not stop within "
-                        f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
-                        f"is still blocked, outstanding_refs={outstanding_ids}"
-                    )
+                if worker.ident is not None or worker.is_alive():
+                    worker.join(timeout=_PREFETCH_JOIN_TIMEOUT_S)
+                    if worker.is_alive():
+                        outstanding_ids = state.outstanding_ids()
+                        raise RuntimeError(
+                            "FeatureDataLoader prefetch worker did not stop within "
+                            f"{_PREFETCH_JOIN_TIMEOUT_S:.1f}s; backend get/materialize "
+                            f"is still blocked, outstanding_refs={outstanding_ids}"
+                        )
+            if state.pool is not None:
+                state.pool.shutdown(wait=False, cancel_futures=True)
+                state.pool = None
             live = state.live_fetches()
             # The submitter has stopped, so this snapshot includes every fetch
             # still owned by the loader. Normal EOF has already consumed them;
