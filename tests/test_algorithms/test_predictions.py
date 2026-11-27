@@ -31,8 +31,16 @@ class PredictionsTest(unittest.TestCase):
                 if hasattr(model, "initialize_transfer_space"):
                     model.initialize_transfer_space()
                 options = {"num_anchors": 2} if config.spec_config.protocol else {}
-                runtime = build_objective_model(model, options=options)
                 batch = {k: v.detach() for k, v in training_batch(config).items()}
+                runtime = build_objective_model(
+                    model,
+                    options=options,
+                    target_head=nn.Linear(
+                        batch["target_last_hidden_states"].shape[-1],
+                        config.vocab_size,
+                        bias=False,
+                    ),
+                )
                 with patch.object(
                     model.lm_head, "forward", wraps=model.lm_head.forward
                 ) as head:

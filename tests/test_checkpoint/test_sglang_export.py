@@ -162,6 +162,7 @@ class SGLangExportTest(unittest.TestCase):
                 "DSpineDraftModel",
                 "DMTPDraftModel",
                 "PEagleDraftModel",
+                "ParallelReconsiderationDraftModel",
             }:
                 with self.assertRaisesRegex(ValueError, "no serving implementation"):
                     convert_config(config)

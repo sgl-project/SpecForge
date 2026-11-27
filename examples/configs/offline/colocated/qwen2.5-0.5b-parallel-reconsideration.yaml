@@ -1,0 +1,40 @@
+model:
+  target_model_path: Qwen/Qwen2.5-0.5B-Instruct
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+draft: specforge/config/draft/presets/qwen2.5-0.5b-parallel-reconsideration.yaml
+
+data:
+  hidden_states_path: cache/hidden_states/qwen2.5-0.5b-parallel-reconsideration
+  max_length: 512
+  chat_template: qwen
+  cache_dir: cache
+
+training:
+  objective: parallel_reconsideration
+  objective_options:
+    ttt_length: 3
+    max_reconsiderations: 2
+    balance_beta: 0.01
+  num_epochs: 10
+  max_steps: 10000
+  batch_size: 1
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.015
+  max_grad_norm: 0.5
+  attention_backend: sdpa
+  save_interval: 100
+  max_checkpoints: 3
+  log_interval: 10
+  seed: 0
+
+run_id: qwen2.5-0.5b-parallel-reconsideration
+output_dir: outputs/qwen2.5-0.5b-parallel-reconsideration
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

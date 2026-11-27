@@ -399,7 +399,12 @@ def unsupported(config):
     )
 
 
-for name in ("DSpineDraftModel", "DMTPDraftModel", "PEagleDraftModel"):
+for name in (
+    "DSpineDraftModel",
+    "DMTPDraftModel",
+    "PEagleDraftModel",
+    "ParallelReconsiderationDraftModel",
+):
     register_converter(name)(unsupported)
 
 

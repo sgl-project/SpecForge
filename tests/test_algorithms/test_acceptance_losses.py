@@ -173,7 +173,7 @@ class AcceptanceLossTest(unittest.TestCase):
                 training=False,
             )
 
-    def test_dpace_runs_all_protocols(self):
+    def test_dpace_runs_protocols_with_acceptance_chains(self):
         from torch import nn
 
         from specforge.algorithms.objectives import build_objective_model
@@ -181,8 +181,6 @@ class AcceptanceLossTest(unittest.TestCase):
         from tests.test_algorithms.test_objectives import configurations
 
         for config in configurations():
-            if config.architecture == "MTPDraftModel":
-                continue  # one proposal per position: D-PACE is rejected at build
             with self.subTest(architecture=config.architecture):
                 torch.manual_seed(11)
                 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -203,12 +201,19 @@ class AcceptanceLossTest(unittest.TestCase):
                     )
                 if hasattr(model, "initialize_transfer_space"):
                     model.initialize_transfer_space()
-                runtime = build_objective_model(
-                    model,
+                options = dict(
                     options={"num_anchors": 2} if config.spec_config.protocol else {},
                     target_head=nn.Linear(32, config.vocab_size, device=device),
                     weighting={"kind": "dpace"},
                 )
+                if config.architecture in {
+                    "MTPDraftModel",
+                    "ParallelReconsiderationDraftModel",
+                }:
+                    with self.assertRaisesRegex(ValueError, "acceptance_chain"):
+                        build_objective_model(model, **options)
+                    continue
+                runtime = build_objective_model(model, **options)
                 result = runtime(training_batch(config, device), step=1, total_steps=10)
                 self.assertTrue(torch.isfinite(result.loss))
                 result.loss.backward()

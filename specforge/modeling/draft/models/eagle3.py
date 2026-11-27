@@ -124,11 +124,27 @@ class Eagle3DraftModel(DraftPreTrainedModel):
             raise ValueError(
                 "features must align with input IDs and draft hidden width"
             )
+        return self._decode_embeddings(
+            self.embed_tokens(input_ids).to(features.dtype),
+            features,
+            layer_inputs,
+            kv_prefix=kv_prefix,
+            output_logits=output_logits,
+        )
+
+    def _decode_embeddings(
+        self,
+        embeddings: Tensor,
+        features: Tensor,
+        layer_inputs: Sequence[LayerInputs],
+        *,
+        kv_prefix: AttentionKV | None,
+        output_logits: bool,
+    ) -> Eagle3Output:
+        """Run the shared decoder on aligned [batch, sequence, hidden] streams."""
         # EAGLE3 has one stage. The caller owns depth iteration and K/V lifetime.
         state = self.backbone.begin(
-            torch.cat(
-                (self.embed_tokens(input_ids).to(features.dtype), features), dim=-1
-            ),
+            torch.cat((embeddings, features), dim=-1),
             layer_inputs,
         )
         state = self.backbone.run_next_layer(state, kv_prefix=kv_prefix, output_kv=True)
