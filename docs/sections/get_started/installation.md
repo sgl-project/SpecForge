@@ -53,6 +53,14 @@ PyPI installation also requires the explicit SGLang installation above when
 using a capture server. Install SGLang and the capture plugin in the server's
 environment; an existing compatible server can be used separately.
 
+## Remote development container
+
+For VS Code development on a remote Linux NVIDIA host, follow the
+[Dev Container walkthrough](https://github.com/sgl-project/SpecForge/blob/main/.devcontainer/README.md).
+It covers Remote SSH, host UID/GID configuration, the isolated Python 3.11
+environment, and a first Llama EAGLE3 training run with external SGLang and
+Mooncake capture services.
+
 ## Accelerator-specific environments
 
 ### NVIDIA CUDA
