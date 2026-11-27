@@ -156,6 +156,7 @@ export default defineConfig({
           text: 'Advanced Features',
           items: [
             { text: 'Customize a Training Run', link: '/advanced_features/customization' },
+            { text: 'Multi-Drafter Training Design', link: '/advanced_features/multi_drafter_training' },
           ],
         },
         {
