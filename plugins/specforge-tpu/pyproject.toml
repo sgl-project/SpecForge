@@ -14,5 +14,8 @@ dependencies = ["specforge"]
 [project.entry-points."specforge.plugins"]
 tpu = "specforge_tpu:register"
 
+[project.entry-points."sglang.srt.plugins"]
+specforge_tpu_capture = "specforge_tpu.sglang_capture:register"
+
 [tool.setuptools]
-packages = ["specforge_tpu"]
+packages = ["specforge_tpu", "specforge_tpu.sglang_capture"]

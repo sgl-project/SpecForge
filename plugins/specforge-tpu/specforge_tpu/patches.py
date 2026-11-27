@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import socket
 from collections.abc import Callable, Mapping
@@ -11,7 +12,12 @@ from typing import Any
 
 import torch
 
-from specforge_tpu import shapes
+from specforge_tpu import producer, shapes
+
+HOST_ONLY_ENV = "SPECFORGE_TPU_HOST_ONLY"
+# CPU-only roles must not open the chips: torch.manual_seed alone makes
+# torch_tpu acquire every chip on the host.
+_HOST_ONLY_CHILD_ENV = {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0", HOST_ONLY_ENV: "1"}
 
 
 def _pick_ports(count: int) -> list[int]:
@@ -50,6 +56,19 @@ def _trainer_command(original: Callable[..., Any], cfg: Any, **kwargs: Any) -> A
     return type(command)(command.label, command.argv, env)
 
 
+def _build_launch_plan(original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    plan = original(*args, **kwargs)
+    commands = tuple(
+        (
+            dataclasses.replace(command, env={**command.env, **_HOST_ONLY_CHILD_ENV})
+            if command.label == "producer"
+            else command
+        )
+        for command in plan.commands
+    )
+    return dataclasses.replace(plan, commands=commands)
+
+
 def _resolve_rank_topology() -> None:
     # Any torch.tpu call that touches the PjRt client (e.g. accelerate's
     # set_seed before init_distributed) needs the topology of the whole group.
@@ -74,7 +93,22 @@ def _get_local_device() -> torch.device:
     return torch.device("tpu", 0)
 
 
+def apply_host() -> None:
+    """Patches that never touch the TPU, for every process."""
+    from specforge import launch_plan
+    from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter
+
+    launch_plan.build_launch_plan = partial(
+        _build_launch_plan, launch_plan.build_launch_plan
+    )
+    original = SGLangServerCaptureAdapter.__init__
+    SGLangServerCaptureAdapter.__init__ = producer.wrap_adapter_init(original)
+
+
 def apply() -> None:
+    if os.environ.get(HOST_ONLY_ENV) == "1":
+        apply_host()
+        return
     # Registers torch.compile(backend="tpu").
     import_module("torch_tpu._internal.compile")
 
@@ -88,6 +122,7 @@ def apply() -> None:
     buckets = shapes.seq_buckets()
     _resolve_rank_topology()
 
+    apply_host()
     utils.get_local_device = _get_local_device
     backends["tpu"] = "tpu_dist"
     distributed._bind_local_device = bind_device

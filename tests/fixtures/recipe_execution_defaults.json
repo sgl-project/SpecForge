@@ -9,6 +9,15 @@
    "loss_checkpoint": null,
    "loss_chunk": 0
   },
+  "online/disaggregated/external/gpt-oss-120b-dspark-disaggregated-tpu.yaml": {
+   "attention_backend": "sdpa",
+   "dataloader_workers": 8,
+   "fused_conv": false,
+   "fused_loss": true,
+   "liger": false,
+   "loss_checkpoint": true,
+   "loss_chunk": 128
+  },
   "offline/colocated/gpt-oss-120b-dspark-tpu.yaml": {
    "attention_backend": "sdpa",
    "dataloader_workers": 8,
