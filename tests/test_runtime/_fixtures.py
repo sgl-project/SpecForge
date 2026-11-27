@@ -510,8 +510,17 @@ def on_host_fsdp1():
     return mock.patch.object(FullyShardedDataParallel, "__init__", _init_on_cpu)
 
 
+_SINGLE_RANK_GLOO_SUBGROUPS: dict = {}
+
+
 def gloo_single_rank():
-    """Context manager for a temporary single-rank Gloo process group."""
+    """Context manager yielding a single-rank Gloo process group.
+
+    When the default process group is already up (e.g. a single-rank NCCL group
+    reused across CUDA tests in the same ``unittest discover`` process), reuses
+    one Gloo subgroup tied to ``WORLD`` so PyTorch's ``DeviceMesh`` / ``DTensor``
+    dispatch cache never retains a destroyed subgroup handle.
+    """
     import contextlib
     import tempfile
 
@@ -519,6 +528,20 @@ def gloo_single_rank():
 
     @contextlib.contextmanager
     def _ctx():
+        if dist.is_initialized():
+            assert (
+                dist.get_world_size() == 1
+            ), "gloo_single_rank requires a single-rank default process group"
+            if dist.get_backend() == "gloo":
+                yield dist.group.WORLD
+                return
+            world_key = id(dist.group.WORLD)
+            group = _SINGLE_RANK_GLOO_SUBGROUPS.get(world_key)
+            if group is None:
+                group = dist.new_group(backend="gloo")
+                _SINGLE_RANK_GLOO_SUBGROUPS[world_key] = group
+            yield group
+            return
         with tempfile.TemporaryDirectory(prefix="gloo_r1_") as directory:
             dist.init_process_group(
                 "gloo",
@@ -527,7 +550,7 @@ def gloo_single_rank():
                 world_size=1,
             )
             try:
-                yield directory
+                yield dist.group.WORLD
             finally:
                 if dist.is_initialized():
                     dist.destroy_process_group()
