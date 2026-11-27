@@ -792,8 +792,17 @@ class FSDPTrainingBackend(TrainingBackend):
             self._load_module_state_dict(state["model"])
         try:
             # This rank's own state: its failure is this rank's alone.
-            if self.optimizer is not None and state.get("optimizer") is not None:
-                self._load_optimizer_state_dict(state["optimizer"])
+            opt_state = state.get("optimizer")
+            if opt_state is not None:
+                from specforge.optimizer import FSDP2_OPTIMIZER_FORMAT_KEY
+
+                if self.name == "fsdp" and FSDP2_OPTIMIZER_FORMAT_KEY in opt_state:
+                    raise ValueError(
+                        "this optimizer state was written by the fsdp2 runtime; "
+                        "resume it with training.runtime=fsdp2"
+                    )
+                if self.optimizer is not None:
+                    self._load_optimizer_state_dict(opt_state)
             if state.get("rng") is not None:
                 self._set_rng_state(state["rng"])
         except Exception as error:

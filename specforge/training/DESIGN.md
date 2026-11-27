@@ -47,15 +47,16 @@ state and repositions fixed offline refs through `FeatureDataLoader.seek()`.
 ### Boundaries
 
 The parts meet through `contracts.py`. `tests/test_runtime/test_training_boundaries.py`
-reads five import rules from the source:
+reads six import rules from the source:
 
 | Rule | Modules | May not reach |
 |---|---|---|
 | A collective across samples appears only in a runner | objectives, drafts, losses, layers; the frame; the run loop and the evaluator; the checkpoint manager, the profiler and `trainer.py` | `torch.distributed`, `specforge.distributed` |
 | The frame imports the shared contracts only | `contracts.py`, `frame.py`, `program.py` | anything else in `specforge` |
 | The run loop imports no runner, backend, optimizer, objective or model | `controller.py`, `specforge/eval/` | `training.runner`, `training.backend`, `training.backends`, `optimizer`, `algorithms`, `modeling`, `layers`, `losses`, `torch.optim` |
-| A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
+| A runner decides from declarations and imports no registry | `runner.py`, `backend.py`, `backends/`, `optimizer.py` | `algorithms`, `modeling`, `config.draft.registry` |
 | A program imports nothing that trains it | objectives, drafts, losses, layers | `training`, `runtime`, `launch`, `eval`, `optimizer`, `torch.optim`, `torch.nn.parallel` |
+| Only the trainer imports a runtime package | everything in `specforge` outside `training/backends/` and `trainer.py` | `specforge.training.backends` |
 
 The shared contracts are `training.contracts`, `runtime.contracts` and the
 value types of `config.draft`, which the test lists by name (`DraftConfig`):

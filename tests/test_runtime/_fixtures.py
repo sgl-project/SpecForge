@@ -493,3 +493,116 @@ def build_domino(workdir, **options):
 
 def build_dspark(workdir, **options):
     return build_block_model(workdir, "dspark", **options)[:2]
+
+
+def on_host_fsdp1():
+    """Patch FSDP1 to initialize on CPU (avoids macOS MPS probe in Gloo tests)."""
+    from unittest import mock
+
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    original = FullyShardedDataParallel.__init__
+
+    def _init_on_cpu(self, module, *args, **kwargs):
+        kwargs.setdefault("device_id", torch.device("cpu"))
+        original(self, module, *args, **kwargs)
+
+    return mock.patch.object(FullyShardedDataParallel, "__init__", _init_on_cpu)
+
+
+_SINGLE_RANK_GLOO_SUBGROUPS: dict = {}
+
+
+def gloo_single_rank():
+    """Context manager yielding a single-rank Gloo process group.
+
+    When the default process group is already up (e.g. a single-rank NCCL group
+    reused across CUDA tests in the same ``unittest discover`` process), reuses
+    one Gloo subgroup tied to ``WORLD`` so PyTorch's ``DeviceMesh`` / ``DTensor``
+    dispatch cache never retains a destroyed subgroup handle.
+    """
+    import contextlib
+    import tempfile
+
+    import torch.distributed as dist
+
+    @contextlib.contextmanager
+    def _ctx():
+        if dist.is_initialized():
+            assert (
+                dist.get_world_size() == 1
+            ), "gloo_single_rank requires a single-rank default process group"
+            if dist.get_backend() == "gloo":
+                yield dist.group.WORLD
+                return
+            world_key = id(dist.group.WORLD)
+            group = _SINGLE_RANK_GLOO_SUBGROUPS.get(world_key)
+            if group is None:
+                group = dist.new_group(backend="gloo")
+                _SINGLE_RANK_GLOO_SUBGROUPS[world_key] = group
+            yield group
+            return
+        with tempfile.TemporaryDirectory(prefix="gloo_r1_") as directory:
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{os.path.join(directory, 'store')}",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                yield dist.group.WORLD
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
+    return _ctx()
+
+
+def _gloo_worker_entry(rank, world, store_path, out_dir, report_prefix, worker, args):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        result = worker(rank, world, out_dir, *args)
+        if result is not None:
+            torch.save(result, os.path.join(out_dir, f"{report_prefix}_{rank}.pt"))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def spawn_gloo(worker, *args, world=2, workdir=None, prefix="gloo_"):
+    """Run ``worker(rank, world, out_dir, *args)`` across ``world`` Gloo ranks.
+
+    Returns a list of per-rank return values (in rank order) when ``worker``
+    returns non-None values. Creates and cleans up a temporary directory unless
+    ``workdir`` is supplied.
+    """
+    import tempfile
+    import uuid
+
+    import torch.multiprocessing as mp
+
+    def _run(directory):
+        tag = f"{worker.__name__}_{uuid.uuid4().hex[:8]}"
+        store = os.path.join(directory, f"store_{tag}")
+        report_prefix = f"_report_{tag}"
+        mp.spawn(
+            _gloo_worker_entry,
+            args=(world, store, directory, report_prefix, worker, args),
+            nprocs=world,
+            join=True,
+        )
+        reports = []
+        for rank in range(world):
+            path = os.path.join(directory, f"{report_prefix}_{rank}.pt")
+            if os.path.exists(path):
+                reports.append(torch.load(path, weights_only=False))
+        return reports
+
+    if workdir is not None:
+        return _run(workdir)
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        return _run(directory)

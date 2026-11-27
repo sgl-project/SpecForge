@@ -36,6 +36,7 @@ from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.contracts import (
+    RUNTIMES,
     OptimizerSpec,
     ProgramSpec,
     RankFailure,
@@ -100,7 +101,7 @@ class Trainer:
         on_fit_failure: Optional[Callable[[BaseException], None]] = None,
         on_fit_finally: Optional[Callable[[], None]] = None,
     ):
-        if runtime.name != "fsdp":
+        if runtime.name not in RUNTIMES:
             raise ValueError(f"unknown training runtime {runtime.name!r}")
         ref_source = dict(ref_source)
         data_prepositioned = bool(ref_source.pop("prepositioned", False))
@@ -532,7 +533,15 @@ class Trainer:
             sharding_strategy=fsdp_sharding,
             ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         )
-        backend = FSDPTrainingBackend(
+        if runtime.name == "fsdp":
+            backend_class = FSDPTrainingBackend
+        elif runtime.name == "fsdp2":
+            from specforge.training.backends.fsdp2 import FSDP2TrainingBackend
+
+            backend_class = FSDP2TrainingBackend
+        else:
+            raise ValueError(f"unknown training runtime {runtime.name!r}")
+        backend = backend_class(
             parallel,
             precision=runtime.precision,
             optimizer_factory=optimizer_factory,
