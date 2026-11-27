@@ -18,7 +18,11 @@ import torch.distributed as dist
 from torch import nn
 
 from specforge.optimizer import FSDP2_OPTIMIZER_FORMAT_KEY, local_tensor
-from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+from specforge.training.backend import (
+    FSDPTrainingBackend,
+    ParallelConfig,
+    _optimizer_params,
+)
 from specforge.training.contracts import (
     OptimizerSpec,
     PrecisionSpec,
@@ -97,6 +101,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         self._trainable: Tuple[nn.Parameter, ...] = ()
         self._artifact_dtypes: Dict[str, torch.dtype] = {}
         self._owned_groups: Tuple[Any, ...] = ()
+        self._reference_layout: Optional[dict] = None
 
     def _validate_precision(self, precision: PrecisionSpec) -> None:
         if not (
@@ -131,6 +136,7 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
         optimizer_target: Optional[nn.Module] = None,
         frozen_modules: Tuple[nn.Module, ...] = (),
         blocks: Tuple[str, ...] = (),
+        retain_reference_layout: bool = False,
     ) -> nn.Module:
         """Store the trainable draft in fp32 and shard it with FSDP2.
 
@@ -142,6 +148,11 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             frozen_modules: Frozen modules of ``model``: kept as built,
                 replicated.
             blocks: Class names of the modules sharded as one unit each.
+            retain_reference_layout: Capture a meta-device copy of the
+                unwrapped module tree so ``load_state_dict`` can translate an
+                ``fsdp`` (FSDP1/DDP) checkpoint. Kept False on fresh runs so no
+                extra module graph is retained, and freed as soon as
+                ``load_state_dict`` finishes.
 
         Raises:
             ValueError: A frozen module holds a trainable parameter, or
@@ -168,6 +179,18 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
                 f"blocks {sorted(blocks)} name no module class of the model"
             )
         target = model if optimizer_target is None else optimizer_target
+        if retain_reference_layout:
+            from .reference_state import empty_structure
+
+            names = {id(module): name for name, module in model.named_modules()}
+            self._reference_layout = dict(
+                structure=empty_structure(model),
+                trainable=names[id(target)],
+                frozen=tuple(names[id(module)] for module in frozen_modules),
+                blocks=tuple(blocks),
+            )
+        else:
+            self._reference_layout = None
         self._artifact_dtypes = _store_in_fp32(
             model,
             frozen_modules=frozen_modules,
@@ -335,6 +358,113 @@ class FSDP2TrainingBackend(FSDPTrainingBackend):
             raise RankFailure(f"{type(error).__name__}: {error}") from error
         return {"model": model, "optimizer": optimizer, "rng": rng}
 
+    def load_state_dict(self, state: dict) -> None:
+        """Restore optimizer and RNG state; reads the reference runtime's too.
+
+        An optimizer state without :attr:`FORMAT_KEY` is the reference
+        runtime's (``BF16Optimizer`` under DDP or FSDP1): every rank reads it,
+        one parameter at a time, and keeps its own shard. Any retained
+        reference layout is released as soon as loading completes.
+        """
+        try:
+            saved = state.get("optimizer")
+            if saved is not None and self.FORMAT_KEY not in saved:
+                try:
+                    # Past the conversion's collectives: a failure is this rank's.
+                    converted = self._from_reference(saved)
+                except ValueError as error:
+                    raise RankFailure(f"{type(error).__name__}: {error}") from error
+                state = {**state, "optimizer": converted}
+            super().load_state_dict(state)
+        finally:
+            self._reference_layout = None
+
+    def _from_reference(self, saved: Mapping[str, Any]) -> dict:
+        from .reference_state import read_reference_state
+
+        if self._reference_layout is None:
+            raise ValueError(
+                "resuming from the fsdp runtime's optimizer state requires "
+                "retain_reference_layout=True in prepare_model"
+            )
+        # Align named_parameters() order (used by BF16Optimizer.fp32_params and
+        # FSDP1 layout replay) with flattened param_groups order (used by
+        # optimizer_state_dict["state"] and _load_torch_optimizer_state_dict).
+        by_id = {id(p): i for i, p in enumerate(self._trainable)}
+        if self.optimizer is None:
+            raise ValueError(
+                "reading the fsdp runtime's optimizer state needs this runtime's "
+                "optimizer to read it into"
+            )
+        opt_params = _optimizer_params(self.optimizer)
+        if len(opt_params) != len(self._trainable) or any(
+            id(p) not in by_id for p in opt_params
+        ):
+            raise ValueError(
+                "optimizer parameters do not match trainable draft parameters"
+            )
+        opt_to_named = [by_id[id(p)] for p in opt_params]
+        saved_groups = saved["optimizer_state_dict"]["param_groups"]
+        saved_sizes = [len(g["params"]) for g in saved_groups]
+        current_sizes = [len(g["params"]) for g in self.optimizer.param_groups]
+        if saved_sizes != current_sizes:
+            raise ValueError(
+                f"checkpoint param_groups sizes {saved_sizes} do not match "
+                f"current optimizer param_groups {current_sizes}"
+            )
+        named_to_opt = {ni: oi for oi, ni in enumerate(opt_to_named)}
+        state_indices = [named_to_opt[i] for i in range(len(self._trainable))]
+
+        group = self.parallel_config.fsdp_process_group or dist.group.WORLD
+        replay_group = None
+        if dist.get_world_size(group) != dist.get_world_size():
+            raise ValueError(
+                "reading the fsdp runtime's optimizer state needs this runtime's "
+                "group to be the whole job, as the reference's was"
+            )
+        if dist.get_backend(group) != "gloo":
+            # The replay runs FSDP1 on the host. Over the whole job, in its
+            # rank order: the order the reference sharded in.
+            replay_group = group = dist.new_group(backend="gloo")
+        try:
+            state = read_reference_state(
+                saved,
+                shapes=[p.shape for p in self._trainable],
+                group=group,
+                keep=lambda index, full: _local_part(full, self._trainable[index]),
+                state_indices=state_indices,
+                **self._reference_layout,
+            )
+        finally:
+            if replay_group is not None:
+                dist.destroy_process_group(replay_group)
+        converted = {
+            "optimizer_state_dict": {
+                # A parameter the reference never stepped starts afresh.
+                "state": {
+                    oi: dict(state.states[ni])
+                    for oi, ni in enumerate(opt_to_named)
+                    if state.states[ni]
+                },
+                "param_groups": state.param_groups,
+            },
+            "scheduler_state_dict": state.scheduler_state_dict,
+            "lr_scheduler_type": state.lr_scheduler_type,
+            "max_grad_norm": state.max_grad_norm,
+            "fp32_params": [state.masters[ni] for ni in opt_to_named],
+            self.FORMAT_KEY: True,
+        }
+        for key in (
+            "optimizer_type",
+            "param_group_policy",
+            "optimizer_options",
+            "lr_scheduler_min_lr_ratio",
+            "lr_scheduler_options",
+        ):
+            if key in saved:
+                converted[key] = saved[key]
+        return converted
+
     def _load_module_state_dict(self, model_state: dict) -> None:
         raise ValueError(
             "the fsdp2 runtime restores optimizer and RNG state; the program's "
@@ -384,6 +514,33 @@ def _store_in_fp32(
             if name not in owner._non_persistent_buffers_set:
                 artifact[f"{prefix}.{name}" if prefix else name] = built
     return artifact
+
+
+def _local_part(full: torch.Tensor, param) -> torch.Tensor:
+    """This rank's part of the whole tensor ``full``, cut on the host as
+    ``param`` is sharded (``torch.chunk`` per sharded mesh dimension, empty
+    parts last, as ``Shard`` splits)."""
+    from torch.distributed.tensor import Shard
+
+    part = full
+    coordinate = param.device_mesh.get_coordinate()
+    for mesh_dim, placement in enumerate(param.placements):
+        if isinstance(placement, Shard):
+            chunks = torch.chunk(
+                part, param.device_mesh.size(mesh_dim), dim=placement.dim
+            )
+            index = coordinate[mesh_dim]
+            part = (
+                chunks[index]
+                if index < len(chunks)
+                else part.narrow(placement.dim, 0, 0)
+            )
+    if part.shape != param.to_local().shape:
+        raise ValueError(
+            f"a part of shape {tuple(part.shape)} for this rank's shard of shape "
+            f"{tuple(param.to_local().shape)}"
+        )
+    return part.contiguous()
 
 
 def _broadcast_replicas(program: nn.Module, group) -> None:
