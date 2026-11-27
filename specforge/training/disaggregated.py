@@ -418,6 +418,7 @@ def _build_offline(
     topology: Optional[Topology],
     build_model_bundle: Callable,
     optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
@@ -526,6 +527,7 @@ def _build_offline(
         draft_model=bundle.model,
         target_head=bundle.target_head,
         **_optimizer_kwargs(cfg, optimizer_factory),
+        runtime=training_runtime(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         ttt_length=cfg.training.objective_options.get("ttt_length", 7),
@@ -587,6 +589,7 @@ def _build_online(
     build_model_bundle: Callable,
     prepare_prompts: Callable,
     optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
@@ -811,6 +814,7 @@ def _build_online(
         draft_model=bundle.model,
         target_head=bundle.target_head,
         **_optimizer_kwargs(cfg, optimizer_factory),
+        runtime=training_runtime(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=cfg.training.batch_size,
@@ -847,6 +851,7 @@ def build_disaggregated_run(
     build_model_bundle: Callable,
     prepare_prompts: Callable,
     optimizer_factory: Optional[Callable] = None,
+    training_runtime: Callable,
     logger: Callable,
     preflight_model_bundle: Optional[Callable] = None,
 ):
@@ -868,6 +873,7 @@ def build_disaggregated_run(
                 topology=topology,
                 build_model_bundle=build_model_bundle,
                 optimizer_factory=optimizer_factory,
+                training_runtime=training_runtime,
                 logger=logger,
                 preflight_model_bundle=preflight_model_bundle,
             )
@@ -878,6 +884,7 @@ def build_disaggregated_run(
             build_model_bundle=build_model_bundle,
             prepare_prompts=prepare_prompts,
             optimizer_factory=optimizer_factory,
+            training_runtime=training_runtime,
             logger=logger,
             preflight_model_bundle=preflight_model_bundle,
         )

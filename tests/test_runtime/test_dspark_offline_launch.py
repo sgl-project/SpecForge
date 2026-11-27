@@ -56,6 +56,7 @@ class TestDSparkOfflineLaunch(unittest.TestCase):
                 warmup_ratio=0.0,
                 total_steps=2,
             ),
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="dspark-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,

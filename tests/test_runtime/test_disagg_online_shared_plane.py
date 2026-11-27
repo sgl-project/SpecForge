@@ -18,6 +18,7 @@ from specforge.runtime.control_plane.metadata_store import SQLiteMetadataStore
 from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 from specforge.training.checkpoint import STATE_FILE
 from tests.test_algorithms.fixtures import builtin_algorithm_registry
+from tests.test_runtime._fixtures import reference_runtime
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
@@ -117,6 +118,7 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
                 channel=self.channel,
                 draft_model=object(),
                 optimizer_factory=object(),
+                runtime=reference_runtime(),
                 run_id="run0",
                 output_dir=os.path.join(self.work, "output"),
                 collate_fn=lambda features: {},

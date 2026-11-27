@@ -36,6 +36,7 @@ from specforge.runtime.contracts import TrainBatch
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.contracts import (
     OptimizerSpec,
+    PrecisionSpec,
     ProgramSpec,
     SchedulerSpec,
     StepContext,
@@ -710,7 +711,6 @@ def _fsdp1_no_decay_worker(rank, world, store_path, out_dir):
             ParallelConfig(
                 world_size=world,
                 sharding_strategy="SHARD_GRAD_OP",
-                param_dtype=torch.bfloat16,
                 fsdp_process_group=dist.group.WORLD,
             ),
             optimizer_spec=OptimizerSpec(
@@ -721,6 +721,11 @@ def _fsdp1_no_decay_worker(rank, world, store_path, out_dir):
             ),
             scheduler_spec=SchedulerSpec(kind="constant", total_steps=4),
             max_grad_norm=1.0,
+            precision=PrecisionSpec.resolve(
+                runtime="fsdp",
+                model_dtype=torch.bfloat16,
+                sharding_strategy="SHARD_GRAD_OP",
+            ),
         )
         with mock.patch.object(FullyShardedDataParallel, "__init__", _cpu_fsdp_init):
             backend.prepare_model(

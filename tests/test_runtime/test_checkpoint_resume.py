@@ -197,6 +197,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.data_plane.feature_store import LocalFeatureStore
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
         from specforge.training.trainer import Trainer
+        from tests.test_runtime._fixtures import reference_runtime
 
         Composite, _ = _fake_seam()
         seen = [] if seen is None else seen
@@ -222,6 +223,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                     warmup_ratio=0.0,
                     total_steps=(total_steps if total_steps is not None else max_steps),
                 ),
+                runtime=reference_runtime(),
                 run_id=run_id,
                 output_dir=out_dir,
                 batch_size=2,
@@ -914,6 +916,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         from specforge.runtime.control_plane import DataFlowController
         from specforge.runtime.data_plane.feature_store import LocalFeatureStore
         from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
+        from tests.test_runtime._fixtures import reference_runtime
 
         Program, _ = _fake_seam()
 
@@ -1004,6 +1007,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                         warmup_ratio=0.0,
                         total_steps=100,
                     ),
+                    runtime=reference_runtime(),
                     run_id="direct",
                     output_dir=output_dir,
                     batch_size=2,
@@ -1722,7 +1726,7 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
     from specforge.training.checkpoint import CheckpointManager
     from specforge.training.controller import TrainerController
     from specforge.training.runner import DataParallelRunner
-    from tests.test_runtime._fixtures import FakeProgram, fake_spec
+    from tests.test_runtime._fixtures import FakeProgram, fake_spec, reference_runtime
 
     class Draft(nn.Module):
         def __init__(self):
@@ -1809,7 +1813,6 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
             pc = ParallelConfig(
                 world_size=2,
                 sharding_strategy="SHARD_GRAD_OP",
-                param_dtype=torch.float32,
                 fsdp_process_group=dist.group.WORLD,
             )
 
@@ -1824,6 +1827,8 @@ def _two_rank_fsdp_resume_worker(rank, workdir, use_cuda):
                 optimizer_factory=lambda target: _ZeroingAdamW(
                     target.parameters(), lr=1e-2
                 ),
+                # A plain torch optimizer updates the parameters themselves.
+                precision=reference_runtime(torch.float32, master_dtype=None).precision,
             )
             with patch_ctx:
                 wrapped = backend.prepare_model(

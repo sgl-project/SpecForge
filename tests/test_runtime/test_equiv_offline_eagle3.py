@@ -77,6 +77,7 @@ class TestEquivOfflineEagle3(unittest.TestCase):
                     draft_model=model,
                     target_head=target_head,
                     optimizer_factory=_optimizer_factory,
+                    runtime=fx.reference_runtime(torch.bfloat16),
                     run_id="offline-canonical",
                     output_dir=os.path.join(work, "output"),
                     ttt_length=3,

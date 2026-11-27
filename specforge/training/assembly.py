@@ -38,6 +38,7 @@ from specforge.config import Config
 
 if TYPE_CHECKING:
     from specforge.distributed import Topology
+    from specforge.training.contracts import TrainingRuntime
 
 
 @dataclass
@@ -162,6 +163,19 @@ def build_model_bundle(
 ) -> ModelBundle:
     """Build the resolved canonical model, objective and frozen target pieces."""
     return algorithm.providers.model.build_bundle(cfg, algorithm, topology)
+
+
+def _training_runtime(cfg: Config) -> TrainingRuntime:
+    """The runtime that trains this run's draft, and its precision: decided here."""
+    import torch
+
+    from specforge.training.contracts import TrainingRuntime
+
+    return TrainingRuntime.resolve(
+        "fsdp",
+        model_dtype=getattr(torch, cfg.model.torch_dtype),
+        sharding_strategy=cfg.training.fsdp_sharding,
+    )
 
 
 def _optimizer_spec(cfg: Config):
@@ -478,6 +492,7 @@ def _common_launch_kwargs(
         optimizer_spec=_optimizer_spec(cfg),
         scheduler_spec=_scheduler_spec(cfg),
         max_grad_norm=t.max_grad_norm,
+        runtime=_training_runtime(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
@@ -556,6 +571,7 @@ def build_training_run(
                     algorithm=algorithm,
                     **kwargs,
                 ),
+                training_runtime=_training_runtime,
                 logger=run_logger,
             )
         except BaseException:

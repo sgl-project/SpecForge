@@ -127,6 +127,30 @@ def fake_spec(*inputs, name="test", **declarations):
     return ProgramSpec(name=name, inputs=tuple(inputs), **declarations)
 
 
+def reference_runtime(
+    dtype=torch.float32,
+    *,
+    master_dtype=torch.float32,
+    sharding_strategy="SHARD_GRAD_OP",
+):
+    """The reference runtime of a draft whose trainable parameters are ``dtype``.
+
+    Its ``precision`` is what an ``FSDPTrainingBackend`` that wraps with FSDP
+    is given. ``master_dtype=None`` declares a plain torch optimizer, which
+    updates the parameters themselves.
+    """
+    from dataclasses import replace
+
+    from specforge.training.contracts import TrainingRuntime
+
+    runtime = TrainingRuntime.resolve(
+        "fsdp", model_dtype=dtype, sharding_strategy=sharding_strategy
+    )
+    return replace(
+        runtime, precision=replace(runtime.precision, master_dtype=master_dtype)
+    )
+
+
 def train_window(runner, batches, ctx=None):
     """Run ``batches`` as one optimizer window and return the update's metrics."""
     from dataclasses import replace

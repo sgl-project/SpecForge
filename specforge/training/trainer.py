@@ -40,6 +40,7 @@ from specforge.training.contracts import (
     ProgramSpec,
     RankFailure,
     SchedulerSpec,
+    TrainingRuntime,
 )
 from specforge.training.controller import TrainerController
 from specforge.training.runner import DataParallelRunner
@@ -66,6 +67,7 @@ class Trainer:
         optimizer_spec: Optional[OptimizerSpec] = None,
         scheduler_spec: Optional[SchedulerSpec] = None,
         max_grad_norm: Optional[float] = None,
+        runtime: TrainingRuntime,  # which runtime trains, with what precision
         run_id: str,
         output_dir: str,
         batch_size: int,
@@ -98,6 +100,8 @@ class Trainer:
         on_fit_failure: Optional[Callable[[BaseException], None]] = None,
         on_fit_finally: Optional[Callable[[], None]] = None,
     ):
+        if runtime.name != "fsdp":
+            raise ValueError(f"unknown training runtime {runtime.name!r}")
         ref_source = dict(ref_source)
         data_prepositioned = bool(ref_source.pop("prepositioned", False))
         defer_queue_ack = bool(ref_source.pop("defer_ack_until_durable", False))
@@ -282,6 +286,9 @@ class Trainer:
             "tp_size": topology.tp_size,
             "sp_ulysses_size": topology.sp_ulysses_size,
             "sp_ring_size": topology.sp_ring_size,
+            "runtime": runtime.name,
+            "precision": runtime.precision.to_record(),
+            "fsdp_sharding": fsdp_sharding,
         }
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
@@ -527,6 +534,7 @@ class Trainer:
         )
         backend = FSDPTrainingBackend(
             parallel,
+            precision=runtime.precision,
             optimizer_factory=optimizer_factory,
             optimizer_spec=optimizer_spec,
             scheduler_spec=scheduler_spec,

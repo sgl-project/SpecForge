@@ -58,6 +58,7 @@ class TestDominoOfflineLaunch(unittest.TestCase):
             draft_model=model,
             target_head=None,
             optimizer_factory=optimizer_factory,
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="domino-offline",
             output_dir=os.path.join(workdir, "out"),
             max_len=sequence_length,
