@@ -15,55 +15,6 @@ from specforge.modeling.draft.layers.attention.masks import AttentionLayout
 from specforge.modeling.draft.layers.rope import apply_rotary
 
 
-class FullEagleRollout:
-    """General recurrent execution for components without a projected KV cache."""
-
-    def __init__(self, model):
-        self.model = model
-        self.tokens, self.features, self.positions = [], [], []
-
-    def step(self, input_ids, features, padding, positions):
-        from ..layers.inputs import LayerInputs
-
-        depth, length = len(self.tokens), input_ids.shape[1]
-        self.tokens.append(input_ids)
-        self.features.append(features)
-        self.positions.append(positions + depth)
-        all_positions = torch.cat(self.positions, dim=-1)
-        logical = all_positions[0] if all_positions.ndim == 3 else all_positions
-        valid_length = padding.sum(-1)
-
-        def visible(b, h, q, k):
-            qa, ka = q % length, k % length
-            qd, kd = q // length, k // length
-            return (
-                (((kd == 0) & (ka <= qa)) | ((ka == qa) & (kd <= qd)))
-                & (qa + qd < valid_length[b])
-                & (ka + kd < valid_length[b])
-            )
-
-        layout = AttentionLayout(
-            query_positions=logical,
-            key_positions=logical,
-            visibility=visible,
-            active_queries=(
-                torch.arange(all_positions.shape[-1], device=padding.device)[None]
-                % length
-                + torch.arange(all_positions.shape[-1], device=padding.device)[None]
-                // length
-                < valid_length[:, None]
-            ),
-        )
-        output = self.model(
-            torch.cat(self.tokens, dim=1),
-            None,
-            (LayerInputs(position_ids=all_positions, attention_layout=layout),),
-            recurrent_hidden=torch.cat(self.features, dim=1),
-            output_logits=False,
-        )
-        return output.hidden_states[:, -length:]
-
-
 class EagleRollout:
     def __init__(self, model, backend, *, ring_group=None, ulysses_group=None):
         self.model, self.backend = model, backend
@@ -97,7 +48,12 @@ class EagleRollout:
                 hidden = self.model.backbone.final_norm(hidden)
             return hidden, key, value
 
-        if self.model.is_gradient_checkpointing and torch.is_grad_enabled():
+        backbone = self.model.backbone
+        if (
+            backbone.gradient_checkpointing
+            and backbone.training
+            and torch.is_grad_enabled()
+        ):
             output, key, value = checkpoint(
                 run, input_embeds, hidden_states, use_reentrant=False
             )
@@ -129,9 +85,8 @@ class EagleCachedStep:
             self.values,
         )
         attention, node = stage.self_attn, stage.self_attn.config
-        hidden = torch.cat(
-            (stage.input_layernorm(embeds), stage.hidden_norm(features)), -1
-        )
+        normed_features = stage.hidden_norm(features)
+        hidden = torch.cat((stage.input_layernorm(embeds), normed_features), -1)
         batch, length = hidden.shape[:2]
         query, gate = attention.project_query(hidden)
         key = (
@@ -210,9 +165,7 @@ class EagleCachedStep:
             )
             output, active = result.output, result.active_queries
         output = attention.project_output(output, gate, active)
-        residual = (
-            stage.hidden_norm(features) if stage.norm_before_residual else features
-        )
+        residual = normed_features if stage.norm_before_residual else features
         hidden = residual + output
         hidden = hidden + stage.mlp(stage.post_attention_layernorm(hidden))
         return hidden, key, value

@@ -8,7 +8,7 @@ from torch import Tensor
 
 from specforge.config.draft._validation import boolean, positive_int
 
-from ..masks import AttentionLayout
+from ..masks import AttentionLayout, ContextBlocks
 
 
 @dataclass(frozen=True, eq=False)
@@ -23,6 +23,8 @@ class AttentionResult:
 
 
 class AttentionBackend(ABC):
+    _uses_dense_visibility: bool = False
+
     def validate(self, *, head_dim: int, value_head_dim: int, dropout_p: float) -> None:
         """Check static execution limits before parameters are allocated.
 
@@ -129,15 +131,35 @@ class AttentionPreparationScope:
 
     def __init__(self):
         self._cache = None
+        self._context_visibility = None
 
     def __enter__(self):
         if self._cache is not None:
             raise RuntimeError("attention preparation is already active")
         self._cache = []
+        self._context_visibility = {}
         return self
 
     def __exit__(self, *exc):
         self._cache = None
+        self._context_visibility = None
+
+    def _prepare_layout(
+        self, backend: AttentionBackend, layout: AttentionLayout
+    ) -> AttentionLayout:
+        blocks = layout.visibility
+        if not (backend._uses_dense_visibility and isinstance(blocks, ContextBlocks)):
+            return layout
+        visibility = self._context_visibility.get(blocks)
+        if visibility is None:
+            visibility = blocks.compute_visibility()
+            self._context_visibility[blocks] = visibility
+        return AttentionLayout(
+            query_positions=layout.query_positions,
+            key_positions=layout.key_positions,
+            visibility=visibility,
+            active_queries=layout.active_queries,
+        )
 
     def prepare(
         self,
@@ -171,7 +193,7 @@ class AttentionPreparationScope:
             ):
                 return entry
         mask, active = backend.prepare(
-            layout,
+            self._prepare_layout(backend, layout),
             batch_size=batch_size,
             num_heads=num_heads,
             is_causal=is_causal,

@@ -7,7 +7,6 @@ import re
 import tokenize
 import tomllib
 import unittest
-from collections.abc import Iterator
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,11 +20,6 @@ REMOVED_MODULE_FILES = (
     "specforge/algorithms/builtin.py",
     "specforge/algorithms/model_providers.py",
     "specforge/checkpoint/formats/legacy.py",
-    "specforge/modeling/target/base.py",
-    "specforge/modeling/target/factory.py",
-    "specforge/modeling/target/dflash_target_model.py",
-    "specforge/modeling/target/eagle3_target_model.py",
-    "specforge/modeling/target/sglang_backend/__init__.py",
     "specforge/runtime/inference/capture.py",
     "specforge/runtime/inference/dflash_adapter.py",
     "specforge/runtime/inference/sglang_adapter.py",
@@ -39,6 +33,12 @@ REMOVED_MODULE_FILES = (
     "specforge/inference/target_engine/dflash_target_model.py",
     "specforge/inference/target_engine/eagle3_target_model.py",
     "specforge/modeling/utils.py",
+    "specforge/losses/lk.py",
+    "specforge/losses/soft_cross_entropy.py",
+    "specforge/data/utils.py",
+    "specforge/training/model_utils.py",
+    "specforge/inference/media.py",
+    "specforge/inference/batch_partition.py",
 )
 
 REMOVED_TRAINING_ENTRY_FILES = (
@@ -85,7 +85,8 @@ CAPABILITY_TEST_REPLACEMENTS = {
         "tests/test_runtime/test_compact_teacher_strategy.py",
     ),
     "tests/test_scripts/test_disagg_dflash_mask_token.py": (
-        "tests/test_runtime/test_model_assembly_utils.py",
+        "tests/test_config/test_draft_contracts.py",
+        "tests/test_config/test_model_loading_schema.py",
     ),
     "tests/test_scripts/test_train_eagle3.py": (
         "tests/test_runtime/test_single_entry.py",
@@ -148,22 +149,15 @@ OPERATIONAL_EXAMPLE_REPLACEMENTS = {
 }
 
 REMOVED_PACKAGE_DIRECTORIES = (
-    "specforge/modeling/target/sglang_backend",
-    "specforge/modeling/target/custom_backend",
+    "specforge/modeling/target",
     "specforge/inference/target_engine",
-    "tests/test_modeling/test_target/test_custom_backend",
-    "tests/test_modeling/test_target/test_sglang_backend",
+    "tests/test_modeling/test_target",
     "specforge/runtime/inference",
     "specforge/runtime/training",
 )
 
 REMOVED_MODULE_PREFIXES = (
-    "specforge.modeling.target.base",
-    "specforge.modeling.target.factory",
-    "specforge.modeling.target.dflash_target_model",
-    "specforge.modeling.target.eagle3_target_model",
-    "specforge.modeling.target.sglang_backend",
-    "specforge.modeling.target.custom_backend",
+    "specforge.modeling.target",
     "specforge.runtime.inference",
     "specforge.runtime.training",
     "specforge.args",
@@ -176,6 +170,12 @@ REMOVED_MODULE_PREFIXES = (
     "specforge.inference.target_engine.dflash_target_model",
     "specforge.inference.target_engine.eagle3_target_model",
     "specforge.modeling.utils",
+    "specforge.losses.lk",
+    "specforge.losses.soft_cross_entropy",
+    "specforge.data.utils",
+    "specforge.training.model_utils",
+    "specforge.inference.media",
+    "specforge.inference.batch_partition",
     "scripts.train_eagle3",
     "scripts.train_eagle3_dataflow",
     "scripts.train_dflash",
@@ -259,6 +259,14 @@ LEGACY_API_NAMES = {
     "partition_key",
     "train_lease",
     "build_control_plane_for_mode",
+    "LogSoftmaxLoss",
+    "TargetHead",
+    "TargetEmbeddingsAndHead",
+    "TargetBatchPartition",
+    "MediaInputs",
+    "PreparedTargetInput",
+    "resolve_mask_token_id",
+    "complete_prompt_tasks",
 }
 
 CANONICAL_LAUNCH_EXPORTS = {
@@ -278,26 +286,55 @@ DOC_ONLY_PACKAGE_INITIALIZERS = (
     "specforge/__init__.py",
     "specforge/data/__init__.py",
     "specforge/inference/__init__.py",
-    "specforge/modeling/target/__init__.py",
 )
 
 
-def _is_removed_module(module: str) -> bool:
+def _matches_any_prefix(module: str, prefixes: tuple[str, ...]) -> bool:
     return any(
-        module == prefix or module.startswith(f"{prefix}.")
-        for prefix in REMOVED_MODULE_PREFIXES
+        module == prefix or module.startswith(f"{prefix}.") for prefix in prefixes
     )
 
 
-def _imported_modules(path: Path) -> Iterator[tuple[int, str]]:
-    with tokenize.open(path) as source_file:
-        tree = ast.parse(source_file.read(), filename=str(path))
+def _matching_import_targets(
+    tree: ast.AST, path: Path, target_prefixes: str | tuple[str, ...]
+) -> list[tuple[int, str]]:
+    """Resolve absolute and relative imports against ``REPO_ROOT``."""
+    prefixes = (
+        (target_prefixes,) if isinstance(target_prefixes, str) else target_prefixes
+    )
+    package_parts = path.relative_to(REPO_ROOT).parent.parts
+    matches: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                yield node.lineno, alias.name
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            yield node.lineno, node.module
+                if _matches_any_prefix(alias.name, prefixes):
+                    matches.append((node.lineno, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                drop = node.level - 1
+                if drop > len(package_parts):
+                    continue
+                base_parts = package_parts[: len(package_parts) - drop]
+                module_parts = (
+                    base_parts + tuple(node.module.split("."))
+                    if node.module
+                    else base_parts
+                )
+                base_module = ".".join(module_parts)
+            else:
+                base_module = node.module or ""
+
+            if base_module and _matches_any_prefix(base_module, prefixes):
+                matches.append((node.lineno, base_module))
+                continue
+
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                target = f"{base_module}.{alias.name}" if base_module else alias.name
+                if _matches_any_prefix(target, prefixes):
+                    matches.append((node.lineno, target))
+    return matches
 
 
 def _module_tree(path: Path) -> ast.Module:
@@ -333,8 +370,12 @@ class TestPackageArchitecture(unittest.TestCase):
     def test_removed_move_shims_stay_deleted(self):
         present = [
             relative_path
-            for relative_path in REMOVED_MODULE_FILES + REMOVED_PACKAGE_DIRECTORIES
+            for relative_path in REMOVED_MODULE_FILES
             if (REPO_ROOT / relative_path).exists()
+        ] + [
+            relative_path
+            for relative_path in REMOVED_PACKAGE_DIRECTORIES
+            if (path := REPO_ROOT / relative_path).is_file() or any(path.rglob("*.py"))
         ]
         self.assertEqual([], present, f"old-path shims reintroduced: {present}")
 
@@ -376,7 +417,9 @@ class TestPackageArchitecture(unittest.TestCase):
             bad_paths = [
                 path
                 for path in replacements
-                if not path.startswith("tests/test_runtime/test_")
+                if not path.startswith(
+                    ("tests/test_runtime/test_", "tests/test_config/test_")
+                )
                 or not path.endswith(".py")
             ]
             if bad_paths:
@@ -410,10 +453,11 @@ class TestPackageArchitecture(unittest.TestCase):
         violations = []
         for source_root in SOURCE_ROOTS:
             for path in sorted(source_root.rglob("*.py")):
-                for line_number, module in _imported_modules(path):
-                    if _is_removed_module(module):
-                        relative_path = path.relative_to(REPO_ROOT)
-                        violations.append(f"{relative_path}:{line_number}: {module}")
+                for line_number, target in _matching_import_targets(
+                    _module_tree(path), path, REMOVED_MODULE_PREFIXES
+                ):
+                    relative_path = path.relative_to(REPO_ROOT)
+                    violations.append(f"{relative_path}:{line_number}: {target}")
 
         self.assertEqual(
             [],
@@ -451,12 +495,29 @@ class TestPackageArchitecture(unittest.TestCase):
     def test_package_does_not_import_the_legacy_converter(self):
         # HF export bundles code by following the package's imports.
         violations = [
-            f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
+            f"{path.relative_to(REPO_ROOT)}:{line_number}: {target}"
             for path in sorted((REPO_ROOT / "specforge").rglob("*.py"))
-            for line_number, module in _imported_modules(path)
-            if module.split(".")[0] in {"scripts", "legacy_checkpoint"}
+            for line_number, target in _matching_import_targets(
+                _module_tree(path), path, ("scripts", "legacy_checkpoint")
+            )
         ]
         self.assertEqual([], violations, "converter imports:\n" + "\n".join(violations))
+
+    def test_data_package_does_not_import_distributed(self):
+        violations = [
+            f"{path.relative_to(REPO_ROOT)}:{line_number}: {target}"
+            for path in sorted((REPO_ROOT / "specforge" / "data").rglob("*.py"))
+            for line_number, target in _matching_import_targets(
+                _module_tree(path),
+                path,
+                ("specforge.distributed", "torch.distributed"),
+            )
+        ]
+        self.assertEqual(
+            [],
+            violations,
+            "specforge.data distributed imports:\n" + "\n".join(violations),
+        )
 
     def test_launch_exports_only_canonical_topology_builders(self):
         self.assertEqual(
@@ -724,13 +785,14 @@ class TestPackageArchitecture(unittest.TestCase):
         direct_imports = []
         for root in (REPO_ROOT / "scripts", REPO_ROOT / "examples"):
             for path in sorted(root.rglob("*.py")):
-                for line_number, module in _imported_modules(path):
-                    if module == "specforge.launch" or module.startswith(
-                        "specforge.training"
-                    ):
-                        direct_imports.append(
-                            f"{path.relative_to(REPO_ROOT)}:{line_number}: {module}"
-                        )
+                for line_number, target in _matching_import_targets(
+                    _module_tree(path),
+                    path,
+                    ("specforge.launch", "specforge.training"),
+                ):
+                    direct_imports.append(
+                        f"{path.relative_to(REPO_ROOT)}:{line_number}: {target}"
+                    )
         self.assertEqual(
             [], direct_imports, "CLI bypass imports:\n" + "\n".join(direct_imports)
         )

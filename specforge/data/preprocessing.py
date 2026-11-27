@@ -22,7 +22,6 @@
 
 import json
 import os
-import re
 import warnings
 from collections import Counter
 from collections.abc import Sequence
@@ -34,7 +33,7 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from .loss_mask import has_consecutive_supervised_tokens, normalize_loss_mask_1d
+from .loss_mask import normalize_loss_mask_1d
 from .parse import (
     DeepSeekV4Parser,
     GeneralParser,
@@ -81,62 +80,6 @@ def _require_int(
 # ==============================
 # This file is for preprocessing the data
 # ==============================
-
-
-def _apply_loss_mask_from_chat_template(
-    text: str,
-    offsets: torch.Tensor,
-    chat_template: ChatTemplate,
-) -> torch.Tensor:
-    """
-    Apply loss mask to identify assistant response spans using chat template.
-
-    Args:
-        text: The formatted conversation text.
-        offsets: Token offset mapping from tokenizer.
-        chat_template: The chat template to use for identifying assistant spans.
-
-    Returns:
-        A tensor indicating which tokens should contribute to the loss (1) or not (0).
-    """
-    loss_mask = torch.zeros(len(offsets), dtype=torch.long)
-
-    user_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.user_header}"
-    )
-    assistant_message_separator = (
-        f"{chat_template.end_of_turn_token}{chat_template.assistant_header}"
-    )
-
-    # Find spans of assistant responses using regex
-    assistant_pattern = (
-        re.escape(assistant_message_separator)
-        + r"(.*?)(?="
-        + re.escape(user_message_separator)
-        + "|$)"
-    )
-
-    matches_found = 0
-
-    for match in re.finditer(assistant_pattern, text, re.DOTALL):
-        matches_found += 1
-        # Assistant response text span (excluding assistant_header itself)
-        assistant_start_char = match.start(1)
-        assistant_end_char = match.end(1)
-
-        # Mark tokens overlapping with assistant response
-        for idx, (token_start, token_end) in enumerate(offsets):
-            # Token is part of the assistant response span
-            if token_end <= assistant_start_char:
-                continue  # token before assistant text
-            if token_start > assistant_end_char:
-                continue  # token after assistant text
-            loss_mask[idx] = 1
-
-    if matches_found == 0:
-        print("WARNING: No assistant response spans found in the conversation text.")
-
-    return loss_mask
 
 
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
@@ -473,83 +416,6 @@ def generate_vocab_mapping_file(
     torch.save(vocab_mapping, vocab_mapping_path)
     print(f"Saved vocab mapping to: {vocab_mapping_path}")
     return vocab_mapping_path
-
-
-def process_offline_eagle3_sample(
-    raw: Dict[str, torch.Tensor], max_len: int
-) -> Dict[str, torch.Tensor]:
-    """Normalize one prepared EAGLE3 feature sample for the canonical loader.
-
-    Hidden-state preparation stores the target final state under
-    hidden_state and auxiliary layers under aux_hidden_state. Training consumes
-    those tensors as target and hidden_state respectively.
-    """
-    hidden_state = raw["aux_hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
-    target = raw["hidden_state"].squeeze(0)[:max_len].unsqueeze(0)
-    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
-    loss_mask = raw["loss_mask"][:max_len].clone().unsqueeze(0)
-    if loss_mask.numel() > 0:
-        loss_mask[0, -1] = 0
-
-    return {
-        "attention_mask": torch.ones_like(loss_mask, dtype=torch.long),
-        "loss_mask": loss_mask,
-        "target": target,
-        "hidden_state": hidden_state,
-        "input_ids": input_ids,
-    }
-
-
-def process_offline_dflash_sample(
-    raw: Dict[str, torch.Tensor], max_len: int
-) -> Dict[str, torch.Tensor]:
-    """Normalize one prepared DFlash-family feature sample.
-
-    DFlash and Domino consume the same capture contract: token ids, a loss
-    mask, and the concatenated target-layer states.  Unlike EAGLE3, there is no
-    auxiliary/final-state swap and no target distribution.  Offline feature
-    files may store ``hidden_states`` as either ``[seq, width]`` or
-    ``[1, seq, width]``; the canonical loader always receives a leading batch
-    dimension.
-    """
-    input_ids = raw["input_ids"][:max_len].unsqueeze(0)
-    loss_mask = raw["loss_mask"][:max_len].unsqueeze(0)
-    hidden_states = raw["hidden_states"]
-    if hidden_states.dim() == 3:
-        if hidden_states.shape[0] != 1:
-            raise ValueError(
-                "offline DFlash hidden_states must have shape [seq, width] or "
-                f"[1, seq, width], got {tuple(hidden_states.shape)}"
-            )
-        hidden_states = hidden_states.squeeze(0)
-    if hidden_states.dim() != 2:
-        raise ValueError(
-            "offline DFlash hidden_states must have shape [seq, width] or "
-            f"[1, seq, width], got {tuple(hidden_states.shape)}"
-        )
-    hidden_states = hidden_states[:max_len].unsqueeze(0)
-
-    sequence_lengths = {
-        input_ids.shape[1],
-        loss_mask.shape[1],
-        hidden_states.shape[1],
-    }
-    if len(sequence_lengths) != 1:
-        raise ValueError(
-            "offline DFlash features have mismatched sequence lengths after "
-            f"truncation: input_ids={input_ids.shape[1]}, "
-            f"loss_mask={loss_mask.shape[1]}, "
-            f"hidden_states={hidden_states.shape[1]}"
-        )
-    if not has_consecutive_supervised_tokens(loss_mask[0]):
-        raise ValueError(
-            "offline DFlash samples require two consecutive supervised tokens"
-        )
-    return {
-        "input_ids": input_ids,
-        "loss_mask": loss_mask,
-        "hidden_states": hidden_states,
-    }
 
 
 def process_token_dict_to_mappings(

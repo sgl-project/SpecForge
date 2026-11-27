@@ -26,7 +26,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
     def test_synthetic_server_features_train_through_canonical_consumer(self):
         from tests.test_runtime import _fixtures as fx
 
-        fx.build_single_rank_distributed(port="29579")
+        topology = fx.build_single_rank_distributed(port="29579")
 
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -63,6 +63,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
         logged_metrics = []
 
         trainer = build_disagg_online_consumer(
+            topology=topology,
             algorithm=ALGORITHM,
             feature_store=consumer_store,
             channel=channel,
@@ -74,6 +75,7 @@ class TestDSparkDisaggregatedLaunch(unittest.TestCase):
                 warmup_ratio=0.0,
                 total_steps=1,
             ),
+            runtime=fx.reference_runtime(torch.bfloat16),
             run_id="dspark-e2e",
             output_dir=os.path.join(workdir, "out"),
             batch_size=1,

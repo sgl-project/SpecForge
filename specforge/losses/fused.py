@@ -10,8 +10,7 @@ without Triton; eager reference co-located in the same module.
 The explicit-label CE/L1 pair (ce_l1_loss / fused_ce_l1_loss) adds a joint
 reduction and optional top-k outputs. Its specialized kernels live in the
 private _fused_logits_loss_triton module; callers use this public module for both
-implementations. The documentation below describes the upstream single-loss
-kernel pair, whose existing APIs remain unchanged.
+implementations. The documentation below describes the upstream single-loss kernel pair.
 
 Upstream kernel documentation (speculators losses/fused.py):
 
@@ -29,7 +28,6 @@ treated as constant), L the row loss:
     kl_div  dp - tp
     rkl     dp * (log dp - log tp - L)
     jsd     0.5 * dp * (log(dp / mix) - KL(dp || mix)),  mix = (dp + tp) / 2
-    ce      dp - onehot(argmax tp)
     tv      -dp * (1[dp <= tp] - s_s),  s_s = sum of dp where dp <= tp
 """
 
@@ -50,7 +48,6 @@ __all__ = [
     "fused_soft_ce_loss",
     "fused_reverse_kl_div_loss",
     "fused_js_div_loss",
-    "fused_ce_loss",
     "fused_tv_loss",
     "fused_nla_loss",
     "fused_lk_hybrid_loss",
@@ -61,7 +58,6 @@ __all__ = [
     "kl_div_loss",
     "reverse_kl_div_loss",
     "js_div_loss",
-    "ce_loss",
     "tv_loss",
     "neg_log_acceptance_loss",
     "lk_hybrid_loss",
@@ -71,8 +67,7 @@ __all__ = [
 MAX_FUSED_SIZE = 131072
 # Ascend NPU's Unified Buffer (~192 KB) cannot fit the double-row load these
 # kernels perform (logits + targets per block) beyond 4096 elements per block;
-# triton-ascend raises "ub overflow" at BLOCK_SIZE >= 8192. CE is single-row
-# but shares the same cap so all _FusedLoss OPs use one path.
+# triton-ascend raises "ub overflow" at BLOCK_SIZE >= 8192.
 MAX_FUSED_SIZE_NPU = 4096
 
 # tl.constexpr instances: Triton kernels may only read globals wrapped this way.
@@ -87,13 +82,12 @@ _LOG2 = 0.6931471805599453
 _OP_KL = 0
 _OP_RKL = 1
 _OP_JSD = 2
-_OP_CE = 3
-_OP_TV = 4
-_OP_SOFT_CE = 5
+_OP_TV = 3
+_OP_SOFT_CE = 4
 
 # stats [_N_STATS, n_rows]: [0]/[1] draft row max / sum-exp, [2]/[3] same for
-# targets (unused by ce), [4] per-OP -- kl_div/rkl: row loss L | jsd:
-# KL(dp||mix) | tv: s_s | ce: argmax as float32 (exact: vocab < 2**24).
+# targets, [4] per-OP -- kl_div/rkl/soft_ce: row loss L | jsd: KL(dp||mix) |
+# tv: s_s.
 _N_STATS = 5
 
 _NLA_EPS = 1e-5
@@ -178,67 +172,46 @@ def loss_forward_kernel(  # noqa: C901 -- constexpr OP branches, pruned per inst
     tl.store(stats_ptr + 0 * stats_row + pid, m_d)
     tl.store(stats_ptr + 1 * stats_row + pid, z_d)
 
-    if OP == _OP_CE:
-        # Only the target argmax is needed; no target softmax stats.
-        best_val = float("-inf")
-        best_idx = 0
-        for i in range(0, n_cols, BLOCK_SIZE):
-            offsets = i + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_cols
-            y = tl.load(targets_ptr + offsets, mask=mask, other=float("-inf")).cast(
-                tl.float32
-            )
-            block_max = tl.max(y)
-            block_arg = tl.argmax(y, axis=0)
-            # strict > keeps the first occurrence, the torch.argmax convention
-            update = block_max > best_val
-            best_idx = tl.where(update, i + block_arg, best_idx)
-            best_val = tl.where(update, block_max, best_val)
-        logit_at_target = tl.load(logits_ptr + best_idx).cast(tl.float32)
-        tl.store(loss_ptr + pid, lse_d - logit_at_target)
-        # mypy reads traced Triton code as Python and types best_idx as int
-        tl.store(stats_ptr + 4 * stats_row + pid, best_idx.to(tl.float32))  # type: ignore[attr-defined]
-    else:
-        m_t, z_t = _online_stats(targets_ptr, n_cols, BLOCK_SIZE)
-        lse_t = m_t + tl.log(z_t)
-        tl.store(stats_ptr + 2 * stats_row + pid, m_t)
-        tl.store(stats_ptr + 3 * stats_row + pid, z_t)
+    m_t, z_t = _online_stats(targets_ptr, n_cols, BLOCK_SIZE)
+    lse_t = m_t + tl.log(z_t)
+    tl.store(stats_ptr + 2 * stats_row + pid, m_t)
+    tl.store(stats_ptr + 3 * stats_row + pid, z_t)
 
-        acc = 0.0
-        extra = 0.0
-        for i in range(0, n_cols, BLOCK_SIZE):
-            offsets = i + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < n_cols
-            x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
-            y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
-            ldp = x - lse_d
-            ltp = y - lse_t
-            dp = tl.exp(ldp)
-            tp = tl.exp(ltp)
-            if OP == _OP_KL:
-                acc += tl.sum(tl.where(mask, tp * (ltp - ldp), 0.0))
-            elif OP == _OP_SOFT_CE:
-                acc += tl.sum(tl.where(mask, -tp * ldp, 0.0))
-            elif OP == _OP_RKL:
-                acc += tl.sum(tl.where(mask, dp * (ldp - ltp), 0.0))
-            elif OP == _OP_JSD:
-                lmp = _log_mix(ldp, ltp)
-                acc += tl.sum(tl.where(mask, dp * (ldp - lmp), 0.0))
-                extra += tl.sum(tl.where(mask, tp * (ltp - lmp), 0.0))
-            elif OP == _OP_TV:
-                acc += tl.sum(tl.where(mask, tl.minimum(dp, tp), 0.0))
-                extra += tl.sum(tl.where(mask & (dp <= tp), dp, 0.0))
-
-        # Lint exemptions: `in`/merged compares aren't constexpr-foldable here.
-        if OP == _OP_KL or OP == _OP_RKL or OP == _OP_SOFT_CE:  # noqa: PLR1714, SIM109
-            tl.store(loss_ptr + pid, acc)
-            tl.store(stats_ptr + 4 * stats_row + pid, acc)
+    acc = 0.0
+    extra = 0.0
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        ldp = x - lse_d
+        ltp = y - lse_t
+        dp = tl.exp(ldp)
+        tp = tl.exp(ltp)
+        if OP == _OP_KL:
+            acc += tl.sum(tl.where(mask, tp * (ltp - ldp), 0.0))
+        elif OP == _OP_SOFT_CE:
+            acc += tl.sum(tl.where(mask, -tp * ldp, 0.0))
+        elif OP == _OP_RKL:
+            acc += tl.sum(tl.where(mask, dp * (ldp - ltp), 0.0))
         elif OP == _OP_JSD:
-            tl.store(loss_ptr + pid, 0.5 * (acc + extra))
-            tl.store(stats_ptr + 4 * stats_row + pid, acc)
+            lmp = _log_mix(ldp, ltp)
+            acc += tl.sum(tl.where(mask, dp * (ldp - lmp), 0.0))
+            extra += tl.sum(tl.where(mask, tp * (ltp - lmp), 0.0))
         elif OP == _OP_TV:
-            tl.store(loss_ptr + pid, 1.0 - acc)
-            tl.store(stats_ptr + 4 * stats_row + pid, extra)
+            acc += tl.sum(tl.where(mask, tl.minimum(dp, tp), 0.0))
+            extra += tl.sum(tl.where(mask & (dp <= tp), dp, 0.0))
+
+    # Lint exemptions: `in`/merged compares aren't constexpr-foldable here.
+    if OP == _OP_KL or OP == _OP_RKL or OP == _OP_SOFT_CE:  # noqa: PLR1714, SIM109
+        tl.store(loss_ptr + pid, acc)
+        tl.store(stats_ptr + 4 * stats_row + pid, acc)
+    elif OP == _OP_JSD:
+        tl.store(loss_ptr + pid, 0.5 * (acc + extra))
+        tl.store(stats_ptr + 4 * stats_row + pid, acc)
+    elif OP == _OP_TV:
+        tl.store(loss_ptr + pid, 1.0 - acc)
+        tl.store(stats_ptr + 4 * stats_row + pid, extra)
 
 
 def loss_backward_kernel(
@@ -269,14 +242,10 @@ def loss_backward_kernel(
     z_d = tl.load(stats_ptr + 1 * stats_row + pid)
     lse_d = m_d + tl.log(z_d)
     extra = tl.load(stats_ptr + 4 * stats_row + pid)
-    if OP != _OP_CE:
-        # CE passes None for targets_ptr.
-        targets_ptr += pid * n_cols
-        m_t = tl.load(stats_ptr + 2 * stats_row + pid)
-        z_t = tl.load(stats_ptr + 3 * stats_row + pid)
-        lse_t = m_t + tl.log(z_t)
-    else:
-        target_idx = extra.to(tl.int32)
+    targets_ptr += pid * n_cols
+    m_t = tl.load(stats_ptr + 2 * stats_row + pid)
+    z_t = tl.load(stats_ptr + 3 * stats_row + pid)
+    lse_t = m_t + tl.log(z_t)
 
     for i in range(0, n_cols, BLOCK_SIZE):
         offsets = i + tl.arange(0, BLOCK_SIZE)
@@ -284,20 +253,17 @@ def loss_backward_kernel(
         x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
         ldp = x - lse_d
         dp = tl.exp(ldp)
-        if OP == _OP_CE:
-            grad = dp - (offsets == target_idx).to(tl.float32)
-        else:
-            y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
-            ltp = y - lse_t
-            tp = tl.exp(ltp)
-            if OP == _OP_KL or OP == _OP_SOFT_CE:
-                grad = dp - tp
-            elif OP == _OP_RKL:
-                grad = dp * (ldp - ltp - extra)
-            elif OP == _OP_JSD:
-                grad = 0.5 * dp * (ldp - _log_mix(ldp, ltp) - extra)
-            elif OP == _OP_TV:
-                grad = -dp * ((dp <= tp).to(tl.float32) - extra)
+        y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        ltp = y - lse_t
+        tp = tl.exp(ltp)
+        if OP == _OP_KL or OP == _OP_SOFT_CE:
+            grad = dp - tp
+        elif OP == _OP_RKL:
+            grad = dp * (ldp - ltp - extra)
+        elif OP == _OP_JSD:
+            grad = 0.5 * dp * (ldp - _log_mix(ldp, ltp) - extra)
+        elif OP == _OP_TV:
+            grad = -dp * ((dp <= tp).to(tl.float32) - extra)
         tl.store(grad_in_ptr + offsets, go * grad, mask=mask)
 
 
@@ -330,7 +296,6 @@ def _require_triton():
     module_globals["_OP_KL"] = tl.constexpr(_OP_KL)
     module_globals["_OP_RKL"] = tl.constexpr(_OP_RKL)
     module_globals["_OP_JSD"] = tl.constexpr(_OP_JSD)
-    module_globals["_OP_CE"] = tl.constexpr(_OP_CE)
     module_globals["_OP_TV"] = tl.constexpr(_OP_TV)
     module_globals["_OP_SOFT_CE"] = tl.constexpr(_OP_SOFT_CE)
     module_globals["_online_stats"] = triton.jit(_online_stats)
@@ -366,10 +331,7 @@ class _FusedLoss(torch.autograd.Function):
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        # CE backward only needs the target argmax cached in stats.
-        ctx.save_for_backward(
-            logits_flat, None if op == _OP_CE.value else targets_flat, stats
-        )
+        ctx.save_for_backward(logits_flat, targets_flat, stats)
         ctx.op = op
         ctx.shape = (B, T, V)
         ctx.settings = (BLOCK_SIZE, num_warps)
@@ -418,12 +380,6 @@ def fused_js_div_loss(logits, targets):
     """Per-position JSD ``[1, T]``; fused twin of ``js_div_loss``."""
     _require_triton()
     return _FusedLoss.apply(logits, targets, _OP_JSD.value)
-
-
-def fused_ce_loss(logits, targets):
-    """Per-position CE vs argmax(targets) ``[1, T]``; fused twin of ``ce_loss``."""
-    _require_triton()
-    return _FusedLoss.apply(logits, targets, _OP_CE.value)
 
 
 def fused_tv_loss(logits, targets):
@@ -674,32 +630,6 @@ def js_div_loss(
     return elementwise_loss  # noqa: RET504
 
 
-def ce_loss(
-    logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
-    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
-):
-    """Compute per-position cross-entropy loss using argmax of target logits as labels.
-
-    Args:
-        logits: Draft model logits.
-        targets: Target model logits (argmax taken to produce hard labels).
-
-    Returns:
-        Per-position cross-entropy loss with shape [1, seq_len].
-    """
-    batch_size, seq_len, draft_vocab_size = logits.shape
-    target_ids = torch.argmax(targets, dim=-1)  # shape: [1, seq_len]
-
-    elementwise_loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, draft_vocab_size),
-        target_ids.reshape(-1),
-        reduction="none",
-        ignore_index=-100,
-    ).reshape(batch_size, seq_len)
-
-    return elementwise_loss  # noqa: RET504
-
-
 def tv_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
@@ -807,10 +737,10 @@ def ce_l1_loss(
 ) -> CEL1Loss:
     """CPU-safe reference for ``fused_ce_l1_loss``, with the same input/result API.
 
-    CE uses explicit token IDs, unlike ``ce_loss(logits, targets)`` which uses
-    the teacher argmax. Low-precision CE is promoted to FP32; explicit FP64
-    inputs retain FP64 for numerical references. Teacher L1 uses FP32 softmax.
-    Teacher logits and diagnostics are detached on both implementations.
+    CE uses explicit token IDs rather than teacher argmax. Low-precision CE is
+    promoted to FP32; explicit FP64 inputs retain FP64 for numerical references.
+    Teacher L1 uses FP32 softmax. Teacher logits and diagnostics are detached
+    on both implementations.
     """
     ce_logits = logits.to(torch.promote_types(logits.dtype, torch.float32))
     ce = torch.nn.functional.cross_entropy(

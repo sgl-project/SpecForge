@@ -146,6 +146,8 @@ def evaluated_metrics(runtime, batches):
         controller = TrainerController(
             runner,
             strategy_name=runner.spec.name,
+            rank=0,
+            world_size=1,
             run_id="metrics",
             output_dir=output_dir,
             total_steps=TOTAL_STEPS,

@@ -30,6 +30,7 @@ def program_spec(model) -> ProgramSpec:
         name=model.objective_name,
         inputs=tuple(registration.inputs),
         replay_statistics=() if statistic is None else (statistic.argument_name,),
+        after_step_statistics=model.after_step_statistics,
         evaluation_diagnostics=registration.training.evaluation_diagnostics,
         reduction=registration.training.reduction,
         # A draft class names its transformer blocks; one that names none
@@ -38,6 +39,7 @@ def program_spec(model) -> ProgramSpec:
         partition=PartitionHints(
             blocks=tuple(sorted(model.draft_model._no_split_modules))
         ),
+        axes=(("sequence", "part"),) if model.sequence_parallel is not None else (),
     )
 
 

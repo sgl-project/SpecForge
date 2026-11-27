@@ -56,6 +56,7 @@ LIFECYCLE = (
 RUNNER = (
     "specforge/training/runner.py",
     "specforge/training/backend.py",
+    "specforge/training/backends/**/*.py",
     "specforge/optimizer.py",
 )
 
@@ -85,17 +86,22 @@ class Excepted:
 
 @dataclass(frozen=True)
 class Rule:
-    """Modules matching ``scope`` reach nothing under ``forbidden``."""
+    """Modules matching ``scope`` (minus ``outside``) reach nothing under ``forbidden``."""
 
     name: str
     scope: tuple[str, ...]
     forbidden: tuple[str, ...]
     excepted: dict[str, Excepted] = field(default_factory=dict)
+    outside: tuple[str, ...] = ()
 
     def modules(self) -> list[Path]:
         """The modules the rule covers."""
+        excluded = {
+            path for pattern in self.outside for path in REPO_ROOT.glob(pattern)
+        }
         return sorted(
             {path for pattern in self.scope for path in REPO_ROOT.glob(pattern)}
+            - excluded
         )
 
 
@@ -114,6 +120,7 @@ QUERIES = tuple(
         "get_world_size",
         "is_available",
         "is_initialized",
+        "tensor.DTensor",
     )
 )
 
@@ -131,6 +138,10 @@ def _counted(name: str) -> bool:
 #: of the package brings: every use of a helper counts as the group reads in
 #: its body.
 EXCEPTED_COLLECTIVES = {
+    "specforge/modeling/draft/bindings.py": Excepted(
+        "checks whether an FSDP-wrapped target weight is a DTensor",
+        reads=(f"{_T}.tensor.DTensor",),
+    ),
     # The sequence-parallel axis: ranks of one group share a sequence, never
     # samples.
     "specforge/modeling/draft/models/eagle_rollout.py": Excepted(
@@ -158,23 +169,14 @@ EXCEPTED_COLLECTIVES = {
     # the process group, which the design moves to the runner and to a
     # topology value.
     "specforge/training/controller.py": Excepted(
-        "run loop: the progress bar's rank; rank 0's verdict on whether an "
-        "evaluation runs, broadcast; the world size written into a checkpoint",
+        "run loop: rank 0's verdict on whether an evaluation runs, broadcast",
         {f"{_T}.broadcast_object_list": 1},
-        reads=(
-            _T,
-            f"{_T}.get_rank",
-            f"{_T}.get_world_size",
-            f"{_T}.is_available",
-            f"{_T}.is_initialized",
-        ),
     ),
     "specforge/training/checkpoint.py": Excepted(
-        "checkpoint sequence: the gather of write errors, the barrier, rank 0's "
+        "checkpoint sequence: the gather of write errors, rank 0's "
         "best-checkpoint verdict, broadcast, the gather of resume descriptors",
         {
             f"{_T}.all_gather_object": 2,
-            f"{_T}.barrier": 1,
             f"{_T}.broadcast_object_list": 1,
         },
         reads=(
@@ -192,10 +194,6 @@ EXCEPTED_COLLECTIVES = {
             f"{_T}.is_available",
             f"{_T}.is_initialized",
         ),
-    ),
-    "specforge/training/trainer.py": Excepted(
-        "resume: the world size compared with the checkpoint's",
-        reads=(_T, f"{_T}.get_world_size", f"{_T}.is_initialized"),
     ),
 }
 
@@ -246,6 +244,16 @@ RULES = (
             "specforge.optimizer",
             "torch.optim",
             "torch.nn.parallel",
+        ),
+    ),
+    Rule(
+        "only the trainer, which builds the runtime the run chose, imports a runtime "
+        "package",
+        ("specforge/**/*.py",),
+        ("specforge.training.backends",),
+        outside=(
+            "specforge/training/backends/**/*.py",
+            "specforge/training/trainer.py",
         ),
     ),
 )
@@ -625,8 +633,8 @@ class TrainingBoundaryTest(unittest.TestCase):
     def test_only_what_issues_no_communication_goes_uncounted(self):
         for name in ("barrier", "all_reduce", "all_gather_object", "isend", "P2POp"):
             self.assertTrue(_counted(f"torch.distributed.{name}"), name)
-        # Topology read from the process counts too, through its helpers.
-        self.assertTrue(_counted("specforge.distributed.get_tp_group"))
+        # Anything else of the package's own distributed module counts too.
+        self.assertTrue(_counted("specforge.distributed.init_distributed"))
         for name in ("get_rank", "is_initialized", "ProcessGroup", "ReduceOp.SUM"):
             self.assertFalse(_counted(f"torch.distributed.{name}"), name)
         self.assertFalse(_counted("torch.distributed"))

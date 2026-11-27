@@ -12,6 +12,7 @@ from specforge.algorithms.objectives import (
 )
 from specforge.algorithms.objectives.inputs import prepare_blocks
 from specforge.modeling import build_draft_model
+from specforge.modeling.draft.layers.attention.masks import dense_attention_mask
 from tests.test_config.draft_fixtures import draft_config
 from tests.test_config.test_draft_mtp_spec import mtp_config
 from tests.test_modeling.test_canonical_dflash2 import dflash2_config
@@ -151,7 +152,11 @@ class ObjectiveTest(unittest.TestCase):
             )
         )
         self.assertFalse(blocks.weights[..., 0].any())
-        visible = blocks.layer_inputs[0].attention_layout.visibility[0, 0]
+        visible = dense_attention_mask(
+            blocks.layer_inputs[0].attention_layout,
+            is_causal=False,
+            sliding_window=None,
+        )[0, 0]
         for index, anchor in enumerate(blocks.anchors[0]):
             self.assertFalse(visible[index * 4, anchor:9].any())
         self.assertFalse(visible[:4, 13:].any())

@@ -30,11 +30,15 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from specforge.algorithms.contracts import FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 from specforge.config import Config
+
+if TYPE_CHECKING:
+    from specforge.distributed import Topology
+    from specforge.training.contracts import TrainingRuntime
 
 
 @dataclass
@@ -154,44 +158,57 @@ def _load_input_tools(
     return _load_text_tokenizer(cfg)
 
 
-def build_model_bundle(cfg: Config, *, algorithm: AlgorithmRegistration) -> ModelBundle:
+def build_model_bundle(
+    cfg: Config, *, algorithm: AlgorithmRegistration, topology: Topology
+) -> ModelBundle:
     """Build the resolved canonical model, objective and frozen target pieces."""
-    return algorithm.providers.model.build_bundle(cfg, algorithm)
+    return algorithm.providers.model.build_bundle(cfg, algorithm, topology)
 
 
-class _ConfiguredOptimizerFactory:
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-        self.total_steps = cfg.training.total_steps or cfg.training.max_steps
+def _training_runtime(cfg: Config) -> TrainingRuntime:
+    """The runtime that trains this run's draft, and its precision: decided here."""
+    import torch
 
-    def configure_total_steps(self, total_steps: int) -> None:
-        if self.total_steps is None:
-            self.total_steps = total_steps
-        elif self.total_steps != total_steps:
-            raise ValueError(
-                "optimizer/controller schedule mismatch: "
-                f"{self.total_steps} != {total_steps}"
-            )
+    from specforge.training.contracts import TrainingRuntime
 
-    def __call__(self, draft_module):
-        from specforge.optimizer import BF16Optimizer
-
-        if self.total_steps is None:
-            raise RuntimeError("optimizer total_steps was not resolved before assembly")
-        t = self.cfg.training
-        return BF16Optimizer(
-            draft_module,
-            lr=t.learning_rate,
-            max_grad_norm=t.max_grad_norm,
-            warmup_ratio=t.warmup_ratio,
-            lr_scheduler=t.lr_scheduler,
-            total_steps=self.total_steps,
-            offload_master=t.optimizer_cpu_offload,
-        )
+    gradient_dtype = (
+        getattr(torch, cfg.training.gradient_dtype)
+        if cfg.training.gradient_dtype is not None
+        else None
+    )
+    return TrainingRuntime.resolve(
+        cfg.training.runtime,
+        model_dtype=getattr(torch, cfg.model.torch_dtype),
+        sharding_strategy=cfg.training.fsdp_sharding,
+        gradient_dtype=gradient_dtype,
+    )
 
 
-def _optimizer_factory(cfg: Config):
-    return _ConfiguredOptimizerFactory(cfg)
+def _optimizer_spec(cfg: Config):
+    from specforge.training.contracts import OptimizerSpec
+
+    t = cfg.training
+    return OptimizerSpec(
+        kind=t.optimizer,
+        lr=t.learning_rate,
+        weight_decay=t.weight_decay,
+        param_group_policy=t.param_group_policy,
+        offload_master=t.optimizer_cpu_offload,
+        extra=dict(t.optimizer_options),
+    )
+
+
+def _scheduler_spec(cfg: Config):
+    from specforge.training.contracts import SchedulerSpec
+
+    t = cfg.training
+    return SchedulerSpec(
+        kind=t.lr_scheduler,
+        total_steps=t.total_steps or t.max_steps,
+        warmup_ratio=t.warmup_ratio,
+        min_lr_ratio=t.min_lr_ratio,
+        extra=dict(t.lr_scheduler_options),
+    )
 
 
 def _logger(metrics, step):
@@ -465,6 +482,7 @@ def _common_launch_kwargs(
     bundle: ModelBundle,
     algorithm: AlgorithmRegistration,
     *,
+    topology: Topology,
     logger=_logger,
 ) -> Dict[str, Any]:
     t = cfg.training
@@ -477,7 +495,10 @@ def _common_launch_kwargs(
     return dict(
         algorithm=algorithm,
         modality=cfg.model.input_modality,
-        optimizer_factory=_optimizer_factory(cfg),
+        optimizer_spec=_optimizer_spec(cfg),
+        scheduler_spec=_scheduler_spec(cfg),
+        max_grad_norm=t.max_grad_norm,
+        runtime=_training_runtime(cfg),
         run_id=cfg.run_id,
         output_dir=cfg.output_dir,
         batch_size=t.batch_size,
@@ -490,9 +511,9 @@ def _common_launch_kwargs(
         logger=logger,
         log_interval=t.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
-        tp_size=t.tp_size,
-        sp_ulysses_size=t.sp_ulysses_size,
-        sp_ring_size=t.sp_ring_size,
+        topology=topology,
+        fsdp_sharding=t.fsdp_sharding,
+        ddp_bucket_cap_mb=t.ddp_bucket_cap_mb,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
@@ -502,19 +523,31 @@ def build_training_run(
     cfg: Config,
     *,
     algorithm: AlgorithmRegistration,
+    topology: Optional[Topology] = None,
 ) -> TrainingRun:
     """Assemble one validated run from an already-resolved algorithm.
 
     Offline training may run in one process or with a disaggregated feature
     source.  Online training is always disaggregated and captures through
     external SGLang servers; colocated online execution is intentionally absent.
+    ``topology`` is the job's shape; only a producer runs without one.
     """
 
     t = cfg.training
     if t.role != "producer":
-        import torch.distributed as dist
-
-        cfg.validate_world_size(dist.get_world_size() if dist.is_initialized() else 1)
+        if topology is None:
+            raise ValueError(
+                "training needs the job's topology from init_distributed; "
+                "only a producer runs without one"
+            )
+        cfg.validate_world_size(topology.world_size)
+        configured = (t.tp_size, t.sp_ulysses_size, t.sp_ring_size)
+        built = (topology.tp_size, topology.sp_ulysses_size, topology.sp_ring_size)
+        if built != configured:
+            raise ValueError(
+                f"the topology has (tp, ulysses, ring) = {built} but the run "
+                f"configures {configured}"
+            )
 
     if cfg.mode == "online" and cfg.deployment.mode != "disaggregated":
         raise ValueError(
@@ -531,8 +564,9 @@ def build_training_run(
             return build_disaggregated_run(
                 cfg,
                 algorithm=algorithm,
+                topology=topology,
                 build_model_bundle=lambda run_cfg: build_model_bundle(
-                    run_cfg, algorithm=algorithm
+                    run_cfg, algorithm=algorithm, topology=topology
                 ),
                 preflight_model_bundle=lambda run_cfg: preflight_draft_kernels(
                     run_cfg, algorithm=algorithm
@@ -543,7 +577,7 @@ def build_training_run(
                     algorithm=algorithm,
                     **kwargs,
                 ),
-                optimizer_factory=_optimizer_factory,
+                training_runtime=_training_runtime,
                 logger=run_logger,
             )
         except BaseException:
@@ -553,7 +587,7 @@ def build_training_run(
     if cfg.mode != "offline":
         raise ValueError("colocated execution supports offline training only")
 
-    bundle = build_model_bundle(cfg, algorithm=algorithm)
+    bundle = build_model_bundle(cfg, algorithm=algorithm, topology=topology)
     from specforge.launch import build_offline_runtime
 
     _ensure_offline_vocab_mapping(cfg, bundle, algorithm)
@@ -574,6 +608,7 @@ def build_training_run(
                 cfg,
                 bundle,
                 algorithm,
+                topology=topology,
                 logger=run_logger,
             ),
         )

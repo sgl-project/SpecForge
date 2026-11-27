@@ -2,7 +2,7 @@
 """Shared tiny synthetic fixtures for canonical runtime GPU tests.
 
 Not a test module (no ``test_`` prefix). Builds a tiny EAGLE3 draft model, a
-``TargetHead``, a vocab mapping, and offline ``.ckpt`` feature files — all from
+frozen target LM head, a vocab mapping, and offline ``.ckpt`` feature files — all from
 random tensors, with NO model download. Offline batches are materialized through
 the same manifest-reader and feature-loader path used by training.
 """
@@ -106,7 +106,7 @@ class FakeProgram(torch.nn.Module):
 
     frozen_modules = ()
 
-    def host_inputs(self, tensors):
+    def host_inputs(self, tensors, *, sample_ids, epoch):
         return {}
 
     def replay_arguments(self, replay_values, *, prepass=False):
@@ -127,6 +127,30 @@ def fake_spec(*inputs, name="test", **declarations):
     return ProgramSpec(name=name, inputs=tuple(inputs), **declarations)
 
 
+def reference_runtime(
+    dtype=torch.float32,
+    *,
+    master_dtype=torch.float32,
+    sharding_strategy="SHARD_GRAD_OP",
+):
+    """The reference runtime of a draft whose trainable parameters are ``dtype``.
+
+    Its ``precision`` is what an ``FSDPTrainingBackend`` that wraps with FSDP
+    is given. ``master_dtype=None`` declares a plain torch optimizer, which
+    updates the parameters themselves.
+    """
+    from dataclasses import replace
+
+    from specforge.training.contracts import TrainingRuntime
+
+    runtime = TrainingRuntime.resolve(
+        "fsdp", model_dtype=dtype, sharding_strategy=sharding_strategy
+    )
+    return replace(
+        runtime, precision=replace(runtime.precision, master_dtype=master_dtype)
+    )
+
+
 def train_window(runner, batches, ctx=None):
     """Run ``batches`` as one optimizer window and return the update's metrics."""
     from dataclasses import replace
@@ -139,19 +163,26 @@ def train_window(runner, batches, ctx=None):
 
 
 def build_single_rank_distributed(port="29561"):
+    """Make this process a one-rank job once and return its topology.
+
+    When the default group is already up (an earlier call or another test),
+    this returns the one-process topology over that group.
+    """
     import torch.distributed as dist
 
+    from specforge.distributed import Topology, init_distributed
+
     if dist.is_available() and dist.is_initialized():
-        return
+        # Only a one-rank default group matches the one-process topology.
+        assert dist.get_world_size() == 1, "the default group has more than one rank"
+        return Topology(device_type="cuda", world_group=dist.group.WORLD)
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", port)
     torch.cuda.set_device(0)
-    from specforge.distributed import init_distributed
-
-    init_distributed(timeout=10, tp_size=1)
+    return init_distributed(timeout=10, tp_size=1)
 
 
 def init_rank_distributed(
@@ -163,7 +194,7 @@ def init_rank_distributed(
     sp_ring_size=1,
     port="29571",
 ):
-    """Initialize one rank with the canonical target/draft topology.
+    """Initialize one rank with the canonical target/draft topology; return it.
 
     Defaults preserve the world-sized FSDP/DP layout used by the two-rank
     runtime tests. The explicit TP/SP arguments let the numerical parity gate
@@ -178,7 +209,7 @@ def init_rank_distributed(
     torch.cuda.set_device(rank)
     from specforge.distributed import init_distributed
 
-    init_distributed(
+    return init_distributed(
         timeout=60,
         tp_size=tp_size,
         sp_ulysses_size=sp_ulysses_size,
@@ -281,13 +312,41 @@ def build_offline_eagle3_loader(
     )
 
 
-def load_eagle3(
-    config_path, target_dir, vocab_path, *, ttt=3, backend="sdpa", **options
+def load_target_head(
+    target_dir,
+    *,
+    lm_head_key=None,
+    device=None,
+    dtype=torch.bfloat16,
 ):
+    from specforge.checkpoint.target import TargetWeights
+    from specforge.utils import get_local_device
+
+    keys = {"lm_head": lm_head_key} if lm_head_key is not None else None
+    weight = TargetWeights(target_dir, keys=keys).resolve("lm_head").read()
+    head = torch.nn.Linear(weight.shape[1], weight.shape[0], bias=False, dtype=dtype)
+    with torch.no_grad():
+        head.weight.copy_(weight.to(dtype=dtype))
+    head.requires_grad_(False)
+    return head.eval().to(
+        device=get_local_device() if device is None else device, dtype=dtype
+    )
+
+
+def load_eagle3(
+    config_path,
+    target_dir,
+    vocab_path,
+    *,
+    ttt=3,
+    backend="sdpa",
+    topology=None,
+    **options,
+):
+    """The tiny EAGLE3 program; USP takes its groups from ``topology``."""
     from specforge.algorithms.objectives import build_objective_model
     from specforge.config.draft.codec import decode_config
     from specforge.modeling import build_draft_model
-    from specforge.modeling.target.target_head import TargetHead
 
     with open(config_path) as stream:
         config = decode_config(json.load(stream))
@@ -296,15 +355,15 @@ def load_eagle3(
     ).to(device="cuda", dtype=torch.bfloat16)
     draft.vocabulary.load_mapping(**torch.load(vocab_path, weights_only=True))
     draft.embed_tokens.requires_grad_(False)
-    head = TargetHead.from_pretrained(target_dir, lm_head_key="lm_head.weight")
+    head = load_target_head(target_dir, lm_head_key="lm_head.weight")
     sequence_parallel = None
     if backend == "usp":
         from specforge.training.sequence_parallel import sequence_parallel_groups
 
-        sequence_parallel = sequence_parallel_groups()
+        sequence_parallel = sequence_parallel_groups(topology)
     model = build_objective_model(
         draft,
-        target_head=head.fc,
+        target_head=head,
         options=dict(ttt_length=ttt, **options),
         attention_backend=backend,
         sequence_parallel=sequence_parallel,
@@ -396,8 +455,8 @@ def build_block_model(
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
     from specforge.algorithms.objectives import build_objective_model
+    from specforge.checkpoint.target import TargetWeights
     from specforge.modeling import build_draft_model
-    from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
 
     target_config = Qwen3Config(
         hidden_size=hidden,
@@ -426,19 +485,32 @@ def build_block_model(
     draft = build_draft_model(config, backend=attention_backend).to(
         device="cuda", dtype=torch.bfloat16
     )
-    target = TargetEmbeddingsAndHead.from_pretrained(
-        target_dir, lm_head_key="lm_head.weight", device="cuda", dtype=torch.bfloat16
+    target = TargetWeights(target_dir, keys={"lm_head": "lm_head.weight"})
+    embed_weight = (
+        target.resolve("embed_tokens").read().to(device="cuda", dtype=torch.bfloat16)
+    )
+    head_weight = (
+        target.resolve("lm_head").read().to(device="cuda", dtype=torch.bfloat16)
+    )
+    target_head = torch.nn.Linear(
+        head_weight.shape[1],
+        head_weight.shape[0],
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
     )
     with torch.no_grad():
-        draft.embed_tokens.weight.copy_(target.embed_tokens.weight)
-        draft.lm_head.weight.copy_(target.lm_head.weight)
+        draft.embed_tokens.weight.copy_(embed_weight)
+        draft.lm_head.weight.copy_(head_weight)
+        target_head.weight.copy_(head_weight)
     draft.embed_tokens.requires_grad_(False)
     draft.lm_head.requires_grad_(False)
+    target_head.requires_grad_(False).eval()
     if hasattr(draft, "initialize_transfer_space"):
         draft.initialize_transfer_space()
     options = dict(num_anchors=num_anchors)
     model = build_objective_model(
-        draft, target_head=target.lm_head, options=options
+        draft, target_head=target_head, options=options
     ).cuda()
     layers = list(config.spec_config.target_features.target_layer_ids)
     return model, len(layers) * hidden, target_dir, layers
@@ -454,3 +526,116 @@ def build_domino(workdir, **options):
 
 def build_dspark(workdir, **options):
     return build_block_model(workdir, "dspark", **options)[:2]
+
+
+def on_host_fsdp1():
+    """Patch FSDP1 to initialize on CPU (avoids macOS MPS probe in Gloo tests)."""
+    from unittest import mock
+
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    original = FullyShardedDataParallel.__init__
+
+    def _init_on_cpu(self, module, *args, **kwargs):
+        kwargs.setdefault("device_id", torch.device("cpu"))
+        original(self, module, *args, **kwargs)
+
+    return mock.patch.object(FullyShardedDataParallel, "__init__", _init_on_cpu)
+
+
+_SINGLE_RANK_GLOO_SUBGROUPS: dict = {}
+
+
+def gloo_single_rank():
+    """Context manager yielding a single-rank Gloo process group.
+
+    When the default process group is already up (e.g. a single-rank NCCL group
+    reused across CUDA tests in the same ``unittest discover`` process), reuses
+    one Gloo subgroup tied to ``WORLD`` so PyTorch's ``DeviceMesh`` / ``DTensor``
+    dispatch cache never retains a destroyed subgroup handle.
+    """
+    import contextlib
+    import tempfile
+
+    import torch.distributed as dist
+
+    @contextlib.contextmanager
+    def _ctx():
+        if dist.is_initialized():
+            assert (
+                dist.get_world_size() == 1
+            ), "gloo_single_rank requires a single-rank default process group"
+            if dist.get_backend() == "gloo":
+                yield dist.group.WORLD
+                return
+            world_key = id(dist.group.WORLD)
+            group = _SINGLE_RANK_GLOO_SUBGROUPS.get(world_key)
+            if group is None:
+                group = dist.new_group(backend="gloo")
+                _SINGLE_RANK_GLOO_SUBGROUPS[world_key] = group
+            yield group
+            return
+        with tempfile.TemporaryDirectory(prefix="gloo_r1_") as directory:
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{os.path.join(directory, 'store')}",
+                rank=0,
+                world_size=1,
+            )
+            try:
+                yield dist.group.WORLD
+            finally:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+
+    return _ctx()
+
+
+def _gloo_worker_entry(rank, world, store_path, out_dir, report_prefix, worker, args):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=world
+    )
+    try:
+        result = worker(rank, world, out_dir, *args)
+        if result is not None:
+            torch.save(result, os.path.join(out_dir, f"{report_prefix}_{rank}.pt"))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def spawn_gloo(worker, *args, world=2, workdir=None, prefix="gloo_"):
+    """Run ``worker(rank, world, out_dir, *args)`` across ``world`` Gloo ranks.
+
+    Returns a list of per-rank return values (in rank order) when ``worker``
+    returns non-None values. Creates and cleans up a temporary directory unless
+    ``workdir`` is supplied.
+    """
+    import tempfile
+    import uuid
+
+    import torch.multiprocessing as mp
+
+    def _run(directory):
+        tag = f"{worker.__name__}_{uuid.uuid4().hex[:8]}"
+        store = os.path.join(directory, f"store_{tag}")
+        report_prefix = f"_report_{tag}"
+        mp.spawn(
+            _gloo_worker_entry,
+            args=(world, store, directory, report_prefix, worker, args),
+            nprocs=world,
+            join=True,
+        )
+        reports = []
+        for rank in range(world):
+            path = os.path.join(directory, f"{report_prefix}_{rank}.pt")
+            if os.path.exists(path):
+                reports.append(torch.load(path, weights_only=False))
+        return reports
+
+    if workdir is not None:
+        return _run(workdir)
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        return _run(directory)

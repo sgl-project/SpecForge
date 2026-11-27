@@ -253,6 +253,102 @@ class BindingTest(unittest.TestCase):
                 embedding.weight, torch.ones_like(embedding.weight), rtol=0, atol=0
             )
 
+    def test_value_preserving_apply_and_device_transfer_keep_binding(self):
+        source = torch.full((4, 2), 0.9)
+        head = BoundLMHead(
+            MuPLogitTransformSpec(multiplier=3), vocab_size=4, hidden_size=2
+        )
+        head.load_target_weight(source)
+        expected = source / 3
+        scratch = torch.empty_like(expected)
+
+        def copy_out_without_mutating(tensor):
+            scratch.copy_(tensor)
+            return tensor
+
+        for transfer in (
+            lambda: head._apply(lambda t: t.to(t.device, copy=True)),
+            lambda: head._apply(lambda t: t.clone()),
+            lambda: head._apply(copy_out_without_mutating),
+        ):
+            transfer()
+            torch.testing.assert_close(head.bound_weight(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                head(torch.ones(1, 2)),
+                F.linear(torch.ones(1, 2), expected),
+                rtol=0,
+                atol=0,
+            )
+
+        if torch.cuda.is_available():
+            parent = owner()
+            parent_source = torch.randn(16, 8)
+            for bound in (parent.embed_tokens, parent.lm_head):
+                bound.load_target_weight(parent_source)
+            for move, device_type in ((parent.cuda, "cuda"), (parent.cpu, "cpu")):
+                move()
+                for bound in (parent.embed_tokens, parent.lm_head):
+                    self.assertEqual(bound.bound_weight().device.type, device_type)
+                    torch.testing.assert_close(
+                        bound.bound_weight().cpu(), parent_source, rtol=0, atol=0
+                    )
+
+    def test_parent_to_empty_and_destructive_apply_unbind(self):
+        parent = owner()
+        for bound in (parent.embed_tokens, parent.lm_head):
+            bound.load_target_weight(torch.ones(16, 8))
+        parent.to_empty(device="cpu")
+        for bound in (parent.embed_tokens, parent.lm_head):
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                bound.bound_weight()
+
+        source = torch.full((4, 2), 0.9)
+        head = BoundLMHead(
+            MuPLogitTransformSpec(multiplier=3), vocab_size=4, hidden_size=2
+        )
+        for name, callback in (
+            ("zero_", lambda t: t.zero_()),
+            ("out_kwarg", lambda t: torch.add(t, 1.0, out=t)),
+            ("lossy_roundtrip", lambda t: t.bfloat16().float()),
+        ):
+            with self.subTest(callback=name):
+                head.load_target_weight(source)
+                head._apply(callback)
+                with self.assertRaisesRegex(RuntimeError, "not bound"):
+                    head.bound_weight()
+
+    def test_dtensor_apply_preserves_or_unbinds_binding(self):
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+
+        from tests.test_runtime._fixtures import gloo_single_rank
+
+        def bound_sharded_head(mesh):
+            head = BoundLMHead(NoLogitTransformSpec(), vocab_size=4, hidden_size=2)
+            head.load_target_weight(torch.ones(4, 2))
+            head.weight = nn.Parameter(
+                distribute_tensor(head.weight.detach(), mesh, [Shard(0)]),
+                requires_grad=False,
+            )
+            return head
+
+        with gloo_single_rank() as group:
+            mesh = DeviceMesh.from_group(group, "cpu")
+            head = bound_sharded_head(mesh)
+            head.to("cpu")
+            self.assertIs(head.bound_weight(), head.weight)
+            head._apply(lambda t: t.clone())
+            self.assertIs(head.bound_weight(), head.weight)
+
+            head._apply(lambda t: t.redistribute(placements=[Replicate()]))
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                head.bound_weight()
+
+            head = bound_sharded_head(mesh)
+            head.to_empty(device="cpu")
+            with self.assertRaisesRegex(RuntimeError, "not bound"):
+                head.bound_weight()
+
 
 if __name__ == "__main__":
     unittest.main()

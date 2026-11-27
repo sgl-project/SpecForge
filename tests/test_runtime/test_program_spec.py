@@ -19,6 +19,7 @@ from specforge.training.contracts import PartitionHints, ProgramSpec
 from specforge.training.program import program_spec
 from tests.test_algorithms.test_objective_contracts import build_runtime
 from tests.test_algorithms.test_objectives import configurations
+from tests.test_runtime._fixtures import reference_runtime
 from tests.test_runtime.test_canonical_end_to_end import (
     build,
     drafts,
@@ -76,6 +77,7 @@ class ProgramSpecTest(unittest.TestCase):
         # A block draft is sharded per decoder layer; EAGLE is one unit.
         self.assertEqual(specs["DFlashDraftModel"].partition.blocks, ("DecoderLayer",))
         self.assertEqual(specs["Eagle3DraftModel"].partition.blocks, ())
+        self.assertEqual(specs["Eagle3DraftModel"].axes, ())
         # In one order on every rank, whatever order the draft holds them in.
         _, peagle = build_runtime("PEagleDraftModel")
         for held in (
@@ -103,6 +105,73 @@ class ProgramSpecTest(unittest.TestCase):
         runtime.registration = None
         with self.assertRaisesRegex(ValueError, "without a registration"):
             program_spec(runtime)
+
+    def test_sequence_parallel_program_declares_part_axis(self):
+        from types import SimpleNamespace
+
+        from specforge.training.sequence_parallel import SequenceParallel
+
+        group = SimpleNamespace(size=lambda: 2)
+        _, runtime = build_runtime(
+            "Eagle3DraftModel",
+            attention_backend="usp",
+            sequence_parallel=SequenceParallel(group, group, group),
+        )
+        spec = program_spec(runtime)
+        self.assertEqual(spec.axes, (("sequence", "part"),))
+        # A value: it hashes, as every other declaration does.
+        self.assertEqual(hash(spec), hash(program_spec(runtime)))
+
+    def test_after_step_statistics_declaration_and_overlap_refusal(self):
+        from dataclasses import replace
+
+        from specforge.algorithms.objectives.registry import (
+            TrainingRequirements,
+            WindowStatistic,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be distinct"):
+            ProgramSpec(
+                name="dup",
+                inputs=("x",),
+                replay_statistics=("s",),
+                after_step_statistics=("s",),
+            )
+        with self.assertRaisesRegex(ValueError, "both a replay window_statistic"):
+            TrainingRequirements(
+                window_statistic=WindowStatistic("r", "s"),
+                after_step_statistics=("s",),
+            )
+        _, runtime = build_runtime("DFlashDraftModel")
+
+        class Receiving:
+            def apply_statistics(self, model, values):
+                return {}
+
+        def declared(*names):
+            return ObjectiveModel(
+                runtime.draft_model,
+                Receiving(),
+                registration=replace(
+                    runtime.registration,
+                    training=replace(
+                        runtime.registration.training,
+                        after_step_statistics=("proto_stat",),
+                    ),
+                ),
+                name=runtime.objective_name,
+                loss_configuration=runtime.loss_configuration,
+                after_step_statistics=names,
+            )
+
+        # The registration's, then the model's own.
+        self.assertEqual(
+            program_spec(declared("moe_expert_counts")).after_step_statistics,
+            ("proto_stat", "moe_expert_counts"),
+        )
+        # One name from both sources is a mistake, not a merge.
+        with self.assertRaisesRegex(ValueError, "declared more than once"):
+            declared("moe_expert_counts", "proto_stat")
 
 
 class FrozenModulesTest(unittest.TestCase):
@@ -172,9 +241,13 @@ class FrozenModulesTest(unittest.TestCase):
             pass
 
         model = nn.Sequential(Block(2, 2), nn.Linear(2, 2), nn.Embedding(4, 2))
+        model.to(torch.bfloat16)
         table = model[2]
         table.requires_grad_(False)
-        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="SHARD_GRAD_OP"))
+        spec = reference_runtime(torch.bfloat16).precision
+        backend = FSDPTrainingBackend(
+            ParallelConfig(sharding_strategy="SHARD_GRAD_OP"), precision=spec
+        )
         with patch(
             "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
         ) as wrapper:
@@ -187,12 +260,20 @@ class FrozenModulesTest(unittest.TestCase):
         )
         self.assertEqual(backend.ignored_frozen_modules, (table,))
         self.assertEqual(backend.auto_wrap_block_classes, {Block})
+        # The run's precision is what the wrapper computes and reduces in.
+        precision = arguments["mixed_precision"]
+        self.assertEqual(precision.param_dtype, spec.compute_dtype)
+        self.assertEqual(precision.reduce_dtype, spec.gradient_dtype)
+        # The program receives its inputs as placed, as under DDP: the wrapper
+        # casts parameters, never the program's tensors.
+        self.assertFalse(precision.cast_root_forward_inputs)
+        self.assertFalse(precision.cast_forward_inputs)
         # Without declarations: nothing ignored, one root unit.
         with patch(
             "torch.distributed.fsdp.FullyShardedDataParallel", return_value=model
         ) as wrapper:
             FSDPTrainingBackend(
-                ParallelConfig(sharding_strategy="SHARD_GRAD_OP")
+                ParallelConfig(sharding_strategy="SHARD_GRAD_OP"), precision=spec
             ).prepare_model(model)
         self.assertNotIn("ignored_modules", wrapper.call_args.kwargs)
         self.assertNotIn("auto_wrap_policy", wrapper.call_args.kwargs)
@@ -221,7 +302,10 @@ class FrozenModulesTest(unittest.TestCase):
             pass
 
         model = nn.Sequential(Block(2, 2), nn.Linear(2, 2))
-        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="SHARD_GRAD_OP"))
+        backend = FSDPTrainingBackend(
+            ParallelConfig(sharding_strategy="SHARD_GRAD_OP"),
+            precision=reference_runtime().precision,
+        )
         with self.assertRaisesRegex(ValueError, r"\['Blocks'\] name no module class"):
             backend.prepare_model(model, blocks=("Blocks",))
         # A draft class may name a block that only some of its models hold.
@@ -282,7 +366,9 @@ def sharded_rank(rank, directory):
             "blocks": elements(blocks),
         }
         backend = FSDPTrainingBackend(
-            ParallelConfig(world_size=2, sharding_strategy="SHARD_GRAD_OP")
+            ParallelConfig(world_size=2, sharding_strategy="SHARD_GRAD_OP"),
+            # No optimizer is built here: nothing keeps masters.
+            precision=reference_runtime(master_dtype=None).precision,
         )
         wrapped = backend.prepare_model(
             program,

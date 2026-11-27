@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from .base import ObjectiveModel, SequenceParallelGroups
+from .base import ObjectiveModel, SequenceParallelGroups, validate_anchor_sampling
 from .configuration import (
     LossConfiguration,
     loss_definitions,
@@ -50,6 +50,10 @@ class TrainingRequirements:
     supports_sequence_parallel: bool = False
     attention_backends: frozenset[str] = frozenset({"eager", "sdpa", "flex_attention"})
     window_statistic: WindowStatistic | None = None
+    #: Additive statistics returned in ``ObjectiveResult.statistics`` on every
+    #: training forward, summed over the window and all data-parallel ranks and
+    #: delivered to ``apply_statistics`` after the optimizer update succeeds.
+    after_step_statistics: tuple[str, ...] = ()
     host_inputs: Callable | None = (
         None  # (batch tensors, draft config) -> extra tensors
     )
@@ -68,10 +72,35 @@ class TrainingRequirements:
     #: denominator over the ranks of each micro-batch (the protocol's batches
     #: use the "global_microbatch" reduction).
     reduction: str = "window"
+    #: Whether the objective samples block anchors (``prepare_blocks``); only
+    #: such an objective can have its anchors drawn on the host.
+    samples_anchors: bool = False
+    #: Uniform numbers the objective draws per anchor besides the anchors
+    #: (DSpine's replacement draw); a host draw provides them with the anchors.
+    draws_per_anchor: int = 0
 
     def __post_init__(self):
         if self.reduction not in ("window", "microbatch"):
             raise ValueError(f"unknown reduction: {self.reduction!r}")
+        if self.draws_per_anchor and not self.samples_anchors:
+            raise ValueError("draws_per_anchor needs an objective that samples anchors")
+        if len(set(self.after_step_statistics)) != len(self.after_step_statistics):
+            raise ValueError(
+                f"duplicate after_step_statistics: {self.after_step_statistics!r}"
+            )
+        if any(not isinstance(n, str) or not n for n in self.after_step_statistics):
+            raise ValueError(
+                "after_step_statistics entries must be non-empty strings, got "
+                f"{self.after_step_statistics!r}"
+            )
+        if (
+            self.window_statistic is not None
+            and self.window_statistic.argument_name in self.after_step_statistics
+        ):
+            raise ValueError(
+                f"statistic {self.window_statistic.argument_name!r} cannot be both "
+                "a replay window_statistic and an after_step statistic"
+            )
 
 
 @dataclass(frozen=True)
@@ -305,6 +334,8 @@ def build_objective_model(
     frozen_modules=(),
     attention_backend=None,
     sequence_parallel: Optional[SequenceParallelGroups] = None,
+    anchor_sampling="device",
+    anchor_seed=None,
 ):
     """Compose a draft model with its objective and selected loss execution.
 
@@ -326,6 +357,11 @@ def build_objective_model(
             (the ring group, the Ulysses group and their product, over which
             loss statistics of one sequence are reduced). Given with the
             ``usp`` backend and with no other.
+        anchor_sampling: "device" draws block anchors in the forward from the
+            global generator; "host" draws them before placement from
+            (anchor_seed, sample id, epoch). Only an objective that samples
+            anchors accepts "host".
+        anchor_seed: The run's seed for host-drawn anchors.
 
     Returns:
         ObjectiveModel wrapping the existing draft and optional teacher head.
@@ -344,6 +380,8 @@ def build_objective_model(
         weighting=weighting,
     )
     name, entry, objective = resolved.name, resolved.registration, resolved.objective
+    # Before anything below changes the supplied draft (freezing).
+    validate_anchor_sampling(name, entry.training, anchor_sampling, anchor_seed)
     if (
         attention_backend is not None
         and attention_backend not in entry.training.attention_backends
@@ -433,6 +471,8 @@ def build_objective_model(
         frozen_modules=frozen_modules,
         attention_backend=attention_backend,
         sequence_parallel=sequence_parallel,
+        anchor_sampling=anchor_sampling,
+        anchor_seed=anchor_seed,
     )
 
 

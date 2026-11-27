@@ -34,7 +34,7 @@ def _optimizer_factory(module):
 @unittest.skipUnless(CUDA, "trainer-boundary parity requires CUDA")
 class TestEquivTrainerSplit(unittest.TestCase):
     def test_trainer_fit_matches_direct_runner_step(self):
-        fx.build_single_rank_distributed(port="29562")
+        topology = fx.build_single_rank_distributed(port="29562")
         from specforge.launch import build_offline_runtime
         from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
         from tests.test_algorithms.fixtures import builtin_algorithm_registry
@@ -62,11 +62,13 @@ class TestEquivTrainerSplit(unittest.TestCase):
 
                 logged = []
                 trainer = build_offline_runtime(
+                    topology=topology,
                     algorithm=algorithm,
                     hidden_states_path=feature_dir,
                     draft_model=fit_model,
                     target_head=fit_head,
                     optimizer_factory=_optimizer_factory,
+                    runtime=fx.reference_runtime(torch.bfloat16),
                     run_id="fit-path",
                     output_dir=os.path.join(work, "fit-output"),
                     ttt_length=3,
@@ -78,8 +80,9 @@ class TestEquivTrainerSplit(unittest.TestCase):
                 )
 
                 backend = FSDPTrainingBackend(
-                    ParallelConfig.from_distributed(),
+                    ParallelConfig.from_topology(topology),
                     optimizer_factory=_optimizer_factory,
+                    precision=fx.reference_runtime(torch.bfloat16).precision,
                 )
                 wrapped = backend.prepare_model(
                     runner_model,

@@ -15,7 +15,8 @@ class ObjectiveResult:
     ratios: dict[str, tuple[Tensor, Tensor]] = field(default_factory=dict)
     sums: dict[str, Tensor] = field(default_factory=dict)
     #: This rank's sums of each statistic the objective needs pooled over a
-    #: window, by name; filled by a prepass only.
+    #: window, by name: replay statistics in a prepass, or declared
+    #: ``after_step_statistics`` in a training forward.
     statistics: dict[str, Tensor] = field(default_factory=dict)
     #: Under the ``microbatch`` reduction, in training: every loss term as
     #: ``(coefficient, numerator, denominator)``, the last two this rank's.
@@ -56,6 +57,35 @@ class SequenceParallelGroups(Protocol):
         """Sum detached loss statistics over the ranks of one sequence."""
 
 
+def validate_anchor_sampling(name, training, anchor_sampling, anchor_seed):
+    """Refuse an anchor sampling an objective cannot honour, before any work.
+
+    Args:
+        name: The objective's name, for messages.
+        training: Its ``TrainingRequirements``.
+        anchor_sampling: "device" or "host".
+        anchor_seed: The run's seed for host draws.
+    """
+    if anchor_sampling not in ("device", "host"):
+        raise ValueError(f"unknown anchor_sampling: {anchor_sampling!r}")
+    if anchor_sampling == "device":
+        return
+    if not training.samples_anchors:
+        raise ValueError(
+            f"objective {name!r} samples no block anchors; "
+            "anchor_sampling='host' applies to block objectives only"
+        )
+    from .inputs import prepare_anchor_capacity
+
+    if training.host_inputs not in (None, prepare_anchor_capacity):
+        raise ValueError(
+            f"objective {name!r} derives host inputs besides the anchor capacity; "
+            "host-drawn anchors would replace them"
+        )
+    if anchor_seed is None:
+        raise ValueError("anchor_sampling='host' needs the run's anchor_seed")
+
+
 class ObjectiveModel(nn.Module):
     """One wrapped forward includes the draft and every differentiable loss path.
 
@@ -78,6 +108,9 @@ class ObjectiveModel(nn.Module):
         frozen_modules=(),
         attention_backend=None,
         sequence_parallel: Optional[SequenceParallelGroups] = None,
+        anchor_sampling="device",
+        anchor_seed=None,
+        after_step_statistics=(),
     ):
         super().__init__()
         from .execution_options import LossExecution
@@ -107,11 +140,32 @@ class ObjectiveModel(nn.Module):
             raise ValueError(
                 f"frozen_modules holds modules this model does not: {strangers}"
             )
+        # Additive statistics emitted on training forwards and delivered after
+        # the optimizer update succeeds (e.g. MoE expert counts for bias updates).
+        declared_after_step = (
+            registration.training.after_step_statistics
+            if registration is not None
+            else ()
+        )
+        names = (*declared_after_step, *after_step_statistics)
+        if len(set(names)) != len(names):
+            raise ValueError(f"after_step_statistics declared more than once: {names}")
+        if names and not hasattr(objective, "apply_statistics"):
+            raise TypeError(
+                f"objective {name!r} declares after_step_statistics {names} and "
+                "defines no apply_statistics to receive them"
+            )
+        self.after_step_statistics = names
         # The attention backend the run trains with, and the process groups of
         # its sequence-parallel axis when it has one. A protocol that takes
         # either reads it here; both are fixed for the model's lifetime.
         self.attention_backend = attention_backend
         self.sequence_parallel = sequence_parallel
+        # Where block anchors are drawn: "device" from the global generator in
+        # the forward, "host" before placement from (anchor_seed, sample id,
+        # epoch). Also fixed for the model's lifetime.
+        self.anchor_sampling = anchor_sampling
+        self.anchor_seed = anchor_seed
         if target_head is not None:
             target_head.requires_grad_(False)
             target_head.eval()
@@ -261,12 +315,34 @@ class ObjectiveModel(nn.Module):
             **options,
         )
 
-    def host_inputs(self, tensors):
-        """Extra batch tensors the objective derives on the host, before placement."""
-        prepare = self.registration.training.host_inputs if self.registration else None
-        if prepare is None:
-            return {}
-        return prepare(tensors, self.draft_model.config.draft)
+    def host_inputs(self, tensors, *, sample_ids, epoch):
+        """Extra batch tensors the objective derives on the host, before placement.
+
+        Args:
+            tensors: The batch tensors, on the host.
+            sample_ids: The batch's sample ids, one per row.
+            epoch: The epoch the batch belongs to.
+        """
+        training = self.registration.training if self.registration else None
+        if self.anchor_sampling == "host":
+            # The anchors replace the anchor capacity, the only host input an
+            # objective that samples anchors has (``validate_anchor_sampling``).
+            from .inputs import host_anchor_inputs
+
+            if epoch is None:
+                raise ValueError("host-drawn anchors need the batch's epoch")
+            return host_anchor_inputs(
+                tensors,
+                num_anchors=self.objective.num_anchors,
+                seed=self.anchor_seed,
+                sample_ids=sample_ids,
+                epoch=epoch,
+                draws_per_anchor=training.draws_per_anchor,
+            )
+        prepare = training.host_inputs if training else None
+        return (
+            {} if prepare is None else prepare(tensors, self.draft_model.config.draft)
+        )
 
     def kernel_record(self):
         """The loss kernels resolved so far, by the group they compute."""
@@ -298,9 +374,9 @@ class ObjectiveModel(nn.Module):
         denominator and detached. Otherwise None: the objective then uses the
         batch's own value. Empty for an objective without a statistic.
 
-        A runner calls this outside its wrapper and passes the result through
-        it, so the division is done in the precision the sums were pooled in
-        and a wrapper that casts the forward's inputs casts the value.
+        A runner calls this outside its wrapper so the division runs in the
+        precision the sums were pooled in, and hands the result to forward
+        uncast.
 
         Args:
             replay_values: The pooled sums by statistic name; empty outside a
@@ -322,6 +398,16 @@ class ObjectiveModel(nn.Module):
             value = None
         return {statistic.argument_name: value}
 
+    def apply_statistics(self, values):
+        """Apply pooled after-step statistics once an optimizer update succeeds.
+
+        Delegates to ``self.objective.apply_statistics(self, values)``; a
+        model that declares after-step statistics is built with an objective
+        that defines it. Issues no collective; every rank computes identical
+        buffer updates before any checkpoint snapshot.
+        """
+        return self.objective.apply_statistics(self, values)
+
     def forward(self, batch, *, step, total_steps, prepass=False, **context):
         """Run the objective on one batch.
 
@@ -340,6 +426,18 @@ class ObjectiveModel(nn.Module):
             self.registration.training.window_statistic if self.registration else None
         )
         valid_tokens(batch)
+        if self.anchor_sampling == "host":
+            missing = {"anchors", "anchor_keep"} | (
+                {"anchor_draws"}
+                if self.registration.training.draws_per_anchor
+                else set()
+            )
+            missing -= batch.keys()
+            if missing:
+                raise ValueError(
+                    f"this model draws anchors on the host; the batch lacks "
+                    f"{sorted(missing)}: pass it through host_inputs first"
+                )
         # Detach capture tensors centrally, including offline MTP features.
         batch = {
             key: value.detach() if isinstance(value, Tensor) else value
