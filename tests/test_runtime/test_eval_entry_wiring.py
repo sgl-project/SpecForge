@@ -152,8 +152,8 @@ class TestEvalLaunch(unittest.TestCase):
                 dataloader_num_workers=3,
             )
 
-        first = factory()
-        second = factory()
+        first = factory().loader
+        second = factory().loader
         self.assertIsNot(first, second)
         self.assertIs(first.store, store)
         self.assertEqual(first._refs, refs)
@@ -170,6 +170,58 @@ class TestEvalLaunch(unittest.TestCase):
                 )
             ],
         )
+
+    def test_eval_shards_count_every_sample_once(self):
+        from specforge.launch import _EVAL_PADDING_SUFFIX, _shard_eval_refs
+        from specforge.runtime.contracts import SampleRef
+
+        refs = [
+            SampleRef(
+                sample_id=f"s{index}",
+                run_id="run-eval",
+                source_task_id=None,
+                feature_store_uri=f"file:///eval/{index}.ckpt",
+                feature_keys={},
+                feature_specs={},
+                strategy="dflash",
+            )
+            for index in range(5)
+        ]
+        for dp_size in (1, 2, 3, 4, 8):
+            with self.subTest(dp_size=dp_size):
+                shards = [
+                    _shard_eval_refs(
+                        refs,
+                        topology=Topology(rank=rank, world_size=dp_size, dp_rank=rank),
+                        use_usp_preprocess=False,
+                    )
+                    for rank in range(dp_size)
+                ]
+                # Even shards, so every rank runs the same eval batches.
+                self.assertEqual(len({len(shard) for shard in shards}), 1)
+                counted = sorted(
+                    ref.sample_id
+                    for shard in shards
+                    for ref in shard
+                    if not ref.sample_id.endswith(_EVAL_PADDING_SUFFIX)
+                )
+                self.assertEqual(counted, [ref.sample_id for ref in refs])
+
+    def test_eval_loader_drops_the_supervision_of_padding_copies(self):
+        import torch
+
+        from specforge.launch import _EVAL_PADDING_SUFFIX, _PaddingMaskedLoader
+        from specforge.runtime.contracts import TrainBatch
+
+        loss_mask = torch.ones(2, 3, dtype=torch.long)
+        batch = TrainBatch(
+            sample_ids=["s0", "s1" + _EVAL_PADDING_SUFFIX],
+            strategy="dflash",
+            tensors={"loss_mask": loss_mask},
+        )
+        (seen,) = list(_PaddingMaskedLoader([batch]))
+        self.assertEqual(seen.tensors["loss_mask"].tolist(), [[1, 1, 1], [0, 0, 0]])
+        self.assertEqual(loss_mask.tolist(), [[1, 1, 1], [1, 1, 1]])
 
     def test_offline_builder_passes_eval_factory_to_the_one_trainer(self):
         from specforge.launch import build_offline_runtime

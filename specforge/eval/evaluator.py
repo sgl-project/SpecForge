@@ -42,6 +42,12 @@ class Evaluator:
     ``eval/avg_acc``: for an objective that reports ``acc_<depth>`` pairs,
     position-0 accuracy from eval-set-wide correct/denom counts; otherwise the
     eval-set-wide ratio of its ``acc`` pair.
+
+    ``eval/simulated_acc_len``: expected accepted draft tokens per chain, the
+    bonus token excluded. From ``acc_<depth>`` pairs it is
+    ``a0 + a0*a1 + ...``; otherwise the eval-set-wide ratio of the
+    ``accepted_draft_tokens`` pair. An objective that reports neither (its
+    chains span prediction units, as P-EAGLE's do) gets no value.
     """
 
     def run(
@@ -63,7 +69,8 @@ class Evaluator:
         # pp rows: [correct, denom, acceptance_rate*w, ploss*w] per TTT
         # position, float64 so counts stay exact past 2**24.
         pp = None
-        # [loss*w, w, scalar_acc*denom, scalar_denom, n_batches, ar_w, pl_w]
+        # [loss*w, w, scalar_acc*denom, scalar_denom, n_batches, ar_w, pl_w,
+        #  accepted draft tokens, chains]
         sums = None
 
         # Entered on every rank, with or without batches of its own.
@@ -72,7 +79,7 @@ class Evaluator:
                 result = runner.evaluate(batch, ctx)
                 if sums is None:
                     sums = torch.zeros(
-                        7, dtype=torch.float64, device=result.numerator.device
+                        9, dtype=torch.float64, device=result.numerator.device
                     )
                 sums[0] += self._sum64(result.numerator, sums.device)
                 sums[1] += self._sum64(result.denominator, sums.device)
@@ -109,13 +116,17 @@ class Evaluator:
                     accuracy_numerator, accuracy_denominator = result.ratios["acc"]
                     sums[2] += self._sum64(accuracy_numerator, sums.device)
                     sums[3] += self._sum64(accuracy_denominator, sums.device)
+                    if "accepted_draft_tokens" in result.ratios:
+                        accepted, chains = result.ratios["accepted_draft_tokens"]
+                        sums[7] += self._sum64(accepted, sums.device)
+                        sums[8] += self._sum64(chains, sums.device)
 
         # Fixed global schedule, identical on every rank: (1) SUM the scalar
         # sums, (2) MAX the per-position length — a global decision, so an
         # empty shard still participates — (3) SUM one padded count buffer iff
         # any rank has per-position data.
         sums = runner.reduce_sum(
-            sums if sums is not None else torch.zeros(7, dtype=torch.float64)
+            sums if sums is not None else torch.zeros(9, dtype=torch.float64)
         )
         local_len = pp.size(1) if pp is not None else 0
         global_len = int(
@@ -132,7 +143,9 @@ class Evaluator:
             # would poison best-checkpoint tracking.
             return {}
 
-        loss_x_w, loss_w, acc_sum, acc_w, _n, ar_w, pl_w = sums.tolist()
+        loss_x_w, loss_w, acc_sum, acc_w, _n, ar_w, pl_w, accepted, chains = (
+            sums.tolist()
+        )
         avg_loss = loss_x_w / max(loss_w, 1.0)
 
         if pp is not None:
@@ -153,12 +166,13 @@ class Evaluator:
                     metrics[f"eval/ploss_{i}"] = v
             return metrics
 
-        avg_acc = acc_sum / acc_w if acc_w else 0.0
-        return {
+        metrics = {
             "eval/avg_loss": avg_loss,
-            "eval/avg_acc": avg_acc,
-            "eval/simulated_acc_len": avg_acc,
+            "eval/avg_acc": acc_sum / acc_w if acc_w else 0.0,
         }
+        if chains:
+            metrics["eval/simulated_acc_len"] = accepted / chains
+        return metrics
 
     @staticmethod
     def _stack(values: Iterable[Any]) -> torch.Tensor:

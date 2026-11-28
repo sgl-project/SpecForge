@@ -102,9 +102,43 @@ def _additive_scalar_result(loss_num, loss_den, accuracy_num, accuracy_den):
     )
 
 
+def _chain_result(hits):
+    """A block-shaped result: one fully supervised chain per row of ``hits``."""
+    from specforge.algorithms.objectives.execution import accepted_draft_tokens
+
+    hit = torch.tensor(hits, dtype=torch.bool)
+    supervised = torch.ones_like(hit)
+    return ObjectiveResult(
+        torch.tensor(1.0),
+        torch.tensor(1.0),
+        ratios={
+            "acc": (hit.sum().float(), supervised.sum().float()),
+            "accepted_draft_tokens": accepted_draft_tokens(
+                hit, supervised, torch.ones(hit.shape[1], dtype=torch.bool)
+            ),
+        },
+    )
+
+
 class TestEvaluatorAggregation(unittest.TestCase):
     def _run(self, results):
         return _evaluate(results)
+
+    def test_scalar_acceptance_length_is_the_greedy_prefix(self):
+        # Token accuracy ranks these two drafts the other way round: the
+        # verifier rejects the first at its first token.
+        late = _evaluate([_chain_result([[False, True, True, True]])])
+        early = _evaluate([_chain_result([[True, True, False, False]])])
+        self.assertEqual((late["eval/avg_acc"], early["eval/avg_acc"]), (0.75, 0.5))
+        self.assertEqual(late["eval/simulated_acc_len"], 0.0)
+        self.assertEqual(early["eval/simulated_acc_len"], 2.0)
+
+    def test_scalar_acceptance_length_pools_chains_over_batches(self):
+        hits = [[True, False, True], [True, True, True], [False, True, True]]
+        split = _evaluate([_chain_result([row]) for row in hits])
+        combined = _evaluate([_chain_result(hits)])
+        self.assertEqual(split, combined)
+        self.assertEqual(split["eval/simulated_acc_len"], 4 / 3)
 
     def test_aggregates_counts_before_geometric_sum(self):
         # pos0: (3+1)/(4+1)=0.8 ; pos1: (2+0)/(4+1)=0.4  -- NOT the mean of ratios.
@@ -173,7 +207,8 @@ class TestEvaluatorAggregation(unittest.TestCase):
         ]
         m = _evaluate(results)
         self.assertAlmostEqual(m["eval/avg_acc"], 0.6, places=6)
-        self.assertAlmostEqual(m["eval/simulated_acc_len"], 0.6, places=6)
+        # Without chain counts there is no acceptance length to report.
+        self.assertNotIn("eval/simulated_acc_len", m)
 
     def test_scalar_accuracy_weighted_by_accuracy_denom(self):
         # Realistic DFlash shapes: the accuracy denominator (anchor-block eval
@@ -188,7 +223,6 @@ class TestEvaluatorAggregation(unittest.TestCase):
         for results in (split, combined):
             m = _evaluate(results)
             self.assertAlmostEqual(m["eval/avg_acc"], 4 / 6, places=6)
-            self.assertAlmostEqual(m["eval/simulated_acc_len"], 4 / 6, places=6)
             # loss-token weighting would skew to (0.75*10 + 0.5*50)/60 ~ 0.542
             self.assertNotAlmostEqual(m["eval/avg_acc"], 32.5 / 60, places=2)
 

@@ -97,6 +97,7 @@ class MTPObjective:
             # one proposal per position: no depth for position weights to act on
             positions=torch.zeros_like(positions),
             chain_ids=torch.arange(positions.numel(), device=ids.device).reshape(-1, 1),
+            acceptance_slots=torch.ones(1, dtype=torch.bool, device=ids.device),
         )
         rows = batch.get("mtp_supervised_rows")
         if rows is None:

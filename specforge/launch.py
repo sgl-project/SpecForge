@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, List, Mapping, Optional, Tuple
 
 from specforge.algorithms.registry import AlgorithmRegistration
@@ -191,6 +192,17 @@ def _offline_io(
     )
 
 
+def _data_dp_layout(topology: Topology, use_usp_preprocess: bool):
+    """The (rank, size) the data is sharded over: draft-DP under USP, else DP."""
+    if use_usp_preprocess:
+        dp_rank, dp_size = topology.draft_dp_rank, topology.draft_dp_size
+    else:
+        dp_rank, dp_size = topology.dp_rank, topology.dp_size
+    if dp_size < 1 or not 0 <= dp_rank < dp_size:
+        raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
+    return dp_rank, dp_size
+
+
 def _shard_offline_refs(
     refs,
     *,
@@ -210,12 +222,7 @@ def _shard_offline_refs(
     seek, exactly like the legacy ``DistributedSampler.set_epoch`` lifecycle.
     """
     refs = list(refs)
-    if use_usp_preprocess:
-        dp_rank, dp_size = topology.draft_dp_rank, topology.draft_dp_size
-    else:
-        dp_rank, dp_size = topology.dp_rank, topology.dp_size
-    if dp_size < 1 or not 0 <= dp_rank < dp_size:
-        raise ValueError(f"invalid data-DP layout rank={dp_rank}, size={dp_size}")
+    dp_rank, dp_size = _data_dp_layout(topology, use_usp_preprocess)
     indices = _distributed_sampler_indices(
         len(refs),
         dp_rank=dp_rank,
@@ -280,24 +287,74 @@ def _make_offline_eval_data_factory(
         ttt_length=ttt_length,
         max_len=max_len,
     ).read()
-    refs = _shard_offline_refs(
-        refs, topology=topology, use_usp_preprocess=use_usp_preprocess, shuffle=False
+    refs = _shard_eval_refs(
+        refs, topology=topology, use_usp_preprocess=use_usp_preprocess
     )
     store = LocalFeatureStore(eval_run_id)
 
     def build_loader():
-        return FeatureDataLoader(
-            store,
-            refs=refs,
-            batch_size=batch_size,
-            collate_fn=collate_fn,
-            per_sample_transform=per_sample_transform,
-            drop_last=False,
-            strategy=algorithm.name,
-            num_workers=dataloader_num_workers,
+        return _PaddingMaskedLoader(
+            FeatureDataLoader(
+                store,
+                refs=refs,
+                batch_size=batch_size,
+                collate_fn=collate_fn,
+                per_sample_transform=per_sample_transform,
+                drop_last=False,
+                strategy=algorithm.name,
+                num_workers=dataloader_num_workers,
+            )
         )
 
     return build_loader
+
+
+_EVAL_PADDING_SUFFIX = "#eval-padding"
+
+
+def _shard_eval_refs(refs, *, topology: Topology, use_usp_preprocess: bool):
+    """Shard eval refs in order, marking the copies that even out the shards.
+
+    Every rank needs the same number of eval batches (an FSDP forward is
+    collective), so the copies stay but carry ``_EVAL_PADDING_SUFFIX``, and
+    the loader drops their supervision.
+    """
+    refs = list(refs)
+    dp_rank, dp_size = _data_dp_layout(topology, use_usp_preprocess)
+    shard = _shard_offline_refs(
+        refs, topology=topology, use_usp_preprocess=use_usp_preprocess, shuffle=False
+    )
+    # unshuffled: shard position k is global index dp_rank + k * dp_size
+    return [
+        (
+            replace(ref, sample_id=ref.sample_id + _EVAL_PADDING_SUFFIX)
+            if dp_rank + k * dp_size >= len(refs)
+            else ref
+        )
+        for k, ref in enumerate(shard)
+    ]
+
+
+class _PaddingMaskedLoader:
+    """Yields the eval loader's batches with the padding copies' loss mask zeroed."""
+
+    def __init__(self, loader):
+        self.loader = loader
+
+    def __iter__(self):
+        for batch in self.loader:
+            padding = [
+                row
+                for row, sample_id in enumerate(batch.sample_ids)
+                if sample_id.endswith(_EVAL_PADDING_SUFFIX)
+            ]
+            if padding:
+                loss_mask = batch.tensors["loss_mask"].clone()
+                loss_mask[padding] = 0
+                batch = replace(
+                    batch, tensors={**batch.tensors, "loss_mask": loss_mask}
+                )
+            yield batch
 
 
 def _streaming_collate(

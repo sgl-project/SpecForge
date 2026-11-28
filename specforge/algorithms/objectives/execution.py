@@ -236,12 +236,17 @@ def evaluate_predictions(
     if p.draft_to_target is not None:
         prediction = prediction + p.draft_to_target[prediction]
         target, metric_weights = projected.teacher_ids, p.mask
+    hit = prediction == target
     accuracy = (
-        ((prediction == target) * metric_weights).sum().detach(),
+        (hit * metric_weights).sum().detach(),
         metric_weights.sum().detach(),
     )
     # a set under its own name also counts toward the pooled accuracy
     ratios[p.accuracy_name] = ratios["acc"] = accuracy
+    if p.acceptance_slots is not None:
+        ratios["accepted_draft_tokens"] = accepted_draft_tokens(
+            hit, metric_weights > 0, p.acceptance_slots
+        )
     terms = tuple(
         ObjectiveResult(numerators[i], item.denominator)
         for i, item in enumerate(inputs)
@@ -250,6 +255,29 @@ def evaluate_predictions(
     return PlanResult(
         terms, coefficients, p.plan.shared_reduction, ratios, computation.partials
     )
+
+
+@torch.no_grad()
+def accepted_draft_tokens(hit, supervised, slots):
+    """Greedy accepted draft tokens over chains that are one unit each.
+
+    A chain accepts its ``slots`` in order up to the first slot that is missed
+    or unsupervised; the unit's other slots are skipped.
+
+    Args:
+        hit: Bool [units, positions], the draft's token equals the target.
+        supervised: Bool [units, positions], the position carries supervision.
+        slots: Bool [positions], the unit's chain slots.
+
+    Returns:
+        A ratio pair: the accepted tokens summed over the chains with a
+        supervised slot, and the number of those chains.
+    """
+    in_chain = slots.expand_as(hit)
+    alive = (hit & supervised) | ~in_chain
+    accepted = (alive.long().cumprod(-1) * in_chain).sum(-1)
+    chains = (supervised & in_chain).any(-1)
+    return (accepted * chains).sum().float(), chains.sum().float()
 
 
 @dataclass

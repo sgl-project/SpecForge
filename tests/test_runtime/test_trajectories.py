@@ -137,6 +137,23 @@ class TrajectoryTest(unittest.TestCase):
                         self.first[full.name][0]["evaluated"][0]["eval/avg_loss"],
                     )
 
+    def test_evaluation_leaves_the_training_as_it_was(self):
+        # Losses, weights, optimizer, RNG and data position of every update,
+        # bit for bit, against the same run without evaluation.
+        twins = 0
+        for case in self.cases:
+            twin = replace(case, evaluated=False, empty_eval_rank=None)
+            if not case.evaluated or twin.name not in self.first:
+                continue
+            twins += 1
+            with self.subTest(case=case.name):
+                trained = [
+                    [{**update, "evaluated": None} for update in self.first[name]]
+                    for name in (case.name, twin.name)
+                ]
+                self.assertEqual(differences(*trained), [])
+        self.assertTrue(twins)
+
     def test_runs_warm_up(self):
         """A schedule without its warmup would otherwise record the same rates."""
         for case in self.cases:

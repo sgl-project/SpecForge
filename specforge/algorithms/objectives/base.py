@@ -303,6 +303,10 @@ class ObjectiveModel(nn.Module):
         """
         protocol = self.draft_model.config.draft.spec_config.protocol
         slots = protocol.num_model_slots
+        acceptance_slots = torch.zeros(
+            slots, dtype=torch.bool, device=blocks.labels.device
+        )
+        acceptance_slots[list(protocol.prediction_positions)] = True
         return self.predictions(
             output.hidden_states,
             batch,
@@ -312,6 +316,7 @@ class ObjectiveModel(nn.Module):
             unit_size=slots,
             positions=torch.arange(slots, device=blocks.labels.device)
             - protocol.prediction_positions[0],
+            acceptance_slots=acceptance_slots,
             **options,
         )
 

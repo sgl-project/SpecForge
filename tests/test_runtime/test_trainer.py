@@ -966,9 +966,19 @@ class TestTrainerController(unittest.TestCase):
                 self.assertEqual(alive, [0 if replay_statistics else 1] * 6)
 
 
+class ChainProgram(TinyProgram):
+    """Also reports accepted draft tokens, which give eval its best-tracking score."""
+
+    def forward(self, tensors, **context):
+        result = super().forward(tensors, **context)
+        one = torch.ones(())
+        result.ratios["accepted_draft_tokens"] = (torch.tensor(0.5), one)
+        return result
+
+
 class TestBestTracking(unittest.TestCase):
     def test_best_checkpoint_does_not_require_periodic_saves(self):
-        program = TinyProgram()
+        program = ChainProgram()
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(
                 program,
@@ -988,7 +998,7 @@ class TestBestTracking(unittest.TestCase):
     def test_best_fires_on_misaligned_eval_and_save_intervals(self):
         # eval_interval=1, save_interval=2: the first eval is still checkpointed
         # on demand as the best even though it is not a periodic-save step.
-        program = TinyProgram()
+        program = ChainProgram()
         backend = FakeBackend(program)
         with tempfile.TemporaryDirectory() as d:
             ctrl = _controller(

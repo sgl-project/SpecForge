@@ -365,10 +365,16 @@ class DataParallelRunner:
     @contextlib.contextmanager
     def evaluation(self):
         was_training = self.program.training
+        device = self._device()
         self.program.eval()
         self._evaluating = True
         try:
-            yield
+            # eval draws (block anchors) must not shift training's generators
+            with torch.random.fork_rng(
+                devices=[] if device.type == "cpu" else [device.index],
+                device_type=device.type,
+            ):
+                yield
         finally:
             self._evaluating = False
             self.program.train(was_training)
