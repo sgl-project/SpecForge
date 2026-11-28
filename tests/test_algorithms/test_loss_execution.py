@@ -579,3 +579,29 @@ class LossExecutionTest(unittest.TestCase):
         with patch("torch.random.fork_rng", return_value=nullcontext()) as fork_rng:
             run_dpace(npu_pred)
         fork_rng.assert_called_once_with(devices=[2], device_type="npu")
+
+
+class AcceptedDraftTokensTest(unittest.TestCase):
+    def test_chain_stops_at_a_miss_or_an_unsupervised_slot(self):
+        from specforge.algorithms.objectives.execution import accepted_draft_tokens
+
+        # Slot 0 is the anchor: outside the chain, whatever it holds.
+        slots = torch.tensor([False, True, True, True])
+        hit = torch.tensor(
+            [
+                [False, True, True, False],  # two, then a miss
+                [False, True, True, True],  # three, but the last is unsupervised
+                [True, False, True, True],  # a miss first
+                [True, True, True, True],  # no supervised chain slot: not a chain
+            ]
+        )
+        supervised = torch.tensor(
+            [
+                [False, True, True, True],
+                [False, True, True, False],
+                [False, True, True, True],
+                [True, False, False, False],
+            ]
+        )
+        accepted, chains = accepted_draft_tokens(hit, supervised, slots)
+        self.assertEqual((accepted.item(), chains.item()), (4.0, 3.0))

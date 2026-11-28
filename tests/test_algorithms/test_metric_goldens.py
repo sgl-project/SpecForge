@@ -395,11 +395,12 @@ class MetricGoldenTest(unittest.TestCase):
             GOLDENS.write_text(json.dumps(recorded, indent=1, sort_keys=True) + "\n")
 
     def test_non_logging_step_reports_only_what_the_loss_already_computed(self):
+        # A block's accepted draft tokens come from the accuracy's argmax.
         for kind, expected in (
-            ("dflash", ["acc", "ce_loss", "loss"]),
-            ("dflash2", ["acc", "ce_loss", "loss"]),
-            ("domino", ["acc", "loss"]),
-            ("dspark", ["acc", "loss"]),
+            ("dflash", ["acc", "accepted_draft_tokens", "ce_loss", "loss"]),
+            ("dflash2", ["acc", "accepted_draft_tokens", "ce_loss", "loss"]),
+            ("domino", ["acc", "accepted_draft_tokens", "loss"]),
+            ("dspark", ["acc", "accepted_draft_tokens", "loss"]),
         ):
             with self.subTest(kind=kind):
                 self.assertEqual(

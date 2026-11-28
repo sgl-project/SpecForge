@@ -1,6 +1,7 @@
 {
  "dflash": {
   "acc": 0.6538461446762085,
+  "accepted_draft_tokens": 1.2000000476837158,
   "ce_loss": 3.685969829559326,
   "dflash/hard_label/block_count": 10.0,
   "dflash/hard_label/supervised_prefix_length": 3.5999999046325684,
@@ -83,6 +84,7 @@
  },
  "dflash dpace": {
   "acc": 0.6153846383094788,
+  "accepted_draft_tokens": 0.8999999761581421,
   "ce_loss": 4.6587090492248535,
   "dflash/hard_label/block_count": 10.0,
   "dflash/hard_label/supervised_prefix_length": 3.5999999046325684,
@@ -165,6 +167,7 @@
  },
  "dflash2": {
   "acc": 0.692307710647583,
+  "accepted_draft_tokens": 1.2000000476837158,
   "ce_loss": 3.4481210708618164,
   "dflash/hard_label/block_count": 10.0,
   "dflash/hard_label/supervised_prefix_length": 3.5999999046325684,
@@ -313,6 +316,7 @@
  },
  "dflash2 lk_lambda dpace": {
   "acc": 0.5384615659713745,
+  "accepted_draft_tokens": 1.0,
   "dflash/hard_label/block_count": 10.0,
   "dflash/hard_label/supervised_prefix_length": 3.5999999046325684,
   "dflash/hard_label/unary_gold_probability_chain_length": 1.034998893737793,
@@ -445,6 +449,7 @@
  },
  "dflash2 without a selector objective": {
   "acc": 0.692307710647583,
+  "accepted_draft_tokens": 1.100000023841858,
   "ce_loss": 3.4373044967651367,
   "dflash/hard_label/block_count": 10.0,
   "dflash/hard_label/supervised_prefix_length": 3.5999999046325684,
@@ -587,6 +592,7 @@
  "domino": {
   "acc": 0.5769230723381042,
   "accept_len": 2.0,
+  "accepted_draft_tokens": 1.0,
   "base_accept_len": 2.0,
   "base_accuracy": 0.5384615659713745,
   "base_loss": 3.7114083766937256,
@@ -599,6 +605,7 @@
  "domino shifted": {
   "acc": 0.6764705777168274,
   "accept_len": 2.5,
+  "accepted_draft_tokens": 1.399999976158142,
   "base_accept_len": 2.5,
   "base_accuracy": 0.6764705777168274,
   "base_loss": 3.6897289752960205,
@@ -610,6 +617,7 @@
  },
  "dspark": {
   "acc": 0.4545454680919647,
+  "accepted_draft_tokens": 0.8999999761581421,
   "accuracy_position_0": 0.699999988079071,
   "accuracy_position_1": 0.375,
   "accuracy_position_2": 0.375,
@@ -631,6 +639,7 @@
  },
  "dspark without a confidence head": {
   "acc": 0.4545454680919647,
+  "accepted_draft_tokens": 0.800000011920929,
   "accuracy_position_0": 0.6000000238418579,
   "accuracy_position_1": 0.375,
   "accuracy_position_2": 0.375,
@@ -650,6 +659,7 @@
  },
  "dspine": {
   "acc": 0.3461538553237915,
+  "accepted_draft_tokens": 0.4000000059604645,
   "dspine/alignment_loss": 0.6927199363708496,
   "dspine/backbone_ce": 4.871046543121338,
   "dspine/backbone_l1": 1.4261175394058228,

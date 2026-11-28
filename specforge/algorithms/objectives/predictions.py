@@ -84,6 +84,10 @@ class Predictions:
     computed terms. Every declared term must execute exactly once. Without a
     procedure, all plan groups execute directly. Statistics retain gradients;
     the algorithm decides where supervision must be detached.
+
+    ``acceptance_slots`` (bool over a unit's positions) marks the slots the
+    verifier accepts in order as one chain. It is None where a chain spans
+    units (P-EAGLE), which then report no accepted draft tokens.
     """
 
     hidden: Tensor
@@ -104,11 +108,19 @@ class Predictions:
     draft_to_target: Tensor | None = None
     denominator: Tensor | None = None
     accuracy_name: str = "acc"
+    acceptance_slots: Tensor | None = None
     chunk_safe: bool = True
     reduce_statistics: Callable | None = None
 
     def __post_init__(self):
         shape = self.hidden.shape[:2]
+        if self.acceptance_slots is not None and (
+            self.acceptance_slots.dtype != torch.bool
+            or self.acceptance_slots.shape != shape[1:]
+        ):
+            raise ValueError(
+                "acceptance_slots must be a bool vector over a unit's positions"
+            )
         if (
             self.hidden.ndim != 3
             or self.mask.shape != shape
